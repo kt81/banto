@@ -109,6 +109,8 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
         source_path: path.to_path_buf(),
         mtime,
         size: metadata.len(),
+        // TODO(core teammate): detect the agent-setting head record.
+        is_agent: false,
     })
 }
 

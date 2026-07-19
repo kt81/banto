@@ -33,6 +33,11 @@ pub struct SessionMeta {
     pub mtime: SystemTime,
     /// Source file size in bytes.
     pub size: u64,
+    /// True when this session was run by a spawned agent (subagent /
+    /// Agent-Teams teammate) rather than started interactively by the user.
+    /// Detected from a `{"type":"agent-setting"}` record in the file head
+    /// (observed 2026-07-19); interactive sessions start with `mode` records.
+    pub is_agent: bool,
 }
 
 /// Activity state rendered as the colored dot in the session list.

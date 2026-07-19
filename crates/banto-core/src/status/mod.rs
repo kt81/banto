@@ -99,6 +99,7 @@ mod tests {
             source_path: PathBuf::from("synthetic.jsonl"),
             mtime: fixed_now() - age,
             size: 0,
+            is_agent: false,
         }
     }
 

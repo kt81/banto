@@ -84,6 +84,8 @@ impl Store {
                 source_path: PathBuf::from(row.get::<_, String>(4)?),
                 mtime: unix_ms_to_system_time(row.get(5)?),
                 size: row.get::<_, i64>(6)?.max(0) as u64,
+                // Not persisted yet (schema v1); a v2 migration will add it.
+                is_agent: false,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

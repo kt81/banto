@@ -120,6 +120,7 @@ pub(crate) mod test_util {
             source_path: PathBuf::from(format!("C:/synthetic-fixtures/{id}.jsonl")),
             mtime: UNIX_EPOCH + Duration::from_millis(1_750_000_000_000),
             size: 42,
+            is_agent: false,
         }
     }
 }
