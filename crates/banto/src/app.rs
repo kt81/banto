@@ -64,6 +64,27 @@ impl App {
         }
     }
 
+    /// Replace the session list (e.g. after a filesystem-change reload),
+    /// re-applying the current query unchanged. The previously selected
+    /// session stays selected if it still exists, by id rather than index
+    /// (rows may have been reordered or removed); otherwise the selection
+    /// falls back to the top of the new list. Scroll is re-clamped to the
+    /// new bounds; `last_click` is cleared since its filtered index no
+    /// longer corresponds to anything meaningful after a full replacement.
+    pub fn replace_rows(&mut self, rows: Vec<SessionRow>) {
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+
+        self.rows = rows;
+        self.haystacks = self.rows.iter().map(SessionRow::haystack).collect();
+        self.filtered = rank_indices(&self.query, &self.haystacks);
+
+        self.selected = selected_id
+            .and_then(|id| self.filtered.iter().position(|&i| self.rows[i].id == id))
+            .unwrap_or(0);
+        self.last_click = None;
+        self.ensure_visible();
+    }
+
     // --- query editing --------------------------------------------------
 
     /// Append a printable character to the query and re-filter.
@@ -523,5 +544,81 @@ mod tests {
         let id = app.selected_row().unwrap().id.clone();
         app.set_status(format!("opened session {id}"));
         assert_eq!(app.status(), Some("opened session id1"));
+    }
+
+    #[test]
+    fn replace_rows_preserves_selection_by_id_across_reorder() {
+        let mut app = App::new(numbered(3)); // id0, id1, id2
+        app.set_viewport_height(10);
+        app.select_next(); // id1
+        assert_eq!(app.selected_row().unwrap().id, "id1");
+
+        // Reordered: id1 now comes first.
+        app.replace_rows(vec![
+            row("id1", "title 1", ""),
+            row("id0", "title 0", ""),
+            row("id2", "title 2", ""),
+        ]);
+
+        assert_eq!(app.selected_row().unwrap().id, "id1");
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn replace_rows_falls_back_to_the_top_when_the_selected_session_vanishes() {
+        let mut app = App::new(numbered(3)); // id0, id1, id2
+        app.set_viewport_height(10);
+        app.select_next(); // id1
+
+        app.replace_rows(vec![row("id0", "title 0", ""), row("id2", "title 2", "")]); // id1 gone
+
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.selected_row().unwrap().id, "id0");
+    }
+
+    #[test]
+    fn replace_rows_with_no_matching_session_yields_an_empty_selection() {
+        let mut app = App::new(numbered(3));
+        app.set_viewport_height(10);
+        app.select_next(); // id1
+
+        app.replace_rows(Vec::new());
+
+        assert_eq!(app.selected(), 0);
+        assert!(app.selected_row().is_none());
+    }
+
+    #[test]
+    fn replace_rows_clamps_scroll_when_the_list_shrinks() {
+        let mut app = App::new(numbered(10));
+        app.set_viewport_height(3);
+        app.select_last(); // id9, scrolled near the bottom
+
+        // id9 no longer exists: selection falls back to the top, and the
+        // viewport must not still be scrolled past the (now much shorter) end.
+        app.replace_rows(numbered(3));
+
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.selected_in_viewport(), Some(0));
+        assert_eq!(ids(&app), vec!["id0", "id1", "id2"]);
+    }
+
+    #[test]
+    fn replace_rows_reapplies_the_current_query_without_changing_it() {
+        let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]);
+        app.set_viewport_height(10);
+        for c in "alpha".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.filtered_len(), 1);
+
+        app.replace_rows(vec![
+            row("a", "Alpha", ""),
+            row("b", "Beta", ""),
+            row("c", "Alpha 2", ""),
+        ]);
+
+        assert_eq!(app.query(), "alpha");
+        assert_eq!(app.filtered_len(), 2);
     }
 }

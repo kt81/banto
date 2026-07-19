@@ -7,7 +7,7 @@
 
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -31,6 +31,7 @@ use banto_core::model::{Activity, AgeBucket};
 use banto_core::opener::SystemCommandRunner;
 use banto_core::status::{AgeThresholds, SysinfoProbe};
 use banto_core::store::Store;
+use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
 use crate::app::{App, ClickOutcome};
 use crate::opener::{self, OpenOutcome, SessionToOpen};
@@ -38,6 +39,54 @@ use crate::session::{self, SessionRow};
 
 /// The concrete terminal type used throughout this module.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+/// How long each event-loop tick waits for input before checking for
+/// filesystem changes; keeps input latency imperceptible while still polling
+/// for live updates roughly this often.
+const TICK_INTERVAL: Duration = Duration::from_millis(150);
+
+/// How long `projects/`/`sessions/` must stay quiet before a burst of
+/// filesystem changes triggers a reload (see `banto_core::watch::Debouncer`).
+const DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
+
+/// Everything the render loop needs beyond [`App`] itself: dependencies for
+/// opening/focusing sessions and reloading rows from disk.
+struct Context<'a> {
+    claude_home: &'a Path,
+    thresholds: &'a AgeThresholds,
+    store: &'a Store,
+    opener_mode: OpenerMode,
+}
+
+/// Watches `claude_home` for changes and debounces them into a "reload now"
+/// signal. Construction failures (e.g. an exotic filesystem `notify` can't
+/// watch) degrade to "no live updates" rather than blocking the TUI from
+/// starting at all.
+struct LiveWatch {
+    source: Option<NotifyChangeSource>,
+    debouncer: Debouncer,
+}
+
+impl LiveWatch {
+    fn new(claude_home: &Path) -> Self {
+        Self {
+            source: NotifyChangeSource::new(claude_home).ok(),
+            debouncer: Debouncer::new(DEBOUNCE_QUIET),
+        }
+    }
+
+    /// Drain any pending filesystem changes and report whether their quiet
+    /// period has elapsed as of `now`, i.e. whether a reload is due.
+    fn poll_ready(&mut self, now: SystemTime) -> bool {
+        let Some(source) = &self.source else {
+            return false;
+        };
+        for change in source.drain() {
+            self.debouncer.record(change.root, change.at);
+        }
+        !self.debouncer.poll(now).is_empty()
+    }
+}
 
 /// Load sessions under `claude_home` and run the interactive TUI.
 pub fn run(
@@ -48,9 +97,15 @@ pub fn run(
 ) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
     let mut app = App::new(rows);
+    let ctx = Context {
+        claude_home,
+        thresholds,
+        store,
+        opener_mode,
+    };
 
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, store, opener_mode);
+    let result = event_loop(&mut terminal, &mut app, &ctx);
     // Always restore the terminal, even if the loop errored.
     let restored = restore_terminal();
     result.and(restored)
@@ -96,13 +151,13 @@ fn layout_areas(area: Rect) -> [Rect; 3] {
     .areas(area)
 }
 
-/// Draw, wait for one event, dispatch it, repeat until quit.
-fn event_loop(
-    terminal: &mut Tui,
-    app: &mut App,
-    store: &Store,
-    opener_mode: OpenerMode,
-) -> Result<()> {
+/// Draw, wait up to [`TICK_INTERVAL`] for one event, dispatch it, check for
+/// filesystem changes, repeat until quit. Polling (rather than blocking on
+/// `event::read()`) is what lets live updates land without waiting for the
+/// next keypress.
+fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
+    let mut watch = LiveWatch::new(ctx.claude_home);
+
     loop {
         // Compute the layout up front so the viewport height and mouse
         // hit-testing agree with what we are about to render.
@@ -112,16 +167,22 @@ fn event_loop(
 
         terminal.draw(|frame| render(frame, app))?;
 
-        match event::read()? {
-            Event::Key(key) => {
-                // On Windows crossterm also reports key releases; ignore them.
-                if key.kind == KeyEventKind::Release {
-                    continue;
+        if event::poll(TICK_INTERVAL)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // On Windows crossterm also reports key releases; ignore them.
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                    handle_key(app, key.code, key.modifiers, ctx);
                 }
-                handle_key(app, key.code, key.modifiers, store, opener_mode);
+                Event::Mouse(mouse) => handle_mouse(app, mouse, list_area, ctx),
+                _ => {}
             }
-            Event::Mouse(mouse) => handle_mouse(app, mouse, list_area, store, opener_mode),
-            _ => {}
+        }
+
+        if watch.poll_ready(SystemTime::now()) {
+            reload(app, ctx);
         }
 
         if app.should_quit() {
@@ -131,13 +192,7 @@ fn event_loop(
 }
 
 /// Translate a key press into an [`App`] action.
-fn handle_key(
-    app: &mut App,
-    code: KeyCode,
-    mods: KeyModifiers,
-    store: &Store,
-    opener_mode: OpenerMode,
-) {
+fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {
         // Ctrl+C always quits; other Ctrl combos are ignored for now.
@@ -149,7 +204,7 @@ fn handle_key(
         KeyCode::PageDown => app.page_down(),
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
-        KeyCode::Enter => activate(app, store, opener_mode),
+        KeyCode::Enter => activate(app, ctx),
         KeyCode::Backspace => app.backspace(),
         // Esc clears a non-empty query, otherwise quits.
         KeyCode::Esc => {
@@ -167,13 +222,7 @@ fn handle_key(
 }
 
 /// Translate a mouse event into an [`App`] action.
-fn handle_mouse(
-    app: &mut App,
-    mouse: event::MouseEvent,
-    list_area: Rect,
-    store: &Store,
-    opener_mode: OpenerMode,
-) {
+fn handle_mouse(app: &mut App, mouse: event::MouseEvent, list_area: Rect, ctx: &Context) {
     match mouse.kind {
         MouseEventKind::ScrollDown => app.scroll(1),
         MouseEventKind::ScrollUp => app.scroll(-1),
@@ -182,7 +231,7 @@ fn handle_mouse(
             if list_area.contains(position) {
                 let viewport_row = (mouse.row - list_area.y) as usize;
                 if app.click(viewport_row, Instant::now()) == Some(ClickOutcome::Activated) {
-                    activate(app, store, opener_mode);
+                    activate(app, ctx);
                 }
             }
         }
@@ -191,11 +240,12 @@ fn handle_mouse(
 }
 
 /// Open or focus the selected session (Enter / double-click), posting the
-/// outcome as a status-bar message. All I/O lives in this thin shell, not in
-/// [`App`], which stays a pure, testable state struct — see
+/// outcome as a status-bar message, then reload rows once since the open/
+/// focus attempt just changed the pane map. All I/O lives in this thin
+/// shell, not in [`App`], which stays a pure, testable state struct — see
 /// `crate::opener::open_session` for the actual decision logic (unit tested
 /// there with mocked process/store dependencies).
-fn activate(app: &mut App, store: &Store, opener_mode: OpenerMode) {
+fn activate(app: &mut App, ctx: &Context) {
     let Some(row) = app.selected_row() else {
         return;
     };
@@ -210,9 +260,14 @@ fn activate(app: &mut App, store: &Store, opener_mode: OpenerMode) {
             .unwrap_or_else(|| PathBuf::from(".")),
     };
 
-    let backend = opener::resolve_backend(opener_mode, |key| std::env::var(key).ok());
-    let outcome =
-        opener::open_session(store, &SysinfoProbe, backend, &session, SystemCommandRunner);
+    let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
+    let outcome = opener::open_session(
+        ctx.store,
+        &SysinfoProbe,
+        backend,
+        &session,
+        SystemCommandRunner,
+    );
 
     let message = match outcome {
         Ok(OpenOutcome::Focused) => format!("focused existing pane (session {id})"),
@@ -228,6 +283,17 @@ fn activate(app: &mut App, store: &Store, opener_mode: OpenerMode) {
         Err(err) => format!("failed to open session {id}: {err}"),
     };
     app.set_status(message);
+    reload(app, ctx);
+}
+
+/// Re-read sessions from disk and re-classify their activity, preserving
+/// selection (by session id), query and scroll clamping — see
+/// [`App::replace_rows`]. A read failure is tolerated: the previous rows are
+/// kept rather than the TUI erroring out over a transient filesystem hiccup.
+fn reload(app: &mut App, ctx: &Context) {
+    if let Ok(rows) = session::load_rows(ctx.claude_home, ctx.thresholds) {
+        app.replace_rows(rows);
+    }
 }
 
 /// Render the whole UI for one frame.
