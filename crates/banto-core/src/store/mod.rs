@@ -123,6 +123,14 @@ pub(crate) mod test_util {
             is_agent: false,
         }
     }
+
+    /// Same as [`meta`], but flagged as run by a spawned agent.
+    pub fn agent_meta(id: &str, title: Option<&str>, cwd: Option<&str>) -> SessionMeta {
+        SessionMeta {
+            is_agent: true,
+            ..meta(id, title, cwd)
+        }
+    }
 }
 
 #[cfg(test)]

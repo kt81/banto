@@ -48,6 +48,9 @@ const MIGRATIONS: &[&str] = &[
         pid          INTEGER,
         opened_at_ms INTEGER NOT NULL
     );",
+    // v2: track whether a session was run by a spawned agent (subagent /
+    // Agent-Teams teammate) rather than started interactively.
+    "ALTER TABLE sessions ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -112,7 +115,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]

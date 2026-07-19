@@ -37,6 +37,7 @@ switcher" built-in view (portable-pty + tui-term) can evolve on the same core.
 |---|---|
 | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | Session body. One JSON per line |
 | First few records of the jsonl | `{"type":"custom-title","customTitle":...}` / `{"type":"ai-title","aiTitle":...}` — the title can be extracted by reading only the head chunk. Older formats fall back to the first user message |
+| First record of the jsonl | `{"type":"agent-setting",...}` marks a session run by a spawned agent (subagent / Agent-Teams teammate); interactive sessions open with a `mode` record instead. Sets `SessionMeta.is_agent`, persisted in the store (schema v2) |
 | `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` ("busy" etc.), `kind` ("interactive"/"bg"), `name`, `updatedAt` |
 | `~/.claude/history.jsonl` and others | Unused in the MVP |
 

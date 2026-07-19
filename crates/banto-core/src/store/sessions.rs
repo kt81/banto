@@ -38,15 +38,16 @@ impl Store {
             let source_path = s.source_path.to_string_lossy().into_owned();
             let size = i64::try_from(s.size).unwrap_or(i64::MAX);
             tx.execute(
-                "INSERT INTO sessions (id, provider, title, cwd, source_path, mtime_ms, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO sessions (id, provider, title, cwd, source_path, mtime_ms, size, is_agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                      provider    = excluded.provider,
                      title       = excluded.title,
                      cwd         = excluded.cwd,
                      source_path = excluded.source_path,
                      mtime_ms    = excluded.mtime_ms,
-                     size        = excluded.size",
+                     size        = excluded.size,
+                     is_agent    = excluded.is_agent",
                 params![
                     s.id.0,
                     s.provider,
@@ -55,6 +56,7 @@ impl Store {
                     source_path,
                     system_time_to_unix_ms(s.mtime),
                     size,
+                    s.is_agent,
                 ],
             )?;
             // FTS5 is kept in sync manually: replace this session's entry.
@@ -72,7 +74,7 @@ impl Store {
     /// Returns all cached sessions, most recently modified first.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, provider, title, cwd, source_path, mtime_ms, size
+            "SELECT id, provider, title, cwd, source_path, mtime_ms, size, is_agent
              FROM sessions ORDER BY mtime_ms DESC, id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -84,8 +86,7 @@ impl Store {
                 source_path: PathBuf::from(row.get::<_, String>(4)?),
                 mtime: unix_ms_to_system_time(row.get(5)?),
                 size: row.get::<_, i64>(6)?.max(0) as u64,
-                // Not persisted yet (schema v1); a v2 migration will add it.
-                is_agent: false,
+                is_agent: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -132,7 +133,7 @@ fn build_match_expr(query: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::meta;
+    use super::super::test_util::{agent_meta, meta};
     use super::*;
 
     fn ids(found: &[SessionId]) -> Vec<&str> {
@@ -161,6 +162,37 @@ mod tests {
         assert_eq!(got.source_path, original.source_path);
         assert_eq!(got.mtime, original.mtime);
         assert_eq!(got.size, original.size);
+        assert_eq!(got.is_agent, original.is_agent);
+    }
+
+    #[test]
+    fn sync_roundtrip_preserves_is_agent_flag() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .sync_sessions(&[
+                meta("interactive", Some("normal session"), None),
+                agent_meta("agent", Some("spawned session"), None),
+            ])
+            .unwrap();
+
+        let listed = store.list_sessions().unwrap();
+        let is_agent = |id: &str| listed.iter().find(|s| s.id.0 == id).unwrap().is_agent;
+        assert!(!is_agent("interactive"));
+        assert!(is_agent("agent"));
+    }
+
+    #[test]
+    fn sync_upsert_updates_is_agent_flag() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .sync_sessions(&[meta("s1", Some("title"), None)])
+            .unwrap();
+        store
+            .sync_sessions(&[agent_meta("s1", Some("title"), None)])
+            .unwrap();
+
+        let listed = store.list_sessions().unwrap();
+        assert!(listed[0].is_agent);
     }
 
     #[test]

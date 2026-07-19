@@ -1,8 +1,10 @@
 //! Claude Code CLI session provider.
 //!
 //! Discovers `<claude_home>/projects/<encoded-cwd>/<uuid>.jsonl` files and
-//! extracts metadata (title, cwd, mtime) by reading only the head of each
-//! file. See docs/REQUIREMENTS.md "Data sources" for the observed format.
+//! extracts metadata (title, cwd, mtime, is_agent) by reading only the head
+//! of each file. See docs/REQUIREMENTS.md "Data sources" for the observed
+//! format, including the `agent-setting` record that marks a session run by
+//! a spawned agent rather than started interactively.
 //!
 //! Parsing is lenient by contract: broken lines are skipped, unknown record
 //! types and fields are ignored, and per-file I/O problems never abort
@@ -109,8 +111,7 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
         source_path: path.to_path_buf(),
         mtime,
         size: metadata.len(),
-        // TODO(core teammate): detect the agent-setting head record.
-        is_agent: false,
+        is_agent: fields.is_agent,
     })
 }
 
@@ -138,6 +139,7 @@ struct HeadFields {
     ai_title: Option<String>,
     user_text: Option<String>,
     cwd: Option<PathBuf>,
+    is_agent: bool,
 }
 
 impl HeadFields {
@@ -169,6 +171,11 @@ fn extract_head_fields(head: &str) -> HeadFields {
             fields.cwd = Some(PathBuf::from(cwd));
         }
         match record.get("type").and_then(Value::as_str) {
+            // A spawned agent (subagent / Agent-Teams teammate) session opens
+            // with this record instead of the interactive `mode` record; it
+            // always precedes any title/user record, so it is never missed
+            // by the early-break below.
+            Some("agent-setting") => fields.is_agent = true,
             Some("custom-title") if fields.custom_title.is_none() => {
                 fields.custom_title = record
                     .get("customTitle")
@@ -315,6 +322,36 @@ mod tests {
         );
         let sessions = discover_sorted(&root);
         assert_eq!(sessions[0].title.as_deref(), Some("first second"));
+    }
+
+    #[test]
+    fn agent_setting_record_marks_the_session_as_agent_run() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"agent-setting","agent":"code-reviewer"}
+{"type":"custom-title","customTitle":"Review PR 42"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert!(sessions[0].is_agent);
+    }
+
+    #[test]
+    fn sessions_without_agent_setting_are_not_flagged() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"mode","mode":"interactive"}
+{"type":"ai-title","aiTitle":"Ordinary session"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert!(!sessions[0].is_agent);
     }
 
     #[test]
