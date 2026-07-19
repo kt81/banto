@@ -18,7 +18,7 @@ impl fmt::Display for SessionId {
 }
 
 /// Metadata for one discovered session, provider-agnostic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionMeta {
     pub id: SessionId,
     /// Stable provider name, e.g. "claude-code".
