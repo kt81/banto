@@ -65,7 +65,7 @@ pub fn resolve_backend(mode: OpenerMode, env: impl Fn(&str) -> Option<String>) -
 /// `backend` is the resolved opener backend for *new* opens (see
 /// [`resolve_backend`]); an existing pane is always focused through whichever
 /// backend it was originally opened with, regardless of the current default.
-pub fn open_session<R: CommandRunner + 'static>(
+pub fn open_session<R: CommandRunner + Clone + 'static>(
     store: &Store,
     probe: &dyn ProcessProbe,
     backend: Option<Backend>,
@@ -79,33 +79,56 @@ pub fn open_session<R: CommandRunner + 'static>(
         // rather than risk a double resume.
         let alive = record.pid.is_none_or(|pid| probe.is_alive(pid));
         if alive {
-            return focus_existing(store, &record, runner);
+            match focus_existing(store, &record, runner.clone())? {
+                FocusResult::Outcome(outcome) => return Ok(outcome),
+                // The backend CLI ran but reported the pane doesn't exist
+                // any more (already cleaned up); fall through to open fresh.
+                FocusResult::Stale => {}
+            }
+        } else {
+            // The wrapper is gone but never cleaned up (e.g. it crashed).
+            store.remove_pane(&id)?;
         }
-        // The wrapper is gone but never cleaned up (e.g. it crashed).
-        store.remove_pane(&id)?;
     }
 
     open_fresh(store, backend, session, runner)
+}
+
+/// Outcome of [`focus_existing`]: either a final [`OpenOutcome`], or a
+/// signal that the pane record was stale and the caller should open fresh.
+enum FocusResult {
+    Outcome(OpenOutcome),
+    Stale,
 }
 
 fn focus_existing<R: CommandRunner + 'static>(
     store: &Store,
     record: &PaneRecord,
     runner: R,
-) -> Result<OpenOutcome, SessionOpenError> {
+) -> Result<FocusResult, SessionOpenError> {
     let Some(backend) = parse_backend_key(&record.backend) else {
         // Unknown backend string (e.g. written by a future banto version).
         store.remove_pane(&record.session_id)?;
-        return Ok(OpenOutcome::NoBackendDetected);
+        return Ok(FocusResult::Outcome(OpenOutcome::NoBackendDetected));
     };
     let Some(handle) = decode_handle(backend, &record.target) else {
         store.remove_pane(&record.session_id)?;
-        return Ok(OpenOutcome::NoBackendDetected);
+        return Ok(FocusResult::Outcome(OpenOutcome::NoBackendDetected));
     };
 
     match opener::opener_for(backend, runner).focus(&handle) {
-        Ok(()) => Ok(OpenOutcome::Focused),
-        Err(OpenError::UnsupportedFocus { .. }) => Ok(OpenOutcome::AlreadyOpenCannotFocus),
+        Ok(()) => Ok(FocusResult::Outcome(OpenOutcome::Focused)),
+        Err(OpenError::UnsupportedFocus { .. }) => {
+            Ok(FocusResult::Outcome(OpenOutcome::AlreadyOpenCannotFocus))
+        }
+        Err(OpenError::Command { .. }) => {
+            // The backend CLI ran but failed (e.g. psmux's `select-window`
+            // reporting no such window): the pane is actually gone even
+            // though our record didn't reflect it yet. Stale, not a real
+            // error — clean up and let the caller open a fresh one.
+            store.remove_pane(&record.session_id)?;
+            Ok(FocusResult::Stale)
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -208,29 +231,48 @@ fn decode_handle(backend: Backend, target: &str) -> Option<SessionHandle> {
 mod tests {
     use super::*;
     use banto_core::opener::{CommandOutput, CommandSpec};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashSet;
     use std::rc::Rc;
 
     /// Records every command and always reports success with a fixed
     /// `create` output for commands that need to parse one (psmux's
-    /// `-P -F` create format). Cheaply `Clone`-able (shared call log) so a
-    /// clone can be moved into `open_session` while the original is kept
-    /// around to inspect the calls afterward.
+    /// `-P -F` create format) — unless configured via
+    /// [`MockRunner::failing_select_window`] to simulate the backend CLI
+    /// reporting the pane no longer exists. Cheaply `Clone`-able (shared
+    /// call log) so a clone can be moved into `open_session` while the
+    /// original is kept around to inspect the calls afterward.
     #[derive(Clone, Default)]
     struct MockRunner {
         calls: Rc<RefCell<Vec<CommandSpec>>>,
+        fail_select_window: Rc<Cell<bool>>,
     }
 
     impl MockRunner {
         fn calls(&self) -> Vec<CommandSpec> {
             self.calls.borrow().clone()
         }
+
+        /// A runner whose `select-window` calls fail, simulating psmux
+        /// reporting the pane is gone (e.g. it was closed out of band).
+        fn failing_select_window() -> Self {
+            let runner = Self::default();
+            runner.fail_select_window.set(true);
+            runner
+        }
     }
 
     impl CommandRunner for MockRunner {
         fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, OpenError> {
             self.calls.borrow_mut().push(spec.clone());
+            if self.fail_select_window.get()
+                && spec.args.first().map(String::as_str) == Some("select-window")
+            {
+                return Ok(CommandOutput::failure(
+                    Some(1),
+                    "no such window".to_string(),
+                ));
+            }
             Ok(CommandOutput::success("@1:%1\n"))
         }
     }
@@ -391,6 +433,42 @@ mod tests {
             .unwrap();
         // Replaced with the freshly opened pane, not the stale one.
         assert_eq!(record.target, "@1:%1");
+    }
+
+    #[test]
+    fn focus_command_error_is_treated_as_stale_and_opens_fresh() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_pane(&PaneRecord {
+                session_id: SessionId("sess-1".to_string()),
+                backend: "psmux".to_string(),
+                target: "@3:%8".to_string(),
+                pid: Some(100),
+                opened_at: SystemTime::now(),
+            })
+            .unwrap();
+        // Pid alive, so a normal focus would be attempted, but the backend
+        // reports the pane itself is gone (e.g. closed out of band).
+        let probe = MockProbe::with_alive(&[100]);
+        let runner = MockRunner::failing_select_window();
+
+        let outcome = open_session(
+            &store,
+            &probe,
+            Some(Backend::Psmux),
+            &session(),
+            runner.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, OpenOutcome::Opened);
+        let record = store
+            .get_pane(&SessionId("sess-1".to_string()))
+            .unwrap()
+            .unwrap();
+        // Replaced with the freshly opened pane, not the stale one.
+        assert_eq!(record.target, "@1:%1");
+        assert_ne!(record.target, "@3:%8");
     }
 
     #[test]

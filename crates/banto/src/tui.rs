@@ -51,12 +51,16 @@ const TICK_INTERVAL: Duration = Duration::from_millis(150);
 /// filesystem changes triggers a reload (see `banto_core::watch::Debouncer`).
 const DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
 
-/// How long to wait for the next byte of a possible escape sequence after a
-/// lone `Esc`, before concluding it really is just Esc. A real leaked SGR
-/// mouse sequence arrives as one burst, taking far less than this; a human
-/// pressing Esc and then another key takes far longer — so this never adds
-/// perceptible latency to an ordinary Esc press.
-const ESCAPE_BURST_TIMEOUT: Duration = Duration::from_millis(25);
+/// Grace period for deciding whether a lone `Esc` is genuine or the start of
+/// a leaked SGR sequence (see [`resolve_escape`]). A zero-wait poll was
+/// tried first but proved wrong in the field: under split-pacing delivery
+/// (observed with psmux/ConPTY) the sequence's next byte isn't always
+/// already queued the instant `Esc` arrives, so a zero-wait check
+/// misclassified a leaked sequence as a standalone Esc — cancelling the
+/// search or quitting the app mid-mouse-motion. ~30ms is still far below
+/// human reaction time between two real keypresses, so it doesn't make an
+/// ordinary Esc press feel laggy.
+const ESCAPE_GRACE: Duration = Duration::from_millis(30);
 
 /// Everything the render loop needs beyond [`App`] itself: dependencies for
 /// opening/focusing sessions and reloading rows from disk.
@@ -219,10 +223,11 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
     }
 }
 
-/// Translate a key press into an [`App`] action. Navigation, paging and
-/// Enter behave the same in both modes; everything else is mode-specific
-/// (see [`handle_normal_key`] / [`handle_search_key`]) because letter keys
-/// mean different things: commands in Normal mode, query text in Search mode.
+/// Translate a key press into an [`App`] action. Navigation and paging
+/// behave the same in both modes; everything else — including Enter — is
+/// mode-specific (see [`handle_normal_key`] / [`handle_search_key`]) because
+/// letter keys mean different things: commands in Normal mode, query text
+/// in Search mode.
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     if mods.contains(KeyModifiers::CONTROL) {
         // Ctrl+C always quits; other Ctrl combos are ignored for now.
@@ -232,7 +237,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
         return;
     }
     match code {
-        KeyCode::Enter => activate(app, ctx),
         KeyCode::Up => app.select_prev(),
         KeyCode::Down => app.select_next(),
         KeyCode::PageUp => app.page_up(),
@@ -251,6 +255,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     match code {
         KeyCode::Char('j') => app.select_next(),
         KeyCode::Char('k') => app.select_prev(),
+        KeyCode::Enter => activate(app, ctx),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('p') => toggle_pin(app, ctx),
         KeyCode::Char('a') => toggle_agent_filter(app),
@@ -259,40 +264,107 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     }
 }
 
-/// Search-mode keys: characters type into the query; Esc cancels the search
-/// (clearing the query) back to Normal mode.
+/// Search-mode keys: characters type into the query (`j`/`k` included —
+/// they're ordinary query text here, not movement). Enter confirms the
+/// search (back to Normal, keeping the query/filter, so the just-filtered
+/// list can be navigated); Esc cancels it (clears the query, back to
+/// Normal).
 fn handle_search_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Backspace => app.backspace(),
+        KeyCode::Enter => app.confirm_search(),
         KeyCode::Esc => app.exit_search(),
         KeyCode::Char(c) => app.push_char(c),
         _ => {}
     }
 }
 
-/// Resolve a `KeyCode::Esc` key event: either a genuine lone Escape press,
-/// or the start of an SGR mouse escape sequence (`ESC [ < Cb ; Cx ; Cy
-/// (M|m)`) that leaked through as individual character keys instead of a
-/// proper `Event::Mouse` — observed under some nested terminal/multiplexer
-/// setups. Buffers characters and re-checks [`sgr::parse_prefix`] after
-/// each one:
-/// - a complete match is swallowed entirely (never reaches [`App`]);
+/// Resolve a `KeyCode::Esc` key event by waiting up to [`ESCAPE_GRACE`] to
+/// see if anything follows: if nothing shows up, this is a genuine
+/// standalone Esc. If something DOES follow, it may be the start of an SGR
+/// mouse sequence (`[ < Cb ; Cx ; Cy (M|m)`, the leading `ESC` already
+/// consumed) that leaked through as character keys instead of a proper
+/// `Event::Mouse` — observed under some nested terminal/multiplexer setups
+/// (psmux, ConPTY).
+///
+/// A successfully parsed sequence is translated into the corresponding
+/// scroll/click action (see [`apply_sgr_action`]) rather than just dropped.
+/// Mouse motion fires many of these back to back, so after resolving one
+/// this keeps draining the queue (zero-wait — by then we're only checking
+/// for more already-arrived work, not disambiguating a real Esc) for
+/// another leaked sequence before returning to the render loop.
+fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
+    if !event::poll(ESCAPE_GRACE)? {
+        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+        return Ok(());
+    }
+    loop {
+        if matches!(
+            swallow_one_sequence(app, ctx, list_area)?,
+            EscapeOutcome::Done
+        ) {
+            return Ok(());
+        }
+        // One sequence handled; only keep draining if another leaked
+        // sequence is immediately queued — anything else is dispatched
+        // through the normal path and ends resolution here. Zero-wait is
+        // fine (unlike the checks above): this only decides whether to loop
+        // again, never whether to dispatch a genuine Esc, so there's no
+        // misclassification risk to guard against with a grace period.
+        if !event::poll(Duration::ZERO)? {
+            return Ok(());
+        }
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Release => {}
+            Event::Key(key) if key.code == KeyCode::Esc => continue,
+            Event::Key(key) => {
+                handle_key(app, key.code, key.modifiers, ctx);
+                return Ok(());
+            }
+            Event::Mouse(mouse) => {
+                handle_mouse(app, mouse, list_area, ctx);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Outcome of buffering and resolving one Esc-initiated sequence.
+enum EscapeOutcome {
+    /// A complete SGR sequence was recognized and applied/swallowed; the
+    /// caller may check for another one immediately following.
+    Swallowed,
+    /// The buffer didn't match (or nothing followed in time) and has been
+    /// replayed as ordinary key presses; nothing more to do.
+    Done,
+}
+
+/// Buffer characters starting from a leading `ESC` and re-check
+/// [`sgr::parse_prefix`] after each one, waiting up to [`ESCAPE_GRACE`] each
+/// time for the next byte (see [`resolve_escape`] — the same split-pacing
+/// risk applies at every byte boundary within the sequence, not just its
+/// start):
+/// - a complete match is applied via [`apply_sgr_action`] and swallowed;
 /// - a definite mismatch replays the buffered characters as ordinary key
 ///   presses (the leading Esc dispatched normally, the rest as if typed);
-/// - if nothing follows within [`ESCAPE_BURST_TIMEOUT`], it's a lone Esc.
-fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
+/// - if nothing more arrives in time, whatever was buffered is replayed the same way.
+fn swallow_one_sequence(app: &mut App, ctx: &Context, list_area: Rect) -> Result<EscapeOutcome> {
     let mut pending = vec!['\u{1b}'];
     loop {
         match sgr::parse_prefix(&pending) {
-            SgrParse::Complete(_) => return Ok(()), // a real mouse click/scroll; swallow it
+            SgrParse::Complete(event) => {
+                apply_sgr_action(app, ctx, list_area, event);
+                return Ok(EscapeOutcome::Swallowed);
+            }
             SgrParse::NotSgr => {
                 replay(app, ctx, &pending);
-                return Ok(());
+                return Ok(EscapeOutcome::Done);
             }
             SgrParse::Incomplete => {
-                if !event::poll(ESCAPE_BURST_TIMEOUT)? {
+                if !event::poll(ESCAPE_GRACE)? {
                     replay(app, ctx, &pending);
-                    return Ok(());
+                    return Ok(EscapeOutcome::Done);
                 }
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
@@ -301,18 +373,46 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
                         other => {
                             replay(app, ctx, &pending);
                             handle_key(app, other, key.modifiers, ctx);
-                            return Ok(());
+                            return Ok(EscapeOutcome::Done);
                         }
                     },
                     Event::Mouse(mouse) => {
                         replay(app, ctx, &pending);
                         handle_mouse(app, mouse, list_area, ctx);
-                        return Ok(());
+                        return Ok(EscapeOutcome::Done);
                     }
                     _ => {} // resize/focus/paste mid-burst: keep waiting
                 }
             }
         }
+    }
+}
+
+/// Translate a successfully parsed SGR mouse sequence into the
+/// corresponding [`App`] action, reusing the same scroll/click/double-click
+/// path real `Event::Mouse` events go through. `Cb` (button) encodes: 64/65
+/// = wheel up/down; 0 with a press terminator (`M`) = left click. Anything
+/// else (drag/motion — e.g. `Cb` 35 — other buttons, releases) is
+/// intentionally discarded: there's nothing sensible to do with it here.
+fn apply_sgr_action(app: &mut App, ctx: &Context, list_area: Rect, event: sgr::SgrMouseEvent) {
+    const WHEEL_UP: u32 = 64;
+    const WHEEL_DOWN: u32 = 65;
+    const LEFT_BUTTON: u32 = 0;
+
+    match event.button {
+        WHEEL_UP => app.scroll(-1),
+        WHEEL_DOWN => app.scroll(1),
+        LEFT_BUTTON if event.pressed => {
+            // SGR coordinates are 1-based; ours are 0-based screen cells.
+            let position = Position::new(event.x.saturating_sub(1), event.y.saturating_sub(1));
+            if list_area.contains(position) {
+                let viewport_row = (position.y - list_area.y) as usize;
+                if app.click(viewport_row, Instant::now()) == Some(ClickOutcome::Activated) {
+                    activate(app, ctx);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -527,7 +627,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  / search  \
                                 p pin  a agents  q/Esc quit";
     const SEARCH_HINTS: &str =
-        "type to search  \u{2191}\u{2193} move  Enter open  Esc cancel search";
+        "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
@@ -543,8 +643,10 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 Mode::Search => SEARCH_HINTS,
             };
             let mut hints = hints.to_string();
-            if !app.show_agents() {
-                hints.push_str("  (agents hidden)");
+            let hidden = app.hidden_agent_count();
+            if hidden > 0 {
+                let plural = if hidden == 1 { "" } else { "s" };
+                hints.push_str(&format!("  ({hidden} agent session{plural} hidden)"));
             }
             (hints, Color::Gray)
         }
@@ -596,6 +698,22 @@ mod tests {
         SessionRow {
             is_agent: true,
             ..row(id, title, cwd, activity)
+        }
+    }
+
+    /// A `Context` for tests exercising `handle_key`/`handle_normal_key`/
+    /// `handle_search_key` directly — these are ordinary functions with no
+    /// terminal dependency (only `resolve_escape` touches `event::poll`/
+    /// `read`), so they're testable without a real terminal, just an
+    /// in-memory store (and caller-owned `thresholds`, so the returned
+    /// `Context`'s lifetime doesn't outlive a temporary) to satisfy
+    /// `Context`'s shape.
+    fn test_context<'a>(store: &'a Store, thresholds: &'a AgeThresholds) -> Context<'a> {
+        Context {
+            claude_home: Path::new("."),
+            thresholds,
+            store,
+            opener_mode: OpenerMode::Auto,
         }
     }
 
@@ -719,11 +837,11 @@ mod tests {
             !text.contains("Agent task"),
             "agent row shown by default:\n{text}"
         );
-        // The hint text (including the hidden-indicator suffix) is longer
-        // than the narrow 60-col terminal `draw` uses, so check it wider.
+        // The hint text (including the hidden-count suffix) is longer than
+        // the narrow 60-col terminal `draw` uses, so check it wider.
         let wide_text = draw_with_width(&app, 110);
         assert!(
-            wide_text.contains("agents hidden"),
+            wide_text.contains("1 agent session hidden"),
             "missing hidden indicator:\n{wide_text}"
         );
 
@@ -734,7 +852,10 @@ mod tests {
             "agent row not shown after toggle:\n{text}"
         );
         let wide_text = draw_with_width(&app, 110);
-        assert!(!wide_text.contains("agents hidden"));
+        assert!(
+            !wide_text.contains("hidden)"),
+            "hidden indicator still shown after toggle:\n{wide_text}"
+        );
     }
 
     #[test]
@@ -750,5 +871,253 @@ mod tests {
         app.enter_search();
         let search_text = draw_with_width(&app, 110);
         assert!(search_text.contains("cancel search"), "{search_text}");
+    }
+
+    #[test]
+    fn slash_enters_search_mode_and_typed_characters_filter() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "", Activity::Alive),
+            row("b", "Beta", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.mode(), Mode::Search);
+
+        handle_key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "b");
+        assert_eq!(app.filtered_len(), 1);
+    }
+
+    #[test]
+    fn j_and_k_move_selection_in_normal_mode() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "A", "", Activity::Alive),
+            row("b", "B", "", Activity::Alive),
+            row("c", "C", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.selected_row().unwrap().id, "b");
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.selected_row().unwrap().id, "c");
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.selected_row().unwrap().id, "b");
+    }
+
+    #[test]
+    fn q_quits_in_normal_mode_but_is_query_input_in_search_mode() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &ctx);
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "q");
+        assert!(!app.should_quit());
+
+        app.exit_search();
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &ctx);
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn esc_quits_in_normal_mode() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &ctx);
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn esc_in_search_mode_clears_the_query_and_returns_to_normal_without_quitting() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &ctx);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "a");
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &ctx);
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.query(), "");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn enter_in_search_mode_confirms_without_opening_and_keeps_the_query() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "", Activity::Alive),
+            row("b", "Beta", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &ctx);
+        handle_key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.filtered_len(), 1);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.query(), "b"); // kept, not cleared
+        assert_eq!(app.filtered_len(), 1); // filter preserved
+        assert!(app.status().is_none()); // nothing was opened
+    }
+
+    #[test]
+    fn a_toggles_the_agent_filter_only_in_normal_mode() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("h1", "Human", "", Activity::Alive),
+            agent_row("a1", "Agent", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+        assert_eq!(app.filtered_len(), 1);
+
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.filtered_len(), 2);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &ctx);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &ctx);
+        // In Search mode, 'a' is just a query character, not the toggle.
+        assert_eq!(app.query(), "a");
+    }
+
+    /// The exact bytes from the bug report: continuous mouse motion (button
+    /// code 35) leaking as character keys. Regression test for the crash —
+    /// none of this should ever reach the query or a keybinding.
+    #[test]
+    fn leaked_motion_sequences_never_reach_the_query_or_quit_binding() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        // Simulate what `resolve_escape`/`swallow_one_sequence` does with a
+        // fully-buffered leaked sequence: it must parse as Complete (motion,
+        // discarded) and never call `push_char` for any of its characters.
+        for seq in ["\u{1b}[<35;18;12M", "\u{1b}[<35;19;12M"] {
+            let chars: Vec<char> = seq.chars().collect();
+            assert!(matches!(sgr::parse_prefix(&chars), SgrParse::Complete(_)));
+        }
+        assert_eq!(app.query(), "");
+
+        // 'q' still works as a normal query character (Search mode) and as
+        // quit (Normal mode) — the leaked bytes never changed the mode.
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "q");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn apply_sgr_action_wheel_scrolls_without_moving_selection() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(
+            (0..10)
+                .map(|i| row(&format!("id{i}"), "t", "", Activity::Alive))
+                .collect(),
+        );
+        app.set_viewport_height(3);
+        let list_area = Rect::new(0, 4, 60, 3);
+
+        apply_sgr_action(
+            &mut app,
+            &ctx,
+            list_area,
+            sgr::SgrMouseEvent {
+                button: 65,
+                x: 1,
+                y: 1,
+                pressed: true,
+            },
+        );
+
+        // Wheel never moves the selection.
+        assert_eq!(app.selected_row().unwrap().id, "id0");
+    }
+
+    #[test]
+    fn apply_sgr_action_left_click_selects_the_row_under_the_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "A", "", Activity::Alive),
+            row("b", "B", "", Activity::Alive),
+            row("c", "C", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(3);
+        let list_area = Rect::new(0, 4, 60, 3);
+
+        // SGR coordinates are 1-based; row 6 (1-based) is list_area row 5
+        // (0-based) => viewport row 1 (list_area starts at y=4) => "b".
+        apply_sgr_action(
+            &mut app,
+            &ctx,
+            list_area,
+            sgr::SgrMouseEvent {
+                button: 0,
+                x: 1,
+                y: 6,
+                pressed: true,
+            },
+        );
+
+        assert_eq!(app.selected_row().unwrap().id, "b");
+    }
+
+    #[test]
+    fn apply_sgr_action_ignores_motion_and_releases() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
+        app.set_viewport_height(3);
+        let list_area = Rect::new(0, 4, 60, 3);
+
+        for event in [
+            sgr::SgrMouseEvent {
+                button: 35,
+                x: 1,
+                y: 5,
+                pressed: true,
+            }, // pure motion
+            sgr::SgrMouseEvent {
+                button: 0,
+                x: 1,
+                y: 5,
+                pressed: false,
+            }, // left-button release
+        ] {
+            apply_sgr_action(&mut app, &ctx, list_area, event);
+        }
+
+        assert_eq!(app.selected_row().unwrap().id, "a");
     }
 }

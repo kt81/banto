@@ -125,10 +125,21 @@ impl App {
         self.mode = Mode::Normal;
     }
 
+    /// Confirm the search: keep the query and filtered results exactly as
+    /// they are, just return to [`Mode::Normal`] (bound to Enter in Search
+    /// mode). Unlike [`Self::exit_search`], does not clear the query — the
+    /// user can then navigate the filtered list with `j`/`k` without losing
+    /// it, and a second Enter (now in Normal mode) opens the selection.
+    pub fn confirm_search(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
     // --- agent filter -------------------------------------------------------
 
-    /// Whether agent-run sessions are currently included in the list.
-    pub fn show_agents(&self) -> bool {
+    /// Whether agent-run sessions are currently included in the list. Only
+    /// used by tests; production code reads `hidden_agent_count()` instead.
+    #[cfg(test)]
+    fn show_agents(&self) -> bool {
         self.show_agents
     }
 
@@ -139,6 +150,18 @@ impl App {
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
         self.show_agents
+    }
+
+    /// Number of agent sessions matching the current query that the filter
+    /// is currently hiding (always `0` once [`Self::show_agents`] is on).
+    pub fn hidden_agent_count(&self) -> usize {
+        if self.show_agents {
+            return 0;
+        }
+        rank_indices(&self.query, &self.haystacks)
+            .into_iter()
+            .filter(|&i| self.rows[i].is_agent)
+            .count()
     }
 
     /// Seed the initial pinned-id set (loaded once from the store at
@@ -848,6 +871,44 @@ mod tests {
         assert_eq!(app.query(), "");
         // Cleared query means the full list is back.
         assert_eq!(app.filtered_len(), 3);
+    }
+
+    #[test]
+    fn confirm_search_returns_to_normal_but_keeps_the_query_and_filter() {
+        let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]);
+        app.set_viewport_height(10);
+
+        app.enter_search();
+        app.push_char('b');
+        assert_eq!(app.filtered_len(), 1);
+
+        app.confirm_search();
+
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.query(), "b"); // kept, unlike exit_search
+        assert_eq!(app.filtered_len(), 1); // filter preserved
+    }
+
+    #[test]
+    fn hidden_agent_count_reflects_the_current_query() {
+        let mut app = App::new(vec![
+            row("h1", "orange soda", ""),
+            agent_row("a1", "orange fruit", ""),
+            agent_row("a2", "apple pie", ""),
+        ]);
+        app.set_viewport_height(10);
+
+        // No query: both agent rows count as hidden.
+        assert_eq!(app.hidden_agent_count(), 2);
+
+        for c in "orange".chars() {
+            app.push_char(c);
+        }
+        // Only "orange fruit" (agent) matches "orange"; "apple pie" doesn't.
+        assert_eq!(app.hidden_agent_count(), 1);
+
+        app.toggle_agent_filter();
+        assert_eq!(app.hidden_agent_count(), 0);
     }
 
     #[test]
