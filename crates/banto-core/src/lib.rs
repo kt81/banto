@@ -15,3 +15,4 @@ pub mod provider;
 pub mod search;
 pub mod status;
 pub mod store;
+pub mod watch;
