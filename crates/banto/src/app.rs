@@ -21,6 +21,18 @@ pub enum ClickOutcome {
     Activated,
 }
 
+/// Which input mode the TUI is in. Letter keys mean different things in
+/// each: `j`/`k`/`p`/`a`/`/`/`q` are commands in [`Mode::Normal`], while any
+/// character types into the query in [`Mode::Search`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Letter keys are commands (`j`/`k` move, `/` searches, `p` pins, `a`
+    /// toggles the agent filter, `q`/Esc quit).
+    Normal,
+    /// Typed characters filter the list; Esc cancels back to [`Mode::Normal`].
+    Search,
+}
+
 /// The whole TUI state: the full session list plus the live query, filter
 /// result, selection and scroll position.
 pub struct App {
@@ -38,7 +50,14 @@ pub struct App {
     /// Ids of pinned sessions. A cache for sorting/display only — the store
     /// is the durable source of truth; see [`Self::toggle_pin`].
     pinned: HashSet<String>,
-    /// Current search query.
+    /// Whether agent-run sessions (`SessionRow::is_agent`) are included in
+    /// `filtered`. Off by default: a human browsing their own sessions
+    /// doesn't usually want every spawned-agent session cluttering the list.
+    show_agents: bool,
+    /// Current input mode; see [`Mode`].
+    mode: Mode,
+    /// Current search query. Always empty outside [`Mode::Search`] — entering
+    /// Normal mode always clears it (see [`Self::exit_search`]).
     query: String,
     /// Indices into `rows` that match the query, in display order.
     filtered: Vec<usize>,
@@ -71,6 +90,8 @@ impl App {
             rows: Vec::new(),
             haystacks: Vec::new(),
             pinned: HashSet::new(),
+            show_agents: false,
+            mode: Mode::Normal,
             query: String::new(),
             filtered: Vec::new(),
             selected: 0,
@@ -81,8 +102,43 @@ impl App {
             should_quit: false,
         };
         app.resort_rows();
-        app.filtered = (0..app.rows.len()).collect();
+        app.filtered = app.compute_filtered();
         app
+    }
+
+    // --- mode -------------------------------------------------------------
+
+    /// The current input mode.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Enter [`Mode::Search`] (bound to `/` in Normal mode).
+    pub fn enter_search(&mut self) {
+        self.mode = Mode::Search;
+    }
+
+    /// Cancel the search: clear the query and return to [`Mode::Normal`]
+    /// (bound to Esc in Search mode).
+    pub fn exit_search(&mut self) {
+        self.clear_query();
+        self.mode = Mode::Normal;
+    }
+
+    // --- agent filter -------------------------------------------------------
+
+    /// Whether agent-run sessions are currently included in the list.
+    pub fn show_agents(&self) -> bool {
+        self.show_agents
+    }
+
+    /// Toggle whether agent-run sessions are included, returning the new
+    /// state. Keeps the current selection (by id) if it's still visible.
+    pub fn toggle_agent_filter(&mut self) -> bool {
+        self.show_agents = !self.show_agents;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.refilter_keeping_selected(selected_id);
+        self.show_agents
     }
 
     /// Seed the initial pinned-id set (loaded once from the store at
@@ -145,12 +201,23 @@ impl App {
     /// the list. Clears `last_click`, whose filtered index no longer
     /// corresponds to anything meaningful after a reorder.
     fn refilter_keeping_selected(&mut self, keep_id: Option<String>) {
-        self.filtered = rank_indices(&self.query, &self.haystacks);
+        self.filtered = self.compute_filtered();
         self.selected = keep_id
             .and_then(|id| self.filtered.iter().position(|&i| self.rows[i].id == id))
             .unwrap_or(0);
         self.last_click = None;
         self.ensure_visible();
+    }
+
+    /// Rank `rows` against the current query, then drop agent-run sessions
+    /// unless [`Self::show_agents`] is on. Ranking (and, with an empty
+    /// query, the pinned-first base order) always runs first and is never
+    /// affected by the agent filter — it only removes results afterward.
+    fn compute_filtered(&self) -> Vec<usize> {
+        rank_indices(&self.query, &self.haystacks)
+            .into_iter()
+            .filter(|&i| self.show_agents || !self.rows[i].is_agent)
+            .collect()
     }
 
     // --- query editing --------------------------------------------------
@@ -181,7 +248,7 @@ impl App {
 
     /// Recompute the filter result and reset selection/scroll to the top.
     fn refilter(&mut self) {
-        self.filtered = rank_indices(&self.query, &self.haystacks);
+        self.filtered = self.compute_filtered();
         self.selected = 0;
         self.offset = 0;
         self.status = None;
@@ -408,6 +475,14 @@ mod tests {
             title: (!title.is_empty()).then(|| title.to_string()),
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
             activity: Activity::Idle(AgeBucket::Older),
+            is_agent: false,
+        }
+    }
+
+    fn agent_row(id: &str, title: &str, cwd: &str) -> SessionRow {
+        SessionRow {
+            is_agent: true,
+            ..row(id, title, cwd)
         }
     }
 
@@ -755,5 +830,88 @@ mod tests {
         let mut app = App::new(Vec::new());
         app.set_viewport_height(10);
         assert_eq!(app.toggle_pin(), None);
+    }
+
+    #[test]
+    fn starts_in_normal_mode_and_search_round_trip_clears_the_query() {
+        let mut app = App::new(numbered(3));
+        app.set_viewport_height(10);
+        assert_eq!(app.mode(), Mode::Normal);
+
+        app.enter_search();
+        assert_eq!(app.mode(), Mode::Search);
+        app.push_char('t');
+        assert_eq!(app.query(), "t");
+
+        app.exit_search();
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.query(), "");
+        // Cleared query means the full list is back.
+        assert_eq!(app.filtered_len(), 3);
+    }
+
+    #[test]
+    fn agent_sessions_are_hidden_by_default() {
+        let mut app = App::new(vec![
+            row("h1", "Human session", ""),
+            agent_row("a1", "Agent session", ""),
+        ]);
+        app.set_viewport_height(10);
+
+        assert!(!app.show_agents());
+        assert_eq!(app.total_len(), 2);
+        assert_eq!(ids(&app), vec!["h1"]);
+    }
+
+    #[test]
+    fn toggle_agent_filter_reveals_agent_sessions() {
+        let mut app = App::new(vec![
+            row("h1", "Human session", ""),
+            agent_row("a1", "Agent session", ""),
+        ]);
+        app.set_viewport_height(10);
+
+        let showing = app.toggle_agent_filter();
+
+        assert!(showing);
+        assert!(app.show_agents());
+        assert_eq!(ids(&app), vec!["h1", "a1"]);
+
+        let hiding = app.toggle_agent_filter();
+        assert!(!hiding);
+        assert_eq!(ids(&app), vec!["h1"]);
+    }
+
+    #[test]
+    fn toggle_agent_filter_keeps_the_current_selection() {
+        let mut app = App::new(vec![
+            row("h1", "Human one", ""),
+            row("h2", "Human two", ""),
+            agent_row("a1", "Agent one", ""),
+        ]);
+        app.set_viewport_height(10);
+        app.select_next(); // h2
+
+        app.toggle_agent_filter();
+
+        assert_eq!(app.selected_row().unwrap().id, "h2");
+    }
+
+    #[test]
+    fn agent_filter_hides_matches_during_search_without_affecting_ranking() {
+        let mut app = App::new(vec![
+            row("h1", "match one", ""),
+            agent_row("a1", "match two", ""),
+        ]);
+        app.set_viewport_height(10);
+        for c in "match".chars() {
+            app.push_char(c);
+        }
+
+        // The agent session matches the query too, but stays hidden.
+        assert_eq!(ids(&app), vec!["h1"]);
+
+        app.toggle_agent_filter();
+        assert_eq!(ids(&app), vec!["h1", "a1"]);
     }
 }

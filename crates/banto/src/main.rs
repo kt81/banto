@@ -13,6 +13,7 @@ mod app;
 mod opener;
 mod process;
 mod session;
+mod sgr;
 mod tui;
 mod wrap;
 

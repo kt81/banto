@@ -34,9 +34,10 @@ use banto_core::status::{AgeThresholds, SysinfoProbe};
 use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
-use crate::app::{App, ClickOutcome, VisibleRow};
+use crate::app::{App, ClickOutcome, Mode, VisibleRow};
 use crate::opener::{self, OpenOutcome, SessionToOpen};
 use crate::session;
+use crate::sgr::{self, SgrParse};
 
 /// The concrete terminal type used throughout this module.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -49,6 +50,13 @@ const TICK_INTERVAL: Duration = Duration::from_millis(150);
 /// How long `projects/`/`sessions/` must stay quiet before a burst of
 /// filesystem changes triggers a reload (see `banto_core::watch::Debouncer`).
 const DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
+
+/// How long to wait for the next byte of a possible escape sequence after a
+/// lone `Esc`, before concluding it really is just Esc. A real leaked SGR
+/// mouse sequence arrives as one burst, taking far less than this; a human
+/// pressing Esc and then another key takes far longer — so this never adds
+/// perceptible latency to an ordinary Esc press.
+const ESCAPE_BURST_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Everything the render loop needs beyond [`App`] itself: dependencies for
 /// opening/focusing sessions and reloading rows from disk.
@@ -188,7 +196,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                     if key.kind == KeyEventKind::Release {
                         continue;
                     }
-                    handle_key(app, key.code, key.modifiers, ctx);
+                    // Esc needs special handling: it may be a lone Escape
+                    // press, or the start of a leaked SGR mouse sequence.
+                    if key.code == KeyCode::Esc {
+                        resolve_escape(app, ctx, list_area)?;
+                    } else {
+                        handle_key(app, key.code, key.modifiers, ctx);
+                    }
                 }
                 Event::Mouse(mouse) => handle_mouse(app, mouse, list_area, ctx),
                 _ => {}
@@ -205,35 +219,112 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
     }
 }
 
-/// Translate a key press into an [`App`] action.
+/// Translate a key press into an [`App`] action. Navigation, paging and
+/// Enter behave the same in both modes; everything else is mode-specific
+/// (see [`handle_normal_key`] / [`handle_search_key`]) because letter keys
+/// mean different things: commands in Normal mode, query text in Search mode.
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
-    let ctrl = mods.contains(KeyModifiers::CONTROL);
-    match code {
+    if mods.contains(KeyModifiers::CONTROL) {
         // Ctrl+C always quits; other Ctrl combos are ignored for now.
-        KeyCode::Char('c') if ctrl => app.request_quit(),
-        _ if ctrl => {}
+        if code == KeyCode::Char('c') {
+            app.request_quit();
+        }
+        return;
+    }
+    match code {
+        KeyCode::Enter => activate(app, ctx),
         KeyCode::Up => app.select_prev(),
         KeyCode::Down => app.select_next(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
-        KeyCode::Enter => activate(app, ctx),
+        _ => match app.mode() {
+            Mode::Normal => handle_normal_key(app, code, ctx),
+            Mode::Search => handle_search_key(app, code),
+        },
+    }
+}
+
+/// Normal-mode keys: letters are commands, not query input.
+fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
+    match code {
+        KeyCode::Char('j') => app.select_next(),
+        KeyCode::Char('k') => app.select_prev(),
+        KeyCode::Char('/') => app.enter_search(),
+        KeyCode::Char('p') => toggle_pin(app, ctx),
+        KeyCode::Char('a') => toggle_agent_filter(app),
+        KeyCode::Char('q') | KeyCode::Esc => app.request_quit(),
+        _ => {}
+    }
+}
+
+/// Search-mode keys: characters type into the query; Esc cancels the search
+/// (clearing the query) back to Normal mode.
+fn handle_search_key(app: &mut App, code: KeyCode) {
+    match code {
         KeyCode::Backspace => app.backspace(),
-        // Esc clears a non-empty query, otherwise quits.
-        KeyCode::Esc => {
-            if app.query().is_empty() {
-                app.request_quit();
-            } else {
-                app.clear_query();
-            }
-        }
-        // 'q' quits and 'p' pins only when not typing a query; otherwise
-        // they are input, same as any other character.
-        KeyCode::Char('q') if app.query().is_empty() => app.request_quit(),
-        KeyCode::Char('p') if app.query().is_empty() => toggle_pin(app, ctx),
+        KeyCode::Esc => app.exit_search(),
         KeyCode::Char(c) => app.push_char(c),
         _ => {}
+    }
+}
+
+/// Resolve a `KeyCode::Esc` key event: either a genuine lone Escape press,
+/// or the start of an SGR mouse escape sequence (`ESC [ < Cb ; Cx ; Cy
+/// (M|m)`) that leaked through as individual character keys instead of a
+/// proper `Event::Mouse` — observed under some nested terminal/multiplexer
+/// setups. Buffers characters and re-checks [`sgr::parse_prefix`] after
+/// each one:
+/// - a complete match is swallowed entirely (never reaches [`App`]);
+/// - a definite mismatch replays the buffered characters as ordinary key
+///   presses (the leading Esc dispatched normally, the rest as if typed);
+/// - if nothing follows within [`ESCAPE_BURST_TIMEOUT`], it's a lone Esc.
+fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
+    let mut pending = vec!['\u{1b}'];
+    loop {
+        match sgr::parse_prefix(&pending) {
+            SgrParse::Complete(_) => return Ok(()), // a real mouse click/scroll; swallow it
+            SgrParse::NotSgr => {
+                replay(app, ctx, &pending);
+                return Ok(());
+            }
+            SgrParse::Incomplete => {
+                if !event::poll(ESCAPE_BURST_TIMEOUT)? {
+                    replay(app, ctx, &pending);
+                    return Ok(());
+                }
+                match event::read()? {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
+                        KeyCode::Char(c) => pending.push(c),
+                        KeyCode::Esc => pending.push('\u{1b}'),
+                        other => {
+                            replay(app, ctx, &pending);
+                            handle_key(app, other, key.modifiers, ctx);
+                            return Ok(());
+                        }
+                    },
+                    Event::Mouse(mouse) => {
+                        replay(app, ctx, &pending);
+                        handle_mouse(app, mouse, list_area, ctx);
+                        return Ok(());
+                    }
+                    _ => {} // resize/focus/paste mid-burst: keep waiting
+                }
+            }
+        }
+    }
+}
+
+/// Replay buffered characters as if they had arrived as ordinary key
+/// presses. The first is always the `Esc` that started buffering.
+fn replay(app: &mut App, ctx: &Context, buffered: &[char]) {
+    let mut chars = buffered.iter().copied();
+    if chars.next().is_some() {
+        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+    }
+    for c in chars {
+        handle_key(app, KeyCode::Char(c), KeyModifiers::NONE, ctx);
     }
 }
 
@@ -323,6 +414,17 @@ fn toggle_pin(app: &mut App, ctx: &Context) {
     app.set_status(message);
 }
 
+/// Toggle whether agent-run sessions are shown, posting the new state as a
+/// status message.
+fn toggle_agent_filter(app: &mut App) {
+    let showing = app.toggle_agent_filter();
+    app.set_status(if showing {
+        "showing agent sessions".to_string()
+    } else {
+        "hiding agent sessions".to_string()
+    });
+}
+
 /// Re-read sessions from disk and re-classify their activity, preserving
 /// selection (by session id), query and scroll clamping — see
 /// [`App::replace_rows`]. A read failure is tolerated: the previous rows are
@@ -341,13 +443,21 @@ fn render(frame: &mut Frame, app: &App) {
     render_status(frame, app, status_area);
 }
 
-/// Render the top search box and place the text cursor after the query.
+/// Render the top search box; only shows a text cursor while actually in
+/// [`Mode::Search`] (Normal mode isn't editing the query, so a blinking
+/// caret there would be misleading), with a highlighted border as the
+/// active-mode indicator.
 fn render_search(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Search ");
+    let active = app.mode() == Mode::Search;
+    let border_color = if active { Color::Cyan } else { Color::DarkGray };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(" Search ");
     let inner = block.inner(area);
     frame.render_widget(Paragraph::new(app.query()).block(block), area);
 
-    if inner.width > 0 {
+    if active && inner.width > 0 {
         let query_cols = app.query().chars().count() as u16;
         let cursor_x = (inner.x + query_cols).min(inner.x + inner.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, inner.y));
@@ -414,8 +524,11 @@ fn list_item(visible: VisibleRow<'_>) -> ListItem<'static> {
 /// than one line) so the count stays visible even when the hints are too long
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    const HINTS: &str = "\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  p pin  type to search  \
-                         Esc clear/quit  q quit";
+    const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  / search  \
+                                p pin  a agents  q/Esc quit";
+    const SEARCH_HINTS: &str =
+        "type to search  \u{2191}\u{2193} move  Enter open  Esc cancel search";
+
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
 
@@ -424,7 +537,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let (left, color) = match app.status() {
         Some(message) => (message.to_string(), Color::Yellow),
-        None => (HINTS.to_string(), Color::Gray),
+        None => {
+            let hints = match app.mode() {
+                Mode::Normal => NORMAL_HINTS,
+                Mode::Search => SEARCH_HINTS,
+            };
+            let mut hints = hints.to_string();
+            if !app.show_agents() {
+                hints.push_str("  (agents hidden)");
+            }
+            (hints, Color::Gray)
+        }
     };
     frame.render_widget(
         Paragraph::new(Span::styled(left, Style::default().fg(color))),
@@ -465,6 +588,14 @@ mod tests {
             title: Some(title.into()),
             cwd: Some(PathBuf::from(cwd)),
             activity,
+            is_agent: false,
+        }
+    }
+
+    fn agent_row(id: &str, title: &str, cwd: &str, activity: Activity) -> SessionRow {
+        SessionRow {
+            is_agent: true,
+            ..row(id, title, cwd, activity)
         }
     }
 
@@ -484,7 +615,15 @@ mod tests {
     }
 
     fn draw(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        draw_with_width(app, 60)
+    }
+
+    /// Like [`draw`], but with a wider terminal — needed for assertions on
+    /// the full hint text, which is long enough to be truncated (by design;
+    /// see `render_status`) at the narrow 60-column width the other tests
+    /// use to check the match count stays visible.
+    fn draw_with_width(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         buffer_text(terminal.backend().buffer())
     }
@@ -563,5 +702,53 @@ mod tests {
             .unwrap();
         assert!(!alpha_line.contains('*'), "unexpected marker:\n{text}");
         assert!(text.contains("p pin"), "hint missing:\n{text}");
+    }
+
+    #[test]
+    fn agent_sessions_are_hidden_until_toggled() {
+        let rows = vec![
+            row("h1", "Human task", "/work/human", Activity::Alive),
+            agent_row("a1", "Agent task", "/work/agent", Activity::Alive),
+        ];
+        let mut app = App::new(rows);
+        app.set_viewport_height(11);
+
+        let text = draw(&app);
+        assert!(text.contains("Human task"), "human row missing:\n{text}");
+        assert!(
+            !text.contains("Agent task"),
+            "agent row shown by default:\n{text}"
+        );
+        // The hint text (including the hidden-indicator suffix) is longer
+        // than the narrow 60-col terminal `draw` uses, so check it wider.
+        let wide_text = draw_with_width(&app, 110);
+        assert!(
+            wide_text.contains("agents hidden"),
+            "missing hidden indicator:\n{wide_text}"
+        );
+
+        app.toggle_agent_filter();
+        let text = draw(&app);
+        assert!(
+            text.contains("Agent task"),
+            "agent row not shown after toggle:\n{text}"
+        );
+        let wide_text = draw_with_width(&app, 110);
+        assert!(!wide_text.contains("agents hidden"));
+    }
+
+    #[test]
+    fn search_mode_hint_differs_from_normal_mode_hint() {
+        let rows = vec![row("h1", "Human task", "/work/human", Activity::Alive)];
+        let mut app = App::new(rows);
+        app.set_viewport_height(11);
+
+        let normal_text = draw_with_width(&app, 110);
+        assert!(normal_text.contains("/ search"), "{normal_text}");
+        assert!(!normal_text.contains("cancel search"), "{normal_text}");
+
+        app.enter_search();
+        let search_text = draw_with_width(&app, 110);
+        assert!(search_text.contains("cancel search"), "{search_text}");
     }
 }

@@ -30,6 +30,10 @@ pub struct SessionRow {
     pub cwd: Option<PathBuf>,
     /// Activity state driving the colored dot.
     pub activity: Activity,
+    /// True when a spawned agent (subagent / Agent-Teams teammate) ran this
+    /// session, rather than the user starting it interactively. See
+    /// `banto_core::model::SessionMeta::is_agent`.
+    pub is_agent: bool,
 }
 
 impl SessionRow {
@@ -104,6 +108,7 @@ pub fn load_rows(
                 title: meta.title,
                 cwd: meta.cwd,
                 activity,
+                is_agent: meta.is_agent,
             }
         })
         .collect();
@@ -121,6 +126,7 @@ mod tests {
             title: Some("Fix login".into()),
             cwd: Some(PathBuf::from("/work/app")),
             activity: Activity::Alive,
+            is_agent: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -132,6 +138,7 @@ mod tests {
             title: None,
             cwd: None,
             activity: Activity::Alive,
+            is_agent: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -143,6 +150,7 @@ mod tests {
             title: None,
             cwd: None,
             activity: Activity::Alive,
+            is_agent: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }
