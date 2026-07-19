@@ -106,6 +106,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "tempfile",
 ]
 
 [[package]]

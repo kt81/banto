@@ -9,3 +9,6 @@ banto-core = { version = "0.1.0", path = "../banto-core" }
 clap = { version = "4.6.2", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
+
+[dev-dependencies]
+tempfile = "3"
