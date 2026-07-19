@@ -23,12 +23,14 @@ history.
 
 - **Phase 1 — done:** session discovery + fuzzy search + the TUI list
   (activity dots, mouse support including wheel scrolling).
-- **Phase 2 — in progress:** the opener (psmux / Windows Terminal), the
-  `banto _wrap` resume wrapper, and double-resume prevention.
-- **Phase 3 (live updates) and phase 4 (groups/pins):** the underlying
-  `banto-core` machinery already exists — `notify`-backed watching with
-  debounce, and sqlite-backed groups/pins — but neither is wired into the
-  TUI yet.
+- **Phase 2 — done:** the opener (psmux / Windows Terminal), the
+  `banto _wrap` resume wrapper, and double-resume prevention — Enter or a
+  double-click opens a session, or focuses its pane/tab if it's already open.
+- **Phase 3 — done:** live updates. A `notify`-backed watch of
+  `projects/`/`sessions/`, debounced, reloads the list automatically.
+- **Phase 4a (pins) — done:** `p` toggles a pin; pinned sessions sort first
+  (when not searching) and carry a `*` marker.
+- **Phase 4b (groups UI) — pending UX decisions.**
 
 See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the full design and
 phase breakdown.
@@ -65,6 +67,24 @@ cargo run -- --claude-home /path/to/.claude
 
 `--claude-home` takes priority over `config.toml`'s `claude_home` key, which
 in turn takes priority over the `~/.claude` default.
+
+### TUI keybindings
+
+| Key | Action |
+|---|---|
+| `Up` / `Down` | Move selection |
+| `PgUp` / `PgDn` | Move selection by one page |
+| `Home` / `End` | Jump to first / last session |
+| `Enter` | Open the selected session, or focus its pane/tab if already open |
+| type any character | Add to the search query |
+| `Backspace` | Delete the last query character |
+| `Esc` | Clear the query if non-empty, otherwise quit |
+| `q` | Quit (only when the query is empty) |
+| `p` | Toggle pin on the selected session (only when the query is empty) |
+| `Ctrl+C` | Quit |
+
+Mouse: wheel scrolls the list, a single click selects a row, and a quick
+second click on the same row (double-click) activates it — same as `Enter`.
 
 ### Configuration
 

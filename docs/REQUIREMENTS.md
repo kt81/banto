@@ -99,10 +99,10 @@ sysinfo (PID liveness) / thiserror, anyhow.
 
 ## Phases
 
-1. Indexer + search + TUI list (mouse support) — useful on its own
-2. Opener (psmux / WT) + `_wrap` + double-resume prevention + focus
-3. Activity dots + notify live updates
-4. Groups / pins
+1. Indexer + search + TUI list (mouse support) — useful on its own — done
+2. Opener (psmux / WT) + `_wrap` + double-resume prevention + focus — done
+3. Activity dots + notify live updates — done
+4. Groups / pins — pins done; groups UI remaining
 
 ## Risks
 
