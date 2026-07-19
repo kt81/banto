@@ -32,3 +32,17 @@ All results measured on the actual binary.
 - Remaining unverified items: the direct `split-window <command>` spawn form
   (instead of going through send-keys), and `respawn-pane`. Check while
   implementing the opener
+
+## Follow-up spike (2026-07-19, opener implementation)
+
+Verified on-device, non-destructively (`new-window -d` + `kill-window`):
+
+| Item | Result |
+|---|---|
+| `psmux` binary accepts tmux subcommands directly | OK (`psmux new-window ...` — no need for the `tmux` alias binary) |
+| Combined `-P -F '#{window_id}:#{pane_id}'` | OK. Returns e.g. `@2:%7` on both `new-window` and `split-window` |
+| Direct command spawn: `split-window ... <argv...>` (multi-arg, no send-keys) | OK. `powershell -NoExit -Command Get-Location` ran as passed |
+| `-c <cwd>` on `split-window` | OK. Spawned shell's cwd matched the `-c` argument |
+| `select-pane -T` + `list-panes -F '#{pane_id} #{pane_title}'` | OK (re-confirmed) |
+
+Still unverified: `respawn-pane` (not needed by the current opener design).

@@ -7,15 +7,11 @@
 //! focusing an existing session needs an explicit `select-window` +
 //! `select-pane` pair.
 //!
-//! Still needing on-device verification before phase-2 wiring ships (the
-//! spike did not cover these):
-//! - the direct `split-window <command>` spawn form used here (the spike
-//!   only exercised the send-keys flow and listed this form as unverified)
-//! - the `-c <cwd>` flag and the combined `-F '#{window_id}:#{pane_id}'`
-//!   format
-//! - the binary name: psmux installs both `psmux.exe` and a tmux-compatible
-//!   `tmux.exe`; whether `psmux` accepts these subcommands itself must be
-//!   confirmed (worst case, make [`PROGRAM`] configurable)
+//! The forms the original spike had left unverified were confirmed on-device
+//! in a follow-up spike (2026-07-19, see docs/notes/psmux-spike.md): the
+//! direct `split-window <command>` spawn form (multi-arg trailing command),
+//! the `-c <cwd>` flag, the combined `-F '#{window_id}:#{pane_id}'` format,
+//! and that the `psmux` binary itself accepts these subcommands.
 
 use std::path::Path;
 
