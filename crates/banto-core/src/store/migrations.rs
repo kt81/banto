@@ -78,6 +78,7 @@ pub(super) fn apply(conn: &Connection) -> Result<(), StoreError> {
 mod tests {
     use super::super::test_util::meta;
     use super::super::{Store, StoreError};
+    use super::MIGRATIONS;
 
     /// Proves the bundled rusqlite build ships the FTS5 module.
     #[test]
@@ -111,6 +112,40 @@ mod tests {
         // Reopening must not re-run migrations or lose data.
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_sessions().unwrap().len(), 1);
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn v1_to_v2_upgrade_preserves_existing_rows_with_is_agent_defaulting_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v1 code would have left it: only the v1 script
+        // applied, a row inserted without an `is_agent` column, and
+        // `user_version` left at 1.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, provider, title, cwd, source_path, mtime_ms, size)
+                 VALUES ('s1', 'claude-code', 'title', NULL, 'C:/s1.jsonl', 1000, 42)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        // Opening through Store::open must run the v2 migration and keep the
+        // pre-existing row, defaulting its new column to false.
+        let store = Store::open(&db).unwrap();
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id.0, "s1");
+        assert!(!listed[0].is_agent);
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

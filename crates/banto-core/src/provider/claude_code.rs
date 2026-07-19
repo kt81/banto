@@ -331,7 +331,7 @@ mod tests {
             &root,
             "proj",
             "s1.jsonl",
-            r#"{"type":"agent-setting","agent":"code-reviewer"}
+            r#"{"type":"agent-setting","agentSetting":"claude","sessionId":"s1"}
 {"type":"custom-title","customTitle":"Review PR 42"}
 "#,
         );
@@ -352,6 +352,26 @@ mod tests {
         );
         let sessions = discover_sorted(&root);
         assert!(!sessions[0].is_agent);
+    }
+
+    #[test]
+    fn agent_setting_deep_in_the_head_after_broken_lines_still_marks_agent() {
+        let root = TempDir::new().unwrap();
+        // Garbage and an unrelated record type precede agent-setting; neither
+        // sets custom_title/cwd, so the early-break can't have skipped past
+        // it before it was read.
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"this is not json
+{"type":"unknown-record"}
+{"type":"agent-setting","agentSetting":"claude","sessionId":"s1"}
+{"type":"ai-title","aiTitle":"Deep marker"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert!(sessions[0].is_agent);
     }
 
     #[test]
