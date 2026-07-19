@@ -105,8 +105,10 @@ dependencies = [
  "banto-core",
  "clap",
  "crossterm",
+ "dirs",
  "ratatui",
  "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

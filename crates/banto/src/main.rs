@@ -6,10 +6,15 @@
 //! 3. the provider default (`~/.claude`).
 //!
 //! Everything under the resolved Claude home is read strictly read-only.
+//! banto's own database (session <-> pane map, groups, pins) lives under
+//! `Config.db_path`, falling back to [`config::default_db_path`].
 
 mod app;
+mod opener;
+mod process;
 mod session;
 mod tui;
+mod wrap;
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +24,9 @@ use clap::{Parser, Subcommand};
 use banto_core::config::{self, Config};
 use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::status::AgeThresholds;
+use banto_core::store::Store;
 
+use process::SystemProcessRunner;
 use session::{activity_tag, load_rows, thresholds_from};
 
 /// Search and resume local Claude Code sessions.
@@ -39,17 +46,41 @@ struct Cli {
 enum Command {
     /// Print all sessions as plain text (newest first), one per line.
     List,
+    /// Internal: supervises a resumed session's process (registers its PID,
+    /// waits for it to exit, then cleans up). The opener spawns this; it is
+    /// not meant to be invoked directly.
+    #[command(name = "_wrap", hide = true)]
+    Wrap {
+        /// The session id being resumed.
+        #[arg(long)]
+        session: String,
+        /// The command to run, e.g. `claude --resume <id>`.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config();
-    let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-    let thresholds = thresholds_from(&config.activity);
 
     match cli.command {
-        Some(Command::List) => run_list(&claude_home, &thresholds),
-        None => tui::run(&claude_home, &thresholds),
+        Some(Command::List) => {
+            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let thresholds = thresholds_from(&config.activity);
+            run_list(&claude_home, &thresholds)
+        }
+        Some(Command::Wrap { session, argv }) => {
+            let store = open_store(&config)?;
+            let code = wrap::run(&store, &session, &argv, &SystemProcessRunner)?;
+            std::process::exit(code)
+        }
+        None => {
+            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let thresholds = thresholds_from(&config.activity);
+            let store = open_store(&config)?;
+            tui::run(&claude_home, &thresholds, config.opener, &store)
+        }
     }
 }
 
@@ -67,6 +98,17 @@ fn resolve_claude_home(flag: Option<PathBuf>, config: &Config) -> Result<PathBuf
     flag.or_else(|| config.claude_home.clone())
         .or_else(ClaudeCodeProvider::default_home)
         .context("could not determine the Claude home directory; pass --claude-home <PATH>")
+}
+
+/// Open (creating if needed) banto's own sqlite database at
+/// `Config.db_path`, falling back to [`config::default_db_path`].
+fn open_store(config: &Config) -> Result<Store> {
+    let path = config
+        .db_path
+        .clone()
+        .or_else(config::default_db_path)
+        .context("could not determine banto's database path")?;
+    Store::open(&path).context("failed to open banto's database")
 }
 
 /// `banto list`: one line per session — activity tag, id, title, cwd.

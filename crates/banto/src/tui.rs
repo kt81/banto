@@ -6,7 +6,7 @@
 //! is cross-platform — crossterm handles the Windows specifics.
 
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -26,22 +26,31 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use banto_core::config::OpenerMode;
 use banto_core::model::{Activity, AgeBucket};
-use banto_core::status::AgeThresholds;
+use banto_core::opener::SystemCommandRunner;
+use banto_core::status::{AgeThresholds, SysinfoProbe};
+use banto_core::store::Store;
 
 use crate::app::{App, ClickOutcome};
+use crate::opener::{self, OpenOutcome, SessionToOpen};
 use crate::session::{self, SessionRow};
 
 /// The concrete terminal type used throughout this module.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Load sessions under `claude_home` and run the interactive TUI.
-pub fn run(claude_home: &Path, thresholds: &AgeThresholds) -> Result<()> {
+pub fn run(
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+    opener_mode: OpenerMode,
+    store: &Store,
+) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
     let mut app = App::new(rows);
 
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut app);
+    let result = event_loop(&mut terminal, &mut app, store, opener_mode);
     // Always restore the terminal, even if the loop errored.
     let restored = restore_terminal();
     result.and(restored)
@@ -88,7 +97,12 @@ fn layout_areas(area: Rect) -> [Rect; 3] {
 }
 
 /// Draw, wait for one event, dispatch it, repeat until quit.
-fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
+fn event_loop(
+    terminal: &mut Tui,
+    app: &mut App,
+    store: &Store,
+    opener_mode: OpenerMode,
+) -> Result<()> {
     loop {
         // Compute the layout up front so the viewport height and mouse
         // hit-testing agree with what we are about to render.
@@ -104,9 +118,9 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
-                handle_key(app, key.code, key.modifiers);
+                handle_key(app, key.code, key.modifiers, store, opener_mode);
             }
-            Event::Mouse(mouse) => handle_mouse(app, mouse, list_area),
+            Event::Mouse(mouse) => handle_mouse(app, mouse, list_area, store, opener_mode),
             _ => {}
         }
 
@@ -117,7 +131,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
 }
 
 /// Translate a key press into an [`App`] action.
-fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    store: &Store,
+    opener_mode: OpenerMode,
+) {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {
         // Ctrl+C always quits; other Ctrl combos are ignored for now.
@@ -129,7 +149,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::PageDown => app.page_down(),
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
-        KeyCode::Enter => app.activate_selected(),
+        KeyCode::Enter => activate(app, store, opener_mode),
         KeyCode::Backspace => app.backspace(),
         // Esc clears a non-empty query, otherwise quits.
         KeyCode::Esc => {
@@ -147,7 +167,13 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 }
 
 /// Translate a mouse event into an [`App`] action.
-fn handle_mouse(app: &mut App, mouse: event::MouseEvent, list_area: Rect) {
+fn handle_mouse(
+    app: &mut App,
+    mouse: event::MouseEvent,
+    list_area: Rect,
+    store: &Store,
+    opener_mode: OpenerMode,
+) {
     match mouse.kind {
         MouseEventKind::ScrollDown => app.scroll(1),
         MouseEventKind::ScrollUp => app.scroll(-1),
@@ -156,12 +182,52 @@ fn handle_mouse(app: &mut App, mouse: event::MouseEvent, list_area: Rect) {
             if list_area.contains(position) {
                 let viewport_row = (mouse.row - list_area.y) as usize;
                 if app.click(viewport_row, Instant::now()) == Some(ClickOutcome::Activated) {
-                    app.activate_selected();
+                    activate(app, store, opener_mode);
                 }
             }
         }
         _ => {}
     }
+}
+
+/// Open or focus the selected session (Enter / double-click), posting the
+/// outcome as a status-bar message. All I/O lives in this thin shell, not in
+/// [`App`], which stays a pure, testable state struct — see
+/// `crate::opener::open_session` for the actual decision logic (unit tested
+/// there with mocked process/store dependencies).
+fn activate(app: &mut App, store: &Store, opener_mode: OpenerMode) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let id = row.id.clone();
+    let session = SessionToOpen {
+        id: id.clone(),
+        title: row.display_title().to_string(),
+        cwd: row
+            .cwd
+            .clone()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+
+    let backend = opener::resolve_backend(opener_mode, |key| std::env::var(key).ok());
+    let outcome =
+        opener::open_session(store, &SysinfoProbe, backend, &session, SystemCommandRunner);
+
+    let message = match outcome {
+        Ok(OpenOutcome::Focused) => format!("focused existing pane (session {id})"),
+        Ok(OpenOutcome::Opened) => format!("opened session {id} in a new pane/tab"),
+        Ok(OpenOutcome::AlreadyOpenCannotFocus) => {
+            format!("session {id} is already open (this backend can't auto-focus it)")
+        }
+        Ok(OpenOutcome::NoBackendDetected) => {
+            "no terminal backend detected (run inside psmux/Windows Terminal, \
+             or set `opener` in config.toml)"
+                .to_string()
+        }
+        Err(err) => format!("failed to open session {id}: {err}"),
+    };
+    app.set_status(message);
 }
 
 /// Render the whole UI for one frame.

@@ -222,15 +222,6 @@ impl App {
 
     // --- actions --------------------------------------------------------
 
-    /// Activate (open) the selected session. The opener lands in phase 2, so
-    /// for now this only posts a status-bar notice.
-    pub fn activate_selected(&mut self) {
-        let Some(id) = self.selected_row().map(|row| row.id.clone()) else {
-            return;
-        };
-        self.set_status(format!("opener lands in phase 2 (session {id})"));
-    }
-
     /// Post a transient status-bar message.
     pub fn set_status(&mut self, message: String) {
         self.status = Some(message);
@@ -523,11 +514,14 @@ mod tests {
     }
 
     #[test]
-    fn activate_selected_sets_phase_two_notice() {
+    fn set_status_reflects_the_selected_row() {
+        // The render loop (not App) drives opening; this only checks the two
+        // primitives it composes: reading the selection and posting a message.
         let mut app = App::new(numbered(3));
         app.set_viewport_height(10);
         app.select_next(); // id1
-        app.activate_selected();
-        assert_eq!(app.status(), Some("opener lands in phase 2 (session id1)"));
+        let id = app.selected_row().unwrap().id.clone();
+        app.set_status(format!("opened session {id}"));
+        assert_eq!(app.status(), Some("opened session id1"));
     }
 }
