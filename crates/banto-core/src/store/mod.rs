@@ -24,6 +24,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+/// How long a connection waits for a lock held by another connection before
+/// giving up with `SQLITE_BUSY`. The TUI process and the `banto _wrap`
+/// process(es) it launches all open the same sqlite file, so without this a
+/// pane-map registration or cleanup could fail silently under contention
+/// instead of just waiting the other side out.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Errors returned by [`Store`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -74,6 +81,7 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> Result<Store, StoreError> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         migrations::apply(&conn)?;
         Ok(Store { conn })
     }
@@ -136,6 +144,46 @@ pub(crate) mod test_util {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SessionId;
+
+    #[test]
+    fn open_sets_the_configured_busy_timeout() {
+        let store = Store::open_in_memory().unwrap();
+        let ms: i64 = store
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(ms, BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn busy_timeout_waits_out_a_concurrent_writer_instead_of_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        let store = Store::open(&db).unwrap();
+
+        // A second, independent connection holds the write lock for a short
+        // while, simulating `banto _wrap` touching the pane map at the same
+        // time as the TUI. `pin` is a single-statement, implicit-transaction
+        // write (no held read lock of its own), so it only ever contends on
+        // the lock the blocker is holding.
+        let blocker_db = db.clone();
+        let blocker = std::thread::spawn(move || {
+            let conn = Connection::open(&blocker_db).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            conn.execute_batch("COMMIT;").unwrap();
+        });
+        // Give the blocker a head start so it acquires the lock first.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Without a busy_timeout this would fail immediately with
+        // SQLITE_BUSY; with it configured, the write waits for the blocker
+        // to commit (well under the 5s timeout) and succeeds.
+        let result = store.pin(&SessionId("s1".to_string()));
+        blocker.join().unwrap();
+        assert!(result.is_ok(), "expected the write to wait, got {result:?}");
+    }
 
     #[test]
     fn unix_ms_roundtrip_positive() {
