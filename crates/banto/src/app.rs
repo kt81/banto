@@ -4,6 +4,7 @@
 //! UI-free struct so it can be unit-tested without a terminal. The render loop
 //! in [`crate::tui`] is a thin shell over this state.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::session::SessionRow;
@@ -23,10 +24,20 @@ pub enum ClickOutcome {
 /// The whole TUI state: the full session list plus the live query, filter
 /// result, selection and scroll position.
 pub struct App {
-    /// All sessions, pre-sorted newest-first; never reordered after `new`.
+    /// All sessions exactly as last loaded/replaced, in the provider's
+    /// original order (mtime-descending). Never reordered in place — `rows`
+    /// is re-derived from this (plus `pinned`) on every `resort_rows` call,
+    /// so a pin followed by an unpin restores this exact order instead of
+    /// leaving the session at whatever position it had while pinned.
+    base_rows: Vec<SessionRow>,
+    /// `base_rows` sorted pinned-first (each group keeping `base_rows`'s
+    /// relative order); what `haystacks`/`filtered`/rendering index into.
     rows: Vec<SessionRow>,
     /// Search haystacks, parallel to `rows` (`title + " " + cwd`).
     haystacks: Vec<String>,
+    /// Ids of pinned sessions. A cache for sorting/display only — the store
+    /// is the durable source of truth; see [`Self::toggle_pin`].
+    pinned: HashSet<String>,
     /// Current search query.
     query: String,
     /// Indices into `rows` that match the query, in display order.
@@ -45,23 +56,62 @@ pub struct App {
     should_quit: bool,
 }
 
+/// One row as rendered in the viewport.
+pub struct VisibleRow<'a> {
+    pub row: &'a SessionRow,
+    pub pinned: bool,
+}
+
 impl App {
     /// Build the state from a session list (already sorted newest-first).
+    /// No sessions are pinned initially; see [`Self::with_pinned`].
     pub fn new(rows: Vec<SessionRow>) -> Self {
-        let haystacks = rows.iter().map(SessionRow::haystack).collect();
-        let filtered = (0..rows.len()).collect();
-        Self {
-            rows,
-            haystacks,
+        let mut app = Self {
+            base_rows: rows,
+            rows: Vec::new(),
+            haystacks: Vec::new(),
+            pinned: HashSet::new(),
             query: String::new(),
-            filtered,
+            filtered: Vec::new(),
             selected: 0,
             offset: 0,
             viewport_height: 0,
             last_click: None,
             status: None,
             should_quit: false,
-        }
+        };
+        app.resort_rows();
+        app.filtered = (0..app.rows.len()).collect();
+        app
+    }
+
+    /// Seed the initial pinned-id set (loaded once from the store at
+    /// startup) and re-sort so pinned sessions appear first.
+    pub fn with_pinned(mut self, pinned: HashSet<String>) -> Self {
+        self.pinned = pinned;
+        self.resort_rows();
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.refilter_keeping_selected(selected_id);
+        self
+    }
+
+    /// Toggle the pinned state of the selected session (no-op when nothing
+    /// is selected), returning its id and new pinned state. `App` only
+    /// caches pin state for sorting/display — the caller persists the
+    /// change to the store, which is the durable source of truth. Re-sorts
+    /// and keeps the same session selected (by id), since pinning may move
+    /// it to a new position.
+    pub fn toggle_pin(&mut self) -> Option<(String, bool)> {
+        let id = self.selected_row()?.id.clone();
+        let now_pinned = if self.pinned.remove(&id) {
+            false
+        } else {
+            self.pinned.insert(id.clone());
+            true
+        };
+        self.resort_rows();
+        self.refilter_keeping_selected(Some(id.clone()));
+        Some((id, now_pinned))
     }
 
     /// Replace the session list (e.g. after a filesystem-change reload),
@@ -69,16 +119,34 @@ impl App {
     /// session stays selected if it still exists, by id rather than index
     /// (rows may have been reordered or removed); otherwise the selection
     /// falls back to the top of the new list. Scroll is re-clamped to the
-    /// new bounds; `last_click` is cleared since its filtered index no
-    /// longer corresponds to anything meaningful after a full replacement.
+    /// new bounds.
     pub fn replace_rows(&mut self, rows: Vec<SessionRow>) {
         let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.base_rows = rows;
+        self.resort_rows();
+        self.refilter_keeping_selected(selected_id);
+    }
 
-        self.rows = rows;
+    /// Rebuild `rows` from `base_rows` sorted pinned-first, and `haystacks`
+    /// to match. The sort is stable and `base_rows` is already
+    /// mtime-descending, so each group (pinned / not) keeps that relative
+    /// order without needing to know actual mtimes here. Always rebuilding
+    /// from `base_rows` (rather than re-sorting `rows` in place) is what
+    /// makes pin/unpin round trips restore the exact original order.
+    fn resort_rows(&mut self) {
+        self.rows = self.base_rows.clone();
+        self.rows.sort_by_key(|row| !self.pinned.contains(&row.id));
         self.haystacks = self.rows.iter().map(SessionRow::haystack).collect();
-        self.filtered = rank_indices(&self.query, &self.haystacks);
+    }
 
-        self.selected = selected_id
+    /// Recompute `filtered` from the current query/haystacks, then re-select
+    /// `keep_id` if it's still present — by id, since sorting or reloading
+    /// makes index-based tracking meaningless — falling back to the top of
+    /// the list. Clears `last_click`, whose filtered index no longer
+    /// corresponds to anything meaningful after a reorder.
+    fn refilter_keeping_selected(&mut self, keep_id: Option<String>) {
+        self.filtered = rank_indices(&self.query, &self.haystacks);
+        self.selected = keep_id
             .and_then(|id| self.filtered.iter().position(|&i| self.rows[i].id == id))
             .unwrap_or(0);
         self.last_click = None;
@@ -301,11 +369,17 @@ impl App {
     /// The rows currently visible in the viewport, top to bottom. Which one
     /// (if any) is selected is reported separately by
     /// [`Self::selected_in_viewport`].
-    pub fn visible(&self) -> Vec<&SessionRow> {
+    pub fn visible(&self) -> Vec<VisibleRow<'_>> {
         let end = (self.offset + self.viewport_height).min(self.filtered.len());
         self.filtered[self.offset..end]
             .iter()
-            .map(|&i| &self.rows[i])
+            .map(|&i| {
+                let row = &self.rows[i];
+                VisibleRow {
+                    row,
+                    pinned: self.pinned.contains(&row.id),
+                }
+            })
             .collect()
     }
 }
@@ -344,7 +418,7 @@ mod tests {
     }
 
     fn ids(app: &App) -> Vec<String> {
-        app.visible().iter().map(|row| row.id.clone()).collect()
+        app.visible().iter().map(|v| v.row.id.clone()).collect()
     }
 
     #[test]
@@ -620,5 +694,66 @@ mod tests {
 
         assert_eq!(app.query(), "alpha");
         assert_eq!(app.filtered_len(), 2);
+    }
+
+    #[test]
+    fn with_pinned_sorts_pinned_sessions_first_preserving_group_order() {
+        // id0, id1, id2 arrive in mtime-descending (i.e. incoming) order;
+        // pinning id2 must move it to the front without disturbing the
+        // relative order of the other two.
+        let mut app = App::new(numbered(3));
+        app.set_viewport_height(10);
+
+        app = app.with_pinned(["id2".to_string()].into_iter().collect());
+
+        assert_eq!(ids(&app), vec!["id2", "id0", "id1"]);
+    }
+
+    #[test]
+    fn visible_reports_pinned_status_per_row() {
+        let mut app = App::new(numbered(3));
+        app.set_viewport_height(10);
+        app = app.with_pinned(["id1".to_string()].into_iter().collect());
+
+        let pinned_flags: Vec<bool> = app.visible().iter().map(|v| v.pinned).collect();
+        // id1 sorted first (pinned), then id0, id2.
+        assert_eq!(pinned_flags, vec![true, false, false]);
+    }
+
+    #[test]
+    fn toggle_pin_moves_the_session_to_the_front_and_keeps_it_selected() {
+        let mut app = App::new(numbered(3)); // id0, id1, id2
+        app.set_viewport_height(10);
+        app.select_next(); // id1
+
+        let (id, now_pinned) = app.toggle_pin().unwrap();
+
+        assert_eq!(id, "id1");
+        assert!(now_pinned);
+        assert_eq!(ids(&app), vec!["id1", "id0", "id2"]);
+        // Still selected, just moved to its new (front) position.
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.selected_row().unwrap().id, "id1");
+    }
+
+    #[test]
+    fn toggle_pin_twice_unpins_and_restores_original_order() {
+        let mut app = App::new(numbered(3));
+        app.set_viewport_height(10);
+        app.select_next(); // id1
+
+        let (_, first) = app.toggle_pin().unwrap();
+        let (_, second) = app.toggle_pin().unwrap();
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(ids(&app), vec!["id0", "id1", "id2"]);
+    }
+
+    #[test]
+    fn toggle_pin_on_empty_list_returns_none() {
+        let mut app = App::new(Vec::new());
+        app.set_viewport_height(10);
+        assert_eq!(app.toggle_pin(), None);
     }
 }

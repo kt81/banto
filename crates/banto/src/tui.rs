@@ -5,6 +5,7 @@
 //! hook), and mouse capture is enabled for wheel/click support. All code here
 //! is cross-platform — crossterm handles the Windows specifics.
 
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -27,15 +28,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use banto_core::config::OpenerMode;
-use banto_core::model::{Activity, AgeBucket};
+use banto_core::model::{Activity, AgeBucket, SessionId};
 use banto_core::opener::SystemCommandRunner;
 use banto_core::status::{AgeThresholds, SysinfoProbe};
 use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
-use crate::app::{App, ClickOutcome};
+use crate::app::{App, ClickOutcome, VisibleRow};
 use crate::opener::{self, OpenOutcome, SessionToOpen};
-use crate::session::{self, SessionRow};
+use crate::session;
 
 /// The concrete terminal type used throughout this module.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -96,7 +97,8 @@ pub fn run(
     store: &Store,
 ) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
-    let mut app = App::new(rows);
+    let pinned = load_pinned(store);
+    let mut app = App::new(rows).with_pinned(pinned);
     let ctx = Context {
         claude_home,
         thresholds,
@@ -120,6 +122,18 @@ fn setup_terminal() -> Result<Tui> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     Ok(terminal)
+}
+
+/// Load the currently pinned session ids from the store. Tolerant: a read
+/// failure just means no sessions start out pinned, rather than blocking the
+/// TUI from starting.
+fn load_pinned(store: &Store) -> HashSet<String> {
+    store
+        .pinned_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
 }
 
 /// Leave the alternate screen, disable mouse capture and raw mode.
@@ -214,8 +228,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
                 app.clear_query();
             }
         }
-        // 'q' quits only when not typing a query; otherwise it is input.
+        // 'q' quits and 'p' pins only when not typing a query; otherwise
+        // they are input, same as any other character.
         KeyCode::Char('q') if app.query().is_empty() => app.request_quit(),
+        KeyCode::Char('p') if app.query().is_empty() => toggle_pin(app, ctx),
         KeyCode::Char(c) => app.push_char(c),
         _ => {}
     }
@@ -286,6 +302,27 @@ fn activate(app: &mut App, ctx: &Context) {
     reload(app, ctx);
 }
 
+/// Toggle the pinned state of the selected session and persist it to the
+/// store, which stays the durable source of truth — [`App`] only caches pin
+/// state for sorting/display (see [`App::toggle_pin`]).
+fn toggle_pin(app: &mut App, ctx: &Context) {
+    let Some((id, now_pinned)) = app.toggle_pin() else {
+        return;
+    };
+    let session_id = SessionId(id.clone());
+    let result = if now_pinned {
+        ctx.store.pin(&session_id)
+    } else {
+        ctx.store.unpin(&session_id)
+    };
+    let message = match result {
+        Ok(()) if now_pinned => format!("pinned session {id}"),
+        Ok(()) => format!("unpinned session {id}"),
+        Err(err) => format!("failed to update pin for session {id}: {err}"),
+    };
+    app.set_status(message);
+}
+
 /// Re-read sessions from disk and re-classify their activity, preserving
 /// selection (by session id), query and scroll clamping — see
 /// [`App::replace_rows`]. A read failure is tolerated: the previous rows are
@@ -337,19 +374,33 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Build one list row: colored activity dot, title (or id), dimmed cwd.
-fn list_item(row: &SessionRow) -> ListItem<'static> {
+/// Build one list row: colored activity dot, pin marker (if pinned), title
+/// (or id), dimmed cwd.
+fn list_item(visible: VisibleRow<'_>) -> ListItem<'static> {
     let dot = Span::styled(
         "\u{25cf} ",
-        Style::default().fg(activity_color(row.activity)),
+        Style::default().fg(activity_color(visible.row.activity)),
     );
-    let title = Span::raw(row.display_title().to_string());
-    let cwd = row.cwd_display();
+    let pin = if visible.pinned {
+        // Plain ASCII, not a star symbol/emoji: those can render double-width
+        // in some terminals and would break column alignment.
+        Span::styled(
+            "* ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+    let title = Span::raw(visible.row.display_title().to_string());
+    let cwd = visible.row.cwd_display();
     let line = if cwd.is_empty() {
-        Line::from(vec![dot, title])
+        Line::from(vec![dot, pin, title])
     } else {
         Line::from(vec![
             dot,
+            pin,
             title,
             Span::raw("  "),
             Span::styled(cwd, Style::default().fg(Color::DarkGray)),
@@ -363,8 +414,8 @@ fn list_item(row: &SessionRow) -> ListItem<'static> {
 /// than one line) so the count stays visible even when the hints are too long
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    const HINTS: &str =
-        "\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  type to search  Esc clear/quit  q quit";
+    const HINTS: &str = "\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  p pin  type to search  \
+                         Esc clear/quit  q quit";
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
 
@@ -402,6 +453,7 @@ fn activity_color(activity: Activity) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionRow;
     use banto_core::model::{Activity, AgeBucket};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -486,5 +538,30 @@ mod tests {
         let text = draw(&app);
         assert!(text.contains("No sessions found."), "placeholder:\n{text}");
         assert!(text.contains("0/0"));
+    }
+
+    #[test]
+    fn pinned_rows_are_marked_and_sorted_first() {
+        let rows = vec![
+            row("id-alpha", "Alpha task", "/work/alpha", Activity::Alive),
+            row("id-beta", "Beta task", "/work/beta", Activity::Alive),
+        ];
+        let mut app = App::new(rows);
+        app.set_viewport_height(11);
+        app = app.with_pinned(["id-beta".to_string()].into_iter().collect());
+
+        let text = draw(&app);
+        // Pinned "Beta task" sorts first and carries the pin marker.
+        let beta_line = text
+            .lines()
+            .find(|line| line.contains("Beta task"))
+            .unwrap();
+        assert!(beta_line.contains('*'), "missing pin marker:\n{text}");
+        let alpha_line = text
+            .lines()
+            .find(|line| line.contains("Alpha task"))
+            .unwrap();
+        assert!(!alpha_line.contains('*'), "unexpected marker:\n{text}");
+        assert!(text.contains("p pin"), "hint missing:\n{text}");
     }
 }
