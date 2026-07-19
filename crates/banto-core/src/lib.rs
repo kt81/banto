@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod model;
+pub mod opener;
 pub mod provider;
 pub mod search;
 pub mod status;
