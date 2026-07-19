@@ -146,14 +146,13 @@ fn open_fresh<R: CommandRunner + 'static>(
 
 /// Build the `<banto> _wrap --session <id> -- claude --resume <id>` argv.
 ///
-/// Uses the current executable's own path when available so the spawned
-/// pane/tab can find `banto` even when it isn't on `$PATH` (e.g. a dev
-/// build); falls back to the bare name `banto` otherwise.
-fn wrap_argv(session_id: &str) -> Vec<String> {
-    let banto_exe = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_string))
-        .unwrap_or_else(|| "banto".to_string());
+/// `exe` is the resolved path to the running `banto` binary (production
+/// callers pass `std::env::current_exe()`, injected here so this stays
+/// deterministic in tests) so the spawned pane/tab can find it even when it
+/// isn't on `$PATH` (e.g. a dev build); `None` falls back to the bare name
+/// `banto` (relies on `$PATH`).
+fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
+    let banto_exe = exe.unwrap_or("banto").to_string();
     vec![
         banto_exe,
         "_wrap".to_string(),
@@ -421,6 +420,29 @@ mod tests {
         assert_eq!(outcome, OpenOutcome::AlreadyOpenCannotFocus);
         // Never attempted to open a second tab.
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn wrap_argv_uses_the_given_exe_path_when_available() {
+        assert_eq!(
+            wrap_argv(Some("C:/dev/banto.exe"), "sess-1"),
+            [
+                "C:/dev/banto.exe",
+                "_wrap",
+                "--session",
+                "sess-1",
+                "--",
+                "claude",
+                "--resume",
+                "sess-1",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
+        assert_eq!(wrap_argv(None, "sess-1")[0], "banto");
     }
 
     #[test]
