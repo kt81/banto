@@ -51,26 +51,14 @@ const MIGRATIONS: &[&str] = &[
     // v2: track whether a session was run by a spawned agent (subagent /
     // Agent-Teams teammate) rather than started interactively.
     "ALTER TABLE sessions ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;",
-    // v3: archived sessions, and a session belongs to at most one group.
-    //
-    // `archived` mirrors `pins`. The old `group_members` schema (composite
-    // PRIMARY KEY (group_id, session_id)) allowed a session to join more
-    // than one group; a session now belongs to at most one, so `session_id`
-    // alone becomes the primary key. Existing multi-group memberships
-    // collapse onto the lowest group_id per session (arbitrary but
-    // deterministic) rather than erroring on upgrade.
+    // v3: archived sessions (soft-hide; the source file under ~/.claude is
+    // never touched). Mirrors `pins`: a loose reference (no foreign key),
+    // and `sync_sessions` never touches it, so an archived id survives a
+    // source that is temporarily unavailable.
     "CREATE TABLE archived (
         session_id     TEXT PRIMARY KEY,
         archived_at_ms INTEGER NOT NULL
-    );
-    CREATE TABLE group_members_v3 (
-        session_id TEXT PRIMARY KEY,
-        group_id   INTEGER NOT NULL
-    );
-    INSERT INTO group_members_v3 (session_id, group_id)
-        SELECT session_id, MIN(group_id) FROM group_members GROUP BY session_id;
-    DROP TABLE group_members;
-    ALTER TABLE group_members_v3 RENAME TO group_members;",
+    );",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -177,13 +165,14 @@ mod tests {
     }
 
     #[test]
-    fn v2_to_v3_upgrade_adds_archived_table_and_collapses_multi_group_membership() {
+    fn v2_to_v3_upgrade_adds_archived_table_and_preserves_existing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("banto.db");
 
         // Build a database as v2 code would have left it: v1 + v2 scripts
-        // applied, one session in two groups (possible under the old
-        // multi-group schema), `user_version` left at 2.
+        // applied, a session with an existing (multi-)group membership,
+        // `user_version` left at 2. group_members is untouched by v3, so
+        // this also proves the upgrade doesn't disturb it.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch(MIGRATIONS[0]).unwrap();
@@ -194,7 +183,7 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO group_members (group_id, session_id) VALUES (2, 's1'), (1, 's1')",
+                "INSERT INTO group_members (group_id, session_id) VALUES (1, 's1'), (2, 's1')",
                 [],
             )
             .unwrap();
@@ -202,13 +191,20 @@ mod tests {
         }
 
         // Opening through Store::open must run the v3 migration: the
-        // archived table exists and is usable, and s1's two memberships
-        // collapsed onto the lower group id (1) deterministically.
+        // archived table exists and is usable, and the pre-existing
+        // (multi-)group membership rows are untouched.
         let store = Store::open(&db).unwrap();
-        let s1 = SessionId("s1".to_string());
-        assert_eq!(store.group_for_session(&s1).unwrap(), Some(1));
+        assert_eq!(
+            store.group_members(1).unwrap(),
+            [SessionId("s1".to_string())]
+        );
+        assert_eq!(
+            store.group_members(2).unwrap(),
+            [SessionId("s1".to_string())]
+        );
         assert!(store.archived_ids().unwrap().is_empty());
-        store.archive(&s1).unwrap();
+        let s1 = SessionId("s1".to_string());
+        store.archive_session(&s1).unwrap();
         assert_eq!(store.archived_ids().unwrap(), [s1]);
         let version: i64 = store
             .conn

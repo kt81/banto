@@ -1,8 +1,11 @@
 //! Session groups and their membership (banto-owned state).
 //!
-//! A session belongs to at most one group (enforced by `group_members`
-//! having `session_id` as its primary key, since schema v3 — see
-//! `store::migrations`).
+//! `group_members` is a plain many-to-many join table (a session could in
+//! principle join more than one group via [`add_group_member`]). The
+//! group-join UX wants a session in exactly one group at a time; that's
+//! layered on top via [`set_session_group`]/[`group_for_session`]/
+//! [`clear_session_group`], which move a session by clearing its existing
+//! memberships first, rather than a schema-level constraint.
 
 use rusqlite::{OptionalExtension, params};
 
@@ -65,40 +68,30 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Assigns a session to a group, moving it out of whatever group it was
-    /// previously in (a session belongs to at most one group). Idempotent
-    /// when the session is already in `group_id`.
-    pub fn set_session_group(
+    /// Adds a session to a group. Idempotent. A session can belong to more
+    /// than one group through this primitive; see the module docs for the
+    /// single-membership layer built on top of it.
+    pub fn add_group_member(
         &self,
-        session_id: &SessionId,
         group_id: GroupId,
+        session_id: &SessionId,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO group_members (session_id, group_id) VALUES (?1, ?2)
-             ON CONFLICT(session_id) DO UPDATE SET group_id = excluded.group_id",
-            params![session_id.0, group_id],
+            "INSERT OR IGNORE INTO group_members (group_id, session_id) VALUES (?1, ?2)",
+            params![group_id, session_id.0],
         )?;
         Ok(())
     }
 
-    /// Returns the group a session currently belongs to, if any.
-    pub fn group_for_session(&self, session_id: &SessionId) -> Result<Option<GroupId>, StoreError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT group_id FROM group_members WHERE session_id = ?1",
-                [&session_id.0],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    /// Removes a session from whatever group it belongs to. A no-op if it
-    /// isn't in one.
-    pub fn clear_session_group(&self, session_id: &SessionId) -> Result<(), StoreError> {
+    /// Removes a session from a group. Removing a non-member is a no-op.
+    pub fn remove_group_member(
+        &self,
+        group_id: GroupId,
+        session_id: &SessionId,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM group_members WHERE session_id = ?1",
-            [&session_id.0],
+            "DELETE FROM group_members WHERE group_id = ?1 AND session_id = ?2",
+            params![group_id, session_id.0],
         )?;
         Ok(())
     }
@@ -110,6 +103,53 @@ impl Store {
         )?;
         let rows = stmt.query_map([group_id], |row| row.get::<_, String>(0).map(SessionId))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Assigns a session to exactly one group: transactionally removes any
+    /// existing memberships for that session (there may be more than one if
+    /// [`add_group_member`] was used directly), then adds it to `group_id`.
+    /// Idempotent when the session is already only in `group_id`.
+    pub fn set_session_group(
+        &mut self,
+        session_id: &SessionId,
+        group_id: GroupId,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM group_members WHERE session_id = ?1",
+            [&session_id.0],
+        )?;
+        tx.execute(
+            "INSERT INTO group_members (group_id, session_id) VALUES (?1, ?2)",
+            params![group_id, session_id.0],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns the group a session currently belongs to, if any. If the
+    /// session is (unusually) a member of more than one group via
+    /// [`add_group_member`], returns the lowest group id, deterministically.
+    pub fn group_for_session(&self, session_id: &SessionId) -> Result<Option<GroupId>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT group_id FROM group_members WHERE session_id = ?1
+                 ORDER BY group_id LIMIT 1",
+                [&session_id.0],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Removes a session from every group it belongs to. A no-op if it isn't
+    /// in any.
+    pub fn clear_session_group(&self, session_id: &SessionId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM group_members WHERE session_id = ?1",
+            [&session_id.0],
+        )?;
+        Ok(())
     }
 }
 
@@ -163,8 +203,38 @@ mod tests {
     }
 
     #[test]
-    fn set_get_clear_session_group() {
+    fn membership_add_remove_list() {
         let store = Store::open_in_memory().unwrap();
+        let g = store.create_group("work").unwrap();
+
+        store.add_group_member(g, &sid("b")).unwrap();
+        store.add_group_member(g, &sid("a")).unwrap();
+        // Idempotent add.
+        store.add_group_member(g, &sid("a")).unwrap();
+        assert_eq!(store.group_members(g).unwrap(), [sid("a"), sid("b")]);
+
+        store.remove_group_member(g, &sid("a")).unwrap();
+        assert_eq!(store.group_members(g).unwrap(), [sid("b")]);
+
+        // Removing a non-member is a no-op.
+        store.remove_group_member(g, &sid("zzz")).unwrap();
+        assert_eq!(store.group_members(g).unwrap(), [sid("b")]);
+    }
+
+    #[test]
+    fn delete_group_removes_members() {
+        let mut store = Store::open_in_memory().unwrap();
+        let g = store.create_group("work").unwrap();
+        store.add_group_member(g, &sid("a")).unwrap();
+
+        store.delete_group(g).unwrap();
+        assert!(store.group_members(g).unwrap().is_empty());
+        assert!(store.list_groups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_get_clear_session_group() {
+        let mut store = Store::open_in_memory().unwrap();
         let work = store.create_group("work").unwrap();
 
         assert_eq!(store.group_for_session(&sid("a")).unwrap(), None);
@@ -187,7 +257,7 @@ mod tests {
 
     #[test]
     fn set_session_group_moves_between_groups() {
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         let work = store.create_group("work").unwrap();
         let play = store.create_group("play").unwrap();
 
@@ -199,23 +269,26 @@ mod tests {
         assert_eq!(store.group_members(play).unwrap(), [sid("a")]);
     }
 
+    /// Proves `set_session_group`'s "remove all existing memberships" step
+    /// really is transactional over every prior membership, including a
+    /// session that ended up in more than one group via the lower-level
+    /// `add_group_member` primitive (which `set_session_group` itself never
+    /// creates, but doesn't assume away either).
     #[test]
-    fn group_members_ordered_by_session_id() {
-        let store = Store::open_in_memory().unwrap();
-        let g = store.create_group("work").unwrap();
-        store.set_session_group(&sid("b"), g).unwrap();
-        store.set_session_group(&sid("a"), g).unwrap();
-        assert_eq!(store.group_members(g).unwrap(), [sid("a"), sid("b")]);
-    }
-
-    #[test]
-    fn delete_group_removes_members() {
+    fn set_session_group_clears_prior_multi_group_membership() {
         let mut store = Store::open_in_memory().unwrap();
-        let g = store.create_group("work").unwrap();
-        store.set_session_group(&sid("a"), g).unwrap();
+        let work = store.create_group("work").unwrap();
+        let play = store.create_group("play").unwrap();
+        let home = store.create_group("home").unwrap();
 
-        store.delete_group(g).unwrap();
-        assert!(store.group_members(g).unwrap().is_empty());
-        assert!(store.list_groups().unwrap().is_empty());
+        store.add_group_member(work, &sid("a")).unwrap();
+        store.add_group_member(play, &sid("a")).unwrap();
+
+        store.set_session_group(&sid("a"), home).unwrap();
+
+        assert_eq!(store.group_for_session(&sid("a")).unwrap(), Some(home));
+        assert!(store.group_members(work).unwrap().is_empty());
+        assert!(store.group_members(play).unwrap().is_empty());
+        assert_eq!(store.group_members(home).unwrap(), [sid("a")]);
     }
 }

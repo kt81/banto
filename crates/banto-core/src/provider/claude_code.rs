@@ -26,13 +26,9 @@ const PROVIDER_NAME: &str = "claude-code";
 /// Titles and cwd appear in the first few records, so this is plenty.
 const HEAD_CAP_BYTES: u64 = 256 * 1024;
 
-/// Maximum title length in characters (not bytes).
+/// Maximum title length in characters (not bytes). Also used to cap
+/// `SessionMeta.preview` (see [`HeadFields::preview`]).
 const TITLE_MAX_CHARS: usize = 200;
-
-/// Maximum preview length in characters (not bytes). More generous than
-/// `TITLE_MAX_CHARS`: the preview is shown in the summary panel, which has
-/// more room than the single-line list row a title is rendered in.
-const PREVIEW_MAX_CHARS: usize = 300;
 
 /// Session provider for the Claude Code CLI.
 ///
@@ -166,7 +162,7 @@ impl HeadFields {
     fn preview(&self) -> Option<String> {
         self.user_text
             .as_deref()
-            .and_then(|raw| normalize_single_line(raw, PREVIEW_MAX_CHARS))
+            .and_then(|raw| normalize_single_line(raw, TITLE_MAX_CHARS))
     }
 }
 
@@ -347,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_capped_independently_of_title() {
+    fn preview_is_capped_at_the_same_length_as_title() {
         let root = TempDir::new().unwrap();
         let long = "a".repeat(400);
         write_session(
@@ -358,10 +354,11 @@ mod tests {
         );
         let sessions = discover_sorted(&root);
         let preview = sessions[0].preview.as_deref().unwrap();
-        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS);
-        // The title cap (200) is shorter than the preview cap (300); both
-        // come from the same raw text but are capped independently.
-        assert_eq!(sessions[0].title.as_deref().unwrap().chars().count(), 200);
+        assert_eq!(preview.chars().count(), TITLE_MAX_CHARS);
+        assert_eq!(
+            sessions[0].title.as_deref().unwrap().chars().count(),
+            TITLE_MAX_CHARS
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Responsibilities (docs/REQUIREMENTS.md "Module layout"):
 //! - session index cache (metadata mirror of provider discovery) + FTS5 text index
-//! - groups (single-membership) / pins / archived (banto-owned; never
-//!   written to Claude's files)
+//! - groups / pins / archived sessions (banto-owned; never written to
+//!   Claude's files)
 //! - session <-> pane mapping for the opener (phase 2 consumes this)
 //!
 //! Paths are persisted lossily via `to_string_lossy`: non-UTF-8 path

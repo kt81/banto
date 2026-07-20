@@ -1,8 +1,10 @@
 //! Archived sessions (banto-owned state; never written to Claude's files).
 //!
 //! Archiving hides a session from the default list without deleting
-//! anything or touching pins/groups/panes; `unarchive` reverses it. Mirrors
-//! the `pins` table/API shape.
+//! anything or touching pins/groups/panes; `unarchive_session` reverses it.
+//! Mirrors the `pins` table/API shape: a loose reference (no foreign key),
+//! so an archived id survives a source that is temporarily unavailable.
+//! `sync_sessions` never touches this table.
 
 use std::time::SystemTime;
 
@@ -15,7 +17,7 @@ use super::{Store, StoreError, system_time_to_unix_ms};
 impl Store {
     /// Archives a session. Idempotent: archiving an already-archived session
     /// keeps the original archive time.
-    pub fn archive(&self, session_id: &SessionId) -> Result<(), StoreError> {
+    pub fn archive_session(&self, session_id: &SessionId) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO archived (session_id, archived_at_ms) VALUES (?1, ?2)
              ON CONFLICT(session_id) DO NOTHING",
@@ -26,7 +28,7 @@ impl Store {
 
     /// Unarchives a session. Unarchiving a session that isn't archived is a
     /// no-op.
-    pub fn unarchive(&self, session_id: &SessionId) -> Result<(), StoreError> {
+    pub fn unarchive_session(&self, session_id: &SessionId) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM archived WHERE session_id = ?1",
             [&session_id.0],
@@ -58,23 +60,35 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert!(store.archived_ids().unwrap().is_empty());
 
-        store.archive(&sid("a")).unwrap();
-        store.archive(&sid("b")).unwrap();
+        store.archive_session(&sid("a")).unwrap();
+        store.archive_session(&sid("b")).unwrap();
         assert_eq!(store.archived_ids().unwrap(), [sid("a"), sid("b")]);
 
-        store.unarchive(&sid("a")).unwrap();
+        store.unarchive_session(&sid("a")).unwrap();
         assert_eq!(store.archived_ids().unwrap(), [sid("b")]);
 
         // Unarchiving something not archived is a no-op.
-        store.unarchive(&sid("never-archived")).unwrap();
+        store.unarchive_session(&sid("never-archived")).unwrap();
         assert_eq!(store.archived_ids().unwrap(), [sid("b")]);
     }
 
     #[test]
     fn archive_is_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        store.archive(&sid("a")).unwrap();
-        store.archive(&sid("a")).unwrap();
+        store.archive_session(&sid("a")).unwrap();
+        store.archive_session(&sid("a")).unwrap();
+        assert_eq!(store.archived_ids().unwrap(), [sid("a")]);
+    }
+
+    #[test]
+    fn sync_sessions_never_touches_archived_ids() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.archive_session(&sid("a")).unwrap();
+
+        store
+            .sync_sessions(&[super::super::test_util::meta("b", Some("b"), None)])
+            .unwrap();
+
         assert_eq!(store.archived_ids().unwrap(), [sid("a")]);
     }
 }
