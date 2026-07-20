@@ -70,16 +70,17 @@ pub fn resolve_backend(mode: OpenerMode, env: impl Fn(&str) -> Option<String>) -
     }
 }
 
-/// Launch a brand-new (non-resumed) `claude` session in `cwd`.
+/// Launch a brand-new (non-resumed) `claude` session in `cwd`, via `banto
+/// _wrap --new-session` so it can later be found and focused.
 ///
 /// Unlike [`open_session`], there is no pre-existing session id to key a
-/// double-resume check or a pane-map record against — starting two new
-/// sessions is not a double resume, it's just two new sessions — so this
-/// skips the store entirely and goes straight to the opener. The new
-/// session will simply appear in the list once its jsonl file exists,
-/// resumable like any other from then on. Does not go through `banto _wrap`
-/// either: `_wrap`'s job (PID registration for double-resume detection,
-/// pane-record cleanup) has nothing to attach to here.
+/// double-resume check or a pane-map record against here in the opener —
+/// starting two new sessions is not a double resume, it's just two new
+/// sessions — so this skips the store entirely. But the session Claude
+/// creates for `cwd` *is* discovered and recorded, just not by this
+/// function: `_wrap --new-session` (`crate::wrap::run_new_session`) does
+/// that itself once it's running inside the new pane, since only it can
+/// observe both where it landed and which session id eventually shows up.
 pub fn open_new_session<R: CommandRunner + 'static>(
     backend: Option<Backend>,
     cwd: &Path,
@@ -93,10 +94,13 @@ pub fn open_new_session<R: CommandRunner + 'static>(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| cwd.display().to_string());
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string));
     let cmd = ResumeCommand {
         // Unused: there is no pane-map record for this launch to key.
         session_id: String::new(),
-        argv: vec!["claude".to_string()],
+        argv: new_session_wrap_argv(exe.as_deref(), cwd),
         cwd: cwd.to_path_buf(),
         title,
     };
@@ -279,9 +283,30 @@ fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
     ]
 }
 
+/// Build the `<banto> _wrap --new-session --cwd <cwd> -- claude` argv (see
+/// [`wrap_argv`] for the resume-mode equivalent and the `exe` convention).
+/// Unlike the resume case, `_wrap` itself discovers the session id Claude
+/// assigns and writes its own pane record (`crate::wrap::run_new_session`) —
+/// there's no id known yet for this process to be told.
+fn new_session_wrap_argv(exe: Option<&str>, cwd: &Path) -> Vec<String> {
+    let banto_exe = exe.unwrap_or("banto").to_string();
+    vec![
+        banto_exe,
+        "_wrap".to_string(),
+        "--new-session".to_string(),
+        "--cwd".to_string(),
+        cwd.display().to_string(),
+        "--".to_string(),
+        "claude".to_string(),
+    ]
+}
+
 /// Stable string stored in [`PaneRecord::backend`] (kebab-case, independent
-/// of `Backend`'s human-readable `Display`).
-fn backend_key(backend: Backend) -> &'static str {
+/// of `Backend`'s human-readable `Display`). `pub(crate)`: also used by
+/// `crate::wrap`'s new-session flow, which writes its own pane record
+/// directly (there's no pre-existing one from an `open_*` call for it to
+/// attach to).
+pub(crate) fn backend_key(backend: Backend) -> &'static str {
     match backend {
         Backend::Psmux => "psmux",
         Backend::WindowsTerminal => "windows-terminal",
@@ -296,8 +321,9 @@ fn parse_backend_key(key: &str) -> Option<Backend> {
     }
 }
 
-/// Encode a [`SessionHandle`] into [`PaneRecord::target`].
-fn encode_target(handle: &SessionHandle) -> String {
+/// Encode a [`SessionHandle`] into [`PaneRecord::target`]. `pub(crate)`: see
+/// [`backend_key`].
+pub(crate) fn encode_target(handle: &SessionHandle) -> String {
     match handle {
         SessionHandle::Tmux { window_id, pane_id } => format!("{window_id}:{pane_id}"),
         SessionHandle::WindowsTerminal => String::new(),
@@ -710,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn open_new_session_spawns_plain_claude_with_no_wrap_and_no_session_id() {
+    fn open_new_session_wraps_claude_via_wrap_new_session_with_no_session_id() {
         let runner = MockRunner::default();
 
         let outcome = open_new_session(
@@ -723,10 +749,18 @@ mod tests {
 
         assert_eq!(outcome, OpenOutcome::Opened);
         let calls = runner.calls();
-        // Just `claude` — no `banto _wrap --session ...` wrapping, since
-        // there's no pre-existing session id for it to attach to.
+        // Wrapped via `_wrap --new-session --cwd ... -- claude` (no
+        // `--session <id>`: there's no pre-existing session id to tell it).
+        assert!(calls[0].args.iter().any(|a| a == "_wrap"));
+        assert!(calls[0].args.iter().any(|a| a == "--new-session"));
+        assert!(!calls[0].args.iter().any(|a| a == "--session"));
+        let cwd_pos = calls[0]
+            .args
+            .iter()
+            .position(|a| a == "--cwd")
+            .expect("--cwd missing");
+        assert_eq!(calls[0].args[cwd_pos + 1], "/work/alpha");
         assert!(calls[0].args.iter().any(|a| a == "claude"));
-        assert!(!calls[0].args.iter().any(|a| a == "_wrap"));
         // Tagged with the cwd's directory name, not a session id.
         assert_eq!(
             calls[1].args,
@@ -803,6 +837,31 @@ mod tests {
     #[test]
     fn wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
         assert_eq!(wrap_argv(None, "sess-1")[0], "banto");
+    }
+
+    #[test]
+    fn new_session_wrap_argv_uses_the_given_exe_path_when_available() {
+        assert_eq!(
+            new_session_wrap_argv(Some("C:/dev/banto.exe"), Path::new("/work/alpha")),
+            [
+                "C:/dev/banto.exe",
+                "_wrap",
+                "--new-session",
+                "--cwd",
+                "/work/alpha",
+                "--",
+                "claude",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn new_session_wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
+        assert_eq!(
+            new_session_wrap_argv(None, Path::new("/work/alpha"))[0],
+            "banto"
+        );
     }
 
     #[test]

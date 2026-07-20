@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use banto_core::config::{self, Config};
+use banto_core::opener::SystemCommandRunner;
 use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::status::AgeThresholds;
 use banto_core::store::Store;
@@ -47,15 +48,23 @@ struct Cli {
 enum Command {
     /// Print all sessions as plain text (newest first), one per line.
     List,
-    /// Internal: supervises a resumed session's process (registers its PID,
-    /// waits for it to exit, then cleans up). The opener spawns this; it is
-    /// not meant to be invoked directly.
+    /// Internal: supervises a resumed or brand-new session's process. The
+    /// opener spawns this; it is not meant to be invoked directly.
     #[command(name = "_wrap", hide = true)]
     Wrap {
-        /// The session id being resumed.
-        #[arg(long)]
-        session: String,
-        /// The command to run, e.g. `claude --resume <id>`.
+        /// The session id being resumed (required unless `--new-session`).
+        #[arg(long, required_unless_present = "new_session")]
+        session: Option<String>,
+        /// New-session mode: there is no known session id yet — discover
+        /// the one Claude assigns to `--cwd` and track it so it can later
+        /// be focused instead of double-resumed.
+        #[arg(long, requires = "cwd", conflicts_with = "session")]
+        new_session: bool,
+        /// The new session's launch directory (new-session mode only).
+        #[arg(long, requires = "new_session")]
+        cwd: Option<PathBuf>,
+        /// The command to run, e.g. `claude --resume <id>` (resume mode)
+        /// or plain `claude` (new-session mode).
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
@@ -71,9 +80,30 @@ fn main() -> Result<()> {
             let thresholds = thresholds_from(&config.activity);
             run_list(&claude_home, &thresholds)
         }
-        Some(Command::Wrap { session, argv }) => {
+        Some(Command::Wrap {
+            session,
+            new_session,
+            cwd,
+            argv,
+        }) => {
             let store = open_store(&config)?;
-            let code = wrap::run(&store, &session, &argv, &SystemProcessRunner)?;
+            let code = if new_session {
+                let cwd = cwd.expect("clap requires --cwd with --new-session");
+                let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+                let provider = ClaudeCodeProvider::new(claude_home);
+                wrap::run_new_session(
+                    &store,
+                    &cwd,
+                    &argv,
+                    &SystemProcessRunner,
+                    &SystemCommandRunner,
+                    &provider,
+                    |key| std::env::var(key).ok(),
+                )?
+            } else {
+                let session = session.expect("clap requires --session unless --new-session");
+                wrap::run(&store, &session, &argv, &SystemProcessRunner)?
+            };
             std::process::exit(code)
         }
         None => {
