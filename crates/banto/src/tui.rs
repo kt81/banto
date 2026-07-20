@@ -1379,6 +1379,34 @@ fn modal_area(area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+/// The area [`render_modal`] should pass to [`Clear`] for a modal box that
+/// itself occupies [`modal_area`]`(full_area)`: [`modal_area`]'s box widened
+/// by one column on each side, clamped to `full_area`'s own bounds.
+///
+/// This is one column wider than the box on purpose. A background row's
+/// full-width character (e.g. Japanese) can, by coincidence, have its glyph
+/// cell sit one column to the *left* of the box while its blank
+/// "continuation" cell (see `ratatui_core::buffer::Buffer::set_string`)
+/// lands exactly on the box's own left border column. If that glyph cell is
+/// left untouched by `Clear` (i.e. only [`modal_area`] is cleared) and
+/// therefore unchanged from the previous frame, `ratatui`'s buffer-diffing
+/// (`ratatui_core::buffer::diff`) treats it as an unmodified double-width
+/// cell and — assuming the terminal's own rendering of it already covers
+/// the next column — skips diffing that next column at all. Any different
+/// content the border widget then writes into that "continuation" cell
+/// (e.g. the box's own left border) is silently dropped rather than sent to
+/// the backend, so the border never actually gets (re)drawn there
+/// (dogfooding report; confirmed by inspecting the drawn `TestBackend`
+/// buffer directly). Widening the cleared area by one column blanks that
+/// glyph cell too, which makes it match the previous frame's already-blank
+/// state and stops the diff from skipping the border's own cell.
+fn modal_clear_area(full_area: Rect) -> Rect {
+    let modal = modal_area(full_area);
+    let x = modal.x.saturating_sub(1).max(full_area.x);
+    let right = (modal.x + modal.width + 1).min(full_area.x + full_area.width);
+    Rect::new(x, modal.y, right.saturating_sub(x), modal.height)
+}
+
 /// Inset `area` by one column on the left and right, leaving its vertical
 /// extent untouched — modal content (input text, candidate lists, the
 /// archive-confirm prompt) was rendered flush against the box's left/right
@@ -1475,16 +1503,19 @@ fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 }
 
 /// Render whichever modal is open as a centered overlay on top of the rest
-/// of the UI: [`Clear`] blanks only the modal's own box, leaving the
-/// background list visible in the margin around it — that's a modal's
-/// virtue, not a bug, and worth keeping. A background row with a long
-/// full-width title (the common case for this modal, since the archive/
-/// group-join prompts echo that very session's own title) never actually
-/// overflows *into* the box: the box's own content is always truncated to
-/// fit (see [`truncate_to_width`]), so there is nothing to blank behind it.
+/// of the UI: [`Clear`] blanks only the modal's own box (widened by one
+/// column each side — see [`modal_clear_area`]), leaving the background list
+/// visible in the margin around it — that's a modal's virtue, not a bug, and
+/// worth keeping. A background row with a long full-width title (the common
+/// case for this modal, since the archive/group-join prompts echo that very
+/// session's own title) never actually overflows *into* the box: the box's
+/// own content is always truncated to fit (see [`truncate_to_width`]), so
+/// there is nothing to blank behind it — the one-column widen is solely to
+/// neutralize a background full-width character straddling the border
+/// itself (see [`modal_clear_area`]).
 fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
     let area = modal_area(full_area);
-    frame.render_widget(Clear, area);
+    frame.render_widget(Clear, modal_clear_area(full_area));
     match modal {
         Modal::NewSession(state) => render_new_session_modal(frame, state, area),
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
@@ -2500,6 +2531,93 @@ mod tests {
         let wide = modal_area(Rect::new(0, 0, 200, 50));
         assert_eq!(wide.width, 80); // MODAL_MAX_WIDTH
         assert_eq!(wide.x, 60); // centered: (200 - 80) / 2
+    }
+
+    #[test]
+    fn modal_clear_area_widens_the_modal_box_by_one_column_on_each_side() {
+        let full = Rect::new(0, 0, 40, 15);
+        let modal = modal_area(full);
+
+        let clear = modal_clear_area(full);
+
+        assert_eq!(clear.x, modal.x - 1);
+        assert_eq!(clear.width, modal.width + 2);
+        assert_eq!(clear.y, modal.y);
+        assert_eq!(clear.height, modal.height);
+    }
+
+    #[test]
+    fn modal_clear_area_clamps_at_the_frame_edges_in_a_maximally_narrow_pane() {
+        // A pane so narrow that modal_area is flush against x=0 (its own
+        // saturating-sub clamp already kicks in); the widened clear area
+        // must not underflow past the frame's own left edge, nor extend
+        // past its right edge.
+        let full = Rect::new(0, 0, 1, 10);
+        assert_eq!(modal_area(full).x, 0);
+
+        let clear = modal_clear_area(full);
+
+        assert!(clear.x >= full.x);
+        assert!(clear.x + clear.width <= full.x + full.width);
+    }
+
+    #[test]
+    fn render_modal_neutralizes_a_background_full_width_char_straddling_the_left_border() {
+        let modal = Modal::ConfirmArchive {
+            session_id: "a".to_string(),
+            title: "Alpha".to_string(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                // Simulate a background full-width character whose glyph
+                // cell sits exactly 1 column left of the modal's own left
+                // border (x=2, see
+                // `modal_area_shrinks_margin_in_a_narrow_pane_...`), with its
+                // blank "continuation" cell (see
+                // `ratatui_core::buffer::Buffer::set_string`) landing
+                // exactly on the border column — the scenario that used to
+                // leave a dangling half-glyph once the border overwrote
+                // only the continuation cell.
+                frame.render_widget(Span::raw("あ"), Rect::new(1, 5, 2, 1));
+                render_modal(frame, &modal, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+
+        // The border survived intact...
+        assert_eq!(buf.cell((2, 5)).unwrap().symbol(), "\u{2502}");
+        // ...and the dangling glyph was neutralized (blanked) instead of
+        // being left half-erased.
+        assert_eq!(buf.cell((1, 5)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn render_modal_neutralizes_a_background_full_width_char_straddling_the_right_border() {
+        let modal = Modal::ConfirmArchive {
+            session_id: "a".to_string(),
+            title: "Alpha".to_string(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                // Mirror of the left-border case: glyph at column 38, just
+                // past the box's own right border at column 37 (see
+                // `modal_area_shrinks_margin_in_a_narrow_pane_...`:
+                // width 36 starting at x=2 ends at column 37).
+                frame.render_widget(Span::raw("あ"), Rect::new(38, 5, 2, 1));
+                render_modal(frame, &modal, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+
+        // The right border survived intact...
+        assert_eq!(buf.cell((37, 5)).unwrap().symbol(), "\u{2502}");
+        // ...and the adjacent glyph was neutralized rather than left
+        // dangling at the very edge of the frame.
+        assert_eq!(buf.cell((38, 5)).unwrap().symbol(), " ");
     }
 
     #[test]
