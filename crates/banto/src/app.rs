@@ -17,6 +17,11 @@ pub type GroupId = i64;
 /// Maximum gap between two clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 
+/// How long a transient status-bar message stays visible before
+/// auto-clearing on its own, even if the user never presses another key
+/// (see [`App::expire_status`]).
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Outcome of a left-click on the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickOutcome {
@@ -316,6 +321,9 @@ pub struct App {
     last_click: Option<(usize, Instant)>,
     /// Transient status-bar message (e.g. the phase-2 open notice).
     status: Option<String>,
+    /// When `status` was posted, so [`Self::expire_status`] can clear it
+    /// after [`STATUS_TIMEOUT`] even if the user never presses another key.
+    status_set_at: Option<Instant>,
     /// Set once the user asks to quit.
     should_quit: bool,
 }
@@ -373,6 +381,7 @@ impl App {
             viewport_height: 0,
             last_click: None,
             status: None,
+            status_set_at: None,
             should_quit: false,
         };
         app.resort_rows();
@@ -836,7 +845,7 @@ impl App {
         self.filtered = self.compute_filtered();
         self.selected = 0;
         self.offset = 0;
-        self.status = None;
+        self.clear_status();
         self.last_click = None;
         self.ensure_visible();
     }
@@ -985,9 +994,11 @@ impl App {
 
     // --- actions --------------------------------------------------------
 
-    /// Post a transient status-bar message.
+    /// Post a transient status-bar message, timestamped for
+    /// [`Self::expire_status`].
     pub fn set_status(&mut self, message: String) {
         self.status = Some(message);
+        self.status_set_at = Some(Instant::now());
     }
 
     /// Clear any transient status-bar message, restoring the key-hint
@@ -996,6 +1007,23 @@ impl App {
     /// once the user has moved on to something else.
     pub fn clear_status(&mut self) {
         self.status = None;
+        self.status_set_at = None;
+    }
+
+    /// Clear the status message once it's been showing for
+    /// [`STATUS_TIMEOUT`], given the current time — a notification like
+    /// "pinned session X" would otherwise linger forever if the user simply
+    /// stops touching the keyboard instead of pressing another key (the
+    /// event that normally clears it via [`Self::clear_status`]). Takes an
+    /// injected `now` rather than reading `Instant::now()` itself so this
+    /// stays testable with synthetic timestamps; the render loop calls this
+    /// every tick with the real clock (see `crate::tui::event_loop`).
+    pub fn expire_status(&mut self, now: Instant) {
+        if let Some(set_at) = self.status_set_at
+            && now.saturating_duration_since(set_at) >= STATUS_TIMEOUT
+        {
+            self.clear_status();
+        }
     }
 
     /// Request that the render loop exit.
@@ -1418,6 +1446,28 @@ mod tests {
         let id = app.selected_row().unwrap().id.clone();
         app.set_status(format!("opened session {id}"));
         assert_eq!(app.status(), Some("opened session id1"));
+    }
+
+    #[test]
+    fn status_expires_after_the_timeout_but_not_before() {
+        let mut app = App::new(numbered(1));
+        let t0 = Instant::now();
+        app.set_status("hello".to_string());
+
+        // Comfortably before the 5s timeout: still showing.
+        app.expire_status(t0 + Duration::from_secs(4));
+        assert_eq!(app.status(), Some("hello"));
+
+        // Comfortably after the 5s timeout: cleared.
+        app.expire_status(t0 + Duration::from_secs(6));
+        assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn expire_status_is_a_noop_when_no_status_is_set() {
+        let mut app = App::new(numbered(1));
+        app.expire_status(Instant::now() + Duration::from_secs(100));
+        assert_eq!(app.status(), None);
     }
 
     #[test]
