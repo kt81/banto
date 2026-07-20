@@ -374,6 +374,15 @@ fn resolve_own_pane(
     // window/pane ids across sessions (docs/notes/psmux-spike.md,
     // 2026-07-20), so the pane record must be session-qualified too, not
     // just `<window_id>:<pane_id>`.
+    //
+    // No `-F`: confirmed from real logs that psmux's `display-message`
+    // doesn't take one — the format is a bare positional argument after
+    // `-p` (`-F` was echoed back as a literal token in stdout, e.g.
+    // `"-F test:@1"`, corrupting the target). `-F` is only valid combined
+    // with `-P` on `new-window`/`split-window` (banto-core's
+    // `TmuxOpener::open`), not on `display-message` — see
+    // [`crate::opener::resolve_own_session`], which already used the
+    // correct positional form.
     let spec = CommandSpec::new(
         "psmux",
         [
@@ -381,7 +390,6 @@ fn resolve_own_pane(
             "-p",
             "-t",
             pane_id.as_str(),
-            "-F",
             "#{session_name}:#{window_id}",
         ]
         .map(str::to_string),
@@ -629,12 +637,15 @@ mod tests {
             runner.calls(),
             vec![CommandSpec::new(
                 "psmux",
+                // No `-F`: psmux's `display-message` takes the format as a
+                // bare positional argument, not a flag (confirmed from real
+                // logs — see the comment on the call site in
+                // `resolve_own_pane`).
                 [
                     "display-message",
                     "-p",
                     "-t",
                     "%8",
-                    "-F",
                     "#{session_name}:#{window_id}"
                 ]
                 .map(str::to_string)
