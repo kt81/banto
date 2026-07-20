@@ -1,6 +1,10 @@
 //! Session groups and their membership (banto-owned state).
+//!
+//! A session belongs to at most one group (enforced by `group_members`
+//! having `session_id` as its primary key, since schema v3 — see
+//! `store::migrations`).
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::model::SessionId;
 
@@ -61,28 +65,40 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Adds a session to a group. Idempotent.
-    pub fn add_group_member(
+    /// Assigns a session to a group, moving it out of whatever group it was
+    /// previously in (a session belongs to at most one group). Idempotent
+    /// when the session is already in `group_id`.
+    pub fn set_session_group(
         &self,
-        group_id: GroupId,
         session_id: &SessionId,
+        group_id: GroupId,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO group_members (group_id, session_id) VALUES (?1, ?2)",
-            params![group_id, session_id.0],
+            "INSERT INTO group_members (session_id, group_id) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET group_id = excluded.group_id",
+            params![session_id.0, group_id],
         )?;
         Ok(())
     }
 
-    /// Removes a session from a group. Removing a non-member is a no-op.
-    pub fn remove_group_member(
-        &self,
-        group_id: GroupId,
-        session_id: &SessionId,
-    ) -> Result<(), StoreError> {
+    /// Returns the group a session currently belongs to, if any.
+    pub fn group_for_session(&self, session_id: &SessionId) -> Result<Option<GroupId>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT group_id FROM group_members WHERE session_id = ?1",
+                [&session_id.0],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Removes a session from whatever group it belongs to. A no-op if it
+    /// isn't in one.
+    pub fn clear_session_group(&self, session_id: &SessionId) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM group_members WHERE group_id = ?1 AND session_id = ?2",
-            params![group_id, session_id.0],
+            "DELETE FROM group_members WHERE session_id = ?1",
+            [&session_id.0],
         )?;
         Ok(())
     }
@@ -147,29 +163,56 @@ mod tests {
     }
 
     #[test]
-    fn membership_add_remove_list() {
+    fn set_get_clear_session_group() {
+        let store = Store::open_in_memory().unwrap();
+        let work = store.create_group("work").unwrap();
+
+        assert_eq!(store.group_for_session(&sid("a")).unwrap(), None);
+
+        store.set_session_group(&sid("a"), work).unwrap();
+        assert_eq!(store.group_for_session(&sid("a")).unwrap(), Some(work));
+        assert_eq!(store.group_members(work).unwrap(), [sid("a")]);
+
+        // Idempotent when re-set to the same group.
+        store.set_session_group(&sid("a"), work).unwrap();
+        assert_eq!(store.group_members(work).unwrap(), [sid("a")]);
+
+        store.clear_session_group(&sid("a")).unwrap();
+        assert_eq!(store.group_for_session(&sid("a")).unwrap(), None);
+        assert!(store.group_members(work).unwrap().is_empty());
+
+        // Clearing a session that isn't in any group is a no-op.
+        store.clear_session_group(&sid("never-assigned")).unwrap();
+    }
+
+    #[test]
+    fn set_session_group_moves_between_groups() {
+        let store = Store::open_in_memory().unwrap();
+        let work = store.create_group("work").unwrap();
+        let play = store.create_group("play").unwrap();
+
+        store.set_session_group(&sid("a"), work).unwrap();
+        store.set_session_group(&sid("a"), play).unwrap();
+
+        assert_eq!(store.group_for_session(&sid("a")).unwrap(), Some(play));
+        assert!(store.group_members(work).unwrap().is_empty());
+        assert_eq!(store.group_members(play).unwrap(), [sid("a")]);
+    }
+
+    #[test]
+    fn group_members_ordered_by_session_id() {
         let store = Store::open_in_memory().unwrap();
         let g = store.create_group("work").unwrap();
-
-        store.add_group_member(g, &sid("b")).unwrap();
-        store.add_group_member(g, &sid("a")).unwrap();
-        // Idempotent add.
-        store.add_group_member(g, &sid("a")).unwrap();
+        store.set_session_group(&sid("b"), g).unwrap();
+        store.set_session_group(&sid("a"), g).unwrap();
         assert_eq!(store.group_members(g).unwrap(), [sid("a"), sid("b")]);
-
-        store.remove_group_member(g, &sid("a")).unwrap();
-        assert_eq!(store.group_members(g).unwrap(), [sid("b")]);
-
-        // Removing a non-member is a no-op.
-        store.remove_group_member(g, &sid("zzz")).unwrap();
-        assert_eq!(store.group_members(g).unwrap(), [sid("b")]);
     }
 
     #[test]
     fn delete_group_removes_members() {
         let mut store = Store::open_in_memory().unwrap();
         let g = store.create_group("work").unwrap();
-        store.add_group_member(g, &sid("a")).unwrap();
+        store.set_session_group(&sid("a"), g).unwrap();
 
         store.delete_group(g).unwrap();
         assert!(store.group_members(g).unwrap().is_empty());

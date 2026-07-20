@@ -29,6 +29,11 @@ const HEAD_CAP_BYTES: u64 = 256 * 1024;
 /// Maximum title length in characters (not bytes).
 const TITLE_MAX_CHARS: usize = 200;
 
+/// Maximum preview length in characters (not bytes). More generous than
+/// `TITLE_MAX_CHARS`: the preview is shown in the summary panel, which has
+/// more room than the single-line list row a title is rendered in.
+const PREVIEW_MAX_CHARS: usize = 300;
+
 /// Session provider for the Claude Code CLI.
 ///
 /// Reads session `.jsonl` files under `<claude_home>/projects/`. Everything
@@ -103,17 +108,18 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
     let mtime = metadata.modified().ok()?;
     let head = read_head(path, HEAD_CAP_BYTES).ok()?;
     let fields = extract_head_fields(&head);
+    let title = fields.title();
+    let preview = fields.preview();
     Some(SessionMeta {
         id: SessionId(id),
         provider: PROVIDER_NAME.to_string(),
-        title: fields.title(),
+        title,
         cwd: fields.cwd,
         source_path: path.to_path_buf(),
         mtime,
         size: metadata.len(),
         is_agent: fields.is_agent,
-        // TODO(core teammate): expose the first-user-message excerpt.
-        preview: None,
+        preview,
     })
 }
 
@@ -151,7 +157,16 @@ impl HeadFields {
         [&self.custom_title, &self.ai_title, &self.user_text]
             .into_iter()
             .flatten()
-            .find_map(|raw| normalize_title(raw))
+            .find_map(|raw| normalize_single_line(raw, TITLE_MAX_CHARS))
+    }
+
+    /// The first user message, normalized for the summary panel.
+    /// Independent of `title`: unlike title, this never falls back to a
+    /// custom/ai title, since those are already shown as the title itself.
+    fn preview(&self) -> Option<String> {
+        self.user_text
+            .as_deref()
+            .and_then(|raw| normalize_single_line(raw, PREVIEW_MAX_CHARS))
     }
 }
 
@@ -227,14 +242,14 @@ fn message_text(record: &Value) -> Option<String> {
 }
 
 /// Collapse all whitespace runs (including newlines) into single spaces and
-/// cap the result at [`TITLE_MAX_CHARS`] characters, respecting char
-/// boundaries. Returns `None` if nothing remains.
-fn normalize_title(raw: &str) -> Option<String> {
+/// cap the result at `max_chars` characters, respecting char boundaries.
+/// Returns `None` if nothing remains.
+fn normalize_single_line(raw: &str, max_chars: usize) -> Option<String> {
     let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return None;
     }
-    Some(normalized.chars().take(TITLE_MAX_CHARS).collect())
+    Some(normalized.chars().take(max_chars).collect())
 }
 
 #[cfg(test)]
@@ -296,6 +311,57 @@ mod tests {
         );
         let sessions = discover_sorted(&root);
         assert_eq!(sessions[0].title.as_deref(), Some("AI generated"));
+    }
+
+    #[test]
+    fn preview_comes_from_the_first_user_message_even_when_a_title_wins() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"custom-title","customTitle":"Custom title"}
+{"type":"user","message":{"content":"  the actual first message \n text  "}}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("Custom title"));
+        assert_eq!(
+            sessions[0].preview.as_deref(),
+            Some("the actual first message text")
+        );
+    }
+
+    #[test]
+    fn preview_is_none_without_a_user_message() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"ai-title","aiTitle":"AI generated"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].preview, None);
+    }
+
+    #[test]
+    fn preview_is_capped_independently_of_title() {
+        let root = TempDir::new().unwrap();
+        let long = "a".repeat(400);
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            &format!(r#"{{"type":"user","message":{{"content":"{long}"}}}}"#),
+        );
+        let sessions = discover_sorted(&root);
+        let preview = sessions[0].preview.as_deref().unwrap();
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS);
+        // The title cap (200) is shorter than the preview cap (300); both
+        // come from the same raw text but are capped independently.
+        assert_eq!(sessions[0].title.as_deref().unwrap().chars().count(), 200);
     }
 
     #[test]

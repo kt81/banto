@@ -51,6 +51,26 @@ const MIGRATIONS: &[&str] = &[
     // v2: track whether a session was run by a spawned agent (subagent /
     // Agent-Teams teammate) rather than started interactively.
     "ALTER TABLE sessions ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;",
+    // v3: archived sessions, and a session belongs to at most one group.
+    //
+    // `archived` mirrors `pins`. The old `group_members` schema (composite
+    // PRIMARY KEY (group_id, session_id)) allowed a session to join more
+    // than one group; a session now belongs to at most one, so `session_id`
+    // alone becomes the primary key. Existing multi-group memberships
+    // collapse onto the lowest group_id per session (arbitrary but
+    // deterministic) rather than erroring on upgrade.
+    "CREATE TABLE archived (
+        session_id     TEXT PRIMARY KEY,
+        archived_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE group_members_v3 (
+        session_id TEXT PRIMARY KEY,
+        group_id   INTEGER NOT NULL
+    );
+    INSERT INTO group_members_v3 (session_id, group_id)
+        SELECT session_id, MIN(group_id) FROM group_members GROUP BY session_id;
+    DROP TABLE group_members;
+    ALTER TABLE group_members_v3 RENAME TO group_members;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -79,6 +99,7 @@ mod tests {
     use super::super::test_util::meta;
     use super::super::{Store, StoreError};
     use super::MIGRATIONS;
+    use crate::model::SessionId;
 
     /// Proves the bundled rusqlite build ships the FTS5 module.
     #[test]
@@ -116,7 +137,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     #[test]
@@ -139,8 +160,10 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
 
-        // Opening through Store::open must run the v2 migration and keep the
-        // pre-existing row, defaulting its new column to false.
+        // Opening through Store::open must run the v2 migration (and any
+        // later ones, since `apply` always brings a database to the latest
+        // version) and keep the pre-existing row, defaulting its new column
+        // to false.
         let store = Store::open(&db).unwrap();
         let listed = store.list_sessions().unwrap();
         assert_eq!(listed.len(), 1);
@@ -150,7 +173,48 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v2_to_v3_upgrade_adds_archived_table_and_collapses_multi_group_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v2 code would have left it: v1 + v2 scripts
+        // applied, one session in two groups (possible under the old
+        // multi-group schema), `user_version` left at 2.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(MIGRATIONS[1]).unwrap();
+            conn.execute(
+                "INSERT INTO groups (id, name) VALUES (1, 'work'), (2, 'play')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO group_members (group_id, session_id) VALUES (2, 's1'), (1, 's1')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        // Opening through Store::open must run the v3 migration: the
+        // archived table exists and is usable, and s1's two memberships
+        // collapsed onto the lower group id (1) deterministically.
+        let store = Store::open(&db).unwrap();
+        let s1 = SessionId("s1".to_string());
+        assert_eq!(store.group_for_session(&s1).unwrap(), Some(1));
+        assert!(store.archived_ids().unwrap().is_empty());
+        store.archive(&s1).unwrap();
+        assert_eq!(store.archived_ids().unwrap(), [s1]);
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
     }
 
     #[test]
