@@ -37,6 +37,11 @@ pub struct SessionRow {
     /// Short single-line excerpt of the first user message, for the summary
     /// panel. See `banto_core::model::SessionMeta::preview`.
     pub preview: Option<String>,
+    /// Last modification time of the session's source file, for the summary
+    /// panel's relative-age display (see [`humanize_age`]).
+    pub mtime: SystemTime,
+    /// Source file size in bytes, for the summary panel (see [`humanize_size`]).
+    pub size: u64,
 }
 
 impl SessionRow {
@@ -60,6 +65,47 @@ impl SessionRow {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default()
+    }
+}
+
+/// First 8 characters of a session id (a UUID), for compact display in the
+/// summary panel. Char-based (not byte-slicing) so it never panics
+/// regardless of what the id turns out to contain.
+pub fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Format how long ago `mtime` was, relative to `now`, as a short human
+/// string for the summary panel: "just now", "5m ago", "3h ago", "2d ago",
+/// "3w ago". `mtime` in the future (clock skew, a freshly touched file)
+/// reads as "just now" rather than underflowing.
+pub fn humanize_age(mtime: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m ago", secs / 60)
+    } else if secs < SECS_PER_DAY {
+        format!("{}h ago", secs / SECS_PER_HOUR)
+    } else if secs < SECS_PER_DAY * 7 {
+        format!("{}d ago", secs / SECS_PER_DAY)
+    } else {
+        format!("{}w ago", secs / (SECS_PER_DAY * 7))
+    }
+}
+
+/// Format a byte count as a short human string for the summary panel:
+/// "512 B", "12 KB", "3.4 MB". Whole units only below MB, one decimal at MB
+/// and above — session files are small enough that GB never comes up.
+pub fn humanize_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
     }
 }
 
@@ -113,6 +159,8 @@ pub fn load_rows(
                 activity,
                 is_agent: meta.is_agent,
                 preview: meta.preview,
+                mtime: meta.mtime,
+                size: meta.size,
             }
         })
         .collect();
@@ -132,6 +180,8 @@ mod tests {
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -145,6 +195,8 @@ mod tests {
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -158,8 +210,44 @@ mod tests {
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
         };
         assert_eq!(row.display_title(), "the-id");
+    }
+
+    #[test]
+    fn short_id_takes_the_first_eight_chars() {
+        assert_eq!(short_id("0123456789abcdef"), "01234567");
+        assert_eq!(short_id("short"), "short");
+        assert_eq!(short_id(""), "");
+    }
+
+    #[test]
+    fn humanize_age_covers_every_bucket() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ago = |secs: u64| now - Duration::from_secs(secs);
+
+        assert_eq!(humanize_age(now, now), "just now");
+        assert_eq!(humanize_age(ago(30), now), "just now");
+        assert_eq!(humanize_age(ago(5 * 60), now), "5m ago");
+        assert_eq!(humanize_age(ago(3 * SECS_PER_HOUR), now), "3h ago");
+        assert_eq!(humanize_age(ago(2 * SECS_PER_DAY), now), "2d ago");
+        assert_eq!(humanize_age(ago(20 * SECS_PER_DAY), now), "2w ago");
+    }
+
+    #[test]
+    fn humanize_age_treats_a_future_mtime_as_just_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let future = now + Duration::from_secs(500);
+        assert_eq!(humanize_age(future, now), "just now");
+    }
+
+    #[test]
+    fn humanize_size_covers_every_unit() {
+        assert_eq!(humanize_size(512), "512 B");
+        assert_eq!(humanize_size(12 * 1024), "12 KB");
+        assert_eq!(humanize_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
     }
 
     #[test]

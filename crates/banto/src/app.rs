@@ -43,8 +43,8 @@ pub enum Modal {
 }
 
 /// State for the new-session modal: a free-text cwd input plus a
-/// fuzzy-filtered list of previously seen cwds (extracted from the loaded
-/// sessions) to pick from instead of typing a full path.
+/// substring-filtered list of previously seen cwds (extracted from the
+/// loaded sessions) to pick from instead of typing a full path.
 pub struct NewSessionState {
     /// Every distinct cwd seen across the loaded sessions, most-recent-use
     /// first — captured once when the modal opens rather than re-derived on
@@ -53,10 +53,15 @@ pub struct NewSessionState {
     candidates: Vec<String>,
     /// What the user has typed so far.
     input: String,
-    /// Indices into `candidates` matching `input`, best match first.
+    /// Indices into `candidates` whose text contains `input`
+    /// (case-insensitive), in the same recency order as `candidates` —
+    /// filtering narrows the list, it doesn't re-rank it.
     filtered: Vec<usize>,
     /// Selected position within `filtered`.
     selected: usize,
+    /// Inline validation error from the last confirm attempt (e.g. the typed
+    /// path doesn't exist), cleared as soon as the input changes again.
+    error: Option<String>,
 }
 
 impl NewSessionState {
@@ -66,14 +71,25 @@ impl NewSessionState {
             input: String::new(),
             filtered: Vec::new(),
             selected: 0,
+            error: None,
         };
         state.refilter();
         state
     }
 
     fn refilter(&mut self) {
-        self.filtered = rank_indices(&self.input, &self.candidates);
+        let needle = self.input.to_lowercase();
+        self.filtered = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                needle.is_empty() || candidate.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect();
         self.selected = 0;
+        self.error = None;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -85,12 +101,21 @@ impl NewSessionState {
         self.selected = target as usize;
     }
 
+    /// Complete the input to the currently highlighted candidate (bound to
+    /// Tab). No-op when nothing is highlighted.
+    fn complete_candidate(&mut self) {
+        if let Some(&i) = self.filtered.get(self.selected) {
+            self.input = self.candidates[i].clone();
+            self.refilter();
+        }
+    }
+
     /// The cwd typed so far.
     pub fn input(&self) -> &str {
         &self.input
     }
 
-    /// Candidates matching `input`, best match first.
+    /// Candidates whose text contains the input, most-recent-use first.
     pub fn candidates(&self) -> Vec<&str> {
         self.filtered
             .iter()
@@ -102,6 +127,11 @@ impl NewSessionState {
     /// when nothing matches.
     pub fn selected(&self) -> Option<usize> {
         (!self.filtered.is_empty()).then_some(self.selected)
+    }
+
+    /// The inline validation error from the last confirm attempt, if any.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// The cwd that would be launched if confirmed right now: the
@@ -292,6 +322,14 @@ impl App {
         }
     }
 
+    /// Complete the open modal's input to its highlighted candidate (bound
+    /// to Tab). No-op when no modal is open or nothing is highlighted.
+    pub fn modal_complete_candidate(&mut self) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal {
+            state.complete_candidate();
+        }
+    }
+
     /// The cwd the new-session modal would launch if confirmed right now
     /// (see [`NewSessionState::target`]); `None` if no modal is open or
     /// there's nothing to launch. Does not close the modal — the caller
@@ -300,6 +338,15 @@ impl App {
         match &self.modal {
             Some(Modal::NewSession(state)) => state.target(),
             None => None,
+        }
+    }
+
+    /// Set the open modal's inline validation error (e.g. "not a
+    /// directory"), leaving it open so the user can correct the input. No-op
+    /// when no modal is open.
+    pub fn modal_set_error(&mut self, message: String) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal {
+            state.error = Some(message);
         }
     }
 
@@ -615,6 +662,13 @@ impl App {
         self.filtered.get(self.selected).map(|&i| &self.rows[i])
     }
 
+    /// Whether the currently selected session is pinned (for the summary
+    /// panel's marker); `false` when nothing is selected.
+    pub fn is_selected_pinned(&self) -> bool {
+        self.selected_row()
+            .is_some_and(|row| self.pinned.contains(&row.id))
+    }
+
     /// Selection index relative to the viewport, or `None` when the selection
     /// is scrolled out of view (or the list is empty).
     pub fn selected_in_viewport(&self) -> Option<usize> {
@@ -660,6 +714,7 @@ mod tests {
     use super::*;
     use banto_core::model::{Activity, AgeBucket};
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     fn row(id: &str, title: &str, cwd: &str) -> SessionRow {
         SessionRow {
@@ -669,6 +724,8 @@ mod tests {
             activity: Activity::Idle(AgeBucket::Older),
             is_agent: false,
             preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
         }
     }
 
@@ -1254,7 +1311,79 @@ mod tests {
         app.modal_backspace();
         app.modal_select_next();
         app.modal_select_prev();
+        app.modal_complete_candidate();
+        app.modal_set_error("ignored".to_string());
         assert_eq!(app.modal_new_session_target(), None);
         assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn modal_complete_candidate_fills_the_input_with_the_highlighted_one() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        app.modal_push_char('a');
+
+        app.modal_complete_candidate();
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "/work/alpha");
+    }
+
+    #[test]
+    fn modal_complete_candidate_is_a_noop_when_nothing_matches() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "/nonexistent".chars() {
+            app.modal_push_char(c);
+        }
+
+        app.modal_complete_candidate();
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "/nonexistent");
+    }
+
+    #[test]
+    fn modal_set_error_is_cleared_by_further_editing() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        app.modal_set_error("not a directory".to_string());
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.error(), Some("not a directory"));
+
+        app.modal_push_char('x');
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.error(), None);
+    }
+
+    #[test]
+    fn is_selected_pinned_reflects_the_current_selection() {
+        let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]);
+        app.set_viewport_height(10);
+        assert!(!app.is_selected_pinned());
+
+        app = app.with_pinned(["a".to_string()].into_iter().collect());
+        assert!(app.is_selected_pinned()); // "a" sorted first (pinned)
+
+        app.select_next();
+        assert!(!app.is_selected_pinned()); // now on "b", unpinned
+    }
+
+    #[test]
+    fn is_selected_pinned_is_false_with_nothing_selected() {
+        let app = App::new(Vec::new());
+        assert!(!app.is_selected_pinned());
     }
 }

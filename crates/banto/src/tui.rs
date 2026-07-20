@@ -215,15 +215,27 @@ fn install_panic_hook() {
 /// Height of the always-visible summary panel below the list: one row for
 /// its top border/title plus [`SUMMARY_CONTENT_LINES`] content rows.
 const SUMMARY_HEIGHT: u16 = 1 + SUMMARY_CONTENT_LINES;
-/// Content rows inside the summary panel: activity dot + title, cwd, preview.
-const SUMMARY_CONTENT_LINES: u16 = 3;
+/// Content rows inside the summary panel: title, preview, cwd, meta line.
+const SUMMARY_CONTENT_LINES: u16 = 4;
+/// Below this total terminal height, the summary panel is dropped entirely
+/// so the list keeps whatever room it needs — the panel is a nice-to-have,
+/// the list is the whole point of the app.
+const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
 
-/// Split an area into (search box, list, summary panel, status bar).
+/// Split an area into (search box, list, summary panel, status bar). The
+/// summary panel collapses to zero height in a too-short terminal (see
+/// [`MIN_HEIGHT_FOR_SUMMARY`]) rather than squeezing the list down to make
+/// room for it.
 fn layout_areas(area: Rect) -> [Rect; 4] {
+    let summary_height = if area.height < MIN_HEIGHT_FOR_SUMMARY {
+        0
+    } else {
+        SUMMARY_HEIGHT
+    };
     Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
-        Constraint::Length(SUMMARY_HEIGHT),
+        Constraint::Length(summary_height),
         Constraint::Length(1),
     ])
     .areas(area)
@@ -363,15 +375,17 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 }
 
 /// Keys while a modal is open: typed characters build its text input,
-/// Up/Down move its candidate selection, Backspace edits the input, Enter
-/// confirms (see [`confirm_modal`]), Esc cancels without acting. Only the
-/// new-session modal exists so far, but none of this is specific to it — a
-/// future modal (e.g. group-join) reuses this same shape.
+/// Up/Down move its candidate selection, Tab completes the input to the
+/// highlighted candidate, Backspace edits the input, Enter confirms (see
+/// [`confirm_modal`]), Esc cancels without acting. Only the new-session
+/// modal exists so far, but none of this is specific to it — a future modal
+/// (e.g. group-join) reuses this same shape.
 fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     match code {
         KeyCode::Esc => app.close_modal(),
         KeyCode::Up => app.modal_select_prev(),
         KeyCode::Down => app.modal_select_next(),
+        KeyCode::Tab => app.modal_complete_candidate(),
         KeyCode::Backspace => app.modal_backspace(),
         KeyCode::Enter => confirm_modal(app, ctx),
         KeyCode::Char(c) => app.modal_push_char(c),
@@ -381,16 +395,23 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 
 /// Confirm the open modal. For the new-session modal: resolve the target cwd
 /// (the highlighted candidate, or the raw typed path — see
-/// [`App::modal_new_session_target`]), launch a fresh `claude` there, post
-/// the outcome as a status message, and close the modal either way (the
-/// message reports success or failure, same as [`activate`]'s resume path).
-/// A modal with nothing to confirm yet (empty input, no candidates) is left
-/// open — Enter does nothing, matching how Enter on an empty list does
-/// nothing in [`activate`].
+/// [`App::modal_new_session_target`]), validate it's an existing directory
+/// (an invalid path becomes an inline modal error instead of a failed spawn
+/// — see [`App::modal_set_error`] — so the user can correct it without
+/// losing what they typed), launch a fresh `claude` there, post the outcome
+/// as a status message, and close the modal (the message reports success or
+/// failure, same as [`activate`]'s resume path). A modal with nothing to
+/// confirm yet (empty input, no candidates) is left open — Enter does
+/// nothing, matching how Enter on an empty list does nothing in
+/// [`activate`].
 fn confirm_modal(app: &mut App, ctx: &Context) {
     let Some(cwd) = app.modal_new_session_target() else {
         return;
     };
+    if !cwd.is_dir() {
+        app.modal_set_error(format!("{} is not a directory", cwd.display()));
+        return;
+    }
 
     let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
     let anchor = std::env::var("TMUX_PANE").ok();
@@ -955,11 +976,15 @@ fn list_item(visible: VisibleRow<'_>) -> ListItem<'static> {
 }
 
 /// Render the always-visible summary panel below the list: the selected
-/// session's activity dot + title, cwd, and preview excerpt. A top border is
-/// the only visual separation from the list, to keep this compact. The
-/// preview line renders blank until `SessionRow::preview` extraction lands
-/// (currently always `None`) — the layout doesn't change either way.
+/// session's activity dot + title, preview excerpt, cwd, and a meta line
+/// (relative age, size, short id, pinned/agent markers). A top border is the
+/// only visual separation from the list, to keep this compact. Dropped
+/// entirely in a too-short terminal — see [`MIN_HEIGHT_FOR_SUMMARY`] — in
+/// which case `area` is zero-height and this is a no-op.
 fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -985,18 +1010,39 @@ fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]);
-    let cwd_line = Line::from(Span::styled(
-        row.cwd_display(),
-        Style::default().fg(Color::DarkGray),
-    ));
     let preview_line = Line::from(Span::styled(
         row.preview.as_deref().unwrap_or_default(),
         Style::default().fg(Color::DarkGray),
     ));
+    let cwd_line = Line::from(Span::styled(
+        row.cwd_display(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let meta_line = Line::from(Span::styled(
+        summary_meta(row, app.is_selected_pinned(), SystemTime::now()),
+        Style::default().fg(Color::DarkGray),
+    ));
     frame.render_widget(
-        Paragraph::new(vec![title_line, cwd_line, preview_line]),
+        Paragraph::new(vec![title_line, preview_line, cwd_line, meta_line]),
         inner,
     );
+}
+
+/// Build the summary panel's meta line: relative age, size, short id, and
+/// any markers (pinned/agent) that apply.
+fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> String {
+    let mut parts = vec![
+        session::humanize_age(row.mtime, now),
+        session::humanize_size(row.size),
+        session::short_id(&row.id),
+    ];
+    if pinned {
+        parts.push("pinned".to_string());
+    }
+    if row.is_agent {
+        parts.push("agent".to_string());
+    }
+    parts.join("  \u{b7}  ")
 }
 
 /// Render the bottom status bar: key hints (or a transient message) on the
@@ -1045,21 +1091,34 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Minimum margin (columns/rows) kept around a modal, even in a narrow pane.
-const MODAL_MIN_MARGIN: u16 = 1;
-/// A modal never grows wider/taller than this, so a full-width pane still
-/// gets a comfortable margin around it instead of an edge-to-edge dialog.
-const MODAL_MAX_WIDTH: u16 = 70;
+const MODAL_MIN_MARGIN: u16 = 2;
+/// Below this width, the pane counts as "narrow" (the user mostly runs
+/// banto in a tall, narrow pane): the modal fills nearly the whole width
+/// instead of leaving a percentage-based margin.
+const MODAL_NARROW_THRESHOLD: u16 = 90;
+/// In a pane at or above [`MODAL_NARROW_THRESHOLD`], the modal uses this
+/// percentage of the width, before the [`MODAL_MAX_WIDTH`] cap.
+const MODAL_WIDE_WIDTH_PERCENT: u32 = 60;
+/// A modal's width never exceeds this even in a very wide pane, so it still
+/// gets a comfortable margin instead of stretching edge to edge.
+const MODAL_MAX_WIDTH: u16 = 80;
 const MODAL_MAX_HEIGHT: u16 = 20;
 
-/// Center a modal box within `area`: margin shrinks toward
-/// [`MODAL_MIN_MARGIN`] in a narrow/tall pane (the modal fills almost the
-/// whole width) and grows in a full-width pane, since the modal caps out at
-/// [`MODAL_MAX_WIDTH`]/[`MODAL_MAX_HEIGHT`] instead of stretching edge to edge.
+/// Center a modal box within `area`. Width: below [`MODAL_NARROW_THRESHOLD`]
+/// the modal fills nearly the whole pane (just [`MODAL_MIN_MARGIN`] on each
+/// side); at or above it, the modal uses [`MODAL_WIDE_WIDTH_PERCENT`] of the
+/// width, capped at [`MODAL_MAX_WIDTH`] so a very wide pane still gets a
+/// generous margin instead of an edge-to-edge dialog. Height uses the same
+/// minimal-margin/capped-max shape as the narrow-width case, since the
+/// user's typical pane is already tall.
 fn modal_area(area: Rect) -> Rect {
-    let width = area
-        .width
-        .saturating_sub(MODAL_MIN_MARGIN * 2)
-        .clamp(1, MODAL_MAX_WIDTH);
+    let width = if area.width < MODAL_NARROW_THRESHOLD {
+        area.width.saturating_sub(MODAL_MIN_MARGIN * 2)
+    } else {
+        let wide_width = area.width as u32 * MODAL_WIDE_WIDTH_PERCENT / 100;
+        wide_width.min(MODAL_MAX_WIDTH as u32) as u16
+    }
+    .max(1);
     let height = area
         .height
         .saturating_sub(MODAL_MIN_MARGIN * 2)
@@ -1081,25 +1140,38 @@ fn render_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
 }
 
 /// Render the `n` new-session dialog: a one-line cwd input (with a blinking
-/// cursor, same convention as the search box) above a fuzzy-filtered list of
-/// previously seen cwds to pick from instead of typing a full path.
+/// cursor, same convention as the search box), an inline validation error
+/// when the last confirm attempt failed (see [`App::modal_set_error`]), and
+/// a substring-filtered list of previously seen cwds to pick from instead of
+/// typing a full path (Tab completes the highlighted one into the input).
 fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(" New Session \u{2014} cwd ")
-        .title_bottom(" Enter launch  Esc cancel ");
+        .title_bottom(" Enter launch  Tab complete  Esc cancel ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [input_area, list_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let [input_area, error_area, list_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
 
     frame.render_widget(Paragraph::new(state.input()), input_area);
     if input_area.width > 0 {
         let input_cols = state.input().chars().count() as u16;
         let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    }
+
+    if let Some(error) = state.error() {
+        frame.render_widget(
+            Paragraph::new(error).style(Style::default().fg(Color::Red)),
+            error_area,
+        );
     }
 
     let candidates = state.candidates();
@@ -1150,6 +1222,8 @@ mod tests {
             activity,
             is_agent: false,
             preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
         }
     }
 
@@ -1884,33 +1958,74 @@ mod tests {
     }
 
     #[test]
-    fn modal_area_shrinks_margin_in_a_narrow_pane_and_caps_width_in_a_wide_one() {
+    fn modal_area_shrinks_margin_in_a_narrow_pane_scales_by_percentage_in_a_mid_one_and_caps_in_a_wide_one()
+     {
         // Narrow: minimal margin, modal fills almost the whole width.
         let narrow = modal_area(Rect::new(0, 0, 30, 20));
-        assert_eq!(narrow.width, 28); // 30 - 2*MODAL_MIN_MARGIN
-        assert_eq!(narrow.x, 1);
+        assert_eq!(narrow.width, 26); // 30 - 2*MODAL_MIN_MARGIN
+        assert_eq!(narrow.x, 2);
+
+        // Mid: at/above the narrow threshold but under the cap, the modal
+        // uses MODAL_WIDE_WIDTH_PERCENT of the width.
+        let mid = modal_area(Rect::new(0, 0, 100, 30));
+        assert_eq!(mid.width, 60); // 100 * 60 / 100
+        assert_eq!(mid.x, 20); // centered: (100 - 60) / 2
 
         // Wide: capped at MODAL_MAX_WIDTH, leaving a large margin.
         let wide = modal_area(Rect::new(0, 0, 200, 50));
-        assert_eq!(wide.width, 70); // MODAL_MAX_WIDTH
-        assert_eq!(wide.x, 65); // centered: (200 - 70) / 2
+        assert_eq!(wide.width, 80); // MODAL_MAX_WIDTH
+        assert_eq!(wide.x, 60); // centered: (200 - 80) / 2
     }
 
     #[test]
     fn render_summary_shows_the_selected_session_and_a_placeholder_when_empty() {
-        let mut app = App::new(vec![row("a", "Fix login", "/work/alpha", Activity::Alive)]);
+        let mut app = App::new(vec![row(
+            "9f8e7d6c-uuid-rest",
+            "Fix login",
+            "/work/alpha",
+            Activity::Alive,
+        )]);
         app.set_viewport_height(10);
 
         let text = draw(&app);
         assert!(text.contains("Details"), "panel border missing:\n{text}");
         assert!(text.contains("Fix login"), "title missing:\n{text}");
         assert!(text.contains("/work/alpha"), "cwd missing:\n{text}");
+        // Meta line: size and short id are deterministic even though the
+        // relative-age part depends on `SystemTime::now()`.
+        assert!(text.contains("0 B"), "size missing:\n{text}");
+        assert!(text.contains("9f8e7d6c"), "short id missing:\n{text}");
 
         let empty_app = App::new(Vec::new());
         let empty_text = draw(&empty_app);
         assert!(
             empty_text.contains("No session selected."),
             "placeholder missing:\n{empty_text}"
+        );
+    }
+
+    #[test]
+    fn render_summary_marks_a_pinned_selection() {
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app = app.with_pinned(["a".to_string()].into_iter().collect());
+
+        let text = draw(&app);
+        assert!(text.contains("pinned"), "pinned marker missing:\n{text}");
+    }
+
+    #[test]
+    fn summary_panel_is_dropped_in_a_too_short_terminal() {
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(3);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            !text.contains("Details"),
+            "summary panel shown in a too-short terminal:\n{text}"
         );
     }
 
@@ -1930,5 +2045,101 @@ mod tests {
             text.contains("/work/alpha"),
             "matching candidate missing:\n{text}"
         );
+        assert!(text.contains("Tab complete"), "tab hint missing:\n{text}");
+    }
+
+    #[test]
+    fn new_session_modal_filtering_is_a_literal_substring_match_not_fuzzy() {
+        let mut app = App::new(vec![
+            row("a", "one", "/work/alpha", Activity::Alive),
+            row("b", "two", "/other/beta", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        // "obeta" is a valid fuzzy subsequence of "/other/beta" (o-b-e-t-a
+        // appear in that order, just not contiguously) but never occurs as
+        // a literal substring of it — proves this filters by substring, not
+        // the same fuzzy ranker the main search box uses.
+        for c in "obeta".chars() {
+            app.modal_push_char(c);
+        }
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        // "obeta" is not a literal substring of "/other/beta" (there's an
+        // "her/b" in between), so a substring matcher finds nothing, even
+        // though a fuzzy matcher would.
+        assert!(state.candidates().is_empty());
+    }
+
+    #[test]
+    fn tab_completes_the_highlighted_candidate_into_the_input() {
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "alp".chars() {
+            app.modal_push_char(c);
+        }
+
+        app.modal_complete_candidate();
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "/work/alpha");
+    }
+
+    #[test]
+    fn confirm_modal_sets_an_inline_error_and_stays_open_for_a_nonexistent_directory() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(Vec::new());
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "/definitely/not/a/real/path".chars() {
+            app.modal_push_char(c);
+        }
+
+        confirm_modal(&mut app, &ctx);
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected the modal to still be open");
+        };
+        assert!(state.error().is_some(), "expected an inline error");
+        // Nothing was typed away: editing further clears the error again.
+        app.modal_push_char('x');
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected the modal to still be open");
+        };
+        assert!(state.error().is_none());
+    }
+
+    /// The SGR recognizer runs at the event-loop level, entirely before
+    /// `handle_key`'s modal check — so a leaked mouse sequence must still be
+    /// swallowed cleanly (never landing in the modal's input) regardless of
+    /// whether a modal happens to be open when it arrives.
+    #[test]
+    fn leaked_sgr_sequences_are_swallowed_even_while_a_modal_is_open() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        let list_area = Rect::new(0, 4, 60, 3);
+
+        let chars: Vec<char> = "[<35;18;12M".chars().collect();
+        match sgr::parse_headless_prefix(&chars) {
+            SgrParse::Complete(event) => apply_sgr_action(&mut app, &ctx, list_area, event),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected the modal to still be open");
+        };
+        assert_eq!(state.input(), "");
     }
 }
