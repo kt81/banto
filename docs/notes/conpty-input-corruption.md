@@ -123,6 +123,41 @@ environment/delivery gap outside banto, not an application bug. Because of
 it, banto does not rely on Ctrl+C to quit: `q` and `Esc` are the real quit
 keys (`handle_normal_key`).
 
+### 5. Cursor / navigation keys leak as headless CSI
+
+Confirmed from a user screenshot of the group-join modal: pressing the arrow
+keys inserted the literal text `[B[B[B[B[A[D[C` into the input field. These
+are CSI cursor sequences (`ESC [ A/B/C/D`) with the leading `ESC` dropped —
+the exact same headless shape as mode 1, but ending in a cursor final byte
+(`A`/`B`/`C`/`D`) instead of the SGR mouse `<…M/m`. The headless recognizer
+only accepted the SGR mouse grammar, so `[` + `A` failed to match and was
+replayed as the literal characters `[` and `A`.
+
+banto's fix: `arrow_key_for` recognizes the bare (or ESC-headed) cursor
+shape in the `NotSgr` arm, *before* the replay, and dispatches
+`KeyCode::Up/Down/Right/Left` instead. Only the four arrows are handled;
+other CSI finals (Home/End/PageUp/PageDown as `[H`/`[F`/`[5~`/`[6~`) are a
+known unhandled extension of the same class — add them the same way if a
+capture ever shows them leaking.
+
+### 6. Enter's key-down can arrive as a raw CR/LF character
+
+Reported: `Enter` did nothing inside the modals (group-join, new-session),
+even though the confirm code path was proven correct on-device (an injected
+`psmux send-keys Enter`, which produces a clean `KeyCode::Enter` press, did
+create the group). The delivery-shape gap: a real keyboard `Enter` reached
+banto as a raw `Char('\r')` (carriage return) rather than `KeyCode::Enter`,
+and `App::push_char` silently drops control characters — so the keypress
+vanished with no effect. This is the same *class* as mode 3 (a real key
+arriving as a control char), for the confirm key.
+
+banto's fix: `normalize_key_code` maps `Char('\r')`/`Char('\n')` back to
+`KeyCode::Enter`. The user confirmed group creation works after this change.
+No `BANTO_INPUT_LOG` line was captured that directly shows the `Char('\r')`
+delivery, so the exact codepoint is inferred from the fix resolving the
+symptom rather than observed — but it is consistent with modes 3/5 (the same
+environment corrupting a specific key's press into a bare control char).
+
 ## Grace periods
 
 | Constant | Value | Applies to | Why this value |
@@ -154,9 +189,13 @@ before falling back to `BANTO_INPUT_LOG` with a real mouse:
   press-loss races.** `send-keys` delivers a whole sequence (or a whole
   burst) in one go, so it cannot reproduce the split-pacing, corrupted-key,
   or dropped-event behavior that only shows up under a real, continuously
-  moving mouse. That gap is exactly why `BANTO_INPUT_LOG` exists (see above)
-  — every corruption mode in this document was found through a real capture,
-  not through synthetic injection.
+  moving mouse. That gap is exactly why `BANTO_INPUT_LOG` exists (see above).
+  It also cuts the other way for single keys: `psmux send-keys Enter` injects
+  a clean `KeyCode::Enter`, so it *proved the confirm code path was correct*
+  while completely hiding mode 6 (real `Enter` arriving as `Char('\r')`) —
+  the bug only reproduced from a real keyboard. When an injected key "works"
+  but the real one doesn't, suspect a delivery-shape corruption, not a logic
+  bug.
 
 ## See also
 
