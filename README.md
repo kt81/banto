@@ -30,7 +30,11 @@ history.
   `projects/`/`sessions/`, debounced, reloads the list automatically.
 - **Phase 4a (pins) — done:** `p` toggles a pin; pinned sessions sort first
   (when not searching) and carry a `*` marker.
-- **Phase 4b (groups UI) — pending UX decisions.**
+- **Phase 4b (groups UI) — done:** `g` opens a group-join dialog (pick an
+  existing group or type a new name); a session belongs to at most one
+  group. `Tab` toggles a grouped list view (Pinned / each group / Ungrouped).
+  Delivered alongside it: an `n` new-session dialog, `d` session archiving
+  (soft-hide only), and an always-visible summary panel below the list.
 
 See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the full design and
 phase breakdown.
@@ -75,16 +79,56 @@ in turn takes priority over the `~/.claude` default.
 | `Up` / `Down` | Move selection |
 | `PgUp` / `PgDn` | Move selection by one page |
 | `Home` / `End` | Jump to first / last session |
-| `Enter` | Open the selected session, or focus its pane/tab if already open |
+| `Enter` | Open the selected session, or focus its pane/tab if already open (confirms an open modal instead — see [Modals](#modals)) |
+| `/` | Enter search mode (only when the query is empty) |
 | type any character | Add to the search query |
 | `Backspace` | Delete the last query character |
-| `Esc` | Clear the query if non-empty, otherwise quit |
+| `Esc` | Clear the query if non-empty, otherwise quit (closes an open modal instead, without acting) |
 | `q` | Quit (only when the query is empty) |
 | `p` | Toggle pin on the selected session (only when the query is empty) |
+| `a` | Toggle showing agent-run sessions (only when the query is empty) |
+| `n` | Open the new-session dialog (only when the query is empty) — see [Modals](#modals) |
+| `d` | Open the archive-confirm dialog for the selected session (only when the query is empty) — see [Modals](#modals) |
+| `g` | Open the group-join dialog for the selected session (only when the query is empty) — see [Modals](#modals) |
+| `Tab` | Toggle grouped list view (only when the query is empty) — see [Grouped view](#grouped-view); completes the highlighted candidate inside the new-session dialog |
 | `Ctrl+C` | Quit (best-effort; inside psmux it does not reach banto — use `q`/`Esc`) |
 
 Mouse: wheel scrolls the list, a single click selects a row, and a quick
 second click on the same row (double-click) activates it — same as `Enter`.
+
+### Modals
+
+Three dialogs, opened from Normal mode, take over input until confirmed with
+`Enter` or cancelled with `Esc`:
+
+- **`n` — New session.** Type or pick a previously seen working directory
+  (from loaded sessions, most-recently-used first) and `Enter` launches a
+  fresh `claude` there — not a resume of an existing session. `Tab`
+  completes the highlighted candidate into the input.
+- **`d` — Archive.** `Enter` confirms. Archiving only hides the session from
+  banto's own list (via banto's own sqlite store); the session file under
+  `~/.claude` is never touched. There's currently no keybinding to
+  unarchive it — that's API-only.
+- **`g` — Join group.** Type a new group name, or pick an existing one from
+  the filtered list below the input; `Enter` joins/creates it. A session
+  belongs to at most one group — joining moves it out of whichever group it
+  was in before.
+
+### Grouped view
+
+By default the list is grouped into sections — **Pinned**, then each group
+alphabetically, then **Ungrouped** — with a header line above each. `Tab`
+toggles it off (a flat, unsectioned list). Grouping is skipped automatically
+(shown flat) while searching, and when every session falls into a single
+section, since a lone header wouldn't add anything.
+
+### Summary panel
+
+Below the list, an always-visible "Details" panel shows the selected
+session's activity dot + title, a one-line preview of its first message, its
+working directory, and a meta line (relative age, size, short id, and
+pinned/agent markers). It's hidden in a short terminal (under 12 rows) to
+leave room for the list.
 
 ### Configuration
 

@@ -10,8 +10,11 @@ stays on the premises and directs and watches over the guests (sessions).
 ## MVP requirements
 
 - Fast search over local session history (Claude Code CLI only)
-- Grouping and pinning stored by banto itself (never writes to Claude's files)
+- Grouping (a session belongs to at most one group), pinning, and archiving
+  (soft-hide) — all stored by banto itself, never writing to Claude's files
 - Click or Enter on a search result resumes the session in a separate pane/tab
+- A dedicated dialog also launches a brand-new session (pick or type a
+  working directory), not just resumes an existing one
 - If a session is already resumed, activate its existing pane/tab instead
   (a double resume forks the session history and is therefore forbidden)
 - Activity indicator (colored dot) in the list. Busy sessions get special
@@ -103,7 +106,11 @@ sysinfo (PID liveness) / thiserror, anyhow.
 1. Indexer + search + TUI list (mouse support) — useful on its own — done
 2. Opener (psmux / WT) + `_wrap` + double-resume prevention + focus — done
 3. Activity dots + notify live updates — done
-4. Groups / pins — pins done; groups UI remaining
+4. Groups / pins — done
+
+Delivered alongside groups: a new-session modal (`n`), session archiving
+(`d`, soft-hide only — the real jsonl file under `~/.claude` is never
+touched), and an always-visible summary panel below the list.
 
 ## Risks
 
