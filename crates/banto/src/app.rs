@@ -22,6 +22,49 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 /// (see [`App::expire_status`]).
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Number of Unicode scalar values in `s` — the unit every text-input cursor
+/// position is counted in, so a cursor index can never land inside a
+/// multi-byte character's encoding.
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Byte offset of the char-index `idx` position within `s` (i.e. where a
+/// cursor at that index actually sits), or `s.len()` once `idx` is at or past
+/// the end.
+fn byte_offset(s: &str, idx: usize) -> usize {
+    s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Insert `c` at char-index `cursor` within `s`.
+fn insert_at_cursor(s: &mut String, cursor: usize, c: char) {
+    s.insert(byte_offset(s, cursor), c);
+}
+
+/// Remove the character immediately before char-index `cursor`, returning
+/// whether anything was removed (`false` when `cursor == 0`, matching how
+/// Backspace at the start of a field does nothing).
+fn remove_before_cursor(s: &mut String, cursor: usize) -> bool {
+    if cursor == 0 {
+        return false;
+    }
+    let end = byte_offset(s, cursor);
+    let start = byte_offset(s, cursor - 1);
+    s.replace_range(start..end, "");
+    true
+}
+
+/// Remove the character at char-index `cursor`, returning whether anything
+/// was removed (`false` once the cursor is at or past the end).
+fn remove_at_cursor(s: &mut String, cursor: usize) -> bool {
+    let start = byte_offset(s, cursor);
+    let Some(c) = s[start..].chars().next() else {
+        return false;
+    };
+    s.replace_range(start..start + c.len_utf8(), "");
+    true
+}
+
 /// Outcome of a left-click on the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickOutcome {
@@ -66,6 +109,9 @@ pub struct GroupJoinState {
     /// What the user has typed so far (a new group name, unless it matches
     /// an existing one — see [`Self::target`]).
     input: String,
+    /// Char-index position of the text cursor within `input` (0..=its char
+    /// length); see [`Self::push_char`]/[`Self::move_cursor_left`] etc.
+    cursor: usize,
     /// Indices into `candidates` whose name contains `input`
     /// (case-insensitive), in the same order as `candidates`.
     filtered: Vec<usize>,
@@ -88,6 +134,7 @@ impl GroupJoinState {
             session_id,
             candidates,
             input: String::new(),
+            cursor: 0,
             filtered: Vec::new(),
             selected: 0,
         };
@@ -105,6 +152,55 @@ impl GroupJoinState {
             .map(|(i, _)| i)
             .collect();
         self.selected = 0;
+    }
+
+    /// Insert `c` at the cursor and re-filter.
+    fn push_char(&mut self, c: char) {
+        insert_at_cursor(&mut self.input, self.cursor, c);
+        self.cursor += 1;
+        self.refilter();
+    }
+
+    /// Delete the character before the cursor and re-filter (no-op at the
+    /// start of the input).
+    fn backspace(&mut self) {
+        if remove_before_cursor(&mut self.input, self.cursor) {
+            self.cursor -= 1;
+            self.refilter();
+        }
+    }
+
+    /// Delete the character at the cursor and re-filter (no-op at the end of
+    /// the input).
+    fn delete_forward(&mut self) {
+        if remove_at_cursor(&mut self.input, self.cursor) {
+            self.refilter();
+        }
+    }
+
+    /// Move the cursor one character left, clamped at the start.
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor one character right, clamped at the end.
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(char_len(&self.input));
+    }
+
+    /// Move the cursor to the start of the input.
+    fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the cursor to the end of the input.
+    fn move_cursor_end(&mut self) {
+        self.cursor = char_len(&self.input);
+    }
+
+    /// Char-index position of the text cursor within [`Self::input`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -163,6 +259,9 @@ pub struct NewSessionState {
     candidates: Vec<String>,
     /// What the user has typed so far.
     input: String,
+    /// Char-index position of the text cursor within `input` (0..=its char
+    /// length); see [`Self::push_char`]/[`Self::move_cursor_left`] etc.
+    cursor: usize,
     /// Indices into `candidates` whose text contains `input`
     /// (case-insensitive), in the same recency order as `candidates` —
     /// filtering narrows the list, it doesn't re-rank it.
@@ -179,6 +278,7 @@ impl NewSessionState {
         let mut state = Self {
             candidates: unique_cwds(rows),
             input: String::new(),
+            cursor: 0,
             filtered: Vec::new(),
             selected: 0,
             error: None,
@@ -212,12 +312,64 @@ impl NewSessionState {
     }
 
     /// Complete the input to the currently highlighted candidate (bound to
-    /// Tab). No-op when nothing is highlighted.
+    /// Tab), moving the cursor to the end of the completed text — the same
+    /// place a normal shell's tab-completion leaves it. No-op when nothing is
+    /// highlighted.
     fn complete_candidate(&mut self) {
         if let Some(&i) = self.filtered.get(self.selected) {
             self.input = self.candidates[i].clone();
+            self.cursor = char_len(&self.input);
             self.refilter();
         }
+    }
+
+    /// Insert `c` at the cursor and re-filter.
+    fn push_char(&mut self, c: char) {
+        insert_at_cursor(&mut self.input, self.cursor, c);
+        self.cursor += 1;
+        self.refilter();
+    }
+
+    /// Delete the character before the cursor and re-filter (no-op at the
+    /// start of the input).
+    fn backspace(&mut self) {
+        if remove_before_cursor(&mut self.input, self.cursor) {
+            self.cursor -= 1;
+            self.refilter();
+        }
+    }
+
+    /// Delete the character at the cursor and re-filter (no-op at the end of
+    /// the input).
+    fn delete_forward(&mut self) {
+        if remove_at_cursor(&mut self.input, self.cursor) {
+            self.refilter();
+        }
+    }
+
+    /// Move the cursor one character left, clamped at the start.
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor one character right, clamped at the end.
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(char_len(&self.input));
+    }
+
+    /// Move the cursor to the start of the input.
+    fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the cursor to the end of the input.
+    fn move_cursor_end(&mut self) {
+        self.cursor = char_len(&self.input);
+    }
+
+    /// Char-index position of the text cursor within [`Self::input`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     /// The cwd typed so far.
@@ -306,6 +458,9 @@ pub struct App {
     /// Current search query. Always empty outside [`Mode::Search`] — entering
     /// Normal mode always clears it (see [`Self::exit_search`]).
     query: String,
+    /// Char-index position of the text cursor within `query` (0..=its char
+    /// length); see [`Self::push_char`]/[`Self::move_cursor_left`] etc.
+    query_cursor: usize,
     /// Indices into `rows` that match the query, in display order.
     filtered: Vec<usize>,
     /// Selected position within `filtered`.
@@ -375,6 +530,7 @@ impl App {
             mode: Mode::Normal,
             modal: None,
             query: String::new(),
+            query_cursor: 0,
             filtered: Vec::new(),
             selected: 0,
             offset: 0,
@@ -396,9 +552,13 @@ impl App {
         self.mode
     }
 
-    /// Enter [`Mode::Search`] (bound to `/` in Normal mode).
+    /// Enter [`Mode::Search`] (bound to `/` in Normal mode). The cursor
+    /// starts at the end of whatever query is already there (e.g. after a
+    /// [`Self::confirm_search`] kept it) — the same place re-focusing a
+    /// normal text field would leave it.
     pub fn enter_search(&mut self) {
         self.mode = Mode::Search;
+        self.query_cursor = char_len(&self.query);
     }
 
     /// Cancel the search: clear the query and return to [`Mode::Normal`]
@@ -460,41 +620,78 @@ impl App {
         self.modal = None;
     }
 
-    /// Append a character to the open modal's text input and re-filter its
-    /// candidates. No-op when no modal is open, or it has no text input
-    /// (e.g. the archive confirm dialog).
+    /// Insert a character at the open modal's text-input cursor and
+    /// re-filter its candidates. No-op when no modal is open, or it has no
+    /// text input (e.g. the archive confirm dialog).
     pub fn modal_push_char(&mut self, c: char) {
         if c.is_control() {
             return;
         }
         match &mut self.modal {
-            Some(Modal::NewSession(state)) => {
-                state.input.push(c);
-                state.refilter();
-            }
-            Some(Modal::GroupJoin(state)) => {
-                state.input.push(c);
-                state.refilter();
-            }
+            Some(Modal::NewSession(state)) => state.push_char(c),
+            Some(Modal::GroupJoin(state)) => state.push_char(c),
             Some(Modal::ConfirmArchive { .. }) | None => {}
         }
     }
 
-    /// Delete the open modal's last input character and re-filter. No-op
-    /// when no modal is open, the input is already empty, or it has no text
-    /// input.
+    /// Delete the character before the open modal's text-input cursor and
+    /// re-filter. No-op when no modal is open, the cursor is at the start,
+    /// or it has no text input.
     pub fn modal_backspace(&mut self) {
         match &mut self.modal {
-            Some(Modal::NewSession(state)) => {
-                if state.input.pop().is_some() {
-                    state.refilter();
-                }
-            }
-            Some(Modal::GroupJoin(state)) => {
-                if state.input.pop().is_some() {
-                    state.refilter();
-                }
-            }
+            Some(Modal::NewSession(state)) => state.backspace(),
+            Some(Modal::GroupJoin(state)) => state.backspace(),
+            _ => {}
+        }
+    }
+
+    /// Delete the character at the open modal's text-input cursor and
+    /// re-filter. No-op when no modal is open, the cursor is at the end, or
+    /// it has no text input.
+    pub fn modal_delete_forward(&mut self) {
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.delete_forward(),
+            Some(Modal::GroupJoin(state)) => state.delete_forward(),
+            _ => {}
+        }
+    }
+
+    /// Move the open modal's text-input cursor one character left, clamped
+    /// at the start. No-op when no modal is open or it has no text input.
+    pub fn modal_cursor_left(&mut self) {
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.move_cursor_left(),
+            Some(Modal::GroupJoin(state)) => state.move_cursor_left(),
+            _ => {}
+        }
+    }
+
+    /// Move the open modal's text-input cursor one character right, clamped
+    /// at the end. No-op when no modal is open or it has no text input.
+    pub fn modal_cursor_right(&mut self) {
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.move_cursor_right(),
+            Some(Modal::GroupJoin(state)) => state.move_cursor_right(),
+            _ => {}
+        }
+    }
+
+    /// Move the open modal's text-input cursor to the start. No-op when no
+    /// modal is open or it has no text input.
+    pub fn modal_cursor_home(&mut self) {
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.move_cursor_home(),
+            Some(Modal::GroupJoin(state)) => state.move_cursor_home(),
+            _ => {}
+        }
+    }
+
+    /// Move the open modal's text-input cursor to the end. No-op when no
+    /// modal is open or it has no text input.
+    pub fn modal_cursor_end(&mut self) {
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.move_cursor_end(),
+            Some(Modal::GroupJoin(state)) => state.move_cursor_end(),
             _ => {}
         }
     }
@@ -816,18 +1013,27 @@ impl App {
 
     // --- query editing --------------------------------------------------
 
-    /// Append a printable character to the query and re-filter.
+    /// Insert a printable character at the query cursor and re-filter.
     pub fn push_char(&mut self, c: char) {
         if c.is_control() {
             return;
         }
-        self.query.push(c);
+        insert_at_cursor(&mut self.query, self.query_cursor, c);
+        self.query_cursor += 1;
         self.refilter();
     }
 
-    /// Delete the last query character (if any) and re-filter.
+    /// Delete the character before the query cursor (if any) and re-filter.
     pub fn backspace(&mut self) {
-        if self.query.pop().is_some() {
+        if remove_before_cursor(&mut self.query, self.query_cursor) {
+            self.query_cursor -= 1;
+            self.refilter();
+        }
+    }
+
+    /// Delete the character at the query cursor (if any) and re-filter.
+    pub fn delete_forward(&mut self) {
+        if remove_at_cursor(&mut self.query, self.query_cursor) {
             self.refilter();
         }
     }
@@ -836,8 +1042,29 @@ impl App {
     pub fn clear_query(&mut self) {
         if !self.query.is_empty() {
             self.query.clear();
+            self.query_cursor = 0;
             self.refilter();
         }
+    }
+
+    /// Move the query cursor one character left, clamped at the start.
+    pub fn move_cursor_left(&mut self) {
+        self.query_cursor = self.query_cursor.saturating_sub(1);
+    }
+
+    /// Move the query cursor one character right, clamped at the end.
+    pub fn move_cursor_right(&mut self) {
+        self.query_cursor = (self.query_cursor + 1).min(char_len(&self.query));
+    }
+
+    /// Move the query cursor to the start of the query.
+    pub fn move_cursor_home(&mut self) {
+        self.query_cursor = 0;
+    }
+
+    /// Move the query cursor to the end of the query.
+    pub fn move_cursor_end(&mut self) {
+        self.query_cursor = char_len(&self.query);
     }
 
     /// Recompute the filter result and reset selection/scroll to the top.
@@ -1035,6 +1262,11 @@ impl App {
 
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Char-index position of the text cursor within [`Self::query`].
+    pub fn query_cursor(&self) -> usize {
+        self.query_cursor
     }
 
     pub fn should_quit(&self) -> bool {
@@ -1634,6 +1866,87 @@ mod tests {
     }
 
     #[test]
+    fn query_cursor_moves_and_clamps_at_both_ends() {
+        let mut app = App::new(numbered(1));
+        app.enter_search();
+        for c in "abc".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.query_cursor(), 3);
+
+        app.move_cursor_right(); // already at the end
+        assert_eq!(app.query_cursor(), 3);
+
+        app.move_cursor_left();
+        app.move_cursor_left();
+        app.move_cursor_left();
+        assert_eq!(app.query_cursor(), 0);
+
+        app.move_cursor_left(); // already at the start
+        assert_eq!(app.query_cursor(), 0);
+    }
+
+    #[test]
+    fn push_char_inserts_at_the_cursor_not_always_at_the_end() {
+        let mut app = App::new(numbered(1));
+        app.enter_search();
+        app.push_char('a');
+        app.push_char('c');
+        assert_eq!(app.query(), "ac");
+
+        app.move_cursor_left(); // cursor between 'a' and 'c'
+        app.push_char('b');
+
+        assert_eq!(app.query(), "abc");
+        assert_eq!(app.query_cursor(), 2); // right after the inserted 'b'
+    }
+
+    #[test]
+    fn backspace_deletes_the_character_before_the_cursor_not_always_the_last_one() {
+        let mut app = App::new(numbered(1));
+        app.enter_search();
+        for c in "abc".chars() {
+            app.push_char(c);
+        }
+        app.move_cursor_left(); // cursor between 'b' and 'c'
+
+        app.backspace(); // removes 'b'
+
+        assert_eq!(app.query(), "ac");
+        assert_eq!(app.query_cursor(), 1);
+    }
+
+    #[test]
+    fn delete_forward_removes_the_character_at_the_cursor() {
+        let mut app = App::new(numbered(1));
+        app.enter_search();
+        for c in "abc".chars() {
+            app.push_char(c);
+        }
+        app.move_cursor_home();
+
+        app.delete_forward(); // removes 'a'
+
+        assert_eq!(app.query(), "bc");
+        assert_eq!(app.query_cursor(), 0);
+    }
+
+    #[test]
+    fn move_cursor_home_and_end_jump_to_the_respective_edges() {
+        let mut app = App::new(numbered(1));
+        app.enter_search();
+        for c in "abc".chars() {
+            app.push_char(c);
+        }
+
+        app.move_cursor_home();
+        assert_eq!(app.query_cursor(), 0);
+
+        app.move_cursor_end();
+        assert_eq!(app.query_cursor(), 3);
+    }
+
+    #[test]
     fn confirm_search_returns_to_normal_but_keeps_the_query_and_filter() {
         let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]);
         app.set_viewport_height(10);
@@ -1785,6 +2098,89 @@ mod tests {
     }
 
     #[test]
+    fn modal_push_char_inserts_at_the_cursor_not_always_at_the_end() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        app.modal_push_char('a');
+        app.modal_push_char('c');
+        app.modal_cursor_left(); // cursor between 'a' and 'c'
+        app.modal_push_char('b');
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "abc");
+        assert_eq!(state.cursor(), 2);
+    }
+
+    #[test]
+    fn modal_delete_forward_removes_the_character_at_the_cursor() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "abc".chars() {
+            app.modal_push_char(c);
+        }
+        app.modal_cursor_home();
+
+        app.modal_delete_forward(); // removes 'a'
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "bc");
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn modal_cursor_home_and_end_jump_to_the_respective_edges() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "abc".chars() {
+            app.modal_push_char(c);
+        }
+
+        app.modal_cursor_home();
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.cursor(), 0);
+
+        app.modal_cursor_end();
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.cursor(), 3);
+    }
+
+    #[test]
+    fn modal_cursor_left_right_move_the_text_cursor_independently_of_candidate_selection() {
+        let mut app = App::new(vec![
+            row("1", "one", "/work/alpha"),
+            row("2", "two", "/work/beta"),
+        ]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "wo".chars() {
+            app.modal_push_char(c);
+        }
+        app.modal_select_next(); // highlight /work/beta
+        let target_before = app.modal_new_session_target();
+
+        app.modal_cursor_left();
+        app.modal_cursor_left();
+
+        assert_eq!(app.modal_new_session_target(), target_before);
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
     fn modal_select_next_prev_clamps_within_candidates() {
         let mut app = App::new(vec![row("1", "one", "/a"), row("2", "two", "/b")]);
         app.set_viewport_height(10);
@@ -1842,6 +2238,11 @@ mod tests {
         // No modal open: these must not panic and must do nothing.
         app.modal_push_char('x');
         app.modal_backspace();
+        app.modal_delete_forward();
+        app.modal_cursor_left();
+        app.modal_cursor_right();
+        app.modal_cursor_home();
+        app.modal_cursor_end();
         app.modal_select_next();
         app.modal_select_prev();
         app.modal_complete_candidate();

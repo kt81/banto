@@ -387,11 +387,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
     }
 }
 
-/// Translate a key press into an [`App`] action. Navigation and paging
-/// behave the same in both modes; everything else — including Enter — is
-/// mode-specific (see [`handle_normal_key`] / [`handle_search_key`]) because
-/// letter keys mean different things: commands in Normal mode, query text
-/// in Search mode.
+/// Translate a key press into an [`App`] action. Up/Down/PageUp/PageDown
+/// behave the same in both modes (always list navigation); everything else
+/// is mode-specific (see [`handle_normal_key`] / [`handle_search_key`]) —
+/// not just letters (commands in Normal mode, query text in Search mode),
+/// but also Left/Right/Home/End: list-jump/no-op in Normal mode, versus
+/// moving the search-box text cursor in Search mode, since there's no text
+/// input to edit outside of it.
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     // A transient notification (e.g. "pinned session X") is only relevant
     // until the user does something else — cleared here, before dispatch,
@@ -408,7 +410,8 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     }
     // A modal takes over all key handling while it's open — including
     // Up/Down, which mean "move the candidate selection" there rather than
-    // "move the list selection".
+    // "move the list selection", and Left/Right/Home/End, which move its
+    // text-input cursor rather than the list.
     if app.modal().is_some() {
         handle_modal_key(app, code, ctx);
         return;
@@ -418,8 +421,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
         KeyCode::Down => app.select_next(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
-        KeyCode::Home => app.select_first(),
-        KeyCode::End => app.select_last(),
         _ => match app.mode() {
             Mode::Normal => handle_normal_key(app, code, ctx),
             Mode::Search => handle_search_key(app, code),
@@ -427,11 +428,15 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     }
 }
 
-/// Normal-mode keys: letters are commands, not query input.
+/// Normal-mode keys: letters are commands, not query input. Home/End jump
+/// the list selection here (there's no text input to move a cursor within);
+/// Left/Right have nothing to do and are no-ops.
 fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     match code {
         KeyCode::Char('j') => app.select_next(),
         KeyCode::Char('k') => app.select_prev(),
+        KeyCode::Home => app.select_first(),
+        KeyCode::End => app.select_last(),
         KeyCode::Enter => activate(app, ctx),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('n') => app.open_new_session_modal(),
@@ -459,20 +464,27 @@ fn toggle_grouped_view(app: &mut App) {
     );
 }
 
-/// Keys while a modal is open: typed characters build its text input,
-/// Up/Down move its candidate selection, Tab completes the input to the
-/// highlighted candidate (new-session modal only), Backspace edits the
-/// input, Enter confirms (see [`confirm_modal`]), Esc cancels without
-/// acting. Shared across every modal kind — each of `App`'s `modal_*`
-/// methods is a no-op for a modal that doesn't have the relevant piece (e.g.
-/// the archive confirm dialog has no text input or candidate list).
+/// Keys while a modal is open: typed characters insert at its text-input
+/// cursor, Left/Right/Home/End move that cursor (never the candidate
+/// selection), Up/Down move the candidate selection instead, Tab completes
+/// the input to the highlighted candidate (new-session modal only),
+/// Backspace/Delete edit around the cursor, Enter confirms (see
+/// [`confirm_modal`]), Esc cancels without acting. Shared across every modal
+/// kind — each of `App`'s `modal_*` methods is a no-op for a modal that
+/// doesn't have the relevant piece (e.g. the archive confirm dialog has no
+/// text input or candidate list).
 fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     match code {
         KeyCode::Esc => app.close_modal(),
         KeyCode::Up => app.modal_select_prev(),
         KeyCode::Down => app.modal_select_next(),
+        KeyCode::Left => app.modal_cursor_left(),
+        KeyCode::Right => app.modal_cursor_right(),
+        KeyCode::Home => app.modal_cursor_home(),
+        KeyCode::End => app.modal_cursor_end(),
         KeyCode::Tab => app.modal_complete_candidate(),
         KeyCode::Backspace => app.modal_backspace(),
+        KeyCode::Delete => app.modal_delete_forward(),
         KeyCode::Enter => confirm_modal(app, ctx),
         KeyCode::Char(c) => app.modal_push_char(c),
         _ => {}
@@ -600,13 +612,19 @@ fn confirm_group_join_modal(app: &mut App, ctx: &Context) {
 }
 
 /// Search-mode keys: characters type into the query (`j`/`k` included —
-/// they're ordinary query text here, not movement). Enter confirms the
-/// search (back to Normal, keeping the query/filter, so the just-filtered
-/// list can be navigated); Esc cancels it (clears the query, back to
-/// Normal).
+/// they're ordinary query text here, not movement) at the query cursor;
+/// Left/Right/Home/End move that cursor, Backspace/Delete edit around it.
+/// Enter confirms the search (back to Normal, keeping the query/filter, so
+/// the just-filtered list can be navigated); Esc cancels it (clears the
+/// query, back to Normal).
 fn handle_search_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Home => app.move_cursor_home(),
+        KeyCode::End => app.move_cursor_end(),
         KeyCode::Enter => app.confirm_search(),
         KeyCode::Esc => app.exit_search(),
         KeyCode::Char(c) => app.push_char(c),
@@ -1126,12 +1144,11 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(border_color))
         .title(" Search ");
     let inner = block.inner(area);
-    let visible = tail_to_width(app.query(), inner.width);
+    let (visible, cursor_col) = windowed_view(app.query(), app.query_cursor(), inner.width);
     frame.render_widget(Paragraph::new(visible.as_str()).block(block), area);
 
     if active && inner.width > 0 {
-        let query_cols = visible.width() as u16;
-        let cursor_x = (inner.x + query_cols).min(inner.x + inner.width - 1);
+        let cursor_x = (inner.x + cursor_col).min(inner.x + inner.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, inner.y));
     }
 }
@@ -1401,26 +1418,60 @@ fn truncate_to_width(s: &str, max_width: u16) -> String {
     out
 }
 
-/// Return the longest suffix of `s` whose display width fits within
-/// `max_width` columns. Used for actively-edited text inputs (the search
-/// box, the cwd/group-name modal inputs) so the cursor end stays visible,
-/// scrolling the field the way a normal terminal input box does, instead of
-/// the cursor position math (previously `s.chars().count()`, which
-/// undercounts a full-width character's true 2-column width) silently
-/// drifting away from where the text it's meant to mark actually ends.
-fn tail_to_width(s: &str, max_width: u16) -> String {
+/// Compute the slice of `s` to display in a `max_width`-column single-line
+/// input box so the cursor (`cursor`, a char index into `s`) stays visible,
+/// plus the cursor's on-screen column relative to that slice (which the
+/// caller still needs to clamp to `max_width - 1`, same as any other
+/// in-box column, since a cursor at the very end of a maxed-out field sits
+/// one column past the last visible character). Used by every editable
+/// text input (the search box, the cwd/group-name modal inputs), now that
+/// the cursor can sit anywhere in the string rather than always at the end.
+///
+/// Never splits a full-width character (see [`truncate_to_width`]): a
+/// character whose column span crosses the window's edge is left out
+/// entirely rather than half-drawn. Reduces to showing the tail of the
+/// string when the cursor is at or near the end (matching a normal
+/// terminal input box scrolling as you type), and the head when the cursor
+/// is at or near the start.
+fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
     let max_width = max_width as usize;
-    let mut width = 0usize;
-    let mut start = s.len();
-    for (idx, c) in s.char_indices().rev() {
-        let w = c.width().unwrap_or(0);
-        if width + w > max_width {
-            break;
-        }
-        width += w;
-        start = idx;
+    if max_width == 0 {
+        return (String::new(), 0);
     }
-    s[start..].to_string()
+    let cursor_byte = s
+        .char_indices()
+        .nth(cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let prefix_width = s[..cursor_byte].width();
+    let total_width = s.width();
+    if total_width <= max_width {
+        return (s.to_string(), prefix_width as u16);
+    }
+
+    // Choose the window's start column so the cursor stays inside it,
+    // clamped so the window never scrolls further right than the string's
+    // own end (i.e. it shows the tail exactly, rather than trailing blank
+    // space, once the cursor is near the end).
+    let max_start = total_width - max_width;
+    let start_col = prefix_width
+        .saturating_sub(max_width.saturating_sub(1))
+        .min(max_start);
+
+    let mut visible = String::new();
+    let mut col = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if col >= start_col {
+            if col + w > start_col + max_width {
+                break;
+            }
+            visible.push(c);
+        }
+        col += w;
+    }
+    let cursor_col = prefix_width.saturating_sub(start_col) as u16;
+    (visible, cursor_col)
 }
 
 /// Render whichever modal is open as a centered overlay on top of the rest
@@ -1462,11 +1513,11 @@ fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Re
     ])
     .areas(inner);
 
-    let visible_input = tail_to_width(state.input(), input_area.width);
+    let (visible_input, cursor_col) =
+        windowed_view(state.input(), state.cursor(), input_area.width);
     frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
     if input_area.width > 0 {
-        let input_cols = visible_input.width() as u16;
-        let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
+        let cursor_x = (input_area.x + cursor_col).min(input_area.x + input_area.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, input_area.y));
     }
 
@@ -1550,11 +1601,11 @@ fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect
         hint_area,
     );
 
-    let visible_input = tail_to_width(state.input(), input_area.width);
+    let (visible_input, cursor_col) =
+        windowed_view(state.input(), state.cursor(), input_area.width);
     frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
     if input_area.width > 0 {
-        let input_cols = visible_input.width() as u16;
-        let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
+        let cursor_x = (input_area.x + cursor_col).min(input_area.x + input_area.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, input_area.y));
     }
 
@@ -1834,6 +1885,59 @@ mod tests {
         assert_eq!(app.selected_row().unwrap().id, "c");
         handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &ctx);
         assert_eq!(app.selected_row().unwrap().id, "b");
+    }
+
+    #[test]
+    fn home_and_end_jump_the_list_selection_in_normal_mode() {
+        // Home/End in a modal or Search mode move a text cursor instead (see
+        // `left_right_and_home_end_move_the_search_query_cursor_in_search_mode`
+        // / `left_right_in_a_modal_move_the_text_cursor_not_the_candidate_selection`);
+        // this guards against that routing regressing plain list navigation.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "A", "", Activity::Alive),
+            row("b", "B", "", Activity::Alive),
+            row("c", "C", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::End, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.selected_row().unwrap().id, "c");
+
+        handle_key(&mut app, KeyCode::Home, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.selected_row().unwrap().id, "a");
+    }
+
+    #[test]
+    fn left_right_and_home_end_move_the_search_query_cursor_in_search_mode() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE, &ctx);
+        for c in "ac".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &ctx);
+        }
+        assert_eq!(app.query(), "ac");
+        assert_eq!(app.query_cursor(), 2);
+
+        // Left moves the cursor, so the next typed char inserts mid-string.
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE, &ctx);
+        handle_key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "abc");
+
+        handle_key(&mut app, KeyCode::Home, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query_cursor(), 0);
+        handle_key(&mut app, KeyCode::End, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query_cursor(), 3);
+
+        // Right at the end clamps rather than overflowing.
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query_cursor(), 3);
     }
 
     #[test]
@@ -2347,6 +2451,38 @@ mod tests {
     }
 
     #[test]
+    fn left_right_in_a_modal_move_the_text_cursor_not_the_candidate_selection() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "/work/alpha", Activity::Alive),
+            row("b", "Beta", "/work/beta", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        for c in "wo".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &ctx);
+        }
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE, &ctx); // selects /work/beta
+        let target_before = app.modal_new_session_target();
+
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE, &ctx);
+
+        // Left didn't touch the candidate selection...
+        assert_eq!(app.modal_new_session_target(), target_before);
+
+        // ...but it did move the text cursor: a following char inserts
+        // between 'w' and 'o', not appended at the end.
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &ctx);
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "wxo");
+    }
+
+    #[test]
     fn modal_area_shrinks_margin_in_a_narrow_pane_scales_by_percentage_in_a_mid_one_and_caps_in_a_wide_one()
      {
         // Narrow: minimal margin, modal fills almost the whole width.
@@ -2664,13 +2800,45 @@ mod tests {
     }
 
     #[test]
-    fn tail_to_width_keeps_the_end_when_the_input_overflows() {
-        assert_eq!(tail_to_width("hello world", 5), "world");
+    fn windowed_view_shows_the_tail_when_the_cursor_is_at_the_end() {
+        let (visible, cursor_col) = windowed_view("hello world", 11, 5);
+        assert_eq!(visible, "world");
+        // One past the last visible column; the caller clamps this into the
+        // box, same as any other cursor position.
+        assert_eq!(cursor_col, 5);
     }
 
     #[test]
-    fn tail_to_width_never_splits_a_full_width_character() {
-        assert_eq!(tail_to_width(&"あ".repeat(3), 3), "あ");
+    fn windowed_view_shows_the_head_when_the_cursor_is_at_the_start() {
+        let (visible, cursor_col) = windowed_view("hello world", 0, 5);
+        assert_eq!(visible, "hello");
+        assert_eq!(cursor_col, 0);
+    }
+
+    #[test]
+    fn windowed_view_keeps_the_cursor_visible_when_editing_mid_string() {
+        // cursor at char-index 8 ("hello wo|rld"), a 6-column window.
+        let (visible, cursor_col) = windowed_view("hello world", 8, 6);
+        assert_eq!(visible, "lo wor");
+        assert_eq!(cursor_col, 5);
+    }
+
+    #[test]
+    fn windowed_view_never_splits_a_full_width_character() {
+        let (visible, cursor_col) = windowed_view(&"あ".repeat(3), 3, 3);
+        assert_eq!(visible, "あ");
+        assert_eq!(cursor_col, 3);
+    }
+
+    #[test]
+    fn windowed_view_cursor_column_accounts_for_a_full_width_character_before_it() {
+        // "aあb": cursor after char-index 2 (past 'a' and 'あ'). Width-wise
+        // that's column 3 (1 + 2), not char-count 2 — this is what a
+        // width-aware cursor column must get right that a naive
+        // `chars().count()` one would not.
+        let (visible, cursor_col) = windowed_view("aあb", 2, 10);
+        assert_eq!(visible, "aあb");
+        assert_eq!(cursor_col, 3);
     }
 
     /// Reproduces the actual dogfooding scenario, not a contrived one: the
