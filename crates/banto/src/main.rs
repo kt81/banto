@@ -72,6 +72,14 @@ enum Command {
         /// inside an unrelated tmux session).
         #[arg(long, requires = "new_session", required_if_eq("new_session", "true"))]
         backend: Option<String>,
+        /// Diagnostic log path for this process's own `WrapLog` (new-session
+        /// mode only), passed explicitly by the opener rather than left for
+        /// this process to read `BANTO_WRAP_LOG` from its own environment: a
+        /// psmux-spawned process does not reliably inherit banto's
+        /// environment (docs/notes/psmux-spike.md) — see
+        /// `crate::wrap::WrapLog::new`.
+        #[arg(long, requires = "new_session")]
+        wrap_log: Option<PathBuf>,
         /// The command to run, e.g. `claude --resume <id>` (resume mode)
         /// or plain `claude` (new-session mode).
         #[arg(last = true, required = true)]
@@ -94,6 +102,7 @@ fn main() -> Result<()> {
             new_session,
             cwd,
             backend,
+            wrap_log,
             argv,
         }) => {
             let store = open_store(&config)?;
@@ -109,6 +118,7 @@ fn main() -> Result<()> {
                     &cwd,
                     &argv,
                     backend,
+                    wrap_log.as_deref(),
                     |key| std::env::var(key).ok(),
                     wrap::NewSessionDeps {
                         process_runner: &SystemProcessRunner,

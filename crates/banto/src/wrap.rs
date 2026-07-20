@@ -57,7 +57,7 @@ pub fn run(
     // own $TMUX (see `crate::tui::activate`'s BANTO_INPUT_LOG
     // instrumentation) to confirm or rule out this resumed pane having
     // landed on a different psmux server than banto itself is running on.
-    let log = WrapLog::new();
+    let log = WrapLog::new(None);
     log.log(&format!(
         "run (resume) start session_id={session} own TMUX={:?} TMUX_PANE={:?} argv={argv:?}",
         std::env::var("TMUX").ok(),
@@ -127,22 +127,37 @@ pub struct NewSessionDeps<'a> {
     pub provider: &'a ClaudeCodeProvider,
 }
 
-/// Diagnostic log for [`run_new_session`]'s new-session tracking flow,
-/// enabled via the `BANTO_WRAP_LOG` env var (its value is the file path) —
-/// mirrors `crate::tui`'s `BANTO_INPUT_LOG` mechanism. Purely for debugging
-/// a session that fails to become trackable in the field (a bad
-/// `display-message` result, a `find_new_session` that never matches, a
-/// discovery timeout); it has no effect on behavior, so it is not itself
-/// unit-tested (see [`WrapLog::disabled`], used by the tests that do care
-/// about the surrounding logic).
+/// Diagnostic log for [`run`]/[`run_new_session`]'s tracking flow, enabled
+/// via the `BANTO_WRAP_LOG` env var (its value is the file path) or an
+/// explicit path — mirrors `crate::tui`'s `BANTO_INPUT_LOG` mechanism.
+/// Purely for debugging a session that fails to become trackable in the
+/// field (a bad `display-message` result, a `find_new_session` that never
+/// matches, a discovery timeout); it has no effect on behavior, so it is
+/// not itself unit-tested (see [`WrapLog::disabled`], used by the tests
+/// that do care about the surrounding logic).
 struct WrapLog(RefCell<Option<std::fs::File>>);
 
 impl WrapLog {
-    /// Open the log file when `BANTO_WRAP_LOG` is set; otherwise every
-    /// `log` call is a no-op. A failure to open the file (bad path,
-    /// permissions) degrades to disabled rather than failing the launch.
-    fn new() -> Self {
-        let file = std::env::var_os("BANTO_WRAP_LOG").and_then(|path| {
+    /// Open the log file at `explicit_path` if given, else at the
+    /// `BANTO_WRAP_LOG` env var's value if set; otherwise every `log` call
+    /// is a no-op. A failure to open the file (bad path, permissions)
+    /// degrades to disabled rather than failing the launch.
+    ///
+    /// `explicit_path` exists because a psmux-spawned `_wrap` process does
+    /// not reliably inherit banto's own environment (psmux does not forward
+    /// the client's env to the pane it creates, unlike a directly forked
+    /// child — see docs/notes/psmux-spike.md), so `BANTO_WRAP_LOG` alone
+    /// silently produced no log at all for the new-session path. The opener
+    /// resolves its own `BANTO_WRAP_LOG` (if set) and passes it through
+    /// `_wrap --new-session --wrap-log <path>` argv instead, which
+    /// [`run_new_session`] forwards here. [`run`] (resume mode) has no such
+    /// argv slot yet and always passes `None`, reading `BANTO_WRAP_LOG` from
+    /// its own (possibly non-inherited) environment as before.
+    fn new(explicit_path: Option<&Path>) -> Self {
+        let path = explicit_path
+            .map(|p| p.as_os_str().to_os_string())
+            .or_else(|| std::env::var_os("BANTO_WRAP_LOG"));
+        let file = path.and_then(|path| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -195,6 +210,10 @@ impl WrapLog {
 /// already-resolved choice (the same one it used to open the pane this
 /// process is running in), not re-detected here.
 ///
+/// `wrap_log_path` is `_wrap --new-session`'s own `--wrap-log <path>` flag
+/// (see [`WrapLog::new`] for why this process can't just rely on
+/// `BANTO_WRAP_LOG` from its own environment).
+///
 /// `deps` groups the external-process dependencies (so this stays under
 /// clippy's argument-count limit) — each is still independently swappable
 /// in tests, exactly as if it were its own parameter.
@@ -203,10 +222,11 @@ pub fn run_new_session(
     cwd: &Path,
     argv: &[String],
     backend: Backend,
+    wrap_log_path: Option<&Path>,
     env: impl Fn(&str) -> Option<String>,
     deps: NewSessionDeps<'_>,
 ) -> Result<i32> {
-    let log = WrapLog::new();
+    let log = WrapLog::new(wrap_log_path);
     log.log(&format!(
         "run_new_session start cwd={} backend={backend:?} argv={argv:?}",
         cwd.display()
@@ -823,6 +843,7 @@ mod tests {
             Path::new("/work/proj"),
             &["claude".to_string()],
             Backend::WindowsTerminal,
+            None,
             env,
             NewSessionDeps {
                 process_runner: &process_runner,
@@ -856,6 +877,7 @@ mod tests {
             Path::new("/work/proj"),
             &["claude".to_string()],
             Backend::Psmux,
+            None,
             env,
             NewSessionDeps {
                 process_runner: &process_runner,
@@ -915,6 +937,7 @@ mod tests {
             Path::new("/work/proj"),
             &["claude".to_string()],
             Backend::Psmux,
+            None,
             env,
             NewSessionDeps {
                 process_runner: &process_runner,
@@ -933,5 +956,43 @@ mod tests {
             store.get_pane(&SessionId("new-id".to_string())).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn run_new_session_logs_to_the_explicit_wrap_log_path_argument() {
+        // psmux does not reliably forward banto's own environment to the
+        // pane it spawns `_wrap --new-session` into (docs/notes/psmux-spike.md),
+        // so `BANTO_WRAP_LOG` alone can silently produce no log at all for
+        // this path. `--wrap-log <path>` (threaded through argv by the
+        // opener instead) must be honored regardless of what's in this
+        // process's own environment.
+        let claude_home = TempDir::new().unwrap();
+        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let store = Store::open_in_memory().unwrap();
+        let process_runner = MockProcessRunner::new(Some(0));
+        let command_runner = MockCommandRunner::default();
+        let env = |_: &str| None;
+        let log_dir = TempDir::new().unwrap();
+        let log_path = log_dir.path().join("wrap.log");
+
+        let code = run_new_session(
+            &store,
+            Path::new("/work/proj"),
+            &["claude".to_string()],
+            Backend::WindowsTerminal,
+            Some(log_path.as_path()),
+            env,
+            NewSessionDeps {
+                process_runner: &process_runner,
+                command_runner: &command_runner,
+                provider: &provider,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("wrap: run_new_session start"));
+        assert!(contents.contains("no focusable pane resolved"));
     }
 }

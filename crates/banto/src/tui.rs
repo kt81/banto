@@ -569,7 +569,17 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
     let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
     let tmux_pane = std::env::var("TMUX_PANE").ok();
     let anchor = opener::resolve_own_anchor(backend, &SystemCommandRunner, tmux_pane.as_deref());
-    let outcome = opener::open_new_session(backend, &cwd, SystemCommandRunner, anchor.as_deref());
+    // Passed through explicitly rather than left for `_wrap` to read its own
+    // environment: a psmux-spawned process doesn't reliably inherit banto's
+    // (docs/notes/psmux-spike.md) — see `crate::wrap::WrapLog::new`.
+    let wrap_log = std::env::var("BANTO_WRAP_LOG").ok();
+    let outcome = opener::open_new_session(
+        backend,
+        &cwd,
+        SystemCommandRunner,
+        anchor.as_deref(),
+        wrap_log.as_deref(),
+    );
 
     let message = match outcome {
         Ok(OpenOutcome::Opened) => format!("launched a new session in {}", cwd.display()),
