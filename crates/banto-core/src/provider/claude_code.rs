@@ -112,6 +112,8 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
         mtime,
         size: metadata.len(),
         is_agent: fields.is_agent,
+        // TODO(core teammate): expose the first-user-message excerpt.
+        preview: None,
     })
 }
 

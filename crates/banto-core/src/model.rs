@@ -38,6 +38,9 @@ pub struct SessionMeta {
     /// Detected from a `{"type":"agent-setting"}` record in the file head
     /// (observed 2026-07-19); interactive sessions start with `mode` records.
     pub is_agent: bool,
+    /// Short single-line excerpt of the first user message, for the summary
+    /// panel. Independent of `title` (which may come from custom/ai titles).
+    pub preview: Option<String>,
 }
 
 /// Activity state rendered as the colored dot in the session list.

@@ -129,6 +129,7 @@ pub(crate) mod test_util {
             mtime: UNIX_EPOCH + Duration::from_millis(1_750_000_000_000),
             size: 42,
             is_agent: false,
+            preview: None,
         }
     }
 

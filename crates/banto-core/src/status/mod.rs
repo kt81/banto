@@ -100,6 +100,7 @@ mod tests {
             mtime: fixed_now() - age,
             size: 0,
             is_agent: false,
+            preview: None,
         }
     }
 

@@ -87,6 +87,8 @@ impl Store {
                 mtime: unix_ms_to_system_time(row.get(5)?),
                 size: row.get::<_, i64>(6)?.max(0) as u64,
                 is_agent: row.get(7)?,
+                // Not persisted in the cache; the provider is the source.
+                preview: None,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
