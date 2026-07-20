@@ -50,3 +50,38 @@ Still unverified: `respawn-pane` (not needed by the current opener design).
 See also [`conpty-input-corruption.md`](conpty-input-corruption.md) for a
 different layer of psmux findings: input delivery corruption (dropped ESC
 bytes, corrupted keys) observed running banto's TUI inside psmux on Windows.
+
+## Non-unique window/pane ids across sessions (2026-07-20, on-device)
+
+Unlike tmux — where `@window_id` / `%pane_id` are unique per *server* — psmux
+**reuses these ids across sessions**. Confirmed on a live server: pane `%2`
+existed in both session `play` and session `test` simultaneously; `%2`
+appeared twice in `list-panes -a -F '#{pane_id}'`.
+
+Consequences and the verified session-qualified forms banto must use:
+
+| Target form | Result |
+|---|---|
+| `display-message -t %2` (bare, id in two sessions) | Ambiguous — resolved to the *current* session (not an error, not random, but not guaranteed) |
+| `select-window -t '<session>:<@window_id>'` | **FAILS**: `can't find window: @3`. Must use `<session>:<index>` or `<session>:<name>`, NOT the `@id` |
+| `select-pane -t '<session>:<%pane_id>'` | **OK** — session + bare pane id, no window component needed; this is the reliable focus form |
+| `select-pane -t '<session>:<%pane>' -T <title>` | OK (tagging) |
+| `split-window`/`new-window` `-P -F '#{session_name}:#{window_id}:#{pane_id}'` | OK — captures the creating session, so the pane record can be session-qualified |
+| `display-message -p '#{session_name}'` (no `-t`) | OK — the reliable way for banto to learn its OWN session name |
+| `$TMUX` env third field (session-id number) used as `-t '$0'` | **FAILS** / unreliable — the real `#{session_id}` did not match it. Do not use the env route |
+
+### `switch-client` is DESTRUCTIVE on this psmux build — never call it
+
+Testing cross-session focus, `switch-client -t <session>` corrupted the
+server's client/session accounting: it hijacked the user's attached client
+away from its session, then a subsequent (unrelated, normally-safe)
+`kill-window` of a temp spike window destroyed a whole session that was not
+being killed, and the remaining sessions ended up merged/renamed
+incoherently. **banto must never run `switch-client`.**
+
+Design consequence: banto opens every resumed/new session as a **pane split
+in banto's OWN session** (session-qualified anchor), and focuses only with
+`select-pane -t '<own_session>:<%pane_id>'` — same session, no window switch,
+no client switch. Because the pane always lives in banto's own session,
+focus never needs to cross sessions, so `switch-client` (and the failing
+`select-window -t <session>:@id`) are never needed.
