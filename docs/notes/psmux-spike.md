@@ -85,3 +85,32 @@ in banto's OWN session** (session-qualified anchor), and focuses only with
 no client switch. Because the pane always lives in banto's own session,
 focus never needs to cross sessions, so `switch-client` (and the failing
 `select-window -t <session>:@id`) are never needed.
+
+### `display-message` takes the format positionally, NOT via `-F`
+
+`display-message -p -t <pane> -F '<format>'` does NOT work — psmux echoes the
+literal `-F ` into stdout (`"-F test:@1"`), which silently corrupted a
+recorded pane target to `-F test:@1:%8` and broke focus. The format is a bare
+positional after `-p`: `display-message -p -t <pane> '<format>'`. (The `-F`
+flag IS correct for the *other* command family — `new-window`/`split-window
+-P -F '<format>'` — so don't confuse them.)
+
+## Diagnostic logging (kept in the binary; inert unless enabled)
+
+These were built to diagnose the ConPTY input corruption and the psmux
+pane-tracking bugs, and are retained because those classes of problem only
+reproduce on a real psmux/ConPTY and are otherwise invisible. All are no-ops
+unless explicitly turned on.
+
+| Toggle | Process | Captures |
+|---|---|---|
+| `BANTO_INPUT_LOG=<file>` (env) | the TUI | every raw crossterm event + escape/SGR-resolution decision + banto's own `$TMUX`/`$TMUX_PANE`; lines prefixed `tui:` |
+| `BANTO_WRAP_LOG=<file>` (env) | `banto _wrap` (resume path) | `_wrap`'s `$TMUX`/`$TMUX_PANE`, session id, child exit; lines prefixed `wrap:` |
+| `--wrap-log <file>` (argv) | `banto _wrap --new-session` | the full new-session flow: `resolve_own_pane` (incl. the `display-message` argv + output), each `find_new_session` poll, and whether/why a pane record was written |
+
+Note the `--wrap-log` argv route exists because a psmux pane's process is
+spawned by the psmux *server*, not by banto, so it does NOT inherit banto's
+environment — an env-var toggle never reaches `_wrap`. banto reads its own
+`BANTO_WRAP_LOG` and forwards it to the new-session `_wrap` as `--wrap-log`.
+Both `BANTO_INPUT_LOG` and `BANTO_WRAP_LOG` may point at the same file; the
+`tui:`/`wrap:` prefixes keep the origins unambiguous.
