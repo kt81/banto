@@ -46,3 +46,7 @@ Verified on-device, non-destructively (`new-window -d` + `kill-window`):
 | `select-pane -T` + `list-panes -F '#{pane_id} #{pane_title}'` | OK (re-confirmed) |
 
 Still unverified: `respawn-pane` (not needed by the current opener design).
+
+See also [`conpty-input-corruption.md`](conpty-input-corruption.md) for a
+different layer of psmux findings: input delivery corruption (dropped ESC
+bytes, corrupted keys) observed running banto's TUI inside psmux on Windows.

@@ -81,7 +81,7 @@ in turn takes priority over the `~/.claude` default.
 | `Esc` | Clear the query if non-empty, otherwise quit |
 | `q` | Quit (only when the query is empty) |
 | `p` | Toggle pin on the selected session (only when the query is empty) |
-| `Ctrl+C` | Quit |
+| `Ctrl+C` | Quit (best-effort; inside psmux it does not reach banto — use `q`/`Esc`) |
 
 Mouse: wheel scrolls the list, a single click selects a row, and a quick
 second click on the same row (double-click) activates it — same as `Enter`.
