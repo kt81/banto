@@ -19,6 +19,13 @@
 //! Per docs/REQUIREMENTS.md "Opener spec", this wrapper is what makes
 //! double-resume prevention possible at all, since `wt.exe` detaches
 //! immediately and leaves nothing else to track.
+//!
+//! Both modes log to [`WrapLog`] (`BANTO_WRAP_LOG`), including their own
+//! `$TMUX`/`$TMUX_PANE` — diagnostic-only, for comparing against the
+//! *opener*'s own server/pane identity (`crate::tui::activate`'s
+//! `BANTO_INPUT_LOG` instrumentation) to confirm or rule out a
+//! resumed/opened pane landing on a different psmux server than banto
+//! itself runs on.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -44,11 +51,25 @@ pub fn run(
 ) -> Result<i32> {
     let id = SessionId(session.to_string());
 
+    // Diagnostic only (BANTO_WRAP_LOG, same file/mechanism as
+    // `run_new_session`'s `WrapLog`): this process's own server/pane
+    // identity, so a captured log can be compared against the *opener*'s
+    // own $TMUX (see `crate::tui::activate`'s BANTO_INPUT_LOG
+    // instrumentation) to confirm or rule out this resumed pane having
+    // landed on a different psmux server than banto itself is running on.
+    let log = WrapLog::new();
+    log.log(&format!(
+        "run (resume) start session_id={session} own TMUX={:?} TMUX_PANE={:?} argv={argv:?}",
+        std::env::var("TMUX").ok(),
+        std::env::var("TMUX_PANE").ok()
+    ));
+
     register_pid(store, &id);
 
     let code = runner
         .run(argv)
         .with_context(|| format!("failed to run wrapped command: {argv:?}"))?;
+    log.log(&format!("run (resume) child exited code={code:?}"));
 
     // Best-effort cleanup: a store failure here must not mask the child's
     // own exit code.

@@ -1117,6 +1117,15 @@ fn activate(app: &mut App, ctx: &Context) {
     // Anchor psmux splits on banto's own pane so the resume pane lands
     // next to banto, not in whatever window the client has focused.
     let anchor = std::env::var("TMUX_PANE").ok();
+    // Diagnostic only (BANTO_INPUT_LOG): banto's own server/pane identity,
+    // so a captured log can be compared against `_wrap`'s own $TMUX (see
+    // `crate::wrap`'s BANTO_WRAP_LOG instrumentation) to confirm or rule
+    // out a resumed/opened pane landing on a *different* psmux server.
+    ctx.log(&format!(
+        "activate: session={id} banto TMUX={:?} TMUX_PANE={:?}",
+        std::env::var("TMUX").ok(),
+        anchor
+    ));
     // Only consulted when there's no pane record for this session (see
     // `opener::open_session`), so a fresh read here (rather than caching
     // across activations) keeps it current without needing to invalidate.
@@ -1130,6 +1139,13 @@ fn activate(app: &mut App, ctx: &Context) {
         anchor.as_deref(),
         &live,
     );
+    ctx.log(&format!("activate: open_session outcome={outcome:?}"));
+    if let Ok(record) = ctx.store.borrow().get_pane(&SessionId(id.clone())) {
+        ctx.log(&format!(
+            "activate: pane record after open = {:?}",
+            record.map(|r| (r.backend, r.target))
+        ));
+    }
 
     let message = match outcome {
         Ok(OpenOutcome::Focused) => format!("focused existing pane (session {id})"),
