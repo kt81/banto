@@ -9,7 +9,7 @@
 //! [`crate::wrap`] — mirroring how `banto_core::status` judges session
 //! activity), never by querying the terminal backend itself.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use banto_core::config::OpenerMode;
@@ -141,11 +141,30 @@ pub(crate) fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn Proces
 }
 
 /// A terminal hand-off ready to run in-place: the argv to execute with
-/// inherited stdio, and the directory to run it in.
+/// inherited stdio, the directory to run it in, and a one-line status to
+/// print to stdout right before spawning it (see [`resume_startup_message`]/
+/// [`new_session_startup_message`]) — resuming can take several seconds, and
+/// without this the user just sees a bare, silent shell in that gap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InPlaceLaunch {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
+    pub startup_message: String,
+}
+
+/// The startup message for resuming `title` in place (see [`InPlaceLaunch`]).
+/// `title` is expected to already be the display title-or-id-fallback (see
+/// `SessionToOpen::title`, built from `SessionRow::display_title`) — plain
+/// ASCII wording so it's safe at any terminal width; `title` itself is
+/// user/session data and is printed as-is.
+pub(crate) fn resume_startup_message(title: &str) -> String {
+    format!("banto: resuming \"{title}\" ... (returns to the list when the session closes)")
+}
+
+/// The startup message for launching a new session in place at `cwd` (see
+/// [`InPlaceLaunch`]).
+pub(crate) fn new_session_startup_message(cwd: &Path) -> String {
+    format!("banto: starting a new session in {} ...", cwd.display())
 }
 
 /// Build the in-place launch argv. Unlike [`wrap_argv`] (the split-resume
@@ -179,6 +198,7 @@ pub(crate) fn decide_inplace_resume(
         Some(InPlaceLaunch {
             argv: inplace_argv(Some(&session.id)),
             cwd: session.cwd.clone(),
+            startup_message: resume_startup_message(&session.title),
         })
     }
 }
@@ -569,6 +589,24 @@ mod tests {
     }
 
     #[test]
+    fn resume_startup_message_is_plain_ascii_and_names_the_title() {
+        let message = resume_startup_message("Fix login bug");
+        assert_eq!(
+            message,
+            "banto: resuming \"Fix login bug\" ... \
+             (returns to the list when the session closes)"
+        );
+        assert!(message.is_ascii());
+    }
+
+    #[test]
+    fn new_session_startup_message_is_plain_ascii_and_names_the_cwd() {
+        let message = new_session_startup_message(Path::new("/work/alpha"));
+        assert_eq!(message, "banto: starting a new session in /work/alpha ...");
+        assert!(message.is_ascii());
+    }
+
+    #[test]
     fn decide_inplace_resume_proceeds_when_the_session_is_not_live() {
         let probe = MockProbe::with_alive(&[]);
 
@@ -579,6 +617,7 @@ mod tests {
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
         assert_eq!(launch.cwd, PathBuf::from("/work/alpha"));
+        assert_eq!(launch.startup_message, resume_startup_message("Fix login"));
     }
 
     #[test]

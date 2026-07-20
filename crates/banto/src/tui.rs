@@ -325,6 +325,18 @@ fn run_pending_inplace(
         pending.cwd.display()
     ));
     restore_terminal()?;
+    // Resuming can take a few seconds before `claude` paints anything of its
+    // own; without this, that gap is a bare, silent shell. Printed after
+    // `restore_terminal` (so it lands in the real terminal, not the
+    // about-to-be-torn-down alternate screen) and flushed explicitly since
+    // stdout may not be line-buffered — nothing runs between this and the
+    // child taking over stdout to clear or overwrite it, so it stays
+    // visible for the whole gap.
+    println!("{}", pending.startup_message);
+    {
+        use std::io::Write as _;
+        let _ = io::stdout().flush();
+    }
     let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd);
     *terminal = setup_terminal()?;
     ctx.log(&format!("run_pending_inplace child result={result:?}"));
@@ -640,6 +652,7 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
     ));
     *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
         argv: opener::inplace_argv(None),
+        startup_message: opener::new_session_startup_message(&cwd),
         cwd,
     });
     app.close_modal();
@@ -3097,6 +3110,10 @@ mod tests {
             .expect("expected a pending in-place launch");
         assert_eq!(launch.argv, ["claude"].map(str::to_string));
         assert_eq!(launch.cwd, PathBuf::from("."));
+        assert_eq!(
+            launch.startup_message,
+            opener::new_session_startup_message(&PathBuf::from("."))
+        );
         assert!(app.modal().is_none(), "modal should have closed");
     }
 
@@ -3171,6 +3188,10 @@ mod tests {
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
         assert_eq!(launch.cwd, PathBuf::from("/work/alpha"));
+        assert_eq!(
+            launch.startup_message,
+            opener::resume_startup_message("Alpha")
+        );
         // No refusal status posted for the ordinary "proceed" case.
         assert!(app.status().is_none());
     }
