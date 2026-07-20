@@ -41,6 +41,7 @@ pub enum TmuxPlacement {
 pub struct TmuxOpener<R> {
     runner: R,
     placement: TmuxPlacement,
+    anchor_pane: Option<String>,
 }
 
 impl<R> TmuxOpener<R> {
@@ -52,7 +53,26 @@ impl<R> TmuxOpener<R> {
 
     /// An opener using an explicit placement.
     pub fn with_placement(runner: R, placement: TmuxPlacement) -> Self {
-        Self { runner, placement }
+        Self {
+            runner,
+            placement,
+            anchor_pane: None,
+        }
+    }
+
+    /// Anchor pane splits are created from (only affects [`TmuxPlacement::Pane`]).
+    ///
+    /// `split-window` with no `-t` targets the *client's* currently active
+    /// pane, not banto's own — confirmed on-device: a resume pane can sprout
+    /// in whatever window the user happens to have focused instead of next
+    /// to banto. Setting this anchors every split on a fixed pane (the
+    /// caller resolves it from `$TMUX_PANE`) regardless of where the user's
+    /// tmux client is currently looking. `new-window` is unaffected: it
+    /// creates a whole window rather than splitting an existing pane, so it
+    /// has no equivalent ambiguity.
+    pub fn with_anchor_pane(mut self, anchor_pane: impl Into<String>) -> Self {
+        self.anchor_pane = Some(anchor_pane.into());
+        self
     }
 }
 
@@ -91,15 +111,21 @@ impl<R: CommandRunner> Opener for TmuxOpener<R> {
                 "-F".to_string(),
                 CREATE_FORMAT.to_string(),
             ],
-            TmuxPlacement::Pane => vec![
-                "split-window".to_string(),
-                "-h".to_string(),
-                "-c".to_string(),
-                cwd,
-                "-P".to_string(),
-                "-F".to_string(),
-                CREATE_FORMAT.to_string(),
-            ],
+            TmuxPlacement::Pane => {
+                let mut args = vec!["split-window".to_string(), "-h".to_string()];
+                if let Some(anchor) = &self.anchor_pane {
+                    args.push("-t".to_string());
+                    args.push(anchor.clone());
+                }
+                args.extend([
+                    "-c".to_string(),
+                    cwd,
+                    "-P".to_string(),
+                    "-F".to_string(),
+                    CREATE_FORMAT.to_string(),
+                ]);
+                args
+            }
         };
         args.extend(cmd.argv.iter().cloned());
 
@@ -242,6 +268,56 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn open_as_pane_splits_from_the_anchor_when_set() {
+        let runner = MockRunner::with_responses([CommandOutput::success("@3:%8\n")]);
+        let opener = TmuxOpener::new(runner).with_anchor_pane("%1");
+
+        opener.open(&resume_cmd()).unwrap();
+
+        let calls = opener.runner.calls();
+        assert_eq!(
+            calls[0],
+            CommandSpec::new(
+                "psmux",
+                [
+                    "split-window",
+                    "-h",
+                    "-t",
+                    "%1",
+                    "-c",
+                    "/home/user/project",
+                    "-P",
+                    "-F",
+                    "#{window_id}:#{pane_id}",
+                    "banto",
+                    "_wrap",
+                    "--session",
+                    "sess-1",
+                    "--",
+                    "claude",
+                    "--resume",
+                    "sess-1",
+                ]
+                .map(str::to_string)
+            )
+        );
+    }
+
+    #[test]
+    fn anchor_pane_does_not_affect_window_placement() {
+        let runner = MockRunner::with_responses([CommandOutput::success("@5:%9")]);
+        let opener =
+            TmuxOpener::with_placement(runner, TmuxPlacement::Window).with_anchor_pane("%1");
+
+        opener.open(&resume_cmd()).unwrap();
+
+        let calls = opener.runner.calls();
+        // No `-t` anywhere: new-window creates a whole window, so the anchor
+        // (which only disambiguates which pane a split grows from) is moot.
+        assert!(!calls[0].args.contains(&"-t".to_string()));
     }
 
     #[test]
