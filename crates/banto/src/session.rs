@@ -34,6 +34,9 @@ pub struct SessionRow {
     /// session, rather than the user starting it interactively. See
     /// `banto_core::model::SessionMeta::is_agent`.
     pub is_agent: bool,
+    /// Short single-line excerpt of the first user message, for the summary
+    /// panel. See `banto_core::model::SessionMeta::preview`.
+    pub preview: Option<String>,
 }
 
 impl SessionRow {
@@ -109,6 +112,7 @@ pub fn load_rows(
                 cwd: meta.cwd,
                 activity,
                 is_agent: meta.is_agent,
+                preview: meta.preview,
             }
         })
         .collect();
@@ -127,6 +131,7 @@ mod tests {
             cwd: Some(PathBuf::from("/work/app")),
             activity: Activity::Alive,
             is_agent: false,
+            preview: None,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -139,6 +144,7 @@ mod tests {
             cwd: None,
             activity: Activity::Alive,
             is_agent: false,
+            preview: None,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -151,6 +157,7 @@ mod tests {
             cwd: None,
             activity: Activity::Alive,
             is_agent: false,
+            preview: None,
         };
         assert_eq!(row.display_title(), "the-id");
     }

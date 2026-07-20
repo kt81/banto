@@ -9,7 +9,7 @@
 //! [`crate::wrap`] — mirroring how `banto_core::status` judges session
 //! activity), never by querying the terminal backend itself.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use banto_core::config::OpenerMode;
@@ -61,6 +61,47 @@ pub fn resolve_backend(mode: OpenerMode, env: impl Fn(&str) -> Option<String>) -
         OpenerMode::Psmux => Some(Backend::Psmux),
         OpenerMode::WindowsTerminal => Some(Backend::WindowsTerminal),
     }
+}
+
+/// Launch a brand-new (non-resumed) `claude` session in `cwd`.
+///
+/// Unlike [`open_session`], there is no pre-existing session id to key a
+/// double-resume check or a pane-map record against — starting two new
+/// sessions is not a double resume, it's just two new sessions — so this
+/// skips the store entirely and goes straight to the opener. The new
+/// session will simply appear in the list once its jsonl file exists,
+/// resumable like any other from then on. Does not go through `banto _wrap`
+/// either: `_wrap`'s job (PID registration for double-resume detection,
+/// pane-record cleanup) has nothing to attach to here.
+pub fn open_new_session<R: CommandRunner + 'static>(
+    backend: Option<Backend>,
+    cwd: &Path,
+    runner: R,
+    anchor_pane: Option<&str>,
+) -> Result<OpenOutcome, OpenError> {
+    let Some(backend) = backend else {
+        return Ok(OpenOutcome::NoBackendDetected);
+    };
+    let title = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.display().to_string());
+    let cmd = ResumeCommand {
+        // Unused: there is no pane-map record for this launch to key.
+        session_id: String::new(),
+        argv: vec!["claude".to_string()],
+        cwd: cwd.to_path_buf(),
+        title,
+    };
+    let opener: Box<dyn Opener> = match (backend, anchor_pane) {
+        (Backend::Psmux, Some(anchor)) => {
+            Box::new(TmuxOpener::new(runner).with_anchor_pane(anchor))
+        }
+        (Backend::Psmux, None) => Box::new(TmuxOpener::new(runner)),
+        (Backend::WindowsTerminal, _) => Box::new(WindowsTerminalOpener::new(runner)),
+    };
+    opener.open(&cmd)?;
+    Ok(OpenOutcome::Opened)
 }
 
 /// Open or focus `session`, enforcing the no-double-resume invariant.
@@ -542,6 +583,79 @@ mod tests {
 
         assert_eq!(outcome, OpenOutcome::AlreadyOpenCannotFocus);
         // Never attempted to open a second tab.
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn open_new_session_spawns_plain_claude_with_no_wrap_and_no_session_id() {
+        let runner = MockRunner::default();
+
+        let outcome = open_new_session(
+            Some(Backend::Psmux),
+            &PathBuf::from("/work/alpha"),
+            runner.clone(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, OpenOutcome::Opened);
+        let calls = runner.calls();
+        // Just `claude` — no `banto _wrap --session ...` wrapping, since
+        // there's no pre-existing session id for it to attach to.
+        assert!(calls[0].args.iter().any(|a| a == "claude"));
+        assert!(!calls[0].args.iter().any(|a| a == "_wrap"));
+        // Tagged with the cwd's directory name, not a session id.
+        assert_eq!(
+            calls[1].args,
+            vec!["select-pane", "-t", "%1", "-T", "alpha"]
+        );
+    }
+
+    #[test]
+    fn open_new_session_anchors_the_split_when_given_an_anchor_pane() {
+        let runner = MockRunner::default();
+
+        open_new_session(
+            Some(Backend::Psmux),
+            &PathBuf::from("/work/alpha"),
+            runner.clone(),
+            Some("%7"),
+        )
+        .unwrap();
+
+        let calls = runner.calls();
+        let t = calls[0]
+            .args
+            .iter()
+            .position(|a| a == "-t")
+            .expect("-t missing");
+        assert_eq!(calls[0].args[t + 1], "%7");
+    }
+
+    #[test]
+    fn open_new_session_title_falls_back_to_the_full_path_without_a_file_name() {
+        let runner = MockRunner::default();
+
+        open_new_session(
+            Some(Backend::Psmux),
+            &PathBuf::from("/"),
+            runner.clone(),
+            None,
+        )
+        .unwrap();
+
+        let calls = runner.calls();
+        assert_eq!(calls[1].args, vec!["select-pane", "-t", "%1", "-T", "/"]);
+    }
+
+    #[test]
+    fn open_new_session_with_no_backend_reports_no_backend_detected() {
+        let runner = MockRunner::default();
+
+        let outcome =
+            open_new_session(None, &PathBuf::from("/work/alpha"), runner.clone(), None).unwrap();
+
+        assert_eq!(outcome, OpenOutcome::NoBackendDetected);
         assert!(runner.calls().is_empty());
     }
 

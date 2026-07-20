@@ -5,6 +5,7 @@
 //! in [`crate::tui`] is a thin shell over this state.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::session::SessionRow;
@@ -33,6 +34,99 @@ pub enum Mode {
     Search,
 }
 
+/// A modal dialog overlaying the list, blocking Normal/Search key handling
+/// until it's confirmed or cancelled. Only one is ever open at a time.
+pub enum Modal {
+    /// The `n` new-session dialog: pick or type a cwd to launch `claude`
+    /// fresh in (not a resume of an existing session).
+    NewSession(NewSessionState),
+}
+
+/// State for the new-session modal: a free-text cwd input plus a
+/// fuzzy-filtered list of previously seen cwds (extracted from the loaded
+/// sessions) to pick from instead of typing a full path.
+pub struct NewSessionState {
+    /// Every distinct cwd seen across the loaded sessions, most-recent-use
+    /// first — captured once when the modal opens rather than re-derived on
+    /// every keystroke (`base_rows` is already mtime-descending, so keeping
+    /// the first occurrence of each cwd preserves that order).
+    candidates: Vec<String>,
+    /// What the user has typed so far.
+    input: String,
+    /// Indices into `candidates` matching `input`, best match first.
+    filtered: Vec<usize>,
+    /// Selected position within `filtered`.
+    selected: usize,
+}
+
+impl NewSessionState {
+    fn new(rows: &[SessionRow]) -> Self {
+        let mut state = Self {
+            candidates: unique_cwds(rows),
+            input: String::new(),
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        state.refilter();
+        state
+    }
+
+    fn refilter(&mut self) {
+        self.filtered = rank_indices(&self.input, &self.candidates);
+        self.selected = 0;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let max = self.filtered.len() - 1;
+        let target = (self.selected as isize + delta).clamp(0, max as isize);
+        self.selected = target as usize;
+    }
+
+    /// The cwd typed so far.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Candidates matching `input`, best match first.
+    pub fn candidates(&self) -> Vec<&str> {
+        self.filtered
+            .iter()
+            .map(|&i| self.candidates[i].as_str())
+            .collect()
+    }
+
+    /// Position within [`Self::candidates`] that's highlighted, or `None`
+    /// when nothing matches.
+    pub fn selected(&self) -> Option<usize> {
+        (!self.filtered.is_empty()).then_some(self.selected)
+    }
+
+    /// The cwd that would be launched if confirmed right now: the
+    /// highlighted candidate if any match, otherwise the raw typed input
+    /// (`None` if that's empty too — nothing to launch).
+    fn target(&self) -> Option<PathBuf> {
+        if let Some(&i) = self.filtered.get(self.selected) {
+            return Some(PathBuf::from(&self.candidates[i]));
+        }
+        (!self.input.is_empty()).then(|| PathBuf::from(&self.input))
+    }
+}
+
+/// Distinct cwd strings across `rows`, most-recently-used first (rows are
+/// already mtime-descending, so keeping the first occurrence of each
+/// preserves that order). Rows with no known cwd are skipped.
+fn unique_cwds(rows: &[SessionRow]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    rows.iter()
+        .filter_map(|row| row.cwd.as_ref())
+        .map(|cwd| cwd.display().to_string())
+        .filter(|cwd| seen.insert(cwd.clone()))
+        .collect()
+}
+
 /// The whole TUI state: the full session list plus the live query, filter
 /// result, selection and scroll position.
 pub struct App {
@@ -56,6 +150,8 @@ pub struct App {
     show_agents: bool,
     /// Current input mode; see [`Mode`].
     mode: Mode,
+    /// A modal dialog currently overlaying the list, if any; see [`Modal`].
+    modal: Option<Modal>,
     /// Current search query. Always empty outside [`Mode::Search`] — entering
     /// Normal mode always clears it (see [`Self::exit_search`]).
     query: String,
@@ -92,6 +188,7 @@ impl App {
             pinned: HashSet::new(),
             show_agents: false,
             mode: Mode::Normal,
+            modal: None,
             query: String::new(),
             filtered: Vec::new(),
             selected: 0,
@@ -132,6 +229,78 @@ impl App {
     /// it, and a second Enter (now in Normal mode) opens the selection.
     pub fn confirm_search(&mut self) {
         self.mode = Mode::Normal;
+    }
+
+    // --- modal ------------------------------------------------------------
+
+    /// The currently open modal, if any.
+    pub fn modal(&self) -> Option<&Modal> {
+        self.modal.as_ref()
+    }
+
+    /// Open the `n` new-session modal, seeding its candidate list from every
+    /// distinct cwd across all loaded sessions (bound to `n` in
+    /// [`Mode::Normal`]).
+    pub fn open_new_session_modal(&mut self) {
+        self.modal = Some(Modal::NewSession(NewSessionState::new(&self.base_rows)));
+    }
+
+    /// Close whatever modal is open (no-op if none); bound to Esc while a
+    /// modal is open.
+    pub fn close_modal(&mut self) {
+        self.modal = None;
+    }
+
+    /// Append a character to the open modal's text input and re-filter its
+    /// candidates. No-op when no modal is open.
+    pub fn modal_push_char(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => {
+                state.input.push(c);
+                state.refilter();
+            }
+            None => {}
+        }
+    }
+
+    /// Delete the open modal's last input character and re-filter. No-op
+    /// when no modal is open or the input is already empty.
+    pub fn modal_backspace(&mut self) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal
+            && state.input.pop().is_some()
+        {
+            state.refilter();
+        }
+    }
+
+    /// Move the open modal's candidate selection. No-op when no modal is
+    /// open.
+    pub fn modal_select_prev(&mut self) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal {
+            state.move_selection(-1);
+        }
+    }
+
+    /// Move the open modal's candidate selection. No-op when no modal is
+    /// open.
+    pub fn modal_select_next(&mut self) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal {
+            state.move_selection(1);
+        }
+    }
+
+    /// The cwd the new-session modal would launch if confirmed right now
+    /// (see [`NewSessionState::target`]); `None` if no modal is open or
+    /// there's nothing to launch. Does not close the modal — the caller
+    /// does that once the launch itself succeeds.
+    pub fn modal_new_session_target(&self) -> Option<PathBuf> {
+        match &self.modal {
+            Some(Modal::NewSession(state)) => state.target(),
+            None => None,
+        }
     }
 
     // --- agent filter -------------------------------------------------------
@@ -499,6 +668,7 @@ mod tests {
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
             activity: Activity::Idle(AgeBucket::Older),
             is_agent: false,
+            preview: None,
         }
     }
 
@@ -974,5 +1144,117 @@ mod tests {
 
         app.toggle_agent_filter();
         assert_eq!(ids(&app), vec!["h1", "a1"]);
+    }
+
+    #[test]
+    fn opening_the_new_session_modal_seeds_deduped_recency_ordered_candidates() {
+        // Rows arrive mtime-descending (newest first); "/a" repeats, so its
+        // first (most recent) occurrence is what should survive the dedup.
+        let mut app = App::new(vec![
+            row("1", "one", "/a"),
+            row("2", "two", "/b"),
+            row("3", "three", "/a"),
+        ]);
+        app.set_viewport_height(10);
+
+        app.open_new_session_modal();
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.candidates(), vec!["/a", "/b"]);
+        assert_eq!(state.input(), "");
+    }
+
+    #[test]
+    fn modal_push_char_and_backspace_filter_and_restore_candidates() {
+        let mut app = App::new(vec![
+            row("1", "one", "/work/alpha"),
+            row("2", "two", "/work/beta"),
+        ]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        for c in "beta".chars() {
+            app.modal_push_char(c);
+        }
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.candidates(), vec!["/work/beta"]);
+
+        app.modal_backspace();
+        app.modal_backspace();
+        app.modal_backspace();
+        app.modal_backspace();
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.input(), "");
+        assert_eq!(state.candidates(), vec!["/work/alpha", "/work/beta"]);
+    }
+
+    #[test]
+    fn modal_select_next_prev_clamps_within_candidates() {
+        let mut app = App::new(vec![row("1", "one", "/a"), row("2", "two", "/b")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        app.modal_select_prev(); // already at the top candidate
+        assert_eq!(app.modal_new_session_target(), Some(PathBuf::from("/a")));
+
+        app.modal_select_next();
+        assert_eq!(app.modal_new_session_target(), Some(PathBuf::from("/b")));
+
+        app.modal_select_next(); // clamps at the last candidate
+        assert_eq!(app.modal_new_session_target(), Some(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn modal_new_session_target_falls_back_to_raw_input_when_nothing_matches() {
+        let mut app = App::new(vec![row("1", "one", "/work/alpha")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        for c in "/brand/new/path".chars() {
+            app.modal_push_char(c);
+        }
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert!(state.candidates().is_empty());
+        assert_eq!(
+            app.modal_new_session_target(),
+            Some(PathBuf::from("/brand/new/path"))
+        );
+    }
+
+    #[test]
+    fn modal_new_session_target_is_none_with_empty_input_and_no_candidates() {
+        let mut app = App::new(Vec::new());
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        assert_eq!(app.modal_new_session_target(), None);
+    }
+
+    #[test]
+    fn close_modal_clears_it_and_modal_methods_become_noops() {
+        let mut app = App::new(vec![row("1", "one", "/a")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        assert!(app.modal().is_some());
+
+        app.close_modal();
+        assert!(app.modal().is_none());
+
+        // No modal open: these must not panic and must do nothing.
+        app.modal_push_char('x');
+        app.modal_backspace();
+        app.modal_select_next();
+        app.modal_select_prev();
+        assert_eq!(app.modal_new_session_target(), None);
+        assert!(app.modal().is_none());
     }
 }

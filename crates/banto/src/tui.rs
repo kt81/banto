@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use banto_core::config::OpenerMode;
 use banto_core::model::{Activity, AgeBucket, SessionId};
@@ -34,7 +34,7 @@ use banto_core::status::{AgeThresholds, SysinfoProbe};
 use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
-use crate::app::{App, ClickOutcome, Mode, VisibleRow};
+use crate::app::{App, ClickOutcome, Modal, Mode, NewSessionState, VisibleRow};
 use crate::opener::{self, OpenOutcome, SessionToOpen};
 use crate::session;
 use crate::sgr::{self, SgrParse};
@@ -212,11 +212,18 @@ fn install_panic_hook() {
     }));
 }
 
-/// Split an area into (search box, list, status bar).
-fn layout_areas(area: Rect) -> [Rect; 3] {
+/// Height of the always-visible summary panel below the list: one row for
+/// its top border/title plus [`SUMMARY_CONTENT_LINES`] content rows.
+const SUMMARY_HEIGHT: u16 = 1 + SUMMARY_CONTENT_LINES;
+/// Content rows inside the summary panel: activity dot + title, cwd, preview.
+const SUMMARY_CONTENT_LINES: u16 = 3;
+
+/// Split an area into (search box, list, summary panel, status bar).
+fn layout_areas(area: Rect) -> [Rect; 4] {
     Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
+        Constraint::Length(SUMMARY_HEIGHT),
         Constraint::Length(1),
     ])
     .areas(area)
@@ -233,7 +240,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
         // Compute the layout up front so the viewport height and mouse
         // hit-testing agree with what we are about to render.
         let size = terminal.size()?;
-        let [_, list_area, _] = layout_areas(Rect::new(0, 0, size.width, size.height));
+        let [_, list_area, _, _] = layout_areas(Rect::new(0, 0, size.width, size.height));
         app.set_viewport_height(list_area.height as usize);
 
         terminal.draw(|frame| render(frame, app))?;
@@ -319,6 +326,13 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
         }
         return;
     }
+    // A modal takes over all key handling while it's open — including
+    // Up/Down, which mean "move the candidate selection" there rather than
+    // "move the list selection".
+    if app.modal().is_some() {
+        handle_modal_key(app, code, ctx);
+        return;
+    }
     match code {
         KeyCode::Up => app.select_prev(),
         KeyCode::Down => app.select_next(),
@@ -340,11 +354,62 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
         KeyCode::Char('k') => app.select_prev(),
         KeyCode::Enter => activate(app, ctx),
         KeyCode::Char('/') => app.enter_search(),
+        KeyCode::Char('n') => app.open_new_session_modal(),
         KeyCode::Char('p') => toggle_pin(app, ctx),
         KeyCode::Char('a') => toggle_agent_filter(app),
         KeyCode::Char('q') | KeyCode::Esc => app.request_quit(),
         _ => {}
     }
+}
+
+/// Keys while a modal is open: typed characters build its text input,
+/// Up/Down move its candidate selection, Backspace edits the input, Enter
+/// confirms (see [`confirm_modal`]), Esc cancels without acting. Only the
+/// new-session modal exists so far, but none of this is specific to it — a
+/// future modal (e.g. group-join) reuses this same shape.
+fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
+    match code {
+        KeyCode::Esc => app.close_modal(),
+        KeyCode::Up => app.modal_select_prev(),
+        KeyCode::Down => app.modal_select_next(),
+        KeyCode::Backspace => app.modal_backspace(),
+        KeyCode::Enter => confirm_modal(app, ctx),
+        KeyCode::Char(c) => app.modal_push_char(c),
+        _ => {}
+    }
+}
+
+/// Confirm the open modal. For the new-session modal: resolve the target cwd
+/// (the highlighted candidate, or the raw typed path — see
+/// [`App::modal_new_session_target`]), launch a fresh `claude` there, post
+/// the outcome as a status message, and close the modal either way (the
+/// message reports success or failure, same as [`activate`]'s resume path).
+/// A modal with nothing to confirm yet (empty input, no candidates) is left
+/// open — Enter does nothing, matching how Enter on an empty list does
+/// nothing in [`activate`].
+fn confirm_modal(app: &mut App, ctx: &Context) {
+    let Some(cwd) = app.modal_new_session_target() else {
+        return;
+    };
+
+    let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
+    let anchor = std::env::var("TMUX_PANE").ok();
+    let outcome = opener::open_new_session(backend, &cwd, SystemCommandRunner, anchor.as_deref());
+
+    let message = match outcome {
+        Ok(OpenOutcome::Opened) => format!("launched a new session in {}", cwd.display()),
+        Ok(OpenOutcome::NoBackendDetected) => {
+            "no terminal backend detected (run inside psmux/Windows Terminal, \
+             or set `opener` in config.toml)"
+                .to_string()
+        }
+        // `open_new_session` never focuses or refuses an existing pane —
+        // there's no pre-existing session for a fresh launch to key off of.
+        Ok(OpenOutcome::Focused | OpenOutcome::AlreadyOpenCannotFocus) => unreachable!(),
+        Err(err) => format!("failed to launch a new session in {}: {err}", cwd.display()),
+    };
+    app.set_status(message);
+    app.close_modal();
 }
 
 /// Search-mode keys: characters type into the query (`j`/`k` included —
@@ -683,8 +748,13 @@ fn replay(app: &mut App, ctx: &Context, buffered: &[char]) {
     }
 }
 
-/// Translate a mouse event into an [`App`] action.
+/// Translate a mouse event into an [`App`] action. A no-op while a modal is
+/// open, so clicking "through" the overlay can't select/activate a
+/// background row the user can't currently see is being affected.
 fn handle_mouse(app: &mut App, mouse: event::MouseEvent, list_area: Rect, ctx: &Context) {
+    if app.modal().is_some() {
+        return;
+    }
     match mouse.kind {
         MouseEventKind::ScrollDown => app.scroll(1),
         MouseEventKind::ScrollUp => app.scroll(-1),
@@ -794,12 +864,18 @@ fn reload(app: &mut App, ctx: &Context) {
     }
 }
 
-/// Render the whole UI for one frame.
+/// Render the whole UI for one frame: search box, list, the always-visible
+/// summary panel, status bar, and finally a modal overlay on top of
+/// everything else, if one is open.
 fn render(frame: &mut Frame, app: &App) {
-    let [search_area, list_area, status_area] = layout_areas(frame.area());
+    let [search_area, list_area, summary_area, status_area] = layout_areas(frame.area());
     render_search(frame, app, search_area);
     render_list(frame, app, list_area);
+    render_summary(frame, app, summary_area);
     render_status(frame, app, status_area);
+    if let Some(modal) = app.modal() {
+        render_modal(frame, modal, frame.area());
+    }
 }
 
 /// Render the top search box; only shows a text cursor while actually in
@@ -878,13 +954,58 @@ fn list_item(visible: VisibleRow<'_>) -> ListItem<'static> {
     ListItem::new(line)
 }
 
+/// Render the always-visible summary panel below the list: the selected
+/// session's activity dot + title, cwd, and preview excerpt. A top border is
+/// the only visual separation from the list, to keep this compact. The
+/// preview line renders blank until `SessionRow::preview` extraction lands
+/// (currently always `None`) — the layout doesn't change either way.
+fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Details ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(row) = app.selected_row() else {
+        frame.render_widget(
+            Paragraph::new("No session selected.").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+
+    let title_line = Line::from(vec![
+        Span::styled(
+            "\u{25cf} ",
+            Style::default().fg(activity_color(row.activity)),
+        ),
+        Span::styled(
+            row.display_title().to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let cwd_line = Line::from(Span::styled(
+        row.cwd_display(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let preview_line = Line::from(Span::styled(
+        row.preview.as_deref().unwrap_or_default(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(
+        Paragraph::new(vec![title_line, cwd_line, preview_line]),
+        inner,
+    );
+}
+
 /// Render the bottom status bar: key hints (or a transient message) on the
 /// left, match count right-aligned. Rendered as two separate widgets (rather
 /// than one line) so the count stays visible even when the hints are too long
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  / search  \
-                                p pin  a agents  q/Esc quit";
+                                n new  p pin  a agents  q/Esc quit";
     const SEARCH_HINTS: &str =
         "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
@@ -923,6 +1044,84 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Minimum margin (columns/rows) kept around a modal, even in a narrow pane.
+const MODAL_MIN_MARGIN: u16 = 1;
+/// A modal never grows wider/taller than this, so a full-width pane still
+/// gets a comfortable margin around it instead of an edge-to-edge dialog.
+const MODAL_MAX_WIDTH: u16 = 70;
+const MODAL_MAX_HEIGHT: u16 = 20;
+
+/// Center a modal box within `area`: margin shrinks toward
+/// [`MODAL_MIN_MARGIN`] in a narrow/tall pane (the modal fills almost the
+/// whole width) and grows in a full-width pane, since the modal caps out at
+/// [`MODAL_MAX_WIDTH`]/[`MODAL_MAX_HEIGHT`] instead of stretching edge to edge.
+fn modal_area(area: Rect) -> Rect {
+    let width = area
+        .width
+        .saturating_sub(MODAL_MIN_MARGIN * 2)
+        .clamp(1, MODAL_MAX_WIDTH);
+    let height = area
+        .height
+        .saturating_sub(MODAL_MIN_MARGIN * 2)
+        .clamp(1, MODAL_MAX_HEIGHT);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+/// Render whichever modal is open as a centered overlay on top of the rest
+/// of the UI: [`Clear`] blanks the area first so the list/summary panel
+/// behind it doesn't bleed through.
+fn render_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
+    let area = modal_area(area);
+    frame.render_widget(Clear, area);
+    match modal {
+        Modal::NewSession(state) => render_new_session_modal(frame, state, area),
+    }
+}
+
+/// Render the `n` new-session dialog: a one-line cwd input (with a blinking
+/// cursor, same convention as the search box) above a fuzzy-filtered list of
+/// previously seen cwds to pick from instead of typing a full path.
+fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" New Session \u{2014} cwd ")
+        .title_bottom(" Enter launch  Esc cancel ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [input_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    frame.render_widget(Paragraph::new(state.input()), input_area);
+    if input_area.width > 0 {
+        let input_cols = state.input().chars().count() as u16;
+        let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
+        frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    }
+
+    let candidates = state.candidates();
+    if candidates.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching directories \u{2014} Enter uses the typed path.")
+                .style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = candidates
+        .iter()
+        .map(|candidate| ListItem::new((*candidate).to_string()))
+        .collect();
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    list_state.select(state.selected());
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
 /// Map an [`Activity`] to its list-dot color.
 fn activity_color(activity: Activity) -> Color {
     match activity {
@@ -950,6 +1149,7 @@ mod tests {
             cwd: Some(PathBuf::from(cwd)),
             activity,
             is_agent: false,
+            preview: None,
         }
     }
 
@@ -1079,7 +1279,10 @@ mod tests {
             .find(|line| line.contains("Alpha task"))
             .unwrap();
         assert!(!alpha_line.contains('*'), "unexpected marker:\n{text}");
-        assert!(text.contains("p pin"), "hint missing:\n{text}");
+        // The hint text is longer than the narrow 60-col terminal `draw`
+        // uses, so check it wider (see `search_mode_hint_differs_...`).
+        let wide_text = draw_with_width(&app, 110);
+        assert!(wide_text.contains("p pin"), "hint missing:\n{wide_text}");
     }
 
     #[test]
@@ -1099,7 +1302,7 @@ mod tests {
         );
         // The hint text (including the hidden-count suffix) is longer than
         // the narrow 60-col terminal `draw` uses, so check it wider.
-        let wide_text = draw_with_width(&app, 110);
+        let wide_text = draw_with_width(&app, 130);
         assert!(
             wide_text.contains("1 agent session hidden"),
             "missing hidden indicator:\n{wide_text}"
@@ -1608,5 +1811,124 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL, &ctx);
 
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn n_opens_the_new_session_modal_from_normal_mode() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &ctx);
+
+        assert!(app.modal().is_some());
+    }
+
+    #[test]
+    fn n_is_query_text_in_search_mode_not_the_new_session_shortcut() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &ctx);
+
+        assert_eq!(app.query(), "n");
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn esc_closes_the_open_modal_without_quitting_or_reaching_the_recognizer() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &ctx);
+
+        assert!(app.modal().is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn typing_and_arrow_keys_drive_the_open_modal_instead_of_the_background_list() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "/work/alpha", Activity::Alive),
+            row("b", "Beta", "/work/beta", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+        let selected_before = app.selected_row().unwrap().id.clone();
+        app.open_new_session_modal();
+
+        for c in "beta".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &ctx);
+        }
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE, &ctx);
+
+        // Up/Down moved the modal's candidate selection, not the background
+        // list's selection.
+        assert_eq!(app.selected_row().unwrap().id, selected_before);
+        assert_eq!(
+            app.modal_new_session_target(),
+            Some(PathBuf::from("/work/beta"))
+        );
+    }
+
+    #[test]
+    fn modal_area_shrinks_margin_in_a_narrow_pane_and_caps_width_in_a_wide_one() {
+        // Narrow: minimal margin, modal fills almost the whole width.
+        let narrow = modal_area(Rect::new(0, 0, 30, 20));
+        assert_eq!(narrow.width, 28); // 30 - 2*MODAL_MIN_MARGIN
+        assert_eq!(narrow.x, 1);
+
+        // Wide: capped at MODAL_MAX_WIDTH, leaving a large margin.
+        let wide = modal_area(Rect::new(0, 0, 200, 50));
+        assert_eq!(wide.width, 70); // MODAL_MAX_WIDTH
+        assert_eq!(wide.x, 65); // centered: (200 - 70) / 2
+    }
+
+    #[test]
+    fn render_summary_shows_the_selected_session_and_a_placeholder_when_empty() {
+        let mut app = App::new(vec![row("a", "Fix login", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        let text = draw(&app);
+        assert!(text.contains("Details"), "panel border missing:\n{text}");
+        assert!(text.contains("Fix login"), "title missing:\n{text}");
+        assert!(text.contains("/work/alpha"), "cwd missing:\n{text}");
+
+        let empty_app = App::new(Vec::new());
+        let empty_text = draw(&empty_app);
+        assert!(
+            empty_text.contains("No session selected."),
+            "placeholder missing:\n{empty_text}"
+        );
+    }
+
+    #[test]
+    fn render_new_session_modal_shows_input_and_matching_candidates() {
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        for c in "alpha".chars() {
+            app.modal_push_char(c);
+        }
+
+        let text = draw_with_width(&app, 110);
+        assert!(text.contains("New Session"), "modal title missing:\n{text}");
+        assert!(text.contains("alpha"), "typed input missing:\n{text}");
+        assert!(
+            text.contains("/work/alpha"),
+            "matching candidate missing:\n{text}"
+        );
     }
 }
