@@ -159,7 +159,11 @@ impl WrapLog {
         Self(RefCell::new(None))
     }
 
-    /// Append one timestamped line (no-op when disabled).
+    /// Append one timestamped line (no-op when disabled). Every line is
+    /// prefixed `wrap:` — `BANTO_WRAP_LOG` and the TUI's `BANTO_INPUT_LOG`
+    /// may point at the same file, so this makes which process wrote a
+    /// given line unambiguous at a glance (see `crate::tui::Context::log`'s
+    /// matching `tui:` prefix).
     fn log(&self, message: &str) {
         use std::io::Write as _;
         if let Some(file) = self.0.borrow_mut().as_mut() {
@@ -167,7 +171,7 @@ impl WrapLog {
                 .elapsed()
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let _ = writeln!(file, "{ms} {message}");
+            let _ = writeln!(file, "{ms} wrap: {message}");
         }
     }
 }

@@ -123,6 +123,10 @@ struct Context<'a> {
 
 impl Context<'_> {
     /// Append one line to the diagnostic input log (no-op when disabled).
+    /// Every line is prefixed `tui:` — `BANTO_INPUT_LOG` and `_wrap`'s
+    /// `BANTO_WRAP_LOG` may point at the same file, so this makes which
+    /// process wrote a given line unambiguous at a glance (see
+    /// `crate::wrap::WrapLog::log`'s matching `wrap:` prefix).
     fn log(&self, message: &str) {
         use std::io::Write as _;
         if let Some(file) = self.input_log.borrow_mut().as_mut() {
@@ -130,7 +134,7 @@ impl Context<'_> {
                 .elapsed()
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let _ = writeln!(file, "{ms} {message}");
+            let _ = writeln!(file, "{ms} tui: {message}");
         }
     }
 }
@@ -202,7 +206,11 @@ pub fn run(
         input_log: std::cell::RefCell::new(open_input_log()),
         last_genuine_esc: RefCell::new(None),
     };
-    ctx.log("=== banto TUI started ===");
+    ctx.log(&format!(
+        "=== banto TUI started === own TMUX={:?} TMUX_PANE={:?}",
+        std::env::var("TMUX").ok(),
+        std::env::var("TMUX_PANE").ok()
+    ));
 
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut app, &ctx);
@@ -1122,7 +1130,7 @@ fn activate(app: &mut App, ctx: &Context) {
     // `crate::wrap`'s BANTO_WRAP_LOG instrumentation) to confirm or rule
     // out a resumed/opened pane landing on a *different* psmux server.
     ctx.log(&format!(
-        "activate: session={id} banto TMUX={:?} TMUX_PANE={:?}",
+        "activate session={id} banto TMUX={:?} TMUX_PANE={:?}",
         std::env::var("TMUX").ok(),
         anchor
     ));
@@ -1139,10 +1147,10 @@ fn activate(app: &mut App, ctx: &Context) {
         anchor.as_deref(),
         &live,
     );
-    ctx.log(&format!("activate: open_session outcome={outcome:?}"));
+    ctx.log(&format!("activate open_session outcome={outcome:?}"));
     if let Ok(record) = ctx.store.borrow().get_pane(&SessionId(id.clone())) {
         ctx.log(&format!(
-            "activate: pane record after open = {:?}",
+            "activate pane record after open = {:?}",
             record.map(|r| (r.backend, r.target))
         ));
     }
