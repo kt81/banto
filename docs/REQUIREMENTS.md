@@ -1,8 +1,10 @@
 # banto — Requirements & Design
 
 A resident TUI tool that manages local Claude Code session history with
-Claude-Desktop-like listing and grouping, and resumes a selected session in a
-separate pane/tab. Windows-first.
+Claude-Desktop-like listing and grouping, and resumes a selected session —
+by default **in-place**, in banto's own terminal, with resuming in a
+separate psmux pane / Windows Terminal tab as a first-class alternate.
+Windows-first.
 
 Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese shop, who
 stays on the premises and directs and watches over the guests (sessions).
@@ -12,16 +14,27 @@ stays on the premises and directs and watches over the guests (sessions).
 - Fast search over local session history (Claude Code CLI only)
 - Grouping (a session belongs to at most one group), pinning, and archiving
   (soft-hide) — all stored by banto itself, never writing to Claude's files
-- Click or Enter on a search result resumes the session in a separate pane/tab
+- Enter on a search result resumes the session **in-place**: banto tears
+  down its own TUI (leaves the alt screen, disables raw mode and mouse
+  capture), runs the session as a direct child process in the same
+  terminal, waits for it to exit, then reinitializes the TUI and returns to
+  the (reloaded) list. This is the default and primary action; no terminal
+  multiplexer is involved
+- `s` resumes the session in a separate psmux pane / Windows Terminal tab
+  instead, for users who want a multiplexer layout — see Opener spec
 - A dedicated dialog also launches a brand-new session (pick or type a
   working directory), not just resumes an existing one
-- If a session is already resumed, activate its existing pane/tab instead
-  (a double resume forks the session history and is therefore forbidden)
+- If a session is already resumed, refuse to start a second one instead
+  (a double resume forks the session history and is therefore forbidden):
+  in-place checks liveness up front and shows "already running"; split mode
+  activates the existing pane/tab instead
 - Activity indicator (colored dot) in the list. Busy sessions get special
   treatment; the rest are bucketed by time since last update
 - Mouse support including wheel scrolling
 - Runs on Windows; keeps a structure that also builds on macOS / Linux
-- "Open in new tab vs. new pane" is configurable, default `auto` (see opener)
+- The overall default is in-place (`opener = "in-place"`); setting `opener`
+  to `"auto"` / `"psmux"` / `"windows-terminal"` instead picks which split
+  backend `s` uses (see Opener spec)
 
 Out of MVP scope: Claude Desktop (claude.ai) history, other agents (trait only),
 built-in PTY, remote/SSH.
@@ -33,6 +46,17 @@ banto does no terminal emulation of its own; resuming is delegated to a real
 terminal (psmux / Windows Terminal). `banto-core` (lib) and `banto` (bin:
 TUI/CLI) are separated so that a future Tauri GUI or a "single-screen
 switcher" built-in view (portable-pty + tui-term) can evolve on the same core.
+
+## Architecture decision (2026-07-20): in-place as the default action
+
+**In-place resume is the default (Enter); split-into-a-pane/tab remains a
+first-class alternate (`s` / `opener` config), not deprecated.** In-place
+still needs no PTY emulation and no multiplexer, consistent with the
+2026-07-19 decision above — it's the simplest possible case, banto's own
+terminal handed straight to a direct child process. Motivated by psmux's
+non-uniqueness of window/pane ids across sessions
+(docs/notes/psmux-spike.md) making split-mode targeting inherently more
+fragile than just running the session where banto already is.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -64,25 +88,58 @@ crates/
 
 ## Opener spec
 
+Two actions, mirrored by a TUI key (Enter = in-place, `s` = split) and by
+`opener` in `config.toml` (default `"in-place"`; `"auto"` / `"psmux"` /
+`"windows-terminal"` pick a split backend instead — the exact `s`-vs-`opener`
+interaction when `opener` is left at its `"in-place"` default is an
+implementation detail for the split-mode work, not fixed by this doc):
+
+### In-place (default)
+
+banto hands its own terminal to the session directly: tear down the TUI
+(leave the alt screen, disable raw mode and mouse capture), run
+`claude --resume <id>` (or plain `claude` in the target cwd for a new
+session) as a direct child process, wait for it to exit, then reinitialize
+ratatui and reload the list. No multiplexer, no pane/tab, no `_wrap`
+wrapper — banto is already the direct parent and observes the exit itself.
+Before spawning, the same liveness check `status` uses elsewhere (PID
+alive?) guards against double-resume: if the session is already running
+somewhere, refuse and show "already running" rather than forking its
+history. Resume always starts in the session's original cwd.
+
+### Split into a pane/tab (`s`)
+
+Not deprecated — fully supported for users who want a multiplexer layout.
 Priority: **1. psmux (tmux-compatible CLI) = primary target** 2. Windows
 Terminal tab 3. future: Ghostty etc.
-Auto detection checks environment variables in the order **`$TMUX` →
-`WT_SESSION`** (inside psmux both are set, so the order matters).
+Auto detection (`opener = "auto"`) checks environment variables in the
+order **`$TMUX` → `WT_SESSION`** (inside psmux both are set, so the order
+matters).
 
-- psmux/tmux: spawn with `split-window` / `new-window`, tag with
-  `select-pane -T`, match with `list-panes -F`, focus with
-  `select-window` + `select-pane`.
+- psmux/tmux: spawn with `split-window` / `new-window`, tag with a
+  session-qualified `select-pane -t '<session>:<pane_id>' -T <title>`,
+  match with `list-panes -F`, focus with a session-qualified
+  `select-pane -t '<session>:<pane_id>'` alone.
   psmux confirmed to support all required commands
-  ([compatibility.md](https://github.com/psmux/psmux/blob/master/docs/compatibility.md)).
+  ([compatibility.md](https://github.com/psmux/psmux/blob/master/docs/compatibility.md)),
+  but — unlike real tmux — it reuses window/pane ids across sessions, so
+  every target must be session-qualified (docs/notes/psmux-spike.md,
+  2026-07-20). That spike also found `select-window -t 'session:@window_id'`
+  fails outright and `switch-client` corrupted the live server badly enough
+  to destroy a session, so neither is used; focus is a lone session-qualified
+  `select-pane` (banto's own panes are splits within banto's own session, so
+  no window/client switch is needed to surface one).
   `swap-pane` works, so a Desktop-like "sidebar + main" switcher is possible.
 - Windows Terminal: spawn with `wt -w 0 new-tab`. **There is no API to
   enumerate or focus tabs**, so activating an existing tab is best-effort.
   When reliability is required, a "one session = one window" mode
   (SetForegroundWindow via HWND) is provided as a config option.
-- Every backend goes through
+- Every split backend goes through
   `banto _wrap --session <id> -- claude --resume <id>`, which registers the
   PID, tracks liveness, detects exit, and prevents double resume
-  (`wt.exe` detaches immediately, so the wrapper is mandatory).
+  (`wt.exe` detaches immediately and psmux panes run detached from banto's
+  own process, so the wrapper is mandatory here — in-place needs none of
+  this, see above).
 - Resume always starts in the session's original cwd.
 
 ## Activity indicator
@@ -107,6 +164,9 @@ sysinfo (PID liveness) / thiserror, anyhow.
 2. Opener (psmux / WT) + `_wrap` + double-resume prevention + focus — done
 3. Activity dots + notify live updates — done
 4. Groups / pins — done
+5. In-place resume as the default action (Enter hands off banto's own
+   terminal directly; `s` still splits into a psmux pane / WT tab) — in
+   progress
 
 Delivered alongside groups: a new-session modal (`n`), session archiving
 (`d`, soft-hide only — the real jsonl file under `~/.claude` is never
@@ -117,4 +177,10 @@ touched), and an always-visible summary panel below the list.
 - JSONL format changes → contained by lenient parsing + fixtures
 - WT tab focus limitations → window mode as fallback
 - psmux-specific incompatibilities (claims tmux 3.3.6 compatibility but is an
-  independent implementation) → flush out with spikes and on-device checks
+  independent implementation) → flush out with spikes and on-device checks.
+  Confirmed so far (docs/notes/psmux-spike.md): non-unique window/pane ids
+  across sessions, and `switch-client` corrupting the live server — both
+  are why split-mode targeting is session-qualified `select-pane` only,
+  never `select-window` or `switch-client`. This non-uniqueness was also
+  the motivation for making in-place the default (2026-07-20 decision
+  above): it sidesteps split-target ambiguity entirely for the common case
