@@ -567,7 +567,8 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
     }
 
     let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
-    let anchor = std::env::var("TMUX_PANE").ok();
+    let tmux_pane = std::env::var("TMUX_PANE").ok();
+    let anchor = opener::resolve_own_anchor(backend, &SystemCommandRunner, tmux_pane.as_deref());
     let outcome = opener::open_new_session(backend, &cwd, SystemCommandRunner, anchor.as_deref());
 
     let message = match outcome {
@@ -1122,17 +1123,21 @@ fn activate(app: &mut App, ctx: &Context) {
     };
 
     let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
-    // Anchor psmux splits on banto's own pane so the resume pane lands
-    // next to banto, not in whatever window the client has focused.
-    let anchor = std::env::var("TMUX_PANE").ok();
+    // Anchor psmux splits on banto's own session-qualified pane (psmux
+    // reuses window/pane ids across sessions — docs/notes/psmux-spike.md,
+    // 2026-07-20) so the resume pane lands next to banto, not in whatever
+    // window the client has focused, and never targets the wrong session's
+    // pane by a reused bare id.
+    let tmux_pane = std::env::var("TMUX_PANE").ok();
+    let anchor = opener::resolve_own_anchor(backend, &SystemCommandRunner, tmux_pane.as_deref());
     // Diagnostic only (BANTO_INPUT_LOG): banto's own server/pane identity,
     // so a captured log can be compared against `_wrap`'s own $TMUX (see
     // `crate::wrap`'s BANTO_WRAP_LOG instrumentation) to confirm or rule
     // out a resumed/opened pane landing on a *different* psmux server.
     ctx.log(&format!(
-        "activate session={id} banto TMUX={:?} TMUX_PANE={:?}",
+        "activate session={id} banto TMUX={:?} TMUX_PANE={:?} anchor={anchor:?}",
         std::env::var("TMUX").ok(),
-        anchor
+        tmux_pane
     ));
     // Only consulted when there's no pane record for this session (see
     // `opener::open_session`), so a fresh read here (rather than caching

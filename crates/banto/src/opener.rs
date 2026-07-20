@@ -15,8 +15,8 @@ use std::time::SystemTime;
 use banto_core::config::OpenerMode;
 use banto_core::model::SessionId;
 use banto_core::opener::{
-    self, Backend, CommandRunner, OpenError, Opener, ResumeCommand, SessionHandle, TmuxOpener,
-    WindowsTerminalOpener,
+    self, Backend, CommandRunner, CommandSpec, OpenError, Opener, ResumeCommand, SessionHandle,
+    TmuxOpener, WindowsTerminalOpener,
 };
 use banto_core::status::{LiveSession, ProcessProbe};
 use banto_core::store::{PaneRecord, Store, StoreError};
@@ -333,23 +333,92 @@ pub(crate) fn parse_backend_key(key: &str) -> Option<Backend> {
 /// [`backend_key`].
 pub(crate) fn encode_target(handle: &SessionHandle) -> String {
     match handle {
-        SessionHandle::Tmux { window_id, pane_id } => format!("{window_id}:{pane_id}"),
+        SessionHandle::Tmux {
+            session,
+            window_id,
+            pane_id,
+        } => format!("{session}:{window_id}:{pane_id}"),
         SessionHandle::WindowsTerminal => String::new(),
     }
 }
 
 /// Inverse of [`encode_target`].
+///
+/// A pane record written before psmux's non-unique-id finding
+/// (docs/notes/psmux-spike.md, 2026-07-20) encodes the old, un-qualified
+/// `<window_id>:<pane_id>` form (two `:`-joined parts). That target can no
+/// longer be resolved to a specific session, so it decodes to `None` here —
+/// the caller ([`focus_existing`]) treats a `None` decode as a stale record
+/// and opens a fresh pane instead of risking an ambiguous focus.
 fn decode_handle(backend: Backend, target: &str) -> Option<SessionHandle> {
     match backend {
         Backend::Psmux => {
-            let (window_id, pane_id) = target.split_once(':')?;
-            Some(SessionHandle::Tmux {
-                window_id: window_id.to_string(),
-                pane_id: pane_id.to_string(),
-            })
+            let mut parts = target.splitn(3, ':');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(session), Some(window_id), Some(pane_id))
+                    if !session.is_empty() && !window_id.is_empty() && !pane_id.is_empty() =>
+                {
+                    Some(SessionHandle::Tmux {
+                        session: session.to_string(),
+                        window_id: window_id.to_string(),
+                        pane_id: pane_id.to_string(),
+                    })
+                }
+                _ => None,
+            }
         }
         Backend::WindowsTerminal => Some(SessionHandle::WindowsTerminal),
     }
+}
+
+/// Resolve banto's own session-qualified anchor pane (`"<session>:<pane>"`)
+/// for a psmux split, so a resume/new-session pane always lands next to
+/// banto's own pane unambiguously — psmux reuses pane/window ids across
+/// sessions (docs/notes/psmux-spike.md), so a bare pane id is no longer
+/// enough to anchor a split correctly.
+///
+/// `backend` is the caller's own already-resolved choice, trusted rather
+/// than guessed from `tmux_pane`'s presence (mirrors
+/// `crate::wrap::resolve_own_pane`'s reasoning: banto can be running inside
+/// an unrelated psmux session while still configured to open new sessions
+/// via Windows Terminal). `tmux_pane` is banto's own bare `$TMUX_PANE` (e.g.
+/// `%2`); `None` (not running inside psmux at all) always yields `None`.
+///
+/// If session resolution itself fails (the `display-message` call errors,
+/// or banto somehow isn't attached to a psmux session despite `$TMUX_PANE`
+/// being set), falls back to the bare pane id — best-effort, matching the
+/// pre-session-qualification behavior — rather than refusing to anchor the
+/// split at all.
+pub(crate) fn resolve_own_anchor<R: CommandRunner>(
+    backend: Option<Backend>,
+    runner: &R,
+    tmux_pane: Option<&str>,
+) -> Option<String> {
+    if backend != Some(Backend::Psmux) {
+        return None;
+    }
+    let pane = tmux_pane?;
+    match resolve_own_session(runner) {
+        Some(session) => Some(format!("{session}:{pane}")),
+        None => Some(pane.to_string()),
+    }
+}
+
+/// Resolve banto's own psmux session name via `display-message -p
+/// '#{session_name}'` (no `-t`, so it targets banto's own pane — the
+/// reliable route per docs/notes/psmux-spike.md; the `$TMUX` env var's
+/// session-id field is explicitly documented there as unreliable).
+fn resolve_own_session<R: CommandRunner>(runner: &R) -> Option<String> {
+    let spec = CommandSpec::new(
+        "psmux",
+        ["display-message", "-p", "#{session_name}"].map(str::to_string),
+    );
+    let output = runner.run(&spec).ok()?;
+    if !output.success {
+        return None;
+    }
+    let session = output.stdout.trim();
+    (!session.is_empty()).then(|| session.to_string())
 }
 
 #[cfg(test)]
@@ -357,20 +426,24 @@ mod tests {
     use super::*;
     use banto_core::opener::{CommandOutput, CommandSpec};
     use std::cell::{Cell, RefCell};
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;
 
     /// Records every command and always reports success with a fixed
-    /// `create` output for commands that need to parse one (psmux's
-    /// `-P -F` create format) — unless configured via
-    /// [`MockRunner::failing_select_window`] to simulate the backend CLI
+    /// session-qualified `create` output for commands that need to parse
+    /// one (psmux's `-P -F` create format, now `<session>:<window>:<pane>`
+    /// — docs/notes/psmux-spike.md, 2026-07-20) — unless configured via
+    /// [`MockRunner::failing_select_pane`] to simulate the backend CLI
     /// reporting the pane no longer exists. Cheaply `Clone`-able (shared
     /// call log) so a clone can be moved into `open_session` while the
     /// original is kept around to inspect the calls afterward.
     #[derive(Clone, Default)]
     struct MockRunner {
         calls: Rc<RefCell<Vec<CommandSpec>>>,
-        fail_select_window: Rc<Cell<bool>>,
+        fail_select_pane: Rc<Cell<bool>>,
+        /// Queued responses consumed before falling back to the default
+        /// create-format success (see [`MockRunner::with_responses`]).
+        responses: Rc<RefCell<VecDeque<CommandOutput>>>,
     }
 
     impl MockRunner {
@@ -378,27 +451,45 @@ mod tests {
             self.calls.borrow().clone()
         }
 
-        /// A runner whose `select-window` calls fail, simulating psmux
-        /// reporting the pane is gone (e.g. it was closed out of band).
-        fn failing_select_window() -> Self {
+        /// A runner whose focus-time `select-pane` call fails, simulating
+        /// psmux reporting the pane is gone (e.g. it was closed out of
+        /// band). `focus` (`TmuxOpener::focus`) only ever calls
+        /// `select-pane -t <target>` now — never
+        /// `select-window`/`switch-client` (docs/notes/psmux-spike.md,
+        /// 2026-07-20) — so that 3-arg form (no `-T`) is the only call this
+        /// fails; `open`'s own tagging `select-pane -t <target> -T <title>`
+        /// call (used when this runner also serves a fallback fresh-open)
+        /// is left alone, distinguished by the presence of `-T`.
+        fn failing_select_pane() -> Self {
             let runner = Self::default();
-            runner.fail_select_window.set(true);
+            runner.fail_select_pane.set(true);
             runner
+        }
+
+        /// A runner returning `responses` in order for its first calls (used
+        /// to test [`resolve_own_anchor`] in isolation from the psmux
+        /// create-format response below), then falling back to the default
+        /// behavior once exhausted.
+        fn with_target_responses(responses: impl IntoIterator<Item = CommandOutput>) -> Self {
+            Self {
+                responses: Rc::new(RefCell::new(responses.into_iter().collect())),
+                ..Self::default()
+            }
         }
     }
 
     impl CommandRunner for MockRunner {
         fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, OpenError> {
             self.calls.borrow_mut().push(spec.clone());
-            if self.fail_select_window.get()
-                && spec.args.first().map(String::as_str) == Some("select-window")
-            {
-                return Ok(CommandOutput::failure(
-                    Some(1),
-                    "no such window".to_string(),
-                ));
+            if let Some(response) = self.responses.borrow_mut().pop_front() {
+                return Ok(response);
             }
-            Ok(CommandOutput::success("@1:%1\n"))
+            let is_focus_select_pane = spec.args.first().map(String::as_str) == Some("select-pane")
+                && !spec.args.iter().any(|a| a == "-T");
+            if self.fail_select_pane.get() && is_focus_select_pane {
+                return Ok(CommandOutput::failure(Some(1), "no such pane".to_string()));
+            }
+            Ok(CommandOutput::success("play:@1:%1\n"))
         }
     }
 
@@ -451,7 +542,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.backend, "psmux");
-        assert_eq!(record.target, "@1:%1");
+        assert_eq!(record.target, "play:@1:%1");
         assert_eq!(record.pid, None);
     }
 
@@ -584,7 +675,7 @@ mod tests {
             .set_pane(&PaneRecord {
                 session_id: SessionId("sess-1".to_string()),
                 backend: "psmux".to_string(),
-                target: "@3:%8".to_string(),
+                target: "play:@3:%8".to_string(),
                 pid: Some(100),
                 opened_at: SystemTime::now(),
             })
@@ -605,9 +696,11 @@ mod tests {
 
         assert_eq!(outcome, OpenOutcome::Focused);
         let calls = runner.calls();
-        assert_eq!(calls.len(), 2); // select-window + select-pane
-        assert_eq!(calls[0].args, vec!["select-window", "-t", "@3"]);
-        assert_eq!(calls[1].args, vec!["select-pane", "-t", "%8"]);
+        // Only a session-qualified `select-pane` (docs/notes/psmux-spike.md,
+        // 2026-07-20): no `select-window` (fails on psmux for `session:@id`
+        // targets) and no `switch-client` (corrupted the live server).
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, vec!["select-pane", "-t", "play:%8"]);
     }
 
     #[test]
@@ -617,7 +710,7 @@ mod tests {
             .set_pane(&PaneRecord {
                 session_id: SessionId("sess-1".to_string()),
                 backend: "psmux".to_string(),
-                target: "@3:%8".to_string(),
+                target: "play:@3:%8".to_string(),
                 pid: None,
                 opened_at: SystemTime::now(),
             })
@@ -646,7 +739,7 @@ mod tests {
             .set_pane(&PaneRecord {
                 session_id: SessionId("sess-1".to_string()),
                 backend: "psmux".to_string(),
-                target: "@3:%8".to_string(),
+                target: "play:@3:%8".to_string(),
                 pid: Some(999),
                 opened_at: SystemTime::now(),
             })
@@ -671,7 +764,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // Replaced with the freshly opened pane, not the stale one.
-        assert_eq!(record.target, "@1:%1");
+        assert_eq!(record.target, "play:@1:%1");
     }
 
     #[test]
@@ -681,7 +774,7 @@ mod tests {
             .set_pane(&PaneRecord {
                 session_id: SessionId("sess-1".to_string()),
                 backend: "psmux".to_string(),
-                target: "@3:%8".to_string(),
+                target: "play:@3:%8".to_string(),
                 pid: Some(100),
                 opened_at: SystemTime::now(),
             })
@@ -689,7 +782,7 @@ mod tests {
         // Pid alive, so a normal focus would be attempted, but the backend
         // reports the pane itself is gone (e.g. closed out of band).
         let probe = MockProbe::with_alive(&[100]);
-        let runner = MockRunner::failing_select_window();
+        let runner = MockRunner::failing_select_pane();
 
         let outcome = open_session(
             &store,
@@ -708,8 +801,8 @@ mod tests {
             .unwrap()
             .unwrap();
         // Replaced with the freshly opened pane, not the stale one.
-        assert_eq!(record.target, "@1:%1");
-        assert_ne!(record.target, "@3:%8");
+        assert_eq!(record.target, "play:@1:%1");
+        assert_ne!(record.target, "play:@3:%8");
     }
 
     #[test]
@@ -778,7 +871,7 @@ mod tests {
         // Tagged with the cwd's directory name, not a session id.
         assert_eq!(
             calls[1].args,
-            vec!["select-pane", "-t", "%1", "-T", "alpha"]
+            vec!["select-pane", "-t", "play:%1", "-T", "alpha"]
         );
     }
 
@@ -816,7 +909,10 @@ mod tests {
         .unwrap();
 
         let calls = runner.calls();
-        assert_eq!(calls[1].args, vec!["select-pane", "-t", "%1", "-T", "/"]);
+        assert_eq!(
+            calls[1].args,
+            vec!["select-pane", "-t", "play:%1", "-T", "/"]
+        );
     }
 
     #[test]
@@ -827,6 +923,102 @@ mod tests {
             open_new_session(None, &PathBuf::from("/work/alpha"), runner.clone(), None).unwrap();
 
         assert_eq!(outcome, OpenOutcome::NoBackendDetected);
+        assert!(runner.calls().is_empty());
+    }
+
+    // --- encode_target / decode_handle -----------------------------------
+
+    #[test]
+    fn encode_decode_tmux_target_roundtrips_the_session_qualified_form() {
+        let handle = SessionHandle::Tmux {
+            session: "play".to_string(),
+            window_id: "@3".to_string(),
+            pane_id: "%8".to_string(),
+        };
+
+        let target = encode_target(&handle);
+
+        assert_eq!(target, "play:@3:%8");
+        assert_eq!(decode_handle(Backend::Psmux, &target), Some(handle));
+    }
+
+    #[test]
+    fn decode_handle_rejects_a_pre_session_qualification_two_part_target() {
+        // A pane record written before psmux's non-unique-id finding
+        // (docs/notes/psmux-spike.md, 2026-07-20) encodes the old
+        // `<window_id>:<pane_id>` form. It can no longer be resolved to a
+        // specific session, so it must decode to `None`, not be
+        // misinterpreted as `<session>:<pane_id>` with a missing pane.
+        assert_eq!(decode_handle(Backend::Psmux, "@3:%8"), None);
+    }
+
+    #[test]
+    fn encode_target_windows_terminal_is_empty() {
+        assert_eq!(encode_target(&SessionHandle::WindowsTerminal), "");
+    }
+
+    #[test]
+    fn decode_handle_windows_terminal_ignores_the_target_string() {
+        assert_eq!(
+            decode_handle(Backend::WindowsTerminal, ""),
+            Some(SessionHandle::WindowsTerminal)
+        );
+    }
+
+    // --- resolve_own_anchor / resolve_own_session -------------------------
+
+    #[test]
+    fn resolve_own_anchor_queries_the_session_name_and_qualifies_the_pane() {
+        let runner = MockRunner::with_target_responses([CommandOutput::success("play\n")]);
+
+        let anchor = resolve_own_anchor(Some(Backend::Psmux), &runner, Some("%2"));
+
+        assert_eq!(anchor.as_deref(), Some("play:%2"));
+        assert_eq!(
+            runner.calls(),
+            vec![CommandSpec::new(
+                "psmux",
+                ["display-message", "-p", "#{session_name}"].map(str::to_string)
+            )]
+        );
+    }
+
+    #[test]
+    fn resolve_own_anchor_falls_back_to_the_bare_pane_when_session_lookup_fails() {
+        let runner = MockRunner::with_target_responses([CommandOutput::failure(
+            Some(1),
+            "no server running".to_string(),
+        )]);
+
+        let anchor = resolve_own_anchor(Some(Backend::Psmux), &runner, Some("%2"));
+
+        assert_eq!(anchor.as_deref(), Some("%2"));
+    }
+
+    #[test]
+    fn resolve_own_anchor_is_none_without_a_tmux_pane() {
+        let runner = MockRunner::with_target_responses([CommandOutput::success("play\n")]);
+
+        assert_eq!(
+            resolve_own_anchor(Some(Backend::Psmux), &runner, None),
+            None
+        );
+        // Never shells out when there's no pane to qualify in the first place.
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn resolve_own_anchor_is_none_for_a_non_psmux_backend_even_with_tmux_pane_set() {
+        // Mirrors `crate::wrap::resolve_own_pane`'s reasoning: banto could be
+        // running inside an unrelated psmux session (so `$TMUX_PANE` is set)
+        // while still configured to open new sessions via Windows Terminal.
+        let runner = MockRunner::with_target_responses([CommandOutput::success("play\n")]);
+
+        assert_eq!(
+            resolve_own_anchor(Some(Backend::WindowsTerminal), &runner, Some("%2")),
+            None
+        );
+        assert_eq!(resolve_own_anchor(None, &runner, Some("%2")), None);
         assert!(runner.calls().is_empty());
     }
 

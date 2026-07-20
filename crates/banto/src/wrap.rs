@@ -350,6 +350,10 @@ fn resolve_own_pane(
         return None;
     };
     log.log(&format!("resolve_own_pane: TMUX_PANE={pane_id}"));
+    // A single call captures both the session and the window: psmux reuses
+    // window/pane ids across sessions (docs/notes/psmux-spike.md,
+    // 2026-07-20), so the pane record must be session-qualified too, not
+    // just `<window_id>:<pane_id>`.
     let spec = CommandSpec::new(
         "psmux",
         [
@@ -358,7 +362,7 @@ fn resolve_own_pane(
             "-t",
             pane_id.as_str(),
             "-F",
-            "#{window_id}",
+            "#{session_name}:#{window_id}",
         ]
         .map(str::to_string),
     );
@@ -379,12 +383,19 @@ fn resolve_own_pane(
     if !output.success {
         return None;
     }
-    let window_id = output.stdout.trim();
-    if window_id.is_empty() {
-        log.log("resolve_own_pane: display-message returned an empty window_id");
+    let stdout = output.stdout.trim();
+    let Some((session, window_id)) = stdout.split_once(':') else {
+        log.log(&format!(
+            "resolve_own_pane: display-message output {stdout:?} missing the session:window_id separator"
+        ));
+        return None;
+    };
+    if session.is_empty() || window_id.is_empty() {
+        log.log("resolve_own_pane: display-message returned an empty session or window_id");
         return None;
     }
     let handle = SessionHandle::Tmux {
+        session: session.to_string(),
         window_id: window_id.to_string(),
         pane_id,
     };
@@ -585,17 +596,28 @@ mod tests {
 
     #[test]
     fn resolve_own_pane_resolves_backend_and_target_via_display_message() {
-        let runner = MockCommandRunner::with_responses([CommandOutput::success("@3\n")]);
+        let runner = MockCommandRunner::with_responses([CommandOutput::success("play:@3\n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
         let result = resolve_own_pane(Backend::Psmux, env, &runner, &WrapLog::disabled());
 
-        assert_eq!(result, Some(("psmux".to_string(), "@3:%8".to_string())));
+        assert_eq!(
+            result,
+            Some(("psmux".to_string(), "play:@3:%8".to_string()))
+        );
         assert_eq!(
             runner.calls(),
             vec![CommandSpec::new(
                 "psmux",
-                ["display-message", "-p", "-t", "%8", "-F", "#{window_id}"].map(str::to_string)
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "%8",
+                    "-F",
+                    "#{session_name}:#{window_id}"
+                ]
+                .map(str::to_string)
             )]
         );
     }
@@ -617,6 +639,20 @@ mod tests {
     #[test]
     fn resolve_own_pane_is_none_when_display_message_returns_empty_output() {
         let runner = MockCommandRunner::with_responses([CommandOutput::success("  \n")]);
+        let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
+
+        assert_eq!(
+            resolve_own_pane(Backend::Psmux, env, &runner, &WrapLog::disabled()),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_own_pane_is_none_when_display_message_output_has_no_session_separator() {
+        // A malformed/unexpected output missing the `session:window_id`
+        // separator (e.g. only the bare window id) must not be
+        // misinterpreted as a session name with a missing window id.
+        let runner = MockCommandRunner::with_responses([CommandOutput::success("@3\n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
         assert_eq!(
@@ -811,7 +847,8 @@ mod tests {
         // Exits on the very first poll (0 still-running polls): no session
         // file exists to be found either, so nothing should be recorded.
         let process_runner = MockProcessRunner::new_spawning(0, Some(0));
-        let command_runner = MockCommandRunner::with_responses([CommandOutput::success("@3\n")]);
+        let command_runner =
+            MockCommandRunner::with_responses([CommandOutput::success("play:@3\n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
         let code = run_new_session(
@@ -869,7 +906,8 @@ mod tests {
         // Runs for one "still running" poll (long enough for discovery to
         // happen before exit) then exits.
         let process_runner = MockProcessRunner::new_spawning(1, Some(0));
-        let command_runner = MockCommandRunner::with_responses([CommandOutput::success("@3\n")]);
+        let command_runner =
+            MockCommandRunner::with_responses([CommandOutput::success("play:@3\n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
         let code = run_new_session(
