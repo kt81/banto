@@ -224,6 +224,7 @@ mod tests {
     fn focus_rejects_tmux_handle() {
         let opener = WindowsTerminalOpener::new(MockRunner::new());
         let handle = SessionHandle::Tmux {
+            session: "0".to_string(),
             window_id: "@1".to_string(),
             pane_id: "%1".to_string(),
         };

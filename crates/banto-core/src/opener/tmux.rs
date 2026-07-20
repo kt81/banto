@@ -2,16 +2,24 @@
 //!
 //! Command forms follow docs/notes/psmux-spike.md where the spike verified
 //! them on a live psmux binary: `new-window`/`split-window` with `-P -F`
-//! reliably return freshly created ids, `select-pane -T` is the only usable
-//! way to tag a pane (pane *user options* are set but never read back), and
-//! focusing an existing session needs an explicit `select-window` +
-//! `select-pane` pair.
+//! reliably return freshly created ids, and `select-pane -T` is the only
+//! usable way to tag a pane (pane *user options* are set but never read
+//! back).
 //!
 //! The forms the original spike had left unverified were confirmed on-device
 //! in a follow-up spike (2026-07-19, see docs/notes/psmux-spike.md): the
 //! direct `split-window <command>` spawn form (multi-arg trailing command),
 //! the `-c <cwd>` flag, the combined `-F '#{window_id}:#{pane_id}'` format,
 //! and that the `psmux` binary itself accepts these subcommands.
+//!
+//! A later spike (2026-07-20, see docs/notes/psmux-spike.md) found that
+//! psmux, unlike real tmux, reuses window/pane ids across sessions — so
+//! every target must be session-qualified. It also found that
+//! `select-window -t 'session:@window_id'` fails outright (window ids can't
+//! be qualified that way), and that `switch-client` corrupted the live
+//! server badly enough to destroy a session outright. Both findings shape
+//! [`TmuxOpener::focus`]: it never calls `select-window` or `switch-client`,
+//! only a session-qualified `select-pane`.
 
 use std::path::Path;
 
@@ -21,11 +29,11 @@ use super::{Backend, OpenError, Opener, ResumeCommand, SessionHandle};
 /// The psmux/tmux CLI binary name.
 const PROGRAM: &str = "psmux";
 
-/// Format string for `-P -F`: both ids, `:`-joined. `new-window` and
-/// `split-window` only expose one of `window_id`/`pane_id` directly, but
-/// [`SessionHandle::Tmux`] needs both, and they're both valid in a
+/// Format string for `-P -F`: session, window and pane id, `:`-joined.
+/// [`SessionHandle::Tmux`] needs all three (psmux reuses window/pane ids
+/// across sessions, docs/notes/psmux-spike.md), and they're all valid in a
 /// newly-created pane's format context regardless of which command created it.
-const CREATE_FORMAT: &str = "#{window_id}:#{pane_id}";
+const CREATE_FORMAT: &str = "#{session_name}:#{window_id}:#{pane_id}";
 
 /// Where a resumed session is placed relative to the window banto runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +138,8 @@ impl<R: CommandRunner> Opener for TmuxOpener<R> {
         args.extend(cmd.argv.iter().cloned());
 
         let output = self.run(CommandSpec::new(PROGRAM, args))?;
-        let (window_id, pane_id) = parse_create_output(&output.stdout)?;
+        let (session, window_id, pane_id) = parse_create_output(&output.stdout)?;
+        let target = session_pane_target(&session, &pane_id);
 
         // Pane user options can't be read back (psmux-spike.md), so the
         // title is the pane's actual `-T`; our store's pane map is the
@@ -140,33 +149,44 @@ impl<R: CommandRunner> Opener for TmuxOpener<R> {
             [
                 "select-pane".to_string(),
                 "-t".to_string(),
-                pane_id.clone(),
+                target,
                 "-T".to_string(),
                 cmd.title.clone(),
             ],
         ))?;
 
-        Ok(SessionHandle::Tmux { window_id, pane_id })
+        Ok(SessionHandle::Tmux {
+            session,
+            window_id,
+            pane_id,
+        })
     }
 
     fn focus(&self, handle: &SessionHandle) -> Result<(), OpenError> {
-        let SessionHandle::Tmux { window_id, pane_id } = handle else {
+        let SessionHandle::Tmux {
+            session, pane_id, ..
+        } = handle
+        else {
             return Err(OpenError::MismatchedHandle {
                 backend: Backend::Psmux,
             });
         };
 
+        // Session-qualified `select-pane` only (docs/notes/psmux-spike.md,
+        // 2026-07-20): `select-window -t 'session:@window_id'` fails
+        // outright on psmux, and `switch-client` corrupted the live server
+        // badly enough to destroy a session during a spike, so neither is
+        // used. banto's own panes are splits within banto's own session
+        // (TmuxPlacement::Pane), so a plain session-qualified `select-pane`
+        // is sufficient to surface the target pane without switching
+        // windows or clients.
         self.run(CommandSpec::new(
             PROGRAM,
             [
-                "select-window".to_string(),
+                "select-pane".to_string(),
                 "-t".to_string(),
-                window_id.clone(),
+                session_pane_target(session, pane_id),
             ],
-        ))?;
-        self.run(CommandSpec::new(
-            PROGRAM,
-            ["select-pane".to_string(), "-t".to_string(), pane_id.clone()],
         ))?;
         Ok(())
     }
@@ -176,16 +196,31 @@ fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Parse the `<window_id>:<pane_id>` line printed by `-P -F` for [`CREATE_FORMAT`].
-fn parse_create_output(stdout: &str) -> Result<(String, String), OpenError> {
+/// Build a session-qualified pane target (`<session>:<pane_id>`), the
+/// reliable form confirmed by docs/notes/psmux-spike.md — no window
+/// component is needed for `select-pane`.
+fn session_pane_target(session: &str, pane_id: &str) -> String {
+    format!("{session}:{pane_id}")
+}
+
+/// Parse the `<session>:<window_id>:<pane_id>` line printed by `-P -F` for
+/// [`CREATE_FORMAT`].
+fn parse_create_output(stdout: &str) -> Result<(String, String, String), OpenError> {
     let line = stdout.trim();
-    match line.split_once(':') {
-        Some((window_id, pane_id)) if !window_id.is_empty() && !pane_id.is_empty() => {
-            Ok((window_id.to_string(), pane_id.to_string()))
+    let mut parts = line.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(session), Some(window_id), Some(pane_id))
+            if !session.is_empty() && !window_id.is_empty() && !pane_id.is_empty() =>
+        {
+            Ok((
+                session.to_string(),
+                window_id.to_string(),
+                pane_id.to_string(),
+            ))
         }
         _ => Err(OpenError::UnexpectedOutput {
             program: PROGRAM.to_string(),
-            expected: "`<window_id>:<pane_id>`".to_string(),
+            expected: "`<session>:<window_id>:<pane_id>`".to_string(),
             got: stdout.to_string(),
         }),
     }
@@ -225,7 +260,7 @@ mod tests {
 
     #[test]
     fn open_as_pane_splits_current_window_and_tags() {
-        let runner = MockRunner::with_responses([CommandOutput::success("@3:%8\n")]);
+        let runner = MockRunner::with_responses([CommandOutput::success("play:@3:%8\n")]);
         let opener = TmuxOpener::new(runner);
 
         let handle = opener.open(&resume_cmd()).unwrap();
@@ -233,6 +268,7 @@ mod tests {
         assert_eq!(
             handle,
             SessionHandle::Tmux {
+                session: "play".to_string(),
                 window_id: "@3".to_string(),
                 pane_id: "%8".to_string(),
             }
@@ -250,7 +286,7 @@ mod tests {
                         "/home/user/project",
                         "-P",
                         "-F",
-                        "#{window_id}:#{pane_id}",
+                        "#{session_name}:#{window_id}:#{pane_id}",
                         "banto",
                         "_wrap",
                         "--session",
@@ -264,7 +300,7 @@ mod tests {
                 ),
                 CommandSpec::new(
                     "psmux",
-                    ["select-pane", "-t", "%8", "-T", "sess-1"].map(str::to_string)
+                    ["select-pane", "-t", "play:%8", "-T", "sess-1"].map(str::to_string)
                 ),
             ]
         );
@@ -272,8 +308,8 @@ mod tests {
 
     #[test]
     fn open_as_pane_splits_from_the_anchor_when_set() {
-        let runner = MockRunner::with_responses([CommandOutput::success("@3:%8\n")]);
-        let opener = TmuxOpener::new(runner).with_anchor_pane("%1");
+        let runner = MockRunner::with_responses([CommandOutput::success("play:@3:%8\n")]);
+        let opener = TmuxOpener::new(runner).with_anchor_pane("play:%1");
 
         opener.open(&resume_cmd()).unwrap();
 
@@ -286,12 +322,12 @@ mod tests {
                     "split-window",
                     "-h",
                     "-t",
-                    "%1",
+                    "play:%1",
                     "-c",
                     "/home/user/project",
                     "-P",
                     "-F",
-                    "#{window_id}:#{pane_id}",
+                    "#{session_name}:#{window_id}:#{pane_id}",
                     "banto",
                     "_wrap",
                     "--session",
@@ -308,9 +344,9 @@ mod tests {
 
     #[test]
     fn anchor_pane_does_not_affect_window_placement() {
-        let runner = MockRunner::with_responses([CommandOutput::success("@5:%9")]);
+        let runner = MockRunner::with_responses([CommandOutput::success("play:@5:%9")]);
         let opener =
-            TmuxOpener::with_placement(runner, TmuxPlacement::Window).with_anchor_pane("%1");
+            TmuxOpener::with_placement(runner, TmuxPlacement::Window).with_anchor_pane("play:%1");
 
         opener.open(&resume_cmd()).unwrap();
 
@@ -322,7 +358,7 @@ mod tests {
 
     #[test]
     fn open_as_window_creates_named_window_and_tags() {
-        let runner = MockRunner::with_responses([CommandOutput::success("@5:%9")]);
+        let runner = MockRunner::with_responses([CommandOutput::success("play:@5:%9")]);
         let opener = TmuxOpener::with_placement(runner, TmuxPlacement::Window);
 
         let handle = opener.open(&resume_cmd()).unwrap();
@@ -330,6 +366,7 @@ mod tests {
         assert_eq!(
             handle,
             SessionHandle::Tmux {
+                session: "play".to_string(),
                 window_id: "@5".to_string(),
                 pane_id: "%9".to_string(),
             }
@@ -348,7 +385,7 @@ mod tests {
                     "/home/user/project",
                     "-P",
                     "-F",
-                    "#{window_id}:#{pane_id}",
+                    "#{session_name}:#{window_id}:#{pane_id}",
                     "banto",
                     "_wrap",
                     "--session",
@@ -365,28 +402,33 @@ mod tests {
             calls[1],
             CommandSpec::new(
                 "psmux",
-                ["select-pane", "-t", "%9", "-T", "sess-1"].map(str::to_string)
+                ["select-pane", "-t", "play:%9", "-T", "sess-1"].map(str::to_string)
             )
         );
     }
 
     #[test]
-    fn focus_selects_window_then_pane() {
+    fn focus_selects_the_session_qualified_pane_only() {
         let opener = TmuxOpener::new(MockRunner::new());
         let handle = SessionHandle::Tmux {
+            session: "play".to_string(),
             window_id: "@3".to_string(),
             pane_id: "%8".to_string(),
         };
 
         opener.focus(&handle).unwrap();
 
+        // No `select-window`, no `switch-client` (docs/notes/psmux-spike.md,
+        // 2026-07-20): the former fails on psmux for `session:@id` targets,
+        // the latter corrupted the live server. A session-qualified
+        // `select-pane` alone is the only call.
         let calls = opener.runner.calls();
         assert_eq!(
             calls,
-            vec![
-                CommandSpec::new("psmux", ["select-window", "-t", "@3"].map(str::to_string)),
-                CommandSpec::new("psmux", ["select-pane", "-t", "%8"].map(str::to_string)),
-            ]
+            vec![CommandSpec::new(
+                "psmux",
+                ["select-pane", "-t", "play:%8"].map(str::to_string)
+            )]
         );
     }
 
@@ -418,6 +460,18 @@ mod tests {
     #[test]
     fn open_errors_on_unparseable_create_output() {
         let runner = MockRunner::with_responses([CommandOutput::success("not-an-id\n")]);
+        let opener = TmuxOpener::new(runner);
+
+        let err = opener.open(&resume_cmd()).unwrap_err();
+
+        assert!(matches!(err, OpenError::UnexpectedOutput { .. }));
+    }
+
+    #[test]
+    fn open_errors_on_create_output_missing_the_session_field() {
+        // Only two `:`-joined parts (the pre-spike `<window_id>:<pane_id>`
+        // format) is malformed now that CREATE_FORMAT requires the session.
+        let runner = MockRunner::with_responses([CommandOutput::success("@3:%8\n")]);
         let opener = TmuxOpener::new(runner);
 
         let err = opener.open(&resume_cmd()).unwrap_err();

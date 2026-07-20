@@ -64,8 +64,15 @@ pub struct ResumeCommand {
 /// persists this alongside the session id as the pane map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionHandle {
-    /// A psmux/tmux pane and the window that contains it.
-    Tmux { window_id: String, pane_id: String },
+    /// A psmux/tmux pane, the window that contains it, and the session that
+    /// contains the window. psmux reuses window/pane ids across sessions
+    /// (docs/notes/psmux-spike.md), so `session` is required to target the
+    /// right one.
+    Tmux {
+        session: String,
+        window_id: String,
+        pane_id: String,
+    },
     /// A Windows Terminal tab. WT exposes no handle we can target afterwards.
     WindowsTerminal,
 }
