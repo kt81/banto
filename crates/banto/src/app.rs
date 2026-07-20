@@ -248,6 +248,21 @@ impl GroupJoinState {
     }
 }
 
+/// Where confirming the new-session modal launches the session — mirrors
+/// the list's own Enter (in-place) / `s` (split) distinction. Chosen up
+/// front by which key opened the modal (`n` = in-place, `N` = split — see
+/// [`App::open_new_session_modal`]/[`App::open_new_session_modal_split`])
+/// rather than toggled inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewSessionPlacement {
+    /// `n`: hand banto's own terminal to the new session (the default,
+    /// matching Enter on the list).
+    InPlace,
+    /// `N`: launch it in a separate psmux pane / Windows Terminal tab
+    /// (matching `s` on the list).
+    Split,
+}
+
 /// State for the new-session modal: a free-text cwd input plus a
 /// substring-filtered list of previously seen cwds (extracted from the
 /// loaded sessions) to pick from instead of typing a full path.
@@ -271,10 +286,12 @@ pub struct NewSessionState {
     /// Inline validation error from the last confirm attempt (e.g. the typed
     /// path doesn't exist), cleared as soon as the input changes again.
     error: Option<String>,
+    /// Fixed for the lifetime of the modal (see [`NewSessionPlacement`]).
+    placement: NewSessionPlacement,
 }
 
 impl NewSessionState {
-    fn new(rows: &[SessionRow]) -> Self {
+    fn new(rows: &[SessionRow], placement: NewSessionPlacement) -> Self {
         let mut state = Self {
             candidates: unique_cwds(rows),
             input: String::new(),
@@ -282,6 +299,7 @@ impl NewSessionState {
             filtered: Vec::new(),
             selected: 0,
             error: None,
+            placement,
         };
         state.refilter();
         state
@@ -394,6 +412,12 @@ impl NewSessionState {
     /// The inline validation error from the last confirm attempt, if any.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Where confirming this modal launches the session (see
+    /// [`NewSessionPlacement`]).
+    pub fn placement(&self) -> NewSessionPlacement {
+        self.placement
     }
 
     /// The cwd that would be launched if confirmed right now: the
@@ -584,11 +608,26 @@ impl App {
         self.modal.as_ref()
     }
 
-    /// Open the `n` new-session modal, seeding its candidate list from every
-    /// distinct cwd across all loaded sessions (bound to `n` in
-    /// [`Mode::Normal`]).
+    /// Open the `n` new-session modal for an in-place launch, seeding its
+    /// candidate list from every distinct cwd across all loaded sessions
+    /// (bound to `n` in [`Mode::Normal`] — the default placement, matching
+    /// Enter on the list).
     pub fn open_new_session_modal(&mut self) {
-        self.modal = Some(Modal::NewSession(NewSessionState::new(&self.base_rows)));
+        self.open_new_session_modal_as(NewSessionPlacement::InPlace);
+    }
+
+    /// Open the new-session modal for a split launch (bound to `N` in
+    /// [`Mode::Normal`] — matching `s` on the list). Otherwise identical to
+    /// [`Self::open_new_session_modal`].
+    pub fn open_new_session_modal_split(&mut self) {
+        self.open_new_session_modal_as(NewSessionPlacement::Split);
+    }
+
+    fn open_new_session_modal_as(&mut self, placement: NewSessionPlacement) {
+        self.modal = Some(Modal::NewSession(NewSessionState::new(
+            &self.base_rows,
+            placement,
+        )));
     }
 
     /// Open the `d` archive confirm modal for the selected session (no-op

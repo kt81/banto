@@ -23,7 +23,8 @@ stays on the premises and directs and watches over the guests (sessions).
 - `s` resumes the session in a separate psmux pane / Windows Terminal tab
   instead, for users who want a multiplexer layout — see Opener spec
 - A dedicated dialog also launches a brand-new session (pick or type a
-  working directory), not just resumes an existing one
+  working directory), not just resumes an existing one — `n` opens it
+  in-place, `N` opens it for a split launch, mirroring Enter/`s` on the list
 - If a session is already resumed, refuse to start a second one instead
   (a double resume forks the session history and is therefore forbidden):
   in-place checks liveness up front and shows "already running"; split mode

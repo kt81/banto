@@ -37,7 +37,8 @@ use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
 use crate::app::{
-    App, ClickOutcome, GroupJoinState, GroupJoinTarget, ListLine, Modal, Mode, NewSessionState,
+    App, ClickOutcome, GroupJoinState, GroupJoinTarget, ListLine, Modal, Mode, NewSessionPlacement,
+    NewSessionState,
 };
 use crate::opener::{self, OpenOutcome, SessionToOpen};
 use crate::process::{ProcessRunner, SystemProcessRunner};
@@ -562,6 +563,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
         KeyCode::Char('s') => activate_split(app, ctx),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('n') => app.open_new_session_modal(),
+        KeyCode::Char('N') => app.open_new_session_modal_split(),
         KeyCode::Char('d') => app.open_confirm_archive_modal(),
         KeyCode::Char('g') => app.open_group_join_modal(),
         KeyCode::Tab => toggle_grouped_view(app),
@@ -627,17 +629,23 @@ fn confirm_modal(app: &mut App, ctx: &Context) {
 /// candidate, or the raw typed path — see [`App::modal_new_session_target`]),
 /// validate it's an existing directory (an invalid path becomes an inline
 /// modal error instead of a failed launch — see [`App::modal_set_error`] —
-/// so the user can correct it without losing what they typed), then stash
-/// an in-place launch for `event_loop` to run — same model as [`activate`]'s
-/// resume path (see [`Context::pending_inplace`]), just with no
-/// double-resume guard: a brand-new `claude` launch never forks an existing
-/// session's history, so there's nothing to check against. A modal with
+/// so the user can correct it without losing what they typed), then launch
+/// it per the modal's own [`NewSessionPlacement`] (fixed when it was opened
+/// — `n` vs `N`, see [`App::open_new_session_modal`]/
+/// [`App::open_new_session_modal_split`]): in-place stashes a launch for
+/// `event_loop` to run, same model as [`activate`]'s resume path (see
+/// [`Context::pending_inplace`]); split calls `opener::open_new_session`
+/// directly and posts its outcome as a status message, same model as
+/// [`activate_split`]. Neither needs a double-resume guard: a brand-new
+/// `claude` launch never forks an existing session's history. A modal with
 /// nothing to confirm yet (empty input, no candidates) is left open — Enter
 /// does nothing, matching how Enter on an empty list does nothing in
-/// [`activate`]. Closes the modal immediately; the actual run (and its
-/// resulting status message) happens once `event_loop` drains
-/// `pending_inplace`.
+/// [`activate`].
 fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
+    let Some(Modal::NewSession(state)) = app.modal() else {
+        return;
+    };
+    let placement = state.placement();
     let Some(cwd) = app.modal_new_session_target() else {
         return;
     };
@@ -646,15 +654,59 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
         return;
     }
 
-    ctx.log(&format!(
-        "confirm_new_session_modal (in-place) cwd={}",
-        cwd.display()
-    ));
-    *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
-        argv: opener::inplace_argv(None),
-        startup_message: opener::new_session_startup_message(&cwd),
-        cwd,
-    });
+    match placement {
+        NewSessionPlacement::InPlace => {
+            ctx.log(&format!(
+                "confirm_new_session_modal (in-place) cwd={}",
+                cwd.display()
+            ));
+            *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
+                argv: opener::inplace_argv(None),
+                startup_message: opener::new_session_startup_message(&cwd),
+                cwd,
+            });
+        }
+        NewSessionPlacement::Split => {
+            let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
+            let tmux_pane = std::env::var("TMUX_PANE").ok();
+            let anchor =
+                opener::resolve_own_anchor(backend, &SystemCommandRunner, tmux_pane.as_deref());
+            // Passed through explicitly rather than left for `_wrap` to read
+            // its own environment: a psmux-spawned process doesn't reliably
+            // inherit banto's (docs/notes/psmux-spike.md) — see
+            // `crate::wrap::WrapLog::new`.
+            let wrap_log = std::env::var("BANTO_WRAP_LOG").ok();
+            let outcome = opener::open_new_session(
+                backend,
+                &cwd,
+                SystemCommandRunner,
+                anchor.as_deref(),
+                wrap_log.as_deref(),
+            );
+            ctx.log(&format!(
+                "confirm_new_session_modal (split) cwd={} outcome={outcome:?}",
+                cwd.display()
+            ));
+            let message = match outcome {
+                Ok(OpenOutcome::Opened) => format!("launched a new session in {}", cwd.display()),
+                Ok(OpenOutcome::NoBackendDetected) => {
+                    "no terminal backend detected (run inside psmux/Windows Terminal, \
+                     or set `opener` in config.toml)"
+                        .to_string()
+                }
+                // `open_new_session` never focuses or refuses an existing
+                // pane — there's no pre-existing session for a fresh launch
+                // to key off of.
+                Ok(
+                    OpenOutcome::Focused
+                    | OpenOutcome::AlreadyOpenCannotFocus
+                    | OpenOutcome::AlreadyRunningUntracked,
+                ) => unreachable!(),
+                Err(err) => format!("failed to launch a new session in {}: {err}", cwd.display()),
+            };
+            app.set_status(message);
+        }
+    }
     app.close_modal();
 }
 
@@ -1528,8 +1580,8 @@ fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> Str
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  s split  \
-                                / search  n new  d archive  g group  Tab view  p pin  a agents  \
-                                q/Esc quit";
+                                / search  n new  N new-split  d archive  g group  Tab view  \
+                                p pin  a agents  q/Esc quit";
     const SEARCH_HINTS: &str =
         "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
@@ -1759,10 +1811,14 @@ fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
 /// a substring-filtered list of previously seen cwds to pick from instead of
 /// typing a full path (Tab completes the highlighted one into the input).
 fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Rect) {
+    let placement_label = match state.placement() {
+        NewSessionPlacement::InPlace => "in-place",
+        NewSessionPlacement::Split => "split",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" New Session \u{2014} cwd ")
+        .title(format!(" New Session ({placement_label}) \u{2014} cwd "))
         .title_bottom(" Enter launch  Tab complete  Esc cancel ");
     let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
@@ -2052,8 +2108,10 @@ mod tests {
             .unwrap();
         assert!(!alpha_line.contains('*'), "unexpected marker:\n{text}");
         // The hint text is longer than the narrow 60-col terminal `draw`
-        // uses, so check it wider (see `search_mode_hint_differs_...`).
-        let wide_text = draw_with_width(&app, 110);
+        // uses, so check it wider (see `search_mode_hint_differs_...`) — and
+        // wide enough to comfortably outlive ordinary hint-text growth (new
+        // keybinding hints added over time), not just today's exact length.
+        let wide_text = draw_with_width(&app, 160);
         assert!(wide_text.contains("p pin"), "hint missing:\n{wide_text}");
     }
 
@@ -2653,7 +2711,10 @@ mod tests {
 
         handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &ctx);
 
-        assert!(app.modal().is_some());
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.placement(), NewSessionPlacement::InPlace);
     }
 
     #[test]
@@ -2669,6 +2730,57 @@ mod tests {
 
         assert_eq!(app.query(), "n");
         assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn shift_n_opens_the_new_session_modal_in_split_mode() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('N'), KeyModifiers::NONE, &ctx);
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+        assert_eq!(state.placement(), NewSessionPlacement::Split);
+    }
+
+    #[test]
+    fn shift_n_is_query_text_in_search_mode_not_the_split_new_session_shortcut() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        handle_key(&mut app, KeyCode::Char('N'), KeyModifiers::NONE, &ctx);
+
+        assert_eq!(app.query(), "N");
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn new_session_modal_title_names_its_placement() {
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        app.open_new_session_modal();
+        let in_place_text = draw(&app);
+        assert!(
+            in_place_text.contains("(in-place)"),
+            "in-place label missing:\n{in_place_text}"
+        );
+
+        app.open_new_session_modal_split();
+        let split_text = draw(&app);
+        assert!(
+            split_text.contains("(split)"),
+            "split label missing:\n{split_text}"
+        );
     }
 
     #[test]
