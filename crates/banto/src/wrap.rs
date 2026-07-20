@@ -247,9 +247,21 @@ pub fn run_new_session(
 
     // Best-effort cleanup, same rationale as `run`: a store failure here
     // must not mask the child's own exit code.
-    if let Some(id) = recorded {
-        log.log(&format!("removing pane record session_id={}", id.0));
-        let _ = store.remove_pane(&id);
+    match recorded {
+        Some(id) => {
+            log.log(&format!("removing pane record session_id={}", id.0));
+            let _ = store.remove_pane(&id);
+        }
+        None => {
+            let reason = if poll_count >= DISCOVERY_TIMEOUT_POLLS {
+                "discovery timed out"
+            } else {
+                "child exited before discovery ever matched"
+            };
+            log.log(&format!(
+                "no pane record was ever written for this session ({reason}, {poll_count} polls)"
+            ));
+        }
     }
 
     Ok(code.unwrap_or(1))
