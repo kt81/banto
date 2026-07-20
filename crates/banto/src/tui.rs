@@ -80,6 +80,25 @@ const ESCAPE_GRACE: Duration = Duration::from_millis(30);
 /// still resolving in far less time than a human notices as lag.
 const HEADLESS_GRACE: Duration = Duration::from_millis(120);
 
+/// How long after dispatching a genuine Esc (see [`dispatch_genuine_esc`])
+/// its trailing Release event is still recognized as "already handled" and
+/// consumed rather than misread as a second, independent Esc — see
+/// [`consume_recent_genuine_esc`]. Regression: whenever a physical Esc press
+/// is held longer than [`ESCAPE_GRACE`] (which, since ordinary human key
+/// taps routinely run well past 30ms, is the common case, not an edge
+/// case), `resolve_escape` times out and dispatches the press *before* the
+/// key's own Release has arrived — so that Release later reaches the
+/// top-level loop on its own, with nothing left to say it was already
+/// accounted for, and the "press must have been lost, so treat this bare
+/// Release as the real Esc" fallback (added for a *different*, genuine
+/// dropped-press case during mouse motion) fires a second, spurious Esc —
+/// e.g. closing a modal and then immediately quitting the app. Long enough
+/// to comfortably cover any realistic key hold (well beyond typical human
+/// tap/hold durations), but still bounded so a Release that, for whatever
+/// reason, never arrives doesn't leave the flag stuck and wrongly suppress
+/// a later, actually-independent dropped-press Release.
+const ESC_RELEASE_SUPPRESS_WINDOW: Duration = Duration::from_millis(500);
+
 /// Everything the render loop needs beyond [`App`] itself: dependencies for
 /// opening/focusing sessions and reloading rows from disk.
 struct Context<'a> {
@@ -95,6 +114,11 @@ struct Context<'a> {
     /// every escape-resolution decision with a millisecond timestamp, for
     /// debugging input pipelines we cannot reproduce synthetically.
     input_log: std::cell::RefCell<Option<std::fs::File>>,
+    /// When a genuine Esc was last dispatched (see [`dispatch_genuine_esc`]),
+    /// so its trailing Release can be recognized and silently consumed
+    /// instead of misfiring a second Esc (see
+    /// [`consume_recent_genuine_esc`]/[`ESC_RELEASE_SUPPRESS_WINDOW`]).
+    last_genuine_esc: RefCell<Option<Instant>>,
 }
 
 impl Context<'_> {
@@ -176,6 +200,7 @@ pub fn run(
         store,
         opener_mode,
         input_log: std::cell::RefCell::new(open_input_log()),
+        last_genuine_esc: RefCell::new(None),
     };
     ctx.log("=== banto TUI started ===");
 
@@ -332,17 +357,30 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                             // upstream entirely (same family as the
                             // dropped-ESC-byte finding for leaked mouse
                             // reports) — no Esc press of any shape reaches
-                            // us, only its Release. This signature is safe
-                            // to treat as a real Esc: in the working case,
-                            // a real Esc press is dispatched through
-                            // `resolve_escape`, which consumes the matching
-                            // Release internally (see `swallow_one_sequence`)
-                            // — so a bare Esc Release reaching here always
-                            // means its press never arrived.
-                            ctx.log(
-                                "loop: bare Esc Release with no matching Press -> dispatching as Esc",
-                            );
-                            handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+                            // us, only its Release. That's a genuine
+                            // dropped-press case and this bare Release is
+                            // the only real signal of it — BUT a bare
+                            // Release also reaches here whenever a normal,
+                            // successfully-dispatched Esc's physical hold
+                            // outlasts `ESCAPE_GRACE` (routine for an
+                            // ordinary human tap, not just a held key):
+                            // `resolve_escape` times out and dispatches
+                            // before that Esc's own Release has arrived,
+                            // so the Release shows up here on its own with
+                            // nothing else to say it was already handled.
+                            // `consume_recent_genuine_esc` tells the two
+                            // cases apart via the timestamp
+                            // `dispatch_genuine_esc` leaves behind.
+                            if consume_recent_genuine_esc(ctx, Instant::now()) {
+                                ctx.log(
+                                    "loop: bare Esc Release matches a just-dispatched genuine Esc -> consuming, not re-dispatching",
+                                );
+                            } else {
+                                ctx.log(
+                                    "loop: bare Esc Release with no matching Press -> dispatching as Esc",
+                                );
+                                handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+                            }
                         }
                         continue;
                     }
@@ -636,6 +674,28 @@ fn handle_search_key(app: &mut App, code: KeyCode) {
     }
 }
 
+/// Dispatch a confirmed, genuine Esc — every code path that has decided a
+/// buffered/pending Esc really is one (as opposed to the start of a leaked
+/// sequence) must go through this, not `handle_key` directly, so its
+/// timestamp is on record for [`consume_recent_genuine_esc`] to find. See
+/// [`ESC_RELEASE_SUPPRESS_WINDOW`] for why this matters.
+fn dispatch_genuine_esc(app: &mut App, ctx: &Context) {
+    *ctx.last_genuine_esc.borrow_mut() = Some(Instant::now());
+    handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+}
+
+/// Whether a bare Esc Release we're about to treat as "the press must have
+/// been lost" (see the identical branches in [`event_loop`]/[`drain_more`])
+/// is actually just the trailing Release of an Esc [`dispatch_genuine_esc`]
+/// already fired — in which case it must be silently swallowed, not
+/// dispatched a second time. Consumes the stamp unconditionally (clearing
+/// it either way) so a single stamp only ever gets checked against one
+/// Release, rather than lingering to (mis)judge some later, unrelated one.
+fn consume_recent_genuine_esc(ctx: &Context, now: Instant) -> bool {
+    let stamp = ctx.last_genuine_esc.borrow_mut().take();
+    stamp.is_some_and(|t| now.saturating_duration_since(t) <= ESC_RELEASE_SUPPRESS_WINDOW)
+}
+
 /// Resolve a `KeyCode::Esc` key event by waiting up to [`ESCAPE_GRACE`] to
 /// see if anything follows: if nothing shows up, this is a genuine
 /// standalone Esc. If something DOES follow, it may be the start of an SGR
@@ -652,7 +712,7 @@ fn handle_search_key(app: &mut App, code: KeyCode) {
 fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     if !event::poll(ESCAPE_GRACE)? {
         ctx.log("esc: entry grace expired with empty queue -> lone Esc");
-        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+        dispatch_genuine_esc(app, ctx);
         return Ok(());
     }
     match swallow_one_sequence(
@@ -711,13 +771,20 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
         match read {
             Event::Key(key) if key.kind == KeyEventKind::Release => {
                 if normalize_key_code(key.code) == KeyCode::Esc {
-                    // See the identical case in `event_loop`: a bare Esc
-                    // Release reaching here means its press was dropped
-                    // upstream during motion — dispatch it as the real Esc.
-                    ctx.log(
-                        "esc: drain saw bare Esc Release with no matching Press -> dispatching as Esc",
-                    );
-                    handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+                    // See the identical branch in `event_loop`: this bare
+                    // Release is either a genuinely dropped press (dispatch
+                    // it) or the trailing Release of an Esc already handled
+                    // via `dispatch_genuine_esc` (consume it silently).
+                    if consume_recent_genuine_esc(ctx, Instant::now()) {
+                        ctx.log(
+                            "esc: drain saw a bare Esc Release matching a just-dispatched genuine Esc -> consuming, not re-dispatching",
+                        );
+                    } else {
+                        ctx.log(
+                            "esc: drain saw bare Esc Release with no matching Press -> dispatching as Esc",
+                        );
+                        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+                    }
                     return Ok(());
                 }
             }
@@ -936,7 +1003,7 @@ fn end_interrupted_buffer(app: &mut App, ctx: &Context, pending: &[char]) {
             "esc: interrupted, dispatching leading Esc and discarding tail {:?}",
             &pending[1..]
         ));
-        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+        dispatch_genuine_esc(app, ctx);
         return;
     }
     if pending.len() > 1 {
@@ -995,7 +1062,7 @@ fn apply_sgr_action(app: &mut App, ctx: &Context, list_area: Rect, event: sgr::S
 fn replay(app: &mut App, ctx: &Context, buffered: &[char]) {
     for &c in buffered {
         if c == '\u{1b}' {
-            handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+            dispatch_genuine_esc(app, ctx);
         } else {
             handle_key(app, KeyCode::Char(c), KeyModifiers::NONE, ctx);
         }
@@ -1729,6 +1796,7 @@ mod tests {
             store,
             opener_mode: OpenerMode::Auto,
             input_log: std::cell::RefCell::new(None),
+            last_genuine_esc: RefCell::new(None),
         }
     }
 
@@ -2466,6 +2534,104 @@ mod tests {
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &ctx);
 
         assert!(app.modal().is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn dispatch_genuine_esc_stamps_the_context_and_dispatches_the_key() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        assert!(ctx.last_genuine_esc.borrow().is_none());
+
+        dispatch_genuine_esc(&mut app, &ctx);
+
+        assert!(app.should_quit()); // Normal mode: Esc quits.
+        assert!(ctx.last_genuine_esc.borrow().is_some());
+    }
+
+    #[test]
+    fn consume_recent_genuine_esc_suppresses_within_the_window_and_clears_the_stamp() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let t0 = Instant::now();
+        *ctx.last_genuine_esc.borrow_mut() = Some(t0);
+
+        assert!(consume_recent_genuine_esc(
+            &ctx,
+            t0 + Duration::from_millis(50)
+        ));
+        // Consumed: checking again immediately finds nothing left to match.
+        assert!(!consume_recent_genuine_esc(
+            &ctx,
+            t0 + Duration::from_millis(50)
+        ));
+    }
+
+    #[test]
+    fn consume_recent_genuine_esc_does_not_suppress_once_the_window_has_passed() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let t0 = Instant::now();
+        *ctx.last_genuine_esc.borrow_mut() = Some(t0);
+
+        assert!(!consume_recent_genuine_esc(
+            &ctx,
+            t0 + ESC_RELEASE_SUPPRESS_WINDOW + Duration::from_millis(1)
+        ));
+        // Still cleared even though it didn't match, so a stale stamp never
+        // lingers to wrongly suppress a later, unrelated Release.
+        assert!(ctx.last_genuine_esc.borrow().is_none());
+    }
+
+    #[test]
+    fn consume_recent_genuine_esc_is_false_with_no_stamp_at_all() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+
+        assert!(!consume_recent_genuine_esc(&ctx, Instant::now()));
+    }
+
+    /// Regression: a held Esc press that outlasts `ESCAPE_GRACE` (routine
+    /// for an ordinary human tap, not just a deliberately held key) makes
+    /// `resolve_escape` dispatch the press before its own trailing Release
+    /// has arrived; that Release then reaches the top-level loop's "press
+    /// must have been lost" fallback with nothing left to say it was
+    /// already handled. Reproduces the sequence directly: a genuine
+    /// dispatch (as `resolve_escape`'s entry-grace-timeout branch would
+    /// perform) closes the modal, then the same guard the fixed
+    /// `event_loop`/`drain_more` branches run before falling back to a
+    /// second dispatch — proving that second Esc never reaches
+    /// `handle_key`.
+    #[test]
+    fn a_delayed_esc_release_after_a_genuine_dispatch_does_not_fire_a_second_esc() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        // The genuine press: closes the modal (mirrors `resolve_escape`'s
+        // entry-grace-timeout branch).
+        dispatch_genuine_esc(&mut app, &ctx);
+        assert!(app.modal().is_none());
+        assert!(!app.should_quit());
+
+        // The trailing Release, arriving on its own moments later: the
+        // fallback's guard must recognize and consume it rather than
+        // re-dispatching.
+        if !consume_recent_genuine_esc(&ctx, Instant::now()) {
+            handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &ctx);
+        }
+
+        // Without the fix this second Esc would have quit the app (Normal
+        // mode, no modal open any more).
         assert!(!app.should_quit());
     }
 
