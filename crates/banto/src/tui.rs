@@ -769,6 +769,7 @@ mod tests {
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,
+            input_log: std::cell::RefCell::new(None),
         }
     }
 
