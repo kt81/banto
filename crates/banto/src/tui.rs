@@ -468,12 +468,16 @@ fn activate(app: &mut App, ctx: &Context) {
     };
 
     let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
+    // Anchor psmux splits on banto's own pane so the resume pane lands
+    // next to banto, not in whatever window the client has focused.
+    let anchor = std::env::var("TMUX_PANE").ok();
     let outcome = opener::open_session(
         ctx.store,
         &SysinfoProbe,
         backend,
         &session,
         SystemCommandRunner,
+        anchor.as_deref(),
     );
 
     let message = match outcome {

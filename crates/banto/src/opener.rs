@@ -14,7 +14,10 @@ use std::time::SystemTime;
 
 use banto_core::config::OpenerMode;
 use banto_core::model::SessionId;
-use banto_core::opener::{self, Backend, CommandRunner, OpenError, ResumeCommand, SessionHandle};
+use banto_core::opener::{
+    self, Backend, CommandRunner, OpenError, Opener, ResumeCommand, SessionHandle, TmuxOpener,
+    WindowsTerminalOpener,
+};
 use banto_core::status::ProcessProbe;
 use banto_core::store::{PaneRecord, Store, StoreError};
 
@@ -71,6 +74,7 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
     backend: Option<Backend>,
     session: &SessionToOpen,
     runner: R,
+    anchor_pane: Option<&str>,
 ) -> Result<OpenOutcome, SessionOpenError> {
     let id = SessionId(session.id.clone());
 
@@ -91,7 +95,7 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
         }
     }
 
-    open_fresh(store, backend, session, runner)
+    open_fresh(store, backend, session, runner, anchor_pane)
 }
 
 /// Outcome of [`focus_existing`]: either a final [`OpenOutcome`], or a
@@ -138,6 +142,7 @@ fn open_fresh<R: CommandRunner + 'static>(
     backend: Option<Backend>,
     session: &SessionToOpen,
     runner: R,
+    anchor_pane: Option<&str>,
 ) -> Result<OpenOutcome, SessionOpenError> {
     let Some(backend) = backend else {
         return Ok(OpenOutcome::NoBackendDetected);
@@ -152,7 +157,17 @@ fn open_fresh<R: CommandRunner + 'static>(
         cwd: session.cwd.clone(),
         title: session.title.clone(),
     };
-    let handle = opener::opener_for(backend, runner).open(&cmd)?;
+    // Anchor psmux splits on banto's own pane (resolved from TMUX_PANE by
+    // the caller) so the resume pane lands next to banto instead of in
+    // whatever window the user's client is currently focused on.
+    let opener: Box<dyn Opener> = match (backend, anchor_pane) {
+        (Backend::Psmux, Some(anchor)) => {
+            Box::new(TmuxOpener::new(runner).with_anchor_pane(anchor))
+        }
+        (Backend::Psmux, None) => Box::new(TmuxOpener::new(runner)),
+        (Backend::WindowsTerminal, _) => Box::new(WindowsTerminalOpener::new(runner)),
+    };
+    let handle = opener.open(&cmd)?;
 
     store.set_pane(&PaneRecord {
         session_id: SessionId(session.id.clone()),
@@ -315,6 +330,7 @@ mod tests {
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
+            None,
         )
         .unwrap();
 
@@ -329,12 +345,36 @@ mod tests {
     }
 
     #[test]
+    fn open_fresh_anchors_the_split_on_the_given_pane() {
+        let store = Store::open_in_memory().unwrap();
+        let probe = MockProbe::with_alive(&[]);
+        let runner = MockRunner::default();
+
+        let outcome = open_session(
+            &store,
+            &probe,
+            Some(Backend::Psmux),
+            &session(),
+            runner.clone(),
+            Some("%7"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, OpenOutcome::Opened);
+        let calls = runner.calls();
+        let args = &calls[0].args;
+        assert_eq!(args[0], "split-window");
+        let t = args.iter().position(|a| a == "-t").expect("-t missing");
+        assert_eq!(args[t + 1], "%7");
+    }
+
+    #[test]
     fn no_backend_detected_opens_nothing() {
         let store = Store::open_in_memory().unwrap();
         let probe = MockProbe::with_alive(&[]);
         let runner = MockRunner::default();
 
-        let outcome = open_session(&store, &probe, None, &session(), runner.clone()).unwrap();
+        let outcome = open_session(&store, &probe, None, &session(), runner.clone(), None).unwrap();
 
         assert_eq!(outcome, OpenOutcome::NoBackendDetected);
         assert!(runner.calls().is_empty());
@@ -365,6 +405,7 @@ mod tests {
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
+            None,
         )
         .unwrap();
 
@@ -396,6 +437,7 @@ mod tests {
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
+            None,
         )
         .unwrap();
 
@@ -423,6 +465,7 @@ mod tests {
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
+            None,
         )
         .unwrap();
 
@@ -458,6 +501,7 @@ mod tests {
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
+            None,
         )
         .unwrap();
 
@@ -492,6 +536,7 @@ mod tests {
             Some(Backend::WindowsTerminal),
             &session(),
             runner.clone(),
+            None,
         )
         .unwrap();
 
