@@ -5,7 +5,8 @@
 //! hook), and mouse capture is enabled for wheel/click support. All code here
 //! is cross-platform — crossterm handles the Windows specifics.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -34,7 +35,9 @@ use banto_core::status::{AgeThresholds, SysinfoProbe};
 use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
-use crate::app::{App, ClickOutcome, Modal, Mode, NewSessionState, VisibleRow};
+use crate::app::{
+    App, ClickOutcome, GroupJoinState, GroupJoinTarget, ListLine, Modal, Mode, NewSessionState,
+};
 use crate::opener::{self, OpenOutcome, SessionToOpen};
 use crate::session;
 use crate::sgr::{self, SgrParse};
@@ -81,7 +84,10 @@ const HEADLESS_GRACE: Duration = Duration::from_millis(120);
 struct Context<'a> {
     claude_home: &'a Path,
     thresholds: &'a AgeThresholds,
-    store: &'a Store,
+    /// `RefCell`-wrapped so `Store::set_session_group` (which takes `&mut
+    /// self`, since it wraps a transaction) can be called from the many key
+    /// handlers that only hold a plain `&Context` — see [`run`].
+    store: &'a RefCell<Store>,
     opener_mode: OpenerMode,
     /// Diagnostic input-event log, enabled via the `BANTO_INPUT_LOG` env var
     /// (its value is the file path). Records every raw crossterm event and
@@ -149,11 +155,20 @@ pub fn run(
     claude_home: &Path,
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
-    store: &Store,
+    store: &RefCell<Store>,
 ) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
-    let pinned = load_pinned(store);
-    let mut app = App::new(rows).with_pinned(pinned);
+    let (rows, pinned, groups, session_groups) = {
+        let store = store.borrow();
+        let rows = exclude_archived(rows, &store);
+        let pinned = load_pinned(&store);
+        let groups = load_groups(&store);
+        let session_groups = load_session_groups(&store, &groups);
+        (rows, pinned, groups, session_groups)
+    };
+    let mut app = App::new(rows)
+        .with_pinned(pinned)
+        .with_groups(groups, session_groups);
     let ctx = Context {
         claude_home,
         thresholds,
@@ -168,6 +183,47 @@ pub fn run(
     // Always restore the terminal, even if the loop errored.
     let restored = restore_terminal();
     result.and(restored)
+}
+
+/// Drop archived sessions from `rows` (soft-hide via `d` — see
+/// `App::open_confirm_archive_modal`/`confirm_modal`). A read failure is
+/// tolerated: nothing gets excluded rather than blocking the TUI.
+fn exclude_archived(rows: Vec<session::SessionRow>, store: &Store) -> Vec<session::SessionRow> {
+    let archived: HashSet<String> = store
+        .archived_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    rows.into_iter()
+        .filter(|row| !archived.contains(&row.id))
+        .collect()
+}
+
+/// Load every known group, alphabetical by name. Tolerant: a read failure
+/// just means no groups are known yet, rather than blocking the TUI.
+fn load_groups(store: &Store) -> Vec<(i64, String)> {
+    let mut groups: Vec<(i64, String)> = store
+        .list_groups()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| (g.id, g.name))
+        .collect();
+    groups.sort_by(|a, b| a.1.cmp(&b.1));
+    groups
+}
+
+/// Load the session -> group id map by walking each group's members (fewer
+/// queries than asking per-session). Tolerant: a read failure for one group
+/// just means its members show as ungrouped, rather than blocking the TUI.
+fn load_session_groups(store: &Store, groups: &[(i64, String)]) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    for &(group_id, _) in groups {
+        for session_id in store.group_members(group_id).unwrap_or_default() {
+            map.insert(session_id.0, group_id);
+        }
+    }
+    map
 }
 
 /// Enter raw mode + the alternate screen with mouse capture, installing a
@@ -367,6 +423,9 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
         KeyCode::Enter => activate(app, ctx),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('n') => app.open_new_session_modal(),
+        KeyCode::Char('d') => app.open_confirm_archive_modal(),
+        KeyCode::Char('g') => app.open_group_join_modal(),
+        KeyCode::Tab => toggle_grouped_view(app),
         KeyCode::Char('p') => toggle_pin(app, ctx),
         KeyCode::Char('a') => toggle_agent_filter(app),
         KeyCode::Char('q') | KeyCode::Esc => app.request_quit(),
@@ -374,12 +433,27 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     }
 }
 
+/// Toggle grouped view, posting the new state as a status message (bound to
+/// Tab in [`Mode::Normal`]; see [`App::toggle_grouped_view`]).
+fn toggle_grouped_view(app: &mut App) {
+    let grouped = app.toggle_grouped_view();
+    app.set_status(
+        if grouped {
+            "grouped view (Pinned / groups / Ungrouped)"
+        } else {
+            "flat view"
+        }
+        .to_string(),
+    );
+}
+
 /// Keys while a modal is open: typed characters build its text input,
 /// Up/Down move its candidate selection, Tab completes the input to the
-/// highlighted candidate, Backspace edits the input, Enter confirms (see
-/// [`confirm_modal`]), Esc cancels without acting. Only the new-session
-/// modal exists so far, but none of this is specific to it — a future modal
-/// (e.g. group-join) reuses this same shape.
+/// highlighted candidate (new-session modal only), Backspace edits the
+/// input, Enter confirms (see [`confirm_modal`]), Esc cancels without
+/// acting. Shared across every modal kind — each of `App`'s `modal_*`
+/// methods is a no-op for a modal that doesn't have the relevant piece (e.g.
+/// the archive confirm dialog has no text input or candidate list).
 fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     match code {
         KeyCode::Esc => app.close_modal(),
@@ -393,18 +467,27 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     }
 }
 
-/// Confirm the open modal. For the new-session modal: resolve the target cwd
-/// (the highlighted candidate, or the raw typed path — see
-/// [`App::modal_new_session_target`]), validate it's an existing directory
-/// (an invalid path becomes an inline modal error instead of a failed spawn
-/// — see [`App::modal_set_error`] — so the user can correct it without
-/// losing what they typed), launch a fresh `claude` there, post the outcome
-/// as a status message, and close the modal (the message reports success or
-/// failure, same as [`activate`]'s resume path). A modal with nothing to
-/// confirm yet (empty input, no candidates) is left open — Enter does
-/// nothing, matching how Enter on an empty list does nothing in
-/// [`activate`].
+/// Confirm whichever modal is open, dispatching to its kind-specific logic.
 fn confirm_modal(app: &mut App, ctx: &Context) {
+    match app.modal() {
+        Some(Modal::NewSession(_)) => confirm_new_session_modal(app, ctx),
+        Some(Modal::ConfirmArchive { .. }) => confirm_archive_modal(app, ctx),
+        Some(Modal::GroupJoin(_)) => confirm_group_join_modal(app, ctx),
+        None => {}
+    }
+}
+
+/// Confirm the new-session modal: resolve the target cwd (the highlighted
+/// candidate, or the raw typed path — see [`App::modal_new_session_target`]),
+/// validate it's an existing directory (an invalid path becomes an inline
+/// modal error instead of a failed spawn — see [`App::modal_set_error`] — so
+/// the user can correct it without losing what they typed), launch a fresh
+/// `claude` there, post the outcome as a status message, and close the modal
+/// (the message reports success or failure, same as [`activate`]'s resume
+/// path). A modal with nothing to confirm yet (empty input, no candidates)
+/// is left open — Enter does nothing, matching how Enter on an empty list
+/// does nothing in [`activate`].
+fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
     let Some(cwd) = app.modal_new_session_target() else {
         return;
     };
@@ -430,6 +513,77 @@ fn confirm_modal(app: &mut App, ctx: &Context) {
         Err(err) => format!("failed to launch a new session in {}: {err}", cwd.display()),
     };
     app.set_status(message);
+    app.close_modal();
+}
+
+/// Confirm the archive dialog: soft-hides the session via
+/// `Store::archive_session` (never touches the real jsonl file — see
+/// `App::open_confirm_archive_modal`), then reloads so it disappears from
+/// the list immediately instead of waiting for the next filesystem event.
+fn confirm_archive_modal(app: &mut App, ctx: &Context) {
+    let Some(Modal::ConfirmArchive { session_id, title }) = app.modal() else {
+        return;
+    };
+    let session_id = session_id.clone();
+    let title = title.clone();
+
+    let result = ctx
+        .store
+        .borrow()
+        .archive_session(&SessionId(session_id.clone()));
+    let message = match result {
+        Ok(()) => format!("archived session {title}"),
+        Err(err) => format!("failed to archive session {title}: {err}"),
+    };
+    app.set_status(message);
+    app.close_modal();
+    reload(app, ctx);
+}
+
+/// Confirm the group-join dialog: join the highlighted existing group, or
+/// create a new one named after the typed text and join that (see
+/// [`App::modal_group_join_target`]). `Store::set_session_group` moves the
+/// session (clearing any prior group membership first), matching the
+/// single-group-per-session UX. Updates `App`'s group cache on success so
+/// grouped view reflects the change immediately.
+fn confirm_group_join_modal(app: &mut App, ctx: &Context) {
+    let Some(Modal::GroupJoin(state)) = app.modal() else {
+        return;
+    };
+    let session_id = state.session_id().to_string();
+    let Some(target) = app.modal_group_join_target() else {
+        return;
+    };
+
+    let mut store = ctx.store.borrow_mut();
+    let (group_id, group_name, result) = match target {
+        GroupJoinTarget::Existing(group_id, name) => {
+            let result = store.set_session_group(&SessionId(session_id.clone()), group_id);
+            (group_id, name, result)
+        }
+        GroupJoinTarget::New(name) => match store.create_group(&name) {
+            Ok(group_id) => {
+                let result = store.set_session_group(&SessionId(session_id.clone()), group_id);
+                (group_id, name, result)
+            }
+            Err(err) => {
+                drop(store);
+                app.set_status(format!("failed to create group \"{name}\": {err}"));
+                app.close_modal();
+                return;
+            }
+        },
+    };
+    drop(store);
+
+    let message = match &result {
+        Ok(()) => format!("joined group \"{group_name}\""),
+        Err(err) => format!("failed to join group \"{group_name}\": {err}"),
+    };
+    app.set_status(message);
+    if result.is_ok() {
+        app.set_session_group_cache(&session_id, group_id, group_name);
+    }
     app.close_modal();
 }
 
@@ -818,7 +972,7 @@ fn activate(app: &mut App, ctx: &Context) {
     // next to banto, not in whatever window the client has focused.
     let anchor = std::env::var("TMUX_PANE").ok();
     let outcome = opener::open_session(
-        ctx.store,
+        &ctx.store.borrow(),
         &SysinfoProbe,
         backend,
         &session,
@@ -851,10 +1005,11 @@ fn toggle_pin(app: &mut App, ctx: &Context) {
         return;
     };
     let session_id = SessionId(id.clone());
+    let store = ctx.store.borrow();
     let result = if now_pinned {
-        ctx.store.pin(&session_id)
+        store.pin(&session_id)
     } else {
-        ctx.store.unpin(&session_id)
+        store.unpin(&session_id)
     };
     let message = match result {
         Ok(()) if now_pinned => format!("pinned session {id}"),
@@ -877,10 +1032,13 @@ fn toggle_agent_filter(app: &mut App) {
 
 /// Re-read sessions from disk and re-classify their activity, preserving
 /// selection (by session id), query and scroll clamping — see
-/// [`App::replace_rows`]. A read failure is tolerated: the previous rows are
-/// kept rather than the TUI erroring out over a transient filesystem hiccup.
+/// [`App::replace_rows`]. Archived sessions are excluded, same as the
+/// initial load in [`run`]. A read failure is tolerated: the previous rows
+/// are kept rather than the TUI erroring out over a transient filesystem
+/// hiccup.
 fn reload(app: &mut App, ctx: &Context) {
     if let Ok(rows) = session::load_rows(ctx.claude_home, ctx.thresholds) {
+        let rows = exclude_archived(rows, &ctx.store.borrow());
         app.replace_rows(rows);
     }
 }
@@ -940,39 +1098,54 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Build one list row: colored activity dot, pin marker (if pinned), title
-/// (or id), dimmed cwd.
-fn list_item(visible: VisibleRow<'_>) -> ListItem<'static> {
-    let dot = Span::styled(
-        "\u{25cf} ",
-        Style::default().fg(activity_color(visible.row.activity)),
-    );
-    let pin = if visible.pinned {
-        // Plain ASCII, not a star symbol/emoji: those can render double-width
-        // in some terminals and would break column alignment.
-        Span::styled(
-            "* ",
+/// Build one list line: a bold section-header line (grouped view only), or
+/// a row — colored activity dot, pin marker (if pinned), title (or id),
+/// dimmed cwd. Each is its own `ListItem`/physical line rather than a
+/// header bundled into its row, matching the index space
+/// `App::click`/`App::scroll`/`App::ensure_visible` all use — see
+/// [`crate::app::ListLine`] for why that matters for mouse clicks.
+fn list_item(line: ListLine<'_>) -> ListItem<'static> {
+    match line {
+        ListLine::Header(name) => ListItem::new(Line::from(Span::styled(
+            name,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::raw("  ")
-    };
-    let title = Span::raw(visible.row.display_title().to_string());
-    let cwd = visible.row.cwd_display();
-    let line = if cwd.is_empty() {
-        Line::from(vec![dot, pin, title])
-    } else {
-        Line::from(vec![
-            dot,
-            pin,
-            title,
-            Span::raw("  "),
-            Span::styled(cwd, Style::default().fg(Color::DarkGray)),
-        ])
-    };
-    ListItem::new(line)
+        ))),
+        ListLine::Row(visible) => {
+            let dot = Span::styled(
+                "\u{25cf} ",
+                Style::default().fg(activity_color(visible.row.activity)),
+            );
+            let pin = if visible.pinned {
+                // Plain ASCII, not a star symbol/emoji: those can render
+                // double-width in some terminals and would break column
+                // alignment.
+                Span::styled(
+                    "* ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            let title = Span::raw(visible.row.display_title().to_string());
+            let cwd = visible.row.cwd_display();
+            let row_line = if cwd.is_empty() {
+                Line::from(vec![dot, pin, title])
+            } else {
+                Line::from(vec![
+                    dot,
+                    pin,
+                    title,
+                    Span::raw("  "),
+                    Span::styled(cwd, Style::default().fg(Color::DarkGray)),
+                ])
+            };
+            ListItem::new(row_line)
+        }
+    }
 }
 
 /// Render the always-visible summary panel below the list: the selected
@@ -1051,7 +1224,7 @@ fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> Str
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  / search  \
-                                n new  p pin  a agents  q/Esc quit";
+                                n new  d archive  g group  Tab view  p pin  a agents  q/Esc quit";
     const SEARCH_HINTS: &str =
         "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
@@ -1069,6 +1242,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 Mode::Search => SEARCH_HINTS,
             };
             let mut hints = hints.to_string();
+            if app.mode() == Mode::Normal && !app.grouped_view() {
+                hints.push_str("  (flat)");
+            }
             let hidden = app.hidden_agent_count();
             if hidden > 0 {
                 let plural = if hidden == 1 { "" } else { "s" };
@@ -1136,6 +1312,8 @@ fn render_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
     frame.render_widget(Clear, area);
     match modal {
         Modal::NewSession(state) => render_new_session_modal(frame, state, area),
+        Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
+        Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
     }
 }
 
@@ -1178,6 +1356,81 @@ fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Re
     if candidates.is_empty() {
         frame.render_widget(
             Paragraph::new("No matching directories \u{2014} Enter uses the typed path.")
+                .style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = candidates
+        .iter()
+        .map(|candidate| ListItem::new((*candidate).to_string()))
+        .collect();
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    list_state.select(state.selected());
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+/// Render the `d` archive confirm dialog: a one-line yes/no prompt naming
+/// the session. Archiving only soft-hides it (`Store::archive_session`) —
+/// the real jsonl file is never touched, and unarchiving isn't exposed in
+/// the UI yet, so the prompt says as much to set expectations.
+fn render_confirm_archive_modal(frame: &mut Frame, title: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Archive Session \u{2014} confirm ")
+        .title_bottom(" Enter archive  Esc cancel ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(format!("Archive \"{title}\"?")),
+        Line::from(Span::styled(
+            "Hides it from the list; the session file itself is untouched.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the `g` group-join dialog: a one-line new-group-name input (same
+/// input/cursor convention as the search box and the new-session modal)
+/// above a substring-filtered list of existing groups to pick from instead.
+fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" Join Group ")
+        .title_bottom(" Enter join/create  Esc cancel ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [hint_area, input_area, list_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    frame.render_widget(
+        Paragraph::new("Type a new group name, or pick an existing one below:")
+            .style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
+
+    frame.render_widget(Paragraph::new(state.input()), input_area);
+    if input_area.width > 0 {
+        let input_cols = state.input().chars().count() as u16;
+        let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
+        frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    }
+
+    let candidates = state.candidates();
+    if candidates.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching groups \u{2014} Enter creates a new one.")
                 .style(Style::default().fg(Color::DarkGray)),
             list_area,
         );
@@ -1241,7 +1494,7 @@ mod tests {
     /// in-memory store (and caller-owned `thresholds`, so the returned
     /// `Context`'s lifetime doesn't outlive a temporary) to satisfy
     /// `Context`'s shape.
-    fn test_context<'a>(store: &'a Store, thresholds: &'a AgeThresholds) -> Context<'a> {
+    fn test_context<'a>(store: &'a RefCell<Store>, thresholds: &'a AgeThresholds) -> Context<'a> {
         Context {
             claude_home: Path::new("."),
             thresholds,
@@ -1375,8 +1628,11 @@ mod tests {
             "agent row shown by default:\n{text}"
         );
         // The hint text (including the hidden-count suffix) is longer than
-        // the narrow 60-col terminal `draw` uses, so check it wider.
-        let wide_text = draw_with_width(&app, 130);
+        // the narrow 60-col terminal `draw` uses, so check it wider. 200 is
+        // deliberately generous — this exact assertion has already broken
+        // twice from ordinary hint-text growth (new keybinding hints added
+        // over time), so leave real headroom rather than a tight fit.
+        let wide_text = draw_with_width(&app, 200);
         assert!(
             wide_text.contains("1 agent session hidden"),
             "missing hidden indicator:\n{wide_text}"
@@ -1412,7 +1668,7 @@ mod tests {
 
     #[test]
     fn slash_enters_search_mode_and_typed_characters_filter() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![
@@ -1431,7 +1687,7 @@ mod tests {
 
     #[test]
     fn j_and_k_move_selection_in_normal_mode() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![
@@ -1451,7 +1707,7 @@ mod tests {
 
     #[test]
     fn q_quits_in_normal_mode_but_is_query_input_in_search_mode() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
@@ -1469,7 +1725,7 @@ mod tests {
 
     #[test]
     fn esc_quits_in_normal_mode() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
@@ -1481,7 +1737,7 @@ mod tests {
 
     #[test]
     fn esc_in_search_mode_clears_the_query_and_returns_to_normal_without_quitting() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1500,7 +1756,7 @@ mod tests {
 
     #[test]
     fn enter_in_search_mode_confirms_without_opening_and_keeps_the_query() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![
@@ -1523,7 +1779,7 @@ mod tests {
 
     #[test]
     fn a_toggles_the_agent_filter_only_in_normal_mode() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![
@@ -1547,7 +1803,7 @@ mod tests {
     /// none of this should ever reach the query or a keybinding.
     #[test]
     fn leaked_motion_sequences_never_reach_the_query_or_quit_binding() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1572,7 +1828,7 @@ mod tests {
 
     #[test]
     fn apply_sgr_action_wheel_scrolls_without_moving_selection() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(
@@ -1601,7 +1857,7 @@ mod tests {
 
     #[test]
     fn apply_sgr_action_left_click_selects_the_row_under_the_cursor() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![
@@ -1631,7 +1887,7 @@ mod tests {
 
     #[test]
     fn apply_sgr_action_ignores_motion_and_releases() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
@@ -1692,7 +1948,7 @@ mod tests {
 
     #[test]
     fn headless_wheel_sequence_scrolls_via_apply_sgr_action() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1716,7 +1972,7 @@ mod tests {
     /// not eat legitimate keystrokes.
     #[test]
     fn replay_of_a_headless_bracket_mismatch_types_every_buffered_character() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1734,7 +1990,7 @@ mod tests {
     /// `[` and paused) must still land in the query, not vanish.
     #[test]
     fn replay_of_a_lone_headless_bracket_types_the_bracket() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1776,7 +2032,7 @@ mod tests {
     /// and are covered by other tests using that code directly.
     #[test]
     fn backspace_delivered_as_del_during_motion_still_deletes_query_text() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1799,7 +2055,7 @@ mod tests {
     /// honor the real Esc action — the tail is discarded, not typed.
     #[test]
     fn end_interrupted_buffer_dispatches_leading_esc_and_discards_the_tail() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1820,7 +2076,7 @@ mod tests {
     /// must still be dispatched.
     #[test]
     fn end_interrupted_buffer_replays_a_lone_bare_esc_seed() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1837,7 +2093,7 @@ mod tests {
     /// far more likely a truncated leaked sequence than genuine typing.
     #[test]
     fn end_interrupted_buffer_discards_a_grown_headless_bracket_buffer() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1854,7 +2110,7 @@ mod tests {
     /// single real keystroke and must still reach the query.
     #[test]
     fn end_interrupted_buffer_replays_a_lone_headless_bracket_seed() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1876,7 +2132,7 @@ mod tests {
     /// (a no-op in Normal mode) and losing the quit.
     #[test]
     fn ctrl_c_still_quits_when_dispatched_with_its_modifier_intact() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
@@ -1889,7 +2145,7 @@ mod tests {
 
     #[test]
     fn n_opens_the_new_session_modal_from_normal_mode() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
@@ -1902,7 +2158,7 @@ mod tests {
 
     #[test]
     fn n_is_query_text_in_search_mode_not_the_new_session_shortcut() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1917,7 +2173,7 @@ mod tests {
 
     #[test]
     fn esc_closes_the_open_modal_without_quitting_or_reaching_the_recognizer() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
@@ -1932,7 +2188,7 @@ mod tests {
 
     #[test]
     fn typing_and_arrow_keys_drive_the_open_modal_instead_of_the_background_list() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![
@@ -2093,7 +2349,7 @@ mod tests {
 
     #[test]
     fn confirm_modal_sets_an_inline_error_and_stays_open_for_a_nonexistent_directory() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(Vec::new());
@@ -2123,7 +2379,7 @@ mod tests {
     /// whether a modal happens to be open when it arrives.
     #[test]
     fn leaked_sgr_sequences_are_swallowed_even_while_a_modal_is_open() {
-        let store = Store::open_in_memory().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
         let thresholds = AgeThresholds::default();
         let ctx = test_context(&store, &thresholds);
         let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
@@ -2141,5 +2397,116 @@ mod tests {
             panic!("expected the modal to still be open");
         };
         assert_eq!(state.input(), "");
+    }
+
+    #[test]
+    fn d_opens_the_archive_confirm_modal_with_the_selected_session() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &ctx);
+
+        let Some(Modal::ConfirmArchive { session_id, title }) = app.modal() else {
+            panic!("expected an open archive-confirm modal");
+        };
+        assert_eq!(session_id, "a");
+        assert_eq!(title, "Alpha");
+    }
+
+    #[test]
+    fn g_opens_the_group_join_modal_for_the_selected_session() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &ctx);
+
+        assert!(matches!(app.modal(), Some(Modal::GroupJoin(_))));
+    }
+
+    #[test]
+    fn tab_toggles_grouped_view_in_normal_mode() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        assert!(app.grouped_view());
+
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE, &ctx);
+
+        assert!(!app.grouped_view());
+        assert_eq!(app.status(), Some("flat view"));
+    }
+
+    #[test]
+    fn tab_completes_a_candidate_in_the_new_session_modal_not_grouped_view_toggle() {
+        // Tab means different things depending on context: with a modal
+        // open it completes the candidate (see the new-session modal
+        // tests); grouped-view toggling only applies in Normal mode with no
+        // modal open, per `handle_key`'s modal-first routing.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE, &ctx);
+
+        // Grouped view is untouched; the modal's input got completed instead.
+        assert!(app.grouped_view());
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected the new-session modal to still be open");
+        };
+        assert_eq!(state.input(), "/work/alpha");
+    }
+
+    #[test]
+    fn render_confirm_archive_modal_shows_the_session_title() {
+        let mut app = App::new(vec![row("a", "Fix login", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_confirm_archive_modal();
+
+        let text = draw_with_width(&app, 110);
+        assert!(text.contains("Archive Session"), "title missing:\n{text}");
+        assert!(text.contains("Fix login"), "session name missing:\n{text}");
+        assert!(text.contains("Enter archive"), "hint missing:\n{text}");
+    }
+
+    #[test]
+    fn render_group_join_modal_shows_input_and_matching_groups() {
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+        app.modal_push_char('w');
+
+        let text = draw_with_width(&app, 110);
+        assert!(text.contains("Join Group"), "title missing:\n{text}");
+        assert!(text.contains('w'), "typed input missing:\n{text}");
+        assert!(text.contains("work"), "matching group missing:\n{text}");
+    }
+
+    #[test]
+    fn render_list_shows_section_headers_in_grouped_view() {
+        let mut app = App::new(vec![
+            row("a", "Alpha", "", Activity::Alive),
+            row("b", "Beta", "", Activity::Alive),
+        ])
+        .with_pinned(["a".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+
+        let text = draw(&app);
+        assert!(text.contains("Pinned"), "pinned header missing:\n{text}");
+        assert!(
+            text.contains("Ungrouped"),
+            "ungrouped header missing:\n{text}"
+        );
     }
 }

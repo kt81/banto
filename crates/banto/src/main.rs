@@ -79,7 +79,12 @@ fn main() -> Result<()> {
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let thresholds = thresholds_from(&config.activity);
-            let store = open_store(&config)?;
+            // The `g` group-join modal needs `Store::set_session_group`,
+            // which takes `&mut self` (it wraps a transaction); the TUI's
+            // `Context` is passed around as a plain `&Context`, so a
+            // `RefCell` gives interior mutability without threading `&mut
+            // Context` through every key handler.
+            let store = std::cell::RefCell::new(open_store(&config)?);
             tui::run(&claude_home, &thresholds, config.opener, &store)
         }
     }

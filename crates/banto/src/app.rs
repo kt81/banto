@@ -4,11 +4,15 @@
 //! UI-free struct so it can be unit-tested without a terminal. The render loop
 //! in [`crate::tui`] is a thin shell over this state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::session::SessionRow;
+
+/// A group id, mirroring `banto_core::store::GroupId` (`i64`) without
+/// coupling `App` to the store crate's types.
+pub type GroupId = i64;
 
 /// Maximum gap between two clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
@@ -40,6 +44,107 @@ pub enum Modal {
     /// The `n` new-session dialog: pick or type a cwd to launch `claude`
     /// fresh in (not a resume of an existing session).
     NewSession(NewSessionState),
+    /// The `d` archive confirm dialog: Enter archives, Esc cancels.
+    ConfirmArchive { session_id: String, title: String },
+    /// The `g` group-join dialog: pick an existing group or type a new name.
+    GroupJoin(GroupJoinState),
+}
+
+/// State for the group-join modal: a free-text new-group-name input plus a
+/// substring-filtered list of existing groups to pick from instead.
+pub struct GroupJoinState {
+    /// The session being assigned to a group.
+    session_id: String,
+    /// Every existing group, alphabetical (same order as `App::groups`) —
+    /// captured once when the modal opens.
+    candidates: Vec<(GroupId, String)>,
+    /// What the user has typed so far (a new group name, unless it matches
+    /// an existing one — see [`Self::target`]).
+    input: String,
+    /// Indices into `candidates` whose name contains `input`
+    /// (case-insensitive), in the same order as `candidates`.
+    filtered: Vec<usize>,
+    /// Selected position within `filtered`.
+    selected: usize,
+}
+
+/// What confirming the group-join modal would do.
+#[derive(Debug)]
+pub enum GroupJoinTarget {
+    /// Join the highlighted existing group (id, name).
+    Existing(GroupId, String),
+    /// Create a new group with this name, then join it.
+    New(String),
+}
+
+impl GroupJoinState {
+    fn new(session_id: String, candidates: Vec<(GroupId, String)>) -> Self {
+        let mut state = Self {
+            session_id,
+            candidates,
+            input: String::new(),
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        state.refilter();
+        state
+    }
+
+    fn refilter(&mut self) {
+        let needle = self.input.to_lowercase();
+        self.filtered = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, name))| needle.is_empty() || name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = 0;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let max = self.filtered.len() - 1;
+        let target = (self.selected as isize + delta).clamp(0, max as isize);
+        self.selected = target as usize;
+    }
+
+    /// The session this modal is assigning to a group.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// What the user has typed so far.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Existing group names matching the input, alphabetical.
+    pub fn candidates(&self) -> Vec<&str> {
+        self.filtered
+            .iter()
+            .map(|&i| self.candidates[i].1.as_str())
+            .collect()
+    }
+
+    /// Position within [`Self::candidates`] that's highlighted, or `None`
+    /// when nothing matches.
+    pub fn selected(&self) -> Option<usize> {
+        (!self.filtered.is_empty()).then_some(self.selected)
+    }
+
+    /// What confirming right now would do: join the highlighted existing
+    /// group if any match, otherwise create a new one named after the raw
+    /// input (`None` if that's empty too — nothing to confirm).
+    fn target(&self) -> Option<GroupJoinTarget> {
+        if let Some(&i) = self.filtered.get(self.selected) {
+            let (id, name) = &self.candidates[i];
+            return Some(GroupJoinTarget::Existing(*id, name.clone()));
+        }
+        (!self.input.is_empty()).then(|| GroupJoinTarget::New(self.input.clone()))
+    }
 }
 
 /// State for the new-session modal: a free-text cwd input plus a
@@ -178,6 +283,17 @@ pub struct App {
     /// `filtered`. Off by default: a human browsing their own sessions
     /// doesn't usually want every spawned-agent session cluttering the list.
     show_agents: bool,
+    /// Every known group, alphabetical by name — a cache for sorting/display
+    /// only, the store is the durable source of truth; see [`Self::with_groups`].
+    groups: Vec<(GroupId, String)>,
+    /// Session id -> group id, for sessions that belong to one. A cache
+    /// mirroring `groups`; see [`Self::with_groups`].
+    session_group: HashMap<String, GroupId>,
+    /// Whether the list is shown grouped into sections (Pinned, then each
+    /// group by name, then Ungrouped) — default on, toggled by Tab. Only
+    /// takes effect with an empty query; an active search always stays flat
+    /// ranked regardless of this flag (see [`Self::compute_filtered`]).
+    grouped_view: bool,
     /// Current input mode; see [`Mode`].
     mode: Mode,
     /// A modal dialog currently overlaying the list, if any; see [`Modal`].
@@ -189,7 +305,10 @@ pub struct App {
     filtered: Vec<usize>,
     /// Selected position within `filtered`.
     selected: usize,
-    /// First visible `filtered` position (scroll offset).
+    /// First visible position within [`Self::display_sequence`] (scroll
+    /// offset) — a display-line index, not a `filtered` index: in grouped
+    /// view, section headers occupy lines of their own, so the two spaces
+    /// diverge whenever any header is above the current scroll position.
     offset: usize,
     /// Number of list rows currently visible.
     viewport_height: usize,
@@ -201,10 +320,35 @@ pub struct App {
     should_quit: bool,
 }
 
-/// One row as rendered in the viewport.
+/// One session row as rendered in the viewport (see [`ListLine`]).
 pub struct VisibleRow<'a> {
     pub row: &'a SessionRow,
     pub pinned: bool,
+}
+
+/// One physical line in the rendered list, in display order: either a real
+/// session row, or (grouped view only) a section header — its own line, not
+/// bundled into the row after it, so it occupies exactly one slot in the
+/// same index space [`App::click`]/[`App::scroll`]/[`App::ensure_visible`]
+/// use. That's what lets a click below a header land on the right row and
+/// keeps "how many rows fit in the viewport" accurate even when headers are
+/// present — seeded in the previous pass, headers were bundled into the
+/// following row's item instead, which under-counted physical rows and
+/// misaligned every click below a header. See [`App::display_sequence`].
+pub enum ListLine<'a> {
+    Header(String),
+    Row(VisibleRow<'a>),
+}
+
+/// A line in the full grouped-view display sequence (every matching row
+/// plus its headers, not just the current viewport window) — the index
+/// space [`App::click`]/[`App::scroll`]/[`App::ensure_visible`] all convert
+/// through, via [`App::display_sequence`]. `Row` holds a position *within
+/// `filtered`* (not a row index directly), so translating a display line
+/// back to a session is always `self.rows[self.filtered[k]]`.
+enum DisplayLine {
+    Header(String),
+    Row(usize),
 }
 
 impl App {
@@ -217,6 +361,9 @@ impl App {
             haystacks: Vec::new(),
             pinned: HashSet::new(),
             show_agents: false,
+            groups: Vec::new(),
+            session_group: HashMap::new(),
+            grouped_view: true,
             mode: Mode::Normal,
             modal: None,
             query: String::new(),
@@ -275,6 +422,29 @@ impl App {
         self.modal = Some(Modal::NewSession(NewSessionState::new(&self.base_rows)));
     }
 
+    /// Open the `d` archive confirm modal for the selected session (no-op
+    /// when nothing is selected; bound to `d` in [`Mode::Normal`]).
+    pub fn open_confirm_archive_modal(&mut self) {
+        if let Some(row) = self.selected_row() {
+            self.modal = Some(Modal::ConfirmArchive {
+                session_id: row.id.clone(),
+                title: row.display_title().to_string(),
+            });
+        }
+    }
+
+    /// Open the `g` group-join modal for the selected session, seeding its
+    /// candidate list from every known group (no-op when nothing is
+    /// selected; bound to `g` in [`Mode::Normal`]).
+    pub fn open_group_join_modal(&mut self) {
+        if let Some(row) = self.selected_row() {
+            self.modal = Some(Modal::GroupJoin(GroupJoinState::new(
+                row.id.clone(),
+                self.groups.clone(),
+            )));
+        }
+    }
+
     /// Close whatever modal is open (no-op if none); bound to Esc while a
     /// modal is open.
     pub fn close_modal(&mut self) {
@@ -282,7 +452,8 @@ impl App {
     }
 
     /// Append a character to the open modal's text input and re-filter its
-    /// candidates. No-op when no modal is open.
+    /// candidates. No-op when no modal is open, or it has no text input
+    /// (e.g. the archive confirm dialog).
     pub fn modal_push_char(&mut self, c: char) {
         if c.is_control() {
             return;
@@ -292,38 +463,56 @@ impl App {
                 state.input.push(c);
                 state.refilter();
             }
-            None => {}
+            Some(Modal::GroupJoin(state)) => {
+                state.input.push(c);
+                state.refilter();
+            }
+            Some(Modal::ConfirmArchive { .. }) | None => {}
         }
     }
 
     /// Delete the open modal's last input character and re-filter. No-op
-    /// when no modal is open or the input is already empty.
+    /// when no modal is open, the input is already empty, or it has no text
+    /// input.
     pub fn modal_backspace(&mut self) {
-        if let Some(Modal::NewSession(state)) = &mut self.modal
-            && state.input.pop().is_some()
-        {
-            state.refilter();
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => {
+                if state.input.pop().is_some() {
+                    state.refilter();
+                }
+            }
+            Some(Modal::GroupJoin(state)) => {
+                if state.input.pop().is_some() {
+                    state.refilter();
+                }
+            }
+            _ => {}
         }
     }
 
     /// Move the open modal's candidate selection. No-op when no modal is
-    /// open.
+    /// open, or it has no candidate list.
     pub fn modal_select_prev(&mut self) {
-        if let Some(Modal::NewSession(state)) = &mut self.modal {
-            state.move_selection(-1);
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.move_selection(-1),
+            Some(Modal::GroupJoin(state)) => state.move_selection(-1),
+            _ => {}
         }
     }
 
     /// Move the open modal's candidate selection. No-op when no modal is
-    /// open.
+    /// open, or it has no candidate list.
     pub fn modal_select_next(&mut self) {
-        if let Some(Modal::NewSession(state)) = &mut self.modal {
-            state.move_selection(1);
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.move_selection(1),
+            Some(Modal::GroupJoin(state)) => state.move_selection(1),
+            _ => {}
         }
     }
 
     /// Complete the open modal's input to its highlighted candidate (bound
-    /// to Tab). No-op when no modal is open or nothing is highlighted.
+    /// to Tab). No-op when no modal is open or nothing is highlighted (only
+    /// the new-session modal supports this).
     pub fn modal_complete_candidate(&mut self) {
         if let Some(Modal::NewSession(state)) = &mut self.modal {
             state.complete_candidate();
@@ -337,17 +526,166 @@ impl App {
     pub fn modal_new_session_target(&self) -> Option<PathBuf> {
         match &self.modal {
             Some(Modal::NewSession(state)) => state.target(),
-            None => None,
+            _ => None,
+        }
+    }
+
+    /// What confirming the open group-join modal would do (see
+    /// [`GroupJoinState::target`]); `None` if no group-join modal is open or
+    /// there's nothing to confirm.
+    pub fn modal_group_join_target(&self) -> Option<GroupJoinTarget> {
+        match &self.modal {
+            Some(Modal::GroupJoin(state)) => state.target(),
+            _ => None,
         }
     }
 
     /// Set the open modal's inline validation error (e.g. "not a
     /// directory"), leaving it open so the user can correct the input. No-op
-    /// when no modal is open.
+    /// when no modal is open, or it has no text input.
     pub fn modal_set_error(&mut self, message: String) {
         if let Some(Modal::NewSession(state)) = &mut self.modal {
             state.error = Some(message);
         }
+    }
+
+    // --- groups -------------------------------------------------------------
+
+    /// Seed the initial group cache (loaded once from the store at startup)
+    /// and re-sort so grouped view reflects it.
+    pub fn with_groups(
+        mut self,
+        groups: Vec<(GroupId, String)>,
+        session_group: HashMap<String, GroupId>,
+    ) -> Self {
+        self.groups = groups;
+        self.groups.sort_by(|a, b| a.1.cmp(&b.1));
+        self.session_group = session_group;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.refilter_keeping_selected(selected_id);
+        self
+    }
+
+    /// Record a session's group assignment in the cache after the `g` modal
+    /// confirms (the caller persists the change to the store first). Inserts
+    /// `group_name` into the known-groups cache if it's a newly created
+    /// group. Keeps the same session selected (by id), since grouping may
+    /// move it to a new section.
+    pub fn set_session_group_cache(
+        &mut self,
+        session_id: &str,
+        group_id: GroupId,
+        group_name: String,
+    ) {
+        self.session_group.insert(session_id.to_string(), group_id);
+        if !self.groups.iter().any(|&(id, _)| id == group_id) {
+            self.groups.push((group_id, group_name));
+            self.groups.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        let selected_id = Some(session_id.to_string());
+        self.refilter_keeping_selected(selected_id);
+    }
+
+    /// Whether the list is shown grouped into sections; see the
+    /// `grouped_view` field doc.
+    pub fn grouped_view(&self) -> bool {
+        self.grouped_view
+    }
+
+    /// Toggle grouped view, returning the new state (bound to Tab in
+    /// [`Mode::Normal`]).
+    pub fn toggle_grouped_view(&mut self) -> bool {
+        self.grouped_view = !self.grouped_view;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.refilter_keeping_selected(selected_id);
+        self.grouped_view
+    }
+
+    /// Whether grouped-section display is actually in effect right now: the
+    /// toggle is on, the query is empty (an active search always stays flat
+    /// ranked), and `ranked` actually spans more than one section —
+    /// otherwise a lone "Ungrouped" header would show above every row for
+    /// no benefit (e.g. before the user has pinned or grouped anything at
+    /// all). Takes `ranked` explicitly rather than reading `self.filtered`:
+    /// the one call site inside [`Self::compute_filtered`] runs *before*
+    /// `self.filtered` is reassigned, while `self.rows` may already have
+    /// changed size (e.g. `replace_rows` shrinking it) — reading the stale
+    /// field there would index into `self.rows` with indices from before
+    /// the resize and panic.
+    fn grouped_view_active(&self, ranked: &[usize]) -> bool {
+        self.grouped_view && self.query.is_empty() && self.has_multiple_sections(ranked)
+    }
+
+    /// Whether `ranked` spans more than one grouped-view section.
+    fn has_multiple_sections(&self, ranked: &[usize]) -> bool {
+        let mut ranks = ranked.iter().map(|&i| self.section_rank(i));
+        let Some(first) = ranks.next() else {
+            return false;
+        };
+        ranks.any(|rank| rank != first)
+    }
+
+    /// The section a row belongs to in grouped view: "Pinned" takes
+    /// priority over group membership (a pinned+grouped session shows once,
+    /// under Pinned, not duplicated into its group's section too), then the
+    /// session's group name if it has one, else "Ungrouped".
+    fn section_name(&self, row_index: usize) -> String {
+        let row = &self.rows[row_index];
+        if self.pinned.contains(&row.id) {
+            "Pinned".to_string()
+        } else if let Some(group_id) = self.session_group.get(&row.id) {
+            self.groups
+                .iter()
+                .find(|&&(id, _)| id == *group_id)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "Ungrouped".to_string())
+        } else {
+            "Ungrouped".to_string()
+        }
+    }
+
+    /// Sort key for a row's section in grouped view: 0 = Pinned, 1..=N = each
+    /// known group in alphabetical order (matching `self.groups`), `MAX` =
+    /// Ungrouped (always sorts last).
+    fn section_rank(&self, row_index: usize) -> usize {
+        let row = &self.rows[row_index];
+        if self.pinned.contains(&row.id) {
+            return 0;
+        }
+        match self.session_group.get(&row.id) {
+            Some(group_id) => self
+                .groups
+                .iter()
+                .position(|&(id, _)| id == *group_id)
+                .map_or(usize::MAX, |rank| rank + 1),
+            None => usize::MAX,
+        }
+    }
+
+    /// The full display sequence (not just the current viewport window):
+    /// every entry of `filtered`, each represented as `DisplayLine::Row(k)`
+    /// (`k` being its position within `filtered`), with a
+    /// `DisplayLine::Header` inserted immediately before the first row of
+    /// each new section when grouped view is actually in effect (see
+    /// [`Self::grouped_view_active`]). This is the single source of truth
+    /// [`Self::click`]/[`Self::scroll`]/[`Self::ensure_visible`]/
+    /// [`Self::visible`] all convert through, so headers always occupy
+    /// exactly one line in whichever index space each of those needs.
+    fn display_sequence(&self) -> Vec<DisplayLine> {
+        if !self.grouped_view_active(&self.filtered) {
+            return (0..self.filtered.len()).map(DisplayLine::Row).collect();
+        }
+        let mut lines = Vec::with_capacity(self.filtered.len());
+        let mut prev_section: Option<String> = None;
+        for (k, &row_index) in self.filtered.iter().enumerate() {
+            let section = self.section_name(row_index);
+            if prev_section.as_ref() != Some(&section) {
+                lines.push(DisplayLine::Header(section.clone()));
+                prev_section = Some(section);
+            }
+            lines.push(DisplayLine::Row(k));
+        }
+        lines
     }
 
     // --- agent filter -------------------------------------------------------
@@ -452,11 +790,19 @@ impl App {
     /// unless [`Self::show_agents`] is on. Ranking (and, with an empty
     /// query, the pinned-first base order) always runs first and is never
     /// affected by the agent filter — it only removes results afterward.
+    /// Finally, if grouped view is actually in effect (see
+    /// [`Self::grouped_view_active`]), stably re-sorts into section order
+    /// (Pinned, then each group alphabetically, then Ungrouped) — stable so
+    /// each section keeps its mtime-descending relative order.
     fn compute_filtered(&self) -> Vec<usize> {
-        rank_indices(&self.query, &self.haystacks)
+        let mut ranked: Vec<usize> = rank_indices(&self.query, &self.haystacks)
             .into_iter()
             .filter(|&i| self.show_agents || !self.rows[i].is_agent)
-            .collect()
+            .collect();
+        if self.grouped_view_active(&ranked) {
+            ranked.sort_by_key(|&i| self.section_rank(i));
+        }
+        ranked
     }
 
     // --- query editing --------------------------------------------------
@@ -555,45 +901,67 @@ impl App {
         self.ensure_visible();
     }
 
-    /// Scroll the viewport by `delta` rows without moving the selection
-    /// (mouse-wheel behavior). Clamped to the valid offset range.
+    /// Scroll the viewport by `delta` display lines without moving the
+    /// selection (mouse-wheel behavior). Clamped to the valid offset range.
     pub fn scroll(&mut self, delta: isize) {
         if self.viewport_height == 0 {
             return;
         }
-        let max_offset = self.max_offset() as isize;
+        let max_offset = self.max_offset(&self.display_sequence()) as isize;
         let target = (self.offset as isize + delta).clamp(0, max_offset);
         self.offset = target as usize;
     }
 
-    /// Largest offset that still fills the viewport.
-    fn max_offset(&self) -> usize {
-        self.filtered.len().saturating_sub(self.viewport_height)
+    /// Largest offset that still fills the viewport, in display-line space.
+    fn max_offset(&self, display: &[DisplayLine]) -> usize {
+        display.len().saturating_sub(self.viewport_height)
     }
 
-    /// Scroll the minimum amount so the selection is inside the viewport, then
-    /// clamp the offset so we never scroll past the end.
+    /// Scroll the minimum amount so the selection is inside the viewport,
+    /// then clamp the offset so we never scroll past the end. Works in
+    /// display-line space (see [`Self::display_sequence`]) so a section
+    /// header above the selection is correctly counted as occupying a line
+    /// of its own, rather than being invisible to this accounting.
     fn ensure_visible(&mut self) {
         if self.viewport_height == 0 {
             return;
         }
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset + self.viewport_height {
-            self.offset = self.selected + 1 - self.viewport_height;
+        let display = self.display_sequence();
+        let Some(selected_line) = Self::display_line_of(&display, self.selected) else {
+            return; // nothing selected (e.g. filtered is empty)
+        };
+        if selected_line < self.offset {
+            self.offset = selected_line;
+        } else if selected_line >= self.offset + self.viewport_height {
+            self.offset = selected_line + 1 - self.viewport_height;
         }
-        let max_offset = self.max_offset();
+        let max_offset = self.max_offset(&display);
         if self.offset > max_offset {
             self.offset = max_offset;
         }
     }
 
+    /// The display-line index of the `filtered` position `k`, if it's
+    /// present in `display` (it always is, unless `filtered` is empty).
+    fn display_line_of(display: &[DisplayLine], k: usize) -> Option<usize> {
+        display
+            .iter()
+            .position(|line| matches!(line, DisplayLine::Row(row_k) if *row_k == k))
+    }
+
     // --- mouse ----------------------------------------------------------
 
     /// Handle a left click on viewport row `viewport_row` (0 = top visible
-    /// row). Returns `None` when the click lands past the last row.
+    /// display line). Returns `None` when the click lands past the last
+    /// line, or on a section header (grouped view only) — headers aren't
+    /// selectable.
     pub fn click(&mut self, viewport_row: usize, now: Instant) -> Option<ClickOutcome> {
-        let filtered_index = self.offset.checked_add(viewport_row)?;
+        let display = self.display_sequence();
+        let display_index = self.offset.checked_add(viewport_row)?;
+        let filtered_index = match display.get(display_index)? {
+            DisplayLine::Row(k) => *k,
+            DisplayLine::Header(_) => return None,
+        };
         if filtered_index >= self.filtered.len() {
             return None;
         }
@@ -669,28 +1037,39 @@ impl App {
             .is_some_and(|row| self.pinned.contains(&row.id))
     }
 
-    /// Selection index relative to the viewport, or `None` when the selection
-    /// is scrolled out of view (or the list is empty).
+    /// Selection index relative to the viewport (in display-line space —
+    /// see [`Self::display_sequence`]), or `None` when the selection is
+    /// scrolled out of view (or the list is empty).
     pub fn selected_in_viewport(&self) -> Option<usize> {
-        if self.filtered.is_empty() || self.selected < self.offset {
+        if self.filtered.is_empty() {
             return None;
         }
-        let local = self.selected - self.offset;
+        let selected_line = Self::display_line_of(&self.display_sequence(), self.selected)?;
+        if selected_line < self.offset {
+            return None;
+        }
+        let local = selected_line - self.offset;
         (local < self.viewport_height).then_some(local)
     }
 
-    /// The rows currently visible in the viewport, top to bottom. Which one
-    /// (if any) is selected is reported separately by
+    /// The display lines currently visible in the viewport, top to bottom —
+    /// real rows and (grouped view only) section headers, each occupying
+    /// exactly one line (see [`ListLine`]/[`Self::display_sequence`]). Which
+    /// one (if any) is selected is reported separately by
     /// [`Self::selected_in_viewport`].
-    pub fn visible(&self) -> Vec<VisibleRow<'_>> {
-        let end = (self.offset + self.viewport_height).min(self.filtered.len());
-        self.filtered[self.offset..end]
+    pub fn visible(&self) -> Vec<ListLine<'_>> {
+        let display = self.display_sequence();
+        let end = (self.offset + self.viewport_height).min(display.len());
+        display[self.offset..end]
             .iter()
-            .map(|&i| {
-                let row = &self.rows[i];
-                VisibleRow {
-                    row,
-                    pinned: self.pinned.contains(&row.id),
+            .map(|line| match line {
+                DisplayLine::Header(name) => ListLine::Header(name.clone()),
+                DisplayLine::Row(k) => {
+                    let row = &self.rows[self.filtered[*k]];
+                    ListLine::Row(VisibleRow {
+                        row,
+                        pinned: self.pinned.contains(&row.id),
+                    })
                 }
             })
             .collect()
@@ -742,8 +1121,28 @@ mod tests {
             .collect()
     }
 
+    /// Session ids among the visible rows, in display order (headers
+    /// skipped — most tests only care about the rows).
     fn ids(app: &App) -> Vec<String> {
-        app.visible().iter().map(|v| v.row.id.clone()).collect()
+        app.visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Row(r) => Some(r.row.id.clone()),
+                ListLine::Header(_) => None,
+            })
+            .collect()
+    }
+
+    /// Section header labels among the visible lines, in display order
+    /// (rows skipped).
+    fn headers(app: &App) -> Vec<String> {
+        app.visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Header(name) => Some(name.clone()),
+                ListLine::Row(_) => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -933,6 +1332,74 @@ mod tests {
         assert_eq!(app.click(4, Instant::now()), None);
     }
 
+    /// Sets up 4 rows spanning 3 grouped-view sections (Pinned / "work" /
+    /// Ungrouped), so the display sequence is:
+    /// `[Header(Pinned), Row(id3), Header(work), Row(id1), Header(Ungrouped),
+    /// Row(id0), Row(id2)]` — 7 display lines for 4 rows.
+    fn grouped_app_for_click_tests() -> App {
+        let mut app = App::new(vec![
+            row("id0", "zero", ""),
+            row("id1", "one", ""),
+            row("id2", "two", ""),
+            row("id3", "three", ""),
+        ])
+        .with_pinned(["id3".to_string()].into_iter().collect())
+        .with_groups(
+            vec![(1, "work".to_string())],
+            [("id1".to_string(), 1)].into_iter().collect(),
+        );
+        app.set_viewport_height(10);
+        app
+    }
+
+    #[test]
+    fn click_below_a_header_selects_the_right_session() {
+        let mut app = grouped_app_for_click_tests();
+        // Display line 3 is Row(id1), just below the "work" header at line 2.
+        assert_eq!(app.click(3, Instant::now()), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "id1");
+    }
+
+    #[test]
+    fn click_on_a_header_is_a_noop() {
+        let mut app = grouped_app_for_click_tests();
+        app.click(1, Instant::now()); // select id3 first, as a baseline
+        assert_eq!(app.selected_row().unwrap().id, "id3");
+
+        // Display line 2 is the "work" header, not a row.
+        assert_eq!(app.click(2, Instant::now()), None);
+        // Selection untouched by the no-op click.
+        assert_eq!(app.selected_row().unwrap().id, "id3");
+
+        // Same for line 0, the "Pinned" header, and line 4, "Ungrouped".
+        assert_eq!(app.click(0, Instant::now()), None);
+        assert_eq!(app.click(4, Instant::now()), None);
+        assert_eq!(app.selected_row().unwrap().id, "id3");
+    }
+
+    #[test]
+    fn bottom_row_stays_reachable_with_two_sections_in_a_short_viewport() {
+        // 3 rows, 2 sections (Pinned + Ungrouped), so the display sequence
+        // is `[Header(Pinned), Row(pinned), Header(Ungrouped), Row(a),
+        // Row(b)]` — 5 display lines for 3 rows. A naive "viewport_height
+        // rows fit" assumption (ignoring the two header lines) would leave
+        // the last row unreachable in a 2-line viewport.
+        let mut app = App::new(vec![
+            row("a", "A", ""),
+            row("b", "B", ""),
+            row("pinned", "P", ""),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect());
+        app.set_viewport_height(2);
+
+        app.select_last();
+
+        assert_eq!(app.selected_row().unwrap().id, "b");
+        assert_eq!(ids(&app), vec!["a", "b"]);
+        // The last row is on-screen, in the viewport's bottom slot.
+        assert_eq!(app.selected_in_viewport(), Some(1));
+    }
+
     #[test]
     fn set_status_reflects_the_selected_row() {
         // The render loop (not App) drives opening; this only checks the two
@@ -1039,8 +1506,16 @@ mod tests {
         let mut app = App::new(numbered(3));
         app.set_viewport_height(10);
         app = app.with_pinned(["id1".to_string()].into_iter().collect());
+        app.toggle_grouped_view(); // flat: pinned/unpinned unrelated to sections
 
-        let pinned_flags: Vec<bool> = app.visible().iter().map(|v| v.pinned).collect();
+        let pinned_flags: Vec<bool> = app
+            .visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Row(r) => Some(r.pinned),
+                ListLine::Header(_) => None,
+            })
+            .collect();
         // id1 sorted first (pinned), then id0, id2.
         assert_eq!(pinned_flags, vec![true, false, false]);
     }
@@ -1385,5 +1860,171 @@ mod tests {
     fn is_selected_pinned_is_false_with_nothing_selected() {
         let app = App::new(Vec::new());
         assert!(!app.is_selected_pinned());
+    }
+
+    #[test]
+    fn open_confirm_archive_modal_captures_the_selected_session() {
+        let mut app = App::new(vec![row("a", "Alpha", "")]);
+        app.set_viewport_height(10);
+
+        app.open_confirm_archive_modal();
+
+        let Some(Modal::ConfirmArchive { session_id, title }) = app.modal() else {
+            panic!("expected an open archive-confirm modal");
+        };
+        assert_eq!(session_id, "a");
+        assert_eq!(title, "Alpha");
+    }
+
+    #[test]
+    fn open_confirm_archive_modal_is_a_noop_with_nothing_selected() {
+        let mut app = App::new(Vec::new());
+        app.open_confirm_archive_modal();
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn open_group_join_modal_seeds_existing_groups_and_is_a_noop_with_nothing_selected() {
+        let mut app = App::new(vec![row("a", "Alpha", "")]).with_groups(
+            vec![(2, "work".to_string()), (1, "play".to_string())],
+            HashMap::new(),
+        );
+        app.set_viewport_height(10);
+
+        app.open_group_join_modal();
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        // Alphabetical, same as `with_groups` sorts them.
+        assert_eq!(state.candidates(), vec!["play", "work"]);
+        assert_eq!(state.session_id(), "a");
+
+        app.close_modal();
+        app = App::new(Vec::new());
+        app.open_group_join_modal();
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn modal_group_join_target_prefers_existing_group_else_creates_a_new_one() {
+        let mut app = App::new(vec![row("a", "Alpha", "")])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+
+        for c in "wor".chars() {
+            app.modal_push_char(c);
+        }
+        assert!(matches!(
+            app.modal_group_join_target(),
+            Some(GroupJoinTarget::Existing(1, _))
+        ));
+
+        for _ in "wor".chars() {
+            app.modal_backspace();
+        }
+        for c in "brand-new".chars() {
+            app.modal_push_char(c);
+        }
+        match app.modal_group_join_target() {
+            Some(GroupJoinTarget::New(name)) => assert_eq!(name, "brand-new"),
+            other => panic!("expected New(\"brand-new\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_session_group_cache_updates_map_and_inserts_a_new_group() {
+        let mut app = App::new(vec![row("a", "Alpha", "")])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+
+        // Joining an already-known group doesn't duplicate it.
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(state.candidates(), vec!["work"]);
+        app.close_modal();
+
+        // Joining a brand-new group id adds it to the known-groups cache.
+        app.set_session_group_cache("a", 2, "play".to_string());
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(state.candidates(), vec!["play", "work"]);
+    }
+
+    #[test]
+    fn toggle_grouped_view_reorders_into_pinned_group_ungrouped_sections() {
+        // mtime-descending arrival order: id0 newest .. id3 oldest.
+        let mut app = App::new(vec![
+            row("id0", "zero", ""),
+            row("id1", "one", ""),
+            row("id2", "two", ""),
+            row("id3", "three", ""),
+        ])
+        .with_pinned(["id3".to_string()].into_iter().collect())
+        .with_groups(
+            vec![(1, "work".to_string())],
+            [("id1".to_string(), 1)].into_iter().collect(),
+        );
+        app.set_viewport_height(10);
+
+        // Pinned (id3) first, then the "work" group (id1), then Ungrouped
+        // (id0, id2) in their original mtime-descending order.
+        assert_eq!(ids(&app), vec!["id3", "id1", "id0", "id2"]);
+        assert_eq!(headers(&app), vec!["Pinned", "work", "Ungrouped"]);
+
+        let flat = app.toggle_grouped_view();
+        assert!(!flat);
+        // Flat view: back to the plain pinned-first order (no group section).
+        assert_eq!(ids(&app), vec!["id3", "id0", "id1", "id2"]);
+        assert!(headers(&app).is_empty());
+    }
+
+    #[test]
+    fn grouped_view_stays_flat_while_searching() {
+        let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]).with_groups(
+            vec![(1, "work".to_string())],
+            [("a".to_string(), 1)].into_iter().collect(),
+        );
+        app.set_viewport_height(10);
+        assert!(app.grouped_view());
+
+        app.enter_search();
+        app.push_char('a'); // matches both "Alpha" and "Beta" via cwd/title? just Alpha here
+        // A search never shows section headers, even though grouped_view is on.
+        assert!(headers(&app).is_empty());
+    }
+
+    #[test]
+    fn grouped_view_skips_headers_when_everything_is_in_one_section() {
+        // No pins, no groups: everything is "Ungrouped" — a single section,
+        // so no header should show at all (avoids showing a lone,
+        // meaningless "Ungrouped" banner by default).
+        let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]);
+        app.set_viewport_height(10);
+        assert!(app.grouped_view());
+
+        assert!(headers(&app).is_empty());
+    }
+
+    #[test]
+    fn with_groups_sorts_alphabetically_regardless_of_input_order() {
+        let mut app = App::new(vec![row("a", "Alpha", "")]).with_groups(
+            vec![(3, "zeta".to_string()), (1, "alpha".to_string())],
+            HashMap::new(),
+        );
+        app.set_viewport_height(10);
+
+        app.open_group_join_modal();
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(state.candidates(), vec!["alpha", "zeta"]);
     }
 }
