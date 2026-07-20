@@ -245,15 +245,36 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                         "loop key code={:?} kind={:?} mods={:?}",
                         key.code, key.kind, key.modifiers
                     ));
-                    // On Windows crossterm also reports key releases; ignore them.
+                    let code = normalize_key_code(key.code);
+                    // On Windows crossterm also reports key releases; ignore
+                    // them — except a bare Esc Release, which needs special
+                    // handling (see the comment on that branch below).
                     if key.kind == KeyEventKind::Release {
+                        if code == KeyCode::Esc {
+                            // Confirmed via BANTO_INPUT_LOG: during active
+                            // mouse motion, Esc's *press* can be dropped
+                            // upstream entirely (same family as the
+                            // dropped-ESC-byte finding for leaked mouse
+                            // reports) — no Esc press of any shape reaches
+                            // us, only its Release. This signature is safe
+                            // to treat as a real Esc: in the working case,
+                            // a real Esc press is dispatched through
+                            // `resolve_escape`, which consumes the matching
+                            // Release internally (see `swallow_one_sequence`)
+                            // — so a bare Esc Release reaching here always
+                            // means its press never arrived.
+                            ctx.log(
+                                "loop: bare Esc Release with no matching Press -> dispatching as Esc",
+                            );
+                            handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+                        }
                         continue;
                     }
                     // Esc needs special handling: it may be a lone Escape
                     // press, or the start of a leaked SGR mouse sequence.
-                    if key.code == KeyCode::Esc {
+                    if code == KeyCode::Esc {
                         resolve_escape(app, ctx, list_area)?;
-                    } else if is_headless_bracket(key.code, key.modifiers) {
+                    } else if is_headless_bracket(code, key.modifiers) {
                         // Confirmed from BANTO_INPUT_LOG evidence: under
                         // psmux/ConPTY, leaked SGR sequences can arrive with
                         // their leading `ESC` dropped entirely, as a plain
@@ -261,7 +282,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                         // `resolve_headless_bracket`.
                         resolve_headless_bracket(app, ctx, list_area)?;
                     } else {
-                        handle_key(app, key.code, key.modifiers, ctx);
+                        handle_key(app, code, key.modifiers, ctx);
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -414,8 +435,19 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
         let read = event::read()?;
         ctx.log(&format!("esc: drain read {read:?}"));
         match read {
-            Event::Key(key) if key.kind == KeyEventKind::Release => {}
-            Event::Key(key) if key.code == KeyCode::Esc => {
+            Event::Key(key) if key.kind == KeyEventKind::Release => {
+                if normalize_key_code(key.code) == KeyCode::Esc {
+                    // See the identical case in `event_loop`: a bare Esc
+                    // Release reaching here means its press was dropped
+                    // upstream during motion — dispatch it as the real Esc.
+                    ctx.log(
+                        "esc: drain saw bare Esc Release with no matching Press -> dispatching as Esc",
+                    );
+                    handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+                    return Ok(());
+                }
+            }
+            Event::Key(key) if normalize_key_code(key.code) == KeyCode::Esc => {
                 match swallow_one_sequence(
                     app,
                     ctx,
@@ -428,7 +460,7 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
                     EscapeOutcome::Swallowed => {}
                 }
             }
-            Event::Key(key) if is_headless_bracket(key.code, key.modifiers) => {
+            Event::Key(key) if is_headless_bracket(normalize_key_code(key.code), key.modifiers) => {
                 match swallow_one_sequence(
                     app,
                     ctx,
@@ -442,7 +474,7 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
                 }
             }
             Event::Key(key) => {
-                handle_key(app, key.code, key.modifiers, ctx);
+                handle_key(app, normalize_key_code(key.code), key.modifiers, ctx);
                 return Ok(());
             }
             Event::Mouse(mouse) => {
@@ -460,6 +492,25 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
 /// buffering as a possible sequence start.
 fn is_headless_bracket(code: KeyCode, mods: KeyModifiers) -> bool {
     code == KeyCode::Char('[') && mods.is_empty()
+}
+
+/// Recover a key code this pipeline is known to sometimes deliver as a raw
+/// control character instead of its proper `KeyCode` variant. Confirmed via
+/// `BANTO_INPUT_LOG`: during active mouse motion, Backspace's press
+/// consistently (22/22 occurrences in one capture, vs. 2/2 correct
+/// `KeyCode::Backspace` presses while the mouse was stationary) arrives as
+/// `Char('\u{7f}')` (DEL) rather than `KeyCode::Backspace`. `Char('\u{8}')`
+/// (BS) and a literal `Char('\u{1b}')` (ESC) are handled the same way as a
+/// defensive extension of the identical mechanism, though only DEL was
+/// actually observed. All three codepoints are already inert as query text
+/// — `App::push_char` drops control characters outright — so recovering the
+/// intended key here costs nothing and fixes real, silent breakage.
+fn normalize_key_code(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char('\u{7f}') | KeyCode::Char('\u{8}') => KeyCode::Backspace,
+        KeyCode::Char('\u{1b}') => KeyCode::Esc,
+        other => other,
+    }
 }
 
 /// Outcome of buffering and resolving one leaked-sequence candidate.
@@ -513,17 +564,32 @@ fn swallow_one_sequence(
                 let read = event::read()?;
                 ctx.log(&format!("esc: buffered read {read:?}"));
                 match read {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                        KeyCode::Char(c) => pending.push(c),
-                        KeyCode::Esc => pending.push('\u{1b}'),
-                        other => {
-                            replay(app, ctx, &pending);
-                            handle_key(app, other, key.modifiers, ctx);
-                            return Ok(EscapeOutcome::Done);
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        match normalize_key_code(key.code) {
+                            // CONTROL is the one modifier that changes what a
+                            // `Char` key *means* (Ctrl+C is a quit signal,
+                            // not the letter "c"); SHIFT does not — it's
+                            // already baked into which character this is
+                            // (e.g. a real, shifted `<`, which the injection
+                            // harness confirmed genuinely arrives with SHIFT
+                            // set even though every leaked-byte capture in
+                            // BANTO_INPUT_LOG shows no modifiers at all) —
+                            // so only CONTROL routes a `Char` to the
+                            // interrupting-event arm below instead of being
+                            // buffered as a candidate sequence byte.
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                pending.push(c)
+                            }
+                            KeyCode::Esc => pending.push('\u{1b}'),
+                            other => {
+                                end_interrupted_buffer(app, ctx, &pending);
+                                handle_key(app, other, key.modifiers, ctx);
+                                return Ok(EscapeOutcome::Done);
+                            }
                         }
-                    },
+                    }
                     Event::Mouse(mouse) => {
-                        replay(app, ctx, &pending);
+                        end_interrupted_buffer(app, ctx, &pending);
                         handle_mouse(app, mouse, list_area, ctx);
                         return Ok(EscapeOutcome::Done);
                     }
@@ -531,6 +597,43 @@ fn swallow_one_sequence(
                 }
             }
         }
+    }
+}
+
+/// Resolve a buffer that's being interrupted by an event `swallow_one_sequence`
+/// must dispatch immediately (a modified `Char` — e.g. Ctrl+C — any other
+/// non-`Char`/`Esc` key, or a real `Event::Mouse`). Confirmed by inspection:
+/// the previous behavior unconditionally replayed the whole buffer as typed
+/// characters first, which (a) could dump a partial SGR fragment like
+/// `[<35;2` into the query as garbage when the buffer really was a truncated
+/// leaked sequence, and (b) for a bare-Esc-seeded buffer, buried the user's
+/// real Esc action behind that same garbage instead of dispatching it as the
+/// meaningful action it is.
+///
+/// - If `pending` starts with the literal escape character, that first
+///   character is a real user action, not candidate text — it's always
+///   dispatched as `Esc`, discarding only whatever came after it (which, if
+///   the buffer grew this far, is far more likely a truncated leaked
+///   sequence than something a human typed).
+/// - Otherwise (a headless bracket-headed buffer, whose leading `[` is
+///   ordinary text): a buffer that has grown past its bare `[` seed is
+///   discarded for the same reason (nobody types `[<35` then immediately
+///   presses another key); a buffer that's still just the bare `[` is a
+///   single real keystroke and is replayed so it isn't lost.
+fn end_interrupted_buffer(app: &mut App, ctx: &Context, pending: &[char]) {
+    if pending.first() == Some(&'\u{1b}') {
+        ctx.log(&format!(
+            "esc: interrupted, dispatching leading Esc and discarding tail {:?}",
+            &pending[1..]
+        ));
+        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+        return;
+    }
+    if pending.len() > 1 {
+        ctx.log(&format!("esc: interrupted, discarding buffer {pending:?}"));
+    } else {
+        ctx.log(&format!("esc: interrupted, replaying buffer {pending:?}"));
+        replay(app, ctx, pending);
     }
 }
 
@@ -1364,5 +1467,146 @@ mod tests {
         replay(&mut app, &ctx, &['[']);
 
         assert_eq!(app.query(), "[");
+    }
+
+    #[test]
+    fn normalize_key_code_recovers_the_confirmed_control_char_corruptions() {
+        assert_eq!(
+            normalize_key_code(KeyCode::Char('\u{7f}')),
+            KeyCode::Backspace
+        );
+        assert_eq!(
+            normalize_key_code(KeyCode::Char('\u{8}')),
+            KeyCode::Backspace
+        );
+        assert_eq!(normalize_key_code(KeyCode::Char('\u{1b}')), KeyCode::Esc);
+
+        // Everything else passes through unchanged.
+        assert_eq!(normalize_key_code(KeyCode::Char('[')), KeyCode::Char('['));
+        assert_eq!(normalize_key_code(KeyCode::Char('a')), KeyCode::Char('a'));
+        assert_eq!(normalize_key_code(KeyCode::Backspace), KeyCode::Backspace);
+        assert_eq!(normalize_key_code(KeyCode::Esc), KeyCode::Esc);
+        assert_eq!(normalize_key_code(KeyCode::Enter), KeyCode::Enter);
+    }
+
+    /// Regression test for the exact corruption confirmed in `BANTO_INPUT_LOG`:
+    /// during active mouse motion, every one of 22 Backspace presses arrived
+    /// as `Char('\u{7f}')` (DEL) instead of `KeyCode::Backspace` — silently
+    /// eaten by `App::push_char`'s control-character guard before this fix,
+    /// since it went through `handle_search_key`'s `Char(c) => push_char(c)`
+    /// arm like any other typed character. The 2 Backspace presses captured
+    /// while the mouse was stationary arrived correctly as `KeyCode::Backspace`
+    /// and are covered by other tests using that code directly.
+    #[test]
+    fn backspace_delivered_as_del_during_motion_still_deletes_query_text() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+        app.push_char('a');
+        app.push_char('b');
+        assert_eq!(app.query(), "ab");
+
+        let code = normalize_key_code(KeyCode::Char('\u{7f}'));
+        handle_key(&mut app, code, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "a");
+
+        handle_key(&mut app, code, KeyModifiers::NONE, &ctx);
+        assert_eq!(app.query(), "");
+    }
+
+    /// A bare-Esc-seeded buffer that grew past its seed (e.g. an Esc
+    /// followed by a `[` before something else interrupted it) must still
+    /// honor the real Esc action — the tail is discarded, not typed.
+    #[test]
+    fn end_interrupted_buffer_dispatches_leading_esc_and_discards_the_tail() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+        app.push_char('x');
+
+        end_interrupted_buffer(&mut app, &ctx, &['\u{1b}', '[', '<', '3']);
+
+        // Esc fired (query cleared, back to Normal); the "[ < 3" tail never
+        // reached the query.
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.query(), "");
+    }
+
+    /// A bare-Esc-seeded buffer that's still just the seed itself (nothing
+    /// followed before the interruption) is a single real keystroke and
+    /// must still be dispatched.
+    #[test]
+    fn end_interrupted_buffer_replays_a_lone_bare_esc_seed() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        end_interrupted_buffer(&mut app, &ctx, &['\u{1b}']);
+
+        assert_eq!(app.mode(), Mode::Normal);
+    }
+
+    /// A headless-bracket-seeded buffer that grew past its `[` seed is
+    /// discarded silently — no query garbage, no stray action — since it's
+    /// far more likely a truncated leaked sequence than genuine typing.
+    #[test]
+    fn end_interrupted_buffer_discards_a_grown_headless_bracket_buffer() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        end_interrupted_buffer(&mut app, &ctx, &['[', '<', '3', '5']);
+
+        assert_eq!(app.query(), "");
+        assert_eq!(app.mode(), Mode::Search);
+    }
+
+    /// A headless-bracket buffer that never grew past its bare `[` seed is a
+    /// single real keystroke and must still reach the query.
+    #[test]
+    fn end_interrupted_buffer_replays_a_lone_headless_bracket_seed() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        end_interrupted_buffer(&mut app, &ctx, &['[']);
+
+        assert_eq!(app.query(), "[");
+    }
+
+    /// The dispatch target of the modifier-preserving fix: `swallow_one_sequence`
+    /// now matches `KeyCode::Char(c) if key.modifiers.is_empty()` before
+    /// absorbing a char into the buffer, so a modified key like Ctrl+C falls
+    /// through to the interrupting-event arm and is dispatched via
+    /// `handle_key(app, other, key.modifiers, ctx)` with its modifier intact.
+    /// Before this fix, `pending.push(c)` matched on `key.code` alone and
+    /// silently discarded the modifier, downgrading Ctrl+C to a plain `'c'`
+    /// (a no-op in Normal mode) and losing the quit.
+    #[test]
+    fn ctrl_c_still_quits_when_dispatched_with_its_modifier_intact() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "A", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL, &ctx);
+
+        assert!(app.should_quit());
     }
 }
