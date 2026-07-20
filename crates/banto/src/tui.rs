@@ -32,7 +32,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use banto_core::config::OpenerMode;
 use banto_core::model::{Activity, AgeBucket, SessionId};
 use banto_core::opener::SystemCommandRunner;
-use banto_core::status::{AgeThresholds, SysinfoProbe};
+use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
 use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
@@ -533,7 +533,11 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
         }
         // `open_new_session` never focuses or refuses an existing pane —
         // there's no pre-existing session for a fresh launch to key off of.
-        Ok(OpenOutcome::Focused | OpenOutcome::AlreadyOpenCannotFocus) => unreachable!(),
+        Ok(
+            OpenOutcome::Focused
+            | OpenOutcome::AlreadyOpenCannotFocus
+            | OpenOutcome::AlreadyRunningUntracked,
+        ) => unreachable!(),
         Err(err) => format!("failed to launch a new session in {}: {err}", cwd.display()),
     };
     app.set_status(message);
@@ -1046,6 +1050,10 @@ fn activate(app: &mut App, ctx: &Context) {
     // Anchor psmux splits on banto's own pane so the resume pane lands
     // next to banto, not in whatever window the client has focused.
     let anchor = std::env::var("TMUX_PANE").ok();
+    // Only consulted when there's no pane record for this session (see
+    // `opener::open_session`), so a fresh read here (rather than caching
+    // across activations) keeps it current without needing to invalidate.
+    let live = read_live_sessions(&ctx.claude_home.join("sessions"));
     let outcome = opener::open_session(
         &ctx.store.borrow(),
         &SysinfoProbe,
@@ -1053,6 +1061,7 @@ fn activate(app: &mut App, ctx: &Context) {
         &session,
         SystemCommandRunner,
         anchor.as_deref(),
+        &live,
     );
 
     let message = match outcome {
@@ -1060,6 +1069,12 @@ fn activate(app: &mut App, ctx: &Context) {
         Ok(OpenOutcome::Opened) => format!("opened session {id} in a new pane/tab"),
         Ok(OpenOutcome::AlreadyOpenCannotFocus) => {
             format!("session {id} is already open (this backend can't auto-focus it)")
+        }
+        Ok(OpenOutcome::AlreadyRunningUntracked) => {
+            format!(
+                "session {id} is already running (banto can't focus an \
+                 externally/n-launched pane yet)"
+            )
         }
         Ok(OpenOutcome::NoBackendDetected) => {
             "no terminal backend detected (run inside psmux/Windows Terminal, \

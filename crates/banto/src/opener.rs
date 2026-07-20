@@ -18,7 +18,7 @@ use banto_core::opener::{
     self, Backend, CommandRunner, OpenError, Opener, ResumeCommand, SessionHandle, TmuxOpener,
     WindowsTerminalOpener,
 };
-use banto_core::status::ProcessProbe;
+use banto_core::status::{LiveSession, ProcessProbe};
 use banto_core::store::{PaneRecord, Store, StoreError};
 
 /// A session about to be opened or focused.
@@ -38,6 +38,13 @@ pub enum OpenOutcome {
     /// A pane exists and is (presumed) alive, but this backend cannot focus
     /// an existing pane (Windows Terminal). Refuses to open a second one.
     AlreadyOpenCannotFocus,
+    /// No pane record exists for this session (so there's nothing to focus),
+    /// but its own live-state file shows it's still running — most likely a
+    /// session launched via the `n` new-session modal, which has no
+    /// pre-existing session id to key a pane record against. Refuses to
+    /// `--resume` it, since that would fork its history (CLAUDE.md
+    /// invariant 4) while it's already open somewhere banto can't locate.
+    AlreadyRunningUntracked,
     /// No backend could be determined (`OpenerMode::Auto` with neither
     /// `$TMUX` nor `$WT_SESSION` set).
     NoBackendDetected,
@@ -109,6 +116,9 @@ pub fn open_new_session<R: CommandRunner + 'static>(
 /// `backend` is the resolved opener backend for *new* opens (see
 /// [`resolve_backend`]); an existing pane is always focused through whichever
 /// backend it was originally opened with, regardless of the current default.
+/// `live` is the current `<claude_home>/sessions/*.json` snapshot (see
+/// `banto_core::status::read_live_sessions`), used only for the untracked
+/// case below.
 pub fn open_session<R: CommandRunner + Clone + 'static>(
     store: &Store,
     probe: &dyn ProcessProbe,
@@ -116,27 +126,52 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
     session: &SessionToOpen,
     runner: R,
     anchor_pane: Option<&str>,
+    live: &[LiveSession],
 ) -> Result<OpenOutcome, SessionOpenError> {
     let id = SessionId(session.id.clone());
 
-    if let Some(record) = store.get_pane(&id)? {
-        // No PID yet means the wrapper is still starting up; assume alive
-        // rather than risk a double resume.
-        let alive = record.pid.is_none_or(|pid| probe.is_alive(pid));
-        if alive {
-            match focus_existing(store, &record, runner.clone())? {
-                FocusResult::Outcome(outcome) => return Ok(outcome),
-                // The backend CLI ran but reported the pane doesn't exist
-                // any more (already cleaned up); fall through to open fresh.
-                FocusResult::Stale => {}
+    match store.get_pane(&id)? {
+        Some(record) => {
+            // No PID yet means the wrapper is still starting up; assume alive
+            // rather than risk a double resume.
+            let alive = record.pid.is_none_or(|pid| probe.is_alive(pid));
+            if alive {
+                match focus_existing(store, &record, runner.clone())? {
+                    FocusResult::Outcome(outcome) => return Ok(outcome),
+                    // The backend CLI ran but reported the pane doesn't
+                    // exist any more (already cleaned up); fall through to
+                    // open fresh.
+                    FocusResult::Stale => {}
+                }
+            } else {
+                // The wrapper is gone but never cleaned up (e.g. it crashed).
+                store.remove_pane(&id)?;
             }
-        } else {
-            // The wrapper is gone but never cleaned up (e.g. it crashed).
-            store.remove_pane(&id)?;
         }
+        // No pane record — but the session's own live-state file shows it's
+        // still running (e.g. it was launched via the `n` new-session
+        // modal, which has no pre-existing session id to key a pane record
+        // against). Opening fresh here would `--resume` an already-running
+        // session, forking its history.
+        None if is_live(&session.id, live, probe) => {
+            return Ok(OpenOutcome::AlreadyRunningUntracked);
+        }
+        None => {}
     }
 
     open_fresh(store, backend, session, runner, anchor_pane)
+}
+
+/// Whether any live-state entry names `session_id` with a currently-alive
+/// pid, regardless of busy/idle status — used only to guard against
+/// `--resume`-ing (and thereby history-forking) a session that's live but
+/// untracked (see [`open_session`]). Unlike `banto_core::status::classify`
+/// (which is about which activity dot to show, so a busy entry outranks a
+/// merely-alive one), this only answers "is this session actually running
+/// right now".
+fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn ProcessProbe) -> bool {
+    live.iter()
+        .any(|entry| entry.session_id.as_deref() == Some(session_id) && probe.is_alive(entry.pid))
 }
 
 /// Outcome of [`focus_existing`]: either a final [`OpenOutcome`], or a
@@ -372,6 +407,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
+            &[],
         )
         .unwrap();
 
@@ -383,6 +419,86 @@ mod tests {
         assert_eq!(record.backend, "psmux");
         assert_eq!(record.target, "@1:%1");
         assert_eq!(record.pid, None);
+    }
+
+    /// A synthetic live-state entry, e.g. a session launched via the `n`
+    /// new-session modal (no pane record) that's still running.
+    fn live_entry(session_id: &str, pid: u32) -> LiveSession {
+        LiveSession {
+            pid,
+            session_id: Some(session_id.to_string()),
+            cwd: None,
+            status: None,
+            kind: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn is_live_matches_only_a_live_entry_with_the_right_session_id_and_a_live_pid() {
+        let probe = MockProbe::with_alive(&[100]);
+
+        assert!(is_live("sess-1", &[live_entry("sess-1", 100)], &probe));
+        // Wrong session id.
+        assert!(!is_live("sess-1", &[live_entry("sess-2", 100)], &probe));
+        // Right session id, dead pid.
+        assert!(!is_live("sess-1", &[live_entry("sess-1", 999)], &probe));
+        // No live entries at all.
+        assert!(!is_live("sess-1", &[], &probe));
+    }
+
+    #[test]
+    fn live_but_untracked_session_refuses_to_open_fresh_to_avoid_a_double_resume() {
+        let store = Store::open_in_memory().unwrap();
+        let probe = MockProbe::with_alive(&[4242]);
+        let runner = MockRunner::default();
+        let live = [live_entry("sess-1", 4242)];
+
+        let outcome = open_session(
+            &store,
+            &probe,
+            Some(Backend::Psmux),
+            &session(),
+            runner.clone(),
+            None,
+            &live,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, OpenOutcome::AlreadyRunningUntracked);
+        // Never attempted to open a second pane, and never recorded one.
+        assert!(runner.calls().is_empty());
+        assert_eq!(
+            store.get_pane(&SessionId("sess-1".to_string())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn untracked_session_with_no_matching_live_entry_opens_fresh_as_before() {
+        let store = Store::open_in_memory().unwrap();
+        // A live entry exists, but for a different session — and one for
+        // this session's id whose pid is dead. Neither should block a fresh
+        // open.
+        let probe = MockProbe::with_alive(&[100]);
+        let runner = MockRunner::default();
+        let live = [
+            live_entry("some-other-session", 100),
+            live_entry("sess-1", 999), // dead pid
+        ];
+
+        let outcome = open_session(
+            &store,
+            &probe,
+            Some(Backend::Psmux),
+            &session(),
+            runner.clone(),
+            None,
+            &live,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, OpenOutcome::Opened);
     }
 
     #[test]
@@ -398,6 +514,7 @@ mod tests {
             &session(),
             runner.clone(),
             Some("%7"),
+            &[],
         )
         .unwrap();
 
@@ -415,7 +532,8 @@ mod tests {
         let probe = MockProbe::with_alive(&[]);
         let runner = MockRunner::default();
 
-        let outcome = open_session(&store, &probe, None, &session(), runner.clone(), None).unwrap();
+        let outcome =
+            open_session(&store, &probe, None, &session(), runner.clone(), None, &[]).unwrap();
 
         assert_eq!(outcome, OpenOutcome::NoBackendDetected);
         assert!(runner.calls().is_empty());
@@ -447,6 +565,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
+            &[],
         )
         .unwrap();
 
@@ -479,6 +598,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
+            &[],
         )
         .unwrap();
 
@@ -507,6 +627,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
+            &[],
         )
         .unwrap();
 
@@ -543,6 +664,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
+            &[],
         )
         .unwrap();
 
@@ -578,6 +700,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
+            &[],
         )
         .unwrap();
 
