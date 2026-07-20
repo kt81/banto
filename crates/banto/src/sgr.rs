@@ -42,15 +42,34 @@ pub fn parse_prefix(buf: &[char]) -> SgrParse {
     if buf.len() > MAX_LEN {
         return SgrParse::NotSgr;
     }
-    match try_parse(buf) {
+    match try_parse(buf, true) {
         Ok(event) => SgrParse::Complete(event),
         Err(incomplete_or_not) => incomplete_or_not,
     }
 }
 
-fn try_parse(buf: &[char]) -> Result<SgrMouseEvent, SgrParse> {
+/// Match `buf` (characters accumulated since a leading `[`, the `ESC` byte
+/// already missing) against `[ < Cb ; Cx ; Cy (M|m)` — the same grammar as
+/// [`parse_prefix`] minus its leading `ESC`. Some delivery paths drop the
+/// `ESC` byte entirely before it ever reaches us (confirmed via
+/// `BANTO_INPUT_LOG`: real leaked sequences arrive as a headless stream of
+/// plain `Char` presses with no preceding `Esc` event), so the caller needs
+/// a grammar that doesn't require it.
+pub fn parse_headless_prefix(buf: &[char]) -> SgrParse {
+    if buf.len() > MAX_LEN {
+        return SgrParse::NotSgr;
+    }
+    match try_parse(buf, false) {
+        Ok(event) => SgrParse::Complete(event),
+        Err(incomplete_or_not) => incomplete_or_not,
+    }
+}
+
+fn try_parse(buf: &[char], expect_esc: bool) -> Result<SgrMouseEvent, SgrParse> {
     let mut idx = 0;
-    expect_char(buf, &mut idx, '\u{1b}')?;
+    if expect_esc {
+        expect_char(buf, &mut idx, '\u{1b}')?;
+    }
     expect_char(buf, &mut idx, '[')?;
     expect_char(buf, &mut idx, '<')?;
     let button = read_number(buf, &mut idx)?;
@@ -225,5 +244,45 @@ mod tests {
     fn plain_text_after_esc_is_not_sgr() {
         // e.g. the user pressed Esc then started typing "hello" very fast.
         assert_eq!(parse_prefix(&chars("\u{1b}hello")), SgrParse::NotSgr);
+    }
+
+    /// The exact shape confirmed by `BANTO_INPUT_LOG`: a leaked sequence
+    /// with its leading `ESC` byte already missing.
+    #[test]
+    fn headless_complete_sequence_parses_without_a_leading_esc() {
+        let got = parse_headless_prefix(&chars("[<35;18;12M"));
+        assert_eq!(
+            got,
+            SgrParse::Complete(SgrMouseEvent {
+                button: 35,
+                x: 18,
+                y: 12,
+                pressed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn headless_every_valid_prefix_is_incomplete_until_the_last_character() {
+        let full = "[<0;10;20M";
+        for len in 1..full.chars().count() {
+            let prefix: Vec<char> = full.chars().take(len).collect();
+            assert_eq!(
+                parse_headless_prefix(&prefix),
+                SgrParse::Incomplete,
+                "expected incomplete at len {len}: {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_plain_bracket_then_non_matching_char_is_not_sgr() {
+        // e.g. the user genuinely typed "[x" into the search box.
+        assert_eq!(parse_headless_prefix(&chars("[x")), SgrParse::NotSgr);
+    }
+
+    #[test]
+    fn headless_a_lone_bracket_is_incomplete_not_not_sgr() {
+        assert_eq!(parse_headless_prefix(&chars("[")), SgrParse::Incomplete);
     }
 }

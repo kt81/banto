@@ -62,6 +62,20 @@ const DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
 /// ordinary Esc press feel laggy.
 const ESCAPE_GRACE: Duration = Duration::from_millis(30);
 
+/// Grace period between bytes of a leaked SGR sequence that arrives with its
+/// leading `ESC` already missing (see [`resolve_headless_bracket`]) —
+/// confirmed via `BANTO_INPUT_LOG`: real leaked sequences are a stream of
+/// plain `Char` presses, ~1-2ms apart, but one recorded burst had a single
+/// 96ms gap between its last digit and the `M` terminator (the byte-delivery
+/// pacing is not perfectly uniform), so this needs a real safety margin
+/// above that rather than the sub-20ms a purely "1-2ms apart" reading would
+/// suggest. Falsely swallowing genuine typed text would require a human to
+/// type the exact grammar (`[<digits;digits;digitsM`) with every one of the
+/// ~9 gaps in that run under this threshold — a coincidence rare enough that
+/// even a generous margin here carries negligible risk to real typing, while
+/// still resolving in far less time than a human notices as lag.
+const HEADLESS_GRACE: Duration = Duration::from_millis(120);
+
 /// Everything the render loop needs beyond [`App`] itself: dependencies for
 /// opening/focusing sessions and reloading rows from disk.
 struct Context<'a> {
@@ -239,6 +253,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                     // press, or the start of a leaked SGR mouse sequence.
                     if key.code == KeyCode::Esc {
                         resolve_escape(app, ctx, list_area)?;
+                    } else if is_headless_bracket(key.code, key.modifiers) {
+                        // Confirmed from BANTO_INPUT_LOG evidence: under
+                        // psmux/ConPTY, leaked SGR sequences can arrive with
+                        // their leading `ESC` dropped entirely, as a plain
+                        // `Char('[')` press with no modifiers — see
+                        // `resolve_headless_bracket`.
+                        resolve_headless_bracket(app, ctx, list_area)?;
                     } else {
                         handle_key(app, key.code, key.modifiers, ctx);
                     }
@@ -331,28 +352,62 @@ fn handle_search_key(app: &mut App, code: KeyCode) {
 /// A successfully parsed sequence is translated into the corresponding
 /// scroll/click action (see [`apply_sgr_action`]) rather than just dropped.
 /// Mouse motion fires many of these back to back, so after resolving one
-/// this keeps draining the queue (zero-wait — by then we're only checking
-/// for more already-arrived work, not disambiguating a real Esc) for
-/// another leaked sequence before returning to the render loop.
+/// this keeps draining the queue (see [`drain_more`]) for another leaked
+/// sequence before returning to the render loop.
 fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     if !event::poll(ESCAPE_GRACE)? {
         ctx.log("esc: entry grace expired with empty queue -> lone Esc");
         handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
         return Ok(());
     }
+    match swallow_one_sequence(
+        app,
+        ctx,
+        list_area,
+        vec!['\u{1b}'],
+        sgr::parse_prefix,
+        ESCAPE_GRACE,
+    )? {
+        EscapeOutcome::Done => Ok(()),
+        EscapeOutcome::Swallowed => drain_more(app, ctx, list_area),
+    }
+}
+
+/// Resolve a `Char('[')` key event with no modifiers by buffering it as a
+/// possible SGR mouse sequence with its leading `ESC` already missing.
+/// Confirmed via `BANTO_INPUT_LOG`: under psmux/ConPTY, leaked SGR mouse
+/// reports can arrive as a headless stream of plain `Char` press events
+/// (`[`, `<`, digits, `;`, ..., `M`), with no `Esc` event, no modifier, and
+/// no `Event::Mouse` ever involved — the leading `ESC` byte is dropped
+/// somewhere upstream (ConPTY or crossterm's Windows input path) before it
+/// ever reaches us. Unlike [`resolve_escape`] there is no ambiguity to wait
+/// out at entry: an ordinary typed `[` looks identical to the start of a
+/// leaked sequence at this first byte either way, so buffering always
+/// begins — [`HEADLESS_GRACE`] is what keeps genuine typing from being
+/// mistaken for one (see [`swallow_one_sequence`]'s `NotSgr`/timeout path).
+fn resolve_headless_bracket(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
+    match swallow_one_sequence(
+        app,
+        ctx,
+        list_area,
+        vec!['['],
+        sgr::parse_headless_prefix,
+        HEADLESS_GRACE,
+    )? {
+        EscapeOutcome::Done => Ok(()),
+        EscapeOutcome::Swallowed => drain_more(app, ctx, list_area),
+    }
+}
+
+/// After swallowing one complete leaked sequence, keep handling
+/// immediately-queued follow-up sequences (Esc-headed or headless-bracket
+/// shaped — mouse motion fires many of these back to back) before returning
+/// to the render loop. Zero-wait is fine here (unlike the checks in
+/// [`resolve_escape`]/[`resolve_headless_bracket`]): this only decides
+/// whether to keep going, never whether to dispatch a genuine key, so
+/// there's no misclassification risk to guard against with a grace period.
+fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     loop {
-        if matches!(
-            swallow_one_sequence(app, ctx, list_area)?,
-            EscapeOutcome::Done
-        ) {
-            return Ok(());
-        }
-        // One sequence handled; only keep draining if another leaked
-        // sequence is immediately queued — anything else is dispatched
-        // through the normal path and ends resolution here. Zero-wait is
-        // fine (unlike the checks above): this only decides whether to loop
-        // again, never whether to dispatch a genuine Esc, so there's no
-        // misclassification risk to guard against with a grace period.
         if !event::poll(Duration::ZERO)? {
             return Ok(());
         }
@@ -360,7 +415,32 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
         ctx.log(&format!("esc: drain read {read:?}"));
         match read {
             Event::Key(key) if key.kind == KeyEventKind::Release => {}
-            Event::Key(key) if key.code == KeyCode::Esc => continue,
+            Event::Key(key) if key.code == KeyCode::Esc => {
+                match swallow_one_sequence(
+                    app,
+                    ctx,
+                    list_area,
+                    vec!['\u{1b}'],
+                    sgr::parse_prefix,
+                    ESCAPE_GRACE,
+                )? {
+                    EscapeOutcome::Done => return Ok(()),
+                    EscapeOutcome::Swallowed => {}
+                }
+            }
+            Event::Key(key) if is_headless_bracket(key.code, key.modifiers) => {
+                match swallow_one_sequence(
+                    app,
+                    ctx,
+                    list_area,
+                    vec!['['],
+                    sgr::parse_headless_prefix,
+                    HEADLESS_GRACE,
+                )? {
+                    EscapeOutcome::Done => return Ok(()),
+                    EscapeOutcome::Swallowed => {}
+                }
+            }
             Event::Key(key) => {
                 handle_key(app, key.code, key.modifiers, ctx);
                 return Ok(());
@@ -374,7 +454,15 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     }
 }
 
-/// Outcome of buffering and resolving one Esc-initiated sequence.
+/// Whether a key event is the headless-leak shape `resolve_headless_bracket`
+/// handles: `'['` is the only character that can start the SGR grammar (with
+/// or without its leading `ESC`), so it's the only plain char worth
+/// buffering as a possible sequence start.
+fn is_headless_bracket(code: KeyCode, mods: KeyModifiers) -> bool {
+    code == KeyCode::Char('[') && mods.is_empty()
+}
+
+/// Outcome of buffering and resolving one leaked-sequence candidate.
 enum EscapeOutcome {
     /// A complete SGR sequence was recognized and applied/swallowed; the
     /// caller may check for another one immediately following.
@@ -384,19 +472,26 @@ enum EscapeOutcome {
     Done,
 }
 
-/// Buffer characters starting from a leading `ESC` and re-check
-/// [`sgr::parse_prefix`] after each one, waiting up to [`ESCAPE_GRACE`] each
-/// time for the next byte (see [`resolve_escape`] — the same split-pacing
-/// risk applies at every byte boundary within the sequence, not just its
-/// start):
+/// Buffer characters starting from `pending` (already seeded with the bytes
+/// [`resolve_escape`]/[`resolve_headless_bracket`] have consumed so far) and
+/// re-check `parse` after each additional byte, waiting up to `grace` each
+/// time for the next one (see [`resolve_escape`]/[`resolve_headless_bracket`]
+/// — the same split-pacing risk applies at every byte boundary within the
+/// sequence, not just its start):
 /// - a complete match is applied via [`apply_sgr_action`] and swallowed;
 /// - a definite mismatch replays the buffered characters as ordinary key
-///   presses (the leading Esc dispatched normally, the rest as if typed);
+///   presses (see [`replay`]);
 /// - if nothing more arrives in time, whatever was buffered is replayed the same way.
-fn swallow_one_sequence(app: &mut App, ctx: &Context, list_area: Rect) -> Result<EscapeOutcome> {
-    let mut pending = vec!['\u{1b}'];
+fn swallow_one_sequence(
+    app: &mut App,
+    ctx: &Context,
+    list_area: Rect,
+    mut pending: Vec<char>,
+    parse: fn(&[char]) -> SgrParse,
+    grace: Duration,
+) -> Result<EscapeOutcome> {
     loop {
-        match sgr::parse_prefix(&pending) {
+        match parse(&pending) {
             SgrParse::Complete(event) => {
                 ctx.log(&format!("esc: swallowed complete sequence {event:?}"));
                 apply_sgr_action(app, ctx, list_area, event);
@@ -408,7 +503,7 @@ fn swallow_one_sequence(app: &mut App, ctx: &Context, list_area: Rect) -> Result
                 return Ok(EscapeOutcome::Done);
             }
             SgrParse::Incomplete => {
-                if !event::poll(ESCAPE_GRACE)? {
+                if !event::poll(grace)? {
                     ctx.log(&format!(
                         "esc: per-byte grace expired, replaying buffer {pending:?}"
                     ));
@@ -467,15 +562,21 @@ fn apply_sgr_action(app: &mut App, ctx: &Context, list_area: Rect, event: sgr::S
     }
 }
 
-/// Replay buffered characters as if they had arrived as ordinary key
-/// presses. The first is always the `Esc` that started buffering.
+/// Replay a buffered sequence as if its characters had arrived as ordinary
+/// key presses — used both when an Esc-headed buffer (`pending[0] ==
+/// '\u{1b}'`, from [`resolve_escape`]) turns out not to be SGR, and when a
+/// headless bracket-headed buffer (`pending[0] == '['`, from
+/// [`resolve_headless_bracket`]) does. The literal escape character is the
+/// only buffered value that isn't dispatched as itself — everywhere else,
+/// including a bracket-headed `pending[0]`, the character is dispatched as
+/// the plain `Char` it actually was.
 fn replay(app: &mut App, ctx: &Context, buffered: &[char]) {
-    let mut chars = buffered.iter().copied();
-    if chars.next().is_some() {
-        handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
-    }
-    for c in chars {
-        handle_key(app, KeyCode::Char(c), KeyModifiers::NONE, ctx);
+    for &c in buffered {
+        if c == '\u{1b}' {
+            handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
+        } else {
+            handle_key(app, KeyCode::Char(c), KeyModifiers::NONE, ctx);
+        }
     }
 }
 
@@ -1175,5 +1276,93 @@ mod tests {
         }
 
         assert_eq!(app.selected_row().unwrap().id, "a");
+    }
+
+    #[test]
+    fn is_headless_bracket_matches_only_char_bracket_with_no_modifiers() {
+        assert!(is_headless_bracket(KeyCode::Char('['), KeyModifiers::NONE));
+        assert!(!is_headless_bracket(KeyCode::Char('['), KeyModifiers::ALT));
+        assert!(!is_headless_bracket(
+            KeyCode::Char('['),
+            KeyModifiers::CONTROL
+        ));
+        assert!(!is_headless_bracket(KeyCode::Char('<'), KeyModifiers::NONE));
+        assert!(!is_headless_bracket(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    /// The exact event stream from `BANTO_INPUT_LOG` (lines 26-36 of a real
+    /// repro session): a leaked motion report arriving as plain `Char`
+    /// presses with no leading `Esc` and no modifiers at all —
+    /// `resolve_escape` never ran once during that entire session (zero
+    /// "esc:" log lines anywhere in it). This is the shape
+    /// `resolve_headless_bracket` exists to catch.
+    #[test]
+    fn headless_motion_sequence_from_the_real_log_is_swallowed_as_motion() {
+        let chars: Vec<char> = "[<35;41;14M".chars().collect();
+        assert_eq!(
+            sgr::parse_headless_prefix(&chars),
+            SgrParse::Complete(sgr::SgrMouseEvent {
+                button: 35,
+                x: 41,
+                y: 14,
+                pressed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn headless_wheel_sequence_scrolls_via_apply_sgr_action() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+        let list_area = Rect::new(0, 4, 60, 3);
+
+        let chars: Vec<char> = "[<65;1;1M".chars().collect();
+        match sgr::parse_headless_prefix(&chars) {
+            SgrParse::Complete(event) => apply_sgr_action(&mut app, &ctx, list_area, event),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+
+        assert_eq!(app.query(), "");
+        assert_eq!(app.mode(), Mode::Search);
+    }
+
+    /// A real human typing "[x" (never continuing into the SGR grammar,
+    /// which requires `<` next) must still see both characters land in the
+    /// query once the recognizer gives up on it — a fix for the flood must
+    /// not eat legitimate keystrokes.
+    #[test]
+    fn replay_of_a_headless_bracket_mismatch_types_every_buffered_character() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        let buffered: Vec<char> = "[x".chars().collect();
+        replay(&mut app, &ctx, &buffered);
+
+        assert_eq!(app.query(), "[x");
+        assert_eq!(app.mode(), Mode::Search);
+    }
+
+    /// A lone `[` that times out with nothing else queued (the user typed
+    /// `[` and paused) must still land in the query, not vanish.
+    #[test]
+    fn replay_of_a_lone_headless_bracket_types_the_bracket() {
+        let store = Store::open_in_memory().unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        replay(&mut app, &ctx, &['[']);
+
+        assert_eq!(app.query(), "[");
     }
 }
