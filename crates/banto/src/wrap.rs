@@ -20,6 +20,7 @@
 //! double-resume prevention possible at all, since `wt.exe` detaches
 //! immediately and leaves nothing else to track.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -105,6 +106,51 @@ pub struct NewSessionDeps<'a> {
     pub provider: &'a ClaudeCodeProvider,
 }
 
+/// Diagnostic log for [`run_new_session`]'s new-session tracking flow,
+/// enabled via the `BANTO_WRAP_LOG` env var (its value is the file path) —
+/// mirrors `crate::tui`'s `BANTO_INPUT_LOG` mechanism. Purely for debugging
+/// a session that fails to become trackable in the field (a bad
+/// `display-message` result, a `find_new_session` that never matches, a
+/// discovery timeout); it has no effect on behavior, so it is not itself
+/// unit-tested (see [`WrapLog::disabled`], used by the tests that do care
+/// about the surrounding logic).
+struct WrapLog(RefCell<Option<std::fs::File>>);
+
+impl WrapLog {
+    /// Open the log file when `BANTO_WRAP_LOG` is set; otherwise every
+    /// `log` call is a no-op. A failure to open the file (bad path,
+    /// permissions) degrades to disabled rather than failing the launch.
+    fn new() -> Self {
+        let file = std::env::var_os("BANTO_WRAP_LOG").and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+        Self(RefCell::new(file))
+    }
+
+    /// Always-disabled log, for tests exercising the surrounding logic
+    /// rather than this diagnostic-only behavior.
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self(RefCell::new(None))
+    }
+
+    /// Append one timestamped line (no-op when disabled).
+    fn log(&self, message: &str) {
+        use std::io::Write as _;
+        if let Some(file) = self.0.borrow_mut().as_mut() {
+            let ms = std::time::UNIX_EPOCH
+                .elapsed()
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(file, "{ms} {message}");
+        }
+    }
+}
+
 /// Launch a brand-new (non-resumed) session, tracking it so it can later be
 /// focused instead of double-resumed. Unlike [`run`], there is no known
 /// session id up front (`argv` is plain `claude`, no `--resume <id>`), so
@@ -135,38 +181,74 @@ pub fn run_new_session(
     env: impl Fn(&str) -> Option<String>,
     deps: NewSessionDeps<'_>,
 ) -> Result<i32> {
-    let Some((backend_key, target)) = resolve_own_pane(backend, env, deps.command_runner) else {
+    let log = WrapLog::new();
+    log.log(&format!(
+        "run_new_session start cwd={} backend={backend:?} argv={argv:?}",
+        cwd.display()
+    ));
+
+    let Some((backend_key, target)) = resolve_own_pane(backend, env, deps.command_runner, &log)
+    else {
+        log.log("no focusable pane resolved -> running claude directly, untracked");
         let code = deps
             .process_runner
             .run(argv)
             .with_context(|| format!("failed to run new session: {argv:?}"))?;
+        log.log(&format!("untracked child exited code={code:?}"));
         return Ok(code.unwrap_or(1));
     };
+    log.log(&format!(
+        "resolved own pane: backend={backend_key} target={target}"
+    ));
 
     let since = SystemTime::now()
         .checked_sub(DISCOVERY_SINCE_SLOP)
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    log.log(&format!(
+        "discovery since={since:?} (slop={DISCOVERY_SINCE_SLOP:?})"
+    ));
     let mut spawned = deps
         .process_runner
         .spawn(argv)
         .with_context(|| format!("failed to spawn new session: {argv:?}"))?;
 
     let mut recorded: Option<SessionId> = None;
+    let mut poll_count: u32 = 0;
     let code = track_new_session(
         spawned.as_mut(),
-        || deps.provider.find_new_session(cwd, since),
+        || {
+            poll_count += 1;
+            let found = deps.provider.find_new_session(cwd, since);
+            log.log(&format!(
+                "find_new_session poll #{poll_count} cwd={} since={since:?} -> {found:?}",
+                cwd.display()
+            ));
+            if found.is_none() && poll_count == DISCOVERY_TIMEOUT_POLLS {
+                log.log(&format!(
+                    "discovery timeout reached after {poll_count} polls without a match; \
+                     giving up the search, still waiting for the child to exit"
+                ));
+            }
+            found
+        },
         |id| {
             let record = new_session_pane_record(id.clone(), backend_key.clone(), target.clone());
+            log.log(&format!(
+                "writing pane record session_id={} backend={} target={}",
+                record.session_id.0, record.backend, record.target
+            ));
             let _ = store.set_pane(&record);
             recorded = Some(id);
         },
         || std::thread::sleep(POLL_INTERVAL),
         DISCOVERY_TIMEOUT_POLLS,
     )?;
+    log.log(&format!("tracked child exited code={code:?}"));
 
     // Best-effort cleanup, same rationale as `run`: a store failure here
     // must not mask the child's own exit code.
     if let Some(id) = recorded {
+        log.log(&format!("removing pane record session_id={}", id.0));
         let _ = store.remove_pane(&id);
     }
 
@@ -218,40 +300,66 @@ fn resolve_own_pane(
     backend: Backend,
     env: impl Fn(&str) -> Option<String>,
     runner: &dyn CommandRunner,
+    log: &WrapLog,
 ) -> Option<(String, String)> {
     if backend != Backend::Psmux {
+        log.log(&format!(
+            "resolve_own_pane: backend={backend:?} has no focusable pane, skipping"
+        ));
         return None;
     }
-    let pane_id = env("TMUX_PANE")?;
-    let output = runner
-        .run(&CommandSpec::new(
-            "psmux",
-            [
-                "display-message",
-                "-p",
-                "-t",
-                pane_id.as_str(),
-                "-F",
-                "#{window_id}",
-            ]
-            .map(str::to_string),
-        ))
-        .ok()?;
+    let Some(pane_id) = env("TMUX_PANE") else {
+        log.log("resolve_own_pane: $TMUX_PANE not set");
+        return None;
+    };
+    log.log(&format!("resolve_own_pane: TMUX_PANE={pane_id}"));
+    let spec = CommandSpec::new(
+        "psmux",
+        [
+            "display-message",
+            "-p",
+            "-t",
+            pane_id.as_str(),
+            "-F",
+            "#{window_id}",
+        ]
+        .map(str::to_string),
+    );
+    log.log(&format!("resolve_own_pane: running {spec:?}"));
+    let output = match runner.run(&spec) {
+        Ok(output) => output,
+        Err(err) => {
+            log.log(&format!(
+                "resolve_own_pane: display-message failed to run: {err}"
+            ));
+            return None;
+        }
+    };
+    log.log(&format!(
+        "resolve_own_pane: display-message success={} stdout={:?} stderr={:?}",
+        output.success, output.stdout, output.stderr
+    ));
     if !output.success {
         return None;
     }
     let window_id = output.stdout.trim();
     if window_id.is_empty() {
+        log.log("resolve_own_pane: display-message returned an empty window_id");
         return None;
     }
     let handle = SessionHandle::Tmux {
         window_id: window_id.to_string(),
         pane_id,
     };
-    Some((
+    let result = (
         crate::opener::backend_key(backend).to_string(),
         crate::opener::encode_target(&handle),
-    ))
+    );
+    log.log(&format!(
+        "resolve_own_pane: resolved backend={} target={}",
+        result.0, result.1
+    ));
+    Some(result)
 }
 
 /// Poll `spawned` until it exits, meanwhile discovering the session id it
@@ -421,7 +529,7 @@ mod tests {
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
         assert_eq!(
-            resolve_own_pane(Backend::WindowsTerminal, env, &runner),
+            resolve_own_pane(Backend::WindowsTerminal, env, &runner, &WrapLog::disabled()),
             None
         );
         assert!(runner.calls().is_empty());
@@ -431,7 +539,10 @@ mod tests {
     fn resolve_own_pane_is_none_without_tmux_pane_env() {
         let runner = MockCommandRunner::default();
 
-        assert_eq!(resolve_own_pane(Backend::Psmux, |_| None, &runner), None);
+        assert_eq!(
+            resolve_own_pane(Backend::Psmux, |_| None, &runner, &WrapLog::disabled()),
+            None
+        );
         assert!(runner.calls().is_empty());
     }
 
@@ -440,7 +551,7 @@ mod tests {
         let runner = MockCommandRunner::with_responses([CommandOutput::success("@3\n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
-        let result = resolve_own_pane(Backend::Psmux, env, &runner);
+        let result = resolve_own_pane(Backend::Psmux, env, &runner, &WrapLog::disabled());
 
         assert_eq!(result, Some(("psmux".to_string(), "@3:%8".to_string())));
         assert_eq!(
@@ -460,7 +571,10 @@ mod tests {
         )]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
-        assert_eq!(resolve_own_pane(Backend::Psmux, env, &runner), None);
+        assert_eq!(
+            resolve_own_pane(Backend::Psmux, env, &runner, &WrapLog::disabled()),
+            None
+        );
     }
 
     #[test]
@@ -468,7 +582,10 @@ mod tests {
         let runner = MockCommandRunner::with_responses([CommandOutput::success("  \n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
-        assert_eq!(resolve_own_pane(Backend::Psmux, env, &runner), None);
+        assert_eq!(
+            resolve_own_pane(Backend::Psmux, env, &runner, &WrapLog::disabled()),
+            None
+        );
     }
 
     // --- new_session_pane_record ----------------------------------------
