@@ -13,6 +13,7 @@
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -48,6 +49,79 @@ impl ClaudeCodeProvider {
     /// Default Claude Code home: `~/.claude`, if a home directory exists.
     pub fn default_home() -> Option<PathBuf> {
         dirs::home_dir().map(|home| home.join(".claude"))
+    }
+
+    /// Find the session Claude Code most recently created or updated for
+    /// `cwd` at or after `since`.
+    ///
+    /// Used to discover the session id assigned to a `claude` process that
+    /// was launched without a known session id (e.g. banto's "new session"
+    /// flow). Matching is done on the `cwd` recorded *inside* each candidate
+    /// file's head record (the same field `read_session` extracts), not by
+    /// decoding the project directory name: Claude's cwd-to-directory-name
+    /// encoding is lossy (`:`, `\`, `/`, and `.` all collapse to `-`), so a
+    /// renamed project can leave files with different recorded cwd values
+    /// in the same directory.
+    ///
+    /// `since` is compared against each file's filesystem mtime, which can
+    /// have coarse resolution; callers should capture `since` a moment
+    /// *before* launching the new session so a file created in the same
+    /// clock tick is not missed.
+    ///
+    /// Read-only like the rest of this provider: unreadable or broken files
+    /// are skipped, and a missing `projects` directory yields `None`. When
+    /// several candidates match, the one with the greatest mtime wins.
+    pub fn find_new_session(&self, cwd: &Path, since: SystemTime) -> Option<SessionId> {
+        let projects = self.claude_home.join("projects");
+        let entries = fs::read_dir(&projects).ok()?;
+
+        let mut best: Option<(SystemTime, SessionId)> = None;
+        for project in entries {
+            let Ok(project) = project else { continue };
+            let project_path = project.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&project_path) else {
+                continue;
+            };
+            for file in files {
+                let Ok(file) = file else { continue };
+                let path = file.path();
+                if !path.extension().is_some_and(|ext| ext == "jsonl") {
+                    continue;
+                }
+                let Ok(metadata) = fs::metadata(&path) else {
+                    continue;
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                let Ok(mtime) = metadata.modified() else {
+                    continue;
+                };
+                if mtime < since {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(head) = read_head(&path, HEAD_CAP_BYTES) else {
+                    continue;
+                };
+                let fields = extract_head_fields(&head);
+                if fields.cwd.as_deref() != Some(cwd) {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_mtime, _)| mtime > *best_mtime)
+                {
+                    best = Some((mtime, SessionId(id.to_string())));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 }
 
@@ -251,10 +325,18 @@ fn normalize_single_line(raw: &str, max_chars: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn provider(root: &TempDir) -> ClaudeCodeProvider {
         ClaudeCodeProvider::new(root.path().to_path_buf())
+    }
+
+    /// Set a file's mtime deterministically (`File::set_modified`, stable
+    /// since Rust 1.75), matching the pattern used in `banto::session`.
+    fn set_mtime(path: &Path, time: SystemTime) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(time).unwrap();
     }
 
     fn write_session(root: &TempDir, project: &str, file: &str, content: &str) -> PathBuf {
@@ -591,5 +673,109 @@ mod tests {
         if let Some(home) = ClaudeCodeProvider::default_home() {
             assert!(home.ends_with(".claude"));
         }
+    }
+
+    #[test]
+    fn find_new_session_matches_a_fresh_file_with_matching_cwd() {
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let path = write_session(
+            &root,
+            "proj",
+            "new.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&path, since + Duration::from_secs(1));
+
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
+        assert_eq!(found, Some(SessionId("new".to_string())));
+    }
+
+    #[test]
+    fn find_new_session_ignores_a_different_cwd() {
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let path = write_session(
+            &root,
+            "proj",
+            "new.jsonl",
+            r#"{"type":"user","cwd":"/work/other","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&path, since + Duration::from_secs(1));
+
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_new_session_ignores_a_file_older_than_since_even_with_matching_cwd() {
+        // Guards against re-finding a pre-existing session that happens to
+        // share the target cwd but predates the launch we're tracking.
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let path = write_session(
+            &root,
+            "proj",
+            "preexisting.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&path, since - Duration::from_secs(1));
+
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_new_session_picks_the_newest_mtime_among_matches() {
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let earlier = write_session(
+            &root,
+            "proj",
+            "earlier.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&earlier, since + Duration::from_secs(1));
+        let later = write_session(
+            &root,
+            "proj",
+            "later.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&later, since + Duration::from_secs(2));
+
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
+        assert_eq!(found, Some(SessionId("later".to_string())));
+    }
+
+    #[test]
+    fn find_new_session_with_missing_projects_dir_yields_none() {
+        let root = TempDir::new().unwrap();
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), SystemTime::now());
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_new_session_skips_a_broken_file_among_candidates() {
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let broken = write_session(&root, "proj", "broken.jsonl", "not json at all\n");
+        set_mtime(&broken, since + Duration::from_secs(1));
+        let good = write_session(
+            &root,
+            "proj",
+            "good.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&good, since + Duration::from_secs(2));
+
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
+        assert_eq!(found, Some(SessionId("good".to_string())));
     }
 }
