@@ -990,6 +990,14 @@ impl App {
         self.status = Some(message);
     }
 
+    /// Clear any transient status-bar message, restoring the key-hint
+    /// display. Called at the start of key dispatch (see `crate::tui::
+    /// handle_key`) so a notification like "pinned session X" doesn't linger
+    /// once the user has moved on to something else.
+    pub fn clear_status(&mut self) {
+        self.status = None;
+    }
+
     /// Request that the render loop exit.
     pub fn request_quit(&mut self) {
         self.should_quit = true;

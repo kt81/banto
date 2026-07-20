@@ -23,10 +23,11 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::config::OpenerMode;
 use banto_core::model::{Activity, AgeBucket, SessionId};
@@ -387,6 +388,12 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
 /// letter keys mean different things: commands in Normal mode, query text
 /// in Search mode.
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
+    // A transient notification (e.g. "pinned session X") is only relevant
+    // until the user does something else — cleared here, before dispatch,
+    // so it doesn't linger over the hints once its moment has passed. If
+    // this same key press posts its own message (see e.g. `toggle_pin`),
+    // that happens further down this same call and overwrites the clear.
+    app.clear_status();
     if mods.contains(KeyModifiers::CONTROL) {
         // Ctrl+C always quits; other Ctrl combos are ignored for now.
         if code == KeyCode::Char('c') {
@@ -753,6 +760,30 @@ fn normalize_key_code(code: KeyCode) -> KeyCode {
     }
 }
 
+/// Recognize a leaked cursor-movement sequence (plain `CSI A/B/C/D` — Up/
+/// Down/Right/Left, no parameters), with or without its leading `ESC` byte —
+/// the same leak pathway `sgr::parse_prefix`/`parse_headless_prefix` handle
+/// for mouse reports (see the module's doc comments). `[A`/`[B`/`[C`/`[D`
+/// never satisfy the SGR grammar (no `<`), so `swallow_one_sequence` would
+/// otherwise reach `SgrParse::NotSgr` and replay the raw bytes as ordinary
+/// key presses — dogfooding confirmed this as visible mojibake (`[` and a
+/// letter landing in the search box or a modal's text input) and, worse,
+/// when the buffer was Esc-headed, the replayed `Esc` silently closing
+/// whatever modal was open (see the `g`-then-arrow-key regression test).
+fn arrow_key_for(pending: &[char]) -> Option<KeyCode> {
+    let rest: &[char] = match pending.first() {
+        Some('\u{1b}') => &pending[1..],
+        _ => pending,
+    };
+    match rest {
+        ['[', 'A'] => Some(KeyCode::Up),
+        ['[', 'B'] => Some(KeyCode::Down),
+        ['[', 'C'] => Some(KeyCode::Right),
+        ['[', 'D'] => Some(KeyCode::Left),
+        _ => None,
+    }
+}
+
 /// Outcome of buffering and resolving one leaked-sequence candidate.
 enum EscapeOutcome {
     /// A complete SGR sequence was recognized and applied/swallowed; the
@@ -789,6 +820,13 @@ fn swallow_one_sequence(
                 return Ok(EscapeOutcome::Swallowed);
             }
             SgrParse::NotSgr => {
+                if let Some(code) = arrow_key_for(&pending) {
+                    ctx.log(&format!(
+                        "esc: recognized leaked arrow key {code:?} from buffer {pending:?}"
+                    ));
+                    handle_key(app, code, KeyModifiers::NONE, ctx);
+                    return Ok(EscapeOutcome::Swallowed);
+                }
                 ctx.log(&format!("esc: NotSgr, replaying buffer {pending:?}"));
                 replay(app, ctx, &pending);
                 return Ok(EscapeOutcome::Done);
@@ -883,7 +921,16 @@ fn end_interrupted_buffer(app: &mut App, ctx: &Context, pending: &[char]) {
 /// = wheel up/down; 0 with a press terminator (`M`) = left click. Anything
 /// else (drag/motion — e.g. `Cb` 35 — other buttons, releases) is
 /// intentionally discarded: there's nothing sensible to do with it here.
+///
+/// A no-op while a modal is open — same guard as [`handle_mouse`], and for
+/// the same reason: without it, a leaked SGR click "through" the overlay
+/// could select/activate a background row the user can't currently see is
+/// being affected (confirmed in dogfooding: `handle_mouse` already had this
+/// guard, but this parallel delivery path for the same click did not).
 fn apply_sgr_action(app: &mut App, ctx: &Context, list_area: Rect, event: sgr::SgrMouseEvent) {
+    if app.modal().is_some() {
+        return;
+    }
     const WHEEL_UP: u32 = 64;
     const WHEEL_DOWN: u32 = 65;
     const LEFT_BUTTON: u32 = 0;
@@ -1069,10 +1116,11 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(border_color))
         .title(" Search ");
     let inner = block.inner(area);
-    frame.render_widget(Paragraph::new(app.query()).block(block), area);
+    let visible = tail_to_width(app.query(), inner.width);
+    frame.render_widget(Paragraph::new(visible.as_str()).block(block), area);
 
     if active && inner.width > 0 {
-        let query_cols = app.query().chars().count() as u16;
+        let query_cols = visible.width() as u16;
         let cursor_x = (inner.x + query_cols).min(inner.x + inner.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, inner.y));
     }
@@ -1304,12 +1352,79 @@ fn modal_area(area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+/// Inset `area` by one column on the left and right, leaving its vertical
+/// extent untouched — modal content (input text, candidate lists, the
+/// archive-confirm prompt) was rendered flush against the box's left/right
+/// border with no breathing room (dogfooding report).
+fn pad_horizontal(area: Rect) -> Rect {
+    area.inner(Margin::new(1, 0))
+}
+
+/// Truncate `s` to fit within `max_width` display columns (a full-width
+/// character — e.g. Japanese — counts as 2, matching how a terminal actually
+/// advances the cursor for it), appending an ellipsis when anything was cut.
+/// `ratatui` already clips a `Paragraph`/`ListItem` cleanly at its own area
+/// boundary, so this isn't papering over a rendering bug — it's so long
+/// content (a session title, a cwd, a group name) that gets cut ends in a
+/// visible `…` instead of silently vanishing past the edge with no
+/// indication anything was hidden.
+fn truncate_to_width(s: &str, max_width: u16) -> String {
+    let max_width = max_width as usize;
+    if s.width() <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let budget = max_width - 1; // reserve 1 column for the ellipsis
+    let mut out = String::new();
+    let mut width = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if width + w > budget {
+            break;
+        }
+        out.push(c);
+        width += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Return the longest suffix of `s` whose display width fits within
+/// `max_width` columns. Used for actively-edited text inputs (the search
+/// box, the cwd/group-name modal inputs) so the cursor end stays visible,
+/// scrolling the field the way a normal terminal input box does, instead of
+/// the cursor position math (previously `s.chars().count()`, which
+/// undercounts a full-width character's true 2-column width) silently
+/// drifting away from where the text it's meant to mark actually ends.
+fn tail_to_width(s: &str, max_width: u16) -> String {
+    let max_width = max_width as usize;
+    let mut width = 0usize;
+    let mut start = s.len();
+    for (idx, c) in s.char_indices().rev() {
+        let w = c.width().unwrap_or(0);
+        if width + w > max_width {
+            break;
+        }
+        width += w;
+        start = idx;
+    }
+    s[start..].to_string()
+}
+
 /// Render whichever modal is open as a centered overlay on top of the rest
-/// of the UI: [`Clear`] blanks the area first so the list/summary panel
-/// behind it doesn't bleed through.
-fn render_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
-    let area = modal_area(area);
-    frame.render_widget(Clear, area);
+/// of the UI: [`Clear`] blanks the *whole frame* first, not just the modal's
+/// own box, so nothing behind it — including in the margin around it —
+/// bleeds through. Clearing only the modal's own (already-shrunk) box used
+/// to leave that margin untouched, so a background row with a long
+/// full-width title (the common case for this modal, since the archive/
+/// group-join prompts echo that very session's own title) could still peek
+/// out around the box's edges, reading as the modal's own content
+/// overflowing (dogfooding report).
+fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
+    frame.render_widget(Clear, full_area);
+    let area = modal_area(full_area);
     match modal {
         Modal::NewSession(state) => render_new_session_modal(frame, state, area),
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
@@ -1328,7 +1443,7 @@ fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Re
         .border_style(Style::default().fg(Color::Cyan))
         .title(" New Session \u{2014} cwd ")
         .title_bottom(" Enter launch  Tab complete  Esc cancel ");
-    let inner = block.inner(area);
+    let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
     let [input_area, error_area, list_area] = Layout::vertical([
@@ -1338,16 +1453,18 @@ fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Re
     ])
     .areas(inner);
 
-    frame.render_widget(Paragraph::new(state.input()), input_area);
+    let visible_input = tail_to_width(state.input(), input_area.width);
+    frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
     if input_area.width > 0 {
-        let input_cols = state.input().chars().count() as u16;
+        let input_cols = visible_input.width() as u16;
         let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, input_area.y));
     }
 
     if let Some(error) = state.error() {
         frame.render_widget(
-            Paragraph::new(error).style(Style::default().fg(Color::Red)),
+            Paragraph::new(truncate_to_width(error, error_area.width))
+                .style(Style::default().fg(Color::Red)),
             error_area,
         );
     }
@@ -1364,7 +1481,7 @@ fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Re
 
     let items: Vec<ListItem> = candidates
         .iter()
-        .map(|candidate| ListItem::new((*candidate).to_string()))
+        .map(|candidate| ListItem::new(truncate_to_width(candidate, list_area.width)))
         .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut list_state = ListState::default();
@@ -1382,11 +1499,12 @@ fn render_confirm_archive_modal(frame: &mut Frame, title: &str, area: Rect) {
         .border_style(Style::default().fg(Color::Yellow))
         .title(" Archive Session \u{2014} confirm ")
         .title_bottom(" Enter archive  Esc cancel ");
-    let inner = block.inner(area);
+    let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
+    let prompt = truncate_to_width(&format!("Archive \"{title}\"?"), inner.width);
     let lines = vec![
-        Line::from(format!("Archive \"{title}\"?")),
+        Line::from(prompt),
         Line::from(Span::styled(
             "Hides it from the list; the session file itself is untouched.",
             Style::default().fg(Color::DarkGray),
@@ -1404,7 +1522,7 @@ fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect
         .border_style(Style::default().fg(Color::Magenta))
         .title(" Join Group ")
         .title_bottom(" Enter join/create  Esc cancel ");
-    let inner = block.inner(area);
+    let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
     let [hint_area, input_area, list_area] = Layout::vertical([
@@ -1415,14 +1533,18 @@ fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect
     .areas(inner);
 
     frame.render_widget(
-        Paragraph::new("Type a new group name, or pick an existing one below:")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(truncate_to_width(
+            "Type a new group name, or pick an existing one below:",
+            hint_area.width,
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
         hint_area,
     );
 
-    frame.render_widget(Paragraph::new(state.input()), input_area);
+    let visible_input = tail_to_width(state.input(), input_area.width);
+    frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
     if input_area.width > 0 {
-        let input_cols = state.input().chars().count() as u16;
+        let input_cols = visible_input.width() as u16;
         let cursor_x = (input_area.x + input_cols).min(input_area.x + input_area.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, input_area.y));
     }
@@ -1439,7 +1561,7 @@ fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect
 
     let items: Vec<ListItem> = candidates
         .iter()
-        .map(|candidate| ListItem::new((*candidate).to_string()))
+        .map(|candidate| ListItem::new(truncate_to_width(candidate, list_area.width)))
         .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut list_state = ListState::default();
@@ -2507,6 +2629,295 @@ mod tests {
         assert!(
             text.contains("Ungrouped"),
             "ungrouped header missing:\n{text}"
+        );
+    }
+
+    // --- dogfooding fixes: full-width truncation / modal padding ---------
+
+    #[test]
+    fn truncate_to_width_leaves_short_text_untouched() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_cuts_ascii_and_appends_an_ellipsis() {
+        assert_eq!(truncate_to_width("hello world", 6), "hello\u{2026}");
+    }
+
+    #[test]
+    fn truncate_to_width_never_splits_a_full_width_character() {
+        // Each "あ" is 2 display columns; the budget for content is
+        // max_width - 1 (reserved for the ellipsis) = 4, which fits exactly
+        // 2 of them (4 columns) with none left over for a 3rd.
+        assert_eq!(truncate_to_width(&"あ".repeat(5), 5), "ああ\u{2026}");
+    }
+
+    #[test]
+    fn tail_to_width_keeps_the_end_when_the_input_overflows() {
+        assert_eq!(tail_to_width("hello world", 5), "world");
+    }
+
+    #[test]
+    fn tail_to_width_never_splits_a_full_width_character() {
+        assert_eq!(tail_to_width(&"あ".repeat(3), 3), "あ");
+    }
+
+    /// Reproduces the actual dogfooding scenario, not a contrived one: the
+    /// archive-confirm modal's prompt echoes the very session it's
+    /// archiving, so whenever that session's title is a long, full-width
+    /// string, the *background* list row behind the modal shares that exact
+    /// same text. `render_modal` used to `Clear` only its own (already-
+    /// shrunk) box, leaving the margin around it untouched, so that row's
+    /// title could still peek out around the box's edges — reading as the
+    /// modal's own content overflowing past its border.
+    #[test]
+    fn a_long_full_width_session_title_does_not_bleed_through_the_margin_around_the_modal() {
+        let long_title = "あ".repeat(60);
+        let mut app = App::new(vec![row("a", &long_title, "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_confirm_archive_modal();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // modal_area(Rect::new(0, 0, 40, 15)) puts the box at columns 2..38
+        // (see `modal_area_shrinks_margin_...`), leaving a 2-column margin
+        // on each side (x=0..2 and x=38..40) where the background list used
+        // to still be visible.
+        for y in 0..15u16 {
+            for x in [0u16, 1, 38, 39] {
+                let symbol = buf.cell((x, y)).unwrap().symbol();
+                assert_ne!(
+                    symbol,
+                    "\u{3042}", // "あ"
+                    "background title bled through the margin at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_title_in_the_archive_modal_is_truncated_with_an_ellipsis() {
+        let long_title = "あ".repeat(60);
+        let area = Rect::new(2, 2, 20, 6);
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        terminal
+            .draw(|frame| render_confirm_archive_modal(frame, &long_title, area))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+
+        let title_row = area.y + 1;
+        let right_border_x = area.x + area.width - 1;
+        assert_eq!(
+            buf.cell((right_border_x, title_row)).unwrap().symbol(),
+            "\u{2502}",
+            "the block's own right border must survive"
+        );
+        assert_eq!(
+            buf.cell((right_border_x - 1, title_row)).unwrap().symbol(),
+            " ",
+            "the 1-column right padding must stay blank"
+        );
+        let row_text: String = (area.x..=right_border_x)
+            .map(|x| buf.cell((x, title_row)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            row_text.contains('\u{2026}'),
+            "long content should end in a visible ellipsis, not a silent cutoff:\n{row_text}"
+        );
+    }
+
+    #[test]
+    fn archive_modal_content_has_one_column_of_padding_inside_the_border() {
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_confirm_archive_modal();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Left border at x=2 (same math as above); content used to start
+        // right at x=3, flush against it. It must now start at x=4, leaving
+        // x=3 blank.
+        assert_eq!(buf.cell((2, 3)).unwrap().symbol(), "\u{2502}");
+        assert_eq!(
+            buf.cell((3, 3)).unwrap().symbol(),
+            " ",
+            "modal content must not be flush against the left border"
+        );
+        assert_eq!(buf.cell((4, 3)).unwrap().symbol(), "A");
+    }
+
+    // --- dogfooding fixes: headless arrow-key CSI leaks -------------------
+
+    #[test]
+    fn arrow_key_for_recognizes_all_four_directions_headless_and_esc_headed() {
+        assert_eq!(arrow_key_for(&['[', 'A']), Some(KeyCode::Up));
+        assert_eq!(arrow_key_for(&['[', 'B']), Some(KeyCode::Down));
+        assert_eq!(arrow_key_for(&['[', 'C']), Some(KeyCode::Right));
+        assert_eq!(arrow_key_for(&['[', 'D']), Some(KeyCode::Left));
+        assert_eq!(arrow_key_for(&['\u{1b}', '[', 'A']), Some(KeyCode::Up));
+        assert_eq!(arrow_key_for(&['\u{1b}', '[', 'D']), Some(KeyCode::Left));
+    }
+
+    #[test]
+    fn arrow_key_for_rejects_shapes_that_are_not_a_bare_arrow_key() {
+        assert_eq!(arrow_key_for(&['[', 'x']), None);
+        assert_eq!(arrow_key_for(&['[', '<']), None); // SGR mouse lead-in
+        assert_eq!(arrow_key_for(&['[']), None);
+        assert_eq!(arrow_key_for(&[]), None);
+    }
+
+    #[test]
+    fn a_headless_leaked_up_arrow_moves_selection_instead_of_replaying_garbage() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "A", "", Activity::Alive),
+            row("b", "B", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+        app.select_next();
+        assert_eq!(app.selected_row().unwrap().id, "b");
+
+        let list_area = Rect::new(0, 4, 60, 3);
+        let outcome = swallow_one_sequence(
+            &mut app,
+            &ctx,
+            list_area,
+            vec!['[', 'A'],
+            sgr::parse_headless_prefix,
+            HEADLESS_GRACE,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, EscapeOutcome::Swallowed));
+        assert_eq!(app.selected_row().unwrap().id, "a");
+        assert_eq!(app.query(), "", "must not have been typed as garbage");
+    }
+
+    #[test]
+    fn an_esc_headed_leaked_down_arrow_does_not_close_an_open_modal() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+
+        let list_area = Rect::new(0, 4, 60, 3);
+        let outcome = swallow_one_sequence(
+            &mut app,
+            &ctx,
+            list_area,
+            vec!['\u{1b}', '[', 'B'],
+            sgr::parse_prefix,
+            ESCAPE_GRACE,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, EscapeOutcome::Swallowed));
+        assert!(
+            app.modal().is_some(),
+            "the leaked arrow's Esc byte must not have been replayed as a real Esc"
+        );
+    }
+
+    /// Regression test for the "can't create a group" dogfooding report:
+    /// what looked like an independent bug turned out to be entirely a
+    /// side effect of the arrow-key leak above — before this fix, a leaked
+    /// arrow key firing mid-typing would replay its leading `Esc` byte,
+    /// silently closing the group-join modal and discarding the name the
+    /// user had just typed.
+    #[test]
+    fn a_leaked_arrow_key_while_typing_a_new_group_name_does_not_corrupt_it_or_close_the_modal() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+        for c in "myteam".chars() {
+            app.modal_push_char(c);
+        }
+
+        let list_area = Rect::new(0, 4, 60, 3);
+        swallow_one_sequence(
+            &mut app,
+            &ctx,
+            list_area,
+            vec!['\u{1b}', '[', 'B'],
+            sgr::parse_prefix,
+            ESCAPE_GRACE,
+        )
+        .unwrap();
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("modal must still be open after the leaked arrow key");
+        };
+        assert_eq!(state.input(), "myteam", "input must not be corrupted");
+
+        match app.modal_group_join_target() {
+            Some(GroupJoinTarget::New(name)) => assert_eq!(name, "myteam"),
+            other => panic!("expected New(\"myteam\"), got {other:?}"),
+        }
+    }
+
+    // --- dogfooding fixes: SGR-leaked click hitting the background list --
+
+    #[test]
+    fn apply_sgr_action_left_click_is_a_noop_while_a_modal_is_open() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "", Activity::Alive),
+            row("b", "Beta", "", Activity::Alive),
+        ]);
+        app.set_viewport_height(10);
+        let selected_before = app.selected_row().unwrap().id.clone();
+        app.open_new_session_modal();
+
+        let list_area = Rect::new(0, 4, 60, 3);
+        let event = sgr::SgrMouseEvent {
+            button: 0,
+            x: 1,
+            y: 5,
+            pressed: true,
+        };
+        apply_sgr_action(&mut app, &ctx, list_area, event);
+
+        assert_eq!(
+            app.selected_row().unwrap().id,
+            selected_before,
+            "a leaked SGR click must not select a background row while a modal is open"
+        );
+        assert!(app.modal().is_some());
+    }
+
+    // --- dogfooding fixes: a lingering status notification ---------------
+
+    #[test]
+    fn a_transient_status_message_clears_on_the_next_key_press() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE, &ctx);
+        assert!(
+            app.status().is_some(),
+            "pinning should post a status message"
+        );
+
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &ctx);
+        assert!(
+            app.status().is_none(),
+            "the notification must clear once the user does something else"
         );
     }
 }
