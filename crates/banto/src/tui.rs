@@ -69,6 +69,35 @@ struct Context<'a> {
     thresholds: &'a AgeThresholds,
     store: &'a Store,
     opener_mode: OpenerMode,
+    /// Diagnostic input-event log, enabled via the `BANTO_INPUT_LOG` env var
+    /// (its value is the file path). Records every raw crossterm event and
+    /// every escape-resolution decision with a millisecond timestamp, for
+    /// debugging input pipelines we cannot reproduce synthetically.
+    input_log: std::cell::RefCell<Option<std::fs::File>>,
+}
+
+impl Context<'_> {
+    /// Append one line to the diagnostic input log (no-op when disabled).
+    fn log(&self, message: &str) {
+        use std::io::Write as _;
+        if let Some(file) = self.input_log.borrow_mut().as_mut() {
+            let ms = std::time::UNIX_EPOCH
+                .elapsed()
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(file, "{ms} {message}");
+        }
+    }
+}
+
+/// Open the diagnostic log file when `BANTO_INPUT_LOG` is set.
+fn open_input_log() -> Option<std::fs::File> {
+    let path = std::env::var_os("BANTO_INPUT_LOG")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 /// Watches `claude_home` for changes and debounces them into a "reload now"
@@ -116,7 +145,9 @@ pub fn run(
         thresholds,
         store,
         opener_mode,
+        input_log: std::cell::RefCell::new(open_input_log()),
     };
+    ctx.log("=== banto TUI started ===");
 
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut app, &ctx);
@@ -196,6 +227,10 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
         if event::poll(TICK_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) => {
+                    ctx.log(&format!(
+                        "loop key code={:?} kind={:?} mods={:?}",
+                        key.code, key.kind, key.modifiers
+                    ));
                     // On Windows crossterm also reports key releases; ignore them.
                     if key.kind == KeyEventKind::Release {
                         continue;
@@ -208,8 +243,14 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                         handle_key(app, key.code, key.modifiers, ctx);
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(app, mouse, list_area, ctx),
-                _ => {}
+                Event::Mouse(mouse) => {
+                    ctx.log(&format!(
+                        "loop mouse kind={:?} col={} row={}",
+                        mouse.kind, mouse.column, mouse.row
+                    ));
+                    handle_mouse(app, mouse, list_area, ctx)
+                }
+                other => ctx.log(&format!("loop other {other:?}")),
             }
         }
 
@@ -295,6 +336,7 @@ fn handle_search_key(app: &mut App, code: KeyCode) {
 /// another leaked sequence before returning to the render loop.
 fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     if !event::poll(ESCAPE_GRACE)? {
+        ctx.log("esc: entry grace expired with empty queue -> lone Esc");
         handle_key(app, KeyCode::Esc, KeyModifiers::NONE, ctx);
         return Ok(());
     }
@@ -314,7 +356,9 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
         if !event::poll(Duration::ZERO)? {
             return Ok(());
         }
-        match event::read()? {
+        let read = event::read()?;
+        ctx.log(&format!("esc: drain read {read:?}"));
+        match read {
             Event::Key(key) if key.kind == KeyEventKind::Release => {}
             Event::Key(key) if key.code == KeyCode::Esc => continue,
             Event::Key(key) => {
@@ -354,19 +398,26 @@ fn swallow_one_sequence(app: &mut App, ctx: &Context, list_area: Rect) -> Result
     loop {
         match sgr::parse_prefix(&pending) {
             SgrParse::Complete(event) => {
+                ctx.log(&format!("esc: swallowed complete sequence {event:?}"));
                 apply_sgr_action(app, ctx, list_area, event);
                 return Ok(EscapeOutcome::Swallowed);
             }
             SgrParse::NotSgr => {
+                ctx.log(&format!("esc: NotSgr, replaying buffer {pending:?}"));
                 replay(app, ctx, &pending);
                 return Ok(EscapeOutcome::Done);
             }
             SgrParse::Incomplete => {
                 if !event::poll(ESCAPE_GRACE)? {
+                    ctx.log(&format!(
+                        "esc: per-byte grace expired, replaying buffer {pending:?}"
+                    ));
                     replay(app, ctx, &pending);
                     return Ok(EscapeOutcome::Done);
                 }
-                match event::read()? {
+                let read = event::read()?;
+                ctx.log(&format!("esc: buffered read {read:?}"));
+                match read {
                     Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                         KeyCode::Char(c) => pending.push(c),
                         KeyCode::Esc => pending.push('\u{1b}'),
