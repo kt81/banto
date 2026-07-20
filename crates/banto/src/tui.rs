@@ -40,6 +40,7 @@ use crate::app::{
     App, ClickOutcome, GroupJoinState, GroupJoinTarget, ListLine, Modal, Mode, NewSessionState,
 };
 use crate::opener::{self, OpenOutcome, SessionToOpen};
+use crate::process::{ProcessRunner, SystemProcessRunner};
 use crate::session;
 use crate::sgr::{self, SgrParse};
 
@@ -119,6 +120,12 @@ struct Context<'a> {
     /// instead of misfiring a second Esc (see
     /// [`consume_recent_genuine_esc`]/[`ESC_RELEASE_SUPPRESS_WINDOW`]).
     last_genuine_esc: RefCell<Option<Instant>>,
+    /// An in-place launch decided by `activate`/`confirm_new_session_modal`
+    /// but not yet run: only `event_loop` owns `&mut Tui`, so a key/mouse
+    /// handler (which only ever sees `&Context`) stashes it here instead of
+    /// running it directly — drained once per `event_loop` iteration by
+    /// [`run_pending_inplace`].
+    pending_inplace: RefCell<Option<opener::InPlaceLaunch>>,
 }
 
 impl Context<'_> {
@@ -205,6 +212,7 @@ pub fn run(
         opener_mode,
         input_log: std::cell::RefCell::new(open_input_log()),
         last_genuine_esc: RefCell::new(None),
+        pending_inplace: RefCell::new(None),
     };
     ctx.log(&format!(
         "=== banto TUI started === own TMUX={:?} TMUX_PANE={:?}",
@@ -290,16 +298,62 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Run an in-place launch to completion, handing banto's own pane to it:
+/// leave the TUI's alternate screen/raw mode/mouse capture (so the child
+/// gets a normal terminal), block on it with inherited stdio, then
+/// re-initialize the TUI and reload rows (the just-used session's
+/// mtime/activity changed). This is the thin, untested-by-design shell
+/// around [`opener::decide_inplace_resume`]'s pure decision (see
+/// [`activate`]) — the standard "shell out to a full-screen program and
+/// come back" pattern; crossterm handles the re-init.
+///
+/// `*terminal` is replaced with a freshly re-initialized one rather than
+/// reused, mirroring [`run`]'s own one-time `setup_terminal` — there is no
+/// cheaper way to resume drawing after ceding the alternate screen/raw mode
+/// to the child. If re-initializing fails, that error propagates (matching
+/// [`run`]'s "always restore, but a failure is still an error" discipline)
+/// rather than leaving the app silently stuck outside the alternate screen.
+fn run_pending_inplace(
+    terminal: &mut Tui,
+    app: &mut App,
+    ctx: &Context,
+    pending: opener::InPlaceLaunch,
+) -> Result<()> {
+    ctx.log(&format!(
+        "run_pending_inplace argv={:?} cwd={}",
+        pending.argv,
+        pending.cwd.display()
+    ));
+    restore_terminal()?;
+    let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd);
+    *terminal = setup_terminal()?;
+    ctx.log(&format!("run_pending_inplace child result={result:?}"));
+
+    let message = match result {
+        Ok(_) => "returned from session".to_string(),
+        Err(err) => format!("failed to run {:?}: {err}", pending.argv),
+    };
+    app.set_status(message);
+    reload(app, ctx);
+    Ok(())
+}
+
 /// Install a panic hook that best-effort restores the terminal before the
 /// default hook prints the panic message, so a panic never leaves the user in
-/// raw mode on the alternate screen.
+/// raw mode on the alternate screen. Idempotent (`Once`-guarded): in-place
+/// mode calls [`setup_terminal`] again on every round trip back from a
+/// session, and each call installing another wrapping layer would grow the
+/// hook chain unboundedly over a long-running banto session.
 fn install_panic_hook() {
-    let original = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        original(info);
-    }));
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            original(info);
+        }));
+    });
 }
 
 /// Height of the always-visible summary panel below the list: one row for
@@ -418,6 +472,15 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
             }
         }
 
+        // Only `event_loop` owns `&mut Tui`, so an in-place activation
+        // decided above (`activate`/`confirm_new_session_modal`, however
+        // deeply nested — direct Enter, a double-click, a leaked-SGR
+        // double-click) is run here instead of at its own call site — see
+        // [`Context::pending_inplace`].
+        if let Some(pending) = ctx.pending_inplace.borrow_mut().take() {
+            run_pending_inplace(terminal, app, ctx, pending)?;
+        }
+
         if watch.poll_ready(SystemTime::now()) {
             reload(app, ctx);
         }
@@ -484,6 +547,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
         KeyCode::Home => app.select_first(),
         KeyCode::End => app.select_last(),
         KeyCode::Enter => activate(app, ctx),
+        KeyCode::Char('s') => activate_split(app, ctx),
         KeyCode::Char('/') => app.enter_search(),
         KeyCode::Char('n') => app.open_new_session_modal(),
         KeyCode::Char('d') => app.open_confirm_archive_modal(),
@@ -550,13 +614,17 @@ fn confirm_modal(app: &mut App, ctx: &Context) {
 /// Confirm the new-session modal: resolve the target cwd (the highlighted
 /// candidate, or the raw typed path — see [`App::modal_new_session_target`]),
 /// validate it's an existing directory (an invalid path becomes an inline
-/// modal error instead of a failed spawn — see [`App::modal_set_error`] — so
-/// the user can correct it without losing what they typed), launch a fresh
-/// `claude` there, post the outcome as a status message, and close the modal
-/// (the message reports success or failure, same as [`activate`]'s resume
-/// path). A modal with nothing to confirm yet (empty input, no candidates)
-/// is left open — Enter does nothing, matching how Enter on an empty list
-/// does nothing in [`activate`].
+/// modal error instead of a failed launch — see [`App::modal_set_error`] —
+/// so the user can correct it without losing what they typed), then stash
+/// an in-place launch for `event_loop` to run — same model as [`activate`]'s
+/// resume path (see [`Context::pending_inplace`]), just with no
+/// double-resume guard: a brand-new `claude` launch never forks an existing
+/// session's history, so there's nothing to check against. A modal with
+/// nothing to confirm yet (empty input, no candidates) is left open — Enter
+/// does nothing, matching how Enter on an empty list does nothing in
+/// [`activate`]. Closes the modal immediately; the actual run (and its
+/// resulting status message) happens once `event_loop` drains
+/// `pending_inplace`.
 fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
     let Some(cwd) = app.modal_new_session_target() else {
         return;
@@ -566,38 +634,14 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
         return;
     }
 
-    let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
-    let tmux_pane = std::env::var("TMUX_PANE").ok();
-    let anchor = opener::resolve_own_anchor(backend, &SystemCommandRunner, tmux_pane.as_deref());
-    // Passed through explicitly rather than left for `_wrap` to read its own
-    // environment: a psmux-spawned process doesn't reliably inherit banto's
-    // (docs/notes/psmux-spike.md) — see `crate::wrap::WrapLog::new`.
-    let wrap_log = std::env::var("BANTO_WRAP_LOG").ok();
-    let outcome = opener::open_new_session(
-        backend,
-        &cwd,
-        SystemCommandRunner,
-        anchor.as_deref(),
-        wrap_log.as_deref(),
-    );
-
-    let message = match outcome {
-        Ok(OpenOutcome::Opened) => format!("launched a new session in {}", cwd.display()),
-        Ok(OpenOutcome::NoBackendDetected) => {
-            "no terminal backend detected (run inside psmux/Windows Terminal, \
-             or set `opener` in config.toml)"
-                .to_string()
-        }
-        // `open_new_session` never focuses or refuses an existing pane —
-        // there's no pre-existing session for a fresh launch to key off of.
-        Ok(
-            OpenOutcome::Focused
-            | OpenOutcome::AlreadyOpenCannotFocus
-            | OpenOutcome::AlreadyRunningUntracked,
-        ) => unreachable!(),
-        Err(err) => format!("failed to launch a new session in {}: {err}", cwd.display()),
-    };
-    app.set_status(message);
+    ctx.log(&format!(
+        "confirm_new_session_modal (in-place) cwd={}",
+        cwd.display()
+    ));
+    *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
+        argv: opener::inplace_argv(None),
+        cwd,
+    });
     app.close_modal();
 }
 
@@ -1111,26 +1155,77 @@ fn handle_mouse(app: &mut App, mouse: event::MouseEvent, list_area: Rect, ctx: &
     }
 }
 
-/// Open or focus the selected session (Enter / double-click), posting the
-/// outcome as a status-bar message, then reload rows once since the open/
-/// focus attempt just changed the pane map. All I/O lives in this thin
-/// shell, not in [`App`], which stays a pure, testable state struct — see
-/// `crate::opener::open_session` for the actual decision logic (unit tested
-/// there with mocked process/store dependencies).
-fn activate(app: &mut App, ctx: &Context) {
-    let Some(row) = app.selected_row() else {
-        return;
-    };
-    let id = row.id.clone();
-    let session = SessionToOpen {
-        id: id.clone(),
+/// Resolve the selected row into a [`SessionToOpen`], defaulting `cwd` to
+/// the home directory (then `.`) when the session recorded none — shared by
+/// [`activate`] (in-place) and [`activate_split`].
+fn selected_session(app: &App) -> Option<SessionToOpen> {
+    let row = app.selected_row()?;
+    Some(SessionToOpen {
+        id: row.id.clone(),
         title: row.display_title().to_string(),
         cwd: row
             .cwd
             .clone()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from(".")),
+    })
+}
+
+/// Resume the selected session in place (Enter / double-click, the default
+/// action — docs/REQUIREMENTS.md, config default `OpenerMode::InPlace`):
+/// hand banto's own pane to the session instead of spawning a psmux/WT
+/// pane/tab, sidestepping session-qualification, `_wrap`, and the pane map
+/// entirely (`crate::opener::decide_inplace_resume`'s doc comment). Refuses
+/// (posting a status message, staying in the list) when the session is
+/// already running elsewhere — the only guard available here, since
+/// in-place mode has no pane map of its own to consult first. The decision
+/// is a pure function (`opener::decide_inplace_resume`, unit tested there
+/// with a mocked probe/live list); this only does the I/O — reading live
+/// state and, on success, stashing the launch for `event_loop` to actually
+/// run (see [`Context::pending_inplace`]), since only it owns `&mut Tui`.
+fn activate(app: &mut App, ctx: &Context) {
+    let Some(session) = selected_session(app) else {
+        return;
     };
+    let id = session.id.clone();
+
+    // Only consulted here — in-place mode has no pane map, so this is the
+    // *only* double-resume guard, not a fallback for an untracked case.
+    let live = read_live_sessions(&ctx.claude_home.join("sessions"));
+    match opener::decide_inplace_resume(&session, &SysinfoProbe, &live) {
+        Some(launch) => {
+            ctx.log(&format!(
+                "activate (in-place) session={id} argv={:?} cwd={}",
+                launch.argv,
+                launch.cwd.display()
+            ));
+            *ctx.pending_inplace.borrow_mut() = Some(launch);
+        }
+        None => {
+            ctx.log(&format!(
+                "activate (in-place) session={id} refused: already live"
+            ));
+            app.set_status(format!("session {id} is already running elsewhere"));
+        }
+    }
+}
+
+/// Open or focus the selected session in a split pane/tab (`s`), posting
+/// the outcome as a status-bar message, then reload rows once since the
+/// open/focus attempt just changed the pane map. This is the pre-in-place
+/// behavior, kept as an explicit alternative to [`activate`]'s default
+/// in-place action for whoever wants a separate pane instead (or is on a
+/// non-`InPlace` `opener_mode` — see [`opener::resolve_backend`]'s doc
+/// comment for how `s` resolves a backend regardless of that setting). All
+/// I/O lives in this thin shell, not in [`App`], which stays a pure,
+/// testable state struct — see `crate::opener::open_session` for the actual
+/// decision logic (unit tested there with mocked process/store
+/// dependencies).
+fn activate_split(app: &mut App, ctx: &Context) {
+    let Some(session) = selected_session(app) else {
+        return;
+    };
+    let id = session.id.clone();
 
     let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
     // Anchor psmux splits on banto's own session-qualified pane (psmux
@@ -1145,7 +1240,7 @@ fn activate(app: &mut App, ctx: &Context) {
     // `crate::wrap`'s BANTO_WRAP_LOG instrumentation) to confirm or rule
     // out a resumed/opened pane landing on a *different* psmux server.
     ctx.log(&format!(
-        "activate session={id} banto TMUX={:?} TMUX_PANE={:?} anchor={anchor:?}",
+        "activate_split session={id} banto TMUX={:?} TMUX_PANE={:?} anchor={anchor:?}",
         std::env::var("TMUX").ok(),
         tmux_pane
     ));
@@ -1162,10 +1257,10 @@ fn activate(app: &mut App, ctx: &Context) {
         anchor.as_deref(),
         &live,
     );
-    ctx.log(&format!("activate open_session outcome={outcome:?}"));
+    ctx.log(&format!("activate_split open_session outcome={outcome:?}"));
     if let Ok(record) = ctx.store.borrow().get_pane(&SessionId(id.clone())) {
         ctx.log(&format!(
-            "activate pane record after open = {:?}",
+            "activate_split pane record after open = {:?}",
             record.map(|r| (r.backend, r.target))
         ));
     }
@@ -1419,8 +1514,9 @@ fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> Str
 /// than one line) so the count stays visible even when the hints are too long
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  / search  \
-                                n new  d archive  g group  Tab view  p pin  a agents  q/Esc quit";
+    const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  s split  \
+                                / search  n new  d archive  g group  Tab view  p pin  a agents  \
+                                q/Esc quit";
     const SEARCH_HINTS: &str =
         "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
@@ -1836,6 +1932,7 @@ mod tests {
             opener_mode: OpenerMode::Auto,
             input_log: std::cell::RefCell::new(None),
             last_genuine_esc: RefCell::new(None),
+            pending_inplace: RefCell::new(None),
         }
     }
 
@@ -2980,6 +3077,29 @@ mod tests {
         assert!(state.error().is_none());
     }
 
+    #[test]
+    fn confirm_new_session_modal_stages_an_in_place_launch_and_closes() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(Vec::new());
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+        // "." always exists as a directory, whatever the test's cwd is.
+        app.modal_push_char('.');
+
+        confirm_modal(&mut app, &ctx);
+
+        let launch = ctx
+            .pending_inplace
+            .borrow_mut()
+            .take()
+            .expect("expected a pending in-place launch");
+        assert_eq!(launch.argv, ["claude"].map(str::to_string));
+        assert_eq!(launch.cwd, PathBuf::from("."));
+        assert!(app.modal().is_none(), "modal should have closed");
+    }
+
     /// The SGR recognizer runs at the event-loop level, entirely before
     /// `handle_key`'s modal check — so a leaked mouse sequence must still be
     /// swallowed cleanly (never landing in the modal's input) regardless of
@@ -3021,6 +3141,51 @@ mod tests {
         };
         assert_eq!(session_id, "a");
         assert_eq!(title, "Alpha");
+    }
+
+    #[test]
+    fn enter_stages_an_in_place_resume_for_the_selected_session() {
+        // `claude_home` is `.` (see `test_context`), under which no
+        // `sessions/` live-state directory exists, so `read_live_sessions`
+        // tolerantly yields an empty list — the session is never live here,
+        // deterministically, without depending on real process state. This
+        // never spawns anything (unlike `s`/`activate_split`, which is
+        // deliberately left untested here — it can shell out to a real
+        // psmux/wt binary depending on env/backend resolution): `activate`
+        // only stashes the launch for `event_loop` to run.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("sess-1", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+
+        let launch = ctx
+            .pending_inplace
+            .borrow_mut()
+            .take()
+            .expect("expected a pending in-place launch");
+        assert_eq!(
+            launch.argv,
+            ["claude", "--resume", "sess-1"].map(str::to_string)
+        );
+        assert_eq!(launch.cwd, PathBuf::from("/work/alpha"));
+        // No refusal status posted for the ordinary "proceed" case.
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn enter_does_nothing_when_the_list_is_empty() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(Vec::new());
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+
+        assert!(ctx.pending_inplace.borrow().is_none());
     }
 
     #[test]

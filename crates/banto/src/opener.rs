@@ -9,7 +9,7 @@
 //! [`crate::wrap`] — mirroring how `banto_core::status` judges session
 //! activity), never by querying the terminal backend itself.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use banto_core::config::OpenerMode;
@@ -59,66 +59,20 @@ pub enum SessionOpenError {
     Open(#[from] OpenError),
 }
 
-/// Resolve the backend to open new sessions with. `Auto` detects it from the
-/// environment via `env` (injected so this stays deterministic in tests);
-/// production code passes `std::env::var`.
+/// Resolve the backend for a *split* placement (the `s` key) — never
+/// consulted for in-place activation (Enter), which bypasses backend
+/// resolution entirely. `Auto` detects it from the environment via `env`
+/// (injected so this stays deterministic in tests); production code passes
+/// `std::env::var`. `InPlace` (the config default) has no split backend of
+/// its own, so `s` falls back to the same auto-detection as `Auto` — it's
+/// only the *default action* (Enter) that in-place mode changes, not
+/// whether a split is still available on request.
 pub fn resolve_backend(mode: OpenerMode, env: impl Fn(&str) -> Option<String>) -> Option<Backend> {
     match mode {
-        OpenerMode::Auto => opener::detect_backend(env),
+        OpenerMode::InPlace | OpenerMode::Auto => opener::detect_backend(env),
         OpenerMode::Psmux => Some(Backend::Psmux),
         OpenerMode::WindowsTerminal => Some(Backend::WindowsTerminal),
     }
-}
-
-/// Launch a brand-new (non-resumed) `claude` session in `cwd`, via `banto
-/// _wrap --new-session` so it can later be found and focused.
-///
-/// Unlike [`open_session`], there is no pre-existing session id to key a
-/// double-resume check or a pane-map record against here in the opener —
-/// starting two new sessions is not a double resume, it's just two new
-/// sessions — so this skips the store entirely. But the session Claude
-/// creates for `cwd` *is* discovered and recorded, just not by this
-/// function: `_wrap --new-session` (`crate::wrap::run_new_session`) does
-/// that itself once it's running inside the new pane, since only it can
-/// observe both where it landed and which session id eventually shows up.
-///
-/// `wrap_log`, when given, is the caller's own resolved `BANTO_WRAP_LOG`
-/// value, passed through to `_wrap` via `--wrap-log` (see
-/// [`new_session_wrap_argv`]) rather than left for it to read from its own
-/// environment, which a psmux-spawned process does not reliably inherit.
-pub fn open_new_session<R: CommandRunner + 'static>(
-    backend: Option<Backend>,
-    cwd: &Path,
-    runner: R,
-    anchor_pane: Option<&str>,
-    wrap_log: Option<&str>,
-) -> Result<OpenOutcome, OpenError> {
-    let Some(backend) = backend else {
-        return Ok(OpenOutcome::NoBackendDetected);
-    };
-    let title = cwd
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| cwd.display().to_string());
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_string));
-    let cmd = ResumeCommand {
-        // Unused: there is no pane-map record for this launch to key.
-        session_id: String::new(),
-        argv: new_session_wrap_argv(exe.as_deref(), cwd, backend, wrap_log),
-        cwd: cwd.to_path_buf(),
-        title,
-    };
-    let opener: Box<dyn Opener> = match (backend, anchor_pane) {
-        (Backend::Psmux, Some(anchor)) => {
-            Box::new(TmuxOpener::new(runner).with_anchor_pane(anchor))
-        }
-        (Backend::Psmux, None) => Box::new(TmuxOpener::new(runner)),
-        (Backend::WindowsTerminal, _) => Box::new(WindowsTerminalOpener::new(runner)),
-    };
-    opener.open(&cmd)?;
-    Ok(OpenOutcome::Opened)
 }
 
 /// Open or focus `session`, enforcing the no-double-resume invariant.
@@ -173,15 +127,60 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
 }
 
 /// Whether any live-state entry names `session_id` with a currently-alive
-/// pid, regardless of busy/idle status — used only to guard against
+/// pid, regardless of busy/idle status — used to guard against
 /// `--resume`-ing (and thereby history-forking) a session that's live but
-/// untracked (see [`open_session`]). Unlike `banto_core::status::classify`
-/// (which is about which activity dot to show, so a busy entry outranks a
-/// merely-alive one), this only answers "is this session actually running
-/// right now".
-fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn ProcessProbe) -> bool {
+/// untracked (see [`open_session`]), and reused by [`decide_inplace_resume`]
+/// for the same reason: in-place mode has no pane map of its own, so this is
+/// its *only* double-resume guard, not just a fallback for the untracked
+/// case. Unlike `banto_core::status::classify` (which is about which
+/// activity dot to show, so a busy entry outranks a merely-alive one), this
+/// only answers "is this session actually running right now".
+pub(crate) fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn ProcessProbe) -> bool {
     live.iter()
         .any(|entry| entry.session_id.as_deref() == Some(session_id) && probe.is_alive(entry.pid))
+}
+
+/// A terminal hand-off ready to run in-place: the argv to execute with
+/// inherited stdio, and the directory to run it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InPlaceLaunch {
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+/// Build the in-place launch argv. Unlike [`wrap_argv`] (the split-resume
+/// equivalent), there is no `banto _wrap` wrapper: in-place mode blocks on
+/// the child directly as banto's own terminal (see `crate::tui`'s
+/// teardown/run/re-init loop), so there is no separate long-lived process
+/// for a wrapper to attach a pane record to in the first place.
+pub(crate) fn inplace_argv(session_id: Option<&str>) -> Vec<String> {
+    match session_id {
+        Some(id) => vec!["claude".to_string(), "--resume".to_string(), id.to_string()],
+        None => vec!["claude".to_string()],
+    }
+}
+
+/// Decide whether to resume `session` in place, or `None` to refuse: taking
+/// over the terminal for a session that's already running somewhere else (a
+/// split pane, another banto instance, or a directly-launched `claude`)
+/// would `--resume` it a second time and fork its history (CLAUDE.md
+/// invariant 4). `live`/`probe` are the same live-state snapshot and
+/// liveness probe [`open_session`]'s untracked-but-live guard uses (see
+/// [`is_live`]) — the only guard available here, since in-place mode has no
+/// pane map of its own to consult first.
+pub(crate) fn decide_inplace_resume(
+    session: &SessionToOpen,
+    probe: &dyn ProcessProbe,
+    live: &[LiveSession],
+) -> Option<InPlaceLaunch> {
+    if is_live(&session.id, live, probe) {
+        None
+    } else {
+        Some(InPlaceLaunch {
+            argv: inplace_argv(Some(&session.id)),
+            cwd: session.cwd.clone(),
+        })
+    }
 }
 
 /// Outcome of [`focus_existing`]: either a final [`OpenOutcome`], or a
@@ -287,48 +286,6 @@ fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
         "--resume".to_string(),
         session_id.to_string(),
     ]
-}
-
-/// Build the `<banto> _wrap --new-session --cwd <cwd> --backend <key>
-/// [--wrap-log <path>] -- claude` argv (see [`wrap_argv`] for the
-/// resume-mode equivalent and the `exe` convention). Unlike the resume
-/// case, `_wrap` itself discovers the session id Claude assigns and writes
-/// its own pane record (`crate::wrap::run_new_session`) — there's no id
-/// known yet for this process to be told. `backend` is passed through
-/// explicitly (this function's own already-resolved choice) rather than
-/// left for `_wrap` to re-detect from its environment — see
-/// `crate::wrap::resolve_own_pane`'s doc comment for why that would be
-/// unreliable.
-///
-/// `wrap_log`, when set, is banto's own `BANTO_WRAP_LOG` value, passed
-/// through explicitly for the same kind of reason: a psmux-spawned `_wrap`
-/// process does not reliably inherit banto's own environment
-/// (docs/notes/psmux-spike.md), so relying on `_wrap` to read
-/// `BANTO_WRAP_LOG` from its own environment would silently produce no
-/// diagnostic log at all — see `crate::wrap::WrapLog::new`'s doc comment.
-fn new_session_wrap_argv(
-    exe: Option<&str>,
-    cwd: &Path,
-    backend: Backend,
-    wrap_log: Option<&str>,
-) -> Vec<String> {
-    let banto_exe = exe.unwrap_or("banto").to_string();
-    let mut argv = vec![
-        banto_exe,
-        "_wrap".to_string(),
-        "--new-session".to_string(),
-        "--cwd".to_string(),
-        cwd.display().to_string(),
-        "--backend".to_string(),
-        backend_key(backend).to_string(),
-    ];
-    if let Some(path) = wrap_log {
-        argv.push("--wrap-log".to_string());
-        argv.push(path.to_string());
-    }
-    argv.push("--".to_string());
-    argv.push("claude".to_string());
-    argv
 }
 
 /// Stable string stored in [`PaneRecord::backend`] (kebab-case, independent
@@ -596,6 +553,50 @@ mod tests {
         assert!(!is_live("sess-1", &[], &probe));
     }
 
+    // --- inplace_argv / decide_inplace_resume -----------------------------
+
+    #[test]
+    fn inplace_argv_resumes_a_given_session_id() {
+        assert_eq!(
+            inplace_argv(Some("sess-1")),
+            ["claude", "--resume", "sess-1"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn inplace_argv_launches_plain_claude_for_a_new_session() {
+        assert_eq!(inplace_argv(None), ["claude"].map(str::to_string));
+    }
+
+    #[test]
+    fn decide_inplace_resume_proceeds_when_the_session_is_not_live() {
+        let probe = MockProbe::with_alive(&[]);
+
+        let launch = decide_inplace_resume(&session(), &probe, &[]).unwrap();
+
+        assert_eq!(
+            launch.argv,
+            ["claude", "--resume", "sess-1"].map(str::to_string)
+        );
+        assert_eq!(launch.cwd, PathBuf::from("/work/alpha"));
+    }
+
+    #[test]
+    fn decide_inplace_resume_refuses_when_the_session_is_already_live() {
+        let probe = MockProbe::with_alive(&[4242]);
+        let live = [live_entry("sess-1", 4242)];
+
+        assert_eq!(decide_inplace_resume(&session(), &probe, &live), None);
+    }
+
+    #[test]
+    fn decide_inplace_resume_ignores_a_live_entry_for_a_different_session() {
+        let probe = MockProbe::with_alive(&[4242]);
+        let live = [live_entry("some-other-session", 4242)];
+
+        assert!(decide_inplace_resume(&session(), &probe, &live).is_some());
+    }
+
     #[test]
     fn live_but_untracked_session_refuses_to_open_fresh_to_avoid_a_double_resume() {
         let store = Store::open_in_memory().unwrap();
@@ -860,129 +861,6 @@ mod tests {
         assert!(runner.calls().is_empty());
     }
 
-    #[test]
-    fn open_new_session_wraps_claude_via_wrap_new_session_with_no_session_id() {
-        let runner = MockRunner::default();
-
-        let outcome = open_new_session(
-            Some(Backend::Psmux),
-            &PathBuf::from("/work/alpha"),
-            runner.clone(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(outcome, OpenOutcome::Opened);
-        let calls = runner.calls();
-        // Wrapped via `_wrap --new-session --cwd ... -- claude` (no
-        // `--session <id>`: there's no pre-existing session id to tell it).
-        assert!(calls[0].args.iter().any(|a| a == "_wrap"));
-        assert!(calls[0].args.iter().any(|a| a == "--new-session"));
-        assert!(!calls[0].args.iter().any(|a| a == "--session"));
-        // No `BANTO_WRAP_LOG` was resolved, so no `--wrap-log` flag either.
-        assert!(!calls[0].args.iter().any(|a| a == "--wrap-log"));
-        let cwd_pos = calls[0]
-            .args
-            .iter()
-            .position(|a| a == "--cwd")
-            .expect("--cwd missing");
-        assert_eq!(calls[0].args[cwd_pos + 1], "/work/alpha");
-        let backend_pos = calls[0]
-            .args
-            .iter()
-            .position(|a| a == "--backend")
-            .expect("--backend missing");
-        assert_eq!(calls[0].args[backend_pos + 1], "psmux");
-        assert!(calls[0].args.iter().any(|a| a == "claude"));
-        // Tagged with the cwd's directory name, not a session id.
-        assert_eq!(
-            calls[1].args,
-            vec!["select-pane", "-t", "play:%1", "-T", "alpha"]
-        );
-    }
-
-    #[test]
-    fn open_new_session_anchors_the_split_when_given_an_anchor_pane() {
-        let runner = MockRunner::default();
-
-        open_new_session(
-            Some(Backend::Psmux),
-            &PathBuf::from("/work/alpha"),
-            runner.clone(),
-            Some("%7"),
-            None,
-        )
-        .unwrap();
-
-        let calls = runner.calls();
-        let t = calls[0]
-            .args
-            .iter()
-            .position(|a| a == "-t")
-            .expect("-t missing");
-        assert_eq!(calls[0].args[t + 1], "%7");
-    }
-
-    #[test]
-    fn open_new_session_title_falls_back_to_the_full_path_without_a_file_name() {
-        let runner = MockRunner::default();
-
-        open_new_session(
-            Some(Backend::Psmux),
-            &PathBuf::from("/"),
-            runner.clone(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        let calls = runner.calls();
-        assert_eq!(
-            calls[1].args,
-            vec!["select-pane", "-t", "play:%1", "-T", "/"]
-        );
-    }
-
-    #[test]
-    fn open_new_session_with_no_backend_reports_no_backend_detected() {
-        let runner = MockRunner::default();
-
-        let outcome = open_new_session(
-            None,
-            &PathBuf::from("/work/alpha"),
-            runner.clone(),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(outcome, OpenOutcome::NoBackendDetected);
-        assert!(runner.calls().is_empty());
-    }
-
-    #[test]
-    fn open_new_session_passes_wrap_log_through_to_the_wrap_argv() {
-        let runner = MockRunner::default();
-
-        open_new_session(
-            Some(Backend::Psmux),
-            &PathBuf::from("/work/alpha"),
-            runner.clone(),
-            None,
-            Some("C:/logs/wrap.log"),
-        )
-        .unwrap();
-
-        let calls = runner.calls();
-        let pos = calls[0]
-            .args
-            .iter()
-            .position(|a| a == "--wrap-log")
-            .expect("--wrap-log missing");
-        assert_eq!(calls[0].args[pos + 1], "C:/logs/wrap.log");
-    }
-
     // --- encode_target / decode_handle -----------------------------------
 
     #[test]
@@ -1103,76 +981,6 @@ mod tests {
     }
 
     #[test]
-    fn new_session_wrap_argv_uses_the_given_exe_path_when_available() {
-        assert_eq!(
-            new_session_wrap_argv(
-                Some("C:/dev/banto.exe"),
-                Path::new("/work/alpha"),
-                Backend::Psmux,
-                None
-            ),
-            [
-                "C:/dev/banto.exe",
-                "_wrap",
-                "--new-session",
-                "--cwd",
-                "/work/alpha",
-                "--backend",
-                "psmux",
-                "--",
-                "claude",
-            ]
-            .map(str::to_string)
-        );
-    }
-
-    #[test]
-    fn new_session_wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
-        assert_eq!(
-            new_session_wrap_argv(None, Path::new("/work/alpha"), Backend::Psmux, None)[0],
-            "banto"
-        );
-    }
-
-    #[test]
-    fn new_session_wrap_argv_passes_the_windows_terminal_backend_key() {
-        let argv = new_session_wrap_argv(
-            None,
-            Path::new("/work/alpha"),
-            Backend::WindowsTerminal,
-            None,
-        );
-        let pos = argv
-            .iter()
-            .position(|a| a == "--backend")
-            .expect("--backend missing");
-        assert_eq!(argv[pos + 1], "windows-terminal");
-    }
-
-    #[test]
-    fn new_session_wrap_argv_appends_wrap_log_before_the_trailing_claude_argv() {
-        let argv = new_session_wrap_argv(
-            None,
-            Path::new("/work/alpha"),
-            Backend::Psmux,
-            Some("C:/logs/wrap.log"),
-        );
-        let pos = argv
-            .iter()
-            .position(|a| a == "--wrap-log")
-            .expect("--wrap-log missing");
-        assert_eq!(argv[pos + 1], "C:/logs/wrap.log");
-        // Still ends with the separator and the wrapped command.
-        assert_eq!(&argv[pos + 2..], ["--", "claude"]);
-    }
-
-    #[test]
-    fn new_session_wrap_argv_omits_wrap_log_when_not_given() {
-        let argv = new_session_wrap_argv(None, Path::new("/work/alpha"), Backend::Psmux, None);
-        assert!(!argv.iter().any(|a| a == "--wrap-log"));
-    }
-
-    #[test]
     fn resolve_backend_forces_configured_backend_regardless_of_env() {
         assert_eq!(
             resolve_backend(OpenerMode::Psmux, |_| Some("set".to_string())),
@@ -1191,5 +999,17 @@ mod tests {
             Some(Backend::Psmux)
         );
         assert_eq!(resolve_backend(OpenerMode::Auto, |_| None), None);
+    }
+
+    #[test]
+    fn resolve_backend_in_place_falls_back_to_auto_detection_for_the_split_key() {
+        // `InPlace` has no split backend of its own; the `s` key still needs
+        // one, so it detects from the environment exactly like `Auto`.
+        assert_eq!(
+            resolve_backend(OpenerMode::InPlace, |k| (k == "TMUX")
+                .then(|| "1".to_string())),
+            Some(Backend::Psmux)
+        );
+        assert_eq!(resolve_backend(OpenerMode::InPlace, |_| None), None);
     }
 }

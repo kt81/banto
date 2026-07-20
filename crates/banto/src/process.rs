@@ -7,12 +7,17 @@
 //! sits behind an abstraction that tests can mock).
 
 use std::io;
+use std::path::Path;
 
 /// Runs the resumed session's process to completion with inherited stdio.
 pub trait ProcessRunner {
     /// Run `argv` (`argv[0]` is the program, the rest its arguments) and
     /// block until it exits. Returns the exit code, or `None` if the process
-    /// was terminated by a signal (never observed on Windows).
+    /// was terminated by a signal (never observed on Windows). Inherits this
+    /// process's own working directory — correct for `_wrap`, whose own cwd
+    /// is already the session's cwd (set by the opener at pane-creation
+    /// time); in-place mode uses [`Self::run_in`] instead, since banto's own
+    /// long-lived process cwd is not the session's.
     fn run(&self, argv: &[String]) -> io::Result<Option<i32>>;
 
     /// Spawn `argv` with inherited stdio and return a handle for polling it
@@ -21,6 +26,12 @@ pub trait ProcessRunner {
     /// creates while the child is still running — `run`'s blocking `.wait()`
     /// can't interleave with that.
     fn spawn(&self, argv: &[String]) -> io::Result<Box<dyn SpawnedProcess>>;
+
+    /// Like [`Self::run`], but in `cwd` rather than this process's own
+    /// working directory — used by in-place mode (`crate::tui`'s
+    /// teardown/run/re-init loop), where banto is a single long-lived
+    /// process whose own cwd is not necessarily the session's.
+    fn run_in(&self, argv: &[String], cwd: &Path) -> io::Result<Option<i32>>;
 }
 
 /// A spawned, possibly still-running child process — see
@@ -57,6 +68,20 @@ impl ProcessRunner for SystemProcessRunner {
         let child = std::process::Command::new(program).args(args).spawn()?;
         Ok(Box::new(SystemSpawnedProcess(child)))
     }
+
+    fn run_in(&self, argv: &[String], cwd: &Path) -> io::Result<Option<i32>> {
+        let [program, args @ ..] = argv else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty argv passed to run_in",
+            ));
+        };
+        let status = std::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .status()?;
+        Ok(status.code())
+    }
 }
 
 /// [`SpawnedProcess`] backed by [`std::process::Child`].
@@ -72,14 +97,19 @@ impl SpawnedProcess for SystemSpawnedProcess {
 pub(crate) mod mock {
     use std::cell::RefCell;
     use std::io;
+    use std::path::Path;
 
     use super::{ProcessRunner, SpawnedProcess};
 
     /// Records every argv it was asked to run/spawn and replies with a
-    /// canned exit code; never spawns a real process. `run` reports it
-    /// immediately; a `spawn`ed [`MockSpawnedProcess`] reports "still
+    /// canned exit code; never spawns a real process. `run`/`run_in` report
+    /// it immediately; a `spawn`ed [`MockSpawnedProcess`] reports "still
     /// running" for `still_running_polls` polls first (0 by default, i.e.
-    /// already exited) — see [`Self::new_spawning`].
+    /// already exited) — see [`Self::new_spawning`]. `run_in` isn't
+    /// currently exercised by any test (in-place mode's `run_pending_inplace`
+    /// is a thin, untested-by-design shell, same as `event_loop` — see
+    /// `crate::tui`), so unlike `run`/`spawn` it doesn't bother recording
+    /// its calls.
     #[derive(Debug, Default)]
     pub(crate) struct MockProcessRunner {
         exit_code: Option<i32>,
@@ -129,6 +159,10 @@ pub(crate) mod mock {
                 self.exit_code,
             )))
         }
+
+        fn run_in(&self, _argv: &[String], _cwd: &Path) -> io::Result<Option<i32>> {
+            Ok(self.exit_code)
+        }
     }
 
     /// A [`SpawnedProcess`] that reports "still running" for the first
@@ -167,6 +201,12 @@ mod tests {
     #[test]
     fn empty_argv_is_rejected() {
         let err = SystemProcessRunner.run(&[]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn run_in_empty_argv_is_rejected() {
+        let err = SystemProcessRunner.run_in(&[], Path::new(".")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
