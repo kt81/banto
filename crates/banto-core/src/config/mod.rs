@@ -36,12 +36,18 @@ pub enum ConfigError {
     },
 }
 
-/// Which backend resumes sessions into panes/tabs.
+/// Which backend resumes sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpenerMode {
-    /// Detect from the environment: `$TMUX` (psmux) first, then `WT_SESSION`.
+    /// Take over banto's own pane: collapse the TUI and run the session as a
+    /// child process in the same terminal, no terminal multiplexer involved.
+    /// The default — split/tab placement (below) is reserved for the `s`
+    /// key.
     #[default]
+    InPlace,
+    /// Detect a split/tab backend from the environment: `$TMUX` (psmux)
+    /// first, then `WT_SESSION`.
     Auto,
     Psmux,
     WindowsTerminal,
@@ -126,7 +132,7 @@ mod tests {
     #[test]
     fn defaults_have_documented_values() {
         let config = Config::default();
-        assert_eq!(config.opener, OpenerMode::Auto);
+        assert_eq!(config.opener, OpenerMode::InPlace);
         assert_eq!(config.activity.today_hours, 24);
         assert_eq!(config.activity.week_days, 7);
         assert_eq!(config.claude_home, None);
@@ -155,6 +161,7 @@ mod tests {
     #[test]
     fn all_opener_values_parse() {
         for (text, expected) in [
+            ("in-place", OpenerMode::InPlace),
             ("auto", OpenerMode::Auto),
             ("psmux", OpenerMode::Psmux),
             ("windows-terminal", OpenerMode::WindowsTerminal),
