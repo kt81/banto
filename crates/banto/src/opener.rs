@@ -100,7 +100,7 @@ pub fn open_new_session<R: CommandRunner + 'static>(
     let cmd = ResumeCommand {
         // Unused: there is no pane-map record for this launch to key.
         session_id: String::new(),
-        argv: new_session_wrap_argv(exe.as_deref(), cwd),
+        argv: new_session_wrap_argv(exe.as_deref(), cwd, backend),
         cwd: cwd.to_path_buf(),
         title,
     };
@@ -283,12 +283,16 @@ fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
     ]
 }
 
-/// Build the `<banto> _wrap --new-session --cwd <cwd> -- claude` argv (see
-/// [`wrap_argv`] for the resume-mode equivalent and the `exe` convention).
-/// Unlike the resume case, `_wrap` itself discovers the session id Claude
-/// assigns and writes its own pane record (`crate::wrap::run_new_session`) —
-/// there's no id known yet for this process to be told.
-fn new_session_wrap_argv(exe: Option<&str>, cwd: &Path) -> Vec<String> {
+/// Build the `<banto> _wrap --new-session --cwd <cwd> --backend <key> --
+/// claude` argv (see [`wrap_argv`] for the resume-mode equivalent and the
+/// `exe` convention). Unlike the resume case, `_wrap` itself discovers the
+/// session id Claude assigns and writes its own pane record
+/// (`crate::wrap::run_new_session`) — there's no id known yet for this
+/// process to be told. `backend` is passed through explicitly (this
+/// function's own already-resolved choice) rather than left for `_wrap` to
+/// re-detect from its environment — see `crate::wrap::resolve_own_pane`'s
+/// doc comment for why that would be unreliable.
+fn new_session_wrap_argv(exe: Option<&str>, cwd: &Path, backend: Backend) -> Vec<String> {
     let banto_exe = exe.unwrap_or("banto").to_string();
     vec![
         banto_exe,
@@ -296,6 +300,8 @@ fn new_session_wrap_argv(exe: Option<&str>, cwd: &Path) -> Vec<String> {
         "--new-session".to_string(),
         "--cwd".to_string(),
         cwd.display().to_string(),
+        "--backend".to_string(),
+        backend_key(backend).to_string(),
         "--".to_string(),
         "claude".to_string(),
     ]
@@ -313,7 +319,9 @@ pub(crate) fn backend_key(backend: Backend) -> &'static str {
     }
 }
 
-fn parse_backend_key(key: &str) -> Option<Backend> {
+/// Inverse of [`backend_key`]. `pub(crate)`: also used by `main`'s `_wrap
+/// --new-session --backend <key>` parsing.
+pub(crate) fn parse_backend_key(key: &str) -> Option<Backend> {
     match key {
         "psmux" => Some(Backend::Psmux),
         "windows-terminal" => Some(Backend::WindowsTerminal),
@@ -760,6 +768,12 @@ mod tests {
             .position(|a| a == "--cwd")
             .expect("--cwd missing");
         assert_eq!(calls[0].args[cwd_pos + 1], "/work/alpha");
+        let backend_pos = calls[0]
+            .args
+            .iter()
+            .position(|a| a == "--backend")
+            .expect("--backend missing");
+        assert_eq!(calls[0].args[backend_pos + 1], "psmux");
         assert!(calls[0].args.iter().any(|a| a == "claude"));
         // Tagged with the cwd's directory name, not a session id.
         assert_eq!(
@@ -842,13 +856,19 @@ mod tests {
     #[test]
     fn new_session_wrap_argv_uses_the_given_exe_path_when_available() {
         assert_eq!(
-            new_session_wrap_argv(Some("C:/dev/banto.exe"), Path::new("/work/alpha")),
+            new_session_wrap_argv(
+                Some("C:/dev/banto.exe"),
+                Path::new("/work/alpha"),
+                Backend::Psmux
+            ),
             [
                 "C:/dev/banto.exe",
                 "_wrap",
                 "--new-session",
                 "--cwd",
                 "/work/alpha",
+                "--backend",
+                "psmux",
                 "--",
                 "claude",
             ]
@@ -859,9 +879,19 @@ mod tests {
     #[test]
     fn new_session_wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
         assert_eq!(
-            new_session_wrap_argv(None, Path::new("/work/alpha"))[0],
+            new_session_wrap_argv(None, Path::new("/work/alpha"), Backend::Psmux)[0],
             "banto"
         );
+    }
+
+    #[test]
+    fn new_session_wrap_argv_passes_the_windows_terminal_backend_key() {
+        let argv = new_session_wrap_argv(None, Path::new("/work/alpha"), Backend::WindowsTerminal);
+        let pos = argv
+            .iter()
+            .position(|a| a == "--backend")
+            .expect("--backend missing");
+        assert_eq!(argv[pos + 1], "windows-terminal");
     }
 
     #[test]

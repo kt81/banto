@@ -63,6 +63,15 @@ enum Command {
         /// The new session's launch directory (new-session mode only).
         #[arg(long, requires = "new_session")]
         cwd: Option<PathBuf>,
+        /// Which backend this pane was opened with (new-session mode
+        /// only) — `psmux` or `windows-terminal`; the *opener*'s own
+        /// already-resolved choice, passed through explicitly rather than
+        /// re-detected from the environment (e.g. `$TMUX_PANE` could be
+        /// inherited even when banto is configured to open new sessions
+        /// via Windows Terminal, if banto itself happens to be running
+        /// inside an unrelated tmux session).
+        #[arg(long, requires = "new_session", required_if_eq("new_session", "true"))]
+        backend: Option<String>,
         /// The command to run, e.g. `claude --resume <id>` (resume mode)
         /// or plain `claude` (new-session mode).
         #[arg(last = true, required = true)]
@@ -84,21 +93,28 @@ fn main() -> Result<()> {
             session,
             new_session,
             cwd,
+            backend,
             argv,
         }) => {
             let store = open_store(&config)?;
             let code = if new_session {
                 let cwd = cwd.expect("clap requires --cwd with --new-session");
+                let backend_key = backend.expect("clap requires --backend with --new-session");
+                let backend = opener::parse_backend_key(&backend_key)
+                    .with_context(|| format!("unknown --backend value: {backend_key}"))?;
                 let claude_home = resolve_claude_home(cli.claude_home, &config)?;
                 let provider = ClaudeCodeProvider::new(claude_home);
                 wrap::run_new_session(
                     &store,
                     &cwd,
                     &argv,
-                    &SystemProcessRunner,
-                    &SystemCommandRunner,
-                    &provider,
+                    backend,
                     |key| std::env::var(key).ok(),
+                    wrap::NewSessionDeps {
+                        process_runner: &SystemProcessRunner,
+                        command_runner: &SystemCommandRunner,
+                        provider: &provider,
+                    },
                 )?
             } else {
                 let session = session.expect("clap requires --session unless --new-session");

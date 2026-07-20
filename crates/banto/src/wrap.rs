@@ -73,6 +73,38 @@ fn register_pid(store: &Store, id: &SessionId) {
 /// normal human reaction time, without busy-looping.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Give up searching for the new session's id after this many polls without
+/// success — [`POLL_INTERVAL`] * this ≈ 120s, long enough to cover `claude`
+/// sitting at its trust-folder prompt before it ever writes a session file.
+/// Once exhausted, [`track_new_session`] stops calling `find_new_session`
+/// (so a long-running session that was never discovered doesn't keep
+/// re-scanning the filesystem for its entire lifetime) but keeps polling
+/// for the child's exit exactly as before — the session simply stays
+/// untracked, same as if `resolve_own_pane` had found nothing at all; the
+/// `AlreadyRunningUntracked` guard in `open_session` remains the safety
+/// net either way.
+const DISCOVERY_TIMEOUT_POLLS: u32 = 600;
+
+/// Subtracted from the "now" captured just before spawning, before it's
+/// passed to `find_new_session` as `since`. Filesystem mtime resolution can
+/// be coarse enough that a session file created in the very same tick as
+/// the capture would otherwise be missed (see
+/// `ClaudeCodeProvider::find_new_session`'s own doc comment) — 2s is a
+/// generous margin for that without meaningfully risking a false match
+/// against some unrelated pre-existing session in the same cwd (which
+/// would need to have been touched within that same couple of seconds).
+const DISCOVERY_SINCE_SLOP: Duration = Duration::from_secs(2);
+
+/// External-process dependencies for [`run_new_session`], grouped into one
+/// parameter so the function itself doesn't trip clippy's argument-count
+/// lint — each field is still independently swappable in tests, exactly as
+/// if it were its own parameter.
+pub struct NewSessionDeps<'a> {
+    pub process_runner: &'a dyn ProcessRunner,
+    pub command_runner: &'a dyn CommandRunner,
+    pub provider: &'a ClaudeCodeProvider,
+}
+
 /// Launch a brand-new (non-resumed) session, tracking it so it can later be
 /// focused instead of double-resumed. Unlike [`run`], there is no known
 /// session id up front (`argv` is plain `claude`, no `--resume <id>`), so
@@ -85,40 +117,51 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// against either.
 ///
 /// Skips tracking entirely when [`resolve_own_pane`] finds no focusable
-/// pane (e.g. Windows Terminal, which exposes no handle to bring anything
-/// back to the front with): there is nothing useful to record, so the
-/// child just runs to completion directly, exactly like a plain launch.
+/// pane for `backend` (only [`Backend::Psmux`] has one; Windows Terminal
+/// exposes no handle to bring anything back to the front with): there is
+/// nothing useful to record, so the child just runs to completion
+/// directly, exactly like a plain launch. `backend` is the caller's own
+/// already-resolved choice (the same one it used to open the pane this
+/// process is running in), not re-detected here.
+///
+/// `deps` groups the external-process dependencies (so this stays under
+/// clippy's argument-count limit) — each is still independently swappable
+/// in tests, exactly as if it were its own parameter.
 pub fn run_new_session(
     store: &Store,
     cwd: &Path,
     argv: &[String],
-    process_runner: &dyn ProcessRunner,
-    command_runner: &dyn CommandRunner,
-    provider: &ClaudeCodeProvider,
+    backend: Backend,
     env: impl Fn(&str) -> Option<String>,
+    deps: NewSessionDeps<'_>,
 ) -> Result<i32> {
-    let Some((backend, target)) = resolve_own_pane(env, command_runner) else {
-        let code = process_runner
+    let Some((backend_key, target)) = resolve_own_pane(backend, env, deps.command_runner) else {
+        let code = deps
+            .process_runner
             .run(argv)
             .with_context(|| format!("failed to run new session: {argv:?}"))?;
         return Ok(code.unwrap_or(1));
     };
 
-    let since = SystemTime::now();
-    let mut spawned = process_runner
+    let since = SystemTime::now()
+        .checked_sub(DISCOVERY_SINCE_SLOP)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut spawned = deps
+        .process_runner
         .spawn(argv)
         .with_context(|| format!("failed to spawn new session: {argv:?}"))?;
 
     let mut recorded: Option<SessionId> = None;
     let code = track_new_session(
         spawned.as_mut(),
-        || provider.find_new_session(cwd, since),
+        || deps.provider.find_new_session(cwd, since),
         |id| {
-            let record = new_session_pane_record(id.clone(), backend.clone(), target.clone());
+            let record = new_session_pane_record(id.clone(), backend_key.clone(), target.clone());
             let _ = store.set_pane(&record);
             recorded = Some(id);
         },
         || std::thread::sleep(POLL_INTERVAL),
+        DISCOVERY_TIMEOUT_POLLS,
     )?;
 
     // Best-effort cleanup, same rationale as `run`: a store failure here
@@ -145,26 +188,40 @@ fn new_session_pane_record(id: SessionId, backend: String, target: String) -> Pa
 }
 
 /// Resolve this process's own pane as `(backend_key, target)` for a
-/// [`PaneRecord`], or `None` if it isn't running inside a backend whose
-/// pane can later be focused.
+/// [`PaneRecord`], or `None` if `backend` isn't one whose pane can later be
+/// focused (only [`Backend::Psmux`] is; Windows Terminal exposes no handle
+/// to bring anything back to the front with — see [`run_new_session`]).
 ///
-/// Reads `$TMUX_PANE` (set by psmux for every pane) itself, via the
-/// injected `env` lookup, rather than being told via a CLI flag: the resume
-/// flow's pane record is written by the *opener* before this process ever
-/// starts (it already has the handle from creating the pane), but for a
-/// freshly-launched new session there is no pre-existing record — this
-/// process is the only one that can discover where it landed. Absence of
-/// `$TMUX_PANE` means Windows Terminal (or a bare terminal): there is no
-/// handle to record in that case (see [`run_new_session`]).
+/// `backend` comes from the opener's own explicit `--backend` flag (it
+/// already decided which backend to use before spawning this process),
+/// rather than being *guessed* from `$TMUX_PANE`'s presence: banto itself
+/// may be running inside a tmux/psmux session for unrelated reasons while
+/// still configured to open new sessions via Windows Terminal, in which
+/// case `$TMUX_PANE` would be set in this process's environment too
+/// (inherited) even though the pane actually opened for `claude` is a WT
+/// window, not a tmux pane at all — trusting the flag avoids resolving (and
+/// wrongly recording against) the wrong pane entirely in that case.
+///
+/// For [`Backend::Psmux`], reads `$TMUX_PANE` (set by psmux for every pane)
+/// itself via the injected `env` lookup, rather than being told the pane id
+/// via a CLI flag too: the resume flow's pane record is written by the
+/// *opener* before this process ever starts (it already has the handle
+/// from creating the pane), but for a freshly-launched new session there is
+/// no pre-existing record — this process is the only one that can discover
+/// where it landed.
 ///
 /// Passes `-t <pane_id>` explicitly rather than relying on
 /// `display-message`'s default target, which resolves to the *client's*
 /// currently active pane, not necessarily this one — the same ambiguity
 /// `TmuxOpener::with_anchor_pane` documents for `split-window`.
 fn resolve_own_pane(
+    backend: Backend,
     env: impl Fn(&str) -> Option<String>,
     runner: &dyn CommandRunner,
 ) -> Option<(String, String)> {
+    if backend != Backend::Psmux {
+        return None;
+    }
     let pane_id = env("TMUX_PANE")?;
     let output = runner
         .run(&CommandSpec::new(
@@ -192,7 +249,7 @@ fn resolve_own_pane(
         pane_id,
     };
     Some((
-        crate::opener::backend_key(Backend::Psmux).to_string(),
+        crate::opener::backend_key(backend).to_string(),
         crate::opener::encode_target(&handle),
     ))
 }
@@ -201,24 +258,33 @@ fn resolve_own_pane(
 /// creates for the launch (via `find_new_session`, called every poll until
 /// it succeeds once) and recording it (via `record_pane`, called exactly
 /// once, the first time discovery succeeds) so the launched session can
-/// later be focused instead of double-resumed. `sleep` paces each
-/// iteration — a real caller sleeps for [`POLL_INTERVAL`]; tests inject a
-/// no-op so the loop runs at closure speed, driven purely by the mocks'
-/// return sequences.
+/// later be focused instead of double-resumed. Gives up calling
+/// `find_new_session` after `discovery_timeout_polls` polls without a
+/// match (see [`DISCOVERY_TIMEOUT_POLLS`]) — the session then simply stays
+/// untracked, but polling for the child's own exit continues regardless.
+/// `sleep` paces each iteration — a real caller sleeps for
+/// [`POLL_INTERVAL`]; tests inject a no-op so the loop runs at closure
+/// speed, driven purely by the mocks' return sequences.
 fn track_new_session(
     spawned: &mut dyn SpawnedProcess,
     mut find_new_session: impl FnMut() -> Option<SessionId>,
     mut record_pane: impl FnMut(SessionId),
     mut sleep: impl FnMut(),
+    discovery_timeout_polls: u32,
 ) -> Result<Option<i32>> {
     let mut found = false;
+    let mut polls_without_finding = 0u32;
     loop {
         if let Some(code) = spawned.try_wait()? {
             return Ok(code);
         }
-        if !found && let Some(id) = find_new_session() {
-            record_pane(id);
-            found = true;
+        if !found && polls_without_finding < discovery_timeout_polls {
+            if let Some(id) = find_new_session() {
+                record_pane(id);
+                found = true;
+            } else {
+                polls_without_finding += 1;
+            }
         }
         sleep();
     }
@@ -344,10 +410,28 @@ mod tests {
     // --- resolve_own_pane ---------------------------------------------
 
     #[test]
+    fn resolve_own_pane_is_none_for_windows_terminal_even_with_tmux_pane_set() {
+        // The explicit `backend` flag is authoritative, not a guess from
+        // `$TMUX_PANE`'s presence: banto could itself be running inside an
+        // unrelated tmux session (so `$TMUX_PANE` is set and would be
+        // inherited here) while still configured to open new sessions via
+        // Windows Terminal. Trusting the env var anyway would resolve (and
+        // wrongly record against) some unrelated tmux pane.
+        let runner = MockCommandRunner::default();
+        let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
+
+        assert_eq!(
+            resolve_own_pane(Backend::WindowsTerminal, env, &runner),
+            None
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
     fn resolve_own_pane_is_none_without_tmux_pane_env() {
         let runner = MockCommandRunner::default();
 
-        assert_eq!(resolve_own_pane(|_| None, &runner), None);
+        assert_eq!(resolve_own_pane(Backend::Psmux, |_| None, &runner), None);
         assert!(runner.calls().is_empty());
     }
 
@@ -356,7 +440,7 @@ mod tests {
         let runner = MockCommandRunner::with_responses([CommandOutput::success("@3\n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
-        let result = resolve_own_pane(env, &runner);
+        let result = resolve_own_pane(Backend::Psmux, env, &runner);
 
         assert_eq!(result, Some(("psmux".to_string(), "@3:%8".to_string())));
         assert_eq!(
@@ -376,7 +460,7 @@ mod tests {
         )]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
-        assert_eq!(resolve_own_pane(env, &runner), None);
+        assert_eq!(resolve_own_pane(Backend::Psmux, env, &runner), None);
     }
 
     #[test]
@@ -384,7 +468,7 @@ mod tests {
         let runner = MockCommandRunner::with_responses([CommandOutput::success("  \n")]);
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
-        assert_eq!(resolve_own_pane(env, &runner), None);
+        assert_eq!(resolve_own_pane(Backend::Psmux, env, &runner), None);
     }
 
     // --- new_session_pane_record ----------------------------------------
@@ -419,6 +503,7 @@ mod tests {
             },
             |id| recorded.borrow_mut().push(id),
             || {},
+            10,
         )
         .unwrap();
 
@@ -441,6 +526,7 @@ mod tests {
             },
             |id| recorded.borrow_mut().push(id),
             || {},
+            10,
         )
         .unwrap();
 
@@ -464,6 +550,7 @@ mod tests {
             || None,
             |id| recorded.borrow_mut().push(id),
             || {},
+            10,
         )
         .unwrap();
 
@@ -475,7 +562,7 @@ mod tests {
     fn track_new_session_propagates_a_signal_termination_as_none_exit_code() {
         let mut spawned = MockSpawnedProcess::new(0, None);
 
-        let code = track_new_session(&mut spawned, || None, |_| {}, || {}).unwrap();
+        let code = track_new_session(&mut spawned, || None, |_| {}, || {}, 10).unwrap();
 
         assert_eq!(code, None);
     }
@@ -490,6 +577,7 @@ mod tests {
             || None,
             |_| {},
             || sleep_calls.set(sleep_calls.get() + 1),
+            10,
         )
         .unwrap();
 
@@ -498,26 +586,59 @@ mod tests {
         assert_eq!(sleep_calls.get(), 3);
     }
 
+    #[test]
+    fn track_new_session_gives_up_finding_after_the_discovery_timeout_but_keeps_waiting_for_exit() {
+        // Runs for far longer than the discovery timeout before exiting.
+        let mut spawned = MockSpawnedProcess::new(10, Some(0));
+        let find_calls = Cell::new(0);
+        let recorded: RefCell<Vec<SessionId>> = RefCell::default();
+
+        let code = track_new_session(
+            &mut spawned,
+            || {
+                find_calls.set(find_calls.get() + 1);
+                None // never found
+            },
+            |id| recorded.borrow_mut().push(id),
+            || {},
+            3, // give up after 3 polls without a match
+        )
+        .unwrap();
+
+        // Still correctly waits for (and reports) the eventual exit...
+        assert_eq!(code, Some(0));
+        // ...but stopped searching once the timeout was reached, well
+        // before the process actually exited on the 11th poll.
+        assert_eq!(find_calls.get(), 3);
+        assert!(recorded.borrow().is_empty());
+    }
+
     // --- run_new_session --------------------------------------------------
 
     #[test]
-    fn run_new_session_skips_tracking_and_runs_directly_without_a_focusable_pane() {
-        // No `TMUX_PANE`: e.g. Windows Terminal, which exposes no handle to
-        // record anything useful against.
+    fn run_new_session_skips_tracking_for_windows_terminal_even_with_tmux_pane_set() {
+        // `$TMUX_PANE` is set (e.g. leaked from banto itself running inside
+        // an unrelated tmux session) but the backend is explicitly
+        // Windows Terminal, which exposes no handle to record anything
+        // useful against — the explicit flag must win over the env var.
         let claude_home = TempDir::new().unwrap();
         let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
         let store = Store::open_in_memory().unwrap();
         let process_runner = MockProcessRunner::new(Some(0));
         let command_runner = MockCommandRunner::default();
+        let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
         let code = run_new_session(
             &store,
             Path::new("/work/proj"),
             &["claude".to_string()],
-            &process_runner,
-            &command_runner,
-            &provider,
-            |_| None,
+            Backend::WindowsTerminal,
+            env,
+            NewSessionDeps {
+                process_runner: &process_runner,
+                command_runner: &command_runner,
+                provider: &provider,
+            },
         )
         .unwrap();
 
@@ -543,10 +664,13 @@ mod tests {
             &store,
             Path::new("/work/proj"),
             &["claude".to_string()],
-            &process_runner,
-            &command_runner,
-            &provider,
+            Backend::Psmux,
             env,
+            NewSessionDeps {
+                process_runner: &process_runner,
+                command_runner: &command_runner,
+                provider: &provider,
+            },
         )
         .unwrap();
 
@@ -598,10 +722,13 @@ mod tests {
             &store,
             Path::new("/work/proj"),
             &["claude".to_string()],
-            &process_runner,
-            &command_runner,
-            &provider,
+            Backend::Psmux,
             env,
+            NewSessionDeps {
+                process_runner: &process_runner,
+                command_runner: &command_runner,
+                provider: &provider,
+            },
         )
         .unwrap();
 
