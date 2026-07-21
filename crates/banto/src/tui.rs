@@ -327,12 +327,26 @@ fn run_pending_inplace(
     ));
     restore_terminal()?;
     // Resuming can take a few seconds before `claude` paints anything of its
-    // own; without this, that gap is a bare, silent shell. Drawn after
+    // own; without this, that gap is a bare, silent shell. Printed after
     // `restore_terminal` (so it lands in the real terminal, not the
-    // about-to-be-torn-down alternate screen) — nothing runs between this
-    // and the child taking over stdout to clear or overwrite it, so it
-    // stays visible for the whole gap.
-    draw_loading_screen(&pending.loading_lines);
+    // about-to-be-torn-down alternate screen) and flushed explicitly since
+    // stdout may not be line-buffered — nothing runs between this and the
+    // child taking over stdout to clear or overwrite it, so it stays
+    // visible for the whole gap.
+    //
+    // Deliberately a single non-destructive `println!` (no screen clear, no
+    // cursor repositioning): an earlier version cleared the whole screen and
+    // drew a centered block, but that wiped the terminal's existing
+    // scrollback and, if `claude` exited quickly without painting anything
+    // of its own, left the message stranded on an otherwise-blank screen
+    // even after banto itself had exited. A single appended line degrades
+    // far more gracefully — it just sits in the scrollback like any other
+    // command's output.
+    println!("{}", pending.startup_message);
+    {
+        use std::io::Write as _;
+        let _ = io::stdout().flush();
+    }
     let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd);
     *terminal = setup_terminal()?;
     ctx.log(&format!("run_pending_inplace child result={result:?}"));
@@ -344,57 +358,6 @@ fn run_pending_inplace(
     app.set_status(message);
     reload(app, ctx);
     Ok(())
-}
-
-/// Clear the screen and draw `lines` centered — the "loading screen" shown
-/// while `claude` is starting (see [`run_pending_inplace`]). A true
-/// persistent indicator isn't possible in-place (the pane is handed
-/// entirely to the child, free to paint over or scroll past it at any
-/// point), so a one-shot centered message drawn just before the hand-off is
-/// the best available; it stays until `claude` overwrites it.
-///
-/// Best-effort throughout (`crossterm::terminal::size()` failing — e.g.
-/// stdout isn't actually a terminal — falls back to a conservative 80x24;
-/// individual draw calls' errors are swallowed): this is a cosmetic step
-/// between tearing down the TUI and spawning the child, and must never be
-/// what blocks an otherwise-working resume.
-fn draw_loading_screen(lines: &[String]) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-    );
-    for (col, row, line) in centered_lines(lines, cols, rows) {
-        let _ = execute!(stdout, crossterm::cursor::MoveTo(col, row));
-        print!("{line}");
-    }
-    use std::io::Write as _;
-    let _ = stdout.flush();
-}
-
-/// Truncate each of `lines` to fit within `cols` (see [`truncate_to_width`])
-/// and compute where to draw it so the whole block is centered in a
-/// `cols`x`rows` terminal: each line horizontally centered on its own
-/// (possibly-truncated) width, the block as a whole vertically centered.
-/// Pure and terminal-free (`cols`/`rows` are supplied by the caller, real
-/// terminal size in production) so it's unit-testable without one — see
-/// [`draw_loading_screen`], its only caller. Degrades gracefully rather
-/// than panicking/underflowing when the terminal is smaller than the
-/// block: `saturating_sub` clamps both axes to 0 (top-left) instead of
-/// going negative.
-fn centered_lines(lines: &[String], cols: u16, rows: u16) -> Vec<(u16, u16, String)> {
-    let start_row = rows.saturating_sub(lines.len() as u16) / 2;
-    lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let truncated = truncate_to_width(line, cols);
-            let width = truncated.width() as u16;
-            let col = cols.saturating_sub(width) / 2;
-            (col, start_row + i as u16, truncated)
-        })
-        .collect()
 }
 
 /// Install a panic hook that best-effort restores the terminal before the
@@ -708,7 +671,7 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
             ));
             *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
                 argv: opener::inplace_argv(None),
-                loading_lines: opener::new_session_loading_lines(&cwd),
+                startup_message: opener::new_session_startup_message(&cwd),
                 cwd,
             });
         }
@@ -3269,8 +3232,8 @@ mod tests {
         assert_eq!(launch.argv, ["claude"].map(str::to_string));
         assert_eq!(launch.cwd, PathBuf::from("."));
         assert_eq!(
-            launch.loading_lines,
-            opener::new_session_loading_lines(&PathBuf::from("."))
+            launch.startup_message,
+            opener::new_session_startup_message(&PathBuf::from("."))
         );
         assert!(app.modal().is_none(), "modal should have closed");
     }
@@ -3346,7 +3309,10 @@ mod tests {
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
         assert_eq!(launch.cwd, PathBuf::from("/work/alpha"));
-        assert_eq!(launch.loading_lines, opener::resume_loading_lines("Alpha"));
+        assert_eq!(
+            launch.startup_message,
+            opener::resume_startup_message("Alpha")
+        );
         // No refusal status posted for the ordinary "proceed" case.
         assert!(app.status().is_none());
     }
@@ -3476,70 +3442,6 @@ mod tests {
         // max_width - 1 (reserved for the ellipsis) = 4, which fits exactly
         // 2 of them (4 columns) with none left over for a 3rd.
         assert_eq!(truncate_to_width(&"あ".repeat(5), 5), "ああ\u{2026}");
-    }
-
-    #[test]
-    fn centered_lines_centers_a_single_short_line() {
-        let lines = ["hi".to_string()];
-
-        let placed = centered_lines(&lines, 80, 24);
-
-        // (80 - 2) / 2 = 39; a single line is vertically centered the same
-        // way: (24 - 1) / 2 = 11.
-        assert_eq!(placed, vec![(39, 11, "hi".to_string())]);
-    }
-
-    #[test]
-    fn centered_lines_stacks_multiple_lines_as_a_vertically_centered_block() {
-        let lines = ["a".to_string(), "bb".to_string(), "ccc".to_string()];
-
-        let placed = centered_lines(&lines, 10, 5);
-
-        // Block height 3 in 5 rows: start row (5 - 3) / 2 = 1, then stacked.
-        // Each line is independently horizontally centered on its own width.
-        assert_eq!(
-            placed,
-            vec![
-                (4, 1, "a".to_string()),
-                (4, 2, "bb".to_string()),
-                (3, 3, "ccc".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn centered_lines_accounts_for_full_width_characters_when_centering() {
-        // "ああ" is 4 display columns (2 per character), not 2.
-        let lines = ["ああ".to_string()];
-
-        let placed = centered_lines(&lines, 20, 1);
-
-        assert_eq!(placed, vec![(8, 0, "ああ".to_string())]);
-    }
-
-    #[test]
-    fn centered_lines_truncates_a_line_wider_than_the_terminal() {
-        let lines = ["a very long line that will not fit".to_string()];
-
-        let placed = centered_lines(&lines, 10, 1);
-
-        let (col, row, text) = &placed[0];
-        assert_eq!(*col, 0);
-        assert_eq!(*row, 0);
-        assert_eq!(text.width(), 10);
-        assert!(text.ends_with('\u{2026}'));
-    }
-
-    #[test]
-    fn centered_lines_degrades_gracefully_when_the_terminal_is_smaller_than_the_block() {
-        let lines = ["one".to_string(), "two".to_string(), "three".to_string()];
-
-        // Only 1 row for a 3-line block: must not underflow/panic.
-        let placed = centered_lines(&lines, 20, 1);
-
-        assert_eq!(placed[0].1, 0);
-        assert_eq!(placed[1].1, 1);
-        assert_eq!(placed[2].1, 2);
     }
 
     #[test]
