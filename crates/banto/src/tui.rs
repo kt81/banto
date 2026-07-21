@@ -292,28 +292,60 @@ fn load_pinned(store: &Store) -> HashSet<String> {
         .collect()
 }
 
-/// Leave the alternate screen, disable mouse capture and raw mode.
+/// Leave the alternate screen, disable mouse capture and raw mode. Used on
+/// final quit ([`run`]) — the main screen/scrollback underneath is what the
+/// user sees again, so this is the one place that's allowed to touch it.
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 
-/// Run an in-place launch to completion, handing banto's own pane to it:
-/// leave the TUI's alternate screen/raw mode/mouse capture (so the child
-/// gets a normal terminal), block on it with inherited stdio, then
-/// re-initialize the TUI and reload rows (the just-used session's
+/// Disable raw mode and mouse capture but deliberately stay on the
+/// alternate screen — the in-place hand-off's partial teardown (see
+/// [`run_pending_inplace`]), as opposed to [`restore_terminal`]'s full one.
+/// The child gets a normal (cooked, non-mouse-capturing) terminal either
+/// way; the difference is *which* screen it inherits. Staying on the alt
+/// screen means anything drawn here (the loading splash) and anything the
+/// child itself draws both stay off the user's real main screen/scrollback,
+/// which is never touched until banto's own final [`restore_terminal`] —
+/// this is what makes the whole hand-off non-destructive.
+fn pause_for_child() -> Result<()> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), DisableMouseCapture)?;
+    Ok(())
+}
+
+/// Run an in-place launch to completion, handing banto's pane to it without
+/// ever touching the user's real main screen/scrollback: disable raw
+/// mode/mouse capture but stay on the alternate screen ([`pause_for_child`]),
+/// clear *that* screen and draw a centered loading splash on it
+/// ([`draw_splash`]), block on the child with inherited stdio (`claude`
+/// paints its own UI over the same alt screen, and may leave it on exit —
+/// either way is fine), then unconditionally re-establish banto's TUI
+/// ([`setup_terminal`], which enters the alt screen regardless of whether
+/// the child already left it) and reload rows (the just-used session's
 /// mtime/activity changed). This is the thin, untested-by-design shell
 /// around [`opener::decide_inplace_resume`]'s pure decision (see
 /// [`activate`]) — the standard "shell out to a full-screen program and
 /// come back" pattern; crossterm handles the re-init.
 ///
+/// An earlier version used a full [`restore_terminal`] here (leaving the alt
+/// screen entirely) with a plain `println!` for the loading message — safe,
+/// but visually unceremonious. A version before *that* cleared and centered
+/// on the MAIN screen, which was destructive: it wiped the user's own
+/// scrollback, and if `claude` exited before painting anything, the message
+/// was left stranded even after banto itself had quit. Doing the same
+/// clear+center on the alt screen instead keeps the effect (a clean,
+/// legible loading splash) without either downside — the main screen is
+/// simply never touched by any of this.
+///
 /// `*terminal` is replaced with a freshly re-initialized one rather than
 /// reused, mirroring [`run`]'s own one-time `setup_terminal` — there is no
-/// cheaper way to resume drawing after ceding the alternate screen/raw mode
-/// to the child. If re-initializing fails, that error propagates (matching
+/// cheaper way to resume drawing after ceding raw mode/mouse capture to the
+/// child. If re-initializing fails, that error propagates (matching
 /// [`run`]'s "always restore, but a failure is still an error" discipline)
-/// rather than leaving the app silently stuck outside the alternate screen.
+/// rather than leaving the app silently stuck outside raw mode.
 fn run_pending_inplace(
     terminal: &mut Tui,
     app: &mut App,
@@ -325,28 +357,8 @@ fn run_pending_inplace(
         pending.argv,
         pending.cwd.display()
     ));
-    restore_terminal()?;
-    // Resuming can take a few seconds before `claude` paints anything of its
-    // own; without this, that gap is a bare, silent shell. Printed after
-    // `restore_terminal` (so it lands in the real terminal, not the
-    // about-to-be-torn-down alternate screen) and flushed explicitly since
-    // stdout may not be line-buffered — nothing runs between this and the
-    // child taking over stdout to clear or overwrite it, so it stays
-    // visible for the whole gap.
-    //
-    // Deliberately a single non-destructive `println!` (no screen clear, no
-    // cursor repositioning): an earlier version cleared the whole screen and
-    // drew a centered block, but that wiped the terminal's existing
-    // scrollback and, if `claude` exited quickly without painting anything
-    // of its own, left the message stranded on an otherwise-blank screen
-    // even after banto itself had exited. A single appended line degrades
-    // far more gracefully — it just sits in the scrollback like any other
-    // command's output.
-    println!("{}", pending.startup_message);
-    {
-        use std::io::Write as _;
-        let _ = io::stdout().flush();
-    }
+    pause_for_child()?;
+    draw_splash(&pending.startup_message);
     let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd);
     *terminal = setup_terminal()?;
     ctx.log(&format!("run_pending_inplace child result={result:?}"));
@@ -358,6 +370,59 @@ fn run_pending_inplace(
     app.set_status(message);
     reload(app, ctx);
     Ok(())
+}
+
+/// Clear the (still-active) alternate screen and draw `message` centered on
+/// it — the loading splash shown while `claude` is starting (see
+/// [`run_pending_inplace`]). Safe to clear here — unlike the main
+/// screen/scrollback, the alt screen is transient scratch space the user
+/// never otherwise sees, so nothing of theirs is lost. `claude` paints over
+/// it once it starts; if the child exits first, [`run_pending_inplace`]'s
+/// following [`setup_terminal`] repaints over it too.
+///
+/// Best-effort throughout (`crossterm::terminal::size()` failing — e.g.
+/// stdout isn't actually a terminal — falls back to a conservative 80x24;
+/// individual draw calls' errors are swallowed): this is a cosmetic step
+/// between the partial teardown and spawning the child, and must never be
+/// what blocks an otherwise-working resume.
+fn draw_splash(message: &str) {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    );
+    let lines = [message.to_string()];
+    for (col, row, line) in centered_lines(&lines, cols, rows) {
+        let _ = execute!(stdout, crossterm::cursor::MoveTo(col, row));
+        print!("{line}");
+    }
+    use std::io::Write as _;
+    let _ = stdout.flush();
+}
+
+/// Truncate each of `lines` to fit within `cols` (see [`truncate_to_width`])
+/// and compute where to draw it so the whole block is centered in a
+/// `cols`x`rows` terminal: each line horizontally centered on its own
+/// (possibly-truncated) width, the block as a whole vertically centered.
+/// Pure and terminal-free (`cols`/`rows` are supplied by the caller, real
+/// terminal size in production) so it's unit-testable without one — see
+/// [`draw_splash`], its only caller. Degrades gracefully rather than
+/// panicking/underflowing when the terminal is smaller than the block:
+/// `saturating_sub` clamps both axes to 0 (top-left) instead of going
+/// negative.
+fn centered_lines(lines: &[String], cols: u16, rows: u16) -> Vec<(u16, u16, String)> {
+    let start_row = rows.saturating_sub(lines.len() as u16) / 2;
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let truncated = truncate_to_width(line, cols);
+            let width = truncated.width() as u16;
+            let col = cols.saturating_sub(width) / 2;
+            (col, start_row + i as u16, truncated)
+        })
+        .collect()
 }
 
 /// Install a panic hook that best-effort restores the terminal before the
@@ -3442,6 +3507,70 @@ mod tests {
         // max_width - 1 (reserved for the ellipsis) = 4, which fits exactly
         // 2 of them (4 columns) with none left over for a 3rd.
         assert_eq!(truncate_to_width(&"あ".repeat(5), 5), "ああ\u{2026}");
+    }
+
+    #[test]
+    fn centered_lines_centers_a_single_short_line() {
+        let lines = ["hi".to_string()];
+
+        let placed = centered_lines(&lines, 80, 24);
+
+        // (80 - 2) / 2 = 39; a single line is vertically centered the same
+        // way: (24 - 1) / 2 = 11.
+        assert_eq!(placed, vec![(39, 11, "hi".to_string())]);
+    }
+
+    #[test]
+    fn centered_lines_stacks_multiple_lines_as_a_vertically_centered_block() {
+        let lines = ["a".to_string(), "bb".to_string(), "ccc".to_string()];
+
+        let placed = centered_lines(&lines, 10, 5);
+
+        // Block height 3 in 5 rows: start row (5 - 3) / 2 = 1, then stacked.
+        // Each line is independently horizontally centered on its own width.
+        assert_eq!(
+            placed,
+            vec![
+                (4, 1, "a".to_string()),
+                (4, 2, "bb".to_string()),
+                (3, 3, "ccc".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn centered_lines_accounts_for_full_width_characters_when_centering() {
+        // "ああ" is 4 display columns (2 per character), not 2.
+        let lines = ["ああ".to_string()];
+
+        let placed = centered_lines(&lines, 20, 1);
+
+        assert_eq!(placed, vec![(8, 0, "ああ".to_string())]);
+    }
+
+    #[test]
+    fn centered_lines_truncates_a_line_wider_than_the_terminal() {
+        let lines = ["a very long line that will not fit".to_string()];
+
+        let placed = centered_lines(&lines, 10, 1);
+
+        let (col, row, text) = &placed[0];
+        assert_eq!(*col, 0);
+        assert_eq!(*row, 0);
+        assert_eq!(text.width(), 10);
+        assert!(text.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn centered_lines_degrades_gracefully_when_the_terminal_is_smaller_than_the_block() {
+        let lines = ["one".to_string(), "two".to_string(), "three".to_string()];
+
+        // Only 1 row for a 3-line block: must not underflow/panic.
+        let placed = centered_lines(&lines, 20, 1);
+
+        assert_eq!(placed[0].1, 0);
+        assert_eq!(placed[1].1, 1);
+        assert_eq!(placed[2].1, 2);
     }
 
     #[test]
