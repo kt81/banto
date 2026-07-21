@@ -195,30 +195,44 @@ pub(crate) fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn Proces
 }
 
 /// A terminal hand-off ready to run in-place: the argv to execute with
-/// inherited stdio, the directory to run it in, and a one-line status to
-/// print to stdout right before spawning it (see [`resume_startup_message`]/
-/// [`new_session_startup_message`]) — resuming can take several seconds, and
-/// without this the user just sees a bare, silent shell in that gap.
+/// inherited stdio, the directory to run it in, and a "loading screen" —
+/// lines of plain-ASCII text `crate::tui::run_pending_inplace` clears the
+/// screen and draws centered right before spawning it (see
+/// [`resume_loading_lines`]/[`new_session_loading_lines`]) — resuming can
+/// take several seconds, and without this the user just sees a bare,
+/// silent shell in that gap. A true persistent indicator isn't possible
+/// in-place (the pane is handed entirely to the child, which is free to
+/// paint over/scroll past it at any point), so a one-shot centered message
+/// drawn just before the hand-off is the best available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InPlaceLaunch {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
-    pub startup_message: String,
+    pub loading_lines: Vec<String>,
 }
 
-/// The startup message for resuming `title` in place (see [`InPlaceLaunch`]).
-/// `title` is expected to already be the display title-or-id-fallback (see
-/// `SessionToOpen::title`, built from `SessionRow::display_title`) — plain
-/// ASCII wording so it's safe at any terminal width; `title` itself is
-/// user/session data and is printed as-is.
-pub(crate) fn resume_startup_message(title: &str) -> String {
-    format!("banto: resuming \"{title}\" ... (returns to the list when the session closes)")
+/// The loading-screen lines for resuming `title` in place (see
+/// [`InPlaceLaunch`]). `title` is expected to already be the display
+/// title-or-id-fallback (see `SessionToOpen::title`, built from
+/// `SessionRow::display_title`) — the surrounding wording is plain ASCII
+/// (safe to center/measure at any terminal width without full-width/emoji
+/// surprises); `title` itself is user/session data and is printed as-is.
+pub(crate) fn resume_loading_lines(title: &str) -> Vec<String> {
+    vec![
+        format!("banto: resuming \"{title}\""),
+        "launching Claude, this can take a few seconds...".to_string(),
+        "(returns to the list when the session closes)".to_string(),
+    ]
 }
 
-/// The startup message for launching a new session in place at `cwd` (see
-/// [`InPlaceLaunch`]).
-pub(crate) fn new_session_startup_message(cwd: &Path) -> String {
-    format!("banto: starting a new session in {} ...", cwd.display())
+/// The loading-screen lines for launching a new session in place at `cwd`
+/// (see [`InPlaceLaunch`]).
+pub(crate) fn new_session_loading_lines(cwd: &Path) -> Vec<String> {
+    vec![
+        format!("banto: starting a new session in {}", cwd.display()),
+        "launching Claude, this can take a few seconds...".to_string(),
+        "(returns to the list when the session closes)".to_string(),
+    ]
 }
 
 /// Build the in-place launch argv. Unlike [`wrap_argv`]/[`new_session_wrap_argv`]
@@ -253,7 +267,7 @@ pub(crate) fn decide_inplace_resume(
         Some(InPlaceLaunch {
             argv: inplace_argv(Some(&session.id)),
             cwd: session.cwd.clone(),
-            startup_message: resume_startup_message(&session.title),
+            loading_lines: resume_loading_lines(&session.title),
         })
     }
 }
@@ -686,21 +700,33 @@ mod tests {
     }
 
     #[test]
-    fn resume_startup_message_is_plain_ascii_and_names_the_title() {
-        let message = resume_startup_message("Fix login bug");
+    fn resume_loading_lines_are_plain_ascii_and_name_the_title() {
+        let lines = resume_loading_lines("Fix login bug");
         assert_eq!(
-            message,
-            "banto: resuming \"Fix login bug\" ... \
-             (returns to the list when the session closes)"
+            lines,
+            [
+                "banto: resuming \"Fix login bug\"",
+                "launching Claude, this can take a few seconds...",
+                "(returns to the list when the session closes)",
+            ]
+            .map(str::to_string)
         );
-        assert!(message.is_ascii());
+        assert!(lines.iter().all(|line| line.is_ascii()));
     }
 
     #[test]
-    fn new_session_startup_message_is_plain_ascii_and_names_the_cwd() {
-        let message = new_session_startup_message(Path::new("/work/alpha"));
-        assert_eq!(message, "banto: starting a new session in /work/alpha ...");
-        assert!(message.is_ascii());
+    fn new_session_loading_lines_are_plain_ascii_and_name_the_cwd() {
+        let lines = new_session_loading_lines(Path::new("/work/alpha"));
+        assert_eq!(
+            lines,
+            [
+                "banto: starting a new session in /work/alpha",
+                "launching Claude, this can take a few seconds...",
+                "(returns to the list when the session closes)",
+            ]
+            .map(str::to_string)
+        );
+        assert!(lines.iter().all(|line| line.is_ascii()));
     }
 
     #[test]
@@ -714,7 +740,7 @@ mod tests {
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
         assert_eq!(launch.cwd, PathBuf::from("/work/alpha"));
-        assert_eq!(launch.startup_message, resume_startup_message("Fix login"));
+        assert_eq!(launch.loading_lines, resume_loading_lines("Fix login"));
     }
 
     #[test]
