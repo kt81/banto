@@ -10,11 +10,12 @@
 use std::cell::RefCell;
 use std::io::{self, Stdout};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -31,7 +32,7 @@ use banto_core::model::SessionId;
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
 use banto_core::store::Store;
 
-use crate::app::{App, GroupJoinTarget, Modal, Mode};
+use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
 use crate::opener::{self, SessionToOpen};
 use crate::session;
 use crate::tui::LiveWatch;
@@ -137,12 +138,18 @@ fn event_loop(
         let pane = ui.current.map(|i| &ui.sessions[i].1);
         terminal.draw(|frame| draw(frame, app, pane, ui.focus, ui.status.as_deref(), areas))?;
 
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && !handle_key(&mut ui, app, store, claude_home, thresholds, key)
-        {
-            break;
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if !handle_key(&mut ui, app, store, claude_home, thresholds, key) {
+                        break;
+                    }
+                }
+                Event::Mouse(mouse) => handle_mouse(&mut ui, app, mouse, areas, claude_home),
+                _ => {}
+            }
         }
 
         // Live updates: reload the list once the watched dirs settle.
@@ -216,6 +223,88 @@ fn handle_key(
         }
     }
     true
+}
+
+/// Handle a mouse event: scroll / click the sidebar, or focus + forward to the
+/// pane. A no-op while a modal is open (matching the classic mouse guard).
+fn handle_mouse(
+    ui: &mut Emporium,
+    app: &mut App,
+    mouse: MouseEvent,
+    areas: Areas,
+    claude_home: &Path,
+) {
+    if app.modal().is_some() {
+        return;
+    }
+    let pos = Position::new(mouse.column, mouse.row);
+
+    // Over the pane: focus it on a left click, and forward the mouse to the
+    // child once focused.
+    if areas.pane.contains(pos) {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            ui.focus = Focus::Pane;
+        }
+        if ui.focus == Focus::Pane
+            && let Some(i) = ui.current
+            && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(areas.pane))
+        {
+            ui.sessions[i].1.send_bytes(&bytes);
+        }
+        return;
+    }
+
+    // Over the sidebar: scroll, or click to select / open.
+    let sb = areas.sidebar;
+    let sidebar_inner = Rect {
+        x: sb.x + 1,
+        y: sb.y + 1,
+        width: sb.width.saturating_sub(2),
+        height: sb.height.saturating_sub(2),
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp if sb.contains(pos) => app.scroll(-1),
+        MouseEventKind::ScrollDown if sb.contains(pos) => app.scroll(1),
+        MouseEventKind::Down(MouseButton::Left) if sidebar_inner.contains(pos) => {
+            ui.focus = Focus::Sidebar;
+            let viewport_row = (pos.y - sidebar_inner.y) as usize;
+            if app.click(viewport_row, Instant::now()) == Some(ClickOutcome::Activated) {
+                open_or_switch(ui, app, claude_home);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Encode a mouse event as an SGR mouse report for a child whose grid starts at
+/// `content` (screen coords mapped into the grid, 1-based).
+fn mouse_to_sgr(mouse: &MouseEvent, content: Rect) -> Option<Vec<u8>> {
+    if mouse.column < content.x || mouse.row < content.y {
+        return None;
+    }
+    let cx = mouse.column - content.x;
+    let cy = mouse.row - content.y;
+    if cx >= content.width || cy >= content.height {
+        return None;
+    }
+    let (cb, release) = match mouse.kind {
+        MouseEventKind::Down(b) => (mouse_btn(b), false),
+        MouseEventKind::Up(b) => (mouse_btn(b), true),
+        MouseEventKind::Drag(b) => (mouse_btn(b) + 32, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        _ => return None,
+    };
+    let final_char = if release { 'm' } else { 'M' };
+    Some(format!("\x1b[<{};{};{}{}", cb, cx + 1, cy + 1, final_char).into_bytes())
+}
+
+fn mouse_btn(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
 }
 
 /// Enter on the sidebar: switch to the selected session if it's already open

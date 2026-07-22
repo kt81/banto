@@ -56,6 +56,12 @@ impl EmbeddedSession {
         }
     }
 
+    /// Forward raw bytes (e.g. an encoded mouse report) to the child's stdin.
+    pub fn send_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.io.input.write_all(bytes);
+        let _ = self.io.input.flush();
+    }
+
     /// Resize the child's PTY and the terminal model (no-op if unchanged).
     pub fn resize(&mut self, rows: u16, cols: u16) {
         if self.size != (rows, cols) {
