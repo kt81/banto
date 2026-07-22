@@ -154,18 +154,16 @@ fn main() -> Result<()> {
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let thresholds = thresholds_from(&config.activity);
+            // `Store::set_session_group` (the `g` modal) takes `&mut self`
+            // (it wraps a transaction), and the store is shared by both the
+            // classic TUI and emporium, so a `RefCell` gives interior
+            // mutability without threading `&mut Store` through every handler.
+            let store = std::cell::RefCell::new(open_store(&config)?);
             if cli.emporium {
                 // The 大店 (emporium) mode: a separate top-level TUI chosen at
-                // launch (`--emporium` / `--oodana`); the classic list below is
-                // left entirely untouched.
-                embedded::run_emporium(&claude_home, &thresholds)
+                // launch (`--emporium` / `--oodana`).
+                embedded::run_emporium(&claude_home, &thresholds, &store)
             } else {
-                // The `g` group-join modal needs `Store::set_session_group`,
-                // which takes `&mut self` (it wraps a transaction); the TUI's
-                // `Context` is passed around as a plain `&Context`, so a
-                // `RefCell` gives interior mutability without threading `&mut
-                // Context` through every key handler.
-                let store = std::cell::RefCell::new(open_store(&config)?);
                 tui::run(&claude_home, &thresholds, config.opener, &store)
             }
         }

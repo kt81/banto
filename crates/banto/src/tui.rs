@@ -232,7 +232,10 @@ pub fn run(
 /// Drop archived sessions from `rows` (soft-hide via `d` — see
 /// `App::open_confirm_archive_modal`/`confirm_modal`). A read failure is
 /// tolerated: nothing gets excluded rather than blocking the TUI.
-fn exclude_archived(rows: Vec<session::SessionRow>, store: &Store) -> Vec<session::SessionRow> {
+pub(crate) fn exclude_archived(
+    rows: Vec<session::SessionRow>,
+    store: &Store,
+) -> Vec<session::SessionRow> {
     let archived: HashSet<String> = store
         .archived_ids()
         .unwrap_or_default()
@@ -246,7 +249,7 @@ fn exclude_archived(rows: Vec<session::SessionRow>, store: &Store) -> Vec<sessio
 
 /// Load every known group, alphabetical by name. Tolerant: a read failure
 /// just means no groups are known yet, rather than blocking the TUI.
-fn load_groups(store: &Store) -> Vec<(i64, String)> {
+pub(crate) fn load_groups(store: &Store) -> Vec<(i64, String)> {
     let mut groups: Vec<(i64, String)> = store
         .list_groups()
         .unwrap_or_default()
@@ -260,7 +263,7 @@ fn load_groups(store: &Store) -> Vec<(i64, String)> {
 /// Load the session -> group id map by walking each group's members (fewer
 /// queries than asking per-session). Tolerant: a read failure for one group
 /// just means its members show as ungrouped, rather than blocking the TUI.
-fn load_session_groups(store: &Store, groups: &[(i64, String)]) -> HashMap<String, i64> {
+pub(crate) fn load_session_groups(store: &Store, groups: &[(i64, String)]) -> HashMap<String, i64> {
     let mut map = HashMap::new();
     for &(group_id, _) in groups {
         for session_id in store.group_members(group_id).unwrap_or_default() {
@@ -284,7 +287,7 @@ fn setup_terminal() -> Result<Tui> {
 /// Load the currently pinned session ids from the store. Tolerant: a read
 /// failure just means no sessions start out pinned, rather than blocking the
 /// TUI from starting.
-fn load_pinned(store: &Store) -> HashSet<String> {
+pub(crate) fn load_pinned(store: &Store) -> HashSet<String> {
     store
         .pinned_ids()
         .unwrap_or_default()

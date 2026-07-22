@@ -6,6 +6,7 @@
 //! This is a separate top-level mode chosen at launch. The classic list TUI
 //! (`crate::tui`) is left untouched; only `main` decides which mode to run.
 
+use std::cell::RefCell;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::Duration;
@@ -26,6 +27,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
+use banto_core::store::Store;
 
 use crate::app::App;
 use crate::opener::{self, SessionToOpen};
@@ -49,9 +51,21 @@ enum Focus {
 }
 
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
-pub fn run(claude_home: &Path, thresholds: &AgeThresholds) -> Result<()> {
+pub fn run(claude_home: &Path, thresholds: &AgeThresholds, store: &RefCell<Store>) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
-    let mut app = App::new(rows);
+    // Same store-backed state the classic list builds, so grouping / pins /
+    // archived-hiding show identically in the sidebar.
+    let (rows, pinned, groups, session_groups) = {
+        let store = store.borrow();
+        let rows = crate::tui::exclude_archived(rows, &store);
+        let pinned = crate::tui::load_pinned(&store);
+        let groups = crate::tui::load_groups(&store);
+        let session_groups = crate::tui::load_session_groups(&store, &groups);
+        (rows, pinned, groups, session_groups)
+    };
+    let mut app = App::new(rows)
+        .with_pinned(pinned)
+        .with_groups(groups, session_groups);
 
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut app, claude_home);
@@ -128,6 +142,12 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
                             &mut focus,
                             &mut status,
                         ),
+                        KeyCode::Tab => {
+                            app.toggle_grouped_view();
+                        }
+                        KeyCode::Char('a') => {
+                            app.toggle_agent_filter();
+                        }
                         _ => {}
                     }
                 }
