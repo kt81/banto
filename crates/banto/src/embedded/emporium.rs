@@ -31,11 +31,11 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::model::SessionId;
 use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
-use banto_core::store::Store;
+use banto_core::store::{BrigadeId, BrigadeRole, Store};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
 use crate::opener::{self, SessionToOpen};
-use crate::session;
+use crate::session::{self, SessionRow};
 use crate::tui::LiveWatch;
 use crate::view;
 
@@ -63,18 +63,86 @@ enum Focus {
 }
 
 /// The emporium's own mutable UI state, kept apart from `App` (which holds the
-/// shared list state): the kept-alive session panes, which one is shown, the
-/// focus, and a transient status line.
+/// shared list state): the kept-alive session panes, what the pane region
+/// currently shows (the [`Stage`]), the focus, and a transient status line.
 struct Emporium {
     /// Kept-alive embedded sessions, keyed by session id (or a `new::<cwd>`
     /// synthetic key for freshly-launched ones that have no id yet).
+    ///
+    /// Append-only for the lifetime of a run: sessions are never removed
+    /// (removing one from a brigade only drops it from the [`Stage`], the
+    /// session stays alive here). So every index held by a `Stage` stays valid.
     sessions: Vec<(String, EmbeddedSession)>,
-    /// Index into `sessions` of the one shown in the pane.
-    current: Option<usize>,
+    /// What the pane region currently shows.
+    stage: Stage,
     focus: Focus,
     status: Option<String>,
     /// Freshly-launched sessions awaiting id discovery (see [`discover_new_ids`]).
     pending_new: Vec<PendingNew>,
+}
+
+/// What the right-hand pane region is showing: nothing, a single session, or a
+/// brigade tiled across several panes.
+enum Stage {
+    /// Nothing staged (the "select a session" placeholder).
+    Empty,
+    /// A single session filling the pane.
+    Solo(usize),
+    /// A brigade: its members tiled with the Director first, one tile focused.
+    Brigade {
+        /// The persisted brigade this stage reflects.
+        id: BrigadeId,
+        /// Indices into [`Emporium::sessions`], Director first.
+        panes: Vec<usize>,
+        /// Which of `panes` currently receives input (an index into `panes`).
+        focused: usize,
+    },
+}
+
+impl Stage {
+    /// The session index that currently receives pane input, if any.
+    fn focused_index(&self) -> Option<usize> {
+        match self {
+            Stage::Empty => None,
+            Stage::Solo(i) => Some(*i),
+            Stage::Brigade { panes, focused, .. } => panes.get(*focused).copied(),
+        }
+    }
+
+    /// Whether anything is staged (i.e. the pane region shows a session).
+    fn is_active(&self) -> bool {
+        !matches!(self, Stage::Empty)
+    }
+}
+
+/// The outer (bordered) tile rects for the currently-staged sessions, each
+/// paired with its index into [`Emporium::sessions`]. A solo session fills the
+/// whole pane; a brigade puts the Director on the left and stacks the Workers
+/// down the right (a "master + stack" layout).
+fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(usize, Rect)> {
+    match stage {
+        Stage::Empty => Vec::new(),
+        Stage::Solo(i) => vec![(*i, pane_area)],
+        Stage::Brigade { panes, .. } => match panes.split_first() {
+            None => Vec::new(),
+            Some((&director, [])) => vec![(director, pane_area)],
+            Some((&director, workers)) => {
+                let [master, stack] =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .areas(pane_area);
+                let rows = Layout::vertical(vec![
+                    Constraint::Ratio(1, workers.len() as u32);
+                    workers.len()
+                ])
+                .split(stack);
+                let mut tiles = vec![(director, master)];
+                for (worker, row) in workers.iter().zip(rows.iter()) {
+                    tiles.push((*worker, *row));
+                }
+                tiles
+            }
+        },
+    }
 }
 
 /// A new session whose real id Claude hasn't assigned yet: its synthetic
@@ -125,7 +193,7 @@ fn event_loop(
 ) -> Result<()> {
     let mut ui = Emporium {
         sessions: Vec::new(),
-        current: None,
+        stage: Stage::Empty,
         focus: Focus::Sidebar,
         status: None,
         pending_new: Vec::new(),
@@ -138,18 +206,17 @@ fn event_loop(
         let areas = layout(Rect::new(0, 0, size.width, size.height));
         app.set_viewport_height(areas.sidebar.height.saturating_sub(2) as usize);
 
-        // Pump every session so hidden ones keep advancing; resize only the
-        // visible one to its pane.
+        // Pump every session so hidden ones keep advancing; resize each staged
+        // one to its own tile (solo = the whole pane; brigade = its tile).
         for (_, session) in ui.sessions.iter_mut() {
             session.pump();
         }
-        if let Some(i) = ui.current {
-            let content = pane_content(areas.pane);
-            ui.sessions[i].1.resize(content.height, content.width);
+        for (idx, rect) in stage_tiles(areas.pane, &ui.stage) {
+            let content = pane_content(rect);
+            ui.sessions[idx].1.resize(content.height, content.width);
         }
 
-        let pane = ui.current.map(|i| &ui.sessions[i].1);
-        terminal.draw(|frame| draw(frame, app, pane, ui.focus, ui.status.as_deref(), areas))?;
+        terminal.draw(|frame| draw(frame, app, &ui, areas))?;
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -160,7 +227,7 @@ fn event_loop(
                         break;
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(&mut ui, app, mouse, areas, claude_home),
+                Event::Mouse(mouse) => handle_mouse(&mut ui, app, store, mouse, areas, claude_home),
                 _ => {}
             }
         }
@@ -202,15 +269,24 @@ fn handle_key(
     // F2 toggles focus and is never forwarded to the child.
     if code == KeyCode::F(2) {
         ui.focus = match ui.focus {
-            Focus::Sidebar if ui.current.is_some() => Focus::Pane,
+            Focus::Sidebar if ui.stage.is_active() => Focus::Pane,
             _ => Focus::Sidebar,
         };
+        return true;
+    }
+    // F3 cycles the focused pane within a staged brigade (never forwarded).
+    if code == KeyCode::F(3) {
+        if let Stage::Brigade { panes, focused, .. } = &mut ui.stage
+            && !panes.is_empty()
+        {
+            *focused = (*focused + 1) % panes.len();
+        }
         return true;
     }
 
     match ui.focus {
         Focus::Pane => {
-            if let Some(i) = ui.current {
+            if let Some(i) = ui.stage.focused_index() {
                 ui.sessions[i].1.send_key(&key);
             }
         }
@@ -224,7 +300,9 @@ fn handle_key(
                 KeyCode::PageDown => app.page_down(),
                 KeyCode::Home => app.select_first(),
                 KeyCode::End => app.select_last(),
-                KeyCode::Enter => open_or_switch(ui, app, claude_home),
+                KeyCode::Enter => open_or_switch(ui, app, store, claude_home),
+                KeyCode::Char('B') => start_brigade(ui, app, store, claude_home),
+                KeyCode::Char('b') => toggle_worker(ui, app, store, claude_home),
                 KeyCode::Tab => {
                     app.toggle_grouped_view();
                 }
@@ -248,6 +326,7 @@ fn handle_key(
 fn handle_mouse(
     ui: &mut Emporium,
     app: &mut App,
+    store: &RefCell<Store>,
     mouse: MouseEvent,
     areas: Areas,
     claude_home: &Path,
@@ -257,17 +336,25 @@ fn handle_mouse(
     }
     let pos = Position::new(mouse.column, mouse.row);
 
-    // Over the pane: focus it on a left click, and forward the mouse to the
-    // child once focused.
+    // Over the pane: focus it (and, within a brigade, the clicked tile) on a
+    // left click, then forward the mouse to that tile's child once focused.
     if areas.pane.contains(pos) {
+        let tiles = stage_tiles(areas.pane, &ui.stage);
+        let hit = tiles.iter().find(|(_, rect)| rect.contains(pos)).copied();
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             ui.focus = Focus::Pane;
+            if let Stage::Brigade { panes, focused, .. } = &mut ui.stage
+                && let Some((idx, _)) = hit
+                && let Some(p) = panes.iter().position(|&i| i == idx)
+            {
+                *focused = p;
+            }
         }
         if ui.focus == Focus::Pane
-            && let Some(i) = ui.current
-            && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(areas.pane))
+            && let Some((idx, rect)) = hit
+            && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect))
         {
-            ui.sessions[i].1.send_bytes(&bytes);
+            ui.sessions[idx].1.send_bytes(&bytes);
         }
         return;
     }
@@ -287,7 +374,7 @@ fn handle_mouse(
             ui.focus = Focus::Sidebar;
             let viewport_row = (pos.y - sidebar_inner.y) as usize;
             if app.click(viewport_row, Instant::now()) == Some(ClickOutcome::Activated) {
-                open_or_switch(ui, app, claude_home);
+                open_or_switch(ui, app, store, claude_home);
             }
         }
         _ => {}
@@ -325,19 +412,43 @@ fn mouse_btn(button: MouseButton) -> u16 {
     }
 }
 
-/// Enter on the sidebar: switch to the selected session if it's already open
-/// (keeping every session alive), else open it in a new kept-alive pane.
-/// Switching to an already-open session never re-resumes it — that would fork
-/// its history (a double resume) even though banto itself is what holds it.
-fn open_or_switch(ui: &mut Emporium, app: &App, claude_home: &Path) {
+/// Enter / double-click on the sidebar: if the selected session belongs to a
+/// brigade, stage that whole cell; otherwise switch to the session if it's
+/// already open (keeping every session alive), else open it solo in a new
+/// kept-alive pane. Switching to an already-open session never re-resumes it —
+/// that would fork its history (a double resume) even though banto itself is
+/// what holds it.
+fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
     let Some(row) = app.selected_row() else {
         return;
     };
     let id = row.id.clone();
-    if let Some(i) = ui.sessions.iter().position(|(sid, _)| *sid == id) {
-        ui.current = Some(i);
-        ui.focus = Focus::Pane;
+
+    // Belongs to a brigade? Open the whole cell instead of the lone session.
+    let membership = store
+        .borrow()
+        .brigade_of_session(&SessionId(id.clone()))
+        .ok()
+        .flatten();
+    if let Some((brigade_id, _)) = membership {
+        stage_brigade(ui, app, store, claude_home, brigade_id);
         return;
+    }
+
+    if let Some(i) = ensure_session_open(ui, row, claude_home) {
+        ui.stage = Stage::Solo(i);
+        ui.focus = Focus::Pane;
+    }
+}
+
+/// Ensure `row`'s session is open as an embedded pane, returning its index in
+/// [`Emporium::sessions`]. Reuses the pane if already open; otherwise opens it
+/// (enforcing no-double-resume). Returns `None` when it can't be opened
+/// (already running elsewhere, or an error — a status is set in both cases).
+fn ensure_session_open(ui: &mut Emporium, row: &SessionRow, claude_home: &Path) -> Option<usize> {
+    let id = row.id.clone();
+    if let Some(i) = ui.sessions.iter().position(|(sid, _)| *sid == id) {
+        return Some(i);
     }
     let target = SessionToOpen {
         id: id.clone(),
@@ -351,11 +462,164 @@ fn open_or_switch(ui: &mut Emporium, app: &App, claude_home: &Path) {
     match open_embedded(&target, claude_home, &mut ui.status) {
         Ok(Some(embedded)) => {
             ui.sessions.push((id, embedded));
-            ui.current = Some(ui.sessions.len() - 1);
-            ui.focus = Focus::Pane;
+            Some(ui.sessions.len() - 1)
         }
-        Ok(None) => {}
-        Err(err) => ui.status = Some(format!("failed to open: {err}")),
+        Ok(None) => None,
+        Err(err) => {
+            ui.status = Some(format!("failed to open: {err}"));
+            None
+        }
+    }
+}
+
+/// `B`: form a new brigade with the selected session as its Director and stage
+/// it. The brigade is persisted immediately (schema v4), so it can be reopened
+/// later from the sidebar (Enter on any member).
+fn start_brigade(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let name = row.display_title().to_string();
+    let session_id = row.id.clone();
+    let Some(idx) = ensure_session_open(ui, row, claude_home) else {
+        return;
+    };
+
+    let brigade_id = {
+        let mut store = store.borrow_mut();
+        match store.create_brigade(&name).and_then(|bid| {
+            store.set_brigade_member(bid, &SessionId(session_id), BrigadeRole::Director)?;
+            Ok(bid)
+        }) {
+            Ok(bid) => bid,
+            Err(err) => {
+                drop(store);
+                ui.status = Some(format!("failed to form brigade: {err}"));
+                return;
+            }
+        }
+    };
+
+    ui.stage = Stage::Brigade {
+        id: brigade_id,
+        panes: vec![idx],
+        focused: 0,
+    };
+    ui.focus = Focus::Pane;
+    ui.status = Some(format!(
+        "brigade formed — director: {name}. F2 → pick a session → b to add a worker."
+    ));
+}
+
+/// `b`: add the selected session to the staged brigade as a Worker, or remove
+/// it if it's already a Worker there (a no-op on the Director). Requires a
+/// brigade to be staged.
+fn toggle_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
+    let brigade_id = match &ui.stage {
+        Stage::Brigade { id, .. } => *id,
+        _ => {
+            ui.status = Some("no brigade staged — press B to start one".to_string());
+            return;
+        }
+    };
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    let session_id = row.id.clone();
+
+    // Already a member of this brigade? Toggle it out (unless it's the
+    // Director, which `b` never removes).
+    let membership = store
+        .borrow()
+        .brigade_of_session(&SessionId(session_id.clone()))
+        .ok()
+        .flatten();
+    if let Some((member_brigade, role)) = membership
+        && member_brigade == brigade_id
+    {
+        if role == BrigadeRole::Director {
+            ui.status = Some("that session is the Director".to_string());
+            return;
+        }
+        let _ = store
+            .borrow()
+            .remove_brigade_member(brigade_id, &SessionId(session_id.clone()));
+        let open_idx = ui.sessions.iter().position(|(sid, _)| *sid == session_id);
+        if let Stage::Brigade { panes, focused, .. } = &mut ui.stage
+            && let Some(removed) = open_idx
+        {
+            panes.retain(|&i| i != removed);
+            if *focused >= panes.len() {
+                *focused = panes.len().saturating_sub(1);
+            }
+        }
+        ui.status = Some("worker removed".to_string());
+        return;
+    }
+
+    // Otherwise add it as a Worker: open it, persist, and tile it in.
+    let Some(idx) = ensure_session_open(ui, row, claude_home) else {
+        return;
+    };
+    if let Err(err) = store.borrow_mut().set_brigade_member(
+        brigade_id,
+        &SessionId(session_id),
+        BrigadeRole::Worker,
+    ) {
+        ui.status = Some(format!("failed to add worker: {err}"));
+        return;
+    }
+    if let Stage::Brigade { panes, .. } = &mut ui.stage
+        && !panes.contains(&idx)
+    {
+        panes.push(idx);
+    }
+    ui.status = Some("worker added".to_string());
+}
+
+/// Stage brigade `brigade_id`: ensure each member is open (embedded) and show
+/// them tiled with the Director focused. Members that aren't in the loaded
+/// session list (e.g. gone from disk) are skipped.
+fn stage_brigade(
+    ui: &mut Emporium,
+    app: &App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    brigade_id: BrigadeId,
+) {
+    let members = match store.borrow().brigade_members(brigade_id) {
+        Ok(members) => members,
+        Err(err) => {
+            ui.status = Some(format!("failed to load brigade: {err}"));
+            return;
+        }
+    };
+    let mut panes = Vec::new();
+    let mut missing = 0;
+    for member in &members {
+        match app.row_for_id(&member.session_id.0) {
+            Some(row) => {
+                if let Some(idx) = ensure_session_open(ui, row, claude_home)
+                    && !panes.contains(&idx)
+                {
+                    panes.push(idx);
+                }
+            }
+            None => missing += 1,
+        }
+    }
+    if panes.is_empty() {
+        ui.status = Some("no brigade members could be opened".to_string());
+        return;
+    }
+    ui.stage = Stage::Brigade {
+        id: brigade_id,
+        panes,
+        focused: 0,
+    };
+    ui.focus = Focus::Pane;
+    if missing > 0 {
+        ui.status = Some(format!("brigade staged ({missing} member(s) not found)"));
     }
 }
 
@@ -557,7 +821,7 @@ fn confirm_new_embedded(ui: &mut Emporium, app: &mut App) {
             // without a second resume.
             let key = format!("new::{}", cwd.display());
             ui.sessions.push((key.clone(), embedded));
-            ui.current = Some(ui.sessions.len() - 1);
+            ui.stage = Stage::Solo(ui.sessions.len() - 1);
             ui.focus = Focus::Pane;
             ui.pending_new.push(PendingNew { key, cwd, since });
         }
@@ -588,15 +852,9 @@ fn discover_new_ids(ui: &mut Emporium, provider: &ClaudeCodeProvider) {
         .retain(|pending| !discovered.iter().any(|(key, _)| key == &pending.key));
 }
 
-fn draw(
-    frame: &mut ratatui::Frame,
-    app: &App,
-    pane: Option<&EmbeddedSession>,
-    focus: Focus,
-    status: Option<&str>,
-    areas: Areas,
-) {
+fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas) {
     let full_area = frame.area();
+    let focus = ui.focus;
 
     // Sidebar: bordered block with the query in its title while searching.
     let sidebar_title = if app.mode() == Mode::Search {
@@ -614,17 +872,34 @@ fn draw(
     // Details panel below the list (shared with the classic summary).
     view::render_summary(frame, app, areas.summary);
 
-    // Right pane hosting the session.
-    let pane_focused = focus == Focus::Pane;
-    let pane_block = Block::bordered()
-        .title("session")
-        .border_style(border_style(pane_focused));
-    let content = pane_block.inner(areas.pane);
-    frame.render_widget(pane_block, areas.pane);
-    match pane {
-        Some(session) => {
+    // Right region: the staged session(s), tiled — or a placeholder when
+    // nothing is staged.
+    let tiles = stage_tiles(areas.pane, &ui.stage);
+    if tiles.is_empty() {
+        let block = Block::bordered()
+            .title("session")
+            .border_style(border_style(false));
+        let content = block.inner(areas.pane);
+        frame.render_widget(block, areas.pane);
+        frame.render_widget(
+            Paragraph::new(
+                "Select a session and press Enter.\n\
+                 F2 toggles focus · B starts a brigade · q quits.",
+            ),
+            content,
+        );
+    } else {
+        let focused_index = ui.stage.focused_index();
+        for (idx, rect) in &tiles {
+            let session = &ui.sessions[*idx].1;
+            let focused_tile = focus == Focus::Pane && focused_index == Some(*idx);
+            let block = Block::bordered()
+                .title(tile_title(&ui.stage, *idx))
+                .border_style(border_style(focused_tile));
+            let content = block.inner(*rect);
+            frame.render_widget(block, *rect);
             frame.render_widget(Paragraph::new(screen_to_text(session.screen())), content);
-            if pane_focused && !session.screen().hide_cursor() {
+            if focused_tile && !session.screen().hide_cursor() {
                 let (cursor_row, cursor_col) = session.screen().cursor_position();
                 let (x, y) = (content.x + cursor_col, content.y + cursor_row);
                 if x < content.x + content.width && y < content.y + content.height {
@@ -632,15 +907,9 @@ fn draw(
                 }
             }
         }
-        None => {
-            frame.render_widget(
-                Paragraph::new("Select a session and press Enter.\nF2 toggles focus · q quits."),
-                content,
-            );
-        }
     }
 
-    render_status_bar(frame, app, status, areas.status);
+    render_status_bar(frame, app, ui.status.as_deref(), areas.status);
 
     // A modal overlays everything, reusing the classic modal rendering.
     if let Some(modal) = app.modal() {
@@ -648,12 +917,26 @@ fn draw(
     }
 }
 
+/// The title shown on a staged tile: its role within a brigade ("director" /
+/// "worker N"), or just "session" for a solo pane.
+fn tile_title(stage: &Stage, session_index: usize) -> String {
+    match stage {
+        Stage::Brigade { panes, .. } => match panes.iter().position(|&i| i == session_index) {
+            Some(0) => "director".to_string(),
+            Some(n) => format!("worker {n}"),
+            _ => "session".to_string(),
+        },
+        _ => "session".to_string(),
+    }
+}
+
 /// Bottom status bar: emporium key hints (or a transient status) on the left,
 /// the match count on the right — the emporium counterpart of the classic
 /// `render_status` (its own hints, and its own status line).
 fn render_status_bar(frame: &mut ratatui::Frame, app: &App, status: Option<&str>, area: Rect) {
-    const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · / search · n new · \
-                                d archive · g group · Tab view · p pin · a agents · q quit";
+    const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade · b +worker · \
+                                F3 pane · / search · n new · d archive · g group · Tab view · \
+                                p pin · a agents · q quit";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
 
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
@@ -767,7 +1050,10 @@ fn install_panic_hook() {
 mod tests {
     use ratatui::layout::Rect;
 
-    use super::{MIN_HEIGHT_FOR_SUMMARY, SIDEBAR_WIDTH, SUMMARY_HEIGHT, layout, pane_content};
+    use super::{
+        MIN_HEIGHT_FOR_SUMMARY, SIDEBAR_WIDTH, SUMMARY_HEIGHT, Stage, layout, pane_content,
+        stage_tiles,
+    };
 
     #[test]
     fn layout_reserves_sidebar_status_bar_and_details_panel() {
@@ -798,5 +1084,69 @@ mod tests {
         assert_eq!(content.y, 1);
         assert_eq!(content.width, 82);
         assert_eq!(content.height, 38);
+    }
+
+    #[test]
+    fn solo_stage_fills_the_whole_pane() {
+        let area = Rect::new(36, 0, 84, 39);
+        assert_eq!(stage_tiles(area, &Stage::Solo(2)), vec![(2, area)]);
+    }
+
+    #[test]
+    fn empty_stage_has_no_tiles() {
+        let area = Rect::new(36, 0, 84, 39);
+        assert!(stage_tiles(area, &Stage::Empty).is_empty());
+    }
+
+    #[test]
+    fn brigade_with_one_member_fills_the_pane() {
+        let area = Rect::new(36, 0, 84, 39);
+        let stage = Stage::Brigade {
+            id: 1,
+            panes: vec![5],
+            focused: 0,
+        };
+        assert_eq!(stage_tiles(area, &stage), vec![(5, area)]);
+    }
+
+    #[test]
+    fn brigade_tiles_director_left_and_stacks_workers_right() {
+        let area = Rect::new(36, 0, 84, 40);
+        let stage = Stage::Brigade {
+            id: 1,
+            panes: vec![5, 6, 7],
+            focused: 0,
+        };
+        let tiles = stage_tiles(area, &stage);
+        assert_eq!(tiles.len(), 3);
+
+        // Director takes the left half; its session index leads.
+        let (director_idx, director_rect) = tiles[0];
+        assert_eq!(director_idx, 5);
+        assert_eq!(director_rect.x, 36);
+        assert_eq!(director_rect.width, 42);
+        assert_eq!(director_rect.height, 40);
+
+        // Workers share the right half, stacked top-to-bottom in order.
+        let (w0_idx, w0) = tiles[1];
+        let (w1_idx, w1) = tiles[2];
+        assert_eq!((w0_idx, w1_idx), (6, 7));
+        assert_eq!(w0.x, 78);
+        assert_eq!(w1.x, 78);
+        assert_eq!(w0.width, 42);
+        assert!(w1.y > w0.y, "workers stack downward");
+        assert_eq!(w0.height + w1.height, 40, "workers fill the right column");
+    }
+
+    #[test]
+    fn focused_index_tracks_the_focused_pane() {
+        assert_eq!(Stage::Empty.focused_index(), None);
+        assert_eq!(Stage::Solo(3).focused_index(), Some(3));
+        let stage = Stage::Brigade {
+            id: 1,
+            panes: vec![5, 6, 7],
+            focused: 2,
+        };
+        assert_eq!(stage.focused_index(), Some(7));
     }
 }

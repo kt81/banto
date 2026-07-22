@@ -268,7 +268,9 @@ mod tests {
             .set_brigade_member(br, &SessionId("dir".to_string()), BrigadeRole::Director)
             .unwrap();
         assert_eq!(
-            store.brigade_of_session(&SessionId("dir".to_string())).unwrap(),
+            store
+                .brigade_of_session(&SessionId("dir".to_string()))
+                .unwrap(),
             Some((br, BrigadeRole::Director))
         );
         let version: i64 = store

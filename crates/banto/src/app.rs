@@ -1337,6 +1337,15 @@ impl App {
         self.filtered.get(self.selected).map(|&i| &self.rows[i])
     }
 
+    /// The loaded session with this id, if present — searches the full list,
+    /// not just the current filter/sort, so a session referenced by id (e.g. a
+    /// brigade member that the agent filter or search would otherwise hide)
+    /// can still be resolved back to its title/cwd. A plain accessor, unaware
+    /// of any brigade concept.
+    pub fn row_for_id(&self, id: &str) -> Option<&SessionRow> {
+        self.base_rows.iter().find(|row| row.id == id)
+    }
+
     /// Whether the currently selected session is pinned (for the summary
     /// panel's marker); `false` when nothing is selected.
     pub fn is_selected_pinned(&self) -> bool {

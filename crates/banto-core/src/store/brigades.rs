@@ -90,7 +90,9 @@ impl Store {
 
     /// Returns all brigades, oldest first (creation order).
     pub fn list_brigades(&self) -> Result<Vec<Brigade>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM brigades ORDER BY id")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name FROM brigades ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
             Ok(Brigade {
                 id: row.get(0)?,
