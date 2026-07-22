@@ -10,6 +10,7 @@
 //! `Config.db_path`, falling back to [`config::default_db_path`].
 
 mod app;
+mod embedded;
 mod opener;
 mod process;
 mod session;
@@ -85,6 +86,17 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Internal/dev: host a command inside banto's own TUI as an embedded
+    /// terminal (single pane). Exercises the embedded-multiplexer path.
+    #[command(name = "_embed", hide = true)]
+    Embed {
+        /// Working directory for the hosted command (default: inherit banto's).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// The command to host, e.g. `-- claude --resume <id>`.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -132,6 +144,7 @@ fn main() -> Result<()> {
             };
             std::process::exit(code)
         }
+        Some(Command::Embed { cwd, argv }) => embedded::run_embedded(&argv, cwd.as_deref()),
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let thresholds = thresholds_from(&config.activity);
