@@ -60,8 +60,13 @@ pub fn run(claude_home: &Path, thresholds: &AgeThresholds) -> Result<()> {
 }
 
 fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<()> {
+    // Sessions stay alive across switches (keep-alive); `current` indexes the
+    // one shown in the pane. Pumping all of them each tick keeps the hidden
+    // ones advancing — the substrate a brigade (multiple visible panes) builds
+    // on.
+    let mut sessions: Vec<(String, EmbeddedSession)> = Vec::new();
+    let mut current: Option<usize> = None;
     let mut focus = Focus::Sidebar;
-    let mut pane: Option<EmbeddedSession> = None;
     let mut status: Option<String> = None;
 
     loop {
@@ -69,18 +74,22 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
         let (sidebar_area, pane_area) = split(Rect::new(0, 0, size.width, size.height));
         app.set_viewport_height(sidebar_area.height.saturating_sub(2) as usize);
 
-        // Keep the embedded child current and sized to its pane.
-        if let Some(session) = pane.as_mut() {
+        // Pump every session so hidden ones keep advancing; resize only the
+        // visible one to its pane.
+        for (_, session) in sessions.iter_mut() {
             session.pump();
+        }
+        if let Some(i) = current {
             let content = pane_content(pane_area);
-            session.resize(content.height, content.width);
+            sessions[i].1.resize(content.height, content.width);
         }
 
+        let pane = current.map(|i| &sessions[i].1);
         terminal.draw(|frame| {
             draw(
                 frame,
                 app,
-                pane.as_ref(),
+                pane,
                 focus,
                 status.as_deref(),
                 sidebar_area,
@@ -95,7 +104,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
             // F2 always toggles focus and is never forwarded to the child.
             if key.code == KeyCode::F(2) {
                 focus = match focus {
-                    Focus::Sidebar if pane.is_some() => Focus::Pane,
+                    Focus::Sidebar if current.is_some() => Focus::Pane,
                     _ => Focus::Sidebar,
                 };
                 continue;
@@ -111,20 +120,20 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
                         KeyCode::PageDown => app.page_down(),
                         KeyCode::Home => app.select_first(),
                         KeyCode::End => app.select_last(),
-                        KeyCode::Enter => match open_selected(app, claude_home, &mut status) {
-                            Ok(Some(session)) => {
-                                pane = Some(session);
-                                focus = Focus::Pane;
-                            }
-                            Ok(None) => {}
-                            Err(err) => status = Some(format!("failed to open: {err}")),
-                        },
+                        KeyCode::Enter => open_or_switch(
+                            app,
+                            claude_home,
+                            &mut sessions,
+                            &mut current,
+                            &mut focus,
+                            &mut status,
+                        ),
                         _ => {}
                     }
                 }
                 Focus::Pane => {
-                    if let Some(session) = pane.as_mut() {
-                        session.send_key(&key);
+                    if let Some(i) = current {
+                        sessions[i].1.send_key(&key);
                     }
                 }
             }
@@ -133,20 +142,29 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
     Ok(())
 }
 
-/// Open the selected session in an embedded pane, enforcing the no-double-resume
-/// guard (reusing the same decision the classic in-place path uses). Returns the
-/// opened session, or `None` when nothing is selected or the session is already
-/// running elsewhere (in which case a status message is set).
-fn open_selected(
+/// Enter on the sidebar: switch to the selected session if it's already open
+/// (keeping every session alive), else open it in a new kept-alive pane.
+/// Switching to an already-open session never re-resumes it — that would fork
+/// its history (a double resume) even though banto itself is what holds it.
+fn open_or_switch(
     app: &App,
     claude_home: &Path,
+    sessions: &mut Vec<(String, EmbeddedSession)>,
+    current: &mut Option<usize>,
+    focus: &mut Focus,
     status: &mut Option<String>,
-) -> Result<Option<EmbeddedSession>> {
+) {
     let Some(row) = app.selected_row() else {
-        return Ok(None);
+        return;
     };
-    let session = SessionToOpen {
-        id: row.id.clone(),
+    let id = row.id.clone();
+    if let Some(i) = sessions.iter().position(|(sid, _)| *sid == id) {
+        *current = Some(i);
+        *focus = Focus::Pane;
+        return;
+    }
+    let target = SessionToOpen {
+        id: id.clone(),
         title: row.display_title().to_string(),
         cwd: row
             .cwd
@@ -154,8 +172,27 @@ fn open_selected(
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default(),
     };
+    match open_embedded(&target, claude_home, status) {
+        Ok(Some(embedded)) => {
+            sessions.push((id, embedded));
+            *current = Some(sessions.len() - 1);
+            *focus = Focus::Pane;
+        }
+        Ok(None) => {}
+        Err(err) => *status = Some(format!("failed to open: {err}")),
+    }
+}
+
+/// Spawn `session` in a new embedded pane, enforcing the no-double-resume guard
+/// (reusing the classic in-place decision). Returns `None` (and sets a status)
+/// when it's already running elsewhere.
+fn open_embedded(
+    session: &SessionToOpen,
+    claude_home: &Path,
+    status: &mut Option<String>,
+) -> Result<Option<EmbeddedSession>> {
     let live = read_live_sessions(&claude_home.join("sessions"));
-    let Some(launch) = opener::decide_inplace_resume(&session, &SysinfoProbe, &live) else {
+    let Some(launch) = opener::decide_inplace_resume(session, &SysinfoProbe, &live) else {
         *status = Some("already running elsewhere".to_string());
         return Ok(None);
     };
