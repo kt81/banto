@@ -11,6 +11,7 @@
 
 mod app;
 mod embedded;
+mod mcp;
 mod opener;
 mod process;
 mod session;
@@ -103,6 +104,16 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Internal: banto's MCP server on stdio (the brigade Director<->Worker
+    /// mediation channel). Spawned by an embedded `claude` via `--mcp-config`;
+    /// not meant to be invoked directly.
+    #[command(name = "_mcp", hide = true)]
+    Mcp {
+        /// Identifies the calling session (echoed by the ping tool; the
+        /// brigade role/id will join it as the message tools land).
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -151,6 +162,7 @@ fn main() -> Result<()> {
             std::process::exit(code)
         }
         Some(Command::Embed { cwd, argv }) => embedded::run_embedded(&argv, cwd.as_deref()),
+        Some(Command::Mcp { session }) => mcp::run_stdio_server(session),
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let thresholds = thresholds_from(&config.activity);
