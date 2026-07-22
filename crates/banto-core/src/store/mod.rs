@@ -12,12 +12,14 @@
 //! source of truth for real paths.
 
 mod archive;
+mod brigades;
 mod groups;
 mod migrations;
 mod panes;
 mod pins;
 mod sessions;
 
+pub use brigades::{Brigade, BrigadeId, BrigadeMember, BrigadeRole};
 pub use groups::{Group, GroupId};
 pub use panes::PaneRecord;
 

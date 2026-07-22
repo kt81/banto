@@ -59,6 +59,25 @@ const MIGRATIONS: &[&str] = &[
         session_id     TEXT PRIMARY KEY,
         archived_at_ms INTEGER NOT NULL
     );",
+    // v4: brigades — an internal operational cell of one Director session and
+    // one or more Worker sessions, hosted together as tiled panes in the
+    // emporium mode. A *separate* concept from groups (which are the user's own
+    // project/phase filing): a brigade is a live operational unit. Like
+    // groups/pins, a loose reference (no foreign keys) so a brigade survives a
+    // source that is temporarily unavailable. A session belongs to at most one
+    // brigade; that single-membership invariant (and "exactly one Director per
+    // brigade") is layered in code, not a schema constraint.
+    "CREATE TABLE brigades (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE brigade_members (
+        brigade_id INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        role       TEXT NOT NULL,
+        PRIMARY KEY (brigade_id, session_id)
+    );",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -206,11 +225,57 @@ mod tests {
         let s1 = SessionId("s1".to_string());
         store.archive_session(&s1).unwrap();
         assert_eq!(store.archived_ids().unwrap(), [s1]);
+        // `apply` always brings the database to the latest version, so this
+        // tracks MIGRATIONS.len() rather than a hardcoded 3.
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v3_to_v4_upgrade_adds_brigade_tables_and_preserves_existing_rows() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v3 code would have left it: v1..=v3 scripts
+        // applied, a session archived, `user_version` left at 3. The brigade
+        // tables do not exist yet.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(MIGRATIONS[1]).unwrap();
+            conn.execute_batch(MIGRATIONS[2]).unwrap();
+            conn.execute(
+                "INSERT INTO archived (session_id, archived_at_ms) VALUES ('s1', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        // Opening through Store::open must run the v4 migration: the brigade
+        // tables exist and are usable, and the pre-existing archived row is
+        // untouched.
+        let mut store = Store::open(&db).unwrap();
+        assert_eq!(store.archived_ids().unwrap(), [SessionId("s1".to_string())]);
+        assert!(store.list_brigades().unwrap().is_empty());
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .set_brigade_member(br, &SessionId("dir".to_string()), BrigadeRole::Director)
+            .unwrap();
+        assert_eq!(
+            store.brigade_of_session(&SessionId("dir".to_string())).unwrap(),
+            Some((br, BrigadeRole::Director))
+        );
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
     }
 
     #[test]
