@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::io::{self, Stdout};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -23,7 +23,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
@@ -34,6 +34,7 @@ use banto_core::store::Store;
 use crate::app::{App, GroupJoinTarget, Modal, Mode};
 use crate::opener::{self, SessionToOpen};
 use crate::session;
+use crate::tui::LiveWatch;
 use crate::view;
 
 use super::pty::PortablePtyHost;
@@ -44,6 +45,13 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Fixed width of the left sidebar (the session list), in columns.
 const SIDEBAR_WIDTH: u16 = 36;
+
+/// Details panel height: one border row plus its content rows.
+const SUMMARY_HEIGHT: u16 = 5;
+
+/// Below this left-column height the details panel is dropped so the list keeps
+/// the room.
+const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
 
 /// Which side currently receives keyboard input.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,11 +117,12 @@ fn event_loop(
         focus: Focus::Sidebar,
         status: None,
     };
+    let mut watch = LiveWatch::new(claude_home);
 
     loop {
         let size = terminal.size()?;
-        let (sidebar_area, pane_area) = split(Rect::new(0, 0, size.width, size.height));
-        app.set_viewport_height(sidebar_area.height.saturating_sub(2) as usize);
+        let areas = layout(Rect::new(0, 0, size.width, size.height));
+        app.set_viewport_height(areas.sidebar.height.saturating_sub(2) as usize);
 
         // Pump every session so hidden ones keep advancing; resize only the
         // visible one to its pane.
@@ -121,22 +130,12 @@ fn event_loop(
             session.pump();
         }
         if let Some(i) = ui.current {
-            let content = pane_content(pane_area);
+            let content = pane_content(areas.pane);
             ui.sessions[i].1.resize(content.height, content.width);
         }
 
         let pane = ui.current.map(|i| &ui.sessions[i].1);
-        terminal.draw(|frame| {
-            draw(
-                frame,
-                app,
-                pane,
-                ui.focus,
-                ui.status.as_deref(),
-                sidebar_area,
-                pane_area,
-            )
-        })?;
+        terminal.draw(|frame| draw(frame, app, pane, ui.focus, ui.status.as_deref(), areas))?;
 
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
@@ -144,6 +143,11 @@ fn event_loop(
             && !handle_key(&mut ui, app, store, claude_home, thresholds, key)
         {
             break;
+        }
+
+        // Live updates: reload the list once the watched dirs settle.
+        if watch.poll_ready(SystemTime::now()) {
+            reload(app, claude_home, thresholds, store);
         }
     }
     Ok(())
@@ -458,13 +462,11 @@ fn draw(
     pane: Option<&EmbeddedSession>,
     focus: Focus,
     status: Option<&str>,
-    sidebar_area: Rect,
-    pane_area: Rect,
+    areas: Areas,
 ) {
     let full_area = frame.area();
 
-    // In search mode the query lives in the sidebar title (no dedicated search
-    // box in this layout).
+    // Sidebar: bordered block with the query in its title while searching.
     let sidebar_title = if app.mode() == Mode::Search {
         format!("/ {}", app.query())
     } else {
@@ -473,17 +475,20 @@ fn draw(
     let sidebar_block = Block::bordered()
         .title(sidebar_title)
         .border_style(border_style(focus == Focus::Sidebar));
-    let sidebar_inner = sidebar_block.inner(sidebar_area);
-    frame.render_widget(sidebar_block, sidebar_area);
-    render_sidebar(frame, app, sidebar_inner, status);
+    let sidebar_inner = sidebar_block.inner(areas.sidebar);
+    frame.render_widget(sidebar_block, areas.sidebar);
+    view::render_list(frame, app, sidebar_inner);
 
+    // Details panel below the list (shared with the classic summary).
+    view::render_summary(frame, app, areas.summary);
+
+    // Right pane hosting the session.
     let pane_focused = focus == Focus::Pane;
     let pane_block = Block::bordered()
         .title("session")
         .border_style(border_style(pane_focused));
-    let content = pane_block.inner(pane_area);
-    frame.render_widget(pane_block, pane_area);
-
+    let content = pane_block.inner(areas.pane);
+    frame.render_widget(pane_block, areas.pane);
     match pane {
         Some(session) => {
             frame.render_widget(Paragraph::new(screen_to_text(session.screen())), content);
@@ -503,30 +508,49 @@ fn draw(
         }
     }
 
+    render_status_bar(frame, app, status, areas.status);
+
     // A modal overlays everything, reusing the classic modal rendering.
     if let Some(modal) = app.modal() {
         crate::tui::render_modal(frame, modal, full_area);
     }
 }
 
-fn render_sidebar(frame: &mut ratatui::Frame, app: &App, area: Rect, status: Option<&str>) {
-    // Reuse the classic list rendering so both modes look identical.
-    view::render_list(frame, app, area);
-    // A transient status (e.g. "already running elsewhere") overlays the last
-    // sidebar row; it's rare and short-lived, so it needn't reserve a row.
-    if let Some(status) = status
-        && area.height > 0
-    {
-        let status_area = Rect {
-            y: area.y + area.height - 1,
-            height: 1,
-            ..area
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(status, Style::default().fg(Color::Yellow))),
-            status_area,
-        );
-    }
+/// Bottom status bar: emporium key hints (or a transient status) on the left,
+/// the match count on the right — the emporium counterpart of the classic
+/// `render_status` (its own hints, and its own status line).
+fn render_status_bar(frame: &mut ratatui::Frame, app: &App, status: Option<&str>, area: Rect) {
+    const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · / search · n new · \
+                                d archive · g group · Tab view · p pin · a agents · q quit";
+    const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
+
+    let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
+    let counts_width = counts.chars().count() as u16;
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(counts_width)]).areas(area);
+
+    let (text, color) = match status {
+        Some(message) => (message.to_string(), Color::Yellow),
+        None => {
+            let hints = if app.mode() == Mode::Search {
+                SEARCH_HINTS
+            } else {
+                NORMAL_HINTS
+            };
+            (hints.to_string(), Color::Gray)
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(text, Style::default().fg(color))),
+        left,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            counts,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        right,
+    );
 }
 
 fn border_style(focused: bool) -> Style {
@@ -537,11 +561,38 @@ fn border_style(focused: bool) -> Style {
     })
 }
 
-/// Split the whole area into (sidebar, pane).
-fn split(area: Rect) -> (Rect, Rect) {
-    let [sidebar, pane] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(area);
-    (sidebar, pane)
+/// The regions of the emporium layout.
+#[derive(Clone, Copy)]
+struct Areas {
+    /// Bordered sidebar block holding the session list.
+    sidebar: Rect,
+    /// Details / summary panel below the list (0-height in a short terminal).
+    summary: Rect,
+    /// Right pane hosting the session.
+    pane: Rect,
+    /// Bottom status bar (one row).
+    status: Rect,
+}
+
+/// Compute the layout: a bottom status bar, and above it a left column
+/// (sidebar list + details panel) beside the session pane.
+fn layout(area: Rect) -> Areas {
+    let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let [left, pane] =
+        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
+    let summary_h = if left.height < MIN_HEIGHT_FOR_SUMMARY {
+        0
+    } else {
+        SUMMARY_HEIGHT
+    };
+    let [sidebar, summary] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(summary_h)]).areas(left);
+    Areas {
+        sidebar,
+        summary,
+        pane,
+        status,
+    }
 }
 
 /// The inner content rect of the right pane (inside its border).
@@ -584,15 +635,28 @@ fn install_panic_hook() {
 mod tests {
     use ratatui::layout::Rect;
 
-    use super::{SIDEBAR_WIDTH, pane_content, split};
+    use super::{MIN_HEIGHT_FOR_SUMMARY, SIDEBAR_WIDTH, SUMMARY_HEIGHT, layout, pane_content};
 
     #[test]
-    fn split_reserves_the_sidebar_and_gives_the_rest_to_the_pane() {
-        let (sidebar, pane) = split(Rect::new(0, 0, 120, 40));
-        assert_eq!(sidebar.width, SIDEBAR_WIDTH);
-        assert_eq!(pane.x, SIDEBAR_WIDTH);
-        assert_eq!(pane.width, 120 - SIDEBAR_WIDTH);
-        assert_eq!(pane.height, 40);
+    fn layout_reserves_sidebar_status_bar_and_details_panel() {
+        let areas = layout(Rect::new(0, 0, 120, 40));
+        // A one-row status bar at the bottom; the rest is the body.
+        assert_eq!(areas.status.height, 1);
+        assert_eq!(areas.status.y, 39);
+        // Left column of SIDEBAR_WIDTH; the pane takes the rest.
+        assert_eq!(areas.sidebar.width, SIDEBAR_WIDTH);
+        assert_eq!(areas.pane.x, SIDEBAR_WIDTH);
+        assert_eq!(areas.pane.width, 120 - SIDEBAR_WIDTH);
+        assert_eq!(areas.pane.height, 39);
+        // Tall enough for the details panel, so it takes SUMMARY_HEIGHT.
+        assert_eq!(areas.summary.height, SUMMARY_HEIGHT);
+    }
+
+    #[test]
+    fn layout_drops_the_details_panel_when_short() {
+        // Body height (total - status row) ends up below MIN_HEIGHT_FOR_SUMMARY.
+        let areas = layout(Rect::new(0, 0, 120, MIN_HEIGHT_FOR_SUMMARY));
+        assert_eq!(areas.summary.height, 0);
     }
 
     #[test]

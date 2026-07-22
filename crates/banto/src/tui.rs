@@ -162,13 +162,13 @@ fn open_input_log() -> Option<std::fs::File> {
 /// signal. Construction failures (e.g. an exotic filesystem `notify` can't
 /// watch) degrade to "no live updates" rather than blocking the TUI from
 /// starting at all.
-struct LiveWatch {
+pub(crate) struct LiveWatch {
     source: Option<NotifyChangeSource>,
     debouncer: Debouncer,
 }
 
 impl LiveWatch {
-    fn new(claude_home: &Path) -> Self {
+    pub(crate) fn new(claude_home: &Path) -> Self {
         Self {
             source: NotifyChangeSource::new(claude_home).ok(),
             debouncer: Debouncer::new(DEBOUNCE_QUIET),
@@ -177,7 +177,7 @@ impl LiveWatch {
 
     /// Drain any pending filesystem changes and report whether their quiet
     /// period has elapsed as of `now`, i.e. whether a reload is due.
-    fn poll_ready(&mut self, now: SystemTime) -> bool {
+    pub(crate) fn poll_ready(&mut self, now: SystemTime) -> bool {
         let Some(source) = &self.source else {
             return false;
         };
