@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -29,6 +29,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::model::SessionId;
+use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
 use banto_core::store::Store;
 
@@ -72,6 +73,16 @@ struct Emporium {
     current: Option<usize>,
     focus: Focus,
     status: Option<String>,
+    /// Freshly-launched sessions awaiting id discovery (see [`discover_new_ids`]).
+    pending_new: Vec<PendingNew>,
+}
+
+/// A new session whose real id Claude hasn't assigned yet: its synthetic
+/// `new::<cwd>` collection key, launch cwd, and launch time.
+struct PendingNew {
+    key: String,
+    cwd: PathBuf,
+    since: SystemTime,
 }
 
 /// Which confirm branch an open modal takes — resolved before mutating `App`
@@ -117,8 +128,10 @@ fn event_loop(
         current: None,
         focus: Focus::Sidebar,
         status: None,
+        pending_new: Vec::new(),
     };
     let mut watch = LiveWatch::new(claude_home);
+    let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
 
     loop {
         let size = terminal.size()?;
@@ -155,6 +168,11 @@ fn event_loop(
         // Live updates: reload the list once the watched dirs settle.
         if watch.poll_ready(SystemTime::now()) {
             reload(app, claude_home, thresholds, store);
+        }
+        // Discover the ids Claude assigns to freshly-launched sessions, so they
+        // can be re-selected from the sidebar without a second resume.
+        if !ui.pending_new.is_empty() {
+            discover_new_ids(&mut ui, &provider);
         }
     }
     Ok(())
@@ -530,19 +548,44 @@ fn confirm_new_embedded(ui: &mut Emporium, app: &mut App) {
         return;
     }
     let argv = opener::inplace_argv(None);
+    let since = SystemTime::now();
     match EmbeddedSession::open(&PortablePtyHost, &argv, Some(&cwd), 24, 80) {
         Ok(embedded) => {
-            // No session id yet (Claude assigns it); a `new::` key never
-            // collides with a real UUID row id, so it's never re-selected from
-            // the sidebar (which would risk a second resume).
-            ui.sessions
-                .push((format!("new::{}", cwd.display()), embedded));
+            // No session id yet (Claude assigns it). Key it with a synthetic
+            // `new::<cwd>` (never collides with a real UUID id) and record it
+            // for id discovery, so it can later be re-selected from the sidebar
+            // without a second resume.
+            let key = format!("new::{}", cwd.display());
+            ui.sessions.push((key.clone(), embedded));
             ui.current = Some(ui.sessions.len() - 1);
             ui.focus = Focus::Pane;
+            ui.pending_new.push(PendingNew { key, cwd, since });
         }
         Err(err) => ui.status = Some(format!("failed to start a new session: {err}")),
     }
     app.close_modal();
+}
+
+/// Poll for the ids Claude assigns to freshly-launched sessions and re-key their
+/// collection entries from the synthetic `new::<cwd>` key to the real id, so
+/// they behave like any other open session (re-selectable, no second resume).
+fn discover_new_ids(ui: &mut Emporium, provider: &ClaudeCodeProvider) {
+    let mut discovered: Vec<(String, String)> = Vec::new();
+    for pending in &ui.pending_new {
+        if let Some(id) = provider.find_new_session(&pending.cwd, pending.since) {
+            discovered.push((pending.key.clone(), id.0));
+        }
+    }
+    if discovered.is_empty() {
+        return;
+    }
+    for (key, id) in &discovered {
+        if let Some(entry) = ui.sessions.iter_mut().find(|(k, _)| k == key) {
+            entry.0 = id.clone();
+        }
+    }
+    ui.pending_new
+        .retain(|pending| !discovered.iter().any(|(key, _)| key == &pending.key));
 }
 
 fn draw(
