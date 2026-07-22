@@ -9,11 +9,13 @@
 //! straight to the child's stdin, so answering leaks the reply as typed input.
 //! A raw Unix PTY would need answering; that path is deferred.
 
+mod emporium;
 mod input;
 mod pty;
 mod render;
 mod session;
 
+pub use emporium::run as run_emporium;
 pub use pty::PortablePtyHost;
 pub use render::screen_to_text;
 pub use session::EmbeddedSession;

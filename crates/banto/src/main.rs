@@ -41,6 +41,11 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     claude_home: Option<PathBuf>,
 
+    /// Open the 大店 (emporium) mode: banto as a persistent sidebar plus an
+    /// embedded session pane, instead of the classic list.
+    #[arg(long, visible_alias = "oodana")]
+    emporium: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -148,13 +153,20 @@ fn main() -> Result<()> {
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let thresholds = thresholds_from(&config.activity);
-            // The `g` group-join modal needs `Store::set_session_group`,
-            // which takes `&mut self` (it wraps a transaction); the TUI's
-            // `Context` is passed around as a plain `&Context`, so a
-            // `RefCell` gives interior mutability without threading `&mut
-            // Context` through every key handler.
-            let store = std::cell::RefCell::new(open_store(&config)?);
-            tui::run(&claude_home, &thresholds, config.opener, &store)
+            if cli.emporium {
+                // The 大店 (emporium) mode: a separate top-level TUI chosen at
+                // launch (`--emporium` / `--oodana`); the classic list below is
+                // left entirely untouched.
+                embedded::run_emporium(&claude_home, &thresholds)
+            } else {
+                // The `g` group-join modal needs `Store::set_session_group`,
+                // which takes `&mut self` (it wraps a transaction); the TUI's
+                // `Context` is passed around as a plain `&Context`, so a
+                // `RefCell` gives interior mutability without threading `&mut
+                // Context` through every key handler.
+                let store = std::cell::RefCell::new(open_store(&config)?);
+                tui::run(&claude_home, &thresholds, config.opener, &store)
+            }
         }
     }
 }
