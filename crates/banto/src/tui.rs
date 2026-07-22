@@ -30,20 +30,21 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::config::OpenerMode;
-use banto_core::model::{Activity, AgeBucket, SessionId};
+use banto_core::model::SessionId;
 use banto_core::opener::SystemCommandRunner;
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
 use banto_core::store::Store;
 use banto_core::watch::{ChangeSource, Debouncer, NotifyChangeSource};
 
 use crate::app::{
-    App, ClickOutcome, GroupJoinState, GroupJoinTarget, ListLine, Modal, Mode, NewSessionPlacement,
+    App, ClickOutcome, GroupJoinState, GroupJoinTarget, Modal, Mode, NewSessionPlacement,
     NewSessionState,
 };
 use crate::opener::{self, OpenOutcome, SessionToOpen};
 use crate::process::{ProcessRunner, SystemProcessRunner};
 use crate::session;
 use crate::sgr::{self, SgrParse};
+use crate::view;
 
 /// The concrete terminal type used throughout this module.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -1479,8 +1480,8 @@ fn reload(app: &mut App, ctx: &Context) {
 fn render(frame: &mut Frame, app: &App) {
     let [search_area, list_area, summary_area, status_area] = layout_areas(frame.area());
     render_search(frame, app, search_area);
-    render_list(frame, app, list_area);
-    render_summary(frame, app, summary_area);
+    view::render_list(frame, app, list_area);
+    view::render_summary(frame, app, summary_area);
     render_status(frame, app, status_area);
     if let Some(modal) = app.modal() {
         render_modal(frame, modal, frame.area());
@@ -1506,146 +1507,6 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         let cursor_x = (inner.x + cursor_col).min(inner.x + inner.width - 1);
         frame.set_cursor_position(Position::new(cursor_x, inner.y));
     }
-}
-
-/// Render the session list (or a placeholder when nothing matches).
-fn render_list(frame: &mut Frame, app: &App, area: Rect) {
-    if app.filtered_len() == 0 {
-        let message = if app.total_len() == 0 {
-            "No sessions found."
-        } else {
-            "No matching sessions."
-        };
-        let placeholder = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(placeholder, area);
-        return;
-    }
-
-    let items: Vec<ListItem> = app.visible().into_iter().map(list_item).collect();
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default();
-    state.select(app.selected_in_viewport());
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
-/// Build one list line: a bold section-header line (grouped view only), or
-/// a row — colored activity dot, pin marker (if pinned), title (or id),
-/// dimmed cwd. Each is its own `ListItem`/physical line rather than a
-/// header bundled into its row, matching the index space
-/// `App::click`/`App::scroll`/`App::ensure_visible` all use — see
-/// [`crate::app::ListLine`] for why that matters for mouse clicks.
-fn list_item(line: ListLine<'_>) -> ListItem<'static> {
-    match line {
-        ListLine::Header(name) => ListItem::new(Line::from(Span::styled(
-            name,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))),
-        ListLine::Row(visible) => {
-            let dot = Span::styled(
-                "\u{25cf} ",
-                Style::default().fg(activity_color(visible.row.activity)),
-            );
-            let pin = if visible.pinned {
-                // Plain ASCII, not a star symbol/emoji: those can render
-                // double-width in some terminals and would break column
-                // alignment.
-                Span::styled(
-                    "* ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw("  ")
-            };
-            let title = Span::raw(visible.row.display_title().to_string());
-            let cwd = visible.row.cwd_display();
-            let row_line = if cwd.is_empty() {
-                Line::from(vec![dot, pin, title])
-            } else {
-                Line::from(vec![
-                    dot,
-                    pin,
-                    title,
-                    Span::raw("  "),
-                    Span::styled(cwd, Style::default().fg(Color::DarkGray)),
-                ])
-            };
-            ListItem::new(row_line)
-        }
-    }
-}
-
-/// Render the always-visible summary panel below the list: the selected
-/// session's activity dot + title, preview excerpt, cwd, and a meta line
-/// (relative age, size, short id, pinned/agent markers). A top border is the
-/// only visual separation from the list, to keep this compact. Dropped
-/// entirely in a too-short terminal — see [`MIN_HEIGHT_FOR_SUMMARY`] — in
-/// which case `area` is zero-height and this is a no-op.
-fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Details ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let Some(row) = app.selected_row() else {
-        frame.render_widget(
-            Paragraph::new("No session selected.").style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
-        return;
-    };
-
-    let title_line = Line::from(vec![
-        Span::styled(
-            "\u{25cf} ",
-            Style::default().fg(activity_color(row.activity)),
-        ),
-        Span::styled(
-            row.display_title().to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let preview_line = Line::from(Span::styled(
-        row.preview.as_deref().unwrap_or_default(),
-        Style::default().fg(Color::DarkGray),
-    ));
-    let cwd_line = Line::from(Span::styled(
-        row.cwd_display(),
-        Style::default().fg(Color::DarkGray),
-    ));
-    let meta_line = Line::from(Span::styled(
-        summary_meta(row, app.is_selected_pinned(), SystemTime::now()),
-        Style::default().fg(Color::DarkGray),
-    ));
-    frame.render_widget(
-        Paragraph::new(vec![title_line, preview_line, cwd_line, meta_line]),
-        inner,
-    );
-}
-
-/// Build the summary panel's meta line: relative age, size, short id, and
-/// any markers (pinned/agent) that apply.
-fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> String {
-    let mut parts = vec![
-        session::humanize_age(row.mtime, now),
-        session::humanize_size(row.size),
-        session::short_id(&row.id),
-    ];
-    if pinned {
-        parts.push("pinned".to_string());
-    }
-    if row.is_agent {
-        parts.push("agent".to_string());
-    }
-    parts.join("  \u{b7}  ")
 }
 
 /// Render the bottom status bar: key hints (or a transient message) on the
@@ -2018,17 +1879,6 @@ fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect
     let mut list_state = ListState::default();
     list_state.select(state.selected());
     frame.render_stateful_widget(list, list_area, &mut list_state);
-}
-
-/// Map an [`Activity`] to its list-dot color.
-fn activity_color(activity: Activity) -> Color {
-    match activity {
-        Activity::Busy => Color::Green,
-        Activity::Alive => Color::Cyan,
-        Activity::Idle(AgeBucket::Today) => Color::Yellow,
-        Activity::Idle(AgeBucket::ThisWeek) => Color::Gray,
-        Activity::Idle(AgeBucket::Older) => Color::DarkGray,
-    }
 }
 
 #[cfg(test)]

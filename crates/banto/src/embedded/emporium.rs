@@ -21,15 +21,16 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
 
-use crate::app::{App, ListLine};
+use crate::app::App;
 use crate::opener::{self, SessionToOpen};
 use crate::session;
+use crate::view;
 
 use super::pty::PortablePtyHost;
 use super::render::screen_to_text;
@@ -208,33 +209,23 @@ fn draw(
 }
 
 fn render_sidebar(frame: &mut ratatui::Frame, app: &App, area: Rect, status: Option<&str>) {
-    let selected = app.selected_in_viewport();
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, line) in app.visible().iter().enumerate() {
-        let (text, mut style) = match line {
-            ListLine::Header(name) => (format!("— {name} —"), Style::default().fg(Color::DarkGray)),
-            ListLine::Row(visible) => {
-                let tag = session::activity_tag(visible.row.activity);
-                let mark = if visible.pinned { "*" } else { " " };
-                (
-                    format!("{mark}{tag} {}", visible.row.display_title()),
-                    Style::default(),
-                )
-            }
+    // Reuse the classic list rendering so both modes look identical.
+    view::render_list(frame, app, area);
+    // A transient status (e.g. "already running elsewhere") overlays the last
+    // sidebar row; it's rare and short-lived, so it needn't reserve a row.
+    if let Some(status) = status
+        && area.height > 0
+    {
+        let status_area = Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
         };
-        if Some(i) == selected {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        lines.push(Line::from(Span::styled(text, style)));
+        frame.render_widget(
+            Paragraph::new(Span::styled(status, Style::default().fg(Color::Yellow))),
+            status_area,
+        );
     }
-    if let Some(status) = status {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            status.to_string(),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn border_style(focused: bool) -> Style {

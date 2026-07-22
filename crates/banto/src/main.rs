@@ -16,6 +16,7 @@ mod process;
 mod session;
 mod sgr;
 mod tui;
+mod view;
 mod wrap;
 
 use std::path::{Path, PathBuf};
