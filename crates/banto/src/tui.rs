@@ -1733,7 +1733,7 @@ fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 /// there is nothing to blank behind it — the one-column widen is solely to
 /// neutralize a background full-width character straddling the border
 /// itself (see [`modal_clear_area`]).
-fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
+pub(crate) fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
     let area = modal_area(full_area);
     frame.render_widget(Clear, modal_clear_area(full_area));
     match modal {

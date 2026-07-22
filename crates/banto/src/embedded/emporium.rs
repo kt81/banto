@@ -1,10 +1,11 @@
 //! The "emporium" (大店 / `--emporium` / `--oodana`) mode: banto as a
 //! persistent left sidebar (the session list) plus a right pane hosting the
-//! selected session embedded. Slice 1b — a single right pane; brigades
-//! (multiple panes) come in Slice 2.
+//! selected session embedded. Sessions stay alive across switches (keep-alive);
+//! Slice 2 (brigades — multiple visible panes) builds on that.
 //!
-//! This is a separate top-level mode chosen at launch. The classic list TUI
-//! (`crate::tui`) is left untouched; only `main` decides which mode to run.
+//! A separate top-level mode chosen at launch. The classic list TUI
+//! (`crate::tui`) owns the shared pieces this reuses — `App` (list state), the
+//! `view` renderers, the store-load helpers, and `render_modal`.
 
 use std::cell::RefCell;
 use std::io::{self, Stdout};
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -26,10 +27,11 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
+use banto_core::model::SessionId;
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
 use banto_core::store::Store;
 
-use crate::app::App;
+use crate::app::{App, GroupJoinTarget, Modal, Mode};
 use crate::opener::{self, SessionToOpen};
 use crate::session;
 use crate::view;
@@ -50,6 +52,27 @@ enum Focus {
     Pane,
 }
 
+/// The emporium's own mutable UI state, kept apart from `App` (which holds the
+/// shared list state): the kept-alive session panes, which one is shown, the
+/// focus, and a transient status line.
+struct Emporium {
+    /// Kept-alive embedded sessions, keyed by session id (or a `new::<cwd>`
+    /// synthetic key for freshly-launched ones that have no id yet).
+    sessions: Vec<(String, EmbeddedSession)>,
+    /// Index into `sessions` of the one shown in the pane.
+    current: Option<usize>,
+    focus: Focus,
+    status: Option<String>,
+}
+
+/// Which confirm branch an open modal takes — resolved before mutating `App`
+/// so its `modal()` borrow doesn't overlap the mutation.
+enum ModalKind {
+    Archive,
+    Group,
+    New,
+}
+
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
 pub fn run(claude_home: &Path, thresholds: &AgeThresholds, store: &RefCell<Store>) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
@@ -68,20 +91,24 @@ pub fn run(claude_home: &Path, thresholds: &AgeThresholds, store: &RefCell<Store
         .with_groups(groups, session_groups);
 
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, claude_home);
+    let result = event_loop(&mut terminal, &mut app, claude_home, thresholds, store);
     let restored = restore_terminal();
     result.and(restored)
 }
 
-fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<()> {
-    // Sessions stay alive across switches (keep-alive); `current` indexes the
-    // one shown in the pane. Pumping all of them each tick keeps the hidden
-    // ones advancing — the substrate a brigade (multiple visible panes) builds
-    // on.
-    let mut sessions: Vec<(String, EmbeddedSession)> = Vec::new();
-    let mut current: Option<usize> = None;
-    let mut focus = Focus::Sidebar;
-    let mut status: Option<String> = None;
+fn event_loop(
+    terminal: &mut Tui,
+    app: &mut App,
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+    store: &RefCell<Store>,
+) -> Result<()> {
+    let mut ui = Emporium {
+        sessions: Vec::new(),
+        current: None,
+        focus: Focus::Sidebar,
+        status: None,
+    };
 
     loop {
         let size = terminal.size()?;
@@ -90,22 +117,22 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
 
         // Pump every session so hidden ones keep advancing; resize only the
         // visible one to its pane.
-        for (_, session) in sessions.iter_mut() {
+        for (_, session) in ui.sessions.iter_mut() {
             session.pump();
         }
-        if let Some(i) = current {
+        if let Some(i) = ui.current {
             let content = pane_content(pane_area);
-            sessions[i].1.resize(content.height, content.width);
+            ui.sessions[i].1.resize(content.height, content.width);
         }
 
-        let pane = current.map(|i| &sessions[i].1);
+        let pane = ui.current.map(|i| &ui.sessions[i].1);
         terminal.draw(|frame| {
             draw(
                 frame,
                 app,
                 pane,
-                focus,
-                status.as_deref(),
+                ui.focus,
+                ui.status.as_deref(),
                 sidebar_area,
                 pane_area,
             )
@@ -114,73 +141,91 @@ fn event_loop(terminal: &mut Tui, app: &mut App, claude_home: &Path) -> Result<(
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && !handle_key(&mut ui, app, store, claude_home, thresholds, key)
         {
-            // F2 always toggles focus and is never forwarded to the child.
-            if key.code == KeyCode::F(2) {
-                focus = match focus {
-                    Focus::Sidebar if current.is_some() => Focus::Pane,
-                    _ => Focus::Sidebar,
-                };
-                continue;
-            }
-            match focus {
-                Focus::Sidebar => {
-                    status = None;
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-                        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-                        KeyCode::PageUp => app.page_up(),
-                        KeyCode::PageDown => app.page_down(),
-                        KeyCode::Home => app.select_first(),
-                        KeyCode::End => app.select_last(),
-                        KeyCode::Enter => open_or_switch(
-                            app,
-                            claude_home,
-                            &mut sessions,
-                            &mut current,
-                            &mut focus,
-                            &mut status,
-                        ),
-                        KeyCode::Tab => {
-                            app.toggle_grouped_view();
-                        }
-                        KeyCode::Char('a') => {
-                            app.toggle_agent_filter();
-                        }
-                        _ => {}
-                    }
-                }
-                Focus::Pane => {
-                    if let Some(i) = current {
-                        sessions[i].1.send_key(&key);
-                    }
-                }
-            }
+            break;
         }
     }
     Ok(())
+}
+
+/// Dispatch one key press. Returns `false` when the user asked to quit.
+fn handle_key(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+    key: KeyEvent,
+) -> bool {
+    let code = key.code;
+
+    // A modal takes over all keys.
+    if app.modal().is_some() {
+        modal_key(ui, app, store, claude_home, thresholds, code);
+        return true;
+    }
+    // Search mode: characters type into the query.
+    if app.mode() == Mode::Search {
+        search_key(app, code);
+        return true;
+    }
+    // F2 toggles focus and is never forwarded to the child.
+    if code == KeyCode::F(2) {
+        ui.focus = match ui.focus {
+            Focus::Sidebar if ui.current.is_some() => Focus::Pane,
+            _ => Focus::Sidebar,
+        };
+        return true;
+    }
+
+    match ui.focus {
+        Focus::Pane => {
+            if let Some(i) = ui.current {
+                ui.sessions[i].1.send_key(&key);
+            }
+        }
+        Focus::Sidebar => {
+            ui.status = None;
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => return false,
+                KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                KeyCode::PageUp => app.page_up(),
+                KeyCode::PageDown => app.page_down(),
+                KeyCode::Home => app.select_first(),
+                KeyCode::End => app.select_last(),
+                KeyCode::Enter => open_or_switch(ui, app, claude_home),
+                KeyCode::Tab => {
+                    app.toggle_grouped_view();
+                }
+                KeyCode::Char('/') => app.enter_search(),
+                KeyCode::Char('a') => {
+                    app.toggle_agent_filter();
+                }
+                KeyCode::Char('p') => toggle_pin(app, store),
+                KeyCode::Char('d') => app.open_confirm_archive_modal(),
+                KeyCode::Char('g') => app.open_group_join_modal(),
+                KeyCode::Char('n') => app.open_new_session_modal(),
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// Enter on the sidebar: switch to the selected session if it's already open
 /// (keeping every session alive), else open it in a new kept-alive pane.
 /// Switching to an already-open session never re-resumes it — that would fork
 /// its history (a double resume) even though banto itself is what holds it.
-fn open_or_switch(
-    app: &App,
-    claude_home: &Path,
-    sessions: &mut Vec<(String, EmbeddedSession)>,
-    current: &mut Option<usize>,
-    focus: &mut Focus,
-    status: &mut Option<String>,
-) {
+fn open_or_switch(ui: &mut Emporium, app: &App, claude_home: &Path) {
     let Some(row) = app.selected_row() else {
         return;
     };
     let id = row.id.clone();
-    if let Some(i) = sessions.iter().position(|(sid, _)| *sid == id) {
-        *current = Some(i);
-        *focus = Focus::Pane;
+    if let Some(i) = ui.sessions.iter().position(|(sid, _)| *sid == id) {
+        ui.current = Some(i);
+        ui.focus = Focus::Pane;
         return;
     }
     let target = SessionToOpen {
@@ -192,14 +237,14 @@ fn open_or_switch(
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default(),
     };
-    match open_embedded(&target, claude_home, status) {
+    match open_embedded(&target, claude_home, &mut ui.status) {
         Ok(Some(embedded)) => {
-            sessions.push((id, embedded));
-            *current = Some(sessions.len() - 1);
-            *focus = Focus::Pane;
+            ui.sessions.push((id, embedded));
+            ui.current = Some(ui.sessions.len() - 1);
+            ui.focus = Focus::Pane;
         }
         Ok(None) => {}
-        Err(err) => *status = Some(format!("failed to open: {err}")),
+        Err(err) => ui.status = Some(format!("failed to open: {err}")),
     }
 }
 
@@ -222,6 +267,191 @@ fn open_embedded(
     Ok(Some(embedded))
 }
 
+/// Toggle the selected session's pin and persist it (mirrors the classic
+/// `toggle_pin`). No status bar in this layout, so the re-sort is the feedback.
+fn toggle_pin(app: &mut App, store: &RefCell<Store>) {
+    let Some((id, now_pinned)) = app.toggle_pin() else {
+        return;
+    };
+    let store = store.borrow();
+    let _ = if now_pinned {
+        store.pin(&SessionId(id))
+    } else {
+        store.unpin(&SessionId(id))
+    };
+}
+
+/// Reload the session list from disk (after an archive, so it disappears
+/// immediately) — the emporium counterpart of the classic `reload`.
+fn reload(app: &mut App, claude_home: &Path, thresholds: &AgeThresholds, store: &RefCell<Store>) {
+    if let Ok(rows) = session::load_rows(claude_home, thresholds) {
+        let rows = crate::tui::exclude_archived(rows, &store.borrow());
+        app.replace_rows(rows);
+    }
+}
+
+/// Search-mode keys: type into / edit the query (mirrors classic
+/// `handle_search_key`).
+fn search_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Home => app.move_cursor_home(),
+        KeyCode::End => app.move_cursor_end(),
+        KeyCode::Enter => app.confirm_search(),
+        KeyCode::Esc => app.exit_search(),
+        KeyCode::Char(c) => app.push_char(c),
+        _ => {}
+    }
+}
+
+/// Modal keys: edit the modal's input / candidate selection, confirm, or
+/// cancel (mirrors classic `handle_modal_key`; confirm is emporium-specific
+/// since a new session opens embedded here, not in-place/split).
+fn modal_key(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+    code: KeyCode,
+) {
+    match code {
+        KeyCode::Esc => app.close_modal(),
+        KeyCode::Up => app.modal_select_prev(),
+        KeyCode::Down => app.modal_select_next(),
+        KeyCode::Left => app.modal_cursor_left(),
+        KeyCode::Right => app.modal_cursor_right(),
+        KeyCode::Home => app.modal_cursor_home(),
+        KeyCode::End => app.modal_cursor_end(),
+        KeyCode::Tab => app.modal_complete_candidate(),
+        KeyCode::Backspace => app.modal_backspace(),
+        KeyCode::Delete => app.modal_delete_forward(),
+        KeyCode::Enter => confirm_modal(ui, app, store, claude_home, thresholds),
+        KeyCode::Char(c) => app.modal_push_char(c),
+        _ => {}
+    }
+}
+
+fn confirm_modal(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+) {
+    // Resolve the kind first so `app.modal()`'s borrow doesn't overlap the
+    // mutations each branch performs.
+    let kind = match app.modal() {
+        Some(Modal::ConfirmArchive { .. }) => Some(ModalKind::Archive),
+        Some(Modal::GroupJoin(_)) => Some(ModalKind::Group),
+        Some(Modal::NewSession(_)) => Some(ModalKind::New),
+        None => None,
+    };
+    match kind {
+        Some(ModalKind::Archive) => confirm_archive(ui, app, store, claude_home, thresholds),
+        Some(ModalKind::Group) => confirm_group_join(ui, app, store),
+        Some(ModalKind::New) => confirm_new_embedded(ui, app),
+        None => {}
+    }
+}
+
+/// Confirm the archive dialog: soft-hide via the store, then reload so it
+/// leaves the list immediately.
+fn confirm_archive(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+) {
+    let Some(Modal::ConfirmArchive { session_id, title }) = app.modal() else {
+        return;
+    };
+    let session_id = session_id.clone();
+    let title = title.clone();
+    let result = store.borrow().archive_session(&SessionId(session_id));
+    ui.status = Some(match result {
+        Ok(()) => format!("archived {title}"),
+        Err(err) => format!("failed to archive {title}: {err}"),
+    });
+    app.close_modal();
+    reload(app, claude_home, thresholds, store);
+}
+
+/// Confirm the group-join dialog: join the highlighted group or create+join a
+/// new one (mirrors classic `confirm_group_join_modal`).
+fn confirm_group_join(ui: &mut Emporium, app: &mut App, store: &RefCell<Store>) {
+    let Some(Modal::GroupJoin(state)) = app.modal() else {
+        return;
+    };
+    let session_id = state.session_id().to_string();
+    let Some(target) = app.modal_group_join_target() else {
+        return;
+    };
+
+    let mut store = store.borrow_mut();
+    let (group_id, group_name, result) = match target {
+        GroupJoinTarget::Existing(group_id, name) => {
+            let result = store.set_session_group(&SessionId(session_id.clone()), group_id);
+            (group_id, name, result)
+        }
+        GroupJoinTarget::New(name) => match store.create_group(&name) {
+            Ok(group_id) => {
+                let result = store.set_session_group(&SessionId(session_id.clone()), group_id);
+                (group_id, name, result)
+            }
+            Err(err) => {
+                drop(store);
+                ui.status = Some(format!("failed to create group \"{name}\": {err}"));
+                app.close_modal();
+                return;
+            }
+        },
+    };
+    drop(store);
+
+    ui.status = Some(match &result {
+        Ok(()) => format!("joined group \"{group_name}\""),
+        Err(err) => format!("failed to join group \"{group_name}\": {err}"),
+    });
+    if result.is_ok() {
+        app.set_session_group_cache(&session_id, group_id, group_name);
+    }
+    app.close_modal();
+}
+
+/// Confirm the new-session dialog: launch a fresh `claude` in the chosen cwd as
+/// an embedded pane (emporium's answer to the classic in-place/split new).
+fn confirm_new_embedded(ui: &mut Emporium, app: &mut App) {
+    let Some(Modal::NewSession(_)) = app.modal() else {
+        return;
+    };
+    let Some(cwd) = app.modal_new_session_target() else {
+        return;
+    };
+    if !cwd.is_dir() {
+        app.modal_set_error(format!("{} is not a directory", cwd.display()));
+        return;
+    }
+    let argv = opener::inplace_argv(None);
+    match EmbeddedSession::open(&PortablePtyHost, &argv, Some(&cwd), 24, 80) {
+        Ok(embedded) => {
+            // No session id yet (Claude assigns it); a `new::` key never
+            // collides with a real UUID row id, so it's never re-selected from
+            // the sidebar (which would risk a second resume).
+            ui.sessions
+                .push((format!("new::{}", cwd.display()), embedded));
+            ui.current = Some(ui.sessions.len() - 1);
+            ui.focus = Focus::Pane;
+        }
+        Err(err) => ui.status = Some(format!("failed to start a new session: {err}")),
+    }
+    app.close_modal();
+}
+
 fn draw(
     frame: &mut ratatui::Frame,
     app: &App,
@@ -231,8 +461,17 @@ fn draw(
     sidebar_area: Rect,
     pane_area: Rect,
 ) {
+    let full_area = frame.area();
+
+    // In search mode the query lives in the sidebar title (no dedicated search
+    // box in this layout).
+    let sidebar_title = if app.mode() == Mode::Search {
+        format!("/ {}", app.query())
+    } else {
+        "banto".to_string()
+    };
     let sidebar_block = Block::bordered()
-        .title("banto")
+        .title(sidebar_title)
         .border_style(border_style(focus == Focus::Sidebar));
     let sidebar_inner = sidebar_block.inner(sidebar_area);
     frame.render_widget(sidebar_block, sidebar_area);
@@ -262,6 +501,11 @@ fn draw(
                 content,
             );
         }
+    }
+
+    // A modal overlays everything, reusing the classic modal rendering.
+    if let Some(modal) = app.modal() {
+        crate::tui::render_modal(frame, modal, full_area);
     }
 }
 
