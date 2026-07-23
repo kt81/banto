@@ -69,6 +69,18 @@ pub struct BrigadeMember {
     pub role: BrigadeRole,
 }
 
+/// A queued message from one brigade member to the peer role (see the
+/// `brigade_messages` migration): what a recipient pulls via
+/// [`Store::fetch_brigade_messages`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrigadeMessage {
+    /// Monotonic queue id (also the per-session read cursor).
+    pub id: i64,
+    /// The session that sent it (for attribution in the firewall framing).
+    pub from_session: String,
+    pub body: String,
+}
+
 impl Store {
     /// Creates an (empty) brigade and returns its id.
     pub fn create_brigade(&self, name: &str) -> Result<BrigadeId, StoreError> {
@@ -176,6 +188,78 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// Enqueue a message in `brigade_id` from `from_session`, addressed to
+    /// `to_role` (every session of that role in the brigade will pull it).
+    /// Returns the new message's queue id.
+    pub fn enqueue_brigade_message(
+        &self,
+        brigade_id: BrigadeId,
+        from_session: &str,
+        to_role: BrigadeRole,
+        body: &str,
+    ) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO brigade_messages (brigade_id, from_session, to_role, body, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                brigade_id,
+                from_session,
+                to_role.as_token(),
+                body,
+                system_time_to_unix_ms(SystemTime::now())
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Pull the messages in `brigade_id` addressed to `recipient_role` that
+    /// `session_id` has not seen yet (id past its cursor), oldest first, and
+    /// advance that session's cursor past them — so a later call returns only
+    /// what has arrived since. Per-session cursors mean each recipient of a
+    /// broadcast sees it independently.
+    pub fn fetch_brigade_messages(
+        &mut self,
+        brigade_id: BrigadeId,
+        session_id: &str,
+        recipient_role: BrigadeRole,
+    ) -> Result<Vec<BrigadeMessage>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let cursor: i64 = tx
+            .query_row(
+                "SELECT last_seen_id FROM brigade_cursors WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let messages = {
+            let mut stmt = tx.prepare(
+                "SELECT id, from_session, body FROM brigade_messages
+                 WHERE brigade_id = ?1 AND to_role = ?2 AND id > ?3 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(
+                params![brigade_id, recipient_role.as_token(), cursor],
+                |row| {
+                    Ok(BrigadeMessage {
+                        id: row.get(0)?,
+                        from_session: row.get(1)?,
+                        body: row.get(2)?,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if let Some(max_id) = messages.last().map(|message| message.id) {
+            tx.execute(
+                "INSERT INTO brigade_cursors (session_id, last_seen_id) VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET last_seen_id = excluded.last_seen_id",
+                params![session_id, max_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(messages)
     }
 }
 
@@ -302,6 +386,112 @@ mod tests {
                 session_id: sid("w"),
                 role: BrigadeRole::Worker,
             }]
+        );
+    }
+
+    #[test]
+    fn director_message_reaches_the_worker_then_the_cursor_advances() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+
+        // Director sends to the Worker role.
+        store
+            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "please run the tests")
+            .unwrap();
+
+        // The Worker pulls it once.
+        let got = store
+            .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].from_session, "dir");
+        assert_eq!(got[0].body, "please run the tests");
+
+        // A second pull returns nothing (its cursor advanced past the message).
+        assert!(
+            store
+                .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn messages_are_visible_across_separate_connections() {
+        // The Director's and Worker's `banto _mcp` servers are separate
+        // processes, each with its own connection to the same sqlite file —
+        // this is the medium banto mediates over, so a message one enqueues
+        // must be visible to the other's connection.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        let sender = Store::open(&db).unwrap();
+        let br = sender.create_brigade("cell").unwrap();
+        sender
+            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "cross-process")
+            .unwrap();
+
+        let mut receiver = Store::open(&db).unwrap();
+        let got = receiver
+            .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "cross-process");
+    }
+
+    #[test]
+    fn a_broadcast_reaches_every_worker_independently() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "stand by")
+            .unwrap();
+
+        // Both workers see it — per-session cursors, not a shared delivered flag.
+        assert_eq!(
+            store
+                .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .fetch_brigade_messages(br, "w2", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn messages_are_addressed_by_role_and_scoped_to_the_brigade() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        let other = store.create_brigade("other").unwrap();
+
+        // Worker -> Director in this brigade.
+        store
+            .enqueue_brigade_message(br, "w1", BrigadeRole::Director, "done, deviated because X")
+            .unwrap();
+        // Noise addressed to the Director of a *different* brigade.
+        store
+            .enqueue_brigade_message(other, "x", BrigadeRole::Director, "unrelated")
+            .unwrap();
+
+        // The Director pulling its own brigade sees only its message...
+        let got = store
+            .fetch_brigade_messages(br, "dir", BrigadeRole::Director)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "done, deviated because X");
+
+        // ...and a Worker pulling the same brigade sees none (wrong role).
+        assert!(
+            store
+                .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty()
         );
     }
 

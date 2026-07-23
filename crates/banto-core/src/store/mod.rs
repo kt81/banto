@@ -19,7 +19,7 @@ mod panes;
 mod pins;
 mod sessions;
 
-pub use brigades::{Brigade, BrigadeId, BrigadeMember, BrigadeRole};
+pub use brigades::{Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole};
 pub use groups::{Group, GroupId};
 pub use panes::PaneRecord;
 

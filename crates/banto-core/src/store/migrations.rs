@@ -78,6 +78,26 @@ const MIGRATIONS: &[&str] = &[
         role       TEXT NOT NULL,
         PRIMARY KEY (brigade_id, session_id)
     );",
+    // v5: the brigade message queue — the medium banto mediates Director<->Worker
+    // over. Written and read by the `banto _mcp` server(s) that embedded claude
+    // sessions connect to (see crate::mcp), sharing this same sqlite file with
+    // the TUI process (exactly the cross-process access the busy_timeout was set
+    // up for). A message is addressed to a *role* within a brigade (so a Director
+    // broadcasts to every Worker); delivery is per-session-pull via a cursor
+    // (`brigade_cursors`) rather than a global delivered flag, so each recipient
+    // of a broadcast sees it independently.
+    "CREATE TABLE brigade_messages (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        brigade_id    INTEGER NOT NULL,
+        from_session  TEXT NOT NULL,
+        to_role       TEXT NOT NULL,
+        body          TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE brigade_cursors (
+        session_id   TEXT PRIMARY KEY,
+        last_seen_id INTEGER NOT NULL
+    );",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -277,7 +297,62 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v4_to_v5_upgrade_adds_the_message_queue_and_preserves_existing_rows() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v4 code would have left it: v1..=v4 scripts
+        // applied, a brigade with a Director, `user_version` left at 4. The
+        // message-queue tables do not exist yet.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..4] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, session_id, role)
+                 VALUES (1, 'dir', 'director')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        // Opening through Store::open must run the v5 migration: the queue is
+        // usable, and the pre-existing brigade membership is untouched.
+        let mut store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .brigade_of_session(&SessionId("dir".to_string()))
+                .unwrap(),
+            Some((1, BrigadeRole::Director))
+        );
+        store
+            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "hi")
+            .unwrap();
+        assert_eq!(
+            store
+                .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     #[test]

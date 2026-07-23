@@ -109,10 +109,16 @@ enum Command {
     /// not meant to be invoked directly.
     #[command(name = "_mcp", hide = true)]
     Mcp {
-        /// Identifies the calling session (echoed by the ping tool; the
-        /// brigade role/id will join it as the message tools land).
+        /// The calling session's id (echoed by the ping tool; the `from`
+        /// attribution on messages it sends).
         #[arg(long)]
         session: Option<String>,
+        /// The brigade this session belongs to — enables the message tools.
+        #[arg(long)]
+        brigade: Option<i64>,
+        /// This session's role in the brigade: `director` or `worker`.
+        #[arg(long)]
+        role: Option<String>,
     },
 }
 
@@ -162,7 +168,19 @@ fn main() -> Result<()> {
             std::process::exit(code)
         }
         Some(Command::Embed { cwd, argv }) => embedded::run_embedded(&argv, cwd.as_deref()),
-        Some(Command::Mcp { session }) => mcp::run_stdio_server(session),
+        Some(Command::Mcp {
+            session,
+            brigade,
+            role,
+        }) => {
+            let store = open_store(&config)?;
+            let identity = mcp::Identity {
+                session,
+                brigade,
+                role: role.as_deref().and_then(mcp::parse_role),
+            };
+            mcp::run_stdio_server(store, identity)
+        }
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let thresholds = thresholds_from(&config.activity);

@@ -435,7 +435,7 @@ fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_h
         return;
     }
 
-    if let Some(i) = ensure_session_open(ui, row, claude_home) {
+    if let Some(i) = ensure_session_open(ui, row, claude_home, None) {
         ui.stage = Stage::Solo(i);
         ui.focus = Focus::Pane;
     }
@@ -443,11 +443,26 @@ fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_h
 
 /// Ensure `row`'s session is open as an embedded pane, returning its index in
 /// [`Emporium::sessions`]. Reuses the pane if already open; otherwise opens it
-/// (enforcing no-double-resume). Returns `None` when it can't be opened
+/// (enforcing no-double-resume). When `brigade` is set, a freshly-launched
+/// session is wired to its MCP channel. Returns `None` when it can't be opened
 /// (already running elsewhere, or an error — a status is set in both cases).
-fn ensure_session_open(ui: &mut Emporium, row: &SessionRow, claude_home: &Path) -> Option<usize> {
+fn ensure_session_open(
+    ui: &mut Emporium,
+    row: &SessionRow,
+    claude_home: &Path,
+    brigade: Option<(BrigadeId, BrigadeRole)>,
+) -> Option<usize> {
     let id = row.id.clone();
     if let Some(i) = ui.sessions.iter().position(|(sid, _)| *sid == id) {
+        // Already kept alive: reused as-is. If it's joining a brigade now, its
+        // MCP channel can't be wired without relaunching — and banto won't
+        // relaunch a live session (that would fork its history).
+        if brigade.is_some() {
+            ui.status = Some(format!(
+                "{} was already open; its brigade channel activates when reopened",
+                row.display_title()
+            ));
+        }
         return Some(i);
     }
     let target = SessionToOpen {
@@ -459,7 +474,7 @@ fn ensure_session_open(ui: &mut Emporium, row: &SessionRow, claude_home: &Path) 
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default(),
     };
-    match open_embedded(&target, claude_home, &mut ui.status) {
+    match open_embedded(&target, claude_home, brigade, &mut ui.status) {
         Ok(Some(embedded)) => {
             ui.sessions.push((id, embedded));
             Some(ui.sessions.len() - 1)
@@ -481,10 +496,9 @@ fn start_brigade(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_ho
     };
     let name = row.display_title().to_string();
     let session_id = row.id.clone();
-    let Some(idx) = ensure_session_open(ui, row, claude_home) else {
-        return;
-    };
 
+    // Create + persist the brigade first, so the Director launches already wired
+    // to its MCP channel (its identity is passed into the launch below).
     let brigade_id = {
         let mut store = store.borrow_mut();
         match store.create_brigade(&name).and_then(|bid| {
@@ -500,6 +514,15 @@ fn start_brigade(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_ho
         }
     };
 
+    let Some(idx) = ensure_session_open(
+        ui,
+        row,
+        claude_home,
+        Some((brigade_id, BrigadeRole::Director)),
+    ) else {
+        // The brigade is persisted but its Director couldn't open (status set).
+        return;
+    };
     ui.stage = Stage::Brigade {
         id: brigade_id,
         panes: vec![idx],
@@ -557,18 +580,24 @@ fn toggle_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_ho
         return;
     }
 
-    // Otherwise add it as a Worker: open it, persist, and tile it in.
-    let Some(idx) = ensure_session_open(ui, row, claude_home) else {
-        return;
-    };
+    // Otherwise add it as a Worker: persist first, then launch it wired to the
+    // MCP channel, and tile it in.
     if let Err(err) = store.borrow_mut().set_brigade_member(
         brigade_id,
-        &SessionId(session_id),
+        &SessionId(session_id.clone()),
         BrigadeRole::Worker,
     ) {
         ui.status = Some(format!("failed to add worker: {err}"));
         return;
     }
+    let Some(idx) = ensure_session_open(
+        ui,
+        row,
+        claude_home,
+        Some((brigade_id, BrigadeRole::Worker)),
+    ) else {
+        return;
+    };
     if let Stage::Brigade { panes, .. } = &mut ui.stage
         && !panes.contains(&idx)
     {
@@ -599,7 +628,8 @@ fn stage_brigade(
     for member in &members {
         match app.row_for_id(&member.session_id.0) {
             Some(row) => {
-                if let Some(idx) = ensure_session_open(ui, row, claude_home)
+                if let Some(idx) =
+                    ensure_session_open(ui, row, claude_home, Some((brigade_id, member.role)))
                     && !panes.contains(&idx)
                 {
                     panes.push(idx);
@@ -625,10 +655,12 @@ fn stage_brigade(
 
 /// Spawn `session` in a new embedded pane, enforcing the no-double-resume guard
 /// (reusing the classic in-place decision). Returns `None` (and sets a status)
-/// when it's already running elsewhere.
+/// when it's already running elsewhere. When `brigade` is set, the launch is
+/// wired to banto's own MCP server so the session can message its peer.
 fn open_embedded(
     session: &SessionToOpen,
     claude_home: &Path,
+    brigade: Option<(BrigadeId, BrigadeRole)>,
     status: &mut Option<String>,
 ) -> Result<Option<EmbeddedSession>> {
     let live = read_live_sessions(&claude_home.join("sessions"));
@@ -636,10 +668,66 @@ fn open_embedded(
         *status = Some("already running elsewhere".to_string());
         return Ok(None);
     };
+    let mut argv = launch.argv;
+    // A brigade member connects to banto's own MCP server (`banto _mcp`) so it
+    // can message its peer. banto owns the launch argv, so the config file it
+    // points at lives under banto's data dir — never under ~/.claude.
+    if let Some((brigade_id, role)) = brigade {
+        match write_mcp_config(&session.id, brigade_id, role) {
+            Ok(path) => {
+                argv.push("--mcp-config".to_string());
+                argv.push(path.to_string_lossy().into_owned());
+            }
+            Err(err) => *status = Some(format!("brigade channel unavailable: {err}")),
+        }
+    }
     // Size is corrected on the next loop tick from the real pane geometry.
-    let embedded =
-        EmbeddedSession::open(&PortablePtyHost, &launch.argv, Some(&launch.cwd), 24, 80)?;
+    let embedded = EmbeddedSession::open(&PortablePtyHost, &argv, Some(&launch.cwd), 24, 80)?;
     Ok(Some(embedded))
+}
+
+/// Write a per-member `--mcp-config` file wiring the embedded claude to banto's
+/// own MCP server (`banto _mcp`) with this member's brigade identity, and return
+/// its path. Lives under banto's own data dir, never under ~/.claude.
+fn write_mcp_config(session_id: &str, brigade_id: BrigadeId, role: BrigadeRole) -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let role_token = match role {
+        BrigadeRole::Director => "director",
+        BrigadeRole::Worker => "worker",
+    };
+    let config = serde_json::json!({
+        "mcpServers": {
+            "banto": {
+                "command": exe.to_string_lossy(),
+                "args": [
+                    "_mcp",
+                    "--session", session_id,
+                    "--brigade", brigade_id.to_string(),
+                    "--role", role_token,
+                ],
+            }
+        }
+    });
+    let dir = dirs::data_local_dir()
+        .map(|base| base.join("banto").join("mcp"))
+        .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", sanitize_filename(session_id)));
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
+}
+
+/// Keep a session id safe as a filename stem (ids are UUIDs, but be defensive).
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Toggle the selected session's pin and persist it (mirrors the classic
