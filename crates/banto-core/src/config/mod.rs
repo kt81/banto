@@ -73,19 +73,63 @@ impl Default for ActivityConfig {
     }
 }
 
+/// Whether banto auto-nudges a brigade member's stdin once it has unseen
+/// messages and is observed idle, or leaves delivery entirely to a human
+/// prompting `check_messages` (`[brigade] relay` in config.toml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelayMode {
+    /// banto nudges an idle member with unseen messages (see the emporium's
+    /// relay engine).
+    #[default]
+    Auto,
+    /// The relay engine is disabled entirely.
+    Manual,
+}
+
+/// Lenient by design, unlike [`OpenerMode`] (which rejects an unrecognized
+/// value with a parse error): an unrecognized `relay` string falls back to
+/// [`RelayMode::Auto`] rather than failing the whole config load, since a
+/// typo silently keeping the relay on is preferable to it silently taking
+/// the rest of `config.toml` down with it.
+impl<'de> Deserialize<'de> for RelayMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "manual" => RelayMode::Manual,
+            _ => RelayMode::Auto,
+        })
+    }
+}
+
 /// Brigade formation settings (emporium mode only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct BrigadeConfig {
     /// How many fresh Workers to auto-spawn when a brigade is formed.
     /// Clamped to 1..=8 wherever it's consumed — a raw, unclamped value here
     /// lets a config round-trip losslessly even if it's out of range.
     pub workers: u32,
+    /// `--model` passed to an auto-spawned Worker's `claude` invocation. An
+    /// empty string is the escape hatch: no `--model` flag is passed, so the
+    /// Worker inherits the operator's default model. Not validated here —
+    /// an invalid model name is `claude`'s problem, surfaced in the Worker's
+    /// own pane.
+    pub worker_model: String,
+    /// Whether the emporium's relay engine auto-nudges idle brigade members
+    /// with unseen messages.
+    pub relay: RelayMode,
 }
 
 impl Default for BrigadeConfig {
     fn default() -> Self {
-        Self { workers: 1 }
+        Self {
+            workers: 1,
+            worker_model: "sonnet".to_string(),
+            relay: RelayMode::Auto,
+        }
     }
 }
 
@@ -160,6 +204,8 @@ mod tests {
         assert_eq!(config.activity.today_hours, 24);
         assert_eq!(config.activity.week_days, 7);
         assert_eq!(config.brigade.workers, 1);
+        assert_eq!(config.brigade.worker_model, "sonnet");
+        assert_eq!(config.brigade.relay, RelayMode::Auto);
         assert_eq!(config.claude_home, None);
         assert_eq!(config.db_path, None);
     }
@@ -171,14 +217,50 @@ mod tests {
         let config = load(&path).unwrap();
         assert_eq!(config.brigade.workers, 3);
         assert_eq!(config.brigade.worker_count(), 3);
+        assert_eq!(config.brigade.worker_model, "sonnet");
+        assert_eq!(config.brigade.relay, RelayMode::Auto);
     }
 
     #[test]
     fn brigade_worker_count_clamps_to_one_through_eight() {
-        assert_eq!(BrigadeConfig { workers: 0 }.worker_count(), 1);
-        assert_eq!(BrigadeConfig { workers: 1 }.worker_count(), 1);
-        assert_eq!(BrigadeConfig { workers: 8 }.worker_count(), 8);
-        assert_eq!(BrigadeConfig { workers: 20 }.worker_count(), 8);
+        fn with_workers(workers: u32) -> BrigadeConfig {
+            BrigadeConfig {
+                workers,
+                ..Default::default()
+            }
+        }
+        assert_eq!(with_workers(0).worker_count(), 1);
+        assert_eq!(with_workers(1).worker_count(), 1);
+        assert_eq!(with_workers(8).worker_count(), 8);
+        assert_eq!(with_workers(20).worker_count(), 8);
+    }
+
+    #[test]
+    fn brigade_worker_model_and_relay_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "[brigade]\nworker_model = \"opus\"\nrelay = \"manual\"\n",
+        );
+        let config = load(&path).unwrap();
+        assert_eq!(config.brigade.worker_model, "opus");
+        assert_eq!(config.brigade.relay, RelayMode::Manual);
+    }
+
+    #[test]
+    fn brigade_worker_model_empty_string_is_the_inherit_default_escape_hatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[brigade]\nworker_model = \"\"\n");
+        let config = load(&path).unwrap();
+        assert_eq!(config.brigade.worker_model, "");
+    }
+
+    #[test]
+    fn brigade_relay_unknown_value_falls_back_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[brigade]\nrelay = \"sometimes\"\n");
+        let config = load(&path).unwrap();
+        assert_eq!(config.brigade.relay, RelayMode::Auto);
     }
 
     #[test]

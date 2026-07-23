@@ -8,7 +8,7 @@
 //! `view` renderers, the store-load helpers, and `render_modal`.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -29,9 +29,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
+use banto_core::config::{BrigadeConfig, RelayMode};
 use banto_core::model::SessionId;
 use banto_core::provider::claude_code::ClaudeCodeProvider;
-use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
+use banto_core::status::{AgeThresholds, ProcessProbe, SysinfoProbe, read_live_sessions};
 use banto_core::store::{BrigadeId, BrigadeMember, BrigadeRole, MemberToken, Store};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
@@ -84,6 +85,12 @@ struct Emporium {
     status: Option<String>,
     /// Freshly-launched sessions awaiting id discovery (see [`discover_new_ids`]).
     pending_new: Vec<PendingNew>,
+    /// Relay engine bookkeeping per brigade member token (see [`relay_tick`]).
+    relay_states: HashMap<MemberToken, RelayState>,
+    /// When a key/mouse event was last forwarded to the focused pane's
+    /// child — the relay engine's "not being typed into" guard (see
+    /// [`should_nudge`]).
+    last_forwarded_input: Option<Instant>,
 }
 
 /// What the right-hand pane region is showing: nothing, a single session, or a
@@ -171,13 +178,15 @@ enum ModalKind {
 }
 
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
-/// `worker_count` is how many fresh Workers `B` auto-spawns when forming a
-/// new brigade (`[brigade].workers` in config.toml, already clamped).
+/// `brigade` is `[brigade]` from config.toml: how many fresh Workers `B`
+/// auto-spawns when forming a new brigade, the `--model` an auto-spawned
+/// Worker launches with, and whether the relay engine (see [`relay_tick`])
+/// is enabled.
 pub fn run(
     claude_home: &Path,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
-    worker_count: usize,
+    brigade: &BrigadeConfig,
 ) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
     // Same store-backed state the classic list builds, so grouping / pins /
@@ -205,7 +214,7 @@ pub fn run(
         claude_home,
         thresholds,
         store,
-        worker_count,
+        brigade,
     );
     let restored = restore_terminal();
     result.and(restored)
@@ -217,7 +226,7 @@ fn event_loop(
     claude_home: &Path,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
-    worker_count: usize,
+    brigade: &BrigadeConfig,
 ) -> Result<()> {
     let mut ui = Emporium {
         sessions: Vec::new(),
@@ -225,9 +234,12 @@ fn event_loop(
         focus: Focus::Sidebar,
         status: None,
         pending_new: Vec::new(),
+        relay_states: HashMap::new(),
+        last_forwarded_input: None,
     };
     let mut watch = LiveWatch::new(claude_home);
     let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
+    let mut last_relay_tick: Option<Instant> = None;
 
     loop {
         let size = terminal.size()?;
@@ -251,19 +263,13 @@ fn event_loop(
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if !handle_key(
-                        &mut ui,
-                        app,
-                        store,
-                        claude_home,
-                        thresholds,
-                        worker_count,
-                        key,
-                    ) {
+                    if !handle_key(&mut ui, app, store, claude_home, thresholds, brigade, key) {
                         break;
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(&mut ui, app, store, mouse, areas, claude_home),
+                Event::Mouse(mouse) => {
+                    handle_mouse(&mut ui, app, store, mouse, areas, claude_home, brigade)
+                }
                 _ => {}
             }
         }
@@ -278,6 +284,12 @@ fn event_loop(
         if !ui.pending_new.is_empty() {
             discover_new_ids(&mut ui, app, store, &provider);
         }
+        // Relay engine tick, throttled to ~1/s (see `relay_tick`).
+        let now = Instant::now();
+        if last_relay_tick.is_none_or(|tick| now.duration_since(tick) >= RELAY_TICK_INTERVAL) {
+            last_relay_tick = Some(now);
+            relay_tick(&mut ui, store, claude_home, brigade.relay);
+        }
     }
     Ok(())
 }
@@ -289,7 +301,7 @@ fn handle_key(
     store: &RefCell<Store>,
     claude_home: &Path,
     thresholds: &AgeThresholds,
-    worker_count: usize,
+    brigade: &BrigadeConfig,
     key: KeyEvent,
 ) -> bool {
     let code = key.code;
@@ -326,6 +338,7 @@ fn handle_key(
         Focus::Pane => {
             if let Some(i) = ui.stage.focused_index() {
                 ui.sessions[i].1.send_key(&key);
+                ui.last_forwarded_input = Some(Instant::now());
             }
         }
         Focus::Sidebar => {
@@ -338,9 +351,9 @@ fn handle_key(
                 KeyCode::PageDown => app.page_down(),
                 KeyCode::Home => app.select_first(),
                 KeyCode::End => app.select_last(),
-                KeyCode::Enter => open_or_switch(ui, app, store, claude_home),
-                KeyCode::Char('B') => handle_brigade_key(ui, app, store, claude_home, worker_count),
-                KeyCode::Char('b') => add_worker(ui, app, store),
+                KeyCode::Enter => open_or_switch(ui, app, store, claude_home, brigade),
+                KeyCode::Char('B') => handle_brigade_key(ui, app, store, claude_home, brigade),
+                KeyCode::Char('b') => add_worker(ui, app, store, brigade),
                 KeyCode::Tab => {
                     app.toggle_grouped_view();
                 }
@@ -368,6 +381,7 @@ fn handle_mouse(
     mouse: MouseEvent,
     areas: Areas,
     claude_home: &Path,
+    brigade: &BrigadeConfig,
 ) {
     if app.modal().is_some() {
         return;
@@ -393,6 +407,7 @@ fn handle_mouse(
             && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect))
         {
             ui.sessions[idx].1.send_bytes(&bytes);
+            ui.last_forwarded_input = Some(Instant::now());
         }
         return;
     }
@@ -412,7 +427,7 @@ fn handle_mouse(
             ui.focus = Focus::Sidebar;
             let viewport_row = (pos.y - sidebar_inner.y) as usize;
             if app.click(viewport_row, Instant::now()) == Some(ClickOutcome::Activated) {
-                open_or_switch(ui, app, store, claude_home);
+                open_or_switch(ui, app, store, claude_home, brigade);
             }
         }
         _ => {}
@@ -457,7 +472,13 @@ fn mouse_btn(button: MouseButton) -> u16 {
 /// that would fork its history (a double resume) even though banto itself is
 /// what holds it. Workers never reach this: they're hidden from the list (see
 /// `App::hidden`).
-fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
+fn open_or_switch(
+    ui: &mut Emporium,
+    app: &App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    brigade: &BrigadeConfig,
+) {
     let Some(row) = app.selected_row() else {
         return;
     };
@@ -470,7 +491,7 @@ fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_h
         .ok()
         .flatten();
     if let Some((brigade_id, _, BrigadeRole::Director)) = membership {
-        stage_brigade(ui, app, store, claude_home, brigade_id);
+        stage_brigade(ui, app, store, claude_home, brigade_id, brigade);
         return;
     }
 
@@ -528,16 +549,16 @@ fn ensure_session_open(
 }
 
 /// `B`: on a session not yet in a brigade, form one (appoint it Director,
-/// auto-spawn `worker_count` fresh Workers). On a session that IS a brigade's
-/// Director, open the disband confirmation instead. A Worker never reaches
-/// here (hidden from the list), but a defensive no-op status covers it in
-/// case that ever changes.
+/// auto-spawn `brigade.worker_count()` fresh Workers). On a session that IS a
+/// brigade's Director, open the disband confirmation instead. A Worker never
+/// reaches here (hidden from the list), but a defensive no-op status covers
+/// it in case that ever changes.
 fn handle_brigade_key(
     ui: &mut Emporium,
     app: &mut App,
     store: &RefCell<Store>,
     claude_home: &Path,
-    worker_count: usize,
+    brigade: &BrigadeConfig,
 ) {
     let Some(row) = app.selected_row().cloned() else {
         return;
@@ -554,21 +575,22 @@ fn handle_brigade_key(
         Some((_, _, BrigadeRole::Worker)) => {
             ui.status = Some("workers can't be promoted to Director directly".to_string());
         }
-        None => form_brigade(ui, app, store, claude_home, worker_count, &row),
+        None => form_brigade(ui, app, store, claude_home, brigade, &row),
     }
 }
 
-/// Form a new brigade with `row` as Director, then auto-spawn `worker_count`
-/// fresh Workers (plain `claude` processes) in its cwd, each wired to the
-/// brigade's MCP channel under its own `worker-N` token. The brigade is
-/// persisted immediately (schema v7), so it can be reopened later from the
-/// sidebar (Enter on the Director).
+/// Form a new brigade with `row` as Director, then auto-spawn
+/// `brigade.worker_count()` fresh Workers (plain `claude` processes,
+/// launched with `--model brigade.worker_model` when non-empty) in its cwd,
+/// each wired to the brigade's MCP channel under its own `worker-N` token.
+/// The brigade is persisted immediately (schema v7), so it can be reopened
+/// later from the sidebar (Enter on the Director).
 fn form_brigade(
     ui: &mut Emporium,
     app: &mut App,
     store: &RefCell<Store>,
     claude_home: &Path,
-    worker_count: usize,
+    brigade: &BrigadeConfig,
     row: &SessionRow,
 ) {
     let name = row.display_title().to_string();
@@ -610,6 +632,7 @@ fn form_brigade(
         return;
     };
 
+    let worker_count = brigade.worker_count();
     let mut panes = vec![director_idx];
     for n in 1..=worker_count {
         let token = format!("worker-{n}");
@@ -621,7 +644,7 @@ fn form_brigade(
             ui.status = Some(format!("failed to add {token}: {err}"));
             continue;
         }
-        if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &token) {
+        if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &token, &brigade.worker_model) {
             panes.push(idx);
         }
     }
@@ -640,7 +663,7 @@ fn form_brigade(
 
 /// `b`: spawn one more fresh Worker into the staged brigade, under the next
 /// `worker-N` token. Requires a brigade to be staged.
-fn add_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>) {
+fn add_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>, brigade: &BrigadeConfig) {
     let brigade_id = match &ui.stage {
         Stage::Brigade { id, .. } => *id,
         _ => {
@@ -673,7 +696,7 @@ fn add_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>) {
         ui.status = Some(format!("failed to add {token}: {err}"));
         return;
     }
-    if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &token) {
+    if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &token, &brigade.worker_model) {
         if let Stage::Brigade { panes, .. } = &mut ui.stage {
             panes.push(idx);
         }
@@ -703,6 +726,7 @@ fn stage_brigade(
     store: &RefCell<Store>,
     claude_home: &Path,
     brigade_id: BrigadeId,
+    brigade: &BrigadeConfig,
 ) {
     let members = match store.borrow().brigade_members(brigade_id) {
         Ok(members) => members,
@@ -735,7 +759,9 @@ fn stage_brigade(
                 }
             }
             None if member.role == BrigadeRole::Worker => {
-                if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &member.token) {
+                if let Some(idx) =
+                    spawn_worker(ui, &cwd, brigade_id, &member.token, &brigade.worker_model)
+                {
                     panes.push(idx);
                 }
             }
@@ -761,15 +787,22 @@ fn stage_brigade(
 /// wired to the brigade's MCP channel, and register it for id discovery
 /// ([`PendingNew`]) so its Claude-assigned session id gets recorded via
 /// `Store::set_member_claude_session` once known (see [`discover_new_ids`]).
-/// Returns its index in [`Emporium::sessions`], or `None` on failure (a
-/// status is set).
+/// `worker_model` is `[brigade].worker_model`: appended as `--model
+/// <worker_model>` when non-empty; an empty string is the escape hatch to
+/// inherit the operator's default model (no flag passed at all). Returns its
+/// index in [`Emporium::sessions`], or `None` on failure (a status is set).
 fn spawn_worker(
     ui: &mut Emporium,
     cwd: &Path,
     brigade_id: BrigadeId,
     token: &str,
+    worker_model: &str,
 ) -> Option<usize> {
     let mut argv = opener::inplace_argv(None);
+    if !worker_model.is_empty() {
+        argv.push("--model".to_string());
+        argv.push(worker_model.to_string());
+    }
     match write_mcp_config(brigade_id, token, BrigadeRole::Worker, None) {
         Ok(path) => {
             argv.push("--mcp-config".to_string());
@@ -1190,6 +1223,198 @@ fn discover_new_ids(
     }
 }
 
+// --- Relay engine ----------------------------------------------------------
+//
+// Today a queued brigade message sits until a human prompts the recipient to
+// call `check_messages`. The relay engine closes that gap: once banto sees a
+// staged member has unseen messages and is idle at its prompt, it types a
+// short fixed line into that member's stdin to start a turn, and the member
+// pulls the real message itself via the tool. The nudge is a control-plane
+// push only — the message body never goes through stdin (attribution of who
+// actually said what, the exactly-once queue semantics, and the fragility of
+// injecting arbitrary text into a live TUI's input all forbid it).
+
+/// How often [`relay_tick`] re-evaluates the staged brigade's members.
+const RELAY_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// Consecutive relay ticks a member must be observed idle before it's
+/// eligible for a nudge — a single idle observation could be a live-session
+/// file caught mid-update.
+const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
+/// How long a focused pane's own recently-forwarded input suppresses a nudge
+/// to it, so the relay never interrupts the user's own typing.
+const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(3);
+/// Minimum gap between nudges to the same member. The first nudge in a batch
+/// (no prior nudge recorded) is exempt from this wait.
+const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
+/// Give up nudging a member after this many attempts on one batch of unseen
+/// messages. It becomes eligible again once the batch drains (a human or the
+/// member itself calls `check_messages`) and a new message arrives.
+const RELAY_MAX_ATTEMPTS: u32 = 3;
+/// The fixed, ASCII-only line typed into a nudged member's stdin, followed by
+/// a lone `\r` to submit it (see [`relay_tick`]).
+const RELAY_NUDGE_LINE: &str =
+    "[banto relay] Your brigade peer sent you a message. Call the check_messages tool now.";
+
+/// A member's nudge backoff: when it was last nudged and how many attempts
+/// have been made since its unseen-message batch was last seen drained.
+#[derive(Debug, Default, Clone, Copy)]
+struct NudgeState {
+    last_nudge: Option<Instant>,
+    attempts: u32,
+}
+
+/// Per-member relay bookkeeping, keyed by member token in
+/// [`Emporium::relay_states`].
+#[derive(Debug, Default, Clone, Copy)]
+struct RelayState {
+    /// Consecutive relay ticks this member has been observed idle.
+    idle_streak: u32,
+    nudge: NudgeState,
+}
+
+/// The relay engine's go/no-go decision for nudging one member on this tick.
+/// Pure and side-effect free: `idle_streak` and `state` are this member's
+/// already-updated bookkeeping (see [`tick_relay_decision`], which owns
+/// advancing them from the tick's raw observations).
+fn should_nudge(
+    now: Instant,
+    idle_streak: u32,
+    is_focused: bool,
+    last_forwarded_input: Option<Instant>,
+    has_unseen: bool,
+    state: &NudgeState,
+) -> bool {
+    if !has_unseen || idle_streak < RELAY_IDLE_STREAK_REQUIRED {
+        return false;
+    }
+    if is_focused
+        && let Some(last_input) = last_forwarded_input
+        && now.saturating_duration_since(last_input) < RELAY_INPUT_QUIET_PERIOD
+    {
+        return false;
+    }
+    if state.attempts >= RELAY_MAX_ATTEMPTS {
+        return false;
+    }
+    if let Some(last_nudge) = state.last_nudge
+        && now.saturating_duration_since(last_nudge) < RELAY_NUDGE_COOLDOWN
+    {
+        return false;
+    }
+    true
+}
+
+/// Advance `token`'s entry in `states` for one relay tick and decide whether
+/// to nudge it now (see [`should_nudge`]). `is_idle_this_tick` is `None` when
+/// the member's live-session entry is missing or unmatched ("unknown" —
+/// never counted toward the idle streak, per the relay spec). `has_unseen`
+/// going `false` drops the entry entirely, so once the member (or a human)
+/// drains its queue, the next message it gets starts an entirely fresh batch
+/// — a fresh idle streak and no cooldown/attempt count carried over.
+fn tick_relay_decision(
+    states: &mut HashMap<MemberToken, RelayState>,
+    token: &MemberToken,
+    now: Instant,
+    is_idle_this_tick: Option<bool>,
+    is_focused: bool,
+    last_forwarded_input: Option<Instant>,
+    has_unseen: bool,
+) -> bool {
+    if !has_unseen {
+        states.remove(token);
+        return false;
+    }
+    let state = states.entry(token.clone()).or_default();
+    state.idle_streak = if is_idle_this_tick == Some(true) {
+        state.idle_streak + 1
+    } else {
+        0
+    };
+    let nudge = should_nudge(
+        now,
+        state.idle_streak,
+        is_focused,
+        last_forwarded_input,
+        has_unseen,
+        &state.nudge,
+    );
+    if nudge {
+        state.nudge.last_nudge = Some(now);
+        state.nudge.attempts += 1;
+    }
+    nudge
+}
+
+/// Relay engine tick, called from the main loop at [`RELAY_TICK_INTERVAL`]: a
+/// no-op unless a brigade is staged and `relay == RelayMode::Auto`. For each
+/// of that brigade's members with a known Claude session id and an open pane
+/// among the staged ones, checks whether it has unseen messages addressed to
+/// its role (`Store::has_unseen_brigade_messages` — read-only, never
+/// advances the recipient's cursor) and whether its live-session entry shows
+/// an alive, non-busy pid, then feeds both into [`tick_relay_decision`]. When
+/// that says to nudge, types [`RELAY_NUDGE_LINE`] into the member's stdin via
+/// the pane's existing `send_bytes`, followed by a lone `\r` to submit it,
+/// and sets a status message. The stdin write and the live-session read
+/// themselves are not unit-tested (this file's existing testing boundary for
+/// child-process I/O); the decision logic above is.
+fn relay_tick(ui: &mut Emporium, store: &RefCell<Store>, claude_home: &Path, relay: RelayMode) {
+    if relay != RelayMode::Auto {
+        return;
+    }
+    let (brigade_id, panes, focused_pane) = match &ui.stage {
+        Stage::Brigade { id, panes, focused } => (*id, panes.clone(), panes.get(*focused).copied()),
+        _ => return,
+    };
+    let members = match store.borrow().brigade_members(brigade_id) {
+        Ok(members) => members,
+        Err(_) => return,
+    };
+    let live = read_live_sessions(&claude_home.join("sessions"));
+    let now = Instant::now();
+
+    for member in &members {
+        let Some(claude_session_id) = member.claude_session_id.as_ref() else {
+            continue;
+        };
+        let Some(idx) = ui
+            .sessions
+            .iter()
+            .position(|(key, _)| key == &claude_session_id.0)
+        else {
+            continue;
+        };
+        if !panes.contains(&idx) {
+            continue;
+        }
+        let has_unseen = store
+            .borrow()
+            .has_unseen_brigade_messages(brigade_id, &member.token, member.role)
+            .unwrap_or(false);
+        let is_idle_this_tick = live
+            .iter()
+            .find(|entry| entry.session_id.as_deref() == Some(claude_session_id.0.as_str()))
+            .map(|entry| {
+                SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
+            });
+        let is_focused = ui.focus == Focus::Pane && focused_pane == Some(idx);
+
+        let nudge = tick_relay_decision(
+            &mut ui.relay_states,
+            &member.token,
+            now,
+            is_idle_this_tick,
+            is_focused,
+            ui.last_forwarded_input,
+            has_unseen,
+        );
+        if nudge {
+            ui.sessions[idx].1.send_bytes(RELAY_NUDGE_LINE.as_bytes());
+            ui.sessions[idx].1.send_bytes(b"\r");
+            ui.status = Some(format!("relay: nudged {}", member.token));
+        }
+    }
+}
+
 fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas) {
     let full_area = frame.area();
     let focus = ui.focus;
@@ -1386,11 +1611,15 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
     use ratatui::layout::Rect;
 
     use super::{
-        MIN_HEIGHT_FOR_SUMMARY, SIDEBAR_WIDTH, SUMMARY_HEIGHT, Stage, layout, pane_content,
-        stage_tiles,
+        MIN_HEIGHT_FOR_SUMMARY, NudgeState, RELAY_IDLE_STREAK_REQUIRED, RELAY_INPUT_QUIET_PERIOD,
+        RELAY_MAX_ATTEMPTS, RELAY_NUDGE_COOLDOWN, RelayState, SIDEBAR_WIDTH, SUMMARY_HEIGHT, Stage,
+        layout, pane_content, should_nudge, stage_tiles, tick_relay_decision,
     };
 
     #[test]
@@ -1486,5 +1715,348 @@ mod tests {
             focused: 2,
         };
         assert_eq!(stage.focused_index(), Some(7));
+    }
+
+    // --- Relay engine: should_nudge / tick_relay_decision -------------------
+
+    #[test]
+    fn should_nudge_happy_path() {
+        let now = Instant::now();
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_blocks_without_unseen_messages() {
+        let now = Instant::now();
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            false,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_busy_blocks() {
+        // A member observed busy never accumulates an idle streak — modeled
+        // here as idle_streak staying at 0.
+        let now = Instant::now();
+        assert!(!should_nudge(
+            now,
+            0,
+            false,
+            None,
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_single_tick_idle_blocks_debounce() {
+        let now = Instant::now();
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED - 1,
+            false,
+            None,
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_focused_with_recent_input_blocks() {
+        let now = Instant::now();
+        let last_input = now - Duration::from_millis(500);
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            true,
+            Some(last_input),
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_focused_without_recent_input_is_allowed() {
+        let now = Instant::now();
+        let last_input = now - RELAY_INPUT_QUIET_PERIOD - Duration::from_secs(1);
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            true,
+            Some(last_input),
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_unfocused_ignores_recent_input() {
+        let now = Instant::now();
+        let last_input = now - Duration::from_millis(10);
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            Some(last_input),
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_attempt_cap_blocks() {
+        let now = Instant::now();
+        let state = NudgeState {
+            last_nudge: Some(now - RELAY_NUDGE_COOLDOWN - Duration::from_secs(1)),
+            attempts: RELAY_MAX_ATTEMPTS,
+        };
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn should_nudge_cooldown_blocks_a_too_soon_second_attempt() {
+        let now = Instant::now();
+        let state = NudgeState {
+            last_nudge: Some(now - Duration::from_secs(10)),
+            attempts: 1,
+        };
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn should_nudge_cooldown_elapsed_allows_another_attempt() {
+        let now = Instant::now();
+        let state = NudgeState {
+            last_nudge: Some(now - RELAY_NUDGE_COOLDOWN - Duration::from_secs(1)),
+            attempts: 1,
+        };
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn should_nudge_first_nudge_is_exempt_from_the_cooldown_wait() {
+        // No prior nudge recorded: the cooldown check never blocks it.
+        let now = Instant::now();
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &NudgeState {
+                last_nudge: None,
+                attempts: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn tick_relay_decision_requires_two_consecutive_idle_ticks() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        // First idle observation: streak is only 1, not nudged yet.
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        // Second consecutive idle observation: streak reaches 2, nudged.
+        assert!(tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn tick_relay_decision_busy_tick_resets_the_idle_streak() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        // Observed busy: streak resets, so the next idle tick starts over.
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(false),
+            false,
+            None,
+            true,
+        ));
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn tick_relay_decision_unknown_live_entry_never_counts_as_idle() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        for _ in 0..5 {
+            assert!(!tick_relay_decision(
+                &mut states,
+                &token,
+                now,
+                None, // no matching live entry: "unknown"
+                false,
+                None,
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn tick_relay_decision_resets_on_drain_so_the_next_batch_starts_fresh() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        // Build up to a nudge.
+        tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
+        assert!(tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        assert_eq!(states.get(&token).unwrap().nudge.attempts, 1);
+
+        // The member drains its queue: has_unseen goes false.
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            false,
+        ));
+        assert!(!states.contains_key(&token));
+
+        // A fresh message arrives: the streak and attempts start over, so a
+        // single idle tick does not immediately nudge again.
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        assert_eq!(states.get(&token).unwrap().idle_streak, 1);
+        assert_eq!(states.get(&token).unwrap().nudge.attempts, 0);
+    }
+
+    #[test]
+    fn tick_relay_decision_stops_after_the_attempt_cap_even_past_cooldown() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let mut now = Instant::now();
+
+        // Two idle ticks to arm the streak, then repeatedly advance past the
+        // cooldown and re-observe idle to rack up nudges.
+        tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
+        for _ in 0..RELAY_MAX_ATTEMPTS {
+            now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
+            assert!(tick_relay_decision(
+                &mut states,
+                &token,
+                now,
+                Some(true),
+                false,
+                None,
+                true,
+            ));
+        }
+        assert_eq!(
+            states.get(&token).unwrap().nudge.attempts,
+            RELAY_MAX_ATTEMPTS
+        );
+
+        // One more, well past cooldown: the attempt cap still blocks it.
+        now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+    }
+
+    // A regression guard for `RelayState`'s field shape used above.
+    #[test]
+    fn relay_state_defaults_to_a_zero_streak_and_fresh_backoff() {
+        let state = RelayState::default();
+        assert_eq!(state.idle_streak, 0);
+        assert_eq!(state.nudge.attempts, 0);
+        assert!(state.nudge.last_nudge.is_none());
     }
 }

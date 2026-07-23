@@ -376,6 +376,36 @@ impl Store {
         tx.commit()?;
         Ok(messages)
     }
+
+    /// Whether `member_token` in `brigade_id` has any message addressed to
+    /// `recipient_role` past its read cursor — same visibility rule as
+    /// [`Self::fetch_brigade_messages`], but EXISTS-only and, critically,
+    /// never advances the cursor. The emporium's relay engine polls this
+    /// roughly once a second to decide whether to nudge an idle member;
+    /// consuming the cursor here would make that polling itself the thing
+    /// that swallows messages before the member ever pulls them.
+    pub fn has_unseen_brigade_messages(
+        &self,
+        brigade_id: BrigadeId,
+        member_token: &str,
+        recipient_role: BrigadeRole,
+    ) -> Result<bool, StoreError> {
+        let cursor: i64 = self
+            .conn
+            .query_row(
+                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+                params![brigade_id, member_token],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM brigade_messages
+             WHERE brigade_id = ?1 AND to_role = ?2 AND id > ?3)",
+            params![brigade_id, recipient_role.as_token(), cursor],
+            |row| row.get(0),
+        )?)
+    }
 }
 
 #[cfg(test)]
@@ -705,6 +735,103 @@ mod tests {
             .optional()
             .unwrap();
         assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn has_unseen_brigade_messages_true_after_enqueue_false_after_fetch() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+            .unwrap();
+
+        assert!(
+            !store
+                .has_unseen_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "hi")
+            .unwrap();
+        assert!(
+            store
+                .has_unseen_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+
+        store
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert!(
+            !store
+                .has_unseen_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn has_unseen_brigade_messages_never_advances_the_cursor() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "hi")
+            .unwrap();
+
+        // Polling repeatedly (as the relay engine's ~1/s tick does) must not
+        // consume the message — a later real fetch must still see it.
+        for _ in 0..3 {
+            assert!(
+                store
+                    .has_unseen_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+                    .unwrap()
+            );
+        }
+        let got = store
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn has_unseen_brigade_messages_is_scoped_by_brigade_and_role() {
+        let mut store = Store::open_in_memory().unwrap();
+        let a = store.create_brigade("a").unwrap();
+        let b = store.create_brigade("b").unwrap();
+        store
+            .add_brigade_member(a, "worker-1", BrigadeRole::Worker, Some(&sid("wa")))
+            .unwrap();
+        store
+            .add_brigade_member(b, "worker-1", BrigadeRole::Worker, Some(&sid("wb")))
+            .unwrap();
+        store
+            .add_brigade_member(a, "director", BrigadeRole::Director, Some(&sid("da")))
+            .unwrap();
+
+        store
+            .enqueue_brigade_message(a, "director", BrigadeRole::Worker, "for a's worker")
+            .unwrap();
+
+        assert!(
+            store
+                .has_unseen_brigade_messages(a, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+        // Same token, different brigade: unaffected.
+        assert!(
+            !store
+                .has_unseen_brigade_messages(b, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+        // Same brigade, wrong role: unaffected.
+        assert!(
+            !store
+                .has_unseen_brigade_messages(a, "director", BrigadeRole::Director)
+                .unwrap()
+        );
     }
 
     #[test]
