@@ -104,8 +104,9 @@ fn list_item(line: ListLine<'_>) -> ListItem<'static> {
 /// dot + title, preview excerpt, cwd, and a meta line (relative age, size,
 /// short id, pinned/agent markers). A top border is the only visual
 /// separation. A zero-height `area` (a too-short terminal, per the caller's
-/// layout) makes this a no-op.
-pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
+/// layout) makes this a no-op. `now` is the caller's own clock read (view
+/// functions are pure `(frame, app, area, now)` — no query during drawing).
+pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
     if area.height == 0 {
         return;
     }
@@ -147,7 +148,7 @@ pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
             row,
             app.is_selected_pinned(),
             app.is_selected_director(),
-            SystemTime::now(),
+            now,
         ),
         Style::default().fg(Color::DarkGray),
     ));

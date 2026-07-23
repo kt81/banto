@@ -401,7 +401,7 @@ fn run_pending_inplace(
         Ok(_) => "returned from session".to_string(),
         Err(err) => format!("failed to run {:?}: {err}", pending.argv),
     };
-    app.set_status(message);
+    app.set_status(message, Instant::now());
     reload(app, ctx);
     Ok(())
 }
@@ -520,7 +520,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
         let [_, list_area, _, _] = layout_areas(Rect::new(0, 0, size.width, size.height));
         app.set_viewport_height(list_area.height as usize);
 
-        terminal.draw(|frame| render(frame, app))?;
+        terminal.draw(|frame| render(frame, app, SystemTime::now()))?;
 
         if event::poll(TICK_INTERVAL)? {
             match event::read()? {
@@ -693,6 +693,7 @@ fn toggle_grouped_view(app: &mut App) {
             "flat view"
         }
         .to_string(),
+        Instant::now(),
     );
 }
 
@@ -815,7 +816,7 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 ) => unreachable!(),
                 Err(err) => format!("failed to launch a new session in {}: {err}", cwd.display()),
             };
-            app.set_status(message);
+            app.set_status(message, Instant::now());
         }
     }
     app.close_modal();
@@ -840,7 +841,7 @@ fn confirm_archive_modal(app: &mut App, ctx: &Context) {
         Ok(()) => format!("archived session {title}"),
         Err(err) => format!("failed to archive session {title}: {err}"),
     };
-    app.set_status(message);
+    app.set_status(message, Instant::now());
     app.close_modal();
     reload(app, ctx);
 }
@@ -873,7 +874,10 @@ fn confirm_group_join_modal(app: &mut App, ctx: &Context) {
             }
             Err(err) => {
                 drop(store);
-                app.set_status(format!("failed to create group \"{name}\": {err}"));
+                app.set_status(
+                    format!("failed to create group \"{name}\": {err}"),
+                    Instant::now(),
+                );
                 app.close_modal();
                 return;
             }
@@ -885,7 +889,7 @@ fn confirm_group_join_modal(app: &mut App, ctx: &Context) {
         Ok(()) => format!("joined group \"{group_name}\""),
         Err(err) => format!("failed to join group \"{group_name}\": {err}"),
     };
-    app.set_status(message);
+    app.set_status(message, Instant::now());
     if result.is_ok() {
         app.set_session_group_cache(&session_id, group_id, group_name);
     }
@@ -1381,7 +1385,10 @@ fn activate(app: &mut App, ctx: &Context) {
             ctx.log(&format!(
                 "activate (in-place) session={id} refused: already live"
             ));
-            app.set_status(format!("session {id} is already running elsewhere"));
+            app.set_status(
+                format!("session {id} is already running elsewhere"),
+                Instant::now(),
+            );
         }
     }
 }
@@ -1460,7 +1467,7 @@ fn activate_split(app: &mut App, ctx: &Context) {
         }
         Err(err) => format!("failed to open session {id}: {err}"),
     };
-    app.set_status(message);
+    app.set_status(message, Instant::now());
     reload(app, ctx);
 }
 
@@ -1483,18 +1490,21 @@ fn toggle_pin(app: &mut App, ctx: &Context) {
         Ok(()) => format!("unpinned session {id}"),
         Err(err) => format!("failed to update pin for session {id}: {err}"),
     };
-    app.set_status(message);
+    app.set_status(message, Instant::now());
 }
 
 /// Toggle whether agent-run sessions are shown, posting the new state as a
 /// status message.
 fn toggle_agent_filter(app: &mut App) {
     let showing = app.toggle_agent_filter();
-    app.set_status(if showing {
-        "showing agent sessions".to_string()
-    } else {
-        "hiding agent sessions".to_string()
-    });
+    app.set_status(
+        if showing {
+            "showing agent sessions".to_string()
+        } else {
+            "hiding agent sessions".to_string()
+        },
+        Instant::now(),
+    );
 }
 
 /// Re-read sessions from disk and re-classify their activity, preserving
@@ -1516,12 +1526,14 @@ fn reload(app: &mut App, ctx: &Context) {
 
 /// Render the whole UI for one frame: search box, list, the always-visible
 /// summary panel, status bar, and finally a modal overlay on top of
-/// everything else, if one is open.
-fn render(frame: &mut Frame, app: &App) {
+/// everything else, if one is open. `now` is threaded down to
+/// `view::render_summary` (its relative-age display) rather than read
+/// internally — the clock is read once, here, at the draw call's boundary.
+fn render(frame: &mut Frame, app: &App, now: SystemTime) {
     let [search_area, list_area, summary_area, status_area] = layout_areas(frame.area());
     render_search(frame, app, search_area);
     view::render_list(frame, app, list_area);
-    view::render_summary(frame, app, summary_area);
+    view::render_summary(frame, app, summary_area, now);
     render_status(frame, app, status_area);
     if let Some(modal) = app.modal() {
         render_modal(frame, modal, frame.area());
@@ -2023,7 +2035,9 @@ mod tests {
     /// use to check the match count stays visible.
     fn draw_with_width(app: &App, width: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, 15)).unwrap();
-        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .draw(|frame| render(frame, app, SystemTime::now()))
+            .unwrap();
         buffer_text(terminal.backend().buffer())
     }
 
@@ -3092,13 +3106,37 @@ mod tests {
         assert!(text.contains("pinned"), "pinned marker missing:\n{text}");
     }
 
+    /// Previously untestable: the summary panel's relative-age text depended
+    /// on the real wall clock (`render` read `SystemTime::now()` internally),
+    /// so the exact age string could never be asserted deterministically.
+    /// Now that `now` is an argument, an injected `now` and a fixed `mtime`
+    /// pin the exact humanized age.
+    #[test]
+    fn render_summary_shows_a_deterministic_relative_age_with_an_injected_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mtime = now - Duration::from_secs(3 * 3600);
+        let mut app = App::new(vec![SessionRow {
+            mtime,
+            ..row("a", "Alpha", "/work/alpha", Activity::Alive)
+        }]);
+        app.set_viewport_height(10);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        terminal.draw(|frame| render(frame, &app, now)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("3h ago"), "got {text}");
+    }
+
     #[test]
     fn summary_panel_is_dropped_in_a_too_short_terminal() {
         let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
         app.set_viewport_height(3);
 
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, SystemTime::now()))
+            .unwrap();
         let text = buffer_text(terminal.backend().buffer());
 
         assert!(
@@ -3553,7 +3591,9 @@ mod tests {
         app.open_confirm_archive_modal();
 
         let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, SystemTime::now()))
+            .unwrap();
         let buf = terminal.backend().buffer();
 
         let area = modal_area(Rect::new(0, 0, 40, 15));
@@ -3611,7 +3651,9 @@ mod tests {
         app.open_confirm_archive_modal();
 
         let mut terminal = Terminal::new(TestBackend::new(40, 15)).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, SystemTime::now()))
+            .unwrap();
         let buf = terminal.backend().buffer();
 
         // Left border at x=2 (same math as above); content used to start

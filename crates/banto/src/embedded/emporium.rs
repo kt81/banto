@@ -275,7 +275,7 @@ fn event_loop(
             ui.sessions[idx].1.resize(content.height, content.width);
         }
 
-        terminal.draw(|frame| draw(frame, app, &ui, areas))?;
+        terminal.draw(|frame| draw(frame, app, &ui, areas, SystemTime::now()))?;
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -1518,7 +1518,10 @@ fn submit_is_due(now: Instant, nudged_at: Instant) -> bool {
     now.saturating_duration_since(nudged_at) >= RELAY_SUBMIT_DELAY
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas) {
+/// `now` is threaded down to `view::render_summary` (its relative-age
+/// display) rather than read internally — the clock is read once, at the
+/// draw call's boundary (see [`event_loop`]).
+fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas, now: SystemTime) {
     let full_area = frame.area();
     let focus = ui.focus;
 
@@ -1536,7 +1539,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas) {
     view::render_list(frame, app, sidebar_inner);
 
     // Details panel below the list (shared with the classic summary).
-    view::render_summary(frame, app, areas.summary);
+    view::render_summary(frame, app, areas.summary, now);
 
     // Right region: the staged session(s), tiled — or a placeholder when
     // nothing is staged.

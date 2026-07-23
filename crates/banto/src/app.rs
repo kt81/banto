@@ -1322,11 +1322,12 @@ impl App {
 
     // --- actions --------------------------------------------------------
 
-    /// Post a transient status-bar message, timestamped for
-    /// [`Self::expire_status`].
-    pub fn set_status(&mut self, message: String) {
+    /// Post a transient status-bar message, timestamped (with the given
+    /// `now`, not read internally — see [`Self::expire_status`]'s doc
+    /// comment for why) for [`Self::expire_status`].
+    pub fn set_status(&mut self, message: String, now: Instant) {
         self.status = Some(message);
-        self.status_set_at = Some(Instant::now());
+        self.status_set_at = Some(now);
     }
 
     /// Clear any transient status-bar message, restoring the key-hint
@@ -1794,7 +1795,7 @@ mod tests {
         app.set_viewport_height(10);
         app.select_next(); // id1
         let id = app.selected_row().unwrap().id.clone();
-        app.set_status(format!("opened session {id}"));
+        app.set_status(format!("opened session {id}"), Instant::now());
         assert_eq!(app.status(), Some("opened session id1"));
     }
 
@@ -1802,7 +1803,7 @@ mod tests {
     fn status_expires_after_the_timeout_but_not_before() {
         let mut app = App::new(numbered(1));
         let t0 = Instant::now();
-        app.set_status("hello".to_string());
+        app.set_status("hello".to_string(), t0);
 
         // Comfortably before the 5s timeout: still showing.
         app.expire_status(t0 + Duration::from_secs(4));
