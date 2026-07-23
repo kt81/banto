@@ -377,6 +377,32 @@ impl Store {
         Ok(messages)
     }
 
+    /// Janitor: deletes every brigade with zero `brigade_members` rows —
+    /// legacy data from before disband purged properly, or residue from a
+    /// crash between [`Self::create_brigade`] and its first
+    /// [`Self::add_brigade_member`] — together with any stray
+    /// `brigade_messages`/`brigade_cursors` rows left under those brigade
+    /// ids. A populated brigade, and all its rows, is left untouched.
+    /// Returns how many brigades were removed.
+    pub fn delete_empty_brigades(&mut self) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let empty_ids: Vec<BrigadeId> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM brigades
+                 WHERE id NOT IN (SELECT DISTINCT brigade_id FROM brigade_members)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for id in &empty_ids {
+            tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
+            tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
+            tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(empty_ids.len())
+    }
+
     /// Whether `member_token` in `brigade_id` has any message addressed to
     /// `recipient_role` past its read cursor — same visibility rule as
     /// [`Self::fetch_brigade_messages`], but EXISTS-only and, critically,
@@ -735,6 +761,80 @@ mod tests {
             .optional()
             .unwrap();
         assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn delete_empty_brigades_purges_membership_free_brigades_and_their_stray_rows() {
+        let mut store = Store::open_in_memory().unwrap();
+        let empty = store.create_brigade("empty").unwrap();
+        let populated = store.create_brigade("populated").unwrap();
+        store
+            .add_brigade_member(
+                populated,
+                "director",
+                BrigadeRole::Director,
+                Some(&sid("dir")),
+            )
+            .unwrap();
+
+        // Stray rows under the empty brigade (e.g. a crash mid-formation, or
+        // legacy pre-v7 data) that a naive `DELETE FROM brigades` would leave
+        // orphaned.
+        store
+            .enqueue_brigade_message(empty, "director", BrigadeRole::Worker, "orphaned")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id)
+                 VALUES (?1, ?2, ?3)",
+                params![empty, "stray", 0],
+            )
+            .unwrap();
+
+        let removed = store.delete_empty_brigades().unwrap();
+        assert_eq!(removed, 1);
+
+        assert_eq!(
+            store.list_brigades().unwrap(),
+            [Brigade {
+                id: populated,
+                name: "populated".to_string(),
+            }]
+        );
+        let messages: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_messages WHERE brigade_id = ?1",
+                [empty],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages, 0);
+        let cursors: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_cursors WHERE brigade_id = ?1",
+                [empty],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursors, 0);
+
+        // The populated brigade and its rows are untouched.
+        assert_eq!(store.brigade_members(populated).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_empty_brigades_returns_zero_when_none_are_empty() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+
+        assert_eq!(store.delete_empty_brigades().unwrap(), 0);
+        assert_eq!(store.list_brigades().unwrap().len(), 1);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -41,6 +41,7 @@ use crate::session::{self, SessionRow};
 use crate::tui::LiveWatch;
 use crate::view;
 
+use super::input::{normalize_paste_line_endings, wrap_bracketed_paste};
 use super::pty::PortablePtyHost;
 use super::render::screen_to_text;
 use super::session::EmbeddedSession;
@@ -199,6 +200,12 @@ pub fn run(
     store: &RefCell<Store>,
     brigade: &BrigadeConfig,
 ) -> Result<()> {
+    // Janitor: purge brigades with no members left (legacy pre-v7 data, or
+    // residue from a crash mid-formation) before the sidebar's brigade-
+    // derived caches (hidden Workers, Directors) load. Silent by design — an
+    // empty brigade is never user-visible, so there's nothing to report.
+    let _ = store.borrow_mut().delete_empty_brigades();
+
     let rows = session::load_rows(claude_home, thresholds)?;
     // Same store-backed state the classic list builds, so grouping / pins /
     // archived-hiding / brigade hiding show identically in the sidebar.
@@ -282,6 +289,7 @@ fn event_loop(
                 Event::Mouse(mouse) => {
                     handle_mouse(&mut ui, app, store, mouse, areas, claude_home, brigade)
                 }
+                Event::Paste(text) => handle_paste(&mut ui, app, text),
                 _ => {}
             }
         }
@@ -445,6 +453,51 @@ fn handle_mouse(
             }
         }
         _ => {}
+    }
+}
+
+/// Handle a paste (the host has bracketed paste enabled — see
+/// [`setup_terminal`] — so a multiline paste arrives here as one `text`
+/// rather than a stream of key events). Routing mirrors [`handle_key`]'s
+/// precedence: an open modal or Search mode insert it character-by-character
+/// through their existing per-char paths (both already filter out control
+/// characters, including the newlines this text may carry — fine for cwd
+/// paths and search queries); otherwise, a focused pane gets it forwarded as
+/// one chunk. Sidebar focus with nothing else active is a no-op, matching
+/// `handle_key`'s own unmapped-key behavior there.
+///
+/// Forwarding first normalizes the pasted text's line endings (xterm-style:
+/// CRLF and lone LF both become a bare CR), then sends it as a SINGLE
+/// `send_bytes` call — bracketed-paste-wrapped when the child has bracketed
+/// paste on (so it lands as one paste event, embedded newlines intact,
+/// instead of one submitted line per newline), raw otherwise. This is the
+/// mirror image of the relay nudge's `\r` needing to be split OUT into its
+/// own later chunk to read as a real Enter (see [`flush_pending_submits`]):
+/// here, one coalesced chunk is exactly the point.
+fn handle_paste(ui: &mut Emporium, app: &mut App, text: String) {
+    if app.modal().is_some() {
+        for c in text.chars() {
+            app.modal_push_char(c);
+        }
+        return;
+    }
+    if app.mode() == Mode::Search {
+        for c in text.chars() {
+            app.push_char(c);
+        }
+        return;
+    }
+    if ui.focus == Focus::Pane
+        && let Some(idx) = ui.stage.focused_index()
+    {
+        let normalized = normalize_paste_line_endings(&text);
+        let session = &mut ui.sessions[idx].1;
+        if session.screen().bracketed_paste() {
+            session.send_bytes(&wrap_bracketed_paste(&normalized));
+        } else {
+            session.send_bytes(normalized.as_bytes());
+        }
+        ui.last_forwarded_input = Some(Instant::now());
     }
 }
 
@@ -1633,17 +1686,32 @@ fn pane_content(pane_area: Rect) -> Rect {
     }
 }
 
+/// Enables bracketed paste on the HOST terminal (in addition to mouse
+/// capture) so a multiline paste arrives as one [`Event::Paste`] instead of a
+/// stream of individual key events banto would otherwise forward as one
+/// real `\r` keypress per line — see [`handle_paste`]. The classic list TUI
+/// (`crate::tui`) is untouched: it has its own, separate `setup_terminal`.
 fn setup_terminal() -> Result<Tui> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     Ok(())
 }
 
@@ -1653,7 +1721,12 @@ fn install_panic_hook() {
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            let _ = execute!(
+                io::stdout(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                DisableBracketedPaste
+            );
             original(info);
         }));
     });
