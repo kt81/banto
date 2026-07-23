@@ -27,6 +27,9 @@ pub fn screen_to_text(screen: &vt100::Screen) -> Text<'static> {
                     if cell.bold() {
                         style = style.add_modifier(Modifier::BOLD);
                     }
+                    if cell.dim() {
+                        style = style.add_modifier(Modifier::DIM);
+                    }
                     if cell.italic() {
                         style = style.add_modifier(Modifier::ITALIC);
                     }
@@ -56,7 +59,7 @@ fn conv_color(color: vt100::Color) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
 
     use super::{conv_color, screen_to_text};
 
@@ -79,5 +82,23 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(first.starts_with("hi"), "got {first:?}");
+    }
+
+    #[test]
+    fn sgr_2_dim_survives_vt100_and_maps_to_the_dim_modifier() {
+        // Claude Code's inline ghost/autosuggest text is rendered with SGR 2
+        // (faint) in a naked terminal; vt100 0.16 models this on `Cell::dim`
+        // (see `attrs.rs`'s `set_dim`/`TEXT_MODE_DIM`), so it must survive the
+        // vt100 -> ratatui conversion rather than being dropped on the floor.
+        let mut parser = vt100::Parser::new(1, 10, 0);
+        parser.process(b"\x1b[2mdim\x1b[0mnormal");
+        let text = screen_to_text(parser.screen());
+        let spans = &text.lines[0].spans;
+
+        let dim_span = spans.iter().find(|s| s.content == "d").unwrap();
+        assert!(dim_span.style.add_modifier.contains(Modifier::DIM));
+
+        let normal_span = spans.iter().find(|s| s.content == "n").unwrap();
+        assert!(!normal_span.style.add_modifier.contains(Modifier::DIM));
     }
 }
