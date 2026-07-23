@@ -32,14 +32,24 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use banto_core::store::{BrigadeId, BrigadeMessage, BrigadeRole, Store};
+use banto_core::model::SessionId;
+use banto_core::store::{BrigadeId, BrigadeMessage, BrigadeRole, Store, StoreError};
 
-/// Who banto launched this server for — passed in via the `_mcp` args at launch
-/// (the "register the pair at launch" hook). The message tools need all three;
-/// `banto_ping` needs none.
+/// Who banto launched this server for — passed in via the `_mcp` args at
+/// launch (the "register the pair at launch" hook). `session` identifies the
+/// caller to the message tools, which then resolve its brigade and role
+/// *live* from the store on every call (see [`live_membership`]) rather than
+/// trusting `brigade`/`role` here — those two are launch-time metadata only,
+/// so a later removal or move in the store is never masked by a stale
+/// snapshot from launch. `banto_ping` needs none of the three.
 pub struct Identity {
     pub session: Option<String>,
+    // Never read: kept only as launch-time provenance (visible in the argv a
+    // brigade member was started with), superseded on every call by the live
+    // store lookup in `live_membership`.
+    #[allow(dead_code)]
     pub brigade: Option<BrigadeId>,
+    #[allow(dead_code)]
     pub role: Option<BrigadeRole>,
 }
 
@@ -186,8 +196,10 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
 
 /// `send_to_peer`: enqueue `text` to the opposite role in this brigade.
 fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
-    let Some((brigade, role, session)) = brigade_identity(&ctx.identity) else {
-        return not_in_brigade();
+    let (brigade, role, session) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
     };
     let text = msg
         .pointer("/params/arguments/text")
@@ -208,8 +220,10 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
 
 /// `check_messages`: pull this session's unseen messages, firewall-framed.
 fn tool_check_messages(ctx: &mut ServerContext) -> Value {
-    let Some((brigade, role, session)) = brigade_identity(&ctx.identity) else {
-        return not_in_brigade();
+    let (brigade, role, session) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
     };
     match ctx.store.fetch_brigade_messages(brigade, &session, role) {
         Ok(messages) if messages.is_empty() => {
@@ -220,13 +234,20 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
     }
 }
 
-/// The three identity fields the message tools require, or `None` if this
-/// session wasn't launched as a usable brigade member.
-fn brigade_identity(identity: &Identity) -> Option<(BrigadeId, BrigadeRole, String)> {
-    match (&identity.brigade, &identity.role, &identity.session) {
-        (Some(brigade), Some(role), Some(session)) => Some((*brigade, *role, session.clone())),
-        _ => None,
-    }
+/// Resolve this session's *current* brigade membership, live from the store,
+/// on every call. The `--brigade`/`--role` baked into launch argv (see
+/// [`Identity`]) are launch metadata only — never trusted for addressing —
+/// so a removal or move made in the store takes effect on the very next
+/// call, with no relaunch needed. `Ok(None)` when the session was never a
+/// member, or no longer is; `Err` only on a genuine store failure.
+fn live_membership(
+    ctx: &ServerContext,
+) -> Result<Option<(BrigadeId, BrigadeRole, String)>, StoreError> {
+    let Some(session) = ctx.identity.session.clone() else {
+        return Ok(None);
+    };
+    let membership = ctx.store.brigade_of_session(&SessionId(session.clone()))?;
+    Ok(membership.map(|(brigade, role)| (brigade, role, session)))
 }
 
 /// The role a message from `role` is addressed to.
@@ -272,7 +293,9 @@ fn tool_error(text: &str) -> Value {
 }
 
 fn not_in_brigade() -> Value {
-    tool_error("This session is not part of a brigade, so it has no peer to message.")
+    tool_error(
+        "This session is not (or is no longer) part of a brigade, so it has no peer to message.",
+    )
 }
 
 fn success_response(id: Value, result: Value) -> String {
@@ -287,14 +310,25 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Builds a `ServerContext` with the given launch-argv identity. When
+    /// `brigade`/`role` are both given, also registers that as the session's
+    /// *real* store membership, matching the normal case where launch argv
+    /// reflects membership at spawn time; tests that need the two to diverge
+    /// (a later removal or move) mutate the store afterwards.
     fn ctx(session: &str, brigade: Option<i64>, role: Option<BrigadeRole>) -> ServerContext {
+        let mut store = Store::open_in_memory().unwrap();
+        if let (Some(brigade), Some(role)) = (brigade, role) {
+            store
+                .set_brigade_member(brigade, &SessionId(session.to_string()), role)
+                .unwrap();
+        }
         ServerContext {
             identity: Identity {
                 session: Some(session.to_string()),
                 brigade,
                 role,
             },
-            store: Store::open_in_memory().unwrap(),
+            store,
         }
     }
 
@@ -403,6 +437,66 @@ mod tests {
                 "params":{"name":"check_messages","arguments":{}}}"#,
         );
         assert_eq!(response["result"]["isError"], true);
+    }
+
+    #[test]
+    fn removed_member_gets_iserror_from_both_tools() {
+        // Membership resolves live, so a removal (e.g. `toggle_worker` in the
+        // emporium) takes effect on this connection's very next call, without
+        // a relaunch.
+        let mut ctx = ctx("w1", Some(1), Some(BrigadeRole::Worker));
+        ctx.store
+            .remove_brigade_member(1, &SessionId("w1".to_string()))
+            .unwrap();
+
+        let send_response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi"}}}"#,
+        );
+        assert_eq!(send_response["result"]["isError"], true);
+
+        let check_response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call",
+                "params":{"name":"check_messages","arguments":{}}}"#,
+        );
+        assert_eq!(check_response["result"]["isError"], true);
+    }
+
+    #[test]
+    fn tools_use_live_store_membership_not_the_launch_time_argv() {
+        // argv says brigade 999 as Director, but the store's *real*
+        // membership (as if moved after launch) is brigade 42 as Worker —
+        // the live store must win for addressing.
+        let mut ctx = ctx("s", Some(999), Some(BrigadeRole::Director));
+        ctx.store
+            .set_brigade_member(42, &SessionId("s".to_string()), BrigadeRole::Worker)
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":13,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], false);
+
+        // Landed in brigade 42 addressed to the Director (the peer of a
+        // Worker) — the live membership — not brigade 999 addressed to
+        // Worker (the stale argv).
+        let pulled = ctx
+            .store
+            .fetch_brigade_messages(42, "some-director", BrigadeRole::Director)
+            .unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].body, "hi");
+        assert!(
+            ctx.store
+                .fetch_brigade_messages(999, "w1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty(),
+            "must not have used the stale launch-time brigade/role"
+        );
     }
 
     #[test]

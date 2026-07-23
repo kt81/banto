@@ -98,6 +98,26 @@ const MIGRATIONS: &[&str] = &[
         session_id   TEXT PRIMARY KEY,
         last_seen_id INTEGER NOT NULL
     );",
+    // v6: brigade_cursors keyed by (brigade_id, session_id) instead of
+    // session_id alone. brigade_messages.id is one global AUTOINCREMENT
+    // sequence shared by every brigade, so a session-only cursor carried over
+    // unscoped when a session moved to a different brigade, silently skipping
+    // that brigade's messages whose id happened to fall at or below the old
+    // cursor. Existing rows are rekeyed under each session's *current*
+    // brigade (per `brigade_members`); a session with no current membership
+    // has nothing left to resume into, so its cursor is dropped.
+    "CREATE TABLE brigade_cursors_v6 (
+        brigade_id   INTEGER NOT NULL,
+        session_id   TEXT NOT NULL,
+        last_seen_id INTEGER NOT NULL,
+        PRIMARY KEY (brigade_id, session_id)
+    );
+    INSERT INTO brigade_cursors_v6 (brigade_id, session_id, last_seen_id)
+        SELECT bm.brigade_id, bc.session_id, bc.last_seen_id
+        FROM brigade_cursors bc
+        JOIN brigade_members bm ON bm.session_id = bc.session_id;
+    DROP TABLE brigade_cursors;
+    ALTER TABLE brigade_cursors_v6 RENAME TO brigade_cursors;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -348,6 +368,83 @@ mod tests {
                 .len(),
             1
         );
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v5_to_v6_upgrade_rekeys_cursors_by_brigade_and_preserves_membership() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v5 code would have left it: v1..=v5 scripts
+        // applied, a brigade with a Worker member and an old-shape
+        // (session_id-only) cursor row, `user_version` left at 5.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..5] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, session_id, role)
+                 VALUES (1, 'w1', 'worker')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_cursors (session_id, last_seen_id) VALUES ('w1', 7)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        // Opening through Store::open must run the v6 migration: the cursor
+        // carries over under the composite key, scoped to the session's
+        // current brigade, and membership is untouched.
+        let mut store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .brigade_of_session(&SessionId("w1".to_string()))
+                .unwrap(),
+            Some((1, BrigadeRole::Worker))
+        );
+        // A message at id <= the carried-over cursor (7) must not resurface.
+        store
+            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "old, already seen")
+            .unwrap();
+        for _ in 1..7 {
+            store
+                .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "filler")
+                .unwrap();
+        }
+        assert!(
+            store
+                .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty(),
+            "messages at or before the carried-over cursor must stay hidden"
+        );
+        // A message enqueued past the cursor is delivered normally.
+        store
+            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "new")
+            .unwrap();
+        let got = store
+            .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "new");
+
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

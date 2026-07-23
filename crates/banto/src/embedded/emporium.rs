@@ -565,7 +565,7 @@ fn toggle_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_ho
             return;
         }
         let _ = store
-            .borrow()
+            .borrow_mut()
             .remove_brigade_member(brigade_id, &SessionId(session_id.clone()));
         let open_idx = ui.sessions.iter().position(|(sid, _)| *sid == session_id);
         if let Stage::Brigade { panes, focused, .. } = &mut ui.stage

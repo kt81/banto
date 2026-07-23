@@ -91,10 +91,16 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Deletes a brigade together with its membership rows.
+    /// Deletes a brigade together with its membership, queued messages, and
+    /// read cursors — nothing is left orphaned for a deleted brigade id to
+    /// accumulate under. (Pruning *read* messages out of a still-live brigade
+    /// is a separate concern, left for later: this only clears a brigade that
+    /// is gone entirely.)
     pub fn delete_brigade(&mut self, id: BrigadeId) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM brigade_members WHERE brigade_id = ?1", [id])?;
+        tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
+        tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(())
@@ -114,10 +120,18 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Assigns a session to exactly one brigade with `role`: transactionally
-    /// removes any existing brigade membership for that session (a session
-    /// belongs to at most one brigade), then adds it to `brigade_id`.
-    /// Idempotent when the session is already only in `brigade_id`.
+    /// Assigns a session to exactly one brigade with `role`. A session
+    /// belongs to at most one brigade, enforced here rather than by the
+    /// schema:
+    /// - re-setting a session that is already a member of `brigade_id` only
+    ///   updates its role, leaving its cursor (progress through this
+    ///   brigade's queue) untouched — idempotent;
+    /// - assigning a session that belongs elsewhere (or nowhere) drops its
+    ///   prior membership and cursor, then joins `brigade_id` fresh with its
+    ///   cursor starting at "now" (the current max message id), so a joining
+    ///   member sees only messages enqueued *after* joining, never a former
+    ///   member's backlog and never a stale position carried over from
+    ///   whatever brigade it was last in.
     pub fn set_brigade_member(
         &mut self,
         brigade_id: BrigadeId,
@@ -125,28 +139,58 @@ impl Store {
         role: BrigadeRole,
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM brigade_members WHERE session_id = ?1",
-            [&session_id.0],
-        )?;
-        tx.execute(
-            "INSERT INTO brigade_members (brigade_id, session_id, role) VALUES (?1, ?2, ?3)",
-            params![brigade_id, session_id.0, role.as_token()],
-        )?;
+        let current_brigade: Option<BrigadeId> = tx
+            .query_row(
+                "SELECT brigade_id FROM brigade_members WHERE session_id = ?1",
+                [&session_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_brigade == Some(brigade_id) {
+            tx.execute(
+                "UPDATE brigade_members SET role = ?1 WHERE brigade_id = ?2 AND session_id = ?3",
+                params![role.as_token(), brigade_id, session_id.0],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM brigade_cursors WHERE session_id = ?1",
+                [&session_id.0],
+            )?;
+            tx.execute(
+                "DELETE FROM brigade_members WHERE session_id = ?1",
+                [&session_id.0],
+            )?;
+            tx.execute(
+                "INSERT INTO brigade_members (brigade_id, session_id, role) VALUES (?1, ?2, ?3)",
+                params![brigade_id, session_id.0, role.as_token()],
+            )?;
+            tx.execute(
+                "INSERT INTO brigade_cursors (brigade_id, session_id, last_seen_id)
+                 VALUES (?1, ?2, COALESCE((SELECT MAX(id) FROM brigade_messages), 0))",
+                params![brigade_id, session_id.0],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Removes a session from a brigade. Removing a non-member is a no-op.
+    /// Removes a session from a brigade together with its cursor for that
+    /// brigade. Removing a non-member is a no-op.
     pub fn remove_brigade_member(
-        &self,
+        &mut self,
         brigade_id: BrigadeId,
         session_id: &SessionId,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM brigade_members WHERE brigade_id = ?1 AND session_id = ?2",
             params![brigade_id, session_id.0],
         )?;
+        tx.execute(
+            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND session_id = ?2",
+            params![brigade_id, session_id.0],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -217,7 +261,9 @@ impl Store {
     /// Pull the messages in `brigade_id` addressed to `recipient_role` that
     /// `session_id` has not seen yet (id past its cursor), oldest first, and
     /// advance that session's cursor past them — so a later call returns only
-    /// what has arrived since. Per-session cursors mean each recipient of a
+    /// what has arrived since. The cursor is scoped to `(brigade_id,
+    /// session_id)`, so it doesn't carry over if the session later moves to a
+    /// different brigade, and per-session cursors mean each recipient of a
     /// broadcast sees it independently.
     pub fn fetch_brigade_messages(
         &mut self,
@@ -228,8 +274,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         let cursor: i64 = tx
             .query_row(
-                "SELECT last_seen_id FROM brigade_cursors WHERE session_id = ?1",
-                [session_id],
+                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND session_id = ?2",
+                params![brigade_id, session_id],
                 |row| row.get(0),
             )
             .optional()?
@@ -253,9 +299,10 @@ impl Store {
         };
         if let Some(max_id) = messages.last().map(|message| message.id) {
             tx.execute(
-                "INSERT INTO brigade_cursors (session_id, last_seen_id) VALUES (?1, ?2)
-                 ON CONFLICT(session_id) DO UPDATE SET last_seen_id = excluded.last_seen_id",
-                params![session_id, max_id],
+                "INSERT INTO brigade_cursors (brigade_id, session_id, last_seen_id)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(brigade_id, session_id) DO UPDATE SET last_seen_id = excluded.last_seen_id",
+                params![brigade_id, session_id, max_id],
             )?;
         }
         tx.commit()?;
@@ -520,5 +567,166 @@ mod tests {
         store.delete_brigade(br).unwrap();
         assert!(store.brigade_members(br).unwrap().is_empty());
         assert_eq!(store.brigade_of_session(&sid("dir")).unwrap(), None);
+    }
+
+    #[test]
+    fn moving_to_a_new_brigade_does_not_skip_its_messages_under_a_high_carried_cursor() {
+        // The bug the composite-key cursor fixes: brigade_messages.id is one
+        // global sequence shared by every brigade, so a session-only cursor
+        // driven up in brigade A used to carry over unscoped into brigade B,
+        // silently skipping B's own messages whose id fell at or below it.
+        let mut store = Store::open_in_memory().unwrap();
+        let a = store.create_brigade("a").unwrap();
+        let b = store.create_brigade("b").unwrap();
+
+        store
+            .set_brigade_member(a, &sid("w"), BrigadeRole::Worker)
+            .unwrap();
+        for _ in 0..5 {
+            store
+                .enqueue_brigade_message(a, "dir-a", BrigadeRole::Worker, "in A")
+                .unwrap();
+        }
+        // Drive "w"'s cursor up well past B's eventual message ids.
+        store
+            .fetch_brigade_messages(a, "w", BrigadeRole::Worker)
+            .unwrap();
+
+        // "w" moves to brigade B.
+        store
+            .set_brigade_member(b, &sid("w"), BrigadeRole::Worker)
+            .unwrap();
+
+        // A message enqueued in B after the move must be delivered.
+        store
+            .enqueue_brigade_message(b, "dir-b", BrigadeRole::Worker, "in B, after the move")
+            .unwrap();
+        let got = store
+            .fetch_brigade_messages(b, "w", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "in B, after the move");
+    }
+
+    #[test]
+    fn joining_a_brigade_only_sees_messages_enqueued_after_joining() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+
+        // Enqueued before "w" joins...
+        store
+            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "before joining")
+            .unwrap();
+
+        store
+            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .unwrap();
+
+        // ...enqueued after "w" joins.
+        store
+            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "after joining")
+            .unwrap();
+
+        // Only the post-join message is delivered.
+        let got = store
+            .fetch_brigade_messages(br, "w", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "after joining");
+    }
+
+    #[test]
+    fn remove_brigade_member_deletes_its_cursor_too() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "seen")
+            .unwrap();
+        store
+            .fetch_brigade_messages(br, "w", BrigadeRole::Worker)
+            .unwrap();
+
+        store.remove_brigade_member(br, &sid("w")).unwrap();
+
+        let cursor: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND session_id = ?2",
+                params![br, "w"],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn delete_brigade_purges_its_messages_and_cursors_but_not_another_brigades() {
+        let mut store = Store::open_in_memory().unwrap();
+        let a = store.create_brigade("a").unwrap();
+        let b = store.create_brigade("b").unwrap();
+
+        store
+            .set_brigade_member(a, &sid("w-a"), BrigadeRole::Worker)
+            .unwrap();
+        store
+            .set_brigade_member(b, &sid("w-b"), BrigadeRole::Worker)
+            .unwrap();
+        store
+            .enqueue_brigade_message(a, "dir-a", BrigadeRole::Worker, "in A")
+            .unwrap();
+        store
+            .enqueue_brigade_message(b, "dir-b", BrigadeRole::Worker, "in B")
+            .unwrap();
+        store
+            .fetch_brigade_messages(a, "w-a", BrigadeRole::Worker)
+            .unwrap();
+        store
+            .fetch_brigade_messages(b, "w-b", BrigadeRole::Worker)
+            .unwrap();
+
+        store.delete_brigade(a).unwrap();
+
+        let messages_a: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_messages WHERE brigade_id = ?1",
+                [a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages_a, 0);
+        let cursors_a: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_cursors WHERE brigade_id = ?1",
+                [a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursors_a, 0);
+
+        // Brigade B's rows are untouched.
+        let messages_b: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_messages WHERE brigade_id = ?1",
+                [b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(messages_b, 1);
+        let cursors_b: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_cursors WHERE brigade_id = ?1",
+                [b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursors_b, 1);
     }
 }
