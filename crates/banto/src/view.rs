@@ -71,14 +71,25 @@ fn list_item(line: ListLine<'_>) -> ListItem<'static> {
             } else {
                 Span::raw("  ")
             };
+            let director = if visible.director {
+                Span::styled(
+                    "D ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
             let title = Span::raw(visible.row.display_title().to_string());
             let cwd = visible.row.cwd_display();
             let row_line = if cwd.is_empty() {
-                Line::from(vec![dot, pin, title])
+                Line::from(vec![dot, pin, director, title])
             } else {
                 Line::from(vec![
                     dot,
                     pin,
+                    director,
                     title,
                     Span::raw("  "),
                     Span::styled(cwd, Style::default().fg(Color::DarkGray)),
@@ -132,7 +143,12 @@ pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
     let meta_line = Line::from(Span::styled(
-        summary_meta(row, app.is_selected_pinned(), SystemTime::now()),
+        summary_meta(
+            row,
+            app.is_selected_pinned(),
+            app.is_selected_director(),
+            SystemTime::now(),
+        ),
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(
@@ -142,8 +158,13 @@ pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Build the summary panel's meta line: relative age, size, short id, and any
-/// markers (pinned/agent) that apply.
-fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> String {
+/// markers (pinned/director/agent) that apply.
+fn summary_meta(
+    row: &session::SessionRow,
+    pinned: bool,
+    director: bool,
+    now: SystemTime,
+) -> String {
     let mut parts = vec![
         session::humanize_age(row.mtime, now),
         session::humanize_size(row.size),
@@ -151,6 +172,9 @@ fn summary_meta(row: &session::SessionRow, pinned: bool, now: SystemTime) -> Str
     ];
     if pinned {
         parts.push("pinned".to_string());
+    }
+    if director {
+        parts.push("director".to_string());
     }
     if row.is_agent {
         parts.push("agent".to_string());

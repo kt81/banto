@@ -109,14 +109,21 @@ enum Command {
     /// not meant to be invoked directly.
     #[command(name = "_mcp", hide = true)]
     Mcp {
-        /// The calling session's id (echoed by the ping tool; the `from`
-        /// attribution on messages it sends).
+        /// The calling session's id (echoed by the ping tool; the fallback
+        /// used to resolve membership when `--member` is absent, for
+        /// `--mcp-config` files written before it existed).
         #[arg(long)]
         session: Option<String>,
         /// The brigade this session belongs to — enables the message tools.
         #[arg(long)]
         brigade: Option<i64>,
+        /// This session's banto-owned member token within the brigade
+        /// (`director`, `worker-1`, `worker-2`, ...).
+        #[arg(long)]
+        member: Option<String>,
         /// This session's role in the brigade: `director` or `worker`.
+        /// Parsed for compatibility with `--mcp-config` files already on
+        /// disk; the live role always comes from the store instead.
         #[arg(long)]
         role: Option<String>,
     },
@@ -171,12 +178,14 @@ fn main() -> Result<()> {
         Some(Command::Mcp {
             session,
             brigade,
+            member,
             role,
         }) => {
             let store = open_store(&config)?;
             let identity = mcp::Identity {
                 session,
                 brigade,
+                member,
                 role: role.as_deref().and_then(mcp::parse_role),
             };
             mcp::run_stdio_server(store, identity)
@@ -192,7 +201,8 @@ fn main() -> Result<()> {
             if cli.emporium {
                 // The 大店 (emporium) mode: a separate top-level TUI chosen at
                 // launch (`--emporium` / `--oodana`).
-                embedded::run_emporium(&claude_home, &thresholds, &store)
+                let worker_count = config.brigade.worker_count();
+                embedded::run_emporium(&claude_home, &thresholds, &store, worker_count)
             } else {
                 tui::run(&claude_home, &thresholds, config.opener, &store)
             }

@@ -196,17 +196,21 @@ pub fn run(
     store: &RefCell<Store>,
 ) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
-    let (rows, pinned, groups, session_groups) = {
+    let (rows, pinned, groups, session_groups, hidden, directors) = {
         let store = store.borrow();
         let rows = exclude_archived(rows, &store);
         let pinned = load_pinned(&store);
         let groups = load_groups(&store);
         let session_groups = load_session_groups(&store, &groups);
-        (rows, pinned, groups, session_groups)
+        let hidden = load_hidden_worker_ids(&store);
+        let directors = load_directors(&store);
+        (rows, pinned, groups, session_groups, hidden, directors)
     };
     let mut app = App::new(rows)
         .with_pinned(pinned)
-        .with_groups(groups, session_groups);
+        .with_groups(groups, session_groups)
+        .with_hidden_worker_ids(hidden)
+        .with_directors(directors);
     let ctx = Context {
         claude_home,
         thresholds,
@@ -290,6 +294,32 @@ fn setup_terminal() -> Result<Tui> {
 pub(crate) fn load_pinned(store: &Store) -> HashSet<String> {
     store
         .pinned_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Load every brigade Worker's Claude session id, across every brigade, that
+/// has been assigned one so far — [`App`] hides these from the list (see
+/// `App::hidden`). Tolerant: a read failure just means nothing is hidden yet,
+/// rather than blocking the TUI from starting.
+pub(crate) fn load_hidden_worker_ids(store: &Store) -> HashSet<String> {
+    store
+        .brigade_worker_session_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Load every brigade Director's Claude session id, across every brigade —
+/// [`App`] marks these in the list/summary (see `App::directors`). Tolerant:
+/// a read failure just means no marker shows yet, rather than blocking the
+/// TUI from starting.
+pub(crate) fn load_directors(store: &Store) -> HashSet<String> {
+    store
+        .brigade_director_session_ids()
         .unwrap_or_default()
         .into_iter()
         .map(|id| id.0)
@@ -694,12 +724,15 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 }
 
 /// Confirm whichever modal is open, dispatching to its kind-specific logic.
+/// `ConfirmDisband` is the emporium's own modal — classic mode never opens
+/// it, so confirming it here is a no-op (Esc still closes it, via the shared
+/// `close_modal` in [`handle_modal_key`]).
 fn confirm_modal(app: &mut App, ctx: &Context) {
     match app.modal() {
         Some(Modal::NewSession(_)) => confirm_new_session_modal(app, ctx),
         Some(Modal::ConfirmArchive { .. }) => confirm_archive_modal(app, ctx),
         Some(Modal::GroupJoin(_)) => confirm_group_join_modal(app, ctx),
-        None => {}
+        Some(Modal::ConfirmDisband { .. }) | None => {}
     }
 }
 
@@ -1467,13 +1500,17 @@ fn toggle_agent_filter(app: &mut App) {
 /// Re-read sessions from disk and re-classify their activity, preserving
 /// selection (by session id), query and scroll clamping — see
 /// [`App::replace_rows`]. Archived sessions are excluded, same as the
-/// initial load in [`run`]. A read failure is tolerated: the previous rows
-/// are kept rather than the TUI erroring out over a transient filesystem
-/// hiccup.
+/// initial load in [`run`]. Also refreshes the hidden-worker/director id
+/// sets (a brigade may have formed, spawned a Worker, or disbanded since the
+/// last reload). A read failure is tolerated: the previous rows are kept
+/// rather than the TUI erroring out over a transient filesystem hiccup.
 fn reload(app: &mut App, ctx: &Context) {
     if let Ok(rows) = session::load_rows(ctx.claude_home, ctx.thresholds) {
-        let rows = exclude_archived(rows, &ctx.store.borrow());
+        let store = ctx.store.borrow();
+        let rows = exclude_archived(rows, &store);
         app.replace_rows(rows);
+        app.set_hidden_worker_ids(load_hidden_worker_ids(&store));
+        app.set_directors(load_directors(&store));
     }
 }
 
@@ -1740,6 +1777,7 @@ pub(crate) fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
         Modal::NewSession(state) => render_new_session_modal(frame, state, area),
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
         Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
+        Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
     }
 }
 
@@ -1822,6 +1860,34 @@ fn render_confirm_archive_modal(frame: &mut Frame, title: &str, area: Rect) {
         Line::from(prompt),
         Line::from(Span::styled(
             "Hides it from the list; the session file itself is untouched.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the emporium's `B`-on-a-Director disband confirm dialog: a
+/// one-line yes/no prompt naming the brigade's Director. Its Workers'
+/// `claude` processes are left running (they simply reappear in the list as
+/// live sessions once the brigade's hiding is gone), so the prompt says as
+/// much to set expectations.
+fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Disband Brigade \u{2014} confirm ")
+        .title_bottom(" Enter disband  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let prompt = truncate_to_width(
+        &format!("Disband the brigade led by \"{name}\"?"),
+        inner.width,
+    );
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(Span::styled(
+            "Its Workers keep running and simply reappear in the list.",
             Style::default().fg(Color::DarkGray),
         )),
     ];

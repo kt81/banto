@@ -6,13 +6,19 @@
 //! Director commanding Worker(s). It is an internal term, never surfaced to the
 //! user.
 //!
-//! `brigade_members` is a plain join table. Two policies are layered here in
-//! code rather than enforced by the schema, mirroring how single-group
-//! membership is layered on `group_members`:
-//! - a session belongs to at most one brigade (see [`Store::set_brigade_member`],
-//!   which clears any prior membership first);
+//! `brigade_members` is keyed by a banto-owned `member_token` ('director',
+//! 'worker-1', 'worker-2', ...) rather than the Claude session id itself: a
+//! Worker is formed *before* Claude assigns it a session id (banto
+//! auto-spawns a fresh `claude` process and only later discovers its id —
+//! see `crate::embedded::emporium`'s `PendingNew` flow), so the id has to be
+//! a nullable column (`claude_session_id`) filled in after the fact, not the
+//! primary identity. Two policies are layered here in code rather than
+//! enforced by the schema:
 //! - a brigade has exactly one Director — that rule lives in the formation
-//!   layer (the emporium), not this table.
+//!   layer (the emporium), not this table;
+//! - a Claude session belongs to at most one brigade at a time — also the
+//!   formation layer's job (it only ever forms a brigade from a session with
+//!   no existing membership, and Workers are always freshly spawned).
 
 use std::time::SystemTime;
 
@@ -24,6 +30,12 @@ use super::{Store, StoreError, system_time_to_unix_ms};
 
 /// Row id of a brigade (sqlite AUTOINCREMENT primary key).
 pub type BrigadeId = i64;
+
+/// A banto-owned member identity within a brigade: `"director"` or
+/// `"worker-1"`, `"worker-2"`, etc. Stable for the member's lifetime in the
+/// brigade, unlike its Claude session id (unknown for a Worker until
+/// discovered, and never reused across brigades).
+pub type MemberToken = String;
 
 /// A member's role within a brigade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +74,14 @@ pub struct Brigade {
     pub name: String,
 }
 
-/// One session's membership in a brigade.
+/// One member of a brigade: its banto-owned token, role, and Claude session
+/// id once known (`None` for a Worker banto has spawned but Claude hasn't
+/// assigned an id to yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrigadeMember {
-    pub session_id: SessionId,
+    pub token: MemberToken,
     pub role: BrigadeRole,
+    pub claude_session_id: Option<SessionId>,
 }
 
 /// A queued message from one brigade member to the peer role (see the
@@ -74,10 +89,11 @@ pub struct BrigadeMember {
 /// [`Store::fetch_brigade_messages`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrigadeMessage {
-    /// Monotonic queue id (also the per-session read cursor).
+    /// Monotonic queue id (also the per-member read cursor).
     pub id: i64,
-    /// The session that sent it (for attribution in the firewall framing).
-    pub from_session: String,
+    /// The token of the member that sent it (for attribution in the
+    /// firewall framing, e.g. "director" or "worker-1").
+    pub from_token: MemberToken,
     pub body: String,
 }
 
@@ -120,127 +136,179 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Assigns a session to exactly one brigade with `role`. A session
-    /// belongs to at most one brigade, enforced here rather than by the
-    /// schema:
-    /// - re-setting a session that is already a member of `brigade_id` only
-    ///   updates its role, leaving its cursor (progress through this
-    ///   brigade's queue) untouched — idempotent;
-    /// - assigning a session that belongs elsewhere (or nowhere) drops its
-    ///   prior membership and cursor, then joins `brigade_id` fresh with its
-    ///   cursor starting at "now" (the current max message id), so a joining
-    ///   member sees only messages enqueued *after* joining, never a former
-    ///   member's backlog and never a stale position carried over from
-    ///   whatever brigade it was last in.
-    pub fn set_brigade_member(
+    /// Adds `token` to `brigade_id` with `role`, optionally already knowing
+    /// its Claude session id (the Director always does, at formation time;
+    /// a freshly-spawned Worker starts with `None`, filled in later via
+    /// [`Self::set_member_claude_session`] once Claude assigns one). Also
+    /// seeds the member's cursor to "now" (the current max message id), so
+    /// it sees only messages enqueued *after* joining.
+    pub fn add_brigade_member(
         &mut self,
         brigade_id: BrigadeId,
-        session_id: &SessionId,
+        token: &str,
         role: BrigadeRole,
+        claude_session_id: Option<&SessionId>,
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
-        let current_brigade: Option<BrigadeId> = tx
-            .query_row(
-                "SELECT brigade_id FROM brigade_members WHERE session_id = ?1",
-                [&session_id.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current_brigade == Some(brigade_id) {
-            tx.execute(
-                "UPDATE brigade_members SET role = ?1 WHERE brigade_id = ?2 AND session_id = ?3",
-                params![role.as_token(), brigade_id, session_id.0],
-            )?;
-        } else {
-            tx.execute(
-                "DELETE FROM brigade_cursors WHERE session_id = ?1",
-                [&session_id.0],
-            )?;
-            tx.execute(
-                "DELETE FROM brigade_members WHERE session_id = ?1",
-                [&session_id.0],
-            )?;
-            tx.execute(
-                "INSERT INTO brigade_members (brigade_id, session_id, role) VALUES (?1, ?2, ?3)",
-                params![brigade_id, session_id.0, role.as_token()],
-            )?;
-            tx.execute(
-                "INSERT INTO brigade_cursors (brigade_id, session_id, last_seen_id)
-                 VALUES (?1, ?2, COALESCE((SELECT MAX(id) FROM brigade_messages), 0))",
-                params![brigade_id, session_id.0],
-            )?;
-        }
+        tx.execute(
+            "INSERT INTO brigade_members (brigade_id, member_token, role, claude_session_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                brigade_id,
+                token,
+                role.as_token(),
+                claude_session_id.map(|s| s.0.as_str())
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id)
+             VALUES (?1, ?2, COALESCE((SELECT MAX(id) FROM brigade_messages), 0))",
+            params![brigade_id, token],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Removes a session from a brigade together with its cursor for that
-    /// brigade. Removing a non-member is a no-op.
+    /// Records the Claude session id Claude assigned to a member banto
+    /// spawned ahead of time (a Worker's `claude_session_id`, initially
+    /// `None`). A no-op if `(brigade_id, token)` doesn't exist.
+    pub fn set_member_claude_session(
+        &self,
+        brigade_id: BrigadeId,
+        token: &str,
+        claude_session_id: &SessionId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE brigade_members SET claude_session_id = ?1
+             WHERE brigade_id = ?2 AND member_token = ?3",
+            params![claude_session_id.0, brigade_id, token],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a member from a brigade together with its cursor. Removing a
+    /// non-member is a no-op.
     pub fn remove_brigade_member(
         &mut self,
         brigade_id: BrigadeId,
-        session_id: &SessionId,
+        token: &str,
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "DELETE FROM brigade_members WHERE brigade_id = ?1 AND session_id = ?2",
-            params![brigade_id, session_id.0],
+            "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, token],
         )?;
         tx.execute(
-            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND session_id = ?2",
-            params![brigade_id, session_id.0],
+            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, token],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Returns a brigade's members: the Director first, then Workers ordered by
-    /// session id.
+    /// Returns a brigade's members: the Director first, then Workers ordered
+    /// by token (`worker-1`, `worker-2`, ... — lexicographic ordering is only
+    /// numerically correct up to single-digit tokens, which the emporium's
+    /// worker-count clamp of 1..=8 guarantees).
     pub fn brigade_members(&self, brigade_id: BrigadeId) -> Result<Vec<BrigadeMember>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, role FROM brigade_members WHERE brigade_id = ?1
-             ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, session_id",
+            "SELECT member_token, role, claude_session_id FROM brigade_members
+             WHERE brigade_id = ?1
+             ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, member_token",
         )?;
         let rows = stmt.query_map([brigade_id], |row| {
-            let session_id: String = row.get(0)?;
+            let token: String = row.get(0)?;
             let role: String = row.get(1)?;
+            let claude_session_id: Option<String> = row.get(2)?;
             Ok(BrigadeMember {
-                session_id: SessionId(session_id),
+                token,
                 role: BrigadeRole::from_token(&role),
+                claude_session_id: claude_session_id.map(SessionId),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Returns the brigade a session belongs to and its role there, if any. If
-    /// the session is (unusually) in more than one brigade, returns the lowest
-    /// brigade id, deterministically.
-    pub fn brigade_of_session(
+    /// Looks up one member of `brigade_id` by its token.
+    pub fn brigade_member(
         &self,
-        session_id: &SessionId,
-    ) -> Result<Option<(BrigadeId, BrigadeRole)>, StoreError> {
+        brigade_id: BrigadeId,
+        token: &str,
+    ) -> Result<Option<BrigadeMember>, StoreError> {
         Ok(self
             .conn
             .query_row(
-                "SELECT brigade_id, role FROM brigade_members WHERE session_id = ?1
-                 ORDER BY brigade_id LIMIT 1",
-                [&session_id.0],
+                "SELECT member_token, role, claude_session_id FROM brigade_members
+                 WHERE brigade_id = ?1 AND member_token = ?2",
+                params![brigade_id, token],
                 |row| {
-                    let id: BrigadeId = row.get(0)?;
+                    let token: String = row.get(0)?;
                     let role: String = row.get(1)?;
-                    Ok((id, BrigadeRole::from_token(&role)))
+                    let claude_session_id: Option<String> = row.get(2)?;
+                    Ok(BrigadeMember {
+                        token,
+                        role: BrigadeRole::from_token(&role),
+                        claude_session_id: claude_session_id.map(SessionId),
+                    })
                 },
             )
             .optional()?)
     }
 
-    /// Enqueue a message in `brigade_id` from `from_session`, addressed to
-    /// `to_role` (every session of that role in the brigade will pull it).
+    /// Returns the brigade a Claude session belongs to, its token, and its
+    /// role there, if any. If the session is (unusually) linked from more
+    /// than one member, returns the lowest brigade id, deterministically.
+    pub fn brigade_of_claude_session(
+        &self,
+        claude_session_id: &SessionId,
+    ) -> Result<Option<(BrigadeId, MemberToken, BrigadeRole)>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT brigade_id, member_token, role FROM brigade_members
+                 WHERE claude_session_id = ?1
+                 ORDER BY brigade_id LIMIT 1",
+                [&claude_session_id.0],
+                |row| {
+                    let id: BrigadeId = row.get(0)?;
+                    let token: String = row.get(1)?;
+                    let role: String = row.get(2)?;
+                    Ok((id, token, BrigadeRole::from_token(&role)))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every known Worker's Claude session id, across every brigade, that has
+    /// been assigned one so far (a Worker banto is still waiting on Claude to
+    /// assign one has no entry). Used to hide Workers from the session list.
+    pub fn brigade_worker_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT claude_session_id FROM brigade_members
+             WHERE role = 'worker' AND claude_session_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(SessionId(row.get(0)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every known Director's Claude session id, across every brigade. Used
+    /// to mark Directors in the session list.
+    pub fn brigade_director_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT claude_session_id FROM brigade_members
+             WHERE role = 'director' AND claude_session_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(SessionId(row.get(0)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Enqueue a message in `brigade_id` from `from_token`, addressed to
+    /// `to_role` (every member of that role in the brigade will pull it).
     /// Returns the new message's queue id.
     pub fn enqueue_brigade_message(
         &self,
         brigade_id: BrigadeId,
-        from_session: &str,
+        from_token: &str,
         to_role: BrigadeRole,
         body: &str,
     ) -> Result<i64, StoreError> {
@@ -249,7 +317,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 brigade_id,
-                from_session,
+                from_token,
                 to_role.as_token(),
                 body,
                 system_time_to_unix_ms(SystemTime::now())
@@ -259,23 +327,23 @@ impl Store {
     }
 
     /// Pull the messages in `brigade_id` addressed to `recipient_role` that
-    /// `session_id` has not seen yet (id past its cursor), oldest first, and
-    /// advance that session's cursor past them — so a later call returns only
-    /// what has arrived since. The cursor is scoped to `(brigade_id,
-    /// session_id)`, so it doesn't carry over if the session later moves to a
-    /// different brigade, and per-session cursors mean each recipient of a
-    /// broadcast sees it independently.
+    /// `member_token` has not seen yet (id past its cursor), oldest first,
+    /// and advance that member's cursor past them — so a later call returns
+    /// only what has arrived since. The cursor is scoped to `(brigade_id,
+    /// member_token)`, so it doesn't carry over if the token's underlying
+    /// Claude session later changes, and per-member cursors mean each
+    /// recipient of a broadcast sees it independently.
     pub fn fetch_brigade_messages(
         &mut self,
         brigade_id: BrigadeId,
-        session_id: &str,
+        member_token: &str,
         recipient_role: BrigadeRole,
     ) -> Result<Vec<BrigadeMessage>, StoreError> {
         let tx = self.conn.transaction()?;
         let cursor: i64 = tx
             .query_row(
-                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND session_id = ?2",
-                params![brigade_id, session_id],
+                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+                params![brigade_id, member_token],
                 |row| row.get(0),
             )
             .optional()?
@@ -290,7 +358,7 @@ impl Store {
                 |row| {
                     Ok(BrigadeMessage {
                         id: row.get(0)?,
-                        from_session: row.get(1)?,
+                        from_token: row.get(1)?,
                         body: row.get(2)?,
                     })
                 },
@@ -299,10 +367,10 @@ impl Store {
         };
         if let Some(max_id) = messages.last().map(|message| message.id) {
             tx.execute(
-                "INSERT INTO brigade_cursors (brigade_id, session_id, last_seen_id)
+                "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(brigade_id, session_id) DO UPDATE SET last_seen_id = excluded.last_seen_id",
-                params![brigade_id, session_id, max_id],
+                 ON CONFLICT(brigade_id, member_token) DO UPDATE SET last_seen_id = excluded.last_seen_id",
+                params![brigade_id, member_token, max_id],
             )?;
         }
         tx.commit()?;
@@ -344,18 +412,18 @@ mod tests {
     }
 
     #[test]
-    fn members_list_director_first_then_workers_by_id() {
+    fn members_list_director_first_then_workers_by_token() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
 
         store
-            .set_brigade_member(br, &sid("w2"), BrigadeRole::Worker)
+            .add_brigade_member(br, "worker-2", BrigadeRole::Worker, Some(&sid("w2")))
             .unwrap();
         store
-            .set_brigade_member(br, &sid("dir"), BrigadeRole::Director)
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
             .unwrap();
         store
-            .set_brigade_member(br, &sid("w1"), BrigadeRole::Worker)
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
             .unwrap();
 
         let members = store.brigade_members(br).unwrap();
@@ -363,77 +431,86 @@ mod tests {
             members,
             [
                 BrigadeMember {
-                    session_id: sid("dir"),
+                    token: "director".to_string(),
                     role: BrigadeRole::Director,
+                    claude_session_id: Some(sid("dir")),
                 },
                 BrigadeMember {
-                    session_id: sid("w1"),
+                    token: "worker-1".to_string(),
                     role: BrigadeRole::Worker,
+                    claude_session_id: Some(sid("w1")),
                 },
                 BrigadeMember {
-                    session_id: sid("w2"),
+                    token: "worker-2".to_string(),
                     role: BrigadeRole::Worker,
+                    claude_session_id: Some(sid("w2")),
                 },
             ]
         );
     }
 
     #[test]
-    fn brigade_of_session_reports_membership_and_role() {
+    fn worker_can_be_added_with_no_claude_session_yet() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+
+        let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        assert_eq!(member.claude_session_id, None);
+
+        store
+            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .unwrap();
+        let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        assert_eq!(member.claude_session_id, Some(sid("w1")));
+    }
+
+    #[test]
+    fn brigade_of_claude_session_reports_membership_token_and_role() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
 
-        assert_eq!(store.brigade_of_session(&sid("dir")).unwrap(), None);
+        assert_eq!(store.brigade_of_claude_session(&sid("dir")).unwrap(), None);
 
         store
-            .set_brigade_member(br, &sid("dir"), BrigadeRole::Director)
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
             .unwrap();
         assert_eq!(
-            store.brigade_of_session(&sid("dir")).unwrap(),
-            Some((br, BrigadeRole::Director))
+            store.brigade_of_claude_session(&sid("dir")).unwrap(),
+            Some((br, "director".to_string(), BrigadeRole::Director))
         );
     }
 
     #[test]
-    fn set_member_moves_a_session_between_brigades() {
+    fn brigade_of_claude_session_is_none_for_a_worker_awaiting_discovery() {
         let mut store = Store::open_in_memory().unwrap();
-        let a = store.create_brigade("a").unwrap();
-        let b = store.create_brigade("b").unwrap();
-
+        let br = store.create_brigade("cell").unwrap();
         store
-            .set_brigade_member(a, &sid("w"), BrigadeRole::Worker)
-            .unwrap();
-        // Re-assigning to another brigade moves it (single-brigade invariant).
-        store
-            .set_brigade_member(b, &sid("w"), BrigadeRole::Director)
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
             .unwrap();
 
-        assert!(store.brigade_members(a).unwrap().is_empty());
-        assert_eq!(
-            store.brigade_of_session(&sid("w")).unwrap(),
-            Some((b, BrigadeRole::Director))
-        );
+        assert_eq!(store.brigade_of_claude_session(&sid("w1")).unwrap(), None);
     }
 
     #[test]
-    fn set_member_is_idempotent_within_the_same_brigade() {
+    fn worker_and_director_session_id_sets_are_reported_separately() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
-
         store
-            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
             .unwrap();
         store
-            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+            .unwrap();
+        // Still awaiting discovery: contributes no id to either set.
+        store
+            .add_brigade_member(br, "worker-2", BrigadeRole::Worker, None)
             .unwrap();
 
-        assert_eq!(
-            store.brigade_members(br).unwrap(),
-            [BrigadeMember {
-                session_id: sid("w"),
-                role: BrigadeRole::Worker,
-            }]
-        );
+        assert_eq!(store.brigade_worker_session_ids().unwrap(), [sid("w1")]);
+        assert_eq!(store.brigade_director_session_ids().unwrap(), [sid("dir")]);
     }
 
     #[test]
@@ -443,21 +520,21 @@ mod tests {
 
         // Director sends to the Worker role.
         store
-            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "please run the tests")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "please run the tests")
             .unwrap();
 
         // The Worker pulls it once.
         let got = store
-            .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
             .unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].from_session, "dir");
+        assert_eq!(got[0].from_token, "director");
         assert_eq!(got[0].body, "please run the tests");
 
         // A second pull returns nothing (its cursor advanced past the message).
         assert!(
             store
-                .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+                .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
                 .unwrap()
                 .is_empty()
         );
@@ -475,12 +552,12 @@ mod tests {
         let sender = Store::open(&db).unwrap();
         let br = sender.create_brigade("cell").unwrap();
         sender
-            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "cross-process")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "cross-process")
             .unwrap();
 
         let mut receiver = Store::open(&db).unwrap();
         let got = receiver
-            .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].body, "cross-process");
@@ -491,20 +568,20 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
-            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "stand by")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "stand by")
             .unwrap();
 
-        // Both workers see it — per-session cursors, not a shared delivered flag.
+        // Both workers see it — per-member cursors, not a shared delivered flag.
         assert_eq!(
             store
-                .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+                .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
             store
-                .fetch_brigade_messages(br, "w2", BrigadeRole::Worker)
+                .fetch_brigade_messages(br, "worker-2", BrigadeRole::Worker)
                 .unwrap()
                 .len(),
             1
@@ -519,16 +596,21 @@ mod tests {
 
         // Worker -> Director in this brigade.
         store
-            .enqueue_brigade_message(br, "w1", BrigadeRole::Director, "done, deviated because X")
+            .enqueue_brigade_message(
+                br,
+                "worker-1",
+                BrigadeRole::Director,
+                "done, deviated because X",
+            )
             .unwrap();
         // Noise addressed to the Director of a *different* brigade.
         store
-            .enqueue_brigade_message(other, "x", BrigadeRole::Director, "unrelated")
+            .enqueue_brigade_message(other, "worker-1", BrigadeRole::Director, "unrelated")
             .unwrap();
 
         // The Director pulling its own brigade sees only its message...
         let got = store
-            .fetch_brigade_messages(br, "dir", BrigadeRole::Director)
+            .fetch_brigade_messages(br, "director", BrigadeRole::Director)
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].body, "done, deviated because X");
@@ -536,7 +618,7 @@ mod tests {
         // ...and a Worker pulling the same brigade sees none (wrong role).
         assert!(
             store
-                .fetch_brigade_messages(br, "w1", BrigadeRole::Worker)
+                .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
                 .unwrap()
                 .is_empty()
         );
@@ -547,65 +629,27 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
-            .set_brigade_member(br, &sid("dir"), BrigadeRole::Director)
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
             .unwrap();
         store
-            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w")))
             .unwrap();
 
-        store.remove_brigade_member(br, &sid("w")).unwrap();
+        store.remove_brigade_member(br, "worker-1").unwrap();
         assert_eq!(
             store.brigade_members(br).unwrap(),
             [BrigadeMember {
-                session_id: sid("dir"),
+                token: "director".to_string(),
                 role: BrigadeRole::Director,
+                claude_session_id: Some(sid("dir")),
             }]
         );
         // Removing a non-member is a no-op.
-        store.remove_brigade_member(br, &sid("nobody")).unwrap();
+        store.remove_brigade_member(br, "nobody").unwrap();
 
         store.delete_brigade(br).unwrap();
         assert!(store.brigade_members(br).unwrap().is_empty());
-        assert_eq!(store.brigade_of_session(&sid("dir")).unwrap(), None);
-    }
-
-    #[test]
-    fn moving_to_a_new_brigade_does_not_skip_its_messages_under_a_high_carried_cursor() {
-        // The bug the composite-key cursor fixes: brigade_messages.id is one
-        // global sequence shared by every brigade, so a session-only cursor
-        // driven up in brigade A used to carry over unscoped into brigade B,
-        // silently skipping B's own messages whose id fell at or below it.
-        let mut store = Store::open_in_memory().unwrap();
-        let a = store.create_brigade("a").unwrap();
-        let b = store.create_brigade("b").unwrap();
-
-        store
-            .set_brigade_member(a, &sid("w"), BrigadeRole::Worker)
-            .unwrap();
-        for _ in 0..5 {
-            store
-                .enqueue_brigade_message(a, "dir-a", BrigadeRole::Worker, "in A")
-                .unwrap();
-        }
-        // Drive "w"'s cursor up well past B's eventual message ids.
-        store
-            .fetch_brigade_messages(a, "w", BrigadeRole::Worker)
-            .unwrap();
-
-        // "w" moves to brigade B.
-        store
-            .set_brigade_member(b, &sid("w"), BrigadeRole::Worker)
-            .unwrap();
-
-        // A message enqueued in B after the move must be delivered.
-        store
-            .enqueue_brigade_message(b, "dir-b", BrigadeRole::Worker, "in B, after the move")
-            .unwrap();
-        let got = store
-            .fetch_brigade_messages(b, "w", BrigadeRole::Worker)
-            .unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].body, "in B, after the move");
+        assert_eq!(store.brigade_of_claude_session(&sid("dir")).unwrap(), None);
     }
 
     #[test]
@@ -613,23 +657,23 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
 
-        // Enqueued before "w" joins...
+        // Enqueued before "worker-1" joins...
         store
-            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "before joining")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "before joining")
             .unwrap();
 
         store
-            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w")))
             .unwrap();
 
-        // ...enqueued after "w" joins.
+        // ...enqueued after it joins.
         store
-            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "after joining")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "after joining")
             .unwrap();
 
         // Only the post-join message is delivered.
         let got = store
-            .fetch_brigade_messages(br, "w", BrigadeRole::Worker)
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].body, "after joining");
@@ -640,22 +684,22 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
-            .set_brigade_member(br, &sid("w"), BrigadeRole::Worker)
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w")))
             .unwrap();
         store
-            .enqueue_brigade_message(br, "dir", BrigadeRole::Worker, "seen")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "seen")
             .unwrap();
         store
-            .fetch_brigade_messages(br, "w", BrigadeRole::Worker)
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
             .unwrap();
 
-        store.remove_brigade_member(br, &sid("w")).unwrap();
+        store.remove_brigade_member(br, "worker-1").unwrap();
 
         let cursor: Option<i64> = store
             .conn
             .query_row(
-                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND session_id = ?2",
-                params![br, "w"],
+                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+                params![br, "worker-1"],
                 |row| row.get(0),
             )
             .optional()
@@ -670,22 +714,22 @@ mod tests {
         let b = store.create_brigade("b").unwrap();
 
         store
-            .set_brigade_member(a, &sid("w-a"), BrigadeRole::Worker)
+            .add_brigade_member(a, "worker-1", BrigadeRole::Worker, Some(&sid("w-a")))
             .unwrap();
         store
-            .set_brigade_member(b, &sid("w-b"), BrigadeRole::Worker)
+            .add_brigade_member(b, "worker-1", BrigadeRole::Worker, Some(&sid("w-b")))
             .unwrap();
         store
-            .enqueue_brigade_message(a, "dir-a", BrigadeRole::Worker, "in A")
+            .enqueue_brigade_message(a, "director", BrigadeRole::Worker, "in A")
             .unwrap();
         store
-            .enqueue_brigade_message(b, "dir-b", BrigadeRole::Worker, "in B")
+            .enqueue_brigade_message(b, "director", BrigadeRole::Worker, "in B")
             .unwrap();
         store
-            .fetch_brigade_messages(a, "w-a", BrigadeRole::Worker)
+            .fetch_brigade_messages(a, "worker-1", BrigadeRole::Worker)
             .unwrap();
         store
-            .fetch_brigade_messages(b, "w-b", BrigadeRole::Worker)
+            .fetch_brigade_messages(b, "worker-1", BrigadeRole::Worker)
             .unwrap();
 
         store.delete_brigade(a).unwrap();

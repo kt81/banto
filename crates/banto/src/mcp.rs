@@ -1,12 +1,12 @@
 //! banto's MCP server: the brigade Director<->Worker mediation channel.
 //!
 //! An embedded `claude` session is launched with `claude --mcp-config <file>`
-//! pointing at `banto _mcp --session <id> --brigade <bid> --role <role>`; Claude
-//! Code spawns that as a stdio MCP server and speaks JSON-RPC 2.0 to it. Because
-//! banto controls the launch argv, the config file lives under banto's own data
-//! dir and nothing is ever written under `~/.claude` (read-only invariant 1).
-//! Transport was validated end to end against real Claude Code — see
-//! `docs/notes/mcp-spike.md`.
+//! pointing at `banto _mcp --brigade <bid> --member <token> --role <role>
+//! [--session <id>]`; Claude Code spawns that as a stdio MCP server and speaks
+//! JSON-RPC 2.0 to it. Because banto controls the launch argv, the config
+//! file lives under banto's own data dir and nothing is ever written under
+//! `~/.claude` (read-only invariant 1). Transport was validated end to end
+//! against real Claude Code — see `docs/notes/mcp-spike.md`.
 //!
 //! The server shares banto's own sqlite store with the TUI process (exactly the
 //! cross-process access the store's busy_timeout was set up for), and mediates a
@@ -33,28 +33,31 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use banto_core::model::SessionId;
-use banto_core::store::{BrigadeId, BrigadeMessage, BrigadeRole, Store, StoreError};
+use banto_core::store::{BrigadeId, BrigadeMessage, BrigadeRole, MemberToken, Store, StoreError};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
-/// launch (the "register the pair at launch" hook). `session` identifies the
-/// caller to the message tools, which then resolve its brigade and role
-/// *live* from the store on every call (see [`live_membership`]) rather than
-/// trusting `brigade`/`role` here — those two are launch-time metadata only,
-/// so a later removal or move in the store is never masked by a stale
-/// snapshot from launch. `banto_ping` needs none of the three.
+/// launch (the "register the pair at launch" hook). `brigade` + `member`
+/// identify the caller's `(brigade_id, member_token)` row, which the message
+/// tools resolve *live* from the store on every call (see
+/// [`live_membership`]) — its existence and role are never trusted from argv
+/// alone, so a removal takes effect on the very next call, with no relaunch.
+/// `session` is a fallback for `--mcp-config` files written before `--member`
+/// existed: with no `member`, membership is instead resolved by matching
+/// `session` against a member's `claude_session_id`. `banto_ping` needs only
+/// `session`, to echo it.
 pub struct Identity {
     pub session: Option<String>,
-    // Never read: kept only as launch-time provenance (visible in the argv a
-    // brigade member was started with), superseded on every call by the live
-    // store lookup in `live_membership`.
-    #[allow(dead_code)]
     pub brigade: Option<BrigadeId>,
+    pub member: Option<MemberToken>,
+    // Never read: `--role` is kept only for compatibility with `--mcp-config`
+    // files already on disk before this field existed. The live role always
+    // comes from the resolved store row (see `live_membership`).
     #[allow(dead_code)]
     pub role: Option<BrigadeRole>,
 }
 
-/// Parse the `--role` arg. Unknown values yield `None` (the message tools then
-/// report the session isn't a usable brigade member).
+/// Parse the `--role` arg. Unknown values yield `None` (only relevant to the
+/// old-config fallback path — see [`Identity`]).
 pub fn parse_role(token: &str) -> Option<BrigadeRole> {
     match token {
         "director" => Some(BrigadeRole::Director),
@@ -196,7 +199,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
 
 /// `send_to_peer`: enqueue `text` to the opposite role in this brigade.
 fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
-    let (brigade, role, session) = match live_membership(ctx) {
+    let (brigade, token, role) = match live_membership(ctx) {
         Ok(Some(membership)) => membership,
         Ok(None) => return not_in_brigade(),
         Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
@@ -209,10 +212,7 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
         return tool_error("send_to_peer requires a non-empty `text`.");
     }
     let to = peer_role(role);
-    match ctx
-        .store
-        .enqueue_brigade_message(brigade, &session, to, text)
-    {
+    match ctx.store.enqueue_brigade_message(brigade, &token, to, text) {
         Ok(_) => tool_text(format!("Delivered to your {}.", role_label(to)), false),
         Err(err) => tool_error(&format!("failed to send: {err}")),
     }
@@ -220,12 +220,12 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
 
 /// `check_messages`: pull this session's unseen messages, firewall-framed.
 fn tool_check_messages(ctx: &mut ServerContext) -> Value {
-    let (brigade, role, session) = match live_membership(ctx) {
+    let (brigade, token, role) = match live_membership(ctx) {
         Ok(Some(membership)) => membership,
         Ok(None) => return not_in_brigade(),
         Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
     };
-    match ctx.store.fetch_brigade_messages(brigade, &session, role) {
+    match ctx.store.fetch_brigade_messages(brigade, &token, role) {
         Ok(messages) if messages.is_empty() => {
             tool_text("No new messages from your brigade peer.".to_string(), false)
         }
@@ -234,20 +234,25 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
     }
 }
 
-/// Resolve this session's *current* brigade membership, live from the store,
-/// on every call. The `--brigade`/`--role` baked into launch argv (see
-/// [`Identity`]) are launch metadata only — never trusted for addressing —
-/// so a removal or move made in the store takes effect on the very next
-/// call, with no relaunch needed. `Ok(None)` when the session was never a
-/// member, or no longer is; `Err` only on a genuine store failure.
+/// Resolve this connection's *current* `(brigade, member_token, role)`, live
+/// from the store, on every call. When launch argv carries both `--brigade`
+/// and `--member`, that `(brigade, member)` row must still exist — a
+/// revocation (the member was removed from the brigade) takes effect
+/// immediately, with no relaunch needed, and the role always comes from the
+/// row, never from argv. Older `--mcp-config` files predating `--member` fall
+/// back to matching `--session` against a member's `claude_session_id`.
+/// `Ok(None)` when nothing resolves; `Err` only on a genuine store failure.
 fn live_membership(
     ctx: &ServerContext,
-) -> Result<Option<(BrigadeId, BrigadeRole, String)>, StoreError> {
+) -> Result<Option<(BrigadeId, MemberToken, BrigadeRole)>, StoreError> {
+    if let (Some(brigade), Some(member)) = (ctx.identity.brigade, ctx.identity.member.clone()) {
+        let row = ctx.store.brigade_member(brigade, &member)?;
+        return Ok(row.map(|member| (brigade, member.token, member.role)));
+    }
     let Some(session) = ctx.identity.session.clone() else {
         return Ok(None);
     };
-    let membership = ctx.store.brigade_of_session(&SessionId(session.clone()))?;
-    Ok(membership.map(|(brigade, role)| (brigade, role, session)))
+    ctx.store.brigade_of_claude_session(&SessionId(session))
 }
 
 /// The role a message from `role` is addressed to.
@@ -267,6 +272,8 @@ fn role_label(role: BrigadeRole) -> &'static str {
 
 /// Render pulled messages with the firewall framing that keeps the recipient
 /// from mistaking a relayed AI message for a direct operator instruction.
+/// Attribution is the sender's member token (`"director"`, `"worker-1"`,
+/// ...) — also simply more readable than a raw session UUID.
 fn format_inbox(role: BrigadeRole, messages: &[BrigadeMessage]) -> String {
     let peer = role_label(peer_role(role));
     let mut out = format!(
@@ -278,7 +285,7 @@ fn format_inbox(role: BrigadeRole, messages: &[BrigadeMessage]) -> String {
     for message in messages {
         out.push_str(&format!(
             "\n[from {}]\n{}\n",
-            message.from_session, message.body
+            message.from_token, message.body
         ));
     }
     out
@@ -310,22 +317,30 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Builds a `ServerContext` with the given launch-argv identity. When
-    /// `brigade`/`role` are both given, also registers that as the session's
-    /// *real* store membership, matching the normal case where launch argv
-    /// reflects membership at spawn time; tests that need the two to diverge
-    /// (a later removal or move) mutate the store afterwards.
-    fn ctx(session: &str, brigade: Option<i64>, role: Option<BrigadeRole>) -> ServerContext {
+    /// Builds a `ServerContext` from `(session, brigade, member, role)`
+    /// launch-argv fields. When `brigade`/`member`/`role` are all given, also
+    /// registers that as the member's *real* store row (with
+    /// `claude_session_id` set from `session`), matching the normal case
+    /// where launch argv reflects membership at spawn time; tests that need
+    /// the two to diverge (a later removal or reassignment) mutate the store
+    /// afterwards.
+    fn ctx(
+        session: &str,
+        brigade: Option<i64>,
+        member: Option<&str>,
+        role: Option<BrigadeRole>,
+    ) -> ServerContext {
         let mut store = Store::open_in_memory().unwrap();
-        if let (Some(brigade), Some(role)) = (brigade, role) {
+        if let (Some(brigade), Some(member), Some(role)) = (brigade, member, role) {
             store
-                .set_brigade_member(brigade, &SessionId(session.to_string()), role)
+                .add_brigade_member(brigade, member, role, Some(&SessionId(session.to_string())))
                 .unwrap();
         }
         ServerContext {
             identity: Identity {
                 session: Some(session.to_string()),
                 brigade,
+                member: member.map(str::to_string),
                 role,
             },
             store,
@@ -339,7 +354,7 @@ mod tests {
 
     #[test]
     fn initialize_echoes_protocol_version_and_advertises_tools() {
-        let mut ctx = ctx("s", None, None);
+        let mut ctx = ctx("s", None, None, None);
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize",
@@ -351,7 +366,7 @@ mod tests {
 
     #[test]
     fn tools_list_advertises_the_mediation_tools() {
-        let mut ctx = ctx("s", None, None);
+        let mut ctx = ctx("s", None, None, None);
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
@@ -369,7 +384,7 @@ mod tests {
 
     #[test]
     fn ping_echoes_the_session() {
-        let mut ctx = ctx("spike-session", None, None);
+        let mut ctx = ctx("spike-session", None, None, None);
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call",
@@ -381,7 +396,12 @@ mod tests {
 
     #[test]
     fn send_to_peer_as_director_enqueues_for_the_worker_role() {
-        let mut ctx = ctx("dir", Some(1), Some(BrigadeRole::Director));
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call",
@@ -391,18 +411,18 @@ mod tests {
         // A Worker in the same brigade can now pull it.
         let pulled = ctx
             .store
-            .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
             .unwrap();
         assert_eq!(pulled.len(), 1);
         assert_eq!(pulled[0].body, "run the tests");
-        assert_eq!(pulled[0].from_session, "dir");
+        assert_eq!(pulled[0].from_token, "director");
     }
 
     #[test]
-    fn check_messages_returns_firewall_framed_text_then_clears() {
-        let mut ctx = ctx("w1", Some(1), Some(BrigadeRole::Worker));
+    fn check_messages_returns_firewall_framed_text_naming_the_sender_token_then_clears() {
+        let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
         ctx.store
-            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "please rebase")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "please rebase")
             .unwrap();
 
         let response = call(
@@ -413,6 +433,10 @@ mod tests {
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("please rebase"), "got {text:?}");
         assert!(text.contains("Director"), "names the peer role: {text:?}");
+        assert!(
+            text.contains("[from director]"),
+            "names the sender token: {text:?}"
+        );
         assert!(
             text.contains("another AI"),
             "carries firewall framing: {text:?}"
@@ -430,7 +454,7 @@ mod tests {
 
     #[test]
     fn message_tools_error_when_not_in_a_brigade() {
-        let mut ctx = ctx("solo", None, None);
+        let mut ctx = ctx("solo", None, None, None);
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":7,"method":"tools/call",
@@ -441,13 +465,11 @@ mod tests {
 
     #[test]
     fn removed_member_gets_iserror_from_both_tools() {
-        // Membership resolves live, so a removal (e.g. `toggle_worker` in the
-        // emporium) takes effect on this connection's very next call, without
-        // a relaunch.
-        let mut ctx = ctx("w1", Some(1), Some(BrigadeRole::Worker));
-        ctx.store
-            .remove_brigade_member(1, &SessionId("w1".to_string()))
-            .unwrap();
+        // Membership resolves live, so a removal (e.g. disbanding the
+        // brigade in the emporium) takes effect on this connection's very
+        // next call, without a relaunch.
+        let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
+        ctx.store.remove_brigade_member(1, "worker-1").unwrap();
 
         let send_response = call(
             &mut ctx,
@@ -465,13 +487,22 @@ mod tests {
     }
 
     #[test]
-    fn tools_use_live_store_membership_not_the_launch_time_argv() {
-        // argv says brigade 999 as Director, but the store's *real*
-        // membership (as if moved after launch) is brigade 42 as Worker —
-        // the live store must win for addressing.
-        let mut ctx = ctx("s", Some(999), Some(BrigadeRole::Director));
+    fn tools_use_the_live_member_row_not_the_launch_time_role_argv() {
+        // argv says --role director, but the store's *real* row for this
+        // (brigade, member) is a Worker — the live row must win for role.
+        let mut ctx = ctx("s", Some(1), Some("worker-1"), Some(BrigadeRole::Director));
         ctx.store
-            .set_brigade_member(42, &SessionId("s".to_string()), BrigadeRole::Worker)
+            .set_member_claude_session(1, "worker-1", &SessionId("s".to_string()))
+            .unwrap();
+        // Overwrite what `ctx()` inserted (as Director) with the true role.
+        ctx.store.remove_brigade_member(1, "worker-1").unwrap();
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("s".to_string())),
+            )
             .unwrap();
 
         let response = call(
@@ -481,27 +512,48 @@ mod tests {
         );
         assert_eq!(response["result"]["isError"], false);
 
-        // Landed in brigade 42 addressed to the Director (the peer of a
-        // Worker) — the live membership — not brigade 999 addressed to
-        // Worker (the stale argv).
+        // Addressed to the Director (the peer of a Worker) — the live role —
+        // not to the Worker role the stale argv would have used.
         let pulled = ctx
             .store
-            .fetch_brigade_messages(42, "some-director", BrigadeRole::Director)
+            .fetch_brigade_messages(1, "director", BrigadeRole::Director)
             .unwrap();
         assert_eq!(pulled.len(), 1);
         assert_eq!(pulled[0].body, "hi");
-        assert!(
-            ctx.store
-                .fetch_brigade_messages(999, "w1", BrigadeRole::Worker)
-                .unwrap()
-                .is_empty(),
-            "must not have used the stale launch-time brigade/role"
+    }
+
+    #[test]
+    fn falls_back_to_matching_session_against_claude_session_id_when_member_is_absent() {
+        // An old `--mcp-config` written before `--member` existed: no
+        // `member` in argv, so membership is resolved by matching `session`
+        // against a member's claude_session_id instead.
+        let mut ctx = ctx("s", None, None, None);
+        ctx.store
+            .add_brigade_member(
+                7,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("s".to_string())),
+            )
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":14,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi via fallback"}}}"#,
         );
+        assert_eq!(response["result"]["isError"], false);
+        let pulled = ctx
+            .store
+            .fetch_brigade_messages(7, "director", BrigadeRole::Director)
+            .unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].from_token, "worker-1");
     }
 
     #[test]
     fn notifications_get_no_response() {
-        let mut ctx = ctx("s", None, None);
+        let mut ctx = ctx("s", None, None, None);
         assert!(
             handle_line(
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
@@ -513,7 +565,7 @@ mod tests {
 
     #[test]
     fn unknown_method_returns_method_not_found() {
-        let mut ctx = ctx("s", None, None);
+        let mut ctx = ctx("s", None, None, None);
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":8,"method":"resources/list"}"#,

@@ -73,6 +73,29 @@ impl Default for ActivityConfig {
     }
 }
 
+/// Brigade formation settings (emporium mode only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BrigadeConfig {
+    /// How many fresh Workers to auto-spawn when a brigade is formed.
+    /// Clamped to 1..=8 wherever it's consumed — a raw, unclamped value here
+    /// lets a config round-trip losslessly even if it's out of range.
+    pub workers: u32,
+}
+
+impl Default for BrigadeConfig {
+    fn default() -> Self {
+        Self { workers: 1 }
+    }
+}
+
+impl BrigadeConfig {
+    /// [`Self::workers`] clamped to a sane 1..=8 range for actual use.
+    pub fn worker_count(&self) -> usize {
+        self.workers.clamp(1, 8) as usize
+    }
+}
+
 /// Top-level banto configuration. Every field has a default and unknown keys
 /// are ignored, so any subset of `config.toml` is valid.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -80,6 +103,7 @@ impl Default for ActivityConfig {
 pub struct Config {
     pub opener: OpenerMode,
     pub activity: ActivityConfig,
+    pub brigade: BrigadeConfig,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
     /// Overrides [`default_db_path`].
@@ -135,8 +159,26 @@ mod tests {
         assert_eq!(config.opener, OpenerMode::InPlace);
         assert_eq!(config.activity.today_hours, 24);
         assert_eq!(config.activity.week_days, 7);
+        assert_eq!(config.brigade.workers, 1);
         assert_eq!(config.claude_home, None);
         assert_eq!(config.db_path, None);
+    }
+
+    #[test]
+    fn partial_brigade_section_fills_remaining_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[brigade]\nworkers = 3\n");
+        let config = load(&path).unwrap();
+        assert_eq!(config.brigade.workers, 3);
+        assert_eq!(config.brigade.worker_count(), 3);
+    }
+
+    #[test]
+    fn brigade_worker_count_clamps_to_one_through_eight() {
+        assert_eq!(BrigadeConfig { workers: 0 }.worker_count(), 1);
+        assert_eq!(BrigadeConfig { workers: 1 }.worker_count(), 1);
+        assert_eq!(BrigadeConfig { workers: 8 }.worker_count(), 8);
+        assert_eq!(BrigadeConfig { workers: 20 }.worker_count(), 8);
     }
 
     #[test]

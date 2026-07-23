@@ -118,6 +118,52 @@ const MIGRATIONS: &[&str] = &[
         JOIN brigade_members bm ON bm.session_id = bc.session_id;
     DROP TABLE brigade_cursors;
     ALTER TABLE brigade_cursors_v6 RENAME TO brigade_cursors;",
+    // v7: banto-owned member identity. `brigade_members` moves from being
+    // keyed by the Claude session id itself to a stable `member_token`
+    // ('director', 'worker-1', 'worker-2', ...) with an optional
+    // `claude_session_id` — a brigade Worker is now formed by banto
+    // *before* Claude assigns it a session id (auto-spawned, see
+    // crate::embedded::emporium), so the id has to be a nullable, filled-in
+    // -later column rather than the primary identity. `brigade_messages`
+    // keeps its shape; `from_session` now holds a member token going
+    // forward (existing rows are left as-is — old session-id attribution on
+    // already-queued messages is cosmetic history, not a correctness
+    // concern). Existing v6 rows are rekeyed: the sole director row becomes
+    // token 'director', worker rows become 'worker-1', 'worker-2', ... in
+    // their old session-id order; `brigade_cursors` follows the same
+    // mapping, dropping any cursor with no surviving membership (the INNER
+    // JOIN naturally excludes it).
+    "CREATE TABLE brigade_members_v7 (
+        brigade_id        INTEGER NOT NULL,
+        member_token      TEXT NOT NULL,
+        role              TEXT NOT NULL,
+        claude_session_id TEXT,
+        PRIMARY KEY (brigade_id, member_token)
+    );
+    INSERT INTO brigade_members_v7 (brigade_id, member_token, role, claude_session_id)
+        SELECT brigade_id, 'director', role, session_id
+        FROM brigade_members WHERE role = 'director';
+    INSERT INTO brigade_members_v7 (brigade_id, member_token, role, claude_session_id)
+        SELECT brigade_id,
+               'worker-' || ROW_NUMBER() OVER (PARTITION BY brigade_id ORDER BY session_id),
+               role,
+               session_id
+        FROM brigade_members WHERE role != 'director';
+    CREATE TABLE brigade_cursors_v7 (
+        brigade_id   INTEGER NOT NULL,
+        member_token TEXT NOT NULL,
+        last_seen_id INTEGER NOT NULL,
+        PRIMARY KEY (brigade_id, member_token)
+    );
+    INSERT INTO brigade_cursors_v7 (brigade_id, member_token, last_seen_id)
+        SELECT bc.brigade_id, bm7.member_token, bc.last_seen_id
+        FROM brigade_cursors bc
+        JOIN brigade_members_v7 bm7
+          ON bm7.brigade_id = bc.brigade_id AND bm7.claude_session_id = bc.session_id;
+    DROP TABLE brigade_members;
+    ALTER TABLE brigade_members_v7 RENAME TO brigade_members;
+    DROP TABLE brigade_cursors;
+    ALTER TABLE brigade_cursors_v7 RENAME TO brigade_cursors;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -305,13 +351,18 @@ mod tests {
         assert!(store.list_brigades().unwrap().is_empty());
         let br = store.create_brigade("cell").unwrap();
         store
-            .set_brigade_member(br, &SessionId("dir".to_string()), BrigadeRole::Director)
+            .add_brigade_member(
+                br,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
             .unwrap();
         assert_eq!(
             store
-                .brigade_of_session(&SessionId("dir".to_string()))
+                .brigade_of_claude_session(&SessionId("dir".to_string()))
                 .unwrap(),
-            Some((br, BrigadeRole::Director))
+            Some((br, "director".to_string(), BrigadeRole::Director))
         );
         let version: i64 = store
             .conn
@@ -354,16 +405,16 @@ mod tests {
         let mut store = Store::open(&db).unwrap();
         assert_eq!(
             store
-                .brigade_of_session(&SessionId("dir".to_string()))
+                .brigade_of_claude_session(&SessionId("dir".to_string()))
                 .unwrap(),
-            Some((1, BrigadeRole::Director))
+            Some((1, "director".to_string(), BrigadeRole::Director))
         );
         store
-            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "hi")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "hi")
             .unwrap();
         assert_eq!(
             store
-                .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
                 .unwrap()
                 .len(),
             1
@@ -376,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_to_v6_upgrade_rekeys_cursors_by_brigade_and_preserves_membership() {
+    fn v5_to_v7_upgrade_carries_the_cursor_fix_through_the_token_rekey() {
         use super::super::BrigadeRole;
 
         let dir = tempfile::tempdir().unwrap();
@@ -409,41 +460,128 @@ mod tests {
             conn.pragma_update(None, "user_version", 5).unwrap();
         }
 
-        // Opening through Store::open must run the v6 migration: the cursor
-        // carries over under the composite key, scoped to the session's
-        // current brigade, and membership is untouched.
+        // Opening through Store::open must run both the v6 and v7 migrations:
+        // the lone worker becomes token "worker-1" with its claude session id
+        // preserved, and its cursor carries over under the new composite key
+        // (brigade_id, member_token) — still scoped, so the v6 fix survives
+        // the v7 rekey.
         let mut store = Store::open(&db).unwrap();
         assert_eq!(
             store
-                .brigade_of_session(&SessionId("w1".to_string()))
+                .brigade_of_claude_session(&SessionId("w1".to_string()))
                 .unwrap(),
-            Some((1, BrigadeRole::Worker))
+            Some((1, "worker-1".to_string(), BrigadeRole::Worker))
         );
         // A message at id <= the carried-over cursor (7) must not resurface.
         store
-            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "old, already seen")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "old, already seen")
             .unwrap();
         for _ in 1..7 {
             store
-                .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "filler")
+                .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "filler")
                 .unwrap();
         }
         assert!(
             store
-                .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
                 .unwrap()
                 .is_empty(),
             "messages at or before the carried-over cursor must stay hidden"
         );
         // A message enqueued past the cursor is delivered normally.
         store
-            .enqueue_brigade_message(1, "dir", BrigadeRole::Worker, "new")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "new")
             .unwrap();
         let got = store
-            .fetch_brigade_messages(1, "w1", BrigadeRole::Worker)
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].body, "new");
+
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v6_to_v7_upgrade_assigns_tokens_and_rekeys_membership_and_cursors() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v6 code would have left it: v1..=v6 scripts
+        // applied, a brigade with a Director and two Workers (old shape:
+        // keyed by session_id), each with its own (brigade_id, session_id)
+        // cursor, `user_version` left at 6.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..6] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, session_id, role) VALUES
+                 (1, 'dir', 'director'),
+                 (1, 'alice', 'worker'),
+                 (1, 'bob',   'worker')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_cursors (brigade_id, session_id, last_seen_id) VALUES
+                 (1, 'dir',   0),
+                 (1, 'alice', 3),
+                 (1, 'bob',   5)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        // Opening through Store::open must run the v7 migration: the
+        // director becomes token "director", the two workers become
+        // "worker-1"/"worker-2" in session-id order ("alice" < "bob"), each
+        // keeping its claude session id and its own cursor value.
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .brigade_of_claude_session(&SessionId("dir".to_string()))
+                .unwrap(),
+            Some((1, "director".to_string(), BrigadeRole::Director))
+        );
+        assert_eq!(
+            store
+                .brigade_of_claude_session(&SessionId("alice".to_string()))
+                .unwrap(),
+            Some((1, "worker-1".to_string(), BrigadeRole::Worker))
+        );
+        assert_eq!(
+            store
+                .brigade_of_claude_session(&SessionId("bob".to_string()))
+                .unwrap(),
+            Some((1, "worker-2".to_string(), BrigadeRole::Worker))
+        );
+
+        let cursor = |token: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = 1 AND member_token = ?1",
+                    [token],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(cursor("director"), 0);
+        assert_eq!(cursor("worker-1"), 3);
+        assert_eq!(cursor("worker-2"), 5);
 
         let version: i64 = store
             .conn

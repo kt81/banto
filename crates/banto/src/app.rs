@@ -96,6 +96,11 @@ pub enum Modal {
     ConfirmArchive { session_id: String, title: String },
     /// The `g` group-join dialog: pick an existing group or type a new name.
     GroupJoin(GroupJoinState),
+    /// The emporium's `B`-on-a-Director disband confirm dialog: Enter
+    /// disbands the brigade (`brigade_id`), Esc cancels. `name` is the
+    /// Director's title, for the prompt. Classic mode never opens this, but
+    /// still has to render/dispatch it since the two share `App`/`render_modal`.
+    ConfirmDisband { brigade_id: i64, name: String },
 }
 
 /// State for the group-join modal: a free-text new-group-name input plus a
@@ -460,6 +465,18 @@ pub struct App {
     /// Ids of pinned sessions. A cache for sorting/display only — the store
     /// is the durable source of truth; see [`Self::toggle_pin`].
     pinned: HashSet<String>,
+    /// Claude session ids of brigade Workers, hidden from `filtered` (see
+    /// [`Self::compute_filtered`]) — a Worker is banto's own implementation
+    /// detail, not a session the user picks directly. A cache loaded from the
+    /// store at startup and on every reload (see [`Self::with_hidden_worker_ids`]/
+    /// [`Self::set_hidden_worker_ids`]); never used to pre-filter `base_rows`
+    /// itself, so `row_for_id` can still resolve a hidden Worker's row when
+    /// staging its brigade.
+    hidden: HashSet<String>,
+    /// Claude session ids of brigade Directors, for the list/summary marker
+    /// (mirrors `pinned`'s cache-only role); see
+    /// [`Self::with_directors`]/[`Self::set_directors`].
+    directors: HashSet<String>,
     /// Whether agent-run sessions (`SessionRow::is_agent`) are included in
     /// `filtered`. Off by default: a human browsing their own sessions
     /// doesn't usually want every spawned-agent session cluttering the list.
@@ -511,6 +528,7 @@ pub struct App {
 pub struct VisibleRow<'a> {
     pub row: &'a SessionRow,
     pub pinned: bool,
+    pub director: bool,
 }
 
 /// One physical line in the rendered list, in display order: either a real
@@ -547,6 +565,8 @@ impl App {
             rows: Vec::new(),
             haystacks: Vec::new(),
             pinned: HashSet::new(),
+            hidden: HashSet::new(),
+            directors: HashSet::new(),
             show_agents: false,
             groups: Vec::new(),
             session_group: HashMap::new(),
@@ -669,7 +689,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.push_char(c),
             Some(Modal::GroupJoin(state)) => state.push_char(c),
-            Some(Modal::ConfirmArchive { .. }) | None => {}
+            Some(Modal::ConfirmArchive { .. }) | Some(Modal::ConfirmDisband { .. }) | None => {}
         }
     }
 
@@ -973,6 +993,45 @@ impl App {
         self
     }
 
+    /// Seed the initial hidden-worker-id set (loaded from the store at
+    /// startup — see [`Self::set_hidden_worker_ids`] for reloads).
+    pub fn with_hidden_worker_ids(mut self, hidden: HashSet<String>) -> Self {
+        self.hidden = hidden;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.refilter_keeping_selected(selected_id);
+        self
+    }
+
+    /// Replace the hidden-worker-id set (e.g. after a reload, or once a
+    /// brigade is formed/disbanded), keeping the current selection if it's
+    /// still visible.
+    pub fn set_hidden_worker_ids(&mut self, hidden: HashSet<String>) {
+        self.hidden = hidden;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.refilter_keeping_selected(selected_id);
+    }
+
+    /// Seed the initial brigade-director-id set (loaded from the store at
+    /// startup — see [`Self::set_directors`] for reloads). Unlike
+    /// [`Self::with_hidden_worker_ids`], this never affects filtering
+    /// (`directors` is display-only), so no re-filter is needed.
+    pub fn with_directors(mut self, directors: HashSet<String>) -> Self {
+        self.directors = directors;
+        self
+    }
+
+    /// Replace the brigade-director-id set (e.g. after a reload, or once a
+    /// brigade is formed/disbanded).
+    pub fn set_directors(&mut self, directors: HashSet<String>) {
+        self.directors = directors;
+    }
+
+    /// Open the emporium's disband confirm dialog for the given brigade
+    /// (bound to `B` on a session that is that brigade's Director).
+    pub fn open_confirm_disband_modal(&mut self, brigade_id: i64, name: String) {
+        self.modal = Some(Modal::ConfirmDisband { brigade_id, name });
+    }
+
     /// Toggle the pinned state of the selected session (no-op when nothing
     /// is selected), returning its id and new pinned state. `App` only
     /// caches pin state for sorting/display — the caller persists the
@@ -1032,17 +1091,20 @@ impl App {
     }
 
     /// Rank `rows` against the current query, then drop agent-run sessions
-    /// unless [`Self::show_agents`] is on. Ranking (and, with an empty
-    /// query, the pinned-first base order) always runs first and is never
-    /// affected by the agent filter — it only removes results afterward.
-    /// Finally, if grouped view is actually in effect (see
-    /// [`Self::grouped_view_active`]), stably re-sorts into section order
-    /// (Pinned, then each group alphabetically, then Ungrouped) — stable so
-    /// each section keeps its mtime-descending relative order.
+    /// unless [`Self::show_agents`] is on, and always drop brigade Workers
+    /// (banto's own implementation detail, not something the user picks
+    /// directly — see `hidden`). Ranking (and, with an empty query, the
+    /// pinned-first base order) always runs first and is never affected by
+    /// either filter — they only remove results afterward. Finally, if
+    /// grouped view is actually in effect (see [`Self::grouped_view_active`]),
+    /// stably re-sorts into section order (Pinned, then each group
+    /// alphabetically, then Ungrouped) — stable so each section keeps its
+    /// mtime-descending relative order.
     fn compute_filtered(&self) -> Vec<usize> {
         let mut ranked: Vec<usize> = rank_indices(&self.query, &self.haystacks)
             .into_iter()
             .filter(|&i| self.show_agents || !self.rows[i].is_agent)
+            .filter(|&i| !self.hidden.contains(&self.rows[i].id))
             .collect();
         if self.grouped_view_active(&ranked) {
             ranked.sort_by_key(|&i| self.section_rank(i));
@@ -1353,6 +1415,13 @@ impl App {
             .is_some_and(|row| self.pinned.contains(&row.id))
     }
 
+    /// Whether the currently selected session is a brigade Director (for the
+    /// summary panel's marker); `false` when nothing is selected.
+    pub fn is_selected_director(&self) -> bool {
+        self.selected_row()
+            .is_some_and(|row| self.directors.contains(&row.id))
+    }
+
     /// Selection index relative to the viewport (in display-line space —
     /// see [`Self::display_sequence`]), or `None` when the selection is
     /// scrolled out of view (or the list is empty).
@@ -1385,6 +1454,7 @@ impl App {
                     ListLine::Row(VisibleRow {
                         row,
                         pinned: self.pinned.contains(&row.id),
+                        director: self.directors.contains(&row.id),
                     })
                 }
             })
@@ -2367,6 +2437,85 @@ mod tests {
     fn is_selected_pinned_is_false_with_nothing_selected() {
         let app = App::new(Vec::new());
         assert!(!app.is_selected_pinned());
+    }
+
+    #[test]
+    fn hidden_worker_ids_are_excluded_from_filtered_but_still_resolve_by_id() {
+        let mut app = App::new(numbered(3)); // id0, id1, id2
+        app.set_viewport_height(10);
+
+        app = app.with_hidden_worker_ids(["id1".to_string()].into_iter().collect());
+
+        assert_eq!(ids(&app), vec!["id0", "id2"]);
+        // Still resolvable by id (e.g. to stage its brigade), just not listed.
+        assert!(app.row_for_id("id1").is_some());
+    }
+
+    #[test]
+    fn set_hidden_worker_ids_updates_the_filter_after_a_reload() {
+        let mut app = App::new(numbered(2)); // id0, id1
+        app.set_viewport_height(10);
+        assert_eq!(ids(&app), vec!["id0", "id1"]);
+
+        app.set_hidden_worker_ids(["id0".to_string()].into_iter().collect());
+        assert_eq!(ids(&app), vec!["id1"]);
+
+        // Un-hiding (e.g. the brigade was disbanded) brings it back.
+        app.set_hidden_worker_ids(HashSet::new());
+        assert_eq!(ids(&app), vec!["id0", "id1"]);
+    }
+
+    #[test]
+    fn is_selected_director_reflects_the_current_selection() {
+        let mut app = App::new(vec![row("a", "Alpha", ""), row("b", "Beta", "")]);
+        app.set_viewport_height(10);
+        assert!(!app.is_selected_director());
+
+        app = app.with_directors(["a".to_string()].into_iter().collect());
+        assert!(app.is_selected_director());
+
+        app.select_next();
+        assert!(!app.is_selected_director()); // now on "b", not a director
+    }
+
+    #[test]
+    fn visible_reports_director_status_per_row() {
+        let mut app = App::new(numbered(3));
+        app.set_viewport_height(10);
+        app = app.with_directors(["id1".to_string()].into_iter().collect());
+        app.toggle_grouped_view(); // flat: directors unrelated to sections
+
+        let director_flags: Vec<bool> = app
+            .visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Row(r) => Some(r.director),
+                ListLine::Header(_) => None,
+            })
+            .collect();
+        assert_eq!(director_flags, vec![false, true, false]);
+    }
+
+    #[test]
+    fn open_confirm_disband_modal_captures_the_brigade() {
+        let mut app = App::new(vec![row("dir", "Director", "")]);
+        app.set_viewport_height(10);
+
+        app.open_confirm_disband_modal(7, "Director".to_string());
+
+        let Some(Modal::ConfirmDisband { brigade_id, name }) = app.modal() else {
+            panic!("expected an open disband-confirm modal");
+        };
+        assert_eq!(*brigade_id, 7);
+        assert_eq!(name, "Director");
+    }
+
+    #[test]
+    fn close_modal_dismisses_the_disband_confirm() {
+        let mut app = App::new(Vec::new());
+        app.open_confirm_disband_modal(1, "cell".to_string());
+        app.close_modal();
+        assert!(app.modal().is_none());
     }
 
     #[test]

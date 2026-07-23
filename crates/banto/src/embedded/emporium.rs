@@ -8,6 +8,7 @@
 //! `view` renderers, the store-load helpers, and `render_modal`.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -31,7 +32,7 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::model::SessionId;
 use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::status::{AgeThresholds, SysinfoProbe, read_live_sessions};
-use banto_core::store::{BrigadeId, BrigadeRole, Store};
+use banto_core::store::{BrigadeId, BrigadeMember, BrigadeRole, MemberToken, Store};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
 use crate::opener::{self, SessionToOpen};
@@ -66,12 +67,16 @@ enum Focus {
 /// shared list state): the kept-alive session panes, what the pane region
 /// currently shows (the [`Stage`]), the focus, and a transient status line.
 struct Emporium {
-    /// Kept-alive embedded sessions, keyed by session id (or a `new::<cwd>`
-    /// synthetic key for freshly-launched ones that have no id yet).
+    /// Kept-alive embedded sessions, keyed by session id, or a synthetic key
+    /// for freshly-launched ones with no id yet: `new::<cwd>` for a plain new
+    /// session, `new-worker::<brigade>::<token>` for an auto-spawned brigade
+    /// Worker (globally unique per member, so several Workers launched into
+    /// the same cwd at once never collide the way a shared `new::<cwd>` key
+    /// would — see [`discover_new_ids`]).
     ///
     /// Append-only for the lifetime of a run: sessions are never removed
-    /// (removing one from a brigade only drops it from the [`Stage`], the
-    /// session stays alive here). So every index held by a `Stage` stays valid.
+    /// (disbanding a brigade only drops it from the [`Stage`], the session
+    /// stays alive here). So every index held by a `Stage` stays valid.
     sessions: Vec<(String, EmbeddedSession)>,
     /// What the pane region currently shows.
     stage: Stage,
@@ -146,11 +151,14 @@ fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(usize, Rect)> {
 }
 
 /// A new session whose real id Claude hasn't assigned yet: its synthetic
-/// `new::<cwd>` collection key, launch cwd, and launch time.
+/// collection key, launch cwd, and launch time. When it's a brigade Worker
+/// banto auto-spawned, `member` carries the `(brigade, token)` to persist its
+/// id under once discovered (see [`discover_new_ids`]).
 struct PendingNew {
     key: String,
     cwd: PathBuf,
     since: SystemTime,
+    member: Option<(BrigadeId, MemberToken)>,
 }
 
 /// Which confirm branch an open modal takes — resolved before mutating `App`
@@ -159,27 +167,46 @@ enum ModalKind {
     Archive,
     Group,
     New,
+    Disband,
 }
 
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
-pub fn run(claude_home: &Path, thresholds: &AgeThresholds, store: &RefCell<Store>) -> Result<()> {
+/// `worker_count` is how many fresh Workers `B` auto-spawns when forming a
+/// new brigade (`[brigade].workers` in config.toml, already clamped).
+pub fn run(
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+    store: &RefCell<Store>,
+    worker_count: usize,
+) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
     // Same store-backed state the classic list builds, so grouping / pins /
-    // archived-hiding show identically in the sidebar.
-    let (rows, pinned, groups, session_groups) = {
+    // archived-hiding / brigade hiding show identically in the sidebar.
+    let (rows, pinned, groups, session_groups, hidden, directors) = {
         let store = store.borrow();
         let rows = crate::tui::exclude_archived(rows, &store);
         let pinned = crate::tui::load_pinned(&store);
         let groups = crate::tui::load_groups(&store);
         let session_groups = crate::tui::load_session_groups(&store, &groups);
-        (rows, pinned, groups, session_groups)
+        let hidden = crate::tui::load_hidden_worker_ids(&store);
+        let directors = crate::tui::load_directors(&store);
+        (rows, pinned, groups, session_groups, hidden, directors)
     };
     let mut app = App::new(rows)
         .with_pinned(pinned)
-        .with_groups(groups, session_groups);
+        .with_groups(groups, session_groups)
+        .with_hidden_worker_ids(hidden)
+        .with_directors(directors);
 
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, claude_home, thresholds, store);
+    let result = event_loop(
+        &mut terminal,
+        &mut app,
+        claude_home,
+        thresholds,
+        store,
+        worker_count,
+    );
     let restored = restore_terminal();
     result.and(restored)
 }
@@ -190,6 +217,7 @@ fn event_loop(
     claude_home: &Path,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
+    worker_count: usize,
 ) -> Result<()> {
     let mut ui = Emporium {
         sessions: Vec::new(),
@@ -223,7 +251,15 @@ fn event_loop(
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if !handle_key(&mut ui, app, store, claude_home, thresholds, key) {
+                    if !handle_key(
+                        &mut ui,
+                        app,
+                        store,
+                        claude_home,
+                        thresholds,
+                        worker_count,
+                        key,
+                    ) {
                         break;
                     }
                 }
@@ -237,9 +273,10 @@ fn event_loop(
             reload(app, claude_home, thresholds, store);
         }
         // Discover the ids Claude assigns to freshly-launched sessions, so they
-        // can be re-selected from the sidebar without a second resume.
+        // can be re-selected from the sidebar without a second resume (and, for
+        // a brigade Worker, so its membership row gets its real id).
         if !ui.pending_new.is_empty() {
-            discover_new_ids(&mut ui, &provider);
+            discover_new_ids(&mut ui, app, store, &provider);
         }
     }
     Ok(())
@@ -252,6 +289,7 @@ fn handle_key(
     store: &RefCell<Store>,
     claude_home: &Path,
     thresholds: &AgeThresholds,
+    worker_count: usize,
     key: KeyEvent,
 ) -> bool {
     let code = key.code;
@@ -301,8 +339,8 @@ fn handle_key(
                 KeyCode::Home => app.select_first(),
                 KeyCode::End => app.select_last(),
                 KeyCode::Enter => open_or_switch(ui, app, store, claude_home),
-                KeyCode::Char('B') => start_brigade(ui, app, store, claude_home),
-                KeyCode::Char('b') => toggle_worker(ui, app, store, claude_home),
+                KeyCode::Char('B') => handle_brigade_key(ui, app, store, claude_home, worker_count),
+                KeyCode::Char('b') => add_worker(ui, app, store),
                 KeyCode::Tab => {
                     app.toggle_grouped_view();
                 }
@@ -412,25 +450,26 @@ fn mouse_btn(button: MouseButton) -> u16 {
     }
 }
 
-/// Enter / double-click on the sidebar: if the selected session belongs to a
-/// brigade, stage that whole cell; otherwise switch to the session if it's
+/// Enter / double-click on the sidebar: if the selected session is a brigade
+/// Director, stage that whole cell; otherwise switch to the session if it's
 /// already open (keeping every session alive), else open it solo in a new
 /// kept-alive pane. Switching to an already-open session never re-resumes it —
 /// that would fork its history (a double resume) even though banto itself is
-/// what holds it.
+/// what holds it. Workers never reach this: they're hidden from the list (see
+/// `App::hidden`).
 fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
     let Some(row) = app.selected_row() else {
         return;
     };
     let id = row.id.clone();
 
-    // Belongs to a brigade? Open the whole cell instead of the lone session.
+    // A brigade Director? Open the whole cell instead of the lone session.
     let membership = store
         .borrow()
-        .brigade_of_session(&SessionId(id.clone()))
+        .brigade_of_claude_session(&SessionId(id.clone()))
         .ok()
         .flatten();
-    if let Some((brigade_id, _)) = membership {
+    if let Some((brigade_id, _, BrigadeRole::Director)) = membership {
         stage_brigade(ui, app, store, claude_home, brigade_id);
         return;
     }
@@ -444,13 +483,14 @@ fn open_or_switch(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_h
 /// Ensure `row`'s session is open as an embedded pane, returning its index in
 /// [`Emporium::sessions`]. Reuses the pane if already open; otherwise opens it
 /// (enforcing no-double-resume). When `brigade` is set, a freshly-launched
-/// session is wired to its MCP channel. Returns `None` when it can't be opened
-/// (already running elsewhere, or an error — a status is set in both cases).
+/// session is wired to its MCP channel under that `(brigade, token, role)`.
+/// Returns `None` when it can't be opened (already running elsewhere, or an
+/// error — a status is set in both cases).
 fn ensure_session_open(
     ui: &mut Emporium,
     row: &SessionRow,
     claude_home: &Path,
-    brigade: Option<(BrigadeId, BrigadeRole)>,
+    brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
 ) -> Option<usize> {
     let id = row.id.clone();
     if let Some(i) = ui.sessions.iter().position(|(sid, _)| *sid == id) {
@@ -487,22 +527,68 @@ fn ensure_session_open(
     }
 }
 
-/// `B`: form a new brigade with the selected session as its Director and stage
-/// it. The brigade is persisted immediately (schema v4), so it can be reopened
-/// later from the sidebar (Enter on any member).
-fn start_brigade(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
-    let Some(row) = app.selected_row() else {
+/// `B`: on a session not yet in a brigade, form one (appoint it Director,
+/// auto-spawn `worker_count` fresh Workers). On a session that IS a brigade's
+/// Director, open the disband confirmation instead. A Worker never reaches
+/// here (hidden from the list), but a defensive no-op status covers it in
+/// case that ever changes.
+fn handle_brigade_key(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    worker_count: usize,
+) {
+    let Some(row) = app.selected_row().cloned() else {
         return;
     };
-    let name = row.display_title().to_string();
-    let session_id = row.id.clone();
+    let membership = store
+        .borrow()
+        .brigade_of_claude_session(&SessionId(row.id.clone()))
+        .ok()
+        .flatten();
+    match membership {
+        Some((brigade_id, _, BrigadeRole::Director)) => {
+            app.open_confirm_disband_modal(brigade_id, row.display_title().to_string());
+        }
+        Some((_, _, BrigadeRole::Worker)) => {
+            ui.status = Some("workers can't be promoted to Director directly".to_string());
+        }
+        None => form_brigade(ui, app, store, claude_home, worker_count, &row),
+    }
+}
 
-    // Create + persist the brigade first, so the Director launches already wired
-    // to its MCP channel (its identity is passed into the launch below).
+/// Form a new brigade with `row` as Director, then auto-spawn `worker_count`
+/// fresh Workers (plain `claude` processes) in its cwd, each wired to the
+/// brigade's MCP channel under its own `worker-N` token. The brigade is
+/// persisted immediately (schema v7), so it can be reopened later from the
+/// sidebar (Enter on the Director).
+fn form_brigade(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    worker_count: usize,
+    row: &SessionRow,
+) {
+    let name = row.display_title().to_string();
+    let cwd = row
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+
+    // Create + persist the brigade first, so the Director launches already
+    // wired to its MCP channel (its identity is passed into the launch below).
     let brigade_id = {
         let mut store = store.borrow_mut();
         match store.create_brigade(&name).and_then(|bid| {
-            store.set_brigade_member(bid, &SessionId(session_id), BrigadeRole::Director)?;
+            store.add_brigade_member(
+                bid,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId(row.id.clone())),
+            )?;
             Ok(bid)
         }) {
             Ok(bid) => bid,
@@ -514,30 +600,47 @@ fn start_brigade(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_ho
         }
     };
 
-    let Some(idx) = ensure_session_open(
+    let Some(director_idx) = ensure_session_open(
         ui,
         row,
         claude_home,
-        Some((brigade_id, BrigadeRole::Director)),
+        Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
     ) else {
         // The brigade is persisted but its Director couldn't open (status set).
         return;
     };
+
+    let mut panes = vec![director_idx];
+    for n in 1..=worker_count {
+        let token = format!("worker-{n}");
+        if let Err(err) =
+            store
+                .borrow_mut()
+                .add_brigade_member(brigade_id, &token, BrigadeRole::Worker, None)
+        {
+            ui.status = Some(format!("failed to add {token}: {err}"));
+            continue;
+        }
+        if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &token) {
+            panes.push(idx);
+        }
+    }
+
     ui.stage = Stage::Brigade {
         id: brigade_id,
-        panes: vec![idx],
+        panes,
         focused: 0,
     };
     ui.focus = Focus::Pane;
+    refresh_brigade_caches(app, store);
     ui.status = Some(format!(
-        "brigade formed — director: {name}. F2 → pick a session → b to add a worker."
+        "brigade formed — director: {name}, {worker_count} worker(s) spawned"
     ));
 }
 
-/// `b`: add the selected session to the staged brigade as a Worker, or remove
-/// it if it's already a Worker there (a no-op on the Director). Requires a
-/// brigade to be staged.
-fn toggle_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_home: &Path) {
+/// `b`: spawn one more fresh Worker into the staged brigade, under the next
+/// `worker-N` token. Requires a brigade to be staged.
+fn add_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>) {
     let brigade_id = match &ui.stage {
         Stage::Brigade { id, .. } => *id,
         _ => {
@@ -545,70 +648,55 @@ fn toggle_worker(ui: &mut Emporium, app: &App, store: &RefCell<Store>, claude_ho
             return;
         }
     };
-    let Some(row) = app.selected_row() else {
-        return;
-    };
-    let session_id = row.id.clone();
-
-    // Already a member of this brigade? Toggle it out (unless it's the
-    // Director, which `b` never removes).
-    let membership = store
-        .borrow()
-        .brigade_of_session(&SessionId(session_id.clone()))
-        .ok()
-        .flatten();
-    if let Some((member_brigade, role)) = membership
-        && member_brigade == brigade_id
-    {
-        if role == BrigadeRole::Director {
-            ui.status = Some("that session is the Director".to_string());
+    let members = match store.borrow().brigade_members(brigade_id) {
+        Ok(members) => members,
+        Err(err) => {
+            ui.status = Some(format!("failed to load brigade: {err}"));
             return;
         }
-        let _ = store
-            .borrow_mut()
-            .remove_brigade_member(brigade_id, &SessionId(session_id.clone()));
-        let open_idx = ui.sessions.iter().position(|(sid, _)| *sid == session_id);
-        if let Stage::Brigade { panes, focused, .. } = &mut ui.stage
-            && let Some(removed) = open_idx
-        {
-            panes.retain(|&i| i != removed);
-            if *focused >= panes.len() {
-                *focused = panes.len().saturating_sub(1);
-            }
-        }
-        ui.status = Some("worker removed".to_string());
-        return;
-    }
-
-    // Otherwise add it as a Worker: persist first, then launch it wired to the
-    // MCP channel, and tile it in.
-    if let Err(err) = store.borrow_mut().set_brigade_member(
-        brigade_id,
-        &SessionId(session_id.clone()),
-        BrigadeRole::Worker,
-    ) {
-        ui.status = Some(format!("failed to add worker: {err}"));
-        return;
-    }
-    let Some(idx) = ensure_session_open(
-        ui,
-        row,
-        claude_home,
-        Some((brigade_id, BrigadeRole::Worker)),
-    ) else {
-        return;
     };
-    if let Stage::Brigade { panes, .. } = &mut ui.stage
-        && !panes.contains(&idx)
+    let next_n = members
+        .iter()
+        .filter(|m| m.role == BrigadeRole::Worker)
+        .count()
+        + 1;
+    let token = format!("worker-{next_n}");
+    let cwd = director_cwd(app, &members)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+
+    if let Err(err) =
+        store
+            .borrow_mut()
+            .add_brigade_member(brigade_id, &token, BrigadeRole::Worker, None)
     {
-        panes.push(idx);
+        ui.status = Some(format!("failed to add {token}: {err}"));
+        return;
     }
-    ui.status = Some("worker added".to_string());
+    if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &token) {
+        if let Stage::Brigade { panes, .. } = &mut ui.stage {
+            panes.push(idx);
+        }
+        ui.status = Some(format!("{token} added"));
+    }
+}
+
+/// The Director's cwd, if it can be resolved from the loaded session list —
+/// used as the launch cwd for a newly- or re-spawned Worker.
+fn director_cwd(app: &App, members: &[BrigadeMember]) -> Option<PathBuf> {
+    members
+        .iter()
+        .find(|m| m.role == BrigadeRole::Director)
+        .and_then(|m| m.claude_session_id.as_ref())
+        .and_then(|sid| app.row_for_id(&sid.0))
+        .and_then(|row| row.cwd.clone())
 }
 
 /// Stage brigade `brigade_id`: ensure each member is open (embedded) and show
-/// them tiled with the Director focused. Members that aren't in the loaded
-/// session list (e.g. gone from disk) are skipped.
+/// them tiled with the Director focused. A member whose Claude session can't
+/// be resolved (a Worker still awaiting id discovery, or one whose session
+/// file is gone from disk) is re-spawned fresh under its same token, since a
+/// Worker is disposable — only the Director not resolving counts as missing.
 fn stage_brigade(
     ui: &mut Emporium,
     app: &App,
@@ -623,15 +711,31 @@ fn stage_brigade(
             return;
         }
     };
+    let cwd = director_cwd(app, &members)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+
     let mut panes = Vec::new();
     let mut missing = 0;
     for member in &members {
-        match app.row_for_id(&member.session_id.0) {
+        let resolved_row = member
+            .claude_session_id
+            .as_ref()
+            .and_then(|sid| app.row_for_id(&sid.0));
+        match resolved_row {
             Some(row) => {
-                if let Some(idx) =
-                    ensure_session_open(ui, row, claude_home, Some((brigade_id, member.role)))
-                    && !panes.contains(&idx)
+                if let Some(idx) = ensure_session_open(
+                    ui,
+                    row,
+                    claude_home,
+                    Some((brigade_id, member.token.clone(), member.role)),
+                ) && !panes.contains(&idx)
                 {
+                    panes.push(idx);
+                }
+            }
+            None if member.role == BrigadeRole::Worker => {
+                if let Some(idx) = spawn_worker(ui, &cwd, brigade_id, &member.token) {
                     panes.push(idx);
                 }
             }
@@ -653,6 +757,57 @@ fn stage_brigade(
     }
 }
 
+/// Spawn a fresh, plain `claude` process in `cwd` as a Worker under `token`,
+/// wired to the brigade's MCP channel, and register it for id discovery
+/// ([`PendingNew`]) so its Claude-assigned session id gets recorded via
+/// `Store::set_member_claude_session` once known (see [`discover_new_ids`]).
+/// Returns its index in [`Emporium::sessions`], or `None` on failure (a
+/// status is set).
+fn spawn_worker(
+    ui: &mut Emporium,
+    cwd: &Path,
+    brigade_id: BrigadeId,
+    token: &str,
+) -> Option<usize> {
+    let mut argv = opener::inplace_argv(None);
+    match write_mcp_config(brigade_id, token, BrigadeRole::Worker, None) {
+        Ok(path) => {
+            argv.push("--mcp-config".to_string());
+            argv.push(path.to_string_lossy().into_owned());
+        }
+        Err(err) => {
+            ui.status = Some(format!("brigade channel unavailable for {token}: {err}"));
+        }
+    }
+    let since = SystemTime::now();
+    match EmbeddedSession::open(&PortablePtyHost, &argv, Some(cwd), 24, 80) {
+        Ok(embedded) => {
+            let key = format!("new-worker::{brigade_id}::{token}");
+            ui.sessions.push((key.clone(), embedded));
+            ui.pending_new.push(PendingNew {
+                key,
+                cwd: cwd.to_path_buf(),
+                since,
+                member: Some((brigade_id, token.to_string())),
+            });
+            Some(ui.sessions.len() - 1)
+        }
+        Err(err) => {
+            ui.status = Some(format!("failed to spawn {token}: {err}"));
+            None
+        }
+    }
+}
+
+/// Refresh `App`'s hidden-worker/director id caches from the store — called
+/// after any brigade mutation (formation, disband) so the list reflects it
+/// immediately rather than waiting for the next filesystem-triggered reload.
+fn refresh_brigade_caches(app: &mut App, store: &RefCell<Store>) {
+    let store = store.borrow();
+    app.set_hidden_worker_ids(crate::tui::load_hidden_worker_ids(&store));
+    app.set_directors(crate::tui::load_directors(&store));
+}
+
 /// Spawn `session` in a new embedded pane, enforcing the no-double-resume guard
 /// (reusing the classic in-place decision). Returns `None` (and sets a status)
 /// when it's already running elsewhere. When `brigade` is set, the launch is
@@ -660,7 +815,7 @@ fn stage_brigade(
 fn open_embedded(
     session: &SessionToOpen,
     claude_home: &Path,
-    brigade: Option<(BrigadeId, BrigadeRole)>,
+    brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
     status: &mut Option<String>,
 ) -> Result<Option<EmbeddedSession>> {
     let live = read_live_sessions(&claude_home.join("sessions"));
@@ -672,8 +827,8 @@ fn open_embedded(
     // A brigade member connects to banto's own MCP server (`banto _mcp`) so it
     // can message its peer. banto owns the launch argv, so the config file it
     // points at lives under banto's data dir — never under ~/.claude.
-    if let Some((brigade_id, role)) = brigade {
-        match write_mcp_config(&session.id, brigade_id, role) {
+    if let Some((brigade_id, token, role)) = brigade {
+        match write_mcp_config(brigade_id, &token, role, Some(&session.id)) {
             Ok(path) => {
                 argv.push("--mcp-config".to_string());
                 argv.push(path.to_string_lossy().into_owned());
@@ -687,24 +842,40 @@ fn open_embedded(
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to banto's
-/// own MCP server (`banto _mcp`) with this member's brigade identity, and return
-/// its path. Lives under banto's own data dir, never under ~/.claude.
-fn write_mcp_config(session_id: &str, brigade_id: BrigadeId, role: BrigadeRole) -> Result<PathBuf> {
+/// own MCP server (`banto _mcp`) with this member's brigade identity, and
+/// return its path. Named by `(brigade_id, token)` rather than the Claude
+/// session id, since that's the only identity known upfront for a
+/// freshly-spawned Worker (`claude_session_id` is `None` until Claude assigns
+/// one). Lives under banto's own data dir, never under `~/.claude`.
+fn write_mcp_config(
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+    claude_session_id: Option<&str>,
+) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let role_token = match role {
         BrigadeRole::Director => "director",
         BrigadeRole::Worker => "worker",
     };
+    let mut args = vec![
+        "_mcp".to_string(),
+        "--brigade".to_string(),
+        brigade_id.to_string(),
+        "--member".to_string(),
+        token.to_string(),
+        "--role".to_string(),
+        role_token.to_string(),
+    ];
+    if let Some(session_id) = claude_session_id {
+        args.push("--session".to_string());
+        args.push(session_id.to_string());
+    }
     let config = serde_json::json!({
         "mcpServers": {
             "banto": {
                 "command": exe.to_string_lossy(),
-                "args": [
-                    "_mcp",
-                    "--session", session_id,
-                    "--brigade", brigade_id.to_string(),
-                    "--role", role_token,
-                ],
+                "args": args,
             }
         }
     });
@@ -712,12 +883,13 @@ fn write_mcp_config(session_id: &str, brigade_id: BrigadeId, role: BrigadeRole) 
         .map(|base| base.join("banto").join("mcp"))
         .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))?;
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", sanitize_filename(session_id)));
+    let path = dir.join(format!("{brigade_id}-{}.json", sanitize_filename(token)));
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     Ok(path)
 }
 
-/// Keep a session id safe as a filename stem (ids are UUIDs, but be defensive).
+/// Keep a token safe as a filename component (tokens are `director`/`worker-N`,
+/// but be defensive).
 fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -745,11 +917,15 @@ fn toggle_pin(app: &mut App, store: &RefCell<Store>) {
 }
 
 /// Reload the session list from disk (after an archive, so it disappears
-/// immediately) — the emporium counterpart of the classic `reload`.
+/// immediately) — the emporium counterpart of the classic `reload`. Also
+/// refreshes the hidden-worker/director id sets.
 fn reload(app: &mut App, claude_home: &Path, thresholds: &AgeThresholds, store: &RefCell<Store>) {
     if let Ok(rows) = session::load_rows(claude_home, thresholds) {
-        let rows = crate::tui::exclude_archived(rows, &store.borrow());
+        let store = store.borrow();
+        let rows = crate::tui::exclude_archived(rows, &store);
         app.replace_rows(rows);
+        app.set_hidden_worker_ids(crate::tui::load_hidden_worker_ids(&store));
+        app.set_directors(crate::tui::load_directors(&store));
     }
 }
 
@@ -811,12 +987,14 @@ fn confirm_modal(
         Some(Modal::ConfirmArchive { .. }) => Some(ModalKind::Archive),
         Some(Modal::GroupJoin(_)) => Some(ModalKind::Group),
         Some(Modal::NewSession(_)) => Some(ModalKind::New),
+        Some(Modal::ConfirmDisband { .. }) => Some(ModalKind::Disband),
         None => None,
     };
     match kind {
         Some(ModalKind::Archive) => confirm_archive(ui, app, store, claude_home, thresholds),
         Some(ModalKind::Group) => confirm_group_join(ui, app, store),
         Some(ModalKind::New) => confirm_new_embedded(ui, app),
+        Some(ModalKind::Disband) => confirm_disband(ui, app, store),
         None => {}
     }
 }
@@ -911,33 +1089,105 @@ fn confirm_new_embedded(ui: &mut Emporium, app: &mut App) {
             ui.sessions.push((key.clone(), embedded));
             ui.stage = Stage::Solo(ui.sessions.len() - 1);
             ui.focus = Focus::Pane;
-            ui.pending_new.push(PendingNew { key, cwd, since });
+            ui.pending_new.push(PendingNew {
+                key,
+                cwd,
+                since,
+                member: None,
+            });
         }
         Err(err) => ui.status = Some(format!("failed to start a new session: {err}")),
     }
     app.close_modal();
 }
 
-/// Poll for the ids Claude assigns to freshly-launched sessions and re-key their
-/// collection entries from the synthetic `new::<cwd>` key to the real id, so
-/// they behave like any other open session (re-selectable, no second resume).
-fn discover_new_ids(ui: &mut Emporium, provider: &ClaudeCodeProvider) {
-    let mut discovered: Vec<(String, String)> = Vec::new();
-    for pending in &ui.pending_new {
-        if let Some(id) = provider.find_new_session(&pending.cwd, pending.since) {
-            discovered.push((pending.key.clone(), id.0));
-        }
-    }
-    if discovered.is_empty() {
+/// Confirm the disband dialog: purge the brigade (schema v7: membership,
+/// messages, cursors), refresh the hidden-worker/director caches so its
+/// Workers reappear in the list immediately, and fall back the stage to the
+/// Director alone. Its Workers' `claude` processes keep running — they simply
+/// reappear as ordinary live sessions (the emporium's append-only
+/// keep-alive invariant never kills a session).
+fn confirm_disband(ui: &mut Emporium, app: &mut App, store: &RefCell<Store>) {
+    let Some(Modal::ConfirmDisband { brigade_id, .. }) = app.modal() else {
+        return;
+    };
+    let brigade_id = *brigade_id;
+    let director_idx = match &ui.stage {
+        Stage::Brigade { id, panes, .. } if *id == brigade_id => panes.first().copied(),
+        _ => None,
+    };
+    if let Err(err) = store.borrow_mut().delete_brigade(brigade_id) {
+        ui.status = Some(format!("failed to disband: {err}"));
+        app.close_modal();
         return;
     }
-    for (key, id) in &discovered {
+    refresh_brigade_caches(app, store);
+    ui.stage = match director_idx {
+        Some(idx) => Stage::Solo(idx),
+        None => Stage::Empty,
+    };
+    ui.status = Some("brigade disbanded".to_string());
+    app.close_modal();
+}
+
+/// Poll for the ids Claude assigns to freshly-launched sessions and re-key their
+/// collection entries from their synthetic key to the real id, so they behave
+/// like any other open session (re-selectable, no second resume). A batch of
+/// brigade Workers auto-spawned into the same cwd at once is disambiguated by
+/// fetching every matching candidate (`find_new_sessions`, not the single-best
+/// `find_new_session`) and greedily assigning each to a still-pending entry,
+/// skipping ids already claimed by another open session — otherwise every
+/// pending entry sharing that cwd would independently resolve to the same
+/// "newest" file. A Worker's discovered id is also persisted via
+/// `Store::set_member_claude_session`, and the hidden-worker cache is
+/// refreshed right away so it disappears from the list on this same tick
+/// rather than waiting for the next filesystem-triggered reload.
+fn discover_new_ids(
+    ui: &mut Emporium,
+    app: &mut App,
+    store: &RefCell<Store>,
+    provider: &ClaudeCodeProvider,
+) {
+    // (pending's synthetic key, its discovered id, its brigade member if any)
+    type Resolved = (String, String, Option<(BrigadeId, MemberToken)>);
+
+    let claimed: HashSet<String> = ui.sessions.iter().map(|(k, _)| k.clone()).collect();
+    let mut used_this_pass: HashSet<String> = HashSet::new();
+    let mut resolved: Vec<Resolved> = Vec::new();
+
+    for pending in &ui.pending_new {
+        let id = provider
+            .find_new_sessions(&pending.cwd, pending.since)
+            .into_iter()
+            .map(|id| id.0)
+            .find(|id| !claimed.contains(id) && !used_this_pass.contains(id));
+        if let Some(id) = id {
+            used_this_pass.insert(id.clone());
+            resolved.push((pending.key.clone(), id, pending.member.clone()));
+        }
+    }
+    if resolved.is_empty() {
+        return;
+    }
+    let mut any_member = false;
+    for (key, id, member) in &resolved {
         if let Some(entry) = ui.sessions.iter_mut().find(|(k, _)| k == key) {
             entry.0 = id.clone();
         }
+        if let Some((brigade_id, token)) = member {
+            any_member = true;
+            let _ = store.borrow_mut().set_member_claude_session(
+                *brigade_id,
+                token,
+                &SessionId(id.clone()),
+            );
+        }
     }
     ui.pending_new
-        .retain(|pending| !discovered.iter().any(|(key, _)| key == &pending.key));
+        .retain(|pending| !resolved.iter().any(|(key, _, _)| key == &pending.key));
+    if any_member {
+        refresh_brigade_caches(app, store);
+    }
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas) {
@@ -1022,7 +1272,7 @@ fn tile_title(stage: &Stage, session_index: usize) -> String {
 /// the match count on the right — the emporium counterpart of the classic
 /// `render_status` (its own hints, and its own status line).
 fn render_status_bar(frame: &mut ratatui::Frame, app: &App, status: Option<&str>, area: Rect) {
-    const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade · b +worker · \
+    const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade/disband · b +worker · \
                                 F3 pane · / search · n new · d archive · g group · Tab view · \
                                 p pin · a agents · q quit";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
