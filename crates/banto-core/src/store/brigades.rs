@@ -84,8 +84,9 @@ pub struct BrigadeMember {
     pub claude_session_id: Option<SessionId>,
 }
 
-/// A queued message from one brigade member to the peer role (see the
-/// `brigade_messages` migration): what a recipient pulls via
+/// A queued message from one brigade member to the peer role, or to one
+/// specific member of it (see the `brigade_messages` migration and the v8
+/// `to_member` column): what a recipient pulls via
 /// [`Store::fetch_brigade_messages`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrigadeMessage {
@@ -95,6 +96,10 @@ pub struct BrigadeMessage {
     /// firewall framing, e.g. "director" or "worker-1").
     pub from_token: MemberToken,
     pub body: String,
+    /// The specific member this was addressed to, if any. `None` means a
+    /// broadcast to every member of the recipient role — the original,
+    /// still-default addressing.
+    pub to_member: Option<MemberToken>,
 }
 
 impl Store {
@@ -303,22 +308,27 @@ impl Store {
     }
 
     /// Enqueue a message in `brigade_id` from `from_token`, addressed to
-    /// `to_role` (every member of that role in the brigade will pull it).
-    /// Returns the new message's queue id.
+    /// `to_role` and, within that role, either every member (`to_member =
+    /// None`, a broadcast — the original semantics) or one specific member
+    /// (`to_member = Some(token)`) — so with 2+ Workers, an instruction meant
+    /// for `worker-1` doesn't also nudge and occupy `worker-2`. Returns the
+    /// new message's queue id.
     pub fn enqueue_brigade_message(
         &self,
         brigade_id: BrigadeId,
         from_token: &str,
         to_role: BrigadeRole,
+        to_member: Option<&str>,
         body: &str,
     ) -> Result<i64, StoreError> {
         self.conn.execute(
-            "INSERT INTO brigade_messages (brigade_id, from_session, to_role, body, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO brigade_messages (brigade_id, from_session, to_role, to_member, body, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 brigade_id,
                 from_token,
                 to_role.as_token(),
+                to_member,
                 body,
                 system_time_to_unix_ms(SystemTime::now())
             ],
@@ -326,13 +336,15 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Pull the messages in `brigade_id` addressed to `recipient_role` that
-    /// `member_token` has not seen yet (id past its cursor), oldest first,
-    /// and advance that member's cursor past them — so a later call returns
-    /// only what has arrived since. The cursor is scoped to `(brigade_id,
-    /// member_token)`, so it doesn't carry over if the token's underlying
-    /// Claude session later changes, and per-member cursors mean each
-    /// recipient of a broadcast sees it independently.
+    /// Pull the messages in `brigade_id` addressed to `recipient_role` (and,
+    /// within that role, either broadcast or specifically to `member_token` —
+    /// see [`Self::enqueue_brigade_message`]) that `member_token` has not
+    /// seen yet (id past its cursor), oldest first, and advance that
+    /// member's cursor past them — so a later call returns only what has
+    /// arrived since. The cursor is scoped to `(brigade_id, member_token)`,
+    /// so it doesn't carry over if the token's underlying Claude session
+    /// later changes, and per-member cursors mean each recipient of a
+    /// broadcast sees it independently.
     pub fn fetch_brigade_messages(
         &mut self,
         brigade_id: BrigadeId,
@@ -350,16 +362,19 @@ impl Store {
             .unwrap_or(0);
         let messages = {
             let mut stmt = tx.prepare(
-                "SELECT id, from_session, body FROM brigade_messages
-                 WHERE brigade_id = ?1 AND to_role = ?2 AND id > ?3 ORDER BY id",
+                "SELECT id, from_session, body, to_member FROM brigade_messages
+                 WHERE brigade_id = ?1 AND to_role = ?2 AND id > ?3
+                   AND (to_member IS NULL OR to_member = ?4)
+                 ORDER BY id",
             )?;
             let rows = stmt.query_map(
-                params![brigade_id, recipient_role.as_token(), cursor],
+                params![brigade_id, recipient_role.as_token(), cursor, member_token],
                 |row| {
                     Ok(BrigadeMessage {
                         id: row.get(0)?,
                         from_token: row.get(1)?,
                         body: row.get(2)?,
+                        to_member: row.get(3)?,
                     })
                 },
             )?;
@@ -404,12 +419,17 @@ impl Store {
     }
 
     /// Whether `member_token` in `brigade_id` has any message addressed to
-    /// `recipient_role` past its read cursor — same visibility rule as
-    /// [`Self::fetch_brigade_messages`], but EXISTS-only and, critically,
-    /// never advances the cursor. The emporium's relay engine polls this
-    /// roughly once a second to decide whether to nudge an idle member;
-    /// consuming the cursor here would make that polling itself the thing
-    /// that swallows messages before the member ever pulls them.
+    /// `recipient_role` — and, within that role, either broadcast or
+    /// specifically to `member_token` — past its read cursor. Same
+    /// visibility rule as [`Self::fetch_brigade_messages`] (this is
+    /// load-bearing, not cosmetic: without the `to_member` condition the
+    /// relay engine would nudge e.g. `worker-2` forever over a message
+    /// addressed to `worker-1` that `worker-2` can never actually pull),
+    /// but EXISTS-only and, critically, never advances the cursor. The
+    /// emporium's relay engine polls this roughly once a second to decide
+    /// whether to nudge an idle member; consuming the cursor here would make
+    /// that polling itself the thing that swallows messages before the
+    /// member ever pulls them.
     pub fn has_unseen_brigade_messages(
         &self,
         brigade_id: BrigadeId,
@@ -427,8 +447,9 @@ impl Store {
             .unwrap_or(0);
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM brigade_messages
-             WHERE brigade_id = ?1 AND to_role = ?2 AND id > ?3)",
-            params![brigade_id, recipient_role.as_token(), cursor],
+             WHERE brigade_id = ?1 AND to_role = ?2 AND id > ?3
+               AND (to_member IS NULL OR to_member = ?4))",
+            params![brigade_id, recipient_role.as_token(), cursor, member_token],
             |row| row.get(0),
         )?)
     }
@@ -576,7 +597,13 @@ mod tests {
 
         // Director sends to the Worker role.
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "please run the tests")
+            .enqueue_brigade_message(
+                br,
+                "director",
+                BrigadeRole::Worker,
+                None,
+                "please run the tests",
+            )
             .unwrap();
 
         // The Worker pulls it once.
@@ -586,6 +613,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].from_token, "director");
         assert_eq!(got[0].body, "please run the tests");
+        assert_eq!(got[0].to_member, None);
 
         // A second pull returns nothing (its cursor advanced past the message).
         assert!(
@@ -608,7 +636,7 @@ mod tests {
         let sender = Store::open(&db).unwrap();
         let br = sender.create_brigade("cell").unwrap();
         sender
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "cross-process")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "cross-process")
             .unwrap();
 
         let mut receiver = Store::open(&db).unwrap();
@@ -624,7 +652,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "stand by")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "stand by")
             .unwrap();
 
         // Both workers see it — per-member cursors, not a shared delivered flag.
@@ -645,6 +673,66 @@ mod tests {
     }
 
     #[test]
+    fn a_member_addressed_message_is_invisible_to_a_different_member_of_the_same_role() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .enqueue_brigade_message(
+                br,
+                "director",
+                BrigadeRole::Worker,
+                Some("worker-1"),
+                "only for worker-1",
+            )
+            .unwrap();
+
+        let for_worker_1 = store
+            .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(for_worker_1.len(), 1);
+        assert_eq!(for_worker_1[0].body, "only for worker-1");
+        assert_eq!(for_worker_1[0].to_member.as_deref(), Some("worker-1"));
+
+        // worker-2 shares the role but is not the addressee: invisible to it,
+        // now and forever (its cursor never advances past this message, but
+        // the (to_role, to_member) filter excludes it regardless of cursor).
+        assert!(
+            store
+                .fetch_brigade_messages(br, "worker-2", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn has_unseen_respects_member_addressing_not_just_role() {
+        let store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .enqueue_brigade_message(
+                br,
+                "director",
+                BrigadeRole::Worker,
+                Some("worker-1"),
+                "only for worker-1",
+            )
+            .unwrap();
+
+        // Without this, the relay engine would nudge worker-2 forever over a
+        // message it can never pull.
+        assert!(
+            store
+                .has_unseen_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_unseen_brigade_messages(br, "worker-2", BrigadeRole::Worker)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn messages_are_addressed_by_role_and_scoped_to_the_brigade() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
@@ -656,12 +744,13 @@ mod tests {
                 br,
                 "worker-1",
                 BrigadeRole::Director,
+                None,
                 "done, deviated because X",
             )
             .unwrap();
         // Noise addressed to the Director of a *different* brigade.
         store
-            .enqueue_brigade_message(other, "worker-1", BrigadeRole::Director, "unrelated")
+            .enqueue_brigade_message(other, "worker-1", BrigadeRole::Director, None, "unrelated")
             .unwrap();
 
         // The Director pulling its own brigade sees only its message...
@@ -715,7 +804,7 @@ mod tests {
 
         // Enqueued before "worker-1" joins...
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "before joining")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "before joining")
             .unwrap();
 
         store
@@ -724,7 +813,7 @@ mod tests {
 
         // ...enqueued after it joins.
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "after joining")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "after joining")
             .unwrap();
 
         // Only the post-join message is delivered.
@@ -743,7 +832,7 @@ mod tests {
             .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w")))
             .unwrap();
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "seen")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "seen")
             .unwrap();
         store
             .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
@@ -781,7 +870,7 @@ mod tests {
         // legacy pre-v7 data) that a naive `DELETE FROM brigades` would leave
         // orphaned.
         store
-            .enqueue_brigade_message(empty, "director", BrigadeRole::Worker, "orphaned")
+            .enqueue_brigade_message(empty, "director", BrigadeRole::Worker, None, "orphaned")
             .unwrap();
         store
             .conn
@@ -852,7 +941,7 @@ mod tests {
         );
 
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "hi")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "hi")
             .unwrap();
         assert!(
             store
@@ -878,7 +967,7 @@ mod tests {
             .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
             .unwrap();
         store
-            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, "hi")
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "hi")
             .unwrap();
 
         // Polling repeatedly (as the relay engine's ~1/s tick does) must not
@@ -912,7 +1001,7 @@ mod tests {
             .unwrap();
 
         store
-            .enqueue_brigade_message(a, "director", BrigadeRole::Worker, "for a's worker")
+            .enqueue_brigade_message(a, "director", BrigadeRole::Worker, None, "for a's worker")
             .unwrap();
 
         assert!(
@@ -947,10 +1036,10 @@ mod tests {
             .add_brigade_member(b, "worker-1", BrigadeRole::Worker, Some(&sid("w-b")))
             .unwrap();
         store
-            .enqueue_brigade_message(a, "director", BrigadeRole::Worker, "in A")
+            .enqueue_brigade_message(a, "director", BrigadeRole::Worker, None, "in A")
             .unwrap();
         store
-            .enqueue_brigade_message(b, "director", BrigadeRole::Worker, "in B")
+            .enqueue_brigade_message(b, "director", BrigadeRole::Worker, None, "in B")
             .unwrap();
         store
             .fetch_brigade_messages(a, "worker-1", BrigadeRole::Worker)

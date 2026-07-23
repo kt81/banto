@@ -164,6 +164,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE brigade_members_v7 RENAME TO brigade_members;
     DROP TABLE brigade_cursors;
     ALTER TABLE brigade_cursors_v7 RENAME TO brigade_cursors;",
+    // v8: addressed sends. `brigade_messages` gains a nullable `to_member`
+    // column narrowing a role-broadcast down to one specific member token —
+    // so with 2+ Workers, an instruction meant for `worker-1` no longer also
+    // nudges and occupies `worker-2`. A plain `ADD COLUMN` needs no table
+    // rebuild; every existing row is left NULL, which keeps meaning exactly
+    // what it always meant: broadcast to every member of `to_role`.
+    "ALTER TABLE brigade_messages ADD COLUMN to_member TEXT;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -410,7 +417,7 @@ mod tests {
             Some((1, "director".to_string(), BrigadeRole::Director))
         );
         store
-            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "hi")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "hi")
             .unwrap();
         assert_eq!(
             store
@@ -474,11 +481,17 @@ mod tests {
         );
         // A message at id <= the carried-over cursor (7) must not resurface.
         store
-            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "old, already seen")
+            .enqueue_brigade_message(
+                1,
+                "director",
+                BrigadeRole::Worker,
+                None,
+                "old, already seen",
+            )
             .unwrap();
         for _ in 1..7 {
             store
-                .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "filler")
+                .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "filler")
                 .unwrap();
         }
         assert!(
@@ -490,7 +503,7 @@ mod tests {
         );
         // A message enqueued past the cursor is delivered normally.
         store
-            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "new")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "new")
             .unwrap();
         let got = store
             .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
@@ -582,6 +595,99 @@ mod tests {
         assert_eq!(cursor("director"), 0);
         assert_eq!(cursor("worker-1"), 3);
         assert_eq!(cursor("worker-2"), 5);
+
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v7_to_v8_upgrade_adds_to_member_and_old_rows_stay_broadcast() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v7 code would have left it: v1..=v7 scripts
+        // applied, a brigade with two Workers and a message already queued
+        // the old way (no `to_member` column exists yet, so it's implicitly
+        // a role-broadcast), `user_version` left at 7.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..7] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, member_token, role, claude_session_id) VALUES
+                 (1, 'director', 'director', 'dir'),
+                 (1, 'worker-1', 'worker',   'w1'),
+                 (1, 'worker-2', 'worker',   'w2')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id) VALUES
+                 (1, 'director', 0), (1, 'worker-1', 0), (1, 'worker-2', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_messages (brigade_id, from_session, to_role, body, created_at_ms)
+                 VALUES (1, 'director', 'worker', 'old broadcast', 2000)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+
+        // Opening through Store::open must run the v8 migration: the
+        // pre-existing message (no `to_member` at insert time, so it lands
+        // NULL) stays visible to BOTH workers as a broadcast, and a freshly
+        // enqueued member-addressed message is usable immediately.
+        let mut store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .fetch_brigade_messages(1, "worker-2", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .enqueue_brigade_message(
+                1,
+                "director",
+                BrigadeRole::Worker,
+                Some("worker-1"),
+                "addressed",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .fetch_brigade_messages(1, "worker-2", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty()
+        );
 
         let version: i64 = store
             .conn

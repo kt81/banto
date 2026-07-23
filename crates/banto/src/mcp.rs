@@ -151,11 +151,23 @@ fn tools_list_result() -> Value {
                 "name": "send_to_peer",
                 "description": "Send a message to your brigade peer through banto: a Director \
                                 reaches every Worker, a Worker reaches the Director. Delivery is \
-                                a pull — the peer receives it when it next calls check_messages.",
+                                a pull — the peer receives it when it next calls check_messages. \
+                                Optionally set `to` to address one specific member instead of \
+                                broadcasting to the whole peer role.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "text": { "type": "string", "description": "The message to relay." }
+                        "text": { "type": "string", "description": "The message to relay." },
+                        "to": {
+                            "type": "string",
+                            "description": "Optional: address one specific brigade member by \
+                                            its token instead of broadcasting to every member of \
+                                            the peer role. A Director may target any Worker \
+                                            token in this brigade (e.g. \"worker-2\"); a Worker \
+                                            may only target \"director\" (the sole Director), \
+                                            which is the same as omitting `to`. Omit for the \
+                                            default: every member of the peer role receives it."
+                        }
                     },
                     "required": ["text"],
                     "additionalProperties": false,
@@ -197,7 +209,10 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
     }
 }
 
-/// `send_to_peer`: enqueue `text` to the opposite role in this brigade.
+/// `send_to_peer`: enqueue `text` to the opposite role in this brigade — a
+/// broadcast (`to` omitted, every member of that role sees it — the
+/// original, still-default behavior) or, if `to` names one specific member
+/// token, addressed just to them (see [`validate_target`]).
 fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     let (brigade, token, role) = match live_membership(ctx) {
         Ok(Some(membership)) => membership,
@@ -211,10 +226,84 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     if text.trim().is_empty() {
         return tool_error("send_to_peer requires a non-empty `text`.");
     }
-    let to = peer_role(role);
-    match ctx.store.enqueue_brigade_message(brigade, &token, to, text) {
-        Ok(_) => tool_text(format!("Delivered to your {}.", role_label(to)), false),
+    let to_role = peer_role(role);
+    let to = msg
+        .pointer("/params/arguments/to")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let target = match validate_target(ctx, brigade, role, to) {
+        Ok(target) => target,
+        Err(message) => return tool_error(&message),
+    };
+
+    match ctx
+        .store
+        .enqueue_brigade_message(brigade, &token, to_role, target.as_deref(), text)
+    {
+        Ok(_) => tool_text(
+            match &target {
+                Some(member) => format!("Delivered to {member}."),
+                None => format!("Delivered to your {}.", role_label(to_role)),
+            },
+            false,
+        ),
         Err(err) => tool_error(&format!("failed to send: {err}")),
+    }
+}
+
+/// Validate an optional `to` argument for the sender's `role`, live against
+/// the brigade's current membership. `Ok(None)` means broadcast (`to` was
+/// omitted); `Ok(Some(token))` names a validated, real target — including a
+/// Worker's `to: "director"`, which names the same sole recipient a
+/// broadcast would but is still tracked as an explicit target so the
+/// confirmation and inbox framing read as addressed rather than broadcast.
+/// `Err` carries the user-facing message for an unknown or wrong-kind
+/// target: a Director may only target an existing Worker token in this
+/// brigade; a Worker may only target `"director"`.
+fn validate_target(
+    ctx: &ServerContext,
+    brigade: BrigadeId,
+    role: BrigadeRole,
+    to: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(to) = to else {
+        return Ok(None);
+    };
+    match role {
+        BrigadeRole::Director => {
+            let members = ctx
+                .store
+                .brigade_members(brigade)
+                .map_err(|err| format!("failed to resolve brigade membership: {err}"))?;
+            let worker_tokens: Vec<&str> = members
+                .iter()
+                .filter(|m| m.role == BrigadeRole::Worker)
+                .map(|m| m.token.as_str())
+                .collect();
+            if worker_tokens.contains(&to) {
+                Ok(Some(to.to_string()))
+            } else {
+                let valid = if worker_tokens.is_empty() {
+                    "(none — no Workers in this brigade)".to_string()
+                } else {
+                    worker_tokens.join(", ")
+                };
+                Err(format!(
+                    "\"{to}\" is not a Worker in this brigade. Valid targets: {valid}."
+                ))
+            }
+        }
+        BrigadeRole::Worker => {
+            if to == "director" {
+                Ok(Some(to.to_string()))
+            } else {
+                Err(format!(
+                    "\"{to}\" is not a valid target for a Worker — the only addressable \
+                     target is \"director\" (or omit `to` for the same effect)."
+                ))
+            }
+        }
     }
 }
 
@@ -279,7 +368,12 @@ fn role_label(role: BrigadeRole) -> &'static str {
 /// Render pulled messages with the firewall framing that keeps the recipient
 /// from mistaking a relayed AI message for a direct operator instruction.
 /// Attribution is the sender's member token (`"director"`, `"worker-1"`,
-/// ...) — also simply more readable than a raw session UUID.
+/// ...) — also simply more readable than a raw session UUID. Each line also
+/// marks its addressing, "to you" or "broadcast" — symmetric for both
+/// Worker->Director and Director->Worker inboxes, since this renders either.
+/// `fetch_brigade_messages` only ever returns a message whose `to_member` is
+/// `None` or equal to the puller's own token, so `to_member.is_some()` alone
+/// is enough to mean "addressed to you" here, with no need to compare tokens.
 fn format_inbox(role: BrigadeRole, messages: &[BrigadeMessage]) -> String {
     let peer = role_label(peer_role(role));
     let mut out = format!(
@@ -289,8 +383,13 @@ fn format_inbox(role: BrigadeRole, messages: &[BrigadeMessage]) -> String {
         messages.len()
     );
     for message in messages {
+        let addressing = if message.to_member.is_some() {
+            "to you"
+        } else {
+            "broadcast"
+        };
         out.push_str(&format!(
-            "\n[from {}]\n{}\n",
+            "\n[from {} — {addressing}]\n{}\n",
             message.from_token, message.body
         ));
     }
@@ -422,13 +521,14 @@ mod tests {
         assert_eq!(pulled.len(), 1);
         assert_eq!(pulled[0].body, "run the tests");
         assert_eq!(pulled[0].from_token, "director");
+        assert_eq!(pulled[0].to_member, None);
     }
 
     #[test]
     fn check_messages_returns_firewall_framed_text_naming_the_sender_token_then_clears() {
         let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
         ctx.store
-            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, "please rebase")
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "please rebase")
             .unwrap();
 
         let response = call(
@@ -440,8 +540,8 @@ mod tests {
         assert!(text.contains("please rebase"), "got {text:?}");
         assert!(text.contains("Director"), "names the peer role: {text:?}");
         assert!(
-            text.contains("[from director]"),
-            "names the sender token: {text:?}"
+            text.contains("[from director — broadcast]"),
+            "names the sender token and marks it broadcast: {text:?}"
         );
         assert!(
             text.contains("another AI"),
@@ -456,6 +556,146 @@ mod tests {
         );
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("No new messages"), "got {text:?}");
+    }
+
+    #[test]
+    fn send_to_peer_director_addresses_one_worker_and_the_others_never_see_it() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-2",
+                BrigadeRole::Worker,
+                Some(&SessionId("w2".to_string())),
+            )
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call",
+                "params":{"name":"send_to_peer",
+                          "arguments":{"text":"you specifically","to":"worker-2"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("worker-2"),
+            "confirmation names the target: {text:?}"
+        );
+
+        assert!(
+            ctx.store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty(),
+            "not addressed to worker-1"
+        );
+        let for_worker_2 = ctx
+            .store
+            .fetch_brigade_messages(1, "worker-2", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(for_worker_2.len(), 1);
+        assert_eq!(for_worker_2[0].body, "you specifically");
+        assert_eq!(for_worker_2[0].to_member.as_deref(), Some("worker-2"));
+    }
+
+    #[test]
+    fn send_to_peer_director_targeting_an_unknown_worker_is_an_error_naming_valid_tokens() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":21,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi","to":"worker-99"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worker-99"), "got {text:?}");
+        assert!(
+            text.contains("worker-1"),
+            "names the valid target: {text:?}"
+        );
+
+        // Nothing was enqueued.
+        assert!(
+            ctx.store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn send_to_peer_worker_can_only_target_director() {
+        let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":22,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi","to":"worker-2"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], true);
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":23,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi","to":"director"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], false);
+        let pulled = ctx
+            .store
+            .fetch_brigade_messages(1, "director", BrigadeRole::Director)
+            .unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].to_member.as_deref(), Some("director"));
+    }
+
+    #[test]
+    fn check_messages_marks_an_addressed_message_as_to_you() {
+        let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
+        ctx.store
+            .enqueue_brigade_message(
+                1,
+                "director",
+                BrigadeRole::Worker,
+                Some("worker-1"),
+                "just for you",
+            )
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":24,"method":"tools/call",
+                "params":{"name":"check_messages","arguments":{}}}"#,
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[from director — to you]"), "got {text:?}");
     }
 
     #[test]
