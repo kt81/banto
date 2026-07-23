@@ -2,6 +2,7 @@
 
 A resident TUI that searches and groups local Claude Code sessions and resumes them into psmux / Windows Terminal panes/tabs.
 The canonical design/requirements document is `docs/REQUIREMENTS.md`. Always read it before starting work.
+The architecture discipline (TEA / sans-IO: Event → State + Cmd, I/O at the edges) is `docs/DISCIPLINE.md` — new code must land inside it.
 
 ## Commands
 
