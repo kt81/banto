@@ -169,7 +169,13 @@ suite) before the next begins.
   `App::set_status` currently calls `Instant::now()` internally), thread
   time as arguments. No structural moves.
 - **Phase 2 — the emporium event loop becomes `update`.** Unify
-  key/mouse/paste/relay/discovery handling into `Event` dispatch. This
+  key/mouse/paste/relay/discovery handling into `Event` dispatch. One
+  design decision is owed here (flagged by the Phase 0 sweep): `tui.rs`'s
+  `Context` mixes read-only dependencies (store, thresholds, claude_home)
+  with `RefCell`-wrapped mutable state (`last_genuine_esc`, `input_log`,
+  `pending_inplace`) behind an `&Context` that reads as configuration —
+  that state must either join the real `State` or be explicitly assigned
+  to the io layer, not survive the migration disguised as config. This
   phase deliberately carries the two features that motivated it:
   - **session termination** — `Event::PtyExited` (today a dead child's
     channel disconnect is silently swallowed by `pump()` and the pane just
@@ -184,22 +190,40 @@ suite) before the next begins.
   enforcer.
 - **Phase 4 — record/replay infrastructure** per §8.
 
-## Appendix A — initial I/O inventory (verify in Phase 0)
+## Appendix A — I/O inventory (verified against code in Phase 0)
 
-Process spawning: opener (psmux/WT via `CommandRunner`), in-place child,
-`PortablePtyHost` (ConPTY), `_wrap` supervision, worker auto-spawn.
+Status: verified 2026-07-24 by an exhaustive sweep of both crates. This
+list defines `Event`: there is no I/O beyond it. The sweep found no
+randomness, no network, and **no disguised inputs** — notably, session
+mtimes always come from real `fs::metadata().modified()`, never from
+"when banto last read it" (§3's own cautionary example, already done
+right).
+
+Process spawning: opener (psmux/WT via `CommandRunner`), in-place child
+(`ProcessRunner`), `PortablePtyHost` (ConPTY), `_wrap` supervision, worker
+auto-spawn.
 File reads: session jsonl (head + tail chunks), `sessions/<pid>.json`,
 `config.toml`, dependency-free re-reads on live reload.
 File writes: banto's own sqlite DB, per-member `--mcp-config` files,
-diagnostic logs (all under banto's own config/data dirs — never `~/.claude`).
-Clocks: `Instant::now()` (event loops, relay, click timing, status expiry),
-`SystemTime::now()` (store timestamps, discovery `since`, live watch).
+diagnostic logs (`BANTO_WRAP_LOG` / `BANTO_INPUT_LOG`) — all under banto's
+own config/data dirs, never `~/.claude`.
+Clocks: `Instant::now()` (event loops, relay ticks, click timing, status
+expiry, the Esc-vs-leaked-SGR disambiguation stamp in `tui.rs`),
+`SystemTime::now()` (store timestamps, discovery `since` — both the
+provider's and the emporium's `PendingNew` instance — live watch, and the
+summary panel's relative-age display, whose read now sits at the draw-loop
+boundary and is injected into the view).
 Input: crossterm key/mouse/paste/resize events; the ConPTY input quirks
 (headless SGR mouse, `\r` for Enter, chunk-boundary paste semantics) live
 at this boundary.
-Watch: `notify` on `projects/` and `sessions/` (`LiveWatch`).
+Watch: `notify` on `projects/` and `sessions/` (`LiveWatch`; its debounce
+is already a pure function of injected timestamps).
 Processes: PID liveness via sysinfo (`ProcessProbe`).
 MCP: stdio JSON-RPC in `_mcp` (per-connection).
 Terminal control: raw mode, alt screen, mouse capture, bracketed paste,
 terminal size.
-Environment: `$TMUX` / `WT_SESSION` detection, `BANTO_*` diagnostics.
+Environment: `$TMUX` / `$TMUX_PANE` / `WT_SESSION` detection (already
+injected as a closure in `detect_backend` — with the relay decision
+functions, the house pattern to imitate), `BANTO_*` diagnostics,
+`std::env::current_exe()` (mcp-config and `_wrap` argv construction),
+`std::env::current_dir()` (cwd fallbacks in the emporium).
