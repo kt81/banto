@@ -236,18 +236,24 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
 
 /// Resolve this connection's *current* `(brigade, member_token, role)`, live
 /// from the store, on every call. When launch argv carries both `--brigade`
-/// and `--member`, that `(brigade, member)` row must still exist — a
-/// revocation (the member was removed from the brigade) takes effect
-/// immediately, with no relaunch needed, and the role always comes from the
-/// row, never from argv. Older `--mcp-config` files predating `--member` fall
-/// back to matching `--session` against a member's `claude_session_id`.
+/// and `--member` and that `(brigade, member)` row still exists, it wins, and
+/// the role always comes from the row, never from argv. When the row is gone
+/// — the brigade was disbanded or the member removed — the `--session`
+/// fallback still runs: a claude session that was since enrolled in a *new*
+/// brigade (disband, then re-form around a still-running session) resolves to
+/// its current membership by `claude_session_id` instead of staying chained
+/// to its launch-time identity forever. A member that was truly removed
+/// matches nothing either way (its `claude_session_id` is on no row), so
+/// revocation still takes effect on the very next call, with no relaunch.
+/// The same fallback serves `--mcp-config` files predating `--member`.
 /// `Ok(None)` when nothing resolves; `Err` only on a genuine store failure.
 fn live_membership(
     ctx: &ServerContext,
 ) -> Result<Option<(BrigadeId, MemberToken, BrigadeRole)>, StoreError> {
-    if let (Some(brigade), Some(member)) = (ctx.identity.brigade, ctx.identity.member.clone()) {
-        let row = ctx.store.brigade_member(brigade, &member)?;
-        return Ok(row.map(|member| (brigade, member.token, member.role)));
+    if let (Some(brigade), Some(member)) = (ctx.identity.brigade, ctx.identity.member.clone())
+        && let Some(row) = ctx.store.brigade_member(brigade, &member)?
+    {
+        return Ok(Some((brigade, row.token, row.role)));
     }
     let Some(session) = ctx.identity.session.clone() else {
         return Ok(None);
@@ -484,6 +490,44 @@ mod tests {
                 "params":{"name":"check_messages","arguments":{}}}"#,
         );
         assert_eq!(check_response["result"]["isError"], true);
+    }
+
+    #[test]
+    fn stale_launch_identity_falls_back_to_the_sessions_current_brigade() {
+        // The dogfood path bug: a session launched as brigade 9's Director
+        // outlives brigade 9 (disbanded), then a NEW brigade is formed around
+        // the same still-running session. Its server still carries the stale
+        // `--brigade 9 --member director` argv; the missing row must fall
+        // through to the `--session` fallback and resolve the CURRENT
+        // membership instead of reporting "not in a brigade" forever.
+        let mut ctx = ctx("s", Some(9), Some("director"), Some(BrigadeRole::Director));
+        // Brigade 9 disappears (disband purges membership)...
+        ctx.store.delete_brigade(9).unwrap();
+        // ...and brigade 10 is formed around the same claude session.
+        ctx.store
+            .add_brigade_member(
+                10,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("s".to_string())),
+            )
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":15,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hello again"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], false);
+
+        // Landed in brigade 10 (the live membership), addressed to Workers.
+        let pulled = ctx
+            .store
+            .fetch_brigade_messages(10, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].body, "hello again");
+        assert_eq!(pulled[0].from_token, "director");
     }
 
     #[test]
