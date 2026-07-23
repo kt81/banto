@@ -27,6 +27,13 @@ const PROVIDER_NAME: &str = "claude-code";
 /// Titles and cwd appear in the first few records, so this is plenty.
 const HEAD_CAP_BYTES: u64 = 256 * 1024;
 
+/// Maximum number of bytes read from the tail of a session file larger than
+/// [`HEAD_CAP_BYTES`], to catch a `custom-title` record a rename (`/rename`)
+/// appended well past the head. Claude Code re-asserts the current title
+/// periodically (not only at rename time), so in practice this window
+/// catches a rename even in a very large file soon after it happens.
+const TAIL_CAP_BYTES: u64 = 64 * 1024;
+
 /// Maximum title length in characters (not bytes). Also used to cap
 /// `SessionMeta.preview` (see [`HeadFields::preview`]).
 const TITLE_MAX_CHARS: usize = 200;
@@ -123,6 +130,73 @@ impl ClaudeCodeProvider {
         }
         best.map(|(_, id)| id)
     }
+
+    /// Find every session Claude Code created or updated for `cwd` at or
+    /// after `since`, sorted oldest-first by mtime (ties broken by id).
+    ///
+    /// [`Self::find_new_session`] alone can only ever report the single
+    /// newest match, which collides when several new sessions are launched
+    /// into the *same* cwd around the same instant (e.g. an emporium brigade
+    /// auto-spawning several fresh Workers in the Director's cwd at once) —
+    /// each caller's independent `find_new_session` call would then resolve
+    /// to the identical "newest" file, double-assigning it to more than one
+    /// pending session. Callers needing to disambiguate a batch should fetch
+    /// every match once via this method and assign candidates to pending
+    /// entries themselves, excluding ids already claimed elsewhere.
+    ///
+    /// Otherwise identical to [`Self::find_new_session`]: read-only, tolerant
+    /// of unreadable/broken files, matches on the cwd recorded inside each
+    /// candidate's head record.
+    pub fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
+        let projects = self.claude_home.join("projects");
+        let Ok(entries) = fs::read_dir(&projects) else {
+            return Vec::new();
+        };
+
+        let mut matches: Vec<(SystemTime, SessionId)> = Vec::new();
+        for project in entries {
+            let Ok(project) = project else { continue };
+            let project_path = project.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&project_path) else {
+                continue;
+            };
+            for file in files {
+                let Ok(file) = file else { continue };
+                let path = file.path();
+                if !path.extension().is_some_and(|ext| ext == "jsonl") {
+                    continue;
+                }
+                let Ok(metadata) = fs::metadata(&path) else {
+                    continue;
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                let Ok(mtime) = metadata.modified() else {
+                    continue;
+                };
+                if mtime < since {
+                    continue;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(head) = read_head(&path, HEAD_CAP_BYTES) else {
+                    continue;
+                };
+                let fields = extract_head_fields(&head);
+                if fields.cwd.as_deref() != Some(cwd) {
+                    continue;
+                }
+                matches.push((mtime, SessionId(id.to_string())));
+            }
+        }
+        matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        matches.into_iter().map(|(_, id)| id).collect()
+    }
 }
 
 impl SessionProvider for ClaudeCodeProvider {
@@ -177,7 +251,16 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
     }
     let mtime = metadata.modified().ok()?;
     let head = read_head(path, HEAD_CAP_BYTES).ok()?;
-    let fields = extract_head_fields(&head);
+    let mut fields = extract_head_fields(&head);
+    // A rename can append a fresh custom-title record well past the head; a
+    // bounded tail read catches the latest one without scanning the whole
+    // file. Skipped when the head read already covered the whole file.
+    if metadata.len() > HEAD_CAP_BYTES
+        && let Ok(tail) = read_tail(path, TAIL_CAP_BYTES)
+        && let Some(latest) = latest_custom_title(&tail)
+    {
+        fields.custom_title = Some(latest);
+    }
     let title = fields.title();
     let preview = fields.preview();
     Some(SessionMeta {
@@ -208,6 +291,53 @@ fn read_head(path: &Path, cap: u64) -> std::io::Result<String> {
         }
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read at most `cap` bytes from the tail of `path` as lossy UTF-8.
+///
+/// The seek point almost never lands on a line boundary, so unless it lands
+/// at the very start of the file (nothing to skip: the whole file was read),
+/// everything up to and including the first newline is dropped so a
+/// truncated leading line is never parsed.
+fn read_tail(path: &Path, cap: u64) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(cap);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    if start > 0 {
+        buf = match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => buf.split_off(pos + 1),
+            None => Vec::new(),
+        };
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Scan `tail` for the value of the *last* `custom-title` record in it (the
+/// newest one, since `tail` comes from the end of the file), leniently
+/// skipping broken lines and unrelated record types. `None` if the tail
+/// window contains no custom-title record.
+fn latest_custom_title(tail: &str) -> Option<String> {
+    let mut latest = None;
+    for line in tail.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) == Some("custom-title")
+            && let Some(value) = record.get("customTitle").and_then(Value::as_str)
+        {
+            latest = Some(value.to_string());
+        }
+    }
+    latest
 }
 
 /// Fields collected from the head records of a session file.
@@ -754,6 +884,78 @@ mod tests {
     }
 
     #[test]
+    fn find_new_sessions_returns_every_match_oldest_first() {
+        // The scenario find_new_session alone can't handle: several new
+        // sessions launched into the same cwd around the same instant (e.g.
+        // auto-spawned brigade Workers).
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let first = write_session(
+            &root,
+            "proj",
+            "worker-1.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&first, since + Duration::from_secs(1));
+        let second = write_session(
+            &root,
+            "proj",
+            "worker-2.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&second, since + Duration::from_secs(2));
+
+        let found = provider(&root).find_new_sessions(Path::new("/work/proj"), since);
+        assert_eq!(
+            found,
+            vec![
+                SessionId("worker-1".to_string()),
+                SessionId("worker-2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn find_new_sessions_ignores_a_different_cwd_and_a_file_older_than_since() {
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let other_cwd = write_session(
+            &root,
+            "proj",
+            "other.jsonl",
+            r#"{"type":"user","cwd":"/somewhere/else","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&other_cwd, since + Duration::from_secs(1));
+        let too_old = write_session(
+            &root,
+            "proj",
+            "preexisting.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&too_old, since - Duration::from_secs(1));
+
+        assert!(
+            provider(&root)
+                .find_new_sessions(Path::new("/work/proj"), since)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn find_new_sessions_with_missing_projects_dir_yields_empty() {
+        let root = TempDir::new().unwrap();
+        assert!(
+            provider(&root)
+                .find_new_sessions(Path::new("/work/proj"), SystemTime::now())
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn find_new_session_with_missing_projects_dir_yields_none() {
         let root = TempDir::new().unwrap();
         let found = provider(&root).find_new_session(Path::new("/work/proj"), SystemTime::now());
@@ -777,5 +979,99 @@ mod tests {
 
         let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
         assert_eq!(found, Some(SessionId("good".to_string())));
+    }
+
+    /// Pads `content` with a filler `user` record whose message is a long
+    /// run of 'x's, large enough to push the file past `HEAD_CAP_BYTES` (so
+    /// the tail-read path engages), followed by `content`.
+    fn padded_past_head_cap(content: &str) -> String {
+        let filler_chars = HEAD_CAP_BYTES as usize + 4096;
+        format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n{}",
+            "x".repeat(filler_chars),
+            content
+        )
+    }
+
+    #[test]
+    fn title_at_head_only_is_unaffected_by_the_tail_read() {
+        // A small file never engages the tail-read path at all; a rename
+        // captured in the head is unaffected.
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            "{\"type\":\"custom-title\",\"customTitle\":\"head title\"}\n",
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("head title"));
+    }
+
+    #[test]
+    fn a_rename_appended_beyond_the_head_chunk_boundary_still_wins() {
+        // The bug this fixes: a mid-session rename appends its custom-title
+        // record far past the head cap (this mirrors what was found in a
+        // real session file: a rename ~4.8MB into a 17MB session).
+        let root = TempDir::new().unwrap();
+        let content =
+            padded_past_head_cap("{\"type\":\"custom-title\",\"customTitle\":\"renamed later\"}\n");
+        assert!(
+            content.len() as u64 > HEAD_CAP_BYTES,
+            "fixture must exceed the head cap"
+        );
+        write_session(&root, "proj", "s1.jsonl", &content);
+
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("renamed later"));
+    }
+
+    #[test]
+    fn multiple_custom_titles_past_the_head_cap_the_latest_wins() {
+        let root = TempDir::new().unwrap();
+        let content = padded_past_head_cap(
+            "{\"type\":\"custom-title\",\"customTitle\":\"first rename\"}\n\
+             {\"type\":\"custom-title\",\"customTitle\":\"second rename\"}\n",
+        );
+        write_session(&root, "proj", "s1.jsonl", &content);
+
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("second rename"));
+    }
+
+    #[test]
+    fn garbage_lines_past_the_head_cap_are_skipped_when_finding_the_latest_title() {
+        let root = TempDir::new().unwrap();
+        let content = padded_past_head_cap(
+            "not json at all\n\
+             {\"type\":\"custom-title\"}\n\
+             {\"type\":\"custom-title\",\"customTitle\":\"survives the garbage\"}\n\
+             {truncated\n",
+        );
+        write_session(&root, "proj", "s1.jsonl", &content);
+
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("survives the garbage"));
+    }
+
+    #[test]
+    fn a_large_file_without_a_later_rename_keeps_the_head_title() {
+        // The tail read finding nothing (no custom-title record within its
+        // window) must not clobber a title already found in the head.
+        let root = TempDir::new().unwrap();
+        let filler_chars = HEAD_CAP_BYTES as usize + 4096;
+        let content = format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"only title\"}}\n\
+             {{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(filler_chars)
+        );
+        assert!(
+            content.len() as u64 > HEAD_CAP_BYTES,
+            "fixture must exceed the head cap"
+        );
+        write_session(&root, "proj", "s1.jsonl", &content);
+
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("only title"));
     }
 }
