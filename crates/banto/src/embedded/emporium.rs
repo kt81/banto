@@ -91,6 +91,17 @@ struct Emporium {
     /// child — the relay engine's "not being typed into" guard (see
     /// [`should_nudge`]).
     last_forwarded_input: Option<Instant>,
+    /// Nudged panes whose submitting `\r` hasn't been sent yet — the second
+    /// phase of a nudge (see [`flush_pending_submits`] for why the Enter must
+    /// trail the text by its own delay instead of riding along with it).
+    pending_submits: Vec<PendingSubmit>,
+}
+
+/// A nudge awaiting its phase-two Enter: which pane, and when phase one (the
+/// text) was written.
+struct PendingSubmit {
+    session_idx: usize,
+    nudged_at: Instant,
 }
 
 /// What the right-hand pane region is showing: nothing, a single session, or a
@@ -236,6 +247,7 @@ fn event_loop(
         pending_new: Vec::new(),
         relay_states: HashMap::new(),
         last_forwarded_input: None,
+        pending_submits: Vec::new(),
     };
     let mut watch = LiveWatch::new(claude_home);
     let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
@@ -284,12 +296,14 @@ fn event_loop(
         if !ui.pending_new.is_empty() {
             discover_new_ids(&mut ui, app, store, &provider);
         }
-        // Relay engine tick, throttled to ~1/s (see `relay_tick`).
+        // Relay engine tick, throttled to ~1/s (see `relay_tick`), plus the
+        // per-iteration flush of any nudge's delayed phase-two Enter.
         let now = Instant::now();
         if last_relay_tick.is_none_or(|tick| now.duration_since(tick) >= RELAY_TICK_INTERVAL) {
             last_relay_tick = Some(now);
             relay_tick(&mut ui, store, claude_home, brigade.relay);
         }
+        flush_pending_submits(&mut ui, Instant::now());
     }
     Ok(())
 }
@@ -1250,10 +1264,15 @@ const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// messages. It becomes eligible again once the batch drains (a human or the
 /// member itself calls `check_messages`) and a new message arrives.
 const RELAY_MAX_ATTEMPTS: u32 = 3;
-/// The fixed, ASCII-only line typed into a nudged member's stdin, followed by
-/// a lone `\r` to submit it (see [`relay_tick`]).
+/// The fixed, ASCII-only line typed into a nudged member's stdin; a lone `\r`
+/// submits it in a second phase (see [`flush_pending_submits`]).
 const RELAY_NUDGE_LINE: &str =
     "[banto relay] Your brigade peer sent you a message. Call the check_messages tool now.";
+/// How long after the nudge text before its submitting `\r` is sent. Long
+/// enough that the child's TUI reads the `\r` in its own chunk (a real Enter)
+/// rather than coalesced with the text (a paste, where `\r` becomes a mere
+/// newline in the input box); short enough to feel immediate.
+const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
 /// A member's nudge backoff: when it was last nudged and how many attempts
 /// have been made since its unseen-message batch was last seen drained.
@@ -1408,11 +1427,42 @@ fn relay_tick(ui: &mut Emporium, store: &RefCell<Store>, claude_home: &Path, rel
             has_unseen,
         );
         if nudge {
+            // Phase one: the text only. The submitting `\r` follows on its
+            // own, later (see `flush_pending_submits`) — sent back-to-back,
+            // the child's TUI reads text+`\r` as one chunk, treats it as a
+            // paste, and turns the `\r` into a newline inside the input box
+            // instead of a submit, so the nudge just piles up there unsent.
             ui.sessions[idx].1.send_bytes(RELAY_NUDGE_LINE.as_bytes());
-            ui.sessions[idx].1.send_bytes(b"\r");
+            ui.pending_submits.push(PendingSubmit {
+                session_idx: idx,
+                nudged_at: now,
+            });
             ui.status = Some(format!("relay: nudged {}", member.token));
         }
     }
+}
+
+/// Phase two of a nudge: send the lone submitting `\r` once
+/// [`RELAY_SUBMIT_DELAY`] has passed since the text was written. The delay is
+/// the whole point — a `\r` riding in the same read chunk as the text is
+/// taken for pasted content (a newline in the input box, observed live in
+/// dogfooding); arriving alone in a later chunk it reads as a real Enter
+/// keypress and submits. Called every main-loop iteration (~50ms cadence).
+fn flush_pending_submits(ui: &mut Emporium, now: Instant) {
+    let mut i = 0;
+    while i < ui.pending_submits.len() {
+        if submit_is_due(now, ui.pending_submits[i].nudged_at) {
+            let entry = ui.pending_submits.swap_remove(i);
+            ui.sessions[entry.session_idx].1.send_bytes(b"\r");
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Whether a phase-two Enter is due (see [`flush_pending_submits`]).
+fn submit_is_due(now: Instant, nudged_at: Instant) -> bool {
+    now.saturating_duration_since(nudged_at) >= RELAY_SUBMIT_DELAY
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App, ui: &Emporium, areas: Areas) {
@@ -1718,6 +1768,15 @@ mod tests {
     }
 
     // --- Relay engine: should_nudge / tick_relay_decision -------------------
+
+    #[test]
+    fn submit_is_due_only_after_the_delay() {
+        use super::{RELAY_SUBMIT_DELAY, submit_is_due};
+        let t0 = std::time::Instant::now();
+        assert!(!submit_is_due(t0, t0));
+        assert!(!submit_is_due(t0 + RELAY_SUBMIT_DELAY / 2, t0));
+        assert!(submit_is_due(t0 + RELAY_SUBMIT_DELAY, t0));
+    }
 
     #[test]
     fn should_nudge_happy_path() {
