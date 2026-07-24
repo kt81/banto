@@ -11,6 +11,7 @@
 
 mod convert;
 mod emporium;
+mod paste_accum;
 mod session;
 
 pub use banto_io::pty::PortablePtyHost;

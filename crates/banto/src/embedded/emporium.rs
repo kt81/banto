@@ -56,6 +56,7 @@ use crate::session;
 use crate::tui::LiveWatch;
 
 use super::convert;
+use super::paste_accum::{PasteAccumulator, is_in_scope};
 use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -145,6 +146,7 @@ fn event_loop(
     let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
     let mut last_tick: Option<Instant> = None;
     let mut input_log = open_input_log();
+    let mut paste_acc = PasteAccumulator::new();
 
     loop {
         let now = Instant::now();
@@ -183,17 +185,58 @@ fn event_loop(
         }
 
         // One real input event, non-blocking with a short poll window (the
-        // pacing knob for the whole loop, matching the pre-migration cadence).
+        // pacing knob for the whole loop, matching the pre-migration cadence)
+        // — dropped from 50ms to 10ms while `paste_acc` holds buffered keys,
+        // so a lone buffered key still flushes within one `PASTE_GAP` of
+        // arriving instead of waiting on the ordinary idle cadence (see
+        // `paste_accum`'s module doc).
         // Converted from crossterm at this boundary (`convert::from_crossterm`)
         // — `None` for an event kind banto ignores (a key release, focus
         // change, ...), which simply contributes nothing to this tick.
-        if event::poll(Duration::from_millis(50))? {
+        let poll_timeout = if paste_acc.is_pending() {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(50)
+        };
+        if event::poll(poll_timeout)? {
+            // Timestamped separately from the loop's own `now` (above):
+            // `paste_acc`'s gap timing must track real inter-keystroke
+            // spacing, not spacing inflated by whatever PTY-pump/discovery
+            // work this iteration happened to do before reaching the poll.
+            let event_now = Instant::now();
             let raw = event::read()?;
             log_input(&mut input_log, &describe_raw_event(&raw));
             if let Some(input) = convert::from_crossterm(raw) {
                 log_input(&mut input_log, &describe_converted_event(&input));
-                events.push_back(Event::Input(input));
+                if is_in_scope(&state, &input) {
+                    // A stale buffer (idle past `PASTE_GAP` before this key
+                    // arrived) flushes first, so it never silently merges
+                    // into this key's run.
+                    if let Some(flushed) = paste_acc.tick(event_now) {
+                        emit_flushed(&mut events, &mut input_log, flushed);
+                    }
+                    let InputEvent::Key(key) = input else {
+                        unreachable!("is_in_scope only admits InputEvent::Key")
+                    };
+                    if let Some(flushed) = paste_acc.accept(key, event_now) {
+                        emit_flushed(&mut events, &mut input_log, flushed);
+                    }
+                } else {
+                    // Out of scope for accumulation: flush whatever is
+                    // buffered first (preserving key order), except a mouse
+                    // event, which passes through with the buffer left
+                    // untouched (see `paste_accum::PasteAccumulator::bypass`).
+                    let is_mouse = matches!(input, InputEvent::Mouse(_));
+                    if let Some(flushed) = paste_acc.bypass(is_mouse) {
+                        emit_flushed(&mut events, &mut input_log, flushed);
+                    }
+                    events.push_back(Event::Input(input));
+                }
             }
+        } else if paste_acc.is_pending()
+            && let Some(flushed) = paste_acc.tick(Instant::now())
+        {
+            emit_flushed(&mut events, &mut input_log, flushed);
         }
 
         // Discovery: poll for the ids Claude assigns to freshly-launched
@@ -936,6 +979,28 @@ fn log_input(file: &mut Option<std::fs::File>, message: &str) {
             .unwrap_or(0);
         let _ = writeln!(file, "{ms} emporium: {message}");
     }
+}
+
+/// Release one event `paste_acc` flushed: logs the synthesis (length and
+/// `Enter` count only, never the text — same privacy stance as
+/// [`describe_raw_event`]/[`describe_converted_event`]) when it turns out
+/// to be a synthesized paste, then queues it exactly like any other input
+/// event. A lone released key (the common case: nothing needed joining)
+/// gets no extra log line — it was already logged as a "converted key ..."
+/// at read time, before scope classification ever ran.
+fn emit_flushed(
+    events: &mut VecDeque<Event>,
+    input_log: &mut Option<std::fs::File>,
+    flushed: InputEvent,
+) {
+    if let InputEvent::Paste(text) = &flushed {
+        let enters = text.matches('\r').count();
+        log_input(
+            input_log,
+            &format!("paste synthesized len={} enters={enters}", text.len()),
+        );
+    }
+    events.push_back(Event::Input(flushed));
 }
 
 /// Compact, payload-free description of one raw crossterm event, logged
