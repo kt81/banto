@@ -10,12 +10,13 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use banto_core::input::KeyEvent;
 use banto_core::key_encode::key_to_bytes;
 use banto_core::screen::Screen;
-use banto_io::pty::{PtyHost, PtyIo};
+use banto_io::pty::{PtyHost, PtyIo, Resizer};
 
 /// The result of one non-blocking poll of a [`PtyHandle`]'s output channel.
 pub(crate) enum PtyPoll {
@@ -116,6 +117,63 @@ impl PtyHandle {
     pub(crate) fn kill(&mut self) -> Result<()> {
         self.io.killer.kill()
     }
+
+    /// Begin the child's *normal* shutdown instead of killing it outright:
+    /// drop the writer and the PTY master (`resizer` is `PtyIo`'s sole owner
+    /// of the master — see `PortablePtyHost::open`). On Windows, closing the
+    /// master this way delivers the same console-close cascade
+    /// (`CTRL_CLOSE_EVENT`) a child sees when its hosting console window
+    /// closes, so an embedded `claude` finalizes its session data exactly as
+    /// it would on any ordinary window close, instead of an abrupt kill.
+    /// Does not kill and does not wait — pair with [`Self::has_exited`] and a
+    /// deadline, then fall back to [`Self::kill`] for stragglers (see
+    /// `emporium::shutdown_handles`, which owns that policy).
+    pub(crate) fn begin_graceful_close(&mut self) {
+        self.io.input = Box::new(std::io::sink());
+        self.io.resizer = Box::new(NullResizer);
+    }
+
+    /// Non-blocking: has the child actually exited? Distinct from
+    /// [`Self::poll`] (which also drains output and adds a one-tick grace
+    /// before reporting `Disconnected`) — shutdown only cares whether it's
+    /// gone, and is never followed by another `poll()` on the same handle.
+    pub(crate) fn has_exited(&mut self) -> bool {
+        if !self.exit_observed && self.io.exited.try_recv().is_ok() {
+            self.exit_observed = true;
+        }
+        self.exit_observed
+    }
+}
+
+/// Swapped in by [`PtyHandle::begin_graceful_close`]: resizing a child
+/// that's already being torn down is meaningless, and dropping the real
+/// resizer — the sole owner of the PTY master — is what actually closes it.
+struct NullResizer;
+
+impl Resizer for NullResizer {
+    fn resize(&self, _rows: u16, _cols: u16) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Polls `handles` until every one has exited or `deadline` passes, sleeping
+/// `poll_interval` between sweeps — the shared-deadline half of graceful
+/// shutdown. A free function (not a method) so one deadline spans however
+/// many handles are passed in, rather than each handle getting its own.
+pub(crate) fn wait_for_exit_or_deadline(
+    handles: &mut [&mut PtyHandle],
+    deadline: Instant,
+    poll_interval: Duration,
+) {
+    loop {
+        if handles.iter_mut().all(|handle| handle.has_exited()) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 /// One hosted session: a [`Screen`] plus the [`PtyHandle`] that feeds it.
@@ -175,11 +233,12 @@ impl EmbeddedSession {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use banto_core::input::{KeyCode, KeyEvent, Modifiers};
     use banto_io::pty::mock::MockPtyHost;
 
-    use super::{EmbeddedSession, PtyHandle, PtyPoll};
+    use super::{EmbeddedSession, PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
     fn open(host: &MockPtyHost) -> EmbeddedSession {
         EmbeddedSession::open(host, &["child".to_string()], None, 24, 80).unwrap()
@@ -290,5 +349,82 @@ mod tests {
         handle.kill().unwrap();
         assert!(matches!(handle.poll(), PtyPoll::Empty), "one-tick grace");
         assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+    }
+
+    // --- graceful shutdown: begin_graceful_close / has_exited / wait ------
+
+    #[test]
+    fn has_exited_is_false_until_the_exit_signal_actually_fires() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        assert!(!handle.has_exited());
+        host.fire_exit();
+        assert!(handle.has_exited());
+        // Latches: still true on a second check, not just the one that saw it.
+        assert!(handle.has_exited());
+    }
+
+    #[test]
+    fn begin_graceful_close_stops_forwarding_writes_and_resizes_without_killing() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let resizes = Arc::new(Mutex::new(Vec::new()));
+        let kills = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            captured: captured.clone(),
+            resizes: resizes.clone(),
+            kills: kills.clone(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        handle.begin_graceful_close();
+        handle.send_bytes(b"still typing?");
+        handle.resize(10, 40);
+        assert!(captured.lock().unwrap().is_empty(), "writer was dropped");
+        assert!(
+            resizes.lock().unwrap().is_empty(),
+            "master/resizer was dropped"
+        );
+        assert_eq!(*kills.lock().unwrap(), 0, "a graceful close is not a kill");
+    }
+
+    #[test]
+    fn wait_for_exit_or_deadline_returns_promptly_once_every_handle_has_exited() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        host.fire_exit();
+        let start = Instant::now();
+        wait_for_exit_or_deadline(
+            &mut [&mut handle],
+            start + Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "an already-exited handle should not wait out the deadline"
+        );
+    }
+
+    #[test]
+    fn wait_for_exit_or_deadline_gives_up_once_the_deadline_passes() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        // Never fired: this handle never exits.
+        let deadline = Instant::now() + Duration::from_millis(30);
+        wait_for_exit_or_deadline(&mut [&mut handle], deadline, Duration::from_millis(5));
+        assert!(Instant::now() >= deadline);
+        assert!(!handle.has_exited());
+    }
+
+    #[test]
+    fn wait_for_exit_or_deadline_keeps_waiting_while_any_handle_is_still_alive() {
+        let host_a = MockPtyHost::default();
+        let host_b = MockPtyHost::default();
+        let mut a = open_handle(&host_a);
+        let mut b = open_handle(&host_b);
+        host_a.fire_exit(); // a exits immediately; b never does.
+        let deadline = Instant::now() + Duration::from_millis(30);
+        wait_for_exit_or_deadline(&mut [&mut a, &mut b], deadline, Duration::from_millis(5));
+        assert!(a.has_exited());
+        assert!(!b.has_exited());
     }
 }

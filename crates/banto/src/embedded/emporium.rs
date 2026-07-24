@@ -41,6 +41,7 @@ use banto_core::engine::{
     self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
     SessionKey, Stage, StoreIntent, layout, stage_tiles,
 };
+use banto_core::input::InputEvent;
 use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
@@ -55,7 +56,7 @@ use crate::session;
 use crate::tui::LiveWatch;
 
 use super::convert;
-use super::session::{PtyHandle, PtyPoll};
+use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -143,6 +144,7 @@ fn event_loop(
     let mut watch = LiveWatch::new(claude_home);
     let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
     let mut last_tick: Option<Instant> = None;
+    let mut input_log = open_input_log();
 
     loop {
         let now = Instant::now();
@@ -185,10 +187,13 @@ fn event_loop(
         // Converted from crossterm at this boundary (`convert::from_crossterm`)
         // — `None` for an event kind banto ignores (a key release, focus
         // change, ...), which simply contributes nothing to this tick.
-        if event::poll(Duration::from_millis(50))?
-            && let Some(input) = convert::from_crossterm(event::read()?)
-        {
-            events.push_back(Event::Input(input));
+        if event::poll(Duration::from_millis(50))? {
+            let raw = event::read()?;
+            log_input(&mut input_log, &describe_raw_event(&raw));
+            if let Some(input) = convert::from_crossterm(raw) {
+                log_input(&mut input_log, &describe_converted_event(&input));
+                events.push_back(Event::Input(input));
+            }
         }
 
         // Discovery: poll for the ids Claude assigns to freshly-launched
@@ -243,7 +248,52 @@ fn event_loop(
             break;
         }
     }
+    shutdown_handles(&mut handles, SHUTDOWN_GRACE, SHUTDOWN_POLL_INTERVAL);
     Ok(())
+}
+
+/// Windows gives a console-closing child ~5s (`CTRL_CLOSE_EVENT`) before it
+/// force-terminates the process — the budget `shutdown_handles` mirrors for
+/// its whole sweep (see that function's doc for why it's shared, not per
+/// child).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Graceful-close-then-wait-then-force teardown for every still-registered
+/// PTY child, run once the event loop above has broken out (quit), before
+/// `run` calls `restore_terminal`. Each child gets `PtyHandle::
+/// begin_graceful_close`'s normal console-close shutdown — so an embedded
+/// `claude` finalizes its session data exactly as it would on any ordinary
+/// window close — instead of an abrupt kill, bounded by one shared deadline
+/// so an unresponsive child can't extend the others' wait, let alone
+/// banto's own exit. Anything still alive past the deadline is force-killed
+/// via the existing `Killer` and shutdown proceeds without waiting further.
+///
+/// `grace`/`poll_interval` are parameters (rather than reading the
+/// module-level constants directly) purely so tests can drive this with a
+/// short deadline instead of the real 5s.
+///
+/// Deliberately NOT how the prefix-x kill path (`Cmd::KillPty`) works: that
+/// is explicit user intent for an immediate stop, and session jsonl is
+/// append-only and parsed leniently on both sides, so a hard kill there
+/// risks at most one truncated trailing line — an already-accepted
+/// (Phase 2b) trade for responsiveness that this sweep does not need to
+/// make, since nothing here is time-sensitive to the user.
+fn shutdown_handles(
+    handles: &mut HashMap<SessionKey, PtyHandle>,
+    grace: Duration,
+    poll_interval: Duration,
+) {
+    for handle in handles.values_mut() {
+        handle.begin_graceful_close();
+    }
+    let mut pending: Vec<&mut PtyHandle> = handles.values_mut().collect();
+    wait_for_exit_or_deadline(&mut pending, Instant::now() + grace, poll_interval);
+    for handle in handles.values_mut() {
+        if !handle.has_exited() {
+            let _ = handle.kill();
+        }
+    }
 }
 
 /// Execute one `Cmd`, returning any follow-up `Event`(s) — the only place
@@ -859,6 +909,83 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Open the diagnostic input-event log when `BANTO_INPUT_LOG` is set —
+/// mirrors `crate::tui`'s own instrumentation (same env var, same
+/// `{ms} <prefix>: <message>` line format) line-for-line except for the
+/// `emporium:` prefix in place of `tui:`, so a log the two modes happen to
+/// share (they never run in the same process, but an operator may point
+/// both at one file across separate runs) still says which mode wrote which
+/// line. Diagnostic plumbing only: never read by anything in this crate,
+/// and `engine.rs` (the pure core) never sees it.
+fn open_input_log() -> Option<std::fs::File> {
+    let path = std::env::var_os("BANTO_INPUT_LOG")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// Append one line to the diagnostic input log (no-op when disabled).
+fn log_input(file: &mut Option<std::fs::File>, message: &str) {
+    use std::io::Write as _;
+    if let Some(file) = file {
+        let ms = std::time::UNIX_EPOCH
+            .elapsed()
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{ms} emporium: {message}");
+    }
+}
+
+/// Compact, payload-free description of one raw crossterm event, logged
+/// before conversion — deliberately a paste's length, never its text (the
+/// diagnostic log is meant to be safe to paste into a bug report).
+fn describe_raw_event(event: &crossterm::event::Event) -> String {
+    match event {
+        crossterm::event::Event::Key(key) => format!(
+            "raw key code={:?} kind={:?} mods={:?}",
+            key.code, key.kind, key.modifiers
+        ),
+        crossterm::event::Event::Mouse(mouse) => format!(
+            "raw mouse kind={:?} col={} row={}",
+            mouse.kind, mouse.column, mouse.row
+        ),
+        crossterm::event::Event::Paste(text) => format!("raw paste len={}", text.len()),
+        crossterm::event::Event::Resize(width, height) => {
+            format!("raw resize {width}x{height}")
+        }
+        crossterm::event::Event::FocusGained => "raw focus_gained".to_string(),
+        crossterm::event::Event::FocusLost => "raw focus_lost".to_string(),
+    }
+}
+
+/// Compact description of the `InputEvent` a raw event converted into —
+/// paired with [`describe_raw_event`] so one operator paste attempt yields a
+/// definitive "what crossterm handed us" vs. "what banto understood it as"
+/// capture, in one file, one line each.
+fn describe_converted_event(event: &InputEvent) -> String {
+    match event {
+        InputEvent::Key(key) => {
+            format!("converted key code={:?} mods={:?}", key.code, key.modifiers)
+        }
+        InputEvent::Mouse(mouse) => format!(
+            "converted mouse kind={:?} col={} row={}",
+            mouse.kind, mouse.column, mouse.row
+        ),
+        InputEvent::Paste(text) => format!("converted paste len={}", text.len()),
+        InputEvent::Resize { width, height } => format!("converted resize {width}x{height}"),
+    }
+}
+
+/// Deliberately does NOT run `shutdown_handles`: this hook is installed once
+/// in `setup_terminal`, before `handles` (owned locally by `event_loop`)
+/// even exists, and a `'static` panic hook has no clean way to reach a
+/// stack-local `HashMap<SessionKey, PtyHandle>` that may itself be
+/// mid-mutation at panic time without new shared mutable state — which
+/// would be a poor trade for a path that only exists to leave the terminal
+/// sane before re-raising. Left as terminal-restore-only; graceful PTY
+/// teardown on panic is not attempted.
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
@@ -874,4 +1001,107 @@ fn install_panic_hook() {
             original(info);
         }));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use banto_io::pty::mock::MockPtyHost;
+
+    use super::*;
+
+    fn open(host: &MockPtyHost) -> PtyHandle {
+        PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
+    }
+
+    #[test]
+    fn shutdown_sweep_lets_a_promptly_exiting_child_go_without_a_force_kill() {
+        let kills = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            kills: kills.clone(),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("a"), open(&host));
+        host.fire_exit();
+
+        shutdown_handles(
+            &mut handles,
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(*kills.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn shutdown_sweep_force_kills_a_child_that_outlives_the_deadline() {
+        let kills = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            kills: kills.clone(),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("a"), open(&host));
+        // Never fired: this child never exits on its own.
+
+        shutdown_handles(
+            &mut handles,
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(*kills.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn shutdown_sweep_shares_one_deadline_across_every_child() {
+        let kills_a = Arc::new(Mutex::new(0));
+        let kills_b = Arc::new(Mutex::new(0));
+        let host_a = MockPtyHost {
+            kills: kills_a.clone(),
+            ..Default::default()
+        };
+        let host_b = MockPtyHost {
+            kills: kills_b.clone(),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("a"), open(&host_a));
+        handles.insert(SessionKey::from_id("b"), open(&host_b));
+        host_a.fire_exit(); // a exits promptly; b never does.
+
+        let start = Instant::now();
+        shutdown_handles(
+            &mut handles,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "one shared deadline, not one per child"
+        );
+        assert_eq!(*kills_a.lock().unwrap(), 0, "a exited on its own");
+        assert_eq!(*kills_b.lock().unwrap(), 1, "b outlived the deadline");
+    }
+
+    // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------
+
+    #[test]
+    fn describe_raw_event_reports_a_paste_length_not_its_text() {
+        let secret = "line one\nline two\nsome pasted secret".to_string();
+        let described = describe_raw_event(&crossterm::event::Event::Paste(secret.clone()));
+        assert_eq!(described, format!("raw paste len={}", secret.len()));
+        assert!(!described.contains("secret"));
+    }
+
+    #[test]
+    fn describe_converted_event_reports_a_paste_length_not_its_text() {
+        let secret = "another\npasted\nsecret".to_string();
+        let described = describe_converted_event(&InputEvent::Paste(secret.clone()));
+        assert_eq!(described, format!("converted paste len={}", secret.len()));
+        assert!(!described.contains("secret"));
+    }
 }
