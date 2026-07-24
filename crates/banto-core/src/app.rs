@@ -550,7 +550,13 @@ pub struct VisibleRow<'a> {
 /// following row's item instead, which under-counted physical rows and
 /// misaligned every click below a header. See [`App::display_sequence`].
 pub enum ListLine<'a> {
-    Header(String),
+    /// `count` is how many rows fall under this section under the current
+    /// filter — varies as the filter changes, so a consumer comparing
+    /// header identity (not just displaying it) must compare `name` only.
+    Header {
+        name: String,
+        count: usize,
+    },
     Row(VisibleRow<'a>),
 }
 
@@ -561,7 +567,7 @@ pub enum ListLine<'a> {
 /// `filtered`* (not a row index directly), so translating a display line
 /// back to a session is always `self.rows[self.filtered[k]]`.
 enum DisplayLine {
-    Header(String),
+    Header { name: String, count: usize },
     Row(usize),
 }
 
@@ -952,12 +958,24 @@ impl App {
         if !self.grouped_view_active(&self.filtered) {
             return (0..self.filtered.len()).map(DisplayLine::Row).collect();
         }
+        // Sections are contiguous in `filtered` (sorted by `section_rank`),
+        // so a plain occurrence count per name is exactly each header's
+        // row count under the current filter.
+        let mut section_counts: HashMap<String, usize> = HashMap::new();
+        for &row_index in &self.filtered {
+            *section_counts
+                .entry(self.section_name(row_index))
+                .or_insert(0) += 1;
+        }
         let mut lines = Vec::with_capacity(self.filtered.len());
         let mut prev_section: Option<String> = None;
         for (k, &row_index) in self.filtered.iter().enumerate() {
             let section = self.section_name(row_index);
             if prev_section.as_ref() != Some(&section) {
-                lines.push(DisplayLine::Header(section.clone()));
+                lines.push(DisplayLine::Header {
+                    name: section.clone(),
+                    count: section_counts[&section],
+                });
                 prev_section = Some(section);
             }
             lines.push(DisplayLine::Row(k));
@@ -1315,7 +1333,7 @@ impl App {
         let display_index = self.offset.checked_add(viewport_row)?;
         let filtered_index = match display.get(display_index)? {
             DisplayLine::Row(k) => *k,
-            DisplayLine::Header(_) => return None,
+            DisplayLine::Header { .. } => return None,
         };
         if filtered_index >= self.filtered.len() {
             return None;
@@ -1467,7 +1485,10 @@ impl App {
         display[self.offset..end]
             .iter()
             .map(|line| match line {
-                DisplayLine::Header(name) => ListLine::Header(name.clone()),
+                DisplayLine::Header { name, count } => ListLine::Header {
+                    name: name.clone(),
+                    count: *count,
+                },
                 DisplayLine::Row(k) => {
                     let row = &self.rows[self.filtered[*k]];
                     ListLine::Row(VisibleRow {
@@ -1533,7 +1554,7 @@ mod tests {
             .iter()
             .filter_map(|line| match line {
                 ListLine::Row(r) => Some(r.row.id.clone()),
-                ListLine::Header(_) => None,
+                ListLine::Header { .. } => None,
             })
             .collect()
     }
@@ -1544,7 +1565,19 @@ mod tests {
         app.visible()
             .iter()
             .filter_map(|line| match line {
-                ListLine::Header(name) => Some(name.clone()),
+                ListLine::Header { name, .. } => Some(name.clone()),
+                ListLine::Row(_) => None,
+            })
+            .collect()
+    }
+
+    /// Section headers among the visible lines, paired with their row count
+    /// under the current filter, in display order.
+    fn header_counts(app: &App) -> Vec<(String, usize)> {
+        app.visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Header { name, count } => Some((name.clone(), *count)),
                 ListLine::Row(_) => None,
             })
             .collect()
@@ -1940,7 +1973,7 @@ mod tests {
             .iter()
             .filter_map(|line| match line {
                 ListLine::Row(r) => Some(r.pinned),
-                ListLine::Header(_) => None,
+                ListLine::Header { .. } => None,
             })
             .collect();
         // id1 sorted first (pinned), then id0, id2.
@@ -2509,7 +2542,7 @@ mod tests {
             .iter()
             .filter_map(|line| match line {
                 ListLine::Row(r) => Some(r.director),
-                ListLine::Header(_) => None,
+                ListLine::Header { .. } => None,
             })
             .collect();
         assert_eq!(director_flags, vec![false, true, false]);
@@ -2658,6 +2691,62 @@ mod tests {
         // Flat view: back to the plain pinned-first order (no group section).
         assert_eq!(ids(&app), vec!["id3", "id0", "id1", "id2"]);
         assert!(headers(&app).is_empty());
+    }
+
+    #[test]
+    fn headers_carry_the_row_count_of_their_section() {
+        // Same layout as the test above: Pinned (id3, 1 row), "work" (id1, 1
+        // row), Ungrouped (id0 + id2, 2 rows).
+        let mut app = App::new(vec![
+            row("id0", "zero", ""),
+            row("id1", "one", ""),
+            row("id2", "two", ""),
+            row("id3", "three", ""),
+        ])
+        .with_pinned(["id3".to_string()].into_iter().collect())
+        .with_groups(
+            vec![(1, "work".to_string())],
+            [("id1".to_string(), 1)].into_iter().collect(),
+        );
+        app.set_viewport_height(10);
+
+        assert_eq!(
+            header_counts(&app),
+            vec![
+                ("Pinned".to_string(), 1),
+                ("work".to_string(), 1),
+                ("Ungrouped".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_header_count_reflects_the_current_agent_filter() {
+        // A search query flattens grouped view entirely (see
+        // `grouped_view_stays_flat_while_searching`), so the agent filter —
+        // which doesn't — is what actually demonstrates a header's count
+        // tracking the *filtered* set rather than every row in its section.
+        let mut app = App::new(vec![
+            row("h1", "Human one", ""),
+            row("h2", "Human two", ""),
+            agent_row("a1", "Agent one", ""),
+        ])
+        .with_pinned(["h1".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+
+        // Agents hidden by default: Ungrouped has only h2.
+        assert_eq!(
+            header_counts(&app),
+            vec![("Pinned".to_string(), 1), ("Ungrouped".to_string(), 1)]
+        );
+
+        app.toggle_agent_filter();
+
+        // Now a1 joins Ungrouped too.
+        assert_eq!(
+            header_counts(&app),
+            vec![("Pinned".to_string(), 1), ("Ungrouped".to_string(), 2)]
+        );
     }
 
     #[test]

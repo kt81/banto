@@ -813,7 +813,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
         .border_style(border_style(focus == Focus::Sidebar));
     let sidebar_inner = sidebar_block.inner(areas.sidebar);
     frame.render_widget(sidebar_block, areas.sidebar);
-    view::render_list(frame, app, sidebar_inner);
+    view::render_list(frame, app, sidebar_inner, now);
 
     view::render_summary(frame, app, areas.summary, now);
 

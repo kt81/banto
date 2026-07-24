@@ -149,6 +149,25 @@ pub fn humanize_age(mtime: SystemTime, now: SystemTime) -> String {
     }
 }
 
+/// Compact form of [`humanize_age`] for the list row's right-aligned age
+/// column: same bucket boundaries, no " ago" suffix — "now", "5m", "3h",
+/// "2d", "3w". `mtime` in the future reads "now", same rationale as
+/// `humanize_age`.
+pub fn humanize_age_compact(mtime: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m", secs / 60)
+    } else if secs < SECS_PER_DAY {
+        format!("{}h", secs / SECS_PER_HOUR)
+    } else if secs < SECS_PER_DAY * 7 {
+        format!("{}d", secs / SECS_PER_DAY)
+    } else {
+        format!("{}w", secs / (SECS_PER_DAY * 7))
+    }
+}
+
 /// Format a byte count as a short human string for the summary panel:
 /// "512 B", "12 KB", "3.4 MB". Whole units only below MB, one decimal at MB
 /// and above — session files are small enough that GB never comes up.
@@ -325,6 +344,26 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let future = now + Duration::from_secs(500);
         assert_eq!(humanize_age(future, now), "just now");
+    }
+
+    #[test]
+    fn humanize_age_compact_covers_every_bucket() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ago = |secs: u64| now - Duration::from_secs(secs);
+
+        assert_eq!(humanize_age_compact(now, now), "now");
+        assert_eq!(humanize_age_compact(ago(30), now), "now");
+        assert_eq!(humanize_age_compact(ago(5 * 60), now), "5m");
+        assert_eq!(humanize_age_compact(ago(3 * SECS_PER_HOUR), now), "3h");
+        assert_eq!(humanize_age_compact(ago(2 * SECS_PER_DAY), now), "2d");
+        assert_eq!(humanize_age_compact(ago(20 * SECS_PER_DAY), now), "2w");
+    }
+
+    #[test]
+    fn humanize_age_compact_treats_a_future_mtime_as_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let future = now + Duration::from_secs(500);
+        assert_eq!(humanize_age_compact(future, now), "now");
     }
 
     #[test]

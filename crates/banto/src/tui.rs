@@ -38,7 +38,8 @@ use banto_io::process::{ProcessRunner, SystemProcessRunner};
 use banto_io::status::{SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
 use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource};
-use banto_tui::render_modal::{render_modal, truncate_to_width, windowed_view};
+use banto_tui::render_modal::{render_modal, windowed_view};
+use banto_tui::text::truncate_to_width;
 use banto_tui::view;
 
 use crate::opener::{self, OpenOutcome};
@@ -1526,12 +1527,13 @@ fn reload(app: &mut App, ctx: &Context) {
 /// Render the whole UI for one frame: search box, list, the always-visible
 /// summary panel, status bar, and finally a modal overlay on top of
 /// everything else, if one is open. `now` is threaded down to
-/// `view::render_summary` (its relative-age display) rather than read
-/// internally — the clock is read once, here, at the draw call's boundary.
+/// `view::render_list`/`view::render_summary` (the age columns) rather than
+/// read internally — the clock is read once, here, at the draw call's
+/// boundary.
 fn render(frame: &mut Frame, app: &App, now: SystemTime) {
     let [search_area, list_area, summary_area, status_area] = layout_areas(frame.area());
     render_search(frame, app, search_area);
-    view::render_list(frame, app, list_area);
+    view::render_list(frame, app, list_area, now);
     view::render_summary(frame, app, summary_area, now);
     render_status(frame, app, status_area);
     if let Some(modal) = app.modal() {
@@ -1756,12 +1758,18 @@ mod tests {
             .lines()
             .find(|line| line.contains("Beta task"))
             .unwrap();
-        assert!(beta_line.contains('*'), "missing pin marker:\n{text}");
+        assert!(
+            beta_line.contains('\u{1F4CC}'), // 📌
+            "missing pin marker:\n{text}"
+        );
         let alpha_line = text
             .lines()
             .find(|line| line.contains("Alpha task"))
             .unwrap();
-        assert!(!alpha_line.contains('*'), "unexpected marker:\n{text}");
+        assert!(
+            !alpha_line.contains('\u{1F4CC}'),
+            "unexpected marker:\n{text}"
+        );
         // The hint text is longer than the narrow 60-col terminal `draw`
         // uses, so check it wider (see `search_mode_hint_differs_...`) — and
         // wide enough to comfortably outlive ordinary hint-text growth (new

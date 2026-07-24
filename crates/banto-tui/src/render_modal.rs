@@ -2,10 +2,10 @@
 //! rendering shared by both the classic list TUI (`banto::tui`) and the
 //! emporium (`banto::embedded::emporium`); each imports [`render_modal`]
 //! back rather than rendering modals independently, so both modes render
-//! identically. [`truncate_to_width`]/[`windowed_view`]/[`modal_area`] are
-//! also reused by each mode's own non-modal rendering (a search box, a
-//! splash screen), so they're `pub` here too rather than only exposed via
-//! `render_modal`.
+//! identically. [`windowed_view`]/[`modal_area`] (and [`crate::text`]'s
+//! truncation helpers) are also reused by each mode's own non-modal
+//! rendering (a search box, a splash screen), so they're `pub` here too
+//! rather than only exposed via `render_modal`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
@@ -15,6 +15,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::app::{GroupJoinState, Modal, NewSessionPlacement, NewSessionState};
+
+use crate::text::truncate_to_width;
 
 /// Minimum margin (columns/rows) kept around a modal, even in a narrow pane.
 const MODAL_MIN_MARGIN: u16 = 2;
@@ -88,37 +90,6 @@ pub fn modal_clear_area(full_area: Rect) -> Rect {
 /// border with no breathing room (dogfooding report).
 fn pad_horizontal(area: Rect) -> Rect {
     area.inner(Margin::new(1, 0))
-}
-
-/// Truncate `s` to fit within `max_width` display columns (a full-width
-/// character — e.g. Japanese — counts as 2, matching how a terminal actually
-/// advances the cursor for it), appending an ellipsis when anything was cut.
-/// `ratatui` already clips a `Paragraph`/`ListItem` cleanly at its own area
-/// boundary, so this isn't papering over a rendering bug — it's so long
-/// content (a session title, a cwd, a group name) that gets cut ends in a
-/// visible `…` instead of silently vanishing past the edge with no
-/// indication anything was hidden.
-pub fn truncate_to_width(s: &str, max_width: u16) -> String {
-    let max_width = max_width as usize;
-    if s.width() <= max_width {
-        return s.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    let budget = max_width - 1; // reserve 1 column for the ellipsis
-    let mut out = String::new();
-    let mut width = 0usize;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
-        if width + w > budget {
-            break;
-        }
-        out.push(c);
-        width += w;
-    }
-    out.push('\u{2026}');
-    out
 }
 
 /// Compute the slice of `s` to display in a `max_width`-column single-line
@@ -538,24 +509,6 @@ mod tests {
         // ...and the adjacent glyph was neutralized rather than left
         // dangling at the very edge of the frame.
         assert_eq!(buf.cell((38, 5)).unwrap().symbol(), " ");
-    }
-
-    #[test]
-    fn truncate_to_width_leaves_short_text_untouched() {
-        assert_eq!(truncate_to_width("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_to_width_cuts_ascii_and_appends_an_ellipsis() {
-        assert_eq!(truncate_to_width("hello world", 6), "hello\u{2026}");
-    }
-
-    #[test]
-    fn truncate_to_width_never_splits_a_full_width_character() {
-        // Each "あ" is 2 display columns; the budget for content is
-        // max_width - 1 (reserved for the ellipsis) = 4, which fits exactly
-        // 2 of them (4 columns) with none left over for a 3rd.
-        assert_eq!(truncate_to_width(&"あ".repeat(5), 5), "ああ\u{2026}");
     }
 
     #[test]

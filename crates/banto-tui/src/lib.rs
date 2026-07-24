@@ -9,7 +9,9 @@
 //!   design) imports it back rather than rendering modals independently
 //! - [`render`] `vt100` screen -> ratatui text (the emporium's embedded panes)
 //! - [`view`] the shared session-list / summary panel widgets
+//! - [`text`] column-aware text truncation, shared by `render_modal`/`view`
 
 pub mod render;
 pub mod render_modal;
+pub mod text;
 pub mod view;
