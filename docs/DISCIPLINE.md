@@ -34,21 +34,25 @@ violations fail to build.
 | `banto-io` | PTY/process spawning, jsonl reads, sqlite, clock, input events, fs watch, MCP stdio | `banto-core` internals (only `Event`/`Cmd`) |
 | `banto-app` | wiring: `banto-io` ↔ `banto-core` ↔ `banto-tui` | — |
 
-**Current reality and mapping.** Today there are two crates: `banto-core`
-(UI-free but *not* IO-free: provider, store, status, opener all perform I/O)
-and the `banto` bin (whose modules — `app`, `tui`, `view`, `embedded`,
-`mcp` — are the de-facto layers). The migration reassigns, roughly:
+**Status: DONE (Phase 3, 2026-07-25).** The split is physical. `banto-core`
+kept its name and purified in place (model, input, config types, age
+bucketing, search, `App`, the emporium engine + `Screen`, key/paste
+encoders — deps: serde, vt100, nucleo, unicode-width, ratatui-core);
+`banto-io` and `banto-tui` are real crates; the bin package `banto` carries
+the app role (the table's "banto-app" is that role, not a rename). Two
+notes from the migration worth keeping:
 
-- pure logic (`app.rs` list state, search ranking, status *classification*,
-  the relay decision functions, `mcp::handle_line`) → new `banto-core`;
-- provider/store/opener/status *reads*, `PortablePtyHost`, `LiveWatch`,
-  terminal setup → `banto-io`;
-- `view.rs` + the render halves of `tui.rs`/`emporium.rs` → `banto-tui`;
-- the event loops → `banto-app`.
+- The umbrella `ratatui` crate enables its `crossterm` feature by default —
+  core uses `ratatui-core` (the backend-free layout/buffer subset) and
+  banto-tui turns the feature off. The `cargo tree` acceptance check is what
+  caught this; keep running it.
+- The classic `tui.rs` remains an un-migrated app-layer monolith by design
+  (only the shared `render_modal` was extracted). Its future migration — or
+  retirement — is a separate decision.
 
 The `vt100::Parser` is itself a sans-IO state machine (bytes in, screen
-state out); it lives on the core side as `State`, fed by output-chunk
-`Event`s.
+state out); it lives in core as `State` (`banto_core::screen`), fed by
+output-chunk `Event`s.
 
 ## 3. Prohibitions (core and tui)
 
