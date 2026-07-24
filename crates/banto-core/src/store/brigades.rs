@@ -24,83 +24,11 @@ use std::time::SystemTime;
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::model::SessionId;
+use crate::model::{
+    Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
+};
 
 use super::{Store, StoreError, system_time_to_unix_ms};
-
-/// Row id of a brigade (sqlite AUTOINCREMENT primary key).
-pub type BrigadeId = i64;
-
-/// A banto-owned member identity within a brigade: `"director"` or
-/// `"worker-1"`, `"worker-2"`, etc. Stable for the member's lifetime in the
-/// brigade, unlike its Claude session id (unknown for a Worker until
-/// discovered, and never reused across brigades).
-pub type MemberToken = String;
-
-/// A member's role within a brigade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrigadeRole {
-    /// Commands the brigade; the user's only interface into it.
-    Director,
-    /// Carries out the Director's instructions.
-    Worker,
-}
-
-impl BrigadeRole {
-    /// The token persisted in the `role` column.
-    fn as_token(self) -> &'static str {
-        match self {
-            BrigadeRole::Director => "director",
-            BrigadeRole::Worker => "worker",
-        }
-    }
-
-    /// Parse a persisted `role` token leniently: anything other than
-    /// `"director"` is treated as a Worker.
-    fn from_token(token: &str) -> BrigadeRole {
-        if token == "director" {
-            BrigadeRole::Director
-        } else {
-            BrigadeRole::Worker
-        }
-    }
-}
-
-/// A brigade row. Its live membership is loaded separately via
-/// [`Store::brigade_members`], mirroring groups.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Brigade {
-    pub id: BrigadeId,
-    pub name: String,
-}
-
-/// One member of a brigade: its banto-owned token, role, and Claude session
-/// id once known (`None` for a Worker banto has spawned but Claude hasn't
-/// assigned an id to yet).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BrigadeMember {
-    pub token: MemberToken,
-    pub role: BrigadeRole,
-    pub claude_session_id: Option<SessionId>,
-}
-
-/// A queued message from one brigade member to the peer role, or to one
-/// specific member of it (see the `brigade_messages` migration and the v8
-/// `to_member` column): what a recipient pulls via
-/// [`Store::fetch_brigade_messages`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BrigadeMessage {
-    /// Monotonic queue id (also the per-member read cursor).
-    pub id: i64,
-    /// The token of the member that sent it (for attribution in the
-    /// firewall framing, e.g. "director" or "worker-1").
-    pub from_token: MemberToken,
-    pub body: String,
-    /// The specific member this was addressed to, if any. `None` means a
-    /// broadcast to every member of the recipient role — the original,
-    /// still-default addressing.
-    pub to_member: Option<MemberToken>,
-}
 
 impl Store {
     /// Creates an (empty) brigade and returns its id.

@@ -21,13 +21,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 
 use banto_core::config::{BrigadeConfig, RelayMode};
+use banto_core::input::{
+    InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use banto_core::store::{BrigadeId, BrigadeRole, MemberToken};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
@@ -391,16 +390,14 @@ impl EmporiumState {
 const PREFIX_ARM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
-/// see `banto_core::config::KeysConfig`). Parsing lives here, not in
-/// `banto-core`, because the result is `crossterm` types and `banto-core`
-/// never depends on `crossterm` (`docs/DISCIPLINE.md` §2's crate table) —
-/// the config module only validates as far as "is it a string"; this is
-/// where "is it a chord" gets decided, lenient by the same design as
-/// `RelayMode`.
+/// see `banto_core::config::KeysConfig`). Parsing lives here rather than in
+/// `banto-core::config` because the config module only validates as far as
+/// "is it a string"; this is where "is it a chord" gets decided, lenient by
+/// the same design as `RelayMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PrefixKey {
     code: KeyCode,
-    mods: KeyModifiers,
+    mods: Modifiers,
 }
 
 impl PrefixKey {
@@ -413,7 +410,7 @@ impl PrefixKey {
             if let (Some(c), None) = (chars.next(), chars.next()) {
                 return Self {
                     code: KeyCode::Char(c),
-                    mods: KeyModifiers::CONTROL,
+                    mods: Modifiers::CONTROL,
                 };
             }
             return Self::default();
@@ -422,7 +419,7 @@ impl PrefixKey {
         if let (Some(c), None) = (chars.next(), chars.next()) {
             return Self {
                 code: KeyCode::Char(c),
-                mods: KeyModifiers::NONE,
+                mods: Modifiers::NONE,
             };
         }
         Self::default()
@@ -444,7 +441,7 @@ impl Default for PrefixKey {
     fn default() -> Self {
         Self {
             code: KeyCode::Char('b'),
-            mods: KeyModifiers::CONTROL,
+            mods: Modifiers::CONTROL,
         }
     }
 }
@@ -711,7 +708,7 @@ pub(super) enum Cmd {
 
 /// A fact about the outside world, fed into [`update`].
 pub(super) enum Event {
-    Input(CtEvent),
+    Input(InputEvent),
     Resized {
         width: u16,
         height: u16,
@@ -907,16 +904,19 @@ fn update_input(
     state: &mut EmporiumState,
     app: &mut App,
     brigade: &BrigadeConfig,
-    input: CtEvent,
+    input: InputEvent,
     now: Instant,
 ) -> Vec<Cmd> {
     match input {
-        CtEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            update_key(state, app, brigade, key, now)
-        }
-        CtEvent::Mouse(mouse) => update_mouse(state, app, brigade, mouse, now),
-        CtEvent::Paste(text) => update_paste(state, app, text, now),
-        _ => Vec::new(),
+        // The press/repeat-vs-release filter the terminal backend's raw key
+        // event kind would need lives at the shell boundary now
+        // (`embedded::convert`) — `InputEvent::Key` only exists at all once
+        // that's already decided, so every `Key` reaching here is one to
+        // act on.
+        InputEvent::Key(key) => update_key(state, app, brigade, key, now),
+        InputEvent::Mouse(mouse) => update_mouse(state, app, brigade, mouse, now),
+        InputEvent::Paste(text) => update_paste(state, app, text, now),
+        InputEvent::Resize { .. } => Vec::new(),
     }
 }
 
@@ -986,21 +986,21 @@ fn update_key(
             state.status = None;
             let mods = key.modifiers;
             // Every plain-char binding below fires only with no modifier
-            // held (`'B'` alone is the exception: crossterm reports a
-            // shifted letter as the already-uppercased `Char` *plus*
-            // `SHIFT` set, not a bare `Char('b')`) — a Ctrl/Alt-modified
-            // char is never one of these bindings, just noise (e.g. the
-            // default prefix `C-b` must never also fire `b`'s add-worker).
+            // held (`'B'` alone is the exception: a shifted letter arrives
+            // as the already-uppercased `Char` *plus* `SHIFT` set, not a
+            // bare `Char('b')`) — a Ctrl/Alt-modified char is never one of
+            // these bindings, just noise (e.g. the default prefix `C-b`
+            // must never also fire `b`'s add-worker).
             match (code, mods) {
-                (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
+                (KeyCode::Char('q'), Modifiers::NONE) | (KeyCode::Esc, _) => {
                     app.request_quit();
                     Vec::new()
                 }
-                (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                (KeyCode::Up, _) | (KeyCode::Char('k'), Modifiers::NONE) => {
                     app.select_prev();
                     Vec::new()
                 }
-                (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                (KeyCode::Down, _) | (KeyCode::Char('j'), Modifiers::NONE) => {
                     app.select_next();
                     Vec::new()
                 }
@@ -1021,32 +1021,30 @@ fn update_key(
                     Vec::new()
                 }
                 (KeyCode::Enter, _) => activate_selected(state, app),
-                (KeyCode::Char('B'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                    brigade_key(state, app)
-                }
-                (KeyCode::Char('b'), KeyModifiers::NONE) => add_worker(state, app, brigade),
+                (KeyCode::Char('B'), Modifiers::NONE | Modifiers::SHIFT) => brigade_key(state, app),
+                (KeyCode::Char('b'), Modifiers::NONE) => add_worker(state, app, brigade),
                 (KeyCode::Tab, _) => {
                     app.toggle_grouped_view();
                     Vec::new()
                 }
-                (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                (KeyCode::Char('/'), Modifiers::NONE) => {
                     app.enter_search();
                     Vec::new()
                 }
-                (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                (KeyCode::Char('a'), Modifiers::NONE) => {
                     app.toggle_agent_filter();
                     Vec::new()
                 }
-                (KeyCode::Char('p'), KeyModifiers::NONE) => toggle_pin(app),
-                (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                (KeyCode::Char('p'), Modifiers::NONE) => toggle_pin(app),
+                (KeyCode::Char('d'), Modifiers::NONE) => {
                     app.open_confirm_archive_modal();
                     Vec::new()
                 }
-                (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                (KeyCode::Char('g'), Modifiers::NONE) => {
                     app.open_group_join_modal();
                     Vec::new()
                 }
-                (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                (KeyCode::Char('n'), Modifiers::NONE) => {
                     app.open_new_session_modal();
                     Vec::new()
                 }
@@ -1929,7 +1927,6 @@ mod tests {
     use std::path::PathBuf;
 
     use banto_core::model::Activity;
-    use crossterm::event::{Event as CtEvent, KeyModifiers};
 
     use super::super::session::Screen;
     use super::*;
@@ -2451,12 +2448,12 @@ mod tests {
 
         // Enter on the sidebar: the row isn't a known brigade member yet, so
         // the first step is always resolving membership (see the module doc).
-        let key_event = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let key_event = KeyEvent::new(KeyCode::Enter, Modifiers::NONE);
         let cmds = update(
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(key_event)),
+            Event::Input(InputEvent::Key(key_event)),
             now,
         );
         assert!(matches!(
@@ -2621,9 +2618,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('a'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -2652,7 +2649,7 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Paste("a\nb".to_string())),
+            Event::Input(InputEvent::Paste("a\nb".to_string())),
             now,
         );
         // Exactly one WritePty (a stray ResizePty may also come back — the
@@ -2812,7 +2809,7 @@ mod tests {
             PrefixKey::parse("C-x"),
             PrefixKey {
                 code: KeyCode::Char('x'),
-                mods: KeyModifiers::CONTROL,
+                mods: Modifiers::CONTROL,
             }
         );
     }
@@ -2823,7 +2820,7 @@ mod tests {
             PrefixKey::parse("x"),
             PrefixKey {
                 code: KeyCode::Char('x'),
-                mods: KeyModifiers::NONE,
+                mods: Modifiers::NONE,
             }
         );
     }
@@ -2852,9 +2849,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('b'),
-                KeyModifiers::CONTROL,
+                Modifiers::CONTROL,
             ))),
             now,
         );
@@ -2886,9 +2883,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('b'),
-                KeyModifiers::CONTROL,
+                Modifiers::CONTROL,
             ))),
             now,
         );
@@ -2925,9 +2922,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('o'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -2961,9 +2958,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('3'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -2990,9 +2987,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('5'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3017,9 +3014,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('s'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3044,9 +3041,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('x'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3075,9 +3072,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('z'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3144,9 +3141,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Enter,
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3170,9 +3167,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Esc,
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3264,9 +3261,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::F(2),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3277,9 +3274,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::F(2),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3305,9 +3302,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::F(3),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3338,9 +3335,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('b'),
-                KeyModifiers::CONTROL,
+                Modifiers::CONTROL,
             ))),
             now,
         );
@@ -3364,9 +3361,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('d'),
-                KeyModifiers::CONTROL,
+                Modifiers::CONTROL,
             ))),
             now,
         );
@@ -3395,9 +3392,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('o'),
-                KeyModifiers::CONTROL,
+                Modifiers::CONTROL,
             ))),
             now,
         );
@@ -3467,9 +3464,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('b'),
-                KeyModifiers::CONTROL,
+                Modifiers::CONTROL,
             ))),
             now,
         );
@@ -3480,9 +3477,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Char('o'),
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3566,9 +3563,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Right,
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3601,9 +3598,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Left,
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );
@@ -3631,9 +3628,9 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(CtEvent::Key(KeyEvent::new(
+            Event::Input(InputEvent::Key(KeyEvent::new(
                 KeyCode::Left,
-                KeyModifiers::NONE,
+                Modifiers::NONE,
             ))),
             now,
         );

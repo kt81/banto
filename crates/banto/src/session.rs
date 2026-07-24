@@ -5,10 +5,11 @@
 //! and the TUI render. It performs read-only work only; nothing here writes
 //! to disk. Everything under `claude_home` is treated as strictly read-only.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::ActivityConfig;
+pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket};
 use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::provider::{ProviderError, SessionProvider};
@@ -18,55 +19,6 @@ use banto_core::status::{self, AgeThresholds, SysinfoProbe};
 const SECS_PER_HOUR: u64 = 60 * 60;
 /// Number of seconds in one day.
 const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
-
-/// One session as shown in the list: its metadata plus computed activity.
-#[derive(Debug, Clone)]
-pub struct SessionRow {
-    /// Session id (UUID for Claude Code).
-    pub id: String,
-    /// Best-effort title (`None` when it could not be extracted).
-    pub title: Option<String>,
-    /// Working directory the session ran in, if known.
-    pub cwd: Option<PathBuf>,
-    /// Activity state driving the colored dot.
-    pub activity: Activity,
-    /// True when a spawned agent (subagent / Agent-Teams teammate) ran this
-    /// session, rather than the user starting it interactively. See
-    /// `banto_core::model::SessionMeta::is_agent`.
-    pub is_agent: bool,
-    /// Short single-line excerpt of the first user message, for the summary
-    /// panel. See `banto_core::model::SessionMeta::preview`.
-    pub preview: Option<String>,
-    /// Last modification time of the session's source file, for the summary
-    /// panel's relative-age display (see [`humanize_age`]).
-    pub mtime: SystemTime,
-    /// Source file size in bytes, for the summary panel (see [`humanize_size`]).
-    pub size: u64,
-}
-
-impl SessionRow {
-    /// Text used as the search haystack: `title + " " + cwd`.
-    pub fn haystack(&self) -> String {
-        let title = self.title.as_deref().unwrap_or("");
-        format!("{title} {}", self.cwd_display())
-    }
-
-    /// Title shown in the list, falling back to the session id.
-    pub fn display_title(&self) -> &str {
-        match self.title.as_deref() {
-            Some(title) if !title.is_empty() => title,
-            _ => &self.id,
-        }
-    }
-
-    /// cwd rendered as a string (empty when unknown).
-    pub fn cwd_display(&self) -> String {
-        self.cwd
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default()
-    }
-}
 
 /// First 8 characters of a session id (a UUID), for compact display in the
 /// summary panel. Char-based (not byte-slicing) so it never panics
@@ -169,6 +121,8 @@ pub fn load_rows(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]

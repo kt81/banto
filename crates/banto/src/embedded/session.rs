@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
-use crossterm::event::KeyEvent;
+use banto_core::input::KeyEvent;
 
 use super::input::key_to_bytes;
 use super::pty::{PtyHost, PtyIo};
@@ -215,7 +215,7 @@ impl EmbeddedSession {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use banto_core::input::{KeyCode, KeyEvent, Modifiers};
 
     use super::super::pty::mock::MockPtyHost;
     use super::{EmbeddedSession, PtyHandle, PtyPoll};
@@ -249,8 +249,8 @@ mod tests {
             ..Default::default()
         };
         let mut session = open(&host);
-        session.send_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        session.send_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        session.send_key(&KeyEvent::new(KeyCode::Enter, Modifiers::NONE));
+        session.send_key(&KeyEvent::new(KeyCode::Char('a'), Modifiers::NONE));
         assert_eq!(&*captured.lock().unwrap(), b"\ra");
     }
 

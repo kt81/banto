@@ -1,12 +1,12 @@
-//! Encode crossterm key events into the byte sequences a PTY child expects.
+//! Encode key events into the byte sequences a PTY child expects.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use banto_core::input::{KeyCode, KeyEvent};
 
 /// Translate a key press into the bytes to write to the child's stdin. Returns
 /// an empty vector for keys that produce no input (e.g. bare modifiers).
 pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let ctrl = key.modifiers.ctrl;
+    let alt = key.modifiers.alt;
     let mut out = Vec::new();
     match key.code {
         KeyCode::Char(c) => {
@@ -101,43 +101,40 @@ fn ctrl_byte(c: char) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use banto_core::input::{KeyCode, KeyEvent, Modifiers};
 
     use super::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
 
-    fn bytes(code: KeyCode, mods: KeyModifiers) -> Vec<u8> {
+    fn bytes(code: KeyCode, mods: Modifiers) -> Vec<u8> {
         key_to_bytes(&KeyEvent::new(code, mods))
     }
 
     #[test]
     fn plain_chars_and_enter() {
-        assert_eq!(bytes(KeyCode::Char('a'), KeyModifiers::NONE), b"a");
-        assert_eq!(bytes(KeyCode::Enter, KeyModifiers::NONE), b"\r");
-        assert_eq!(bytes(KeyCode::Backspace, KeyModifiers::NONE), vec![0x7f]);
+        assert_eq!(bytes(KeyCode::Char('a'), Modifiers::NONE), b"a");
+        assert_eq!(bytes(KeyCode::Enter, Modifiers::NONE), b"\r");
+        assert_eq!(bytes(KeyCode::Backspace, Modifiers::NONE), vec![0x7f]);
     }
 
     #[test]
     fn multibyte_char() {
-        assert_eq!(
-            bytes(KeyCode::Char('あ'), KeyModifiers::NONE),
-            "あ".as_bytes()
-        );
+        assert_eq!(bytes(KeyCode::Char('あ'), Modifiers::NONE), "あ".as_bytes());
     }
 
     #[test]
     fn ctrl_c_is_etx() {
-        assert_eq!(bytes(KeyCode::Char('c'), KeyModifiers::CONTROL), vec![0x03]);
+        assert_eq!(bytes(KeyCode::Char('c'), Modifiers::CONTROL), vec![0x03]);
     }
 
     #[test]
     fn alt_prefixes_escape() {
-        assert_eq!(bytes(KeyCode::Char('x'), KeyModifiers::ALT), b"\x1bx");
+        assert_eq!(bytes(KeyCode::Char('x'), Modifiers::ALT), b"\x1bx");
     }
 
     #[test]
     fn arrows_are_csi() {
-        assert_eq!(bytes(KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
-        assert_eq!(bytes(KeyCode::Left, KeyModifiers::NONE), b"\x1b[D");
+        assert_eq!(bytes(KeyCode::Up, Modifiers::NONE), b"\x1b[A");
+        assert_eq!(bytes(KeyCode::Left, Modifiers::NONE), b"\x1b[D");
     }
 
     #[test]

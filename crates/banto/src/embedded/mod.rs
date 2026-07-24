@@ -9,6 +9,7 @@
 //! straight to the child's stdin, so answering leaks the reply as typed input.
 //! A raw Unix PTY would need answering; that path is deferred.
 
+mod convert;
 mod emporium;
 mod engine;
 mod input;
@@ -95,7 +96,9 @@ fn embedded_loop(
                     if matches!(key.code, KeyCode::F(12)) {
                         break;
                     }
-                    session.send_key(&key);
+                    if let Some(key) = convert::convert_key(key) {
+                        session.send_key(&key);
+                    }
                 }
                 Event::Resize(nw, nh) => {
                     session.resize(nh.saturating_sub(2).max(1), nw.saturating_sub(2).max(1));

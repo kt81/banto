@@ -2,6 +2,7 @@
 //!
 //! Module map (see docs/REQUIREMENTS.md for the design):
 //! - [`model`]    shared domain types (frozen; changes go through the team lead)
+//! - [`input`]    pure key/mouse/paste/resize event types (no terminal backend)
 //! - [`provider`] session discovery + tolerant JSONL parsing
 //! - [`status`]   live-session state and activity bucketing
 //! - [`store`]    sqlite cache, FTS5, groups/pins, session<->pane map
@@ -9,6 +10,7 @@
 //! - [`config`]   config.toml loading and default paths
 
 pub mod config;
+pub mod input;
 pub mod model;
 pub mod opener;
 pub mod provider;

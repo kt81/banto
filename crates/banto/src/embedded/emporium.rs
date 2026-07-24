@@ -47,6 +47,7 @@ use crate::session;
 use crate::tui::LiveWatch;
 use crate::view;
 
+use super::convert;
 use super::engine::{
     self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
     SessionKey, Stage, StoreIntent, layout, stage_tiles,
@@ -180,8 +181,13 @@ fn event_loop(
 
         // One real input event, non-blocking with a short poll window (the
         // pacing knob for the whole loop, matching the pre-migration cadence).
-        if event::poll(Duration::from_millis(50))? {
-            events.push_back(Event::Input(event::read()?));
+        // Converted from crossterm at this boundary (`convert::from_crossterm`)
+        // — `None` for an event kind banto ignores (a key release, focus
+        // change, ...), which simply contributes nothing to this tick.
+        if event::poll(Duration::from_millis(50))?
+            && let Some(input) = convert::from_crossterm(event::read()?)
+        {
+            events.push_back(Event::Input(input));
         }
 
         // Discovery: poll for the ids Claude assigns to freshly-launched
