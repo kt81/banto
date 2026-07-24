@@ -129,6 +129,7 @@ dependencies = [
  "nucleo",
  "ratatui-core",
  "serde",
+ "serde_json",
  "toml",
  "vt100",
 ]

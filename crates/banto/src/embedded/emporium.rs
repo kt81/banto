@@ -13,6 +13,14 @@
 //! `App` (list state), the `view` renderers, the store-load helpers, and
 //! `render_modal`. It has its own, separate event loop and is untouched by
 //! this migration.
+//!
+//! `BANTO_RECORD_EVENTS=<path>` (see [`EventRecorder`]) captures every
+//! `Event` fed into [`engine::update`] as a `docs/DISCIPLINE.md` §8 replay
+//! stream — **a captured file is a LOCAL DIAGNOSTIC ARTIFACT and must never
+//! be committed**: unlike `BANTO_INPUT_LOG`, it contains real session
+//! content in full (keystrokes, pasted text, PTY output), not redacted
+//! lengths. Repo invariant 2 applies with full force — `banto_core::replay`'s
+//! own fixtures are hand-written synthetic streams only.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -43,6 +51,7 @@ use banto_core::engine::{
 };
 use banto_core::input::InputEvent;
 use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
+use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
@@ -147,6 +156,8 @@ fn event_loop(
     let mut last_tick: Option<Instant> = None;
     let mut input_log = open_input_log();
     let mut paste_acc = PasteAccumulator::new();
+    let run_start = Instant::now();
+    let mut event_recorder = open_event_recorder(run_start);
 
     loop {
         let now = Instant::now();
@@ -268,6 +279,9 @@ fn event_loop(
         // the store to every shell-executed `Cmd` (spawning a PTY child is
         // just as synchronous a call as a store write).
         while let Some(ev) = events.pop_front() {
+            if let Some(recorder) = &mut event_recorder {
+                recorder.record(&ev, now);
+            }
             let cmds = engine::update(&mut state, app, brigade, ev, now);
             for cmd in cmds {
                 events.extend(execute_cmd(
@@ -981,6 +995,78 @@ fn log_input(file: &mut Option<std::fs::File>, message: &str) {
     }
 }
 
+/// Env-gated recorder for `docs/DISCIPLINE.md` §8's record/replay stream:
+/// every `Event` fed into `engine::update`, one JSON line per event
+/// (`banto_core::replay::TimedEvent`), `offset_ms` relative to when this
+/// run's event loop started. A `banto_io`/shell concern under §6.2's
+/// diagnostic-bypass relaxation — `banto_core::replay` only ever reads this
+/// format back, never writes it.
+///
+/// **The resulting file is a LOCAL DIAGNOSTIC ARTIFACT, never a repo
+/// fixture.** Unlike `BANTO_INPUT_LOG` (which deliberately logs a paste's
+/// length, never its text), this recorder writes every event whole —
+/// keystrokes, pasted text, PTY output chunks, session ids. A real capture
+/// necessarily contains real session content; repo invariant 2 ("never
+/// bring real session data into the repository") applies with full force.
+/// `banto_core::replay`'s own fixtures are hand-written synthetic streams
+/// only — never a `BANTO_RECORD_EVENTS` capture, however tempting it is to
+/// just point it at a real run and commit the result.
+struct EventRecorder {
+    file: std::fs::File,
+    run_start: Instant,
+}
+
+impl EventRecorder {
+    /// Open (creating if needed, appending if not) the recorder at `path`,
+    /// writing the version header only when the file is new or empty — so
+    /// re-running with the same path keeps appending to one stream instead
+    /// of writing a header mid-file. Separated from [`open_event_recorder`]
+    /// (which resolves `path` from `BANTO_RECORD_EVENTS`) so the actual
+    /// header/append mechanics are testable against a real temp file
+    /// without mutating process-global environment state.
+    fn open(path: &std::path::Path, run_start: Instant) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let is_new = file.metadata()?.len() == 0;
+        let mut recorder = Self { file, run_start };
+        if is_new {
+            recorder.write_header();
+        }
+        Ok(recorder)
+    }
+
+    fn write_header(&mut self) {
+        use std::io::Write as _;
+        let _ = writeln!(self.file, "{{\"banto_event_stream\":{STREAM_VERSION}}}");
+    }
+
+    /// Append one event at `now`, as an offset from `run_start`. Silent on
+    /// any failure — JSON serialization or the write itself — matching
+    /// `log_input`'s stance: a diagnostics channel must never take down the
+    /// TUI.
+    fn record(&mut self, event: &Event, now: Instant) {
+        use std::io::Write as _;
+        let offset_ms = now.saturating_duration_since(self.run_start).as_millis() as u64;
+        let timed = TimedEvent {
+            offset_ms,
+            event: event.clone(),
+        };
+        if let Ok(line) = serde_json::to_string(&timed) {
+            let _ = writeln!(self.file, "{line}");
+        }
+    }
+}
+
+/// Open the event recorder when `BANTO_RECORD_EVENTS` is set — see
+/// [`EventRecorder`]'s doc for what it captures and the loud warning that
+/// pairs with it.
+fn open_event_recorder(run_start: Instant) -> Option<EventRecorder> {
+    let path = std::env::var_os("BANTO_RECORD_EVENTS")?;
+    EventRecorder::open(std::path::Path::new(&path), run_start).ok()
+}
+
 /// Release one event `paste_acc` flushed: logs the synthesis (length and
 /// `Enter` count only, never the text — same privacy stance as
 /// [`describe_raw_event`]/[`describe_converted_event`]) when it turns out
@@ -1168,5 +1254,74 @@ mod tests {
         let described = describe_converted_event(&InputEvent::Paste(secret.clone()));
         assert_eq!(described, format!("converted paste len={}", secret.len()));
         assert!(!described.contains("secret"));
+    }
+
+    // --- BANTO_RECORD_EVENTS: EventRecorder ------------------------------
+
+    #[test]
+    fn event_recorder_writes_the_header_once_then_appends_events_replay_can_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.jsonl");
+        let run_start = Instant::now();
+
+        let mut recorder = EventRecorder::open(&path, run_start).unwrap();
+        recorder.record(
+            &Event::Resized {
+                width: 80,
+                height: 24,
+            },
+            run_start + Duration::from_millis(50),
+        );
+        recorder.record(
+            &Event::Tick { relay: vec![] },
+            run_start + Duration::from_millis(1200),
+        );
+        drop(recorder);
+
+        // Reopening at the same (now non-empty) path must not write a
+        // second header line mid-file.
+        let mut recorder = EventRecorder::open(&path, run_start).unwrap();
+        recorder.record(
+            &Event::Resized {
+                width: 10,
+                height: 10,
+            },
+            run_start + Duration::from_millis(2000),
+        );
+        drop(recorder);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let events = banto_core::replay::parse_stream(&text).expect("a well-formed stream");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].offset_ms, 50);
+        assert_eq!(events[1].offset_ms, 1200);
+        assert_eq!(events[2].offset_ms, 2000);
+        assert_eq!(
+            events[0].event,
+            Event::Resized {
+                width: 80,
+                height: 24
+            }
+        );
+    }
+
+    #[test]
+    fn event_recorder_never_backdates_an_offset_when_now_precedes_run_start() {
+        // `saturating_duration_since` — a defensive floor, not an expected
+        // case: `now` in the real event loop is always >= `run_start`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.jsonl");
+        let run_start = Instant::now() + Duration::from_secs(1);
+
+        let mut recorder = EventRecorder::open(&path, run_start).unwrap();
+        recorder.record(
+            &Event::Tick { relay: vec![] },
+            run_start - Duration::from_secs(1),
+        );
+        drop(recorder);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let events = banto_core::replay::parse_stream(&text).unwrap();
+        assert_eq!(events[0].offset_ms, 0);
     }
 }

@@ -13,6 +13,7 @@
 //! - [`engine`] the emporium's pure core: `update(state, ev, now) -> Vec<Cmd>`
 //! - [`screen`] the emporium's per-pane `vt100` terminal model
 //! - [`key_encode`] key-event -> PTY-child-stdin byte encoding
+//! - [`replay`] the record/replay event-stream format (`docs/DISCIPLINE.md` §8)
 
 pub mod app;
 pub mod config;
@@ -20,6 +21,7 @@ pub mod engine;
 pub mod input;
 pub mod key_encode;
 pub mod model;
+pub mod replay;
 pub mod screen;
 pub mod search;
 pub mod status;

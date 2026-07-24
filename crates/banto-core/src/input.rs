@@ -7,9 +7,16 @@
 //!
 //! [`KeyCode`] is deliberately not a full terminal keycode taxonomy — it's
 //! exactly the set banto's emporium actually binds.
+//!
+//! Every type here also derives `Serialize`/`Deserialize`: `InputEvent` is
+//! reachable from `engine::Event`, which the record/replay stream
+//! (`crate::replay`) serializes one line per event (`docs/DISCIPLINE.md`
+//! §8).
+
+use serde::{Deserialize, Serialize};
 
 /// One recognized key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyCode {
     Char(char),
     Enter,
@@ -33,7 +40,7 @@ pub enum KeyCode {
 /// Which modifier keys were held. A plain struct rather than a bitflags
 /// type — banto only ever tests/sets these three individually or compares
 /// against [`Modifiers::NONE`], so a `bitflags` dependency buys nothing here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub alt: bool,
@@ -68,7 +75,7 @@ impl Modifiers {
 }
 
 /// One key press: what was pressed, plus what was held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub code: KeyCode,
     pub modifiers: Modifiers,
@@ -82,7 +89,7 @@ impl KeyEvent {
 
 /// A mouse button, for [`MouseEventKind::Down`]/[`MouseEventKind::Up`]/
 /// [`MouseEventKind::Drag`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -90,7 +97,7 @@ pub enum MouseButton {
 }
 
 /// What kind of mouse event occurred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseEventKind {
     Down(MouseButton),
     Up(MouseButton),
@@ -102,7 +109,7 @@ pub enum MouseEventKind {
 
 /// One mouse event, at a terminal cell coordinate (0-based, matching
 /// `ratatui::layout::Position`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MouseEvent {
     pub kind: MouseEventKind,
     pub column: u16,
@@ -113,7 +120,7 @@ pub struct MouseEvent {
 /// reacts to from the terminal. Events banto ignores (focus change, key
 /// release, ...) never become one of these; they're dropped at the
 /// crossterm boundary instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),

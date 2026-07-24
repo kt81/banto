@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui_core::layout::{Constraint, Layout, Position, Rect};
+use serde::{Deserialize, Serialize};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
 use crate::config::{BrigadeConfig, RelayMode};
@@ -43,7 +44,7 @@ pub const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
 /// Stable identity for a kept-alive embedded session: the real Claude
 /// session id once known, or a synthetic placeholder for a freshly-launched
 /// one still awaiting id discovery (see [`Self::is_synthetic`]).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey(String);
 
 impl SessionKey {
@@ -79,6 +80,7 @@ pub enum Focus {
 
 /// What the right-hand pane region is showing: nothing, a single session, or
 /// a brigade tiled across several panes.
+#[derive(Debug)]
 pub enum Stage {
     Empty,
     Solo(SessionKey),
@@ -291,6 +293,7 @@ pub fn tick_relay_decision(
 /// One relay-eligible staged member's freshly-gathered observations for this
 /// tick — gathered shell-side (store + live-session reads), decided
 /// core-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayObservation {
     pub token: MemberToken,
     pub key: SessionKey,
@@ -622,6 +625,7 @@ fn arrow_target(from: FocusSlot, direction: Direction, pane_count: usize) -> Foc
 
 /// A store operation the shell executes, reusing the store's existing
 /// transactional functions — an intent, not a SQL statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoreIntent {
     SetPin {
         id: String,
@@ -665,12 +669,20 @@ pub enum StoreIntent {
 /// Mirrors `crate::app::GroupJoinTarget`, but by value (the original borrows
 /// from the modal state, which `update` cannot hold across the round trip to
 /// the shell and back).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupJoinTargetData {
     Existing(i64, String),
     New(String),
 }
 
-/// An instruction for the shell to execute — plain data, never executed here.
+/// An instruction for the shell to execute — plain data, never executed
+/// here. Derives `Serialize`/`Deserialize` alongside `Event` even though
+/// only `Event` is ever written to a record/replay stream (`crate::replay`,
+/// `docs/DISCIPLINE.md` §8) — the discipline's own §5.5 treats a `Cmd`
+/// history as "comparable and snapshotable wholesale", which needs
+/// `PartialEq`/`Eq` (and `Serialize` makes that snapshotting JSON-able too,
+/// for free).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cmd {
     WritePty {
         key: SessionKey,
@@ -703,7 +715,11 @@ pub enum Cmd {
     Reload,
 }
 
-/// A fact about the outside world, fed into [`update`].
+/// A fact about the outside world, fed into [`update`]. Derives
+/// `Serialize`/`Deserialize`: this is the one type a record/replay stream
+/// (`crate::replay`, `docs/DISCIPLINE.md` §8) actually writes to and reads
+/// from disk — one JSON object per line, `{offset_ms, event}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Input(InputEvent),
     Resized {

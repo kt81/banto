@@ -5,6 +5,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 /// Opaque session identifier (a UUID string for Claude Code).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
@@ -42,7 +44,7 @@ pub struct SessionMeta {
 }
 
 /// Activity state rendered as the colored dot in the session list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Activity {
     /// A live process reports status=busy for this session.
     Busy,
@@ -53,7 +55,7 @@ pub enum Activity {
 }
 
 /// Age buckets for sessions without a live process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgeBucket {
     Today,
     ThisWeek,
@@ -68,7 +70,7 @@ pub enum AgeBucket {
 /// formatting helpers below live here instead so both UI crates
 /// (`banto-core`'s own `engine`/`app`, and `banto-tui`'s `view`) can hold,
 /// read, and display a row without depending on the bin crate.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRow {
     /// Session id (UUID for Claude Code).
     pub id: String,
@@ -166,7 +168,7 @@ pub fn humanize_size(bytes: u64) -> String {
 /// `Cmd::OpenEmbedded` carries; the actual opening (spawning a PTY child,
 /// or in the classic list, resuming/focusing it in a real terminal backend)
 /// is `banto` (bin) and `banto_io`'s job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToOpen {
     pub id: String,
     pub title: String,
@@ -183,7 +185,7 @@ pub type BrigadeId = i64;
 pub type MemberToken = String;
 
 /// A member's role within a brigade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrigadeRole {
     /// Commands the brigade; the user's only interface into it.
     Director,
