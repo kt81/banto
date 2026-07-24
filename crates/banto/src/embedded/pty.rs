@@ -8,10 +8,11 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
 use anyhow::Result;
-use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-/// The four channels to a hosted child: its output chunks, an input sink, a
-/// resize handle, and a kill handle. Returned by [`PtyHost::open`].
+/// The five channels to a hosted child: its output chunks, an input sink, a
+/// resize handle, a kill handle, and an exit signal. Returned by
+/// [`PtyHost::open`].
 pub struct PtyIo {
     /// Chunks of the child's terminal output, pumped from a reader thread.
     pub output: Receiver<Vec<u8>>,
@@ -24,6 +25,13 @@ pub struct PtyIo {
     /// Phase 2b (session termination); the executor plumbing is deliberately
     /// ready ahead of it.
     pub killer: Box<dyn Killer>,
+    /// Fires exactly once, when the child has actually exited. On ConPTY, a
+    /// child's exit does **not** produce EOF on `output` (the pseudoconsole
+    /// keeps the pipe open), so `output` disconnecting is a Unix-only signal
+    /// — this channel is the active, cross-platform one. See
+    /// `PortablePtyHost::open`'s exit-waiter thread and
+    /// `super::session::PtyHandle::poll`'s doc for how the two combine.
+    pub exited: Receiver<()>,
 }
 
 /// Resizes a hosted child's PTY.
@@ -62,10 +70,10 @@ impl PtyHost for PortablePtyHost {
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
         }
-        let child = pair.slave.spawn_command(cmd)?;
+        let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
-        // Cloned before `child` moves into the resizer holder below: a
+        // Cloned before `child` moves into the exit-waiter thread below: a
         // `ChildKiller` is an independent handle to the same process, so the
         // resize/kill capabilities don't need to fight over one `&mut Child`.
         let killer = child.clone_killer();
@@ -89,23 +97,34 @@ impl PtyHost for PortablePtyHost {
             }
         });
 
+        // ConPTY quirk: a child's exit does not produce EOF on the master
+        // reader (see `PtyIo::exited`'s doc), so the read loop above would
+        // block forever and never report it. This thread actively waits
+        // instead — `child.wait()` blocks until the process truly exits on
+        // every platform, so it also does what holding `child` here used to
+        // do (keep the handle alive for the pane's lifetime); the resizer
+        // holder below now keeps only the master.
+        let (exited_tx, exited_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = exited_tx.send(());
+        });
+
         Ok(PtyIo {
             output: rx,
             input,
             resizer: Box::new(PortablePtyResizer {
                 master: pair.master,
-                _child: child,
             }),
             killer: Box::new(PortablePtyKiller(killer)),
+            exited: exited_rx,
         })
     }
 }
 
-/// Holds the master PTY (for resizing) and the child handle (to keep the
-/// process alive for the pane's lifetime).
+/// Holds the master PTY, for resizing.
 struct PortablePtyResizer {
     master: Box<dyn MasterPty + Send>,
-    _child: Box<dyn Child + Send + Sync>,
 }
 
 impl Resizer for PortablePtyResizer {
@@ -140,13 +159,39 @@ pub(crate) mod mock {
 
     /// A [`PtyHost`] that spawns nothing: it replays `script` as the child's
     /// output and records everything written to the child, every resize, and
-    /// every kill.
+    /// every kill. `open` stashes the fresh `exited` sender in `exit_sender`
+    /// so a test can fire it later via [`Self::fire_exit`], simulating the
+    /// real waiter thread's `child.wait()` returning.
     #[derive(Default)]
     pub(crate) struct MockPtyHost {
         pub script: Vec<u8>,
         pub captured: Arc<Mutex<Vec<u8>>>,
         pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
         pub kills: Arc<Mutex<u32>>,
+        /// Set by `open`; not meant to be set by test setup directly (use
+        /// [`Self::fire_exit`]) — `pub` only because struct-update syntax
+        /// (`..Default::default()`) requires every field to be nameable
+        /// from the construction site, even ones taken from `Default`.
+        pub exit_sender: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+        /// When `true`, `open`'s output sender drops as soon as `script` is
+        /// sent — simulating a real Unix PTY's reader thread hitting EOF on
+        /// child exit, independent of `exited`. When `false` (the default),
+        /// the sender is kept alive on a parked background thread, so
+        /// `output` stays `Empty` forever on its own — matching ConPTY,
+        /// where a child's exit never closes this side by itself; only
+        /// `fire_exit`/`kill` (via `exited`) ever end the session.
+        pub unix_style_exit: bool,
+    }
+
+    impl MockPtyHost {
+        /// Simulate the child exiting: fires the `exited` channel of the
+        /// most recently opened `PtyIo`. A no-op if nothing is open, or the
+        /// exit was already fired (a real exit only ever happens once).
+        pub(crate) fn fire_exit(&self) {
+            if let Some(tx) = self.exit_sender.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
     }
 
     impl PtyHost for MockPtyHost {
@@ -158,14 +203,29 @@ pub(crate) mod mock {
             _cols: u16,
         ) -> Result<PtyIo> {
             let (tx, rx) = mpsc::channel();
+            // Sent synchronously, before `open` returns: a caller's very
+            // first `poll()` must see it, not race a background thread.
             if !self.script.is_empty() {
                 let _ = tx.send(self.script.clone());
             }
+            if self.unix_style_exit {
+                drop(tx); // disconnects immediately, like a real Unix EOF.
+            } else {
+                // ConPTY: keep `tx` alive forever on a parked thread, so
+                // `output` stays `Empty` (never disconnects on its own).
+                std::thread::spawn(move || {
+                    let _tx = tx;
+                    std::thread::park();
+                });
+            }
+            let (exited_tx, exited_rx) = mpsc::channel();
+            *self.exit_sender.lock().unwrap() = Some(exited_tx);
             Ok(PtyIo {
                 output: rx,
                 input: Box::new(CapturingWriter(self.captured.clone())),
                 resizer: Box::new(MockResizer(self.resizes.clone())),
-                killer: Box::new(MockKiller(self.kills.clone())),
+                killer: Box::new(MockKiller(self.kills.clone(), self.exit_sender.clone())),
+                exited: exited_rx,
             })
         }
     }
@@ -191,11 +251,17 @@ pub(crate) mod mock {
         }
     }
 
-    struct MockKiller(Arc<Mutex<u32>>);
+    /// Mirrors reality: killing a child makes it exit, so `kill` also fires
+    /// the same `exited` signal a real `child.wait()` returning would —
+    /// keeps a future active-kill test's expectations honest.
+    struct MockKiller(Arc<Mutex<u32>>, Arc<Mutex<Option<mpsc::Sender<()>>>>);
 
     impl Killer for MockKiller {
         fn kill(&mut self) -> Result<()> {
             *self.0.lock().unwrap() += 1;
+            if let Some(tx) = self.1.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
             Ok(())
         }
     }

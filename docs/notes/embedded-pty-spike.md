@@ -75,6 +75,26 @@ default is off).
 > a hosting emulator *is* responsible for answering the child's DSR/DA. If a
 > cross-platform PTY path is ever added, the responsibility flips per platform.
 
+## ConPTY gotchas found later, in production dogfooding
+
+Recorded here so the full ConPTY quirk list lives in one place:
+
+2. **Chunk boundaries carry meaning** (2026-07-24). The child's TUI decides
+   "typed" vs "pasted" by read-chunk coalescing: nudge text + `\r` written
+   back-to-back arrives as one chunk and reads as a paste (the `\r` becomes a
+   newline in the input box, not a submit) — the relay nudge sends its Enter
+   ~300ms behind the text for this reason. Symmetrically, a multi-line paste
+   forwarded key-by-key submits line-by-line; it must be forwarded as one
+   bracketed-paste chunk.
+3. **A child's exit produces no EOF on the master** (2026-07-24). The
+   pseudoconsole keeps the output pipe open after the child dies, so a reader
+   blocked in `read()` never unblocks and a channel-disconnect exit signal
+   never fires — a dead pane just freezes (the "zombie pane" dogfood find).
+   Exit must be detected *actively*: a waiter thread blocks on `child.wait()`
+   and reports through its own channel; the poll path drains remaining output
+   first (one-tick grace) before declaring the session dead. On Unix both
+   signals fire (EOF *and* `wait()`), which the dedupe tolerates.
+
 ## Phase 2 — multi-pane, banto-owned layout (verified interactively)
 
 A second binary (`phase2`) hosts several contexts at once, each context owning

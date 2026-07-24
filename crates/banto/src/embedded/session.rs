@@ -74,6 +74,11 @@ pub(crate) enum PtyPoll {
 /// `engine::SessionKey` — never touched from `update`.
 pub(crate) struct PtyHandle {
     io: PtyIo,
+    /// Latches once `io.exited` has fired — see [`Self::poll`]'s doc for why
+    /// this can't just be "check `io.exited` every time" (a `Receiver<()>`
+    /// only ever fires once, and the one-poll grace period needs to
+    /// remember it already happened).
+    exit_observed: bool,
 }
 
 impl PtyHandle {
@@ -86,20 +91,43 @@ impl PtyHandle {
     ) -> Result<Self> {
         Ok(Self {
             io: host.open(argv, cwd, rows, cols)?,
+            exit_observed: false,
         })
     }
 
     /// Poll for the child's next output chunk, non-blocking. A single
     /// primitive (rather than a separate "is there output" / "has it
     /// exited" pair) so nothing can observe `Disconnected` by discarding a
-    /// chunk that arrived in the same instant — `TryRecvError::Disconnected`
-    /// only ever means "and there is nothing left to drain first".
-    pub(crate) fn poll(&self) -> PtyPoll {
+    /// chunk that arrived in the same instant.
+    ///
+    /// Two independent exit signals feed this, because `io.output`
+    /// disconnecting (the Unix path: the child exits, the reader thread's
+    /// `read()` returns EOF, the sender drops) never fires on ConPTY — a
+    /// child's exit doesn't produce EOF on the pseudoconsole's master, so
+    /// `io.exited` (an active `child.wait()` in its own thread — see
+    /// `PortablePtyHost::open`) is the cross-platform signal. Precedence:
+    /// (a) a pending output chunk always wins, drained before declaring
+    /// death, so a dying child's tail output is never dropped; (b) `output`
+    /// actually disconnecting is `Disconnected` immediately (the Unix path,
+    /// unchanged); (c) otherwise, once `io.exited` has fired, the *next*
+    /// poll that still finds `output` empty is `Disconnected` — the first
+    /// such poll only latches [`Self::exit_observed`] and reports `Empty`,
+    /// a one-tick grace for the small race where `wait()` returns while the
+    /// reader thread still holds a chunk it hasn't forwarded yet (the
+    /// shell's ~50ms loop cadence makes one tick plenty).
+    pub(crate) fn poll(&mut self) -> PtyPoll {
         match self.io.output.try_recv() {
-            Ok(chunk) => PtyPoll::Chunk(chunk),
-            Err(std::sync::mpsc::TryRecvError::Empty) => PtyPoll::Empty,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => PtyPoll::Disconnected,
+            Ok(chunk) => return PtyPoll::Chunk(chunk),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return PtyPoll::Disconnected,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+        if self.exit_observed {
+            return PtyPoll::Disconnected;
+        }
+        if self.io.exited.try_recv().is_ok() {
+            self.exit_observed = true;
+        }
+        PtyPoll::Empty
     }
 
     /// Encode `key` and forward it to the child's stdin.
@@ -191,10 +219,14 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::super::pty::mock::MockPtyHost;
-    use super::EmbeddedSession;
+    use super::{EmbeddedSession, PtyHandle, PtyPoll};
 
     fn open(host: &MockPtyHost) -> EmbeddedSession {
         EmbeddedSession::open(host, &["child".to_string()], None, 24, 80).unwrap()
+    }
+
+    fn open_handle(host: &MockPtyHost) -> PtyHandle {
+        PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
     }
 
     #[test]
@@ -235,5 +267,68 @@ mod tests {
         assert_eq!(session.screen().size(), (10, 40));
         session.resize(10, 40); // unchanged -> no extra resize
         assert_eq!(&*resizes.lock().unwrap(), &[(10, 40)]);
+    }
+
+    // --- PtyHandle::poll: ConPTY active-exit detection ----------------------
+
+    #[test]
+    fn poll_reports_chunks_then_stays_empty_with_no_exit() {
+        let host = MockPtyHost {
+            script: b"hi".to_vec(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        assert!(matches!(handle.poll(), PtyPoll::Chunk(bytes) if bytes == b"hi"));
+        assert!(matches!(handle.poll(), PtyPoll::Empty));
+        assert!(
+            matches!(handle.poll(), PtyPoll::Empty),
+            "stays empty, never on its own"
+        );
+    }
+
+    #[test]
+    fn poll_drains_a_queued_chunk_before_exit_then_grace_then_disconnected() {
+        let host = MockPtyHost {
+            script: b"hi".to_vec(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        host.fire_exit();
+        // A pending chunk always wins, even though the exit already fired.
+        assert!(matches!(handle.poll(), PtyPoll::Chunk(bytes) if bytes == b"hi"));
+        // One-poll grace: exit observed, reported Empty once.
+        assert!(matches!(handle.poll(), PtyPoll::Empty));
+        // Now really gone.
+        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+    }
+
+    #[test]
+    fn poll_grace_then_disconnected_when_already_empty() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        host.fire_exit();
+        assert!(matches!(handle.poll(), PtyPoll::Empty), "one-tick grace");
+        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+    }
+
+    #[test]
+    fn poll_is_disconnected_via_the_unix_path_with_no_exit_signal_at_all() {
+        let host = MockPtyHost {
+            unix_style_exit: true,
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        // `exited` never fires; `output` disconnecting on its own (the real
+        // Unix behavior) is enough on its own, with no grace tick.
+        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+    }
+
+    #[test]
+    fn poll_reaches_disconnected_after_kill() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        handle.kill().unwrap();
+        assert!(matches!(handle.poll(), PtyPoll::Empty), "one-tick grace");
+        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
     }
 }

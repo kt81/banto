@@ -158,7 +158,7 @@ fn event_loop(
         // `PtyPoll::Disconnected` is only ever reached once a handle's every
         // last chunk has been drained (see `PtyHandle::poll`'s doc), so a
         // handle reports it once, right here, then gets dropped below.
-        for (key, handle) in &handles {
+        for (key, handle) in &mut handles {
             loop {
                 match handle.poll() {
                     PtyPoll::Chunk(chunk) => events.push_back(Event::PtyOutput {
