@@ -2,6 +2,9 @@
 name = "banto-tui"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "banto's rendering: ratatui views over the pure core's state"
 
 [dependencies]
 banto-core = { version = "0.1.0", path = "../banto-core" }

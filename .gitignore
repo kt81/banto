@@ -2,3 +2,12 @@
 *.sqlite3
 *.db
 .DS_Store
+
+# Local working notes and per-machine Claude Code settings — never published.
+/HANDOVER*.md
+/.claude/
+
+# Local diagnostic captures (BANTO_INPUT_LOG / BANTO_RECORD_EVENTS output may
+# contain real session content; repo fixtures are hand-written synthetic only).
+*.log
+*.events.jsonl

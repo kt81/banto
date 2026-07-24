@@ -2,6 +2,9 @@
 name = "banto-io"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "banto's outside world: session discovery, sqlite store, PTY hosting, watchers"
 
 [dependencies]
 anyhow = "1.0.104"

@@ -2,6 +2,9 @@
 name = "banto"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "A resident TUI that searches, groups, and resumes Claude Code sessions — and hosts them as embedded panes"
 
 [dependencies]
 anyhow = "1.0.104"
