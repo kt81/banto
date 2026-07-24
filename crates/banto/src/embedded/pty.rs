@@ -8,10 +8,10 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
 use anyhow::Result;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-/// The three channels to a hosted child: its output chunks, an input sink, and
-/// a resize handle. Returned by [`PtyHost::open`].
+/// The four channels to a hosted child: its output chunks, an input sink, a
+/// resize handle, and a kill handle. Returned by [`PtyHost::open`].
 pub struct PtyIo {
     /// Chunks of the child's terminal output, pumped from a reader thread.
     pub output: Receiver<Vec<u8>>,
@@ -19,11 +19,21 @@ pub struct PtyIo {
     pub input: Box<dyn Write + Send>,
     /// Resizes the child's PTY (and keeps the child process alive).
     pub resizer: Box<dyn Resizer>,
+    /// Kills the child. Added alongside the resize handle (touching this
+    /// file once) even though nothing emits `Cmd::KillPty` yet — that's
+    /// Phase 2b (session termination); the executor plumbing is deliberately
+    /// ready ahead of it.
+    pub killer: Box<dyn Killer>,
 }
 
 /// Resizes a hosted child's PTY.
 pub trait Resizer: Send {
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
+}
+
+/// Kills a hosted child's process.
+pub trait Killer: Send {
+    fn kill(&mut self) -> Result<()>;
 }
 
 /// Spawns a child inside a PTY.
@@ -55,6 +65,11 @@ impl PtyHost for PortablePtyHost {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
+        // Cloned before `child` moves into the resizer holder below: a
+        // `ChildKiller` is an independent handle to the same process, so the
+        // resize/kill capabilities don't need to fight over one `&mut Child`.
+        let killer = child.clone_killer();
+
         let mut reader = pair.master.try_clone_reader()?;
         let input = pair.master.take_writer()?;
 
@@ -81,6 +96,7 @@ impl PtyHost for PortablePtyHost {
                 master: pair.master,
                 _child: child,
             }),
+            killer: Box::new(PortablePtyKiller(killer)),
         })
     }
 }
@@ -103,6 +119,14 @@ impl Resizer for PortablePtyResizer {
     }
 }
 
+struct PortablePtyKiller(Box<dyn ChildKiller + Send + Sync>);
+
+impl Killer for PortablePtyKiller {
+    fn kill(&mut self) -> Result<()> {
+        self.0.kill().map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod mock {
     use std::io::{self, Write};
@@ -112,15 +136,17 @@ pub(crate) mod mock {
 
     use anyhow::Result;
 
-    use super::{PtyHost, PtyIo, Resizer};
+    use super::{Killer, PtyHost, PtyIo, Resizer};
 
     /// A [`PtyHost`] that spawns nothing: it replays `script` as the child's
-    /// output and records everything written to the child and every resize.
+    /// output and records everything written to the child, every resize, and
+    /// every kill.
     #[derive(Default)]
     pub(crate) struct MockPtyHost {
         pub script: Vec<u8>,
         pub captured: Arc<Mutex<Vec<u8>>>,
         pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+        pub kills: Arc<Mutex<u32>>,
     }
 
     impl PtyHost for MockPtyHost {
@@ -139,6 +165,7 @@ pub(crate) mod mock {
                 output: rx,
                 input: Box::new(CapturingWriter(self.captured.clone())),
                 resizer: Box::new(MockResizer(self.resizes.clone())),
+                killer: Box::new(MockKiller(self.kills.clone())),
             })
         }
     }
@@ -160,6 +187,15 @@ pub(crate) mod mock {
     impl Resizer for MockResizer {
         fn resize(&self, rows: u16, cols: u16) -> Result<()> {
             self.0.lock().unwrap().push((rows, cols));
+            Ok(())
+        }
+    }
+
+    struct MockKiller(Arc<Mutex<u32>>);
+
+    impl Killer for MockKiller {
+        fn kill(&mut self) -> Result<()> {
+            *self.0.lock().unwrap() += 1;
             Ok(())
         }
     }

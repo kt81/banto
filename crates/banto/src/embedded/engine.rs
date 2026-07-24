@@ -1,0 +1,2418 @@
+//! The emporium's pure core (`docs/DISCIPLINE.md` §4): `update(state, app,
+//! ev, now) -> Vec<Cmd>` is a function from an [`Event`] (a fact about the
+//! outside world) to state mutations and [`Cmd`]s (instructions for the
+//! shell — `super::emporium` — to execute). No clock reads, no file/process/
+//! store access, no terminal access in this module; every place that touches
+//! the world is named as an `Event` coming in or a `Cmd` going out.
+//!
+//! `EmporiumState` replaces the old `Emporium` struct. The append-only
+//! sessions invariant retires with it: `screens` can lose entries
+//! (`PtyExited`), and `Stage` holds [`SessionKey`]s rather than indices, so a
+//! removal never invalidates anything else holding a key.
+//!
+//! Two round trips exist here that the pre-migration code didn't need,
+//! because they used to be synchronous inline store reads: resolving
+//! whether a selected row is a brigade Director (`ResolveMembership`), and
+//! joining/spawning a brigade in general. That's the honest cost of moving a
+//! read that used to block the handler into "ask the shell, wait for the
+//! fact" — see the `StoreIntent`/`Event` variants below.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{
+    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+
+use banto_core::config::{BrigadeConfig, RelayMode};
+use banto_core::store::{BrigadeId, BrigadeRole, MemberToken};
+
+use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
+use crate::opener::SessionToOpen;
+use crate::session::SessionRow;
+
+use super::input::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
+
+/// Fixed width of the left sidebar (the session list), in columns.
+pub(super) const SIDEBAR_WIDTH: u16 = 36;
+/// Details panel height: one border row plus its content rows.
+pub(super) const SUMMARY_HEIGHT: u16 = 5;
+/// Below this left-column height the details panel is dropped so the list keeps
+/// the room.
+pub(super) const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
+
+/// Stable identity for a kept-alive embedded session: the real Claude
+/// session id once known, or a synthetic placeholder for a freshly-launched
+/// one still awaiting id discovery (see [`Self::is_synthetic`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct SessionKey(String);
+
+impl SessionKey {
+    pub(super) fn from_id(id: &str) -> Self {
+        Self(id.to_string())
+    }
+
+    fn new_plain(cwd: &std::path::Path) -> Self {
+        Self(format!("new::{}", cwd.display()))
+    }
+
+    fn new_worker(brigade_id: BrigadeId, token: &str) -> Self {
+        Self(format!("new-worker::{brigade_id}::{token}"))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this key is a placeholder awaiting id discovery, rather than
+    /// a real Claude session id.
+    pub(super) fn is_synthetic(&self) -> bool {
+        self.0.starts_with("new::") || self.0.starts_with("new-worker::")
+    }
+}
+
+/// Which side currently receives keyboard input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Focus {
+    Sidebar,
+    Pane,
+}
+
+/// What the right-hand pane region is showing: nothing, a single session, or
+/// a brigade tiled across several panes.
+pub(super) enum Stage {
+    Empty,
+    Solo(SessionKey),
+    Brigade {
+        id: BrigadeId,
+        /// Director first.
+        panes: Vec<SessionKey>,
+        focused: usize,
+    },
+}
+
+impl Stage {
+    pub(super) fn focused_key(&self) -> Option<&SessionKey> {
+        match self {
+            Stage::Empty => None,
+            Stage::Solo(key) => Some(key),
+            Stage::Brigade { panes, focused, .. } => panes.get(*focused),
+        }
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        !matches!(self, Stage::Empty)
+    }
+
+    /// Drop `key` from the stage (a session exited). `Solo` collapses to
+    /// `Empty`; a brigade pane is removed with `focused` clamped into range
+    /// (collapsing to `Empty` if that was the last pane).
+    fn remove(&mut self, key: &SessionKey) {
+        match self {
+            Stage::Solo(k) if k == key => *self = Stage::Empty,
+            Stage::Brigade { panes, focused, .. } => {
+                if let Some(pos) = panes.iter().position(|k| k == key) {
+                    panes.remove(pos);
+                    if panes.is_empty() {
+                        *self = Stage::Empty;
+                    } else if *focused >= panes.len() {
+                        *focused = panes.len() - 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The outer (bordered) tile rects for the currently-staged sessions, each
+/// paired with its key. A solo session fills the whole pane; a brigade puts
+/// the Director on the left and stacks the Workers down the right (a
+/// "master + stack" layout).
+pub(super) fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(SessionKey, Rect)> {
+    match stage {
+        Stage::Empty => Vec::new(),
+        Stage::Solo(key) => vec![(key.clone(), pane_area)],
+        Stage::Brigade { panes, .. } => match panes.split_first() {
+            None => Vec::new(),
+            Some((director, [])) => vec![(director.clone(), pane_area)],
+            Some((director, workers)) => {
+                let [master, stack] =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .areas(pane_area);
+                let rows = Layout::vertical(vec![
+                    Constraint::Ratio(1, workers.len() as u32);
+                    workers.len()
+                ])
+                .split(stack);
+                let mut tiles = vec![(director.clone(), master)];
+                for (worker, row) in workers.iter().zip(rows.iter()) {
+                    tiles.push((worker.clone(), *row));
+                }
+                tiles
+            }
+        },
+    }
+}
+
+/// The inner content rect of the right pane (inside its border).
+pub(super) fn pane_content(pane_area: Rect) -> Rect {
+    Rect {
+        x: pane_area.x + 1,
+        y: pane_area.y + 1,
+        width: pane_area.width.saturating_sub(2).max(1),
+        height: pane_area.height.saturating_sub(2).max(1),
+    }
+}
+
+/// Compute the layout: a bottom status bar, and above it a left column
+/// (sidebar list + details panel) beside the session pane.
+pub(super) fn layout(area: Rect) -> Areas {
+    let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let [left, pane] =
+        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
+    let summary_h = if left.height < MIN_HEIGHT_FOR_SUMMARY {
+        0
+    } else {
+        SUMMARY_HEIGHT
+    };
+    let [sidebar, summary] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(summary_h)]).areas(left);
+    Areas {
+        sidebar,
+        summary,
+        pane,
+        status,
+    }
+}
+
+/// The regions of the emporium layout.
+#[derive(Clone, Copy)]
+pub(super) struct Areas {
+    pub(super) sidebar: Rect,
+    pub(super) summary: Rect,
+    pub(super) pane: Rect,
+    pub(super) status: Rect,
+}
+
+// --- Relay engine (unchanged from the pre-migration code — already pure) ---
+
+/// Consecutive relay ticks a member must be observed idle before it's
+/// eligible for a nudge.
+const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
+/// How long a focused pane's own recently-forwarded input suppresses a nudge.
+const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(3);
+/// Minimum gap between nudges to the same member.
+const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
+/// Give up nudging a member after this many attempts on one unseen batch.
+const RELAY_MAX_ATTEMPTS: u32 = 3;
+/// The fixed, ASCII-only line typed into a nudged member's stdin.
+const RELAY_NUDGE_LINE: &str =
+    "[banto relay] Your brigade peer sent you a message. Call the check_messages tool now.";
+/// How long after the nudge text before its submitting `\r` is sent — see
+/// [`update_tick`].
+const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+/// How long a transient status message shows before [`update_tick`] clears it.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct NudgeState {
+    last_nudge: Option<Instant>,
+    attempts: u32,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RelayState {
+    idle_streak: u32,
+    nudge: NudgeState,
+}
+
+pub(super) fn should_nudge(
+    now: Instant,
+    idle_streak: u32,
+    is_focused: bool,
+    last_forwarded_input: Option<Instant>,
+    has_unseen: bool,
+    state: &NudgeState,
+) -> bool {
+    if !has_unseen || idle_streak < RELAY_IDLE_STREAK_REQUIRED {
+        return false;
+    }
+    if is_focused
+        && let Some(last_input) = last_forwarded_input
+        && now.saturating_duration_since(last_input) < RELAY_INPUT_QUIET_PERIOD
+    {
+        return false;
+    }
+    if state.attempts >= RELAY_MAX_ATTEMPTS {
+        return false;
+    }
+    if let Some(last_nudge) = state.last_nudge
+        && now.saturating_duration_since(last_nudge) < RELAY_NUDGE_COOLDOWN
+    {
+        return false;
+    }
+    true
+}
+
+pub(super) fn tick_relay_decision(
+    states: &mut HashMap<MemberToken, RelayState>,
+    token: &MemberToken,
+    now: Instant,
+    is_idle_this_tick: Option<bool>,
+    is_focused: bool,
+    last_forwarded_input: Option<Instant>,
+    has_unseen: bool,
+) -> bool {
+    if !has_unseen {
+        states.remove(token);
+        return false;
+    }
+    let state = states.entry(token.clone()).or_default();
+    state.idle_streak = if is_idle_this_tick == Some(true) {
+        state.idle_streak + 1
+    } else {
+        0
+    };
+    let nudge = should_nudge(
+        now,
+        state.idle_streak,
+        is_focused,
+        last_forwarded_input,
+        has_unseen,
+        &state.nudge,
+    );
+    if nudge {
+        state.nudge.last_nudge = Some(now);
+        state.nudge.attempts += 1;
+    }
+    nudge
+}
+
+/// One relay-eligible staged member's freshly-gathered observations for this
+/// tick — gathered shell-side (store + live-session reads), decided
+/// core-side.
+pub(super) struct RelayObservation {
+    pub(super) token: MemberToken,
+    pub(super) key: SessionKey,
+    pub(super) has_unseen: bool,
+    pub(super) is_idle_this_tick: Option<bool>,
+}
+
+/// A nudge awaiting its phase-two Enter (see [`update_tick`]).
+struct PendingSubmit {
+    key: SessionKey,
+    nudged_at: Instant,
+}
+
+/// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
+/// `SpawnFailed` know what to do with the result.
+enum PendingOpen {
+    /// Stage as the solo pane once spawned.
+    Solo,
+    /// The Director of a brigade being formed: on success, stage it and
+    /// open each worker token next (workers never spawn ahead of a Director
+    /// that might still fail); on failure, stop — no workers are spawned.
+    BrigadeDirector {
+        brigade_id: BrigadeId,
+        worker_tokens: Vec<MemberToken>,
+        cwd: PathBuf,
+    },
+    /// One member (Director or Worker) of a brigade whose `Stage` already
+    /// exists (or is being built alongside this open): on success, append
+    /// to `panes`.
+    BrigadeMember { brigade_id: BrigadeId },
+}
+
+/// Why a `Cmd::Store(StoreIntent::ResolveMembership)` was requested.
+enum PendingMembership {
+    /// Enter / double-click on the sidebar.
+    Activate,
+    /// `B`.
+    BrigadeKey,
+}
+
+/// The emporium's own state — the sans-IO replacement for the old `Emporium`
+/// struct. `screens` may lose entries (a session can exit); `Stage` holds
+/// [`SessionKey`]s, so removal never invalidates anything else holding one.
+pub(super) struct EmporiumState {
+    pub(super) screens: HashMap<SessionKey, super::session::Screen>,
+    pub(super) stage: Stage,
+    pub(super) focus: Focus,
+    pub(super) status: Option<String>,
+    status_set_at: Option<Instant>,
+    pub(super) relay_states: HashMap<MemberToken, RelayState>,
+    pub(super) last_forwarded_input: Option<Instant>,
+    pending_submits: Vec<PendingSubmit>,
+    pending_opens: HashMap<SessionKey, PendingOpen>,
+    pending_membership: Option<PendingMembership>,
+    pub(super) size: (u16, u16),
+}
+
+impl EmporiumState {
+    pub(super) fn new() -> Self {
+        Self {
+            screens: HashMap::new(),
+            stage: Stage::Empty,
+            focus: Focus::Sidebar,
+            status: None,
+            status_set_at: None,
+            relay_states: HashMap::new(),
+            last_forwarded_input: None,
+            pending_submits: Vec::new(),
+            pending_opens: HashMap::new(),
+            pending_membership: None,
+            size: (0, 0),
+        }
+    }
+
+    fn set_status(&mut self, message: impl Into<String>, now: Instant) {
+        self.status = Some(message.into());
+        self.status_set_at = Some(now);
+    }
+}
+
+/// A store operation the shell executes, reusing the store's existing
+/// transactional functions — an intent, not a SQL statement.
+pub(super) enum StoreIntent {
+    SetPin {
+        id: String,
+        pinned: bool,
+    },
+    Archive {
+        id: String,
+        title: String,
+    },
+    JoinGroup {
+        session_id: String,
+        target: GroupJoinTargetData,
+    },
+    /// Resolve whether `session_id` is a brigade member and, if so, its
+    /// `(brigade_id, token, role)` — the honest cost of moving what used to
+    /// be a synchronous inline store read out of the handler (see the
+    /// module doc).
+    ResolveMembership {
+        session_id: String,
+    },
+    FormBrigade {
+        director_row_id: String,
+        name: String,
+        cwd: PathBuf,
+        worker_count: usize,
+    },
+    AddWorker {
+        brigade_id: BrigadeId,
+        cwd: PathBuf,
+    },
+    Disband {
+        brigade_id: BrigadeId,
+    },
+    SetMemberSession {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+        session_id: String,
+    },
+}
+
+/// Mirrors `crate::app::GroupJoinTarget`, but by value (the original borrows
+/// from the modal state, which `update` cannot hold across the round trip to
+/// the shell and back).
+pub(super) enum GroupJoinTargetData {
+    Existing(i64, String),
+    New(String),
+}
+
+/// An instruction for the shell to execute — plain data, never executed here.
+pub(super) enum Cmd {
+    WritePty {
+        key: SessionKey,
+        bytes: Vec<u8>,
+    },
+    ResizePty {
+        key: SessionKey,
+        rows: u16,
+        cols: u16,
+    },
+    /// Spawn (or, if already running elsewhere, refuse) `target` under
+    /// `key`. `brigade` wires the launch to banto's own MCP server; `model`
+    /// is `--model <model>` for a freshly-spawned Worker (never set for a
+    /// resume — the model was already fixed at the session's original
+    /// launch). The shell answers with `Event::Spawned`/`SpawnFailed`.
+    OpenEmbedded {
+        key: SessionKey,
+        target: SessionToOpen,
+        brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
+        model: Option<String>,
+    },
+    /// Unused until Phase 2b (session termination) emits it; the executor
+    /// exists ahead of it (see `super::pty`'s `Killer`).
+    #[allow(dead_code)]
+    KillPty {
+        key: SessionKey,
+    },
+    Store(StoreIntent),
+    Reload,
+}
+
+/// A fact about the outside world, fed into [`update`].
+pub(super) enum Event {
+    Input(CtEvent),
+    Resized {
+        width: u16,
+        height: u16,
+    },
+    PtyOutput {
+        key: SessionKey,
+        chunk: Vec<u8>,
+    },
+    PtyExited {
+        key: SessionKey,
+    },
+    Spawned {
+        key: SessionKey,
+    },
+    SpawnFailed {
+        key: SessionKey,
+        error: String,
+    },
+    RowsLoaded {
+        rows: Vec<SessionRow>,
+        hidden: HashSet<String>,
+        directors: HashSet<String>,
+    },
+    DiscoveryResult {
+        key: SessionKey,
+        session_id: String,
+        member: Option<(BrigadeId, MemberToken)>,
+    },
+    ArchiveDone {
+        title: String,
+        result: Result<(), String>,
+    },
+    GroupJoinDone {
+        session_id: String,
+        result: Result<(i64, String), String>,
+    },
+    MembershipResolved {
+        session_id: String,
+        membership: Option<(BrigadeId, MemberToken, BrigadeRole)>,
+        /// The resolved brigade's full membership (token, role, Claude
+        /// session id if known) — `Some` whenever `membership` is `Some`,
+        /// bundled into the same shell read rather than a second round
+        /// trip (`stage_brigade` needs the whole roster, not just the
+        /// activating row's own membership).
+        members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
+    },
+    BrigadeFormed {
+        director_row_id: String,
+        name: String,
+        cwd: PathBuf,
+        result: Result<(BrigadeId, Vec<MemberToken>), String>,
+    },
+    WorkerAdded {
+        brigade_id: BrigadeId,
+        cwd: PathBuf,
+        result: Result<MemberToken, String>,
+    },
+    Disbanded {
+        brigade_id: BrigadeId,
+        result: Result<(HashSet<String>, HashSet<String>), String>,
+    },
+    MemberSessionRecorded {
+        hidden: HashSet<String>,
+        directors: HashSet<String>,
+    },
+    /// ~1/s: relay observations for the staged brigade's members (gathered
+    /// shell-side — store + live-session reads), plus the trigger to flush
+    /// any due phase-two nudge submit and expire the status message.
+    Tick {
+        relay: Vec<RelayObservation>,
+    },
+}
+
+/// The core: a pure function from one [`Event`] to state mutations and
+/// [`Cmd`]s. No clock reads (`now` is the only time), no I/O of any kind.
+pub(super) fn update(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    ev: Event,
+    now: Instant,
+) -> Vec<Cmd> {
+    let mut cmds = match ev {
+        Event::Input(input) => update_input(state, app, brigade, input, now),
+        Event::Resized { width, height } => update_resized(state, app, width, height),
+        Event::PtyOutput { key, chunk } => {
+            if let Some(screen) = state.screens.get_mut(&key) {
+                screen.process(&chunk);
+            }
+            Vec::new()
+        }
+        Event::PtyExited { key } => update_pty_exited(state, app, key, now),
+        Event::Spawned { key } => update_spawned(state, brigade, key),
+        Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
+        Event::RowsLoaded {
+            rows,
+            hidden,
+            directors,
+        } => {
+            app.replace_rows(rows);
+            app.set_hidden_worker_ids(hidden);
+            app.set_directors(directors);
+            Vec::new()
+        }
+        Event::DiscoveryResult {
+            key,
+            session_id,
+            member,
+        } => update_discovery_result(state, key, session_id, member),
+        Event::ArchiveDone { title, result } => {
+            state.set_status(
+                match &result {
+                    Ok(()) => format!("archived {title}"),
+                    Err(err) => format!("failed to archive {title}: {err}"),
+                },
+                now,
+            );
+            vec![Cmd::Reload]
+        }
+        Event::GroupJoinDone { session_id, result } => {
+            match result {
+                Ok((group_id, group_name)) => {
+                    state.set_status(format!("joined group \"{group_name}\""), now);
+                    app.set_session_group_cache(&session_id, group_id, group_name);
+                }
+                Err(err) => state.set_status(format!("failed to join group: {err}"), now),
+            }
+            Vec::new()
+        }
+        Event::MembershipResolved {
+            session_id,
+            membership,
+            members,
+        } => update_membership_resolved(state, app, brigade, session_id, membership, members),
+        Event::BrigadeFormed {
+            director_row_id,
+            name,
+            cwd,
+            result,
+        } => update_brigade_formed(state, app, director_row_id, name, cwd, result, now),
+        Event::WorkerAdded {
+            brigade_id,
+            cwd,
+            result,
+        } => update_worker_added(state, brigade_id, cwd, result, now),
+        Event::Disbanded { brigade_id, result } => {
+            update_disbanded(state, app, brigade_id, result, now)
+        }
+        Event::MemberSessionRecorded { hidden, directors } => {
+            app.set_hidden_worker_ids(hidden);
+            app.set_directors(directors);
+            Vec::new()
+        }
+        Event::Tick { relay } => update_tick(state, brigade, relay, now),
+    };
+    cmds.extend(resize_staged_tiles(state));
+    cmds
+}
+
+/// Resize every currently-staged tile's `Screen` to match the current
+/// layout, emitting a `Cmd::ResizePty` only for the ones that actually
+/// changed (matches the pre-migration per-tick unconditional resize, whose
+/// dedup lived inside `EmbeddedSession::resize` — moved here, now pure).
+/// Called once at the end of every `update` regardless of event kind: cheap
+/// (a HashMap lookup per staged tile) and correct without needing every
+/// stage-mutating branch to remember to call it.
+fn resize_staged_tiles(state: &mut EmporiumState) -> Vec<Cmd> {
+    let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+    let mut cmds = Vec::new();
+    for (key, rect) in stage_tiles(areas.pane, &state.stage) {
+        let content = pane_content(rect);
+        if let Some(screen) = state.screens.get_mut(&key)
+            && screen.resize(content.height, content.width)
+        {
+            cmds.push(Cmd::ResizePty {
+                key,
+                rows: content.height,
+                cols: content.width,
+            });
+        }
+    }
+    cmds
+}
+
+fn update_resized(state: &mut EmporiumState, app: &mut App, width: u16, height: u16) -> Vec<Cmd> {
+    state.size = (width, height);
+    let areas = layout(Rect::new(0, 0, width, height));
+    app.set_viewport_height(areas.sidebar.height.saturating_sub(2) as usize);
+    Vec::new()
+}
+
+fn update_input(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    input: CtEvent,
+    now: Instant,
+) -> Vec<Cmd> {
+    match input {
+        CtEvent::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            update_key(state, app, brigade, key, now)
+        }
+        CtEvent::Mouse(mouse) => update_mouse(state, app, brigade, mouse, now),
+        CtEvent::Paste(text) => update_paste(state, app, text, now),
+        _ => Vec::new(),
+    }
+}
+
+/// Dispatch one key press.
+fn update_key(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    key: KeyEvent,
+    now: Instant,
+) -> Vec<Cmd> {
+    let code = key.code;
+
+    if app.modal().is_some() {
+        return update_modal_key(state, app, code);
+    }
+    if app.mode() == Mode::Search {
+        update_search_key(app, code);
+        return Vec::new();
+    }
+    if code == KeyCode::F(2) {
+        state.focus = match state.focus {
+            Focus::Sidebar if state.stage.is_active() => Focus::Pane,
+            _ => Focus::Sidebar,
+        };
+        return Vec::new();
+    }
+    if code == KeyCode::F(3) {
+        if let Stage::Brigade { panes, focused, .. } = &mut state.stage
+            && !panes.is_empty()
+        {
+            *focused = (*focused + 1) % panes.len();
+        }
+        return Vec::new();
+    }
+
+    match state.focus {
+        Focus::Pane => {
+            if let Some(target) = state.stage.focused_key().cloned() {
+                let bytes = key_to_bytes(&key);
+                state.last_forwarded_input = Some(now);
+                if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Cmd::WritePty { key: target, bytes }]
+                }
+            } else {
+                Vec::new()
+            }
+        }
+        Focus::Sidebar => {
+            state.status = None;
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    app.request_quit();
+                    Vec::new()
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.select_prev();
+                    Vec::new()
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.select_next();
+                    Vec::new()
+                }
+                KeyCode::PageUp => {
+                    app.page_up();
+                    Vec::new()
+                }
+                KeyCode::PageDown => {
+                    app.page_down();
+                    Vec::new()
+                }
+                KeyCode::Home => {
+                    app.select_first();
+                    Vec::new()
+                }
+                KeyCode::End => {
+                    app.select_last();
+                    Vec::new()
+                }
+                KeyCode::Enter => activate_selected(state, app),
+                KeyCode::Char('B') => brigade_key(state, app),
+                KeyCode::Char('b') => add_worker(state, app, brigade),
+                KeyCode::Tab => {
+                    app.toggle_grouped_view();
+                    Vec::new()
+                }
+                KeyCode::Char('/') => {
+                    app.enter_search();
+                    Vec::new()
+                }
+                KeyCode::Char('a') => {
+                    app.toggle_agent_filter();
+                    Vec::new()
+                }
+                KeyCode::Char('p') => toggle_pin(app),
+                KeyCode::Char('d') => {
+                    app.open_confirm_archive_modal();
+                    Vec::new()
+                }
+                KeyCode::Char('g') => {
+                    app.open_group_join_modal();
+                    Vec::new()
+                }
+                KeyCode::Char('n') => {
+                    app.open_new_session_modal();
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
+fn update_search_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.move_cursor_left(),
+        KeyCode::Right => app.move_cursor_right(),
+        KeyCode::Home => app.move_cursor_home(),
+        KeyCode::End => app.move_cursor_end(),
+        KeyCode::Enter => app.confirm_search(),
+        KeyCode::Esc => app.exit_search(),
+        KeyCode::Char(c) => app.push_char(c),
+        _ => {}
+    }
+}
+
+fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> Vec<Cmd> {
+    match code {
+        KeyCode::Esc => {
+            app.close_modal();
+            Vec::new()
+        }
+        KeyCode::Up => {
+            app.modal_select_prev();
+            Vec::new()
+        }
+        KeyCode::Down => {
+            app.modal_select_next();
+            Vec::new()
+        }
+        KeyCode::Left => {
+            app.modal_cursor_left();
+            Vec::new()
+        }
+        KeyCode::Right => {
+            app.modal_cursor_right();
+            Vec::new()
+        }
+        KeyCode::Home => {
+            app.modal_cursor_home();
+            Vec::new()
+        }
+        KeyCode::End => {
+            app.modal_cursor_end();
+            Vec::new()
+        }
+        KeyCode::Tab => {
+            app.modal_complete_candidate();
+            Vec::new()
+        }
+        KeyCode::Backspace => {
+            app.modal_backspace();
+            Vec::new()
+        }
+        KeyCode::Delete => {
+            app.modal_delete_forward();
+            Vec::new()
+        }
+        KeyCode::Enter => confirm_modal(state, app),
+        KeyCode::Char(c) => {
+            app.modal_push_char(c);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    enum Kind {
+        Archive,
+        Group,
+        New,
+        Disband,
+    }
+    let kind = match app.modal() {
+        Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
+        Some(Modal::GroupJoin(_)) => Some(Kind::Group),
+        Some(Modal::NewSession(_)) => Some(Kind::New),
+        Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
+        None => None,
+    };
+    match kind {
+        Some(Kind::Archive) => confirm_archive_modal(app),
+        Some(Kind::Group) => confirm_group_join_modal(app),
+        Some(Kind::New) => confirm_new_session_modal(state, app),
+        Some(Kind::Disband) => confirm_disband_modal(app),
+        None => Vec::new(),
+    }
+}
+
+fn confirm_archive_modal(app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmArchive { session_id, title }) = app.modal() else {
+        return Vec::new();
+    };
+    let id = session_id.clone();
+    let title = title.clone();
+    app.close_modal();
+    vec![Cmd::Store(StoreIntent::Archive { id, title })]
+}
+
+fn confirm_group_join_modal(app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::GroupJoin(gstate)) = app.modal() else {
+        return Vec::new();
+    };
+    let session_id = gstate.session_id().to_string();
+    let Some(target) = app.modal_group_join_target() else {
+        return Vec::new();
+    };
+    app.close_modal();
+    let target = match target {
+        GroupJoinTarget::Existing(id, name) => GroupJoinTargetData::Existing(id, name),
+        GroupJoinTarget::New(name) => GroupJoinTargetData::New(name),
+    };
+    vec![Cmd::Store(StoreIntent::JoinGroup { session_id, target })]
+}
+
+fn confirm_new_session_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::NewSession(_)) = app.modal() else {
+        return Vec::new();
+    };
+    let Some(cwd) = app.modal_new_session_target() else {
+        return Vec::new();
+    };
+    if !cwd.is_dir() {
+        app.modal_set_error(format!("{} is not a directory", cwd.display()));
+        return Vec::new();
+    }
+    app.close_modal();
+    let key = SessionKey::new_plain(&cwd);
+    state.pending_opens.insert(key.clone(), PendingOpen::Solo);
+    vec![Cmd::OpenEmbedded {
+        key,
+        target: SessionToOpen {
+            id: String::new(),
+            title: cwd.display().to_string(),
+            cwd,
+        },
+        brigade: None,
+        model: None,
+    }]
+}
+
+fn confirm_disband_modal(app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmDisband { brigade_id, .. }) = app.modal() else {
+        return Vec::new();
+    };
+    let brigade_id = *brigade_id;
+    app.close_modal();
+    vec![Cmd::Store(StoreIntent::Disband { brigade_id })]
+}
+
+/// Enter / double-click on the sidebar: request membership resolution
+/// first (see the module doc) — [`update_membership_resolved`] does the
+/// actual staging/opening once the shell answers.
+fn activate_selected(state: &mut EmporiumState, app: &App) -> Vec<Cmd> {
+    let Some(row) = app.selected_row() else {
+        return Vec::new();
+    };
+    state.pending_membership = Some(PendingMembership::Activate);
+    vec![Cmd::Store(StoreIntent::ResolveMembership {
+        session_id: row.id.clone(),
+    })]
+}
+
+/// `B`: same membership-resolution round trip as [`activate_selected`].
+fn brigade_key(state: &mut EmporiumState, app: &App) -> Vec<Cmd> {
+    let Some(row) = app.selected_row() else {
+        return Vec::new();
+    };
+    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    vec![Cmd::Store(StoreIntent::ResolveMembership {
+        session_id: row.id.clone(),
+    })]
+}
+
+fn update_membership_resolved(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    session_id: String,
+    membership: Option<(BrigadeId, MemberToken, BrigadeRole)>,
+    members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
+) -> Vec<Cmd> {
+    let Some(purpose) = state.pending_membership.take() else {
+        return Vec::new();
+    };
+    let Some(row) = app.row_for_id(&session_id).cloned() else {
+        return Vec::new();
+    };
+    match purpose {
+        PendingMembership::Activate => match membership {
+            Some((brigade_id, _, BrigadeRole::Director)) => stage_brigade(
+                state,
+                app,
+                brigade_id,
+                &members.unwrap_or_default(),
+                &brigade.worker_model,
+            ),
+            _ => open_solo(state, &row),
+        },
+        PendingMembership::BrigadeKey => match membership {
+            Some((brigade_id, _, BrigadeRole::Director)) => {
+                app.open_confirm_disband_modal(brigade_id, row.display_title().to_string());
+                Vec::new()
+            }
+            Some((_, _, BrigadeRole::Worker)) => {
+                state.status = Some("workers can't be promoted to Director directly".to_string());
+                Vec::new()
+            }
+            None => vec![Cmd::Store(StoreIntent::FormBrigade {
+                director_row_id: row.id.clone(),
+                name: row.display_title().to_string(),
+                cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                worker_count: brigade.worker_count(),
+            })],
+        },
+    }
+}
+
+/// Stage `row` solo: reuse its screen if already open, else request a spawn.
+fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
+    let key = SessionKey::from_id(&row.id);
+    if state.screens.contains_key(&key) {
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        return Vec::new();
+    }
+    state.pending_opens.insert(key.clone(), PendingOpen::Solo);
+    vec![Cmd::OpenEmbedded {
+        key,
+        target: SessionToOpen {
+            id: row.id.clone(),
+            title: row.display_title().to_string(),
+            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+        },
+        brigade: None,
+        model: None,
+    }]
+}
+
+/// Stage brigade `brigade_id`: `members` is its full roster (token, role,
+/// Claude session id if known), already fetched by the shell alongside the
+/// membership resolution that led here. A member whose row is already
+/// embedded is added immediately; one that resolves to a row but isn't
+/// embedded yet gets an `OpenEmbedded` request; a Worker with no resolved
+/// session id yet (still awaiting discovery, or its process is gone) is
+/// respawned fresh under its same token — disposable, unlike the Director,
+/// whose failure to resolve just counts as "missing" (mirrors the
+/// pre-migration `stage_brigade`).
+fn stage_brigade(
+    state: &mut EmporiumState,
+    app: &App,
+    brigade_id: BrigadeId,
+    members: &[(MemberToken, BrigadeRole, Option<String>)],
+    worker_model: &str,
+) -> Vec<Cmd> {
+    let cwd = members
+        .iter()
+        .find(|(_, role, _)| *role == BrigadeRole::Director)
+        .and_then(|(_, _, sid)| sid.as_deref())
+        .and_then(|sid| app.row_for_id(sid))
+        .and_then(|row| row.cwd.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut panes = Vec::new();
+    let mut cmds = Vec::new();
+    let mut missing = 0;
+    for (token, role, claude_session_id) in members {
+        let resolved_row = claude_session_id
+            .as_deref()
+            .and_then(|sid| app.row_for_id(sid));
+        match resolved_row {
+            Some(row) => {
+                let key = SessionKey::from_id(&row.id);
+                if state.screens.contains_key(&key) {
+                    panes.push(key);
+                } else {
+                    state
+                        .pending_opens
+                        .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+                    cmds.push(Cmd::OpenEmbedded {
+                        key,
+                        target: SessionToOpen {
+                            id: row.id.clone(),
+                            title: row.display_title().to_string(),
+                            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                        },
+                        brigade: Some((brigade_id, token.clone(), *role)),
+                        model: None,
+                    });
+                }
+            }
+            None if *role == BrigadeRole::Worker => {
+                cmds.extend(open_worker(state, brigade_id, token, &cwd, worker_model));
+            }
+            None => missing += 1,
+        }
+    }
+    if panes.is_empty() && cmds.is_empty() {
+        state.status = Some("no brigade members could be opened".to_string());
+        return Vec::new();
+    }
+    state.stage = Stage::Brigade {
+        id: brigade_id,
+        panes,
+        focused: 0,
+    };
+    state.focus = Focus::Pane;
+    if missing > 0 {
+        state.status = Some(format!("brigade staged ({missing} member(s) not found)"));
+    }
+    cmds
+}
+
+fn toggle_pin(app: &mut App) -> Vec<Cmd> {
+    let Some((id, pinned)) = app.toggle_pin() else {
+        return Vec::new();
+    };
+    vec![Cmd::Store(StoreIntent::SetPin { id, pinned })]
+}
+
+/// `b`: spawn one more fresh Worker into the staged brigade. `cwd` is the
+/// Director's own row cwd, resolved from `app` via the Director's key
+/// (always `panes[0]`, always a known real id) — no extra round trip needed.
+fn add_worker(state: &mut EmporiumState, app: &App, _brigade: &BrigadeConfig) -> Vec<Cmd> {
+    let Stage::Brigade { id, panes, .. } = &state.stage else {
+        state.status = Some("no brigade staged — press B to start one".to_string());
+        return Vec::new();
+    };
+    let brigade_id = *id;
+    let cwd = panes
+        .first()
+        .and_then(|key| app.row_for_id(key.as_str()))
+        .and_then(|row| row.cwd.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+    vec![Cmd::Store(StoreIntent::AddWorker { brigade_id, cwd })]
+}
+
+fn update_mouse(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    mouse: MouseEvent,
+    now: Instant,
+) -> Vec<Cmd> {
+    if app.modal().is_some() {
+        return Vec::new();
+    }
+    let _ = brigade;
+    let pos = Position::new(mouse.column, mouse.row);
+    let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+
+    if areas.pane.contains(pos) {
+        let tiles = stage_tiles(areas.pane, &state.stage);
+        let hit = tiles.iter().find(|(_, rect)| rect.contains(pos)).cloned();
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            state.focus = Focus::Pane;
+            if let Stage::Brigade { panes, focused, .. } = &mut state.stage
+                && let Some((key, _)) = &hit
+                && let Some(p) = panes.iter().position(|k| k == key)
+            {
+                *focused = p;
+            }
+        }
+        if state.focus == Focus::Pane
+            && let Some((key, rect)) = hit
+            && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect))
+        {
+            state.last_forwarded_input = Some(now);
+            return vec![Cmd::WritePty { key, bytes }];
+        }
+        return Vec::new();
+    }
+
+    let sb = areas.sidebar;
+    let sidebar_inner = Rect {
+        x: sb.x + 1,
+        y: sb.y + 1,
+        width: sb.width.saturating_sub(2),
+        height: sb.height.saturating_sub(2),
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp if sb.contains(pos) => {
+            app.scroll(-1);
+            Vec::new()
+        }
+        MouseEventKind::ScrollDown if sb.contains(pos) => {
+            app.scroll(1);
+            Vec::new()
+        }
+        MouseEventKind::Down(MouseButton::Left) if sidebar_inner.contains(pos) => {
+            state.focus = Focus::Sidebar;
+            let viewport_row = (pos.y - sidebar_inner.y) as usize;
+            if app.click(viewport_row, now) == Some(ClickOutcome::Activated) {
+                activate_selected(state, app)
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Encode a mouse event as an SGR mouse report for a child whose grid starts
+/// at `content` (screen coords mapped into the grid, 1-based).
+fn mouse_to_sgr(mouse: &MouseEvent, content: Rect) -> Option<Vec<u8>> {
+    if mouse.column < content.x || mouse.row < content.y {
+        return None;
+    }
+    let cx = mouse.column - content.x;
+    let cy = mouse.row - content.y;
+    if cx >= content.width || cy >= content.height {
+        return None;
+    }
+    let (cb, release) = match mouse.kind {
+        MouseEventKind::Down(b) => (mouse_btn(b), false),
+        MouseEventKind::Up(b) => (mouse_btn(b), true),
+        MouseEventKind::Drag(b) => (mouse_btn(b) + 32, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        _ => return None,
+    };
+    let final_char = if release { 'm' } else { 'M' };
+    Some(format!("\x1b[<{};{};{}{}", cb, cx + 1, cy + 1, final_char).into_bytes())
+}
+
+fn mouse_btn(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Instant) -> Vec<Cmd> {
+    if app.modal().is_some() {
+        for c in text.chars() {
+            app.modal_push_char(c);
+        }
+        return Vec::new();
+    }
+    if app.mode() == Mode::Search {
+        for c in text.chars() {
+            app.push_char(c);
+        }
+        return Vec::new();
+    }
+    if state.focus == Focus::Pane
+        && let Some(key) = state.stage.focused_key().cloned()
+    {
+        let normalized = normalize_paste_line_endings(&text);
+        let bracketed = state
+            .screens
+            .get(&key)
+            .is_some_and(|screen| screen.screen().bracketed_paste());
+        let bytes = if bracketed {
+            wrap_bracketed_paste(&normalized)
+        } else {
+            normalized.into_bytes()
+        };
+        state.last_forwarded_input = Some(now);
+        return vec![Cmd::WritePty { key, bytes }];
+    }
+    Vec::new()
+}
+
+fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: SessionKey) -> Vec<Cmd> {
+    state
+        .screens
+        .insert(key.clone(), super::session::Screen::new(24, 80));
+    let Some(pending) = state.pending_opens.remove(&key) else {
+        return Vec::new();
+    };
+    match pending {
+        PendingOpen::Solo => {
+            state.stage = Stage::Solo(key);
+            state.focus = Focus::Pane;
+            Vec::new()
+        }
+        PendingOpen::BrigadeDirector {
+            brigade_id,
+            worker_tokens,
+            cwd,
+        } => {
+            state.stage = Stage::Brigade {
+                id: brigade_id,
+                panes: vec![key],
+                focused: 0,
+            };
+            state.focus = Focus::Pane;
+            worker_tokens
+                .into_iter()
+                .flat_map(|token| {
+                    open_worker(state, brigade_id, &token, &cwd, &brigade.worker_model)
+                })
+                .collect()
+        }
+        PendingOpen::BrigadeMember { brigade_id } => {
+            if let Stage::Brigade { id, panes, .. } = &mut state.stage
+                && *id == brigade_id
+                && !panes.contains(&key)
+            {
+                panes.push(key);
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Emit the `Cmd::OpenEmbedded` for one auto-spawned Worker, wired to the
+/// brigade's MCP channel, tracked as a `BrigadeMember` open.
+fn open_worker(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    token: &str,
+    cwd: &std::path::Path,
+    worker_model: &str,
+) -> Vec<Cmd> {
+    let key = SessionKey::new_worker(brigade_id, token);
+    state
+        .pending_opens
+        .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+    vec![Cmd::OpenEmbedded {
+        key,
+        target: SessionToOpen {
+            id: String::new(),
+            title: format!("worker {token}"),
+            cwd: cwd.to_path_buf(),
+        },
+        brigade: Some((brigade_id, token.to_string(), BrigadeRole::Worker)),
+        model: (!worker_model.is_empty()).then(|| worker_model.to_string()),
+    }]
+}
+
+fn update_spawn_failed(
+    state: &mut EmporiumState,
+    key: SessionKey,
+    error: String,
+    now: Instant,
+) -> Vec<Cmd> {
+    state.pending_opens.remove(&key);
+    state.set_status(format!("failed to open: {error}"), now);
+    Vec::new()
+}
+
+fn update_pty_exited(
+    state: &mut EmporiumState,
+    app: &App,
+    key: SessionKey,
+    now: Instant,
+) -> Vec<Cmd> {
+    state.screens.remove(&key);
+    state.stage.remove(&key);
+    let title = app
+        .row_for_id(key.as_str())
+        .map(|row| row.display_title().to_string())
+        .unwrap_or_else(|| key.as_str().to_string());
+    state.set_status(format!("session ended: {title}"), now);
+    Vec::new()
+}
+
+fn update_discovery_result(
+    state: &mut EmporiumState,
+    old_key: SessionKey,
+    session_id: String,
+    member: Option<(BrigadeId, MemberToken)>,
+) -> Vec<Cmd> {
+    let new_key = SessionKey::from_id(&session_id);
+    if let Some(screen) = state.screens.remove(&old_key) {
+        state.screens.insert(new_key.clone(), screen);
+    }
+    match &mut state.stage {
+        Stage::Solo(k) if *k == old_key => *k = new_key.clone(),
+        Stage::Brigade { panes, .. } => {
+            for pane in panes.iter_mut() {
+                if *pane == old_key {
+                    *pane = new_key.clone();
+                }
+            }
+        }
+        _ => {}
+    }
+    match member {
+        Some((brigade_id, token)) => vec![Cmd::Store(StoreIntent::SetMemberSession {
+            brigade_id,
+            token,
+            session_id,
+        })],
+        None => Vec::new(),
+    }
+}
+
+fn update_brigade_formed(
+    state: &mut EmporiumState,
+    app: &mut App,
+    director_row_id: String,
+    name: String,
+    cwd: PathBuf,
+    result: Result<(BrigadeId, Vec<MemberToken>), String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    let (brigade_id, worker_tokens) = match result {
+        Ok(pair) => pair,
+        Err(err) => {
+            state.set_status(format!("failed to form brigade: {err}"), now);
+            return Vec::new();
+        }
+    };
+    let director_key = SessionKey::from_id(&director_row_id);
+    let worker_count = worker_tokens.len();
+    let cmds = if state.screens.contains_key(&director_key) {
+        state.stage = Stage::Brigade {
+            id: brigade_id,
+            panes: vec![director_key],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        worker_tokens
+            .into_iter()
+            .flat_map(|token| open_worker(state, brigade_id, &token, &cwd, ""))
+            .collect()
+    } else {
+        state.pending_opens.insert(
+            director_key.clone(),
+            PendingOpen::BrigadeDirector {
+                brigade_id,
+                worker_tokens,
+                cwd: cwd.clone(),
+            },
+        );
+        let Some(row) = app.row_for_id(&director_row_id) else {
+            return Vec::new();
+        };
+        vec![Cmd::OpenEmbedded {
+            key: director_key,
+            target: SessionToOpen {
+                id: director_row_id,
+                title: row.display_title().to_string(),
+                cwd,
+            },
+            brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
+            model: None,
+        }]
+    };
+    state.set_status(
+        format!("brigade formed — director: {name}, {worker_count} worker(s) spawned"),
+        now,
+    );
+    cmds
+}
+
+fn update_worker_added(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    cwd: PathBuf,
+    result: Result<MemberToken, String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    match result {
+        Ok(token) => {
+            state.set_status(format!("{token} added"), now);
+            open_worker(state, brigade_id, &token, &cwd, "")
+        }
+        Err(err) => {
+            state.set_status(format!("failed to add worker: {err}"), now);
+            Vec::new()
+        }
+    }
+}
+
+fn update_disbanded(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade_id: BrigadeId,
+    result: Result<(HashSet<String>, HashSet<String>), String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    match result {
+        Ok((hidden, directors)) => {
+            app.set_hidden_worker_ids(hidden);
+            app.set_directors(directors);
+            let director_key = if let Stage::Brigade { id, panes, .. } = &state.stage
+                && *id == brigade_id
+            {
+                panes.first().cloned()
+            } else {
+                None
+            };
+            state.stage = match director_key {
+                Some(key) => Stage::Solo(key),
+                None => Stage::Empty,
+            };
+            state.set_status("brigade disbanded".to_string(), now);
+        }
+        Err(err) => state.set_status(format!("failed to disband: {err}"), now),
+    }
+    Vec::new()
+}
+
+fn update_tick(
+    state: &mut EmporiumState,
+    brigade: &BrigadeConfig,
+    relay: Vec<RelayObservation>,
+    now: Instant,
+) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+
+    // Phase two of a nudge: send the delayed submitting `\r`. See the
+    // pre-migration `flush_pending_submits`'s doc for why the delay matters.
+    let mut i = 0;
+    while i < state.pending_submits.len() {
+        if now.saturating_duration_since(state.pending_submits[i].nudged_at) >= RELAY_SUBMIT_DELAY {
+            let entry = state.pending_submits.swap_remove(i);
+            cmds.push(Cmd::WritePty {
+                key: entry.key,
+                bytes: b"\r".to_vec(),
+            });
+        } else {
+            i += 1;
+        }
+    }
+
+    if brigade.relay == RelayMode::Auto {
+        let focused = state.stage.focused_key().cloned();
+        for obs in relay {
+            let is_focused = state.focus == Focus::Pane && focused.as_ref() == Some(&obs.key);
+            let nudge = tick_relay_decision(
+                &mut state.relay_states,
+                &obs.token,
+                now,
+                obs.is_idle_this_tick,
+                is_focused,
+                state.last_forwarded_input,
+                obs.has_unseen,
+            );
+            if nudge {
+                cmds.push(Cmd::WritePty {
+                    key: obs.key.clone(),
+                    bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
+                });
+                state.pending_submits.push(PendingSubmit {
+                    key: obs.key,
+                    nudged_at: now,
+                });
+                state.set_status(format!("relay: nudged {}", obs.token), now);
+            }
+        }
+    }
+
+    if let Some(set_at) = state.status_set_at
+        && now.saturating_duration_since(set_at) >= STATUS_TIMEOUT
+    {
+        state.status = None;
+        state.status_set_at = None;
+    }
+
+    cmds
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use banto_core::model::Activity;
+    use crossterm::event::{Event as CtEvent, KeyModifiers};
+
+    use super::super::session::Screen;
+    use super::*;
+
+    fn row(id: &str) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            title: Some(id.to_string()),
+            cwd: Some(PathBuf::from("/work/alpha")),
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+        }
+    }
+
+    fn app_with(rows: Vec<SessionRow>) -> App {
+        App::new(rows)
+    }
+
+    fn brigade_config() -> BrigadeConfig {
+        BrigadeConfig::default()
+    }
+
+    // --- layout / stage_tiles / pane_content (adapted to SessionKey) -------
+
+    #[test]
+    fn layout_reserves_sidebar_status_bar_and_details_panel() {
+        let areas = layout(Rect::new(0, 0, 120, 40));
+        assert_eq!(areas.status.height, 1);
+        assert_eq!(areas.status.y, 39);
+        assert_eq!(areas.sidebar.width, SIDEBAR_WIDTH);
+        assert_eq!(areas.pane.x, SIDEBAR_WIDTH);
+        assert_eq!(areas.pane.width, 120 - SIDEBAR_WIDTH);
+        assert_eq!(areas.pane.height, 39);
+        assert_eq!(areas.summary.height, SUMMARY_HEIGHT);
+    }
+
+    #[test]
+    fn layout_drops_the_details_panel_when_short() {
+        let areas = layout(Rect::new(0, 0, 120, MIN_HEIGHT_FOR_SUMMARY));
+        assert_eq!(areas.summary.height, 0);
+    }
+
+    #[test]
+    fn pane_content_shrinks_by_the_border() {
+        let content = pane_content(Rect::new(36, 0, 84, 40));
+        assert_eq!(content.x, 37);
+        assert_eq!(content.y, 1);
+        assert_eq!(content.width, 82);
+        assert_eq!(content.height, 38);
+    }
+
+    #[test]
+    fn solo_stage_fills_the_whole_pane() {
+        let area = Rect::new(36, 0, 84, 39);
+        let key = SessionKey::from_id("a");
+        assert_eq!(
+            stage_tiles(area, &Stage::Solo(key.clone())),
+            vec![(key, area)]
+        );
+    }
+
+    #[test]
+    fn empty_stage_has_no_tiles() {
+        let area = Rect::new(36, 0, 84, 39);
+        assert!(stage_tiles(area, &Stage::Empty).is_empty());
+    }
+
+    #[test]
+    fn brigade_with_one_member_fills_the_pane() {
+        let area = Rect::new(36, 0, 84, 39);
+        let director = SessionKey::from_id("dir");
+        let stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone()],
+            focused: 0,
+        };
+        assert_eq!(stage_tiles(area, &stage), vec![(director, area)]);
+    }
+
+    #[test]
+    fn brigade_tiles_director_left_and_stacks_workers_right() {
+        let area = Rect::new(36, 0, 84, 40);
+        let director = SessionKey::from_id("dir");
+        let w0 = SessionKey::from_id("w0");
+        let w1 = SessionKey::from_id("w1");
+        let stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), w0.clone(), w1.clone()],
+            focused: 0,
+        };
+        let tiles = stage_tiles(area, &stage);
+        assert_eq!(tiles.len(), 3);
+
+        let (director_key, director_rect) = &tiles[0];
+        assert_eq!(director_key, &director);
+        assert_eq!(director_rect.x, 36);
+        assert_eq!(director_rect.width, 42);
+        assert_eq!(director_rect.height, 40);
+
+        let (w0_key, w0_rect) = &tiles[1];
+        let (w1_key, w1_rect) = &tiles[2];
+        assert_eq!((w0_key, w1_key), (&w0, &w1));
+        assert_eq!(w0_rect.x, 78);
+        assert_eq!(w1_rect.x, 78);
+        assert_eq!(w0_rect.width, 42);
+        assert!(w1_rect.y > w0_rect.y, "workers stack downward");
+        assert_eq!(
+            w0_rect.height + w1_rect.height,
+            40,
+            "workers fill the right column"
+        );
+    }
+
+    #[test]
+    fn focused_key_tracks_the_focused_pane() {
+        assert_eq!(Stage::Empty.focused_key(), None);
+        let solo = SessionKey::from_id("a");
+        assert_eq!(Stage::Solo(solo.clone()).focused_key(), Some(&solo));
+        let w1 = SessionKey::from_id("w1");
+        let stage = Stage::Brigade {
+            id: 1,
+            panes: vec![
+                SessionKey::from_id("dir"),
+                SessionKey::from_id("w0"),
+                w1.clone(),
+            ],
+            focused: 2,
+        };
+        assert_eq!(stage.focused_key(), Some(&w1));
+    }
+
+    #[test]
+    fn stage_remove_collapses_solo_to_empty() {
+        let key = SessionKey::from_id("a");
+        let mut stage = Stage::Solo(key.clone());
+        stage.remove(&key);
+        assert!(matches!(stage, Stage::Empty));
+    }
+
+    #[test]
+    fn stage_remove_clamps_focused_in_a_brigade() {
+        let mut stage = Stage::Brigade {
+            id: 1,
+            panes: vec![
+                SessionKey::from_id("dir"),
+                SessionKey::from_id("w1"),
+                SessionKey::from_id("w2"),
+            ],
+            focused: 2,
+        };
+        stage.remove(&SessionKey::from_id("w2"));
+        match &stage {
+            Stage::Brigade { panes, focused, .. } => {
+                assert_eq!(panes.len(), 2);
+                assert_eq!(*focused, 1);
+            }
+            _ => panic!("expected Brigade"),
+        }
+    }
+
+    #[test]
+    fn stage_remove_last_pane_collapses_to_empty() {
+        let mut stage = Stage::Brigade {
+            id: 1,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+        stage.remove(&SessionKey::from_id("dir"));
+        assert!(matches!(stage, Stage::Empty));
+    }
+
+    #[test]
+    fn session_key_classifies_synthetic_keys() {
+        assert!(SessionKey::new_plain(std::path::Path::new("/work/a")).is_synthetic());
+        assert!(SessionKey::new_worker(1, "worker-1").is_synthetic());
+        assert!(!SessionKey::from_id("00000000-real-uuid").is_synthetic());
+    }
+
+    // --- Relay engine: should_nudge / tick_relay_decision (unchanged logic) -
+
+    #[test]
+    fn should_nudge_happy_path() {
+        let now = Instant::now();
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_blocks_without_unseen_messages() {
+        let now = Instant::now();
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            false,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_busy_blocks() {
+        let now = Instant::now();
+        assert!(!should_nudge(
+            now,
+            0,
+            false,
+            None,
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_single_tick_idle_blocks_debounce() {
+        let now = Instant::now();
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED - 1,
+            false,
+            None,
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_focused_with_recent_input_blocks() {
+        let now = Instant::now();
+        let last_input = now - Duration::from_millis(500);
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            true,
+            Some(last_input),
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_focused_without_recent_input_is_allowed() {
+        let now = Instant::now();
+        let last_input = now - RELAY_INPUT_QUIET_PERIOD - Duration::from_secs(1);
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            true,
+            Some(last_input),
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_unfocused_ignores_recent_input() {
+        let now = Instant::now();
+        let last_input = now - Duration::from_millis(10);
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            Some(last_input),
+            true,
+            &NudgeState::default(),
+        ));
+    }
+
+    #[test]
+    fn should_nudge_attempt_cap_blocks() {
+        let now = Instant::now();
+        let state = NudgeState {
+            last_nudge: Some(now - RELAY_NUDGE_COOLDOWN - Duration::from_secs(1)),
+            attempts: RELAY_MAX_ATTEMPTS,
+        };
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn should_nudge_cooldown_blocks_a_too_soon_second_attempt() {
+        let now = Instant::now();
+        let state = NudgeState {
+            last_nudge: Some(now - Duration::from_secs(10)),
+            attempts: 1,
+        };
+        assert!(!should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn should_nudge_cooldown_elapsed_allows_another_attempt() {
+        let now = Instant::now();
+        let state = NudgeState {
+            last_nudge: Some(now - RELAY_NUDGE_COOLDOWN - Duration::from_secs(1)),
+            attempts: 1,
+        };
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn should_nudge_first_nudge_is_exempt_from_the_cooldown_wait() {
+        let now = Instant::now();
+        assert!(should_nudge(
+            now,
+            RELAY_IDLE_STREAK_REQUIRED,
+            false,
+            None,
+            true,
+            &NudgeState {
+                last_nudge: None,
+                attempts: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn tick_relay_decision_requires_two_consecutive_idle_ticks() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        assert!(tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn tick_relay_decision_busy_tick_resets_the_idle_streak() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(false),
+            false,
+            None,
+            true,
+        ));
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn tick_relay_decision_unknown_live_entry_never_counts_as_idle() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        for _ in 0..5 {
+            assert!(!tick_relay_decision(
+                &mut states,
+                &token,
+                now,
+                None,
+                false,
+                None,
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn tick_relay_decision_resets_on_drain_so_the_next_batch_starts_fresh() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let now = Instant::now();
+
+        tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
+        assert!(tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        assert_eq!(states.get(&token).unwrap().nudge.attempts, 1);
+
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            false,
+        ));
+        assert!(!states.contains_key(&token));
+
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+        assert_eq!(states.get(&token).unwrap().idle_streak, 1);
+        assert_eq!(states.get(&token).unwrap().nudge.attempts, 0);
+    }
+
+    #[test]
+    fn tick_relay_decision_stops_after_the_attempt_cap_even_past_cooldown() {
+        let mut states = HashMap::new();
+        let token = "worker-1".to_string();
+        let mut now = Instant::now();
+
+        tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
+        for _ in 0..RELAY_MAX_ATTEMPTS {
+            now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
+            assert!(tick_relay_decision(
+                &mut states,
+                &token,
+                now,
+                Some(true),
+                false,
+                None,
+                true,
+            ));
+        }
+        assert_eq!(
+            states.get(&token).unwrap().nudge.attempts,
+            RELAY_MAX_ATTEMPTS
+        );
+
+        now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
+        assert!(!tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            false,
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn relay_state_defaults_to_a_zero_streak_and_fresh_backoff() {
+        let state = RelayState::default();
+        assert_eq!(state.idle_streak, 0);
+        assert_eq!(state.nudge.attempts, 0);
+        assert!(state.nudge.last_nudge.is_none());
+    }
+
+    // --- Event-stream tests: update() end to end, no I/O -------------------
+
+    #[test]
+    fn activate_enter_on_a_known_row_resolves_membership_then_opens_then_stages_solo() {
+        let mut state = EmporiumState::new();
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        // Enter on the sidebar: the row isn't a known brigade member yet, so
+        // the first step is always resolving membership (see the module doc).
+        let key_event = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(key_event)),
+            now,
+        );
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::ResolveMembership { session_id }) ] if session_id == "sess-1"
+        ));
+
+        // Not a brigade member: opens solo.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "sess-1".to_string(),
+                membership: None,
+                members: None,
+            },
+            now,
+        );
+        let Some(Cmd::OpenEmbedded { key, target, .. }) = cmds.into_iter().next() else {
+            panic!("expected an OpenEmbedded cmd");
+        };
+        assert_eq!(key, SessionKey::from_id("sess-1"));
+        assert_eq!(target.id, "sess-1");
+
+        // The shell reports success: stage becomes the solo pane, focus moves
+        // to it.
+        update(&mut state, &mut app, &brigade, Event::Spawned { key }, now);
+        assert_eq!(
+            state.stage.focused_key(),
+            Some(&SessionKey::from_id("sess-1"))
+        );
+        assert_eq!(state.focus, Focus::Pane);
+        assert!(state.screens.contains_key(&SessionKey::from_id("sess-1")));
+    }
+
+    #[test]
+    fn spawn_failed_sets_status_and_leaves_stage_untouched() {
+        let mut state = EmporiumState::new();
+        state.stage = Stage::Empty;
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let key = SessionKey::from_id("sess-1");
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::SpawnFailed {
+                key,
+                error: "already running elsewhere".to_string(),
+            },
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert!(matches!(state.stage, Stage::Empty));
+        assert!(state.status.unwrap().contains("already running elsewhere"));
+    }
+
+    #[test]
+    fn pty_output_feeds_the_screen() {
+        let mut state = EmporiumState::new();
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"hi".to_vec(),
+            },
+            Instant::now(),
+        );
+
+        let screen = state.screens.get(&key).unwrap();
+        assert_eq!(screen.screen().cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(screen.screen().cell(0, 1).unwrap().contents(), "i");
+    }
+
+    #[test]
+    fn pty_exited_on_a_staged_solo_collapses_to_empty_with_status() {
+        let mut state = EmporiumState::new();
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key: key.clone() },
+            Instant::now(),
+        );
+
+        assert!(matches!(state.stage, Stage::Empty));
+        assert!(!state.screens.contains_key(&key));
+        assert!(state.status.unwrap().contains("session ended"));
+    }
+
+    #[test]
+    fn pty_exited_on_a_brigade_worker_removes_its_pane_and_clamps_focus() {
+        let mut state = EmporiumState::new();
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        for key in [&director, &worker] {
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+        }
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), worker.clone()],
+            focused: 1,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: worker.clone(),
+            },
+            Instant::now(),
+        );
+
+        match &state.stage {
+            Stage::Brigade { panes, focused, .. } => {
+                assert_eq!(panes, &[director]);
+                assert_eq!(*focused, 0);
+            }
+            other => panic!(
+                "expected a surviving Brigade stage, got a different Stage variant: {}",
+                match other {
+                    Stage::Empty => "Empty",
+                    Stage::Solo(_) => "Solo",
+                    Stage::Brigade { .. } => "Brigade",
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn key_in_pane_focus_forwards_a_write_pty_cmd_with_the_right_encoding() {
+        let mut state = EmporiumState::new();
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(matches!(
+            cmds.first(),
+            Some(Cmd::WritePty { key: k, bytes }) if *k == key && bytes == b"a"
+        ));
+        assert_eq!(state.last_forwarded_input, Some(now));
+    }
+
+    #[test]
+    fn paste_in_pane_focus_is_a_single_write_pty_bracketed_when_the_child_has_paste_mode_on() {
+        let mut state = EmporiumState::new();
+        let key = SessionKey::from_id("sess-1");
+        let mut screen = Screen::new(24, 80);
+        // Turn on bracketed paste mode (DECSET 2004) in the child's model.
+        screen.process(b"\x1b[?2004h");
+        state.screens.insert(key.clone(), screen);
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Paste("a\nb".to_string())),
+            now,
+        );
+        // Exactly one WritePty (a stray ResizePty may also come back — the
+        // fresh 24x80 `Screen` almost certainly doesn't match the pane
+        // geometry computed from `EmporiumState::new()`'s default `size`,
+        // which is incidental here and not what this test is about).
+        let writes: Vec<&Cmd> = cmds
+            .iter()
+            .filter(|cmd| matches!(cmd, Cmd::WritePty { .. }))
+            .collect();
+        assert_eq!(writes.len(), 1, "paste forwards as exactly one WritePty");
+        assert!(matches!(
+            writes[0],
+            Cmd::WritePty { key: k, bytes }
+                if *k == key && bytes == b"\x1b[200~a\rb\x1b[201~"
+        ));
+    }
+
+    #[test]
+    fn tick_nudges_then_flushes_the_delayed_submit() {
+        let mut state = EmporiumState::new();
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.screens.insert(director.clone(), Screen::new(24, 80));
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker.clone()],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mut now = Instant::now();
+
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        // Isolates the WritePty cmds from any incidental ResizePty (the
+        // fresh 24x80 `Screen`s almost certainly don't match the pane
+        // geometry computed from `EmporiumState::new()`'s default `size` —
+        // not what this test is about).
+        let writes = |cmds: &[Cmd]| -> Vec<(SessionKey, Vec<u8>)> {
+            cmds.iter()
+                .filter_map(|cmd| match cmd {
+                    Cmd::WritePty { key, bytes } => Some((key.clone(), bytes.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // First tick: idle streak only reaches 1 — not eligible yet.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        assert!(writes(&cmds).is_empty());
+
+        // Second consecutive idle tick: eligible — nudge text goes out, and
+        // the submitting `\r` is recorded as pending, not sent yet.
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        assert_eq!(
+            writes(&cmds),
+            vec![(worker.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())]
+        );
+        assert!(state.status.as_deref().unwrap().contains("nudged worker-1"));
+
+        // A tick before the submit delay has elapsed: nothing flushed yet.
+        now += Duration::from_millis(50);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(writes(&cmds).is_empty(), "submit not due yet");
+
+        // Once RELAY_SUBMIT_DELAY has passed, the next tick flushes the
+        // lone submitting `\r` — in its own chunk, per the relay engine's
+        // whole reason for existing (see `update_tick`'s doc).
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+    }
+
+    #[test]
+    fn archive_done_sets_status_and_reloads() {
+        let mut state = EmporiumState::new();
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::ArchiveDone {
+                title: "Fix login".to_string(),
+                result: Ok(()),
+            },
+            Instant::now(),
+        );
+        assert!(matches!(cmds.as_slice(), [Cmd::Reload]));
+        assert_eq!(state.status.as_deref(), Some("archived Fix login"));
+    }
+
+    #[test]
+    fn archive_done_failure_sets_status_but_still_reloads() {
+        let mut state = EmporiumState::new();
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::ArchiveDone {
+                title: "Fix login".to_string(),
+                result: Err("disk full".to_string()),
+            },
+            Instant::now(),
+        );
+        assert!(matches!(cmds.as_slice(), [Cmd::Reload]));
+        let status = state.status.unwrap();
+        assert!(status.contains("failed to archive Fix login"));
+        assert!(status.contains("disk full"));
+    }
+}

@@ -1,6 +1,11 @@
-//! A single embedded child terminal: a `vt100` model driven by the child's
-//! output, plus input/resize forwarding. UI-free and unit-testable via a mock
-//! [`PtyHost`](super::pty::PtyHost).
+//! A single embedded child terminal, split along the sans-IO line (see
+//! `docs/DISCIPLINE.md` §2): [`Screen`] is the `vt100` model — pure state,
+//! fed by output chunks, safe to hold in the emporium's core `State` — and
+//! [`PtyHandle`] is the channels to the PTY child — input/resize/kill/output,
+//! all I/O, held in the shell's own registry. [`EmbeddedSession`] composes
+//! both back into the single handle the standalone `banto _embed` demo
+//! (`super::run_embedded`) still uses; the emporium (`super::engine`) uses
+//! `Screen`/`PtyHandle` directly instead.
 
 use std::io::Write;
 use std::path::Path;
@@ -11,12 +16,128 @@ use crossterm::event::KeyEvent;
 use super::input::key_to_bytes;
 use super::pty::{PtyHost, PtyIo};
 
-/// One hosted session: its terminal model (`vt100`) and the channels to its
-/// PTY child.
-pub struct EmbeddedSession {
+/// The `vt100` terminal model for one hosted session: pure state, driven by
+/// output chunks ([`Self::process`]) and resized in step with its `PtyHandle`
+/// ([`Self::resize`] reports whether the size actually changed, so the
+/// caller knows whether to also resize the PTY itself — an I/O action this
+/// type never performs).
+pub(crate) struct Screen {
     parser: vt100::Parser,
-    io: PtyIo,
     size: (u16, u16),
+}
+
+impl Screen {
+    pub(crate) fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows, cols, 0),
+            size: (rows, cols),
+        }
+    }
+
+    /// Feed one chunk of the child's output into the model.
+    pub(crate) fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    /// Resize the model. Returns whether the size actually changed (a no-op
+    /// resize is not worth forwarding to the PTY).
+    pub(crate) fn resize(&mut self, rows: u16, cols: u16) -> bool {
+        if self.size == (rows, cols) {
+            return false;
+        }
+        self.parser.screen_mut().set_size(rows, cols);
+        self.size = (rows, cols);
+        true
+    }
+
+    /// The current terminal screen, for rendering.
+    pub(crate) fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
+    }
+}
+
+/// The result of one non-blocking poll of a [`PtyHandle`]'s output channel.
+pub(crate) enum PtyPoll {
+    /// One chunk of output — becomes `Event::PtyOutput`.
+    Chunk(Vec<u8>),
+    /// Nothing available right now; the child is still running.
+    Empty,
+    /// The channel has disconnected: the child exited and its reader thread
+    /// wound down, with every chunk it ever sent already drained (this
+    /// variant is only reached once no `Chunk` remains) — becomes
+    /// `Event::PtyExited`.
+    Disconnected,
+}
+
+/// The I/O channels to a hosted PTY child: output (drained non-blockingly),
+/// input, resize, and kill. Lives in the shell's own registry, keyed by
+/// `engine::SessionKey` — never touched from `update`.
+pub(crate) struct PtyHandle {
+    io: PtyIo,
+}
+
+impl PtyHandle {
+    pub(crate) fn open(
+        host: &dyn PtyHost,
+        argv: &[String],
+        cwd: Option<&Path>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self> {
+        Ok(Self {
+            io: host.open(argv, cwd, rows, cols)?,
+        })
+    }
+
+    /// Poll for the child's next output chunk, non-blocking. A single
+    /// primitive (rather than a separate "is there output" / "has it
+    /// exited" pair) so nothing can observe `Disconnected` by discarding a
+    /// chunk that arrived in the same instant — `TryRecvError::Disconnected`
+    /// only ever means "and there is nothing left to drain first".
+    pub(crate) fn poll(&self) -> PtyPoll {
+        match self.io.output.try_recv() {
+            Ok(chunk) => PtyPoll::Chunk(chunk),
+            Err(std::sync::mpsc::TryRecvError::Empty) => PtyPoll::Empty,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => PtyPoll::Disconnected,
+        }
+    }
+
+    /// Encode `key` and forward it to the child's stdin.
+    pub(crate) fn send_key(&mut self, key: &KeyEvent) {
+        let bytes = key_to_bytes(key);
+        if !bytes.is_empty() {
+            let _ = self.io.input.write_all(&bytes);
+            let _ = self.io.input.flush();
+        }
+    }
+
+    /// Forward raw bytes (mouse report, paste, relay nudge/submit) to the
+    /// child's stdin — the single stdin-write path.
+    pub(crate) fn send_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.io.input.write_all(bytes);
+        let _ = self.io.input.flush();
+    }
+
+    /// Resize the child's PTY.
+    pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
+        let _ = self.io.resizer.resize(rows, cols);
+    }
+
+    /// Kill the child. Unused until Phase 2b emits `Cmd::KillPty`.
+    #[allow(dead_code)]
+    pub(crate) fn kill(&mut self) -> Result<()> {
+        self.io.killer.kill()
+    }
+}
+
+/// One hosted session: a [`Screen`] plus the [`PtyHandle`] that feeds it.
+/// Kept as a composed convenience type for `super::run_embedded`'s standalone
+/// full-screen demo, which has no `update`/`Cmd` plumbing of its own to split
+/// across; the emporium uses `Screen`/`PtyHandle` separately instead (see the
+/// module doc).
+pub struct EmbeddedSession {
+    screen: Screen,
+    handle: PtyHandle,
 }
 
 impl EmbeddedSession {
@@ -28,11 +149,9 @@ impl EmbeddedSession {
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
-        let io = host.open(argv, cwd, rows, cols)?;
         Ok(Self {
-            parser: vt100::Parser::new(rows, cols, 0),
-            io,
-            size: (rows, cols),
+            screen: Screen::new(rows, cols),
+            handle: PtyHandle::open(host, argv, cwd, rows, cols)?,
         })
     }
 
@@ -40,8 +159,8 @@ impl EmbeddedSession {
     /// Returns whether anything was processed (i.e. a redraw is warranted).
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(bytes) = self.io.output.try_recv() {
-            self.parser.process(&bytes);
+        while let PtyPoll::Chunk(bytes) = self.handle.poll() {
+            self.screen.process(&bytes);
             changed = true;
         }
         changed
@@ -49,31 +168,19 @@ impl EmbeddedSession {
 
     /// Encode `key` and forward it to the child's stdin.
     pub fn send_key(&mut self, key: &KeyEvent) {
-        let bytes = key_to_bytes(key);
-        if !bytes.is_empty() {
-            let _ = self.io.input.write_all(&bytes);
-            let _ = self.io.input.flush();
-        }
-    }
-
-    /// Forward raw bytes (e.g. an encoded mouse report) to the child's stdin.
-    pub fn send_bytes(&mut self, bytes: &[u8]) {
-        let _ = self.io.input.write_all(bytes);
-        let _ = self.io.input.flush();
+        self.handle.send_key(key);
     }
 
     /// Resize the child's PTY and the terminal model (no-op if unchanged).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        if self.size != (rows, cols) {
-            let _ = self.io.resizer.resize(rows, cols);
-            self.parser.screen_mut().set_size(rows, cols);
-            self.size = (rows, cols);
+        if self.screen.resize(rows, cols) {
+            self.handle.resize(rows, cols);
         }
     }
 
     /// The current terminal screen, for rendering.
     pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+        self.screen.screen()
     }
 }
 

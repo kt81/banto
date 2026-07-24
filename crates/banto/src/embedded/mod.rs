@@ -10,6 +10,7 @@
 //! A raw Unix PTY would need answering; that path is deferred.
 
 mod emporium;
+mod engine;
 mod input;
 mod pty;
 mod render;
