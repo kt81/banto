@@ -1,7 +1,7 @@
 //! banto-core: UI-free logic for banto (session indexing, search, status).
 //!
 //! Module map (see docs/REQUIREMENTS.md for the design):
-//! - [`model`]    shared domain types (frozen; changes go through the team lead)
+//! - [`model`]    shared domain types (pure data — see docs/DISCIPLINE.md)
 //! - [`input`]    pure key/mouse/paste/resize event types (no terminal backend)
 //! - [`provider`] session discovery + tolerant JSONL parsing
 //! - [`status`]   live-session state and activity bucketing

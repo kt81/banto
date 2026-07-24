@@ -1,7 +1,5 @@
-//! Shared domain types.
-//!
-//! This file is owned by the team lead. Module agents must not edit it;
-//! propose changes in your final report instead.
+//! Shared domain types — pure data, no I/O, no heavy dependencies. The
+//! future pure-core crate's foundation (docs/DISCIPLINE.md §2).
 
 use std::fmt;
 use std::path::PathBuf;
