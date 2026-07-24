@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use rusqlite::params;
 
-use crate::model::{SessionId, SessionMeta};
+use banto_core::model::{SessionId, SessionMeta};
 
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 

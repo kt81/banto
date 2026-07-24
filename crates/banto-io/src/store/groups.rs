@@ -9,7 +9,7 @@
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::model::SessionId;
+use banto_core::model::SessionId;
 
 use super::{Store, StoreError};
 

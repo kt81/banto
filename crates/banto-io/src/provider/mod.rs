@@ -5,7 +5,7 @@
 
 pub mod claude_code;
 
-use crate::model::SessionMeta;
+use banto_core::model::SessionMeta;
 
 /// A source of sessions (Claude Code today, other agents later).
 pub trait SessionProvider {

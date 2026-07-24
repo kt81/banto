@@ -93,8 +93,12 @@ impl SpawnedProcess for SystemSpawnedProcess {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod mock {
+/// Not `#[cfg(test)]`: `wrap.rs` (a *different* crate, `banto`) needs this
+/// for its own tests, and `#[cfg(test)]` is crate-local in Rust — it never
+/// survives across a crate boundary, even into a downstream crate's own
+/// test build. Always compiled instead (harmless: nothing in a real build
+/// path ever references it, so it never reaches the linked binary).
+pub mod mock {
     use std::cell::RefCell;
     use std::io;
     use std::path::Path;
@@ -108,10 +112,10 @@ pub(crate) mod mock {
     /// already exited) — see [`Self::new_spawning`]. `run_in` isn't
     /// currently exercised by any test (in-place mode's `run_pending_inplace`
     /// is a thin, untested-by-design shell, same as `event_loop` — see
-    /// `crate::tui`), so unlike `run`/`spawn` it doesn't bother recording
+    /// `banto::tui`), so unlike `run`/`spawn` it doesn't bother recording
     /// its calls.
     #[derive(Debug, Default)]
-    pub(crate) struct MockProcessRunner {
+    pub struct MockProcessRunner {
         exit_code: Option<i32>,
         still_running_polls: usize,
         run_calls: RefCell<Vec<Vec<String>>>,
@@ -119,7 +123,7 @@ pub(crate) mod mock {
     }
 
     impl MockProcessRunner {
-        pub(crate) fn new(exit_code: Option<i32>) -> Self {
+        pub fn new(exit_code: Option<i32>) -> Self {
             Self {
                 exit_code,
                 ..Self::default()
@@ -129,7 +133,7 @@ pub(crate) mod mock {
         /// A runner whose `spawn`ed process reports "still running" for
         /// `still_running_polls` `try_wait` calls before exiting with
         /// `exit_code`.
-        pub(crate) fn new_spawning(still_running_polls: usize, exit_code: Option<i32>) -> Self {
+        pub fn new_spawning(still_running_polls: usize, exit_code: Option<i32>) -> Self {
             Self {
                 exit_code,
                 still_running_polls,
@@ -137,11 +141,11 @@ pub(crate) mod mock {
             }
         }
 
-        pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+        pub fn calls(&self) -> Vec<Vec<String>> {
             self.run_calls.borrow().clone()
         }
 
-        pub(crate) fn spawn_calls(&self) -> Vec<Vec<String>> {
+        pub fn spawn_calls(&self) -> Vec<Vec<String>> {
             self.spawn_calls.borrow().clone()
         }
     }
@@ -168,13 +172,13 @@ pub(crate) mod mock {
     /// A [`SpawnedProcess`] that reports "still running" for the first
     /// `still_running_polls` calls to `try_wait`, then exits with
     /// `exit_code` on every call after that.
-    pub(crate) struct MockSpawnedProcess {
+    pub struct MockSpawnedProcess {
         remaining: usize,
         exit_code: Option<i32>,
     }
 
     impl MockSpawnedProcess {
-        pub(crate) fn new(still_running_polls: usize, exit_code: Option<i32>) -> Self {
+        pub fn new(still_running_polls: usize, exit_code: Option<i32>) -> Self {
             Self {
                 remaining: still_running_polls,
                 exit_code,

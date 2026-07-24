@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/banto-core", "crates/banto"]
+members = ["crates/banto-core", "crates/banto-io", "crates/banto-tui", "crates/banto"]
 
 [workspace.package]
 version = "0.1.0"

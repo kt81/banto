@@ -1,9 +1,10 @@
 //! The emporium's pure core (`docs/DISCIPLINE.md` §4): `update(state, app,
 //! ev, now) -> Vec<Cmd>` is a function from an [`Event`] (a fact about the
 //! outside world) to state mutations and [`Cmd`]s (instructions for the
-//! shell — `super::emporium` — to execute). No clock reads, no file/process/
-//! store access, no terminal access in this module; every place that touches
-//! the world is named as an `Event` coming in or a `Cmd` going out.
+//! shell — `banto::embedded::emporium` — to execute). No clock reads, no
+//! file/process/store access, no terminal access in this module; every place
+//! that touches the world is named as an `Event` coming in or a `Cmd` going
+//! out.
 //!
 //! `EmporiumState` replaces the old `Emporium` struct. The append-only
 //! sessions invariant retires with it: `screens` can lose entries
@@ -21,36 +22,32 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::{Constraint, Layout, Position, Rect};
-
-use banto_core::config::{BrigadeConfig, RelayMode};
-use banto_core::input::{
-    InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use banto_core::store::{BrigadeId, BrigadeRole, MemberToken};
+use ratatui_core::layout::{Constraint, Layout, Position, Rect};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode};
-use crate::opener::SessionToOpen;
-use crate::session::SessionRow;
-
-use super::input::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
+use crate::config::{BrigadeConfig, RelayMode};
+use crate::input::{
+    InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crate::key_encode::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
+use crate::model::{BrigadeId, BrigadeRole, MemberToken, SessionRow, SessionToOpen};
 
 /// Fixed width of the left sidebar (the session list), in columns.
-pub(super) const SIDEBAR_WIDTH: u16 = 36;
+pub const SIDEBAR_WIDTH: u16 = 36;
 /// Details panel height: one border row plus its content rows.
-pub(super) const SUMMARY_HEIGHT: u16 = 5;
+pub const SUMMARY_HEIGHT: u16 = 5;
 /// Below this left-column height the details panel is dropped so the list keeps
 /// the room.
-pub(super) const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
+pub const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
 
 /// Stable identity for a kept-alive embedded session: the real Claude
 /// session id once known, or a synthetic placeholder for a freshly-launched
 /// one still awaiting id discovery (see [`Self::is_synthetic`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct SessionKey(String);
+pub struct SessionKey(String);
 
 impl SessionKey {
-    pub(super) fn from_id(id: &str) -> Self {
+    pub fn from_id(id: &str) -> Self {
         Self(id.to_string())
     }
 
@@ -62,27 +59,27 @@ impl SessionKey {
         Self(format!("new-worker::{brigade_id}::{token}"))
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// Whether this key is a placeholder awaiting id discovery, rather than
     /// a real Claude session id.
-    pub(super) fn is_synthetic(&self) -> bool {
+    pub fn is_synthetic(&self) -> bool {
         self.0.starts_with("new::") || self.0.starts_with("new-worker::")
     }
 }
 
 /// Which side currently receives keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Focus {
+pub enum Focus {
     Sidebar,
     Pane,
 }
 
 /// What the right-hand pane region is showing: nothing, a single session, or
 /// a brigade tiled across several panes.
-pub(super) enum Stage {
+pub enum Stage {
     Empty,
     Solo(SessionKey),
     Brigade {
@@ -94,7 +91,7 @@ pub(super) enum Stage {
 }
 
 impl Stage {
-    pub(super) fn focused_key(&self) -> Option<&SessionKey> {
+    pub fn focused_key(&self) -> Option<&SessionKey> {
         match self {
             Stage::Empty => None,
             Stage::Solo(key) => Some(key),
@@ -102,7 +99,7 @@ impl Stage {
         }
     }
 
-    pub(super) fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         !matches!(self, Stage::Empty)
     }
 
@@ -131,7 +128,7 @@ impl Stage {
 /// paired with its key. A solo session fills the whole pane; a brigade puts
 /// the Director on the left and stacks the Workers down the right (a
 /// "master + stack" layout).
-pub(super) fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(SessionKey, Rect)> {
+pub fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(SessionKey, Rect)> {
     match stage {
         Stage::Empty => Vec::new(),
         Stage::Solo(key) => vec![(key.clone(), pane_area)],
@@ -158,7 +155,7 @@ pub(super) fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(SessionKey, Re
 }
 
 /// The inner content rect of the right pane (inside its border).
-pub(super) fn pane_content(pane_area: Rect) -> Rect {
+pub fn pane_content(pane_area: Rect) -> Rect {
     Rect {
         x: pane_area.x + 1,
         y: pane_area.y + 1,
@@ -169,7 +166,7 @@ pub(super) fn pane_content(pane_area: Rect) -> Rect {
 
 /// Compute the layout: a bottom status bar, and above it a left column
 /// (sidebar list + details panel) beside the session pane.
-pub(super) fn layout(area: Rect) -> Areas {
+pub fn layout(area: Rect) -> Areas {
     let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let [left, pane] =
         Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
@@ -190,11 +187,11 @@ pub(super) fn layout(area: Rect) -> Areas {
 
 /// The regions of the emporium layout.
 #[derive(Clone, Copy)]
-pub(super) struct Areas {
-    pub(super) sidebar: Rect,
-    pub(super) summary: Rect,
-    pub(super) pane: Rect,
-    pub(super) status: Rect,
+pub struct Areas {
+    pub sidebar: Rect,
+    pub summary: Rect,
+    pub pane: Rect,
+    pub status: Rect,
 }
 
 // --- Relay engine (unchanged from the pre-migration code — already pure) ---
@@ -218,18 +215,18 @@ const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct NudgeState {
+pub struct NudgeState {
     last_nudge: Option<Instant>,
     attempts: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct RelayState {
+pub struct RelayState {
     idle_streak: u32,
     nudge: NudgeState,
 }
 
-pub(super) fn should_nudge(
+pub fn should_nudge(
     now: Instant,
     idle_streak: u32,
     is_focused: bool,
@@ -257,7 +254,7 @@ pub(super) fn should_nudge(
     true
 }
 
-pub(super) fn tick_relay_decision(
+pub fn tick_relay_decision(
     states: &mut HashMap<MemberToken, RelayState>,
     token: &MemberToken,
     now: Instant,
@@ -294,11 +291,11 @@ pub(super) fn tick_relay_decision(
 /// One relay-eligible staged member's freshly-gathered observations for this
 /// tick — gathered shell-side (store + live-session reads), decided
 /// core-side.
-pub(super) struct RelayObservation {
-    pub(super) token: MemberToken,
-    pub(super) key: SessionKey,
-    pub(super) has_unseen: bool,
-    pub(super) is_idle_this_tick: Option<bool>,
+pub struct RelayObservation {
+    pub token: MemberToken,
+    pub key: SessionKey,
+    pub has_unseen: bool,
+    pub is_idle_this_tick: Option<bool>,
 }
 
 /// A nudge awaiting its phase-two Enter (see [`update_tick`]).
@@ -337,31 +334,31 @@ enum PendingMembership {
 /// The emporium's own state — the sans-IO replacement for the old `Emporium`
 /// struct. `screens` may lose entries (a session can exit); `Stage` holds
 /// [`SessionKey`]s, so removal never invalidates anything else holding one.
-pub(super) struct EmporiumState {
-    pub(super) screens: HashMap<SessionKey, super::session::Screen>,
-    pub(super) stage: Stage,
-    pub(super) focus: Focus,
-    pub(super) status: Option<String>,
+pub struct EmporiumState {
+    pub screens: HashMap<SessionKey, crate::screen::Screen>,
+    pub stage: Stage,
+    pub focus: Focus,
+    pub status: Option<String>,
     status_set_at: Option<Instant>,
-    pub(super) relay_states: HashMap<MemberToken, RelayState>,
-    pub(super) last_forwarded_input: Option<Instant>,
+    pub relay_states: HashMap<MemberToken, RelayState>,
+    pub last_forwarded_input: Option<Instant>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
-    pub(super) size: (u16, u16),
+    pub size: (u16, u16),
     /// The configured prefix chord (`[keys] prefix`), fixed for the run.
     prefix: PrefixKey,
     /// When the prefix was last armed (see [`update_key`]'s prefix handling
     /// and [`PREFIX_ARM_TIMEOUT`]) — `Some` only between the prefix chord
     /// landing on a focused pane and the very next key resolving it (or the
-    /// timeout disarming it on a [`Event::Tick`]). `pub(super)` so the shell
+    /// timeout disarming it on a [`Event::Tick`]). `pub` so the shell
     /// can show the pending-prefix hint while armed (reading state for
     /// drawing is legal; only `update` may write it).
-    pub(super) prefix_armed: Option<Instant>,
+    pub prefix_armed: Option<Instant>,
 }
 
 impl EmporiumState {
-    pub(super) fn new(prefix: PrefixKey) -> Self {
+    pub fn new(prefix: PrefixKey) -> Self {
         Self {
             screens: HashMap::new(),
             stage: Stage::Empty,
@@ -390,12 +387,12 @@ impl EmporiumState {
 const PREFIX_ARM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
-/// see `banto_core::config::KeysConfig`). Parsing lives here rather than in
-/// `banto-core::config` because the config module only validates as far as
+/// see [`crate::config::KeysConfig`]). Parsing lives here rather than in
+/// `crate::config` because the config module only validates as far as
 /// "is it a string"; this is where "is it a chord" gets decided, lenient by
 /// the same design as `RelayMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PrefixKey {
+pub struct PrefixKey {
     code: KeyCode,
     mods: Modifiers,
 }
@@ -404,7 +401,7 @@ impl PrefixKey {
     /// `"C-<char>"` for a Control chord, or a bare single character for an
     /// unmodified key. Anything else (empty, multi-character, malformed
     /// `"C-"` forms) falls back to the default (`C-b`) with no error.
-    pub(super) fn parse(raw: &str) -> Self {
+    pub fn parse(raw: &str) -> Self {
         if let Some(rest) = raw.strip_prefix("C-") {
             let mut chars = rest.chars();
             if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -625,7 +622,7 @@ fn arrow_target(from: FocusSlot, direction: Direction, pane_count: usize) -> Foc
 
 /// A store operation the shell executes, reusing the store's existing
 /// transactional functions — an intent, not a SQL statement.
-pub(super) enum StoreIntent {
+pub enum StoreIntent {
     SetPin {
         id: String,
         pinned: bool,
@@ -668,13 +665,13 @@ pub(super) enum StoreIntent {
 /// Mirrors `crate::app::GroupJoinTarget`, but by value (the original borrows
 /// from the modal state, which `update` cannot hold across the round trip to
 /// the shell and back).
-pub(super) enum GroupJoinTargetData {
+pub enum GroupJoinTargetData {
     Existing(i64, String),
     New(String),
 }
 
 /// An instruction for the shell to execute — plain data, never executed here.
-pub(super) enum Cmd {
+pub enum Cmd {
     WritePty {
         key: SessionKey,
         bytes: Vec<u8>,
@@ -707,7 +704,7 @@ pub(super) enum Cmd {
 }
 
 /// A fact about the outside world, fed into [`update`].
-pub(super) enum Event {
+pub enum Event {
     Input(InputEvent),
     Resized {
         width: u16,
@@ -784,7 +781,7 @@ pub(super) enum Event {
 
 /// The core: a pure function from one [`Event`] to state mutations and
 /// [`Cmd`]s. No clock reads (`now` is the only time), no I/O of any kind.
-pub(super) fn update(
+pub fn update(
     state: &mut EmporiumState,
     app: &mut App,
     brigade: &BrigadeConfig,
@@ -1612,7 +1609,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
 fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: SessionKey) -> Vec<Cmd> {
     state
         .screens
-        .insert(key.clone(), super::session::Screen::new(24, 80));
+        .insert(key.clone(), crate::screen::Screen::new(24, 80));
     let Some(pending) = state.pending_opens.remove(&key) else {
         return Vec::new();
     };
@@ -1926,9 +1923,9 @@ fn update_tick(
 mod tests {
     use std::path::PathBuf;
 
-    use banto_core::model::Activity;
+    use crate::model::Activity;
+    use crate::screen::Screen;
 
-    use super::super::session::Screen;
     use super::*;
 
     fn row(id: &str) -> SessionRow {

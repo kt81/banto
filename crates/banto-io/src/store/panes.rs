@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::model::SessionId;
+use banto_core::model::SessionId;
 
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 

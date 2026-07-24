@@ -146,8 +146,12 @@ impl Killer for PortablePtyKiller {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod mock {
+/// Not `#[cfg(test)]`: `session.rs` (a *different* crate, `banto`) needs
+/// this for its own tests, and `#[cfg(test)]` is crate-local in Rust — it
+/// never survives across a crate boundary, even into a downstream crate's
+/// own test build. Always compiled instead (harmless: nothing in a real
+/// build path ever references it, so it never reaches the linked binary).
+pub mod mock {
     use std::io::{self, Write};
     use std::path::Path;
     use std::sync::mpsc;
@@ -163,7 +167,7 @@ pub(crate) mod mock {
     /// so a test can fire it later via [`Self::fire_exit`], simulating the
     /// real waiter thread's `child.wait()` returning.
     #[derive(Default)]
-    pub(crate) struct MockPtyHost {
+    pub struct MockPtyHost {
         pub script: Vec<u8>,
         pub captured: Arc<Mutex<Vec<u8>>>,
         pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
@@ -187,7 +191,7 @@ pub(crate) mod mock {
         /// Simulate the child exiting: fires the `exited` channel of the
         /// most recently opened `PtyIo`. A no-op if nothing is open, or the
         /// exit was already fired (a real exit only ever happens once).
-        pub(crate) fn fire_exit(&self) {
+        pub fn fire_exit(&self) {
             if let Some(tx) = self.exit_sender.lock().unwrap().take() {
                 let _ = tx.send(());
             }

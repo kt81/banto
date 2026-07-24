@@ -35,25 +35,26 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
+use banto_core::app::{App, Mode};
 use banto_core::config::{BrigadeConfig, KeysConfig};
-use banto_core::model::SessionId;
-use banto_core::provider::claude_code::ClaudeCodeProvider;
-use banto_core::status::{AgeThresholds, ProcessProbe, SysinfoProbe, read_live_sessions};
-use banto_core::store::{BrigadeId, BrigadeRole, MemberToken, Store};
-
-use crate::app::{App, Mode};
-use crate::opener::{self, SessionToOpen};
-use crate::session;
-use crate::tui::LiveWatch;
-use crate::view;
-
-use super::convert;
-use super::engine::{
+use banto_core::engine::{
     self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
     SessionKey, Stage, StoreIntent, layout, stage_tiles,
 };
-use super::pty::PortablePtyHost;
-use super::render::screen_to_text;
+use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
+use banto_core::status::AgeThresholds;
+use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::pty::PortablePtyHost;
+use banto_io::status::{ProcessProbe, SysinfoProbe, read_live_sessions};
+use banto_io::store::Store;
+use banto_tui::render::screen_to_text;
+use banto_tui::view;
+
+use crate::opener;
+use crate::session;
+use crate::tui::LiveWatch;
+
+use super::convert;
 use super::session::{PtyHandle, PtyPoll};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -755,7 +756,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
     );
 
     if let Some(modal) = app.modal() {
-        crate::tui::render_modal(frame, modal, full_area);
+        banto_tui::render_modal::render_modal(frame, modal, full_area);
     }
 }
 

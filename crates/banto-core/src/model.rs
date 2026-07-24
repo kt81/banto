@@ -61,12 +61,13 @@ pub enum AgeBucket {
 }
 
 /// One session as shown in the list: its metadata plus computed activity.
-/// The bin crate's `session` module owns discovering these
-/// (`session::load_rows`) and the pure formatting built on top of them
-/// (`session::short_id`/`humanize_age`/`humanize_size`/`activity_tag`); the
-/// struct and its own field-only accessors live here so `banto-core`'s
-/// pure core (the emporium's `update`, in particular) can hold and read a
-/// row without depending on the bin crate.
+/// `banto::session` owns discovering these (`session::load_rows`, which
+/// needs `banto_io`'s provider/status); the plain-text `session::activity_tag`
+/// also stays there (the `list` subcommand's formatting, not consumed by
+/// either UI). The struct, its own field-only accessors, and the numeric
+/// formatting helpers below live here instead so both UI crates
+/// (`banto-core`'s own `engine`/`app`, and `banto-tui`'s `view`) can hold,
+/// read, and display a row without depending on the bin crate.
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     /// Session id (UUID for Claude Code).
@@ -85,9 +86,9 @@ pub struct SessionRow {
     /// panel. See [`SessionMeta::preview`].
     pub preview: Option<String>,
     /// Last modification time of the session's source file, for the summary
-    /// panel's relative-age display (`session::humanize_age`).
+    /// panel's relative-age display ([`humanize_age`]).
     pub mtime: SystemTime,
-    /// Source file size in bytes, for the summary panel (`session::humanize_size`).
+    /// Source file size in bytes, for the summary panel ([`humanize_size`]).
     pub size: u64,
 }
 
@@ -115,6 +116,63 @@ impl SessionRow {
     }
 }
 
+/// Number of seconds in one hour.
+const SECS_PER_HOUR: u64 = 60 * 60;
+/// Number of seconds in one day.
+const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+
+/// First 8 characters of a session id (a UUID), for compact display in the
+/// summary panel. Char-based (not byte-slicing) so it never panics
+/// regardless of what the id turns out to contain.
+pub fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Format how long ago `mtime` was, relative to `now`, as a short human
+/// string for the summary panel: "just now", "5m ago", "3h ago", "2d ago",
+/// "3w ago". `mtime` in the future (clock skew, a freshly touched file)
+/// reads as "just now" rather than underflowing.
+pub fn humanize_age(mtime: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m ago", secs / 60)
+    } else if secs < SECS_PER_DAY {
+        format!("{}h ago", secs / SECS_PER_HOUR)
+    } else if secs < SECS_PER_DAY * 7 {
+        format!("{}d ago", secs / SECS_PER_DAY)
+    } else {
+        format!("{}w ago", secs / (SECS_PER_DAY * 7))
+    }
+}
+
+/// Format a byte count as a short human string for the summary panel:
+/// "512 B", "12 KB", "3.4 MB". Whole units only below MB, one decimal at MB
+/// and above — session files are small enough that GB never comes up.
+pub fn humanize_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    }
+}
+
+/// A session about to be opened or focused — pure data the emporium's
+/// `Cmd::OpenEmbedded` carries; the actual opening (spawning a PTY child,
+/// or in the classic list, resuming/focusing it in a real terminal backend)
+/// is `banto` (bin) and `banto_io`'s job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionToOpen {
+    pub id: String,
+    pub title: String,
+    pub cwd: PathBuf,
+}
+
 /// Row id of a brigade (sqlite AUTOINCREMENT primary key).
 pub type BrigadeId = i64;
 
@@ -135,7 +193,7 @@ pub enum BrigadeRole {
 
 impl BrigadeRole {
     /// The token persisted in the `role` column.
-    pub(crate) fn as_token(self) -> &'static str {
+    pub fn as_token(self) -> &'static str {
         match self {
             BrigadeRole::Director => "director",
             BrigadeRole::Worker => "worker",
@@ -144,7 +202,7 @@ impl BrigadeRole {
 
     /// Parse a persisted `role` token leniently: anything other than
     /// `"director"` is treated as a Worker.
-    pub(crate) fn from_token(token: &str) -> BrigadeRole {
+    pub fn from_token(token: &str) -> BrigadeRole {
         if token == "director" {
             BrigadeRole::Director
         } else {
@@ -187,4 +245,90 @@ pub struct BrigadeMessage {
     /// broadcast to every member of the recipient role — the original,
     /// still-default addressing.
     pub to_member: Option<MemberToken>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn haystack_joins_title_and_cwd() {
+        let row = SessionRow {
+            id: "id1".into(),
+            title: Some("Fix login".into()),
+            cwd: Some(PathBuf::from("/work/app")),
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+        };
+        assert_eq!(row.haystack(), "Fix login /work/app");
+    }
+
+    #[test]
+    fn haystack_tolerates_missing_fields() {
+        let row = SessionRow {
+            id: "id1".into(),
+            title: None,
+            cwd: None,
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+        };
+        assert_eq!(row.haystack(), " ");
+    }
+
+    #[test]
+    fn display_title_falls_back_to_id() {
+        let row = SessionRow {
+            id: "the-id".into(),
+            title: None,
+            cwd: None,
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+        };
+        assert_eq!(row.display_title(), "the-id");
+    }
+
+    #[test]
+    fn short_id_takes_the_first_eight_chars() {
+        assert_eq!(short_id("0123456789abcdef"), "01234567");
+        assert_eq!(short_id("short"), "short");
+        assert_eq!(short_id(""), "");
+    }
+
+    #[test]
+    fn humanize_age_covers_every_bucket() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ago = |secs: u64| now - Duration::from_secs(secs);
+
+        assert_eq!(humanize_age(now, now), "just now");
+        assert_eq!(humanize_age(ago(30), now), "just now");
+        assert_eq!(humanize_age(ago(5 * 60), now), "5m ago");
+        assert_eq!(humanize_age(ago(3 * SECS_PER_HOUR), now), "3h ago");
+        assert_eq!(humanize_age(ago(2 * SECS_PER_DAY), now), "2d ago");
+        assert_eq!(humanize_age(ago(20 * SECS_PER_DAY), now), "2w ago");
+    }
+
+    #[test]
+    fn humanize_age_treats_a_future_mtime_as_just_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let future = now + Duration::from_secs(500);
+        assert_eq!(humanize_age(future, now), "just now");
+    }
+
+    #[test]
+    fn humanize_size_covers_every_unit() {
+        assert_eq!(humanize_size(512), "512 B");
+        assert_eq!(humanize_size(12 * 1024), "12 KB");
+        assert_eq!(humanize_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    }
 }

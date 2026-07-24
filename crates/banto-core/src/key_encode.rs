@@ -1,6 +1,6 @@
 //! Encode key events into the byte sequences a PTY child expects.
 
-use banto_core::input::{KeyCode, KeyEvent};
+use crate::input::{KeyCode, KeyEvent};
 
 /// Translate a key press into the bytes to write to the child's stdin. Returns
 /// an empty vector for keys that produce no input (e.g. bare modifiers).
@@ -101,7 +101,7 @@ fn ctrl_byte(c: char) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use banto_core::input::{KeyCode, KeyEvent, Modifiers};
+    use crate::input::{KeyCode, KeyEvent, Modifiers};
 
     use super::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
 

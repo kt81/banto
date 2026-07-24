@@ -11,15 +11,11 @@
 
 mod convert;
 mod emporium;
-mod engine;
-mod input;
-mod pty;
-mod render;
 mod session;
 
+pub use banto_io::pty::PortablePtyHost;
+pub use banto_tui::render::screen_to_text;
 pub use emporium::run as run_emporium;
-pub use pty::PortablePtyHost;
-pub use render::screen_to_text;
 pub use session::EmbeddedSession;
 
 use std::io::Stdout;

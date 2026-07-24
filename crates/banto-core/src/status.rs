@@ -1,4 +1,8 @@
-//! Pure mtime-to-age-bucket classification.
+//! Pure mtime-to-age-bucket classification — the activity indicator's
+//! bucketing math only. Live-process/PID state (`ProcessProbe`,
+//! `LiveSession`, `classify`) lives in `banto_io::status`: it needs
+//! `sysinfo` and reads `<claude_home>/sessions/*.json`, both forbidden here
+//! (`docs/DISCIPLINE.md` §2).
 
 use std::time::{Duration, SystemTime};
 

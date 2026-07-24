@@ -1,0 +1,21 @@
+[package]
+name = "banto-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+banto-core = { version = "0.1.0", path = "../banto-core" }
+# Default features off: `ratatui`'s default `crossterm` feature pulls in the
+# real `crossterm` crate (a terminal backend) transitively, which this crate
+# must never depend on (`docs/DISCIPLINE.md` §2) — banto-tui only renders
+# into a `Frame`/`Buffer` the bin crate hands it, it never owns a
+# `Terminal<CrosstermBackend<_>>` itself. `TestBackend` (used in this
+# crate's own tests) needs no backend feature at all.
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "all-widgets",
+    "layout-cache",
+    "macros",
+    "underline-color",
+] }
+unicode-width = "0.2.2"
+vt100 = "0.16.2"

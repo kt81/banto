@@ -1,60 +1,21 @@
 //! A single embedded child terminal, split along the sans-IO line (see
-//! `docs/DISCIPLINE.md` §2): [`Screen`] is the `vt100` model — pure state,
-//! fed by output chunks, safe to hold in the emporium's core `State` — and
-//! [`PtyHandle`] is the channels to the PTY child — input/resize/kill/output,
-//! all I/O, held in the shell's own registry. [`EmbeddedSession`] composes
-//! both back into the single handle the standalone `banto _embed` demo
-//! (`super::run_embedded`) still uses; the emporium (`super::engine`) uses
-//! `Screen`/`PtyHandle` directly instead.
+//! `docs/DISCIPLINE.md` §2): `banto_core::screen::Screen` is the `vt100`
+//! model — pure state, fed by output chunks, safe to hold in the emporium's
+//! core `State` — and [`PtyHandle`] is the channels to the PTY child —
+//! input/resize/kill/output, all I/O, held in the shell's own registry.
+//! [`EmbeddedSession`] composes both back into the single handle the
+//! standalone `banto _embed` demo (`super::run_embedded`) still uses; the
+//! emporium (`banto_core::engine`) uses `Screen`/`PtyHandle` directly
+//! instead.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
 use banto_core::input::KeyEvent;
-
-use super::input::key_to_bytes;
-use super::pty::{PtyHost, PtyIo};
-
-/// The `vt100` terminal model for one hosted session: pure state, driven by
-/// output chunks ([`Self::process`]) and resized in step with its `PtyHandle`
-/// ([`Self::resize`] reports whether the size actually changed, so the
-/// caller knows whether to also resize the PTY itself — an I/O action this
-/// type never performs).
-pub(crate) struct Screen {
-    parser: vt100::Parser,
-    size: (u16, u16),
-}
-
-impl Screen {
-    pub(crate) fn new(rows: u16, cols: u16) -> Self {
-        Self {
-            parser: vt100::Parser::new(rows, cols, 0),
-            size: (rows, cols),
-        }
-    }
-
-    /// Feed one chunk of the child's output into the model.
-    pub(crate) fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-    }
-
-    /// Resize the model. Returns whether the size actually changed (a no-op
-    /// resize is not worth forwarding to the PTY).
-    pub(crate) fn resize(&mut self, rows: u16, cols: u16) -> bool {
-        if self.size == (rows, cols) {
-            return false;
-        }
-        self.parser.screen_mut().set_size(rows, cols);
-        self.size = (rows, cols);
-        true
-    }
-
-    /// The current terminal screen, for rendering.
-    pub(crate) fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
-    }
-}
+use banto_core::key_encode::key_to_bytes;
+use banto_core::screen::Screen;
+use banto_io::pty::{PtyHost, PtyIo};
 
 /// The result of one non-blocking poll of a [`PtyHandle`]'s output channel.
 pub(crate) enum PtyPoll {
@@ -216,8 +177,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use banto_core::input::{KeyCode, KeyEvent, Modifiers};
+    use banto_io::pty::mock::MockPtyHost;
 
-    use super::super::pty::mock::MockPtyHost;
     use super::{EmbeddedSession, PtyHandle, PtyPoll};
 
     fn open(host: &MockPtyHost) -> EmbeddedSession {

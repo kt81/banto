@@ -19,7 +19,7 @@ mod panes;
 mod pins;
 mod sessions;
 
-pub use crate::model::{
+pub use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
 };
 pub use groups::{Group, GroupId};
@@ -121,7 +121,7 @@ pub(crate) mod test_util {
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use crate::model::{SessionId, SessionMeta};
+    use banto_core::model::{SessionId, SessionMeta};
 
     /// Builds a synthetic `SessionMeta` fixture (never real session data).
     /// The mtime is aligned to whole milliseconds so it round-trips exactly.
@@ -151,7 +151,7 @@ pub(crate) mod test_util {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SessionId;
+    use banto_core::model::SessionId;
 
     #[test]
     fn open_sets_the_configured_busy_timeout() {

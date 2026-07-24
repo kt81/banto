@@ -9,15 +9,12 @@
 //! banto's own database (session <-> pane map, groups, pins) lives under
 //! `Config.db_path`, falling back to [`config::default_db_path`].
 
-mod app;
 mod embedded;
 mod mcp;
 mod opener;
-mod process;
 mod session;
 mod sgr;
 mod tui;
-mod view;
 mod wrap;
 
 use std::path::{Path, PathBuf};
@@ -25,13 +22,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use banto_core::config::{self, Config};
-use banto_core::opener::SystemCommandRunner;
-use banto_core::provider::claude_code::ClaudeCodeProvider;
+use banto_core::config::Config;
 use banto_core::status::AgeThresholds;
-use banto_core::store::Store;
+use banto_io::config;
+use banto_io::opener::SystemCommandRunner;
+use banto_io::process::SystemProcessRunner;
+use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::store::Store;
 
-use process::SystemProcessRunner;
 use session::{activity_tag, load_rows, thresholds_from};
 
 /// Search and resume local Claude Code sessions.

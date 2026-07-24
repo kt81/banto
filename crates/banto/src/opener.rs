@@ -1,4 +1,4 @@
-//! Bin-level wiring between `banto-core`'s `Opener`/`Store` and the resume
+//! Bin-level wiring between `banto-io`'s `Opener`/`Store` and the resume
 //! flow triggered from the TUI.
 //!
 //! Decides whether a session's existing pane is still alive (focus it) or a
@@ -6,7 +6,7 @@
 //! the "never resume a session twice" invariant (CLAUDE.md invariant 4;
 //! docs/REQUIREMENTS.md "Opener spec"). Liveness is judged purely by PID (the
 //! `banto _wrap` process registers its own PID once it starts — see
-//! [`crate::wrap`] — mirroring how `banto_core::status` judges session
+//! [`crate::wrap`] — mirroring how `banto_io::status` judges session
 //! activity), never by querying the terminal backend itself.
 
 use std::path::{Path, PathBuf};
@@ -14,19 +14,13 @@ use std::time::SystemTime;
 
 use banto_core::config::OpenerMode;
 use banto_core::model::SessionId;
-use banto_core::opener::{
+pub use banto_core::model::SessionToOpen;
+use banto_io::opener::{
     self, Backend, CommandRunner, CommandSpec, OpenError, Opener, ResumeCommand, SessionHandle,
     TmuxOpener, WindowsTerminalOpener,
 };
-use banto_core::status::{LiveSession, ProcessProbe};
-use banto_core::store::{PaneRecord, Store, StoreError};
-
-/// A session about to be opened or focused.
-pub struct SessionToOpen {
-    pub id: String,
-    pub title: String,
-    pub cwd: PathBuf,
-}
+use banto_io::status::{LiveSession, ProcessProbe};
+use banto_io::store::{PaneRecord, Store, StoreError};
 
 /// Outcome of an open/focus attempt, for the caller to turn into a status message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +129,7 @@ pub fn open_new_session<R: CommandRunner + 'static>(
 /// [`resolve_backend`]); an existing pane is always focused through whichever
 /// backend it was originally opened with, regardless of the current default.
 /// `live` is the current `<claude_home>/sessions/*.json` snapshot (see
-/// `banto_core::status::read_live_sessions`), used only for the untracked
+/// `banto_io::status::read_live_sessions`), used only for the untracked
 /// case below.
 pub fn open_session<R: CommandRunner + Clone + 'static>(
     store: &Store,
@@ -186,7 +180,7 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
 /// untracked (see [`open_session`]), and reused by [`decide_inplace_resume`]
 /// for the same reason: in-place mode has no pane map of its own, so this is
 /// its *only* double-resume guard, not just a fallback for the untracked
-/// case. Unlike `banto_core::status::classify` (which is about which
+/// case. Unlike `banto_io::status::classify` (which is about which
 /// activity dot to show, so a busy entry outranks a merely-alive one), this
 /// only answers "is this session actually running right now".
 pub(crate) fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn ProcessProbe) -> bool {
@@ -532,7 +526,7 @@ fn resolve_own_session<R: CommandRunner>(runner: &R) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use banto_core::opener::{CommandOutput, CommandSpec};
+    use banto_io::opener::{CommandOutput, CommandSpec};
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
     use std::rc::Rc;

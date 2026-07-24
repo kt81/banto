@@ -109,10 +109,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "banto-core",
+ "banto-io",
+ "banto-tui",
  "clap",
  "crossterm",
  "dirs",
- "portable-pty",
  "ratatui",
  "serde_json",
  "tempfile",
@@ -125,9 +126,22 @@ dependencies = [
 name = "banto-core"
 version = "0.1.0"
 dependencies = [
+ "nucleo",
+ "ratatui-core",
+ "serde",
+ "toml",
+ "vt100",
+]
+
+[[package]]
+name = "banto-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "banto-core",
  "dirs",
  "notify",
- "nucleo",
+ "portable-pty",
  "rusqlite",
  "serde",
  "serde_json",
@@ -135,6 +149,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "toml",
+]
+
+[[package]]
+name = "banto-tui"
+version = "0.1.0"
+dependencies = [
+ "banto-core",
+ "ratatui",
+ "unicode-width",
+ "vt100",
 ]
 
 [[package]]

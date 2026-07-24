@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use super::{ProviderError, SessionProvider};
-use crate::model::{SessionId, SessionMeta};
+use banto_core::model::{SessionId, SessionMeta};
 
 /// Stable provider name stored in the DB.
 const PROVIDER_NAME: &str = "claude-code";

@@ -199,7 +199,7 @@ mod tests {
     use super::super::test_util::meta;
     use super::super::{Store, StoreError};
     use super::MIGRATIONS;
-    use crate::model::SessionId;
+    use banto_core::model::SessionId;
 
     /// Proves the bundled rusqlite build ships the FTS5 module.
     #[test]

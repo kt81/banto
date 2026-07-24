@@ -32,8 +32,8 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use banto_core::model::SessionId;
-use banto_core::store::{BrigadeId, BrigadeMessage, BrigadeRole, MemberToken, Store, StoreError};
+use banto_core::model::{BrigadeId, BrigadeMessage, BrigadeRole, MemberToken, SessionId};
+use banto_io::store::{Store, StoreError};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
 /// launch (the "register the pair at launch" hook). `brigade` + `member`

@@ -1,4 +1,6 @@
-//! Live-session state and activity classification.
+//! Live-session state and activity classification — the I/O half of status
+//! (`banto_core::status` keeps the pure bucketing math: `AgeThresholds` /
+//! `age_bucket`).
 //!
 //! Sources, in priority order (docs/REQUIREMENTS.md, "Activity indicator"):
 //! 1. `<claude_home>/sessions/<pid>.json` + PID alive + status=busy -> Busy
@@ -6,20 +8,19 @@
 //! 3. otherwise bucket the session file mtime into Today / ThisWeek / Older
 //!
 //! PID liveness sits behind [`ProcessProbe`] so tests can mock it (no real
-//! processes in tests). Bucketing is a pure function of
-//! (mtime, now, thresholds).
+//! processes in tests). Bucketing itself lives in `banto_core::status`, a
+//! pure function of (mtime, now, thresholds).
 
-mod age;
 mod live;
 mod probe;
 
-pub use age::{AgeThresholds, age_bucket};
 pub use live::{LiveSession, read_live_sessions};
 pub use probe::{ProcessProbe, SysinfoProbe};
 
 use std::time::SystemTime;
 
-use crate::model::{Activity, SessionMeta};
+use banto_core::model::{Activity, SessionMeta};
+use banto_core::status::{AgeThresholds, age_bucket};
 
 /// Classify one session's activity from live state and file age.
 ///
@@ -58,11 +59,13 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::model::{AgeBucket, SessionId};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    use banto_core::model::{AgeBucket, SessionId};
+
+    use super::*;
 
     /// Mock probe reporting only an explicit set of PIDs as alive.
     struct MockProbe {

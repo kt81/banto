@@ -1,40 +1,16 @@
-//! banto configuration.
+//! banto configuration types.
 //!
-//! `config.toml` lives in `dirs::config_dir()/banto`, data (sqlite) in
-//! `dirs::data_local_dir()/banto`; banto never writes outside these two
-//! directories of its own. Loading is tolerant: a missing file means all
-//! defaults, unknown keys are ignored. A malformed file is an error only for
-//! the strict [`load`]; normal startup goes through [`load_or_default`],
-//! which falls back to the defaults so a broken config never prevents the
-//! TUI from starting (use [`load`] when the error should be surfaced, e.g.
-//! for a diagnostics subcommand).
+//! Every field has a default and unknown keys are ignored (`#[serde(default)]`
+//! throughout), so any subset of a TOML document deserializes into a valid
+//! [`Config`] — that leniency is the contract these types promise; loading
+//! the actual `config.toml` file (locating it, reading it, turning a parse
+//! failure into an error or a silent default) is `banto_io::config`'s job —
+//! it needs filesystem access and the `dirs` crate for the default path,
+//! both forbidden here (`docs/DISCIPLINE.md` §2).
 
-mod paths;
-
-pub use paths::{default_config_path, default_db_path};
-
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
-
-/// Errors from the strict [`load`].
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    /// The file exists but could not be read.
-    #[error("failed to read config file {path:?}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// The file is not valid TOML (or a field has the wrong shape).
-    #[error("failed to parse config file {path:?}: {source}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-}
 
 /// Which backend resumes sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -142,8 +118,7 @@ impl BrigadeConfig {
 
 /// Emporium keybinding settings. Just the tmux-style prefix chord this
 /// round — full user-remappable keymaps are out of scope (a scoped decision,
-/// not an oversight: see `crates/banto/src/embedded/engine.rs`'s
-/// `PrefixKey`).
+/// not an oversight: see `crate::engine`'s `PrefixKey`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct KeysConfig {
@@ -153,9 +128,9 @@ pub struct KeysConfig {
     /// or a plain `b` sends the prefix's own byte through literally).
     /// `"C-<char>"` for a Control chord (e.g. the default `"C-b"`), or a
     /// bare single character for an unmodified key. Parsed leniently in the
-    /// `banto` bin crate, not here: `KeyCode`/`KeyModifiers` are `crossterm`
-    /// types, and `banto-core` never depends on `crossterm` — so this field
-    /// is just the raw string, validated no further than "is it a string".
+    /// `banto` bin crate, not here: `KeyCode`/`Modifiers` parsing from a raw
+    /// chord string is `crate::engine::PrefixKey`'s job — this field is just
+    /// the raw string, validated no further than "is it a string".
     pub prefix: String,
 }
 
@@ -178,51 +153,20 @@ pub struct Config {
     pub keys: KeysConfig,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
-    /// Overrides [`default_db_path`].
+    /// Overrides `banto_io::config::default_db_path`.
     pub db_path: Option<PathBuf>,
-}
-
-/// Strict load. A missing file yields all defaults (running without a config
-/// file is normal), but an unreadable or unparsable file is an error.
-pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(err) => {
-            return Err(ConfigError::Read {
-                path: path.to_path_buf(),
-                source: err,
-            });
-        }
-    };
-    toml::from_str(&text).map_err(|source| ConfigError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Tolerant load for normal startup: any read or parse failure silently falls
-/// back to the defaults. See the module docs for the rationale.
-pub fn load_or_default(path: &Path) -> Config {
-    load(path).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn write_config(dir: &tempfile::TempDir, text: &str) -> PathBuf {
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, text).unwrap();
-        path
-    }
-
-    #[test]
-    fn missing_file_yields_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("does-not-exist.toml");
-        assert_eq!(load(&path).unwrap(), Config::default());
-        assert_eq!(load_or_default(&path), Config::default());
+    /// Deserialize `text` as a [`Config`], the same way `banto_io::config`'s
+    /// real file loader does — but without a filesystem, since these tests
+    /// are only about the types' `Deserialize` shape (that's `banto_io`'s
+    /// job to test end to end, over a real temp file).
+    fn parse(text: &str) -> Config {
+        toml::from_str(text).unwrap()
     }
 
     #[test]
@@ -241,25 +185,19 @@ mod tests {
 
     #[test]
     fn keys_prefix_parses_from_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "[keys]\nprefix = \"C-a\"\n");
-        let config = load(&path).unwrap();
+        let config = parse("[keys]\nprefix = \"C-a\"\n");
         assert_eq!(config.keys.prefix, "C-a");
     }
 
     #[test]
     fn keys_section_missing_yields_the_default_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = \"psmux\"\n");
-        let config = load(&path).unwrap();
+        let config = parse("opener = \"psmux\"\n");
         assert_eq!(config.keys.prefix, "C-b");
     }
 
     #[test]
     fn partial_brigade_section_fills_remaining_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "[brigade]\nworkers = 3\n");
-        let config = load(&path).unwrap();
+        let config = parse("[brigade]\nworkers = 3\n");
         assert_eq!(config.brigade.workers, 3);
         assert_eq!(config.brigade.worker_count(), 3);
         assert_eq!(config.brigade.worker_model, "sonnet");
@@ -282,37 +220,26 @@ mod tests {
 
     #[test]
     fn brigade_worker_model_and_relay_parse() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            &dir,
-            "[brigade]\nworker_model = \"opus\"\nrelay = \"manual\"\n",
-        );
-        let config = load(&path).unwrap();
+        let config = parse("[brigade]\nworker_model = \"opus\"\nrelay = \"manual\"\n");
         assert_eq!(config.brigade.worker_model, "opus");
         assert_eq!(config.brigade.relay, RelayMode::Manual);
     }
 
     #[test]
     fn brigade_worker_model_empty_string_is_the_inherit_default_escape_hatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "[brigade]\nworker_model = \"\"\n");
-        let config = load(&path).unwrap();
+        let config = parse("[brigade]\nworker_model = \"\"\n");
         assert_eq!(config.brigade.worker_model, "");
     }
 
     #[test]
     fn brigade_relay_unknown_value_falls_back_to_auto() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "[brigade]\nrelay = \"sometimes\"\n");
-        let config = load(&path).unwrap();
+        let config = parse("[brigade]\nrelay = \"sometimes\"\n");
         assert_eq!(config.brigade.relay, RelayMode::Auto);
     }
 
     #[test]
     fn partial_toml_fills_remaining_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = \"psmux\"\n");
-        let config = load(&path).unwrap();
+        let config = parse("opener = \"psmux\"\n");
         assert_eq!(config.opener, OpenerMode::Psmux);
         assert_eq!(config.activity, ActivityConfig::default());
         assert_eq!(config.db_path, None);
@@ -320,9 +247,7 @@ mod tests {
 
     #[test]
     fn partial_activity_section_fills_remaining_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "[activity]\ntoday_hours = 12\n");
-        let config = load(&path).unwrap();
+        let config = parse("[activity]\ntoday_hours = 12\n");
         assert_eq!(config.activity.today_hours, 12);
         assert_eq!(config.activity.week_days, 7);
     }
@@ -335,31 +260,22 @@ mod tests {
             ("psmux", OpenerMode::Psmux),
             ("windows-terminal", OpenerMode::WindowsTerminal),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = write_config(&dir, &format!("opener = \"{text}\"\n"));
-            assert_eq!(load(&path).unwrap().opener, expected);
+            let config = parse(&format!("opener = \"{text}\"\n"));
+            assert_eq!(config.opener, expected);
         }
     }
 
     #[test]
     fn unknown_keys_are_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            &dir,
-            "opener = \"psmux\"\nfuture_option = true\n[some_new_section]\nx = 1\n",
-        );
-        let config = load(&path).unwrap();
+        let config = parse("opener = \"psmux\"\nfuture_option = true\n[some_new_section]\nx = 1\n");
         assert_eq!(config.opener, OpenerMode::Psmux);
     }
 
     #[test]
     fn path_overrides_parse() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            &dir,
+        let config = parse(
             "claude_home = \"C:/synthetic/claude-home\"\ndb_path = \"C:/synthetic/banto.db\"\n",
         );
-        let config = load(&path).unwrap();
         assert_eq!(
             config.claude_home,
             Some(PathBuf::from("C:/synthetic/claude-home"))
@@ -368,29 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_toml_errors_strictly_and_defaults_tolerantly() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = [not toml");
-        assert!(matches!(load(&path), Err(ConfigError::Parse { .. })));
-        assert_eq!(load_or_default(&path), Config::default());
-    }
-
-    #[test]
     fn wrong_field_type_is_a_parse_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = \"no-such-backend\"\n");
-        assert!(matches!(load(&path), Err(ConfigError::Parse { .. })));
-        assert_eq!(load_or_default(&path), Config::default());
-    }
-
-    #[test]
-    fn default_paths_end_in_banto_directory() {
-        // Only inspects the computed paths; never creates or writes them.
-        if let Some(path) = default_config_path() {
-            assert!(path.ends_with(Path::new("banto").join("config.toml")));
-        }
-        if let Some(path) = default_db_path() {
-            assert!(path.ends_with(Path::new("banto").join("banto.db")));
-        }
+        let result: Result<Config, _> = toml::from_str("opener = \"no-such-backend\"\n");
+        assert!(result.is_err());
     }
 }

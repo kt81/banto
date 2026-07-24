@@ -24,7 +24,7 @@ use std::time::SystemTime;
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::model::{
+use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
 };
 

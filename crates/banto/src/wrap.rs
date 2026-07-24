@@ -34,11 +34,10 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 
 use banto_core::model::SessionId;
-use banto_core::opener::{Backend, CommandRunner, CommandSpec, SessionHandle};
-use banto_core::provider::claude_code::ClaudeCodeProvider;
-use banto_core::store::{PaneRecord, Store};
-
-use crate::process::{ProcessRunner, SpawnedProcess};
+use banto_io::opener::{Backend, CommandRunner, CommandSpec, SessionHandle};
+use banto_io::process::{ProcessRunner, SpawnedProcess};
+use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::store::{PaneRecord, Store};
 
 /// Register this process's PID, run `argv` to completion, then clean up the
 /// pane record. Returns the child's exit code (or `1` if it could not be
@@ -477,8 +476,8 @@ fn track_new_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::mock::{MockProcessRunner, MockSpawnedProcess};
-    use banto_core::opener::{CommandOutput, OpenError};
+    use banto_io::opener::{CommandOutput, OpenError};
+    use banto_io::process::mock::{MockProcessRunner, MockSpawnedProcess};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::fs;
@@ -559,7 +558,7 @@ mod tests {
 
     /// A [`CommandRunner`] that records every spec and replays queued
     /// outputs in order (falling back to an empty success once exhausted).
-    /// Mirrors `banto_core::opener::command::mock::MockRunner`, which is
+    /// Mirrors `banto_io::opener::command::mock::MockRunner`, which is
     /// private to that crate.
     #[derive(Default)]
     struct MockCommandRunner {

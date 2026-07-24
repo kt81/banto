@@ -2,15 +2,16 @@
 //!
 //! All filtering, sorting, selection and scroll math lives here as a plain,
 //! UI-free struct so it can be unit-tested without a terminal. The render loop
-//! in [`crate::tui`] is a thin shell over this state.
+//! in `banto::tui` (the classic list) is a thin shell over this state; the
+//! emporium's `crate::engine` uses it too.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::session::SessionRow;
+use crate::model::SessionRow;
 
-/// A group id, mirroring `banto_core::store::GroupId` (`i64`) without
+/// A group id, mirroring `banto_io::store::GroupId` (`i64`) without
 /// coupling `App` to the store crate's types.
 pub type GroupId = i64;
 
@@ -1482,11 +1483,11 @@ impl App {
 
 /// Rank `haystacks` against `query`, returning matching indices best-first.
 ///
-/// Delegates to `banto_core::search` (nucleo smart-case fuzzy matching): an
+/// Delegates to [`crate::search`] (nucleo smart-case fuzzy matching): an
 /// empty query yields every index in the original order, otherwise only
 /// matches are returned, best score first.
 fn rank_indices(query: &str, haystacks: &[String]) -> Vec<usize> {
-    banto_core::search::rank(query, haystacks)
+    crate::search::rank(query, haystacks)
         .into_iter()
         .map(|m| m.index)
         .collect()
@@ -1495,7 +1496,7 @@ fn rank_indices(query: &str, haystacks: &[String]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use banto_core::model::{Activity, AgeBucket};
+    use crate::model::{Activity, AgeBucket};
     use std::path::PathBuf;
     use std::time::SystemTime;
 

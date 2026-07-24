@@ -1,0 +1,20 @@
+[package]
+name = "banto-io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+banto-core = { version = "0.1.0", path = "../banto-core" }
+dirs = "6.0.0"
+notify = "8.2.0"
+portable-pty = "0.9.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.150"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+thiserror = "2.0.19"
+toml = "0.9.8"
+
+[dev-dependencies]
+tempfile = "3.24.0"

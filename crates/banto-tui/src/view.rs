@@ -1,10 +1,10 @@
 //! Shared session-list / summary rendering, used by both the classic list TUI
-//! (`crate::tui`) and the emporium sidebar (`crate::embedded::emporium`).
+//! (`banto::tui`) and the emporium sidebar (`banto::embedded::emporium`).
 //!
 //! These are pure `(frame, app, area)` widgets so either mode can place them in
-//! its own layout; all list/selection/scroll state lives in `crate::app::App`,
-//! which both modes drive. Extracted from `crate::tui` so the two modes render
-//! sessions identically rather than drifting.
+//! its own layout; all list/selection/scroll state lives in
+//! `banto_core::app::App`, which both modes drive. Extracted from the classic
+//! TUI so the two modes render sessions identically rather than drifting.
 
 use std::time::SystemTime;
 
@@ -14,13 +14,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use banto_core::model::{Activity, AgeBucket};
-
-use crate::app::{App, ListLine};
-use crate::session;
+use banto_core::app::{App, ListLine};
+use banto_core::model::{self, Activity, AgeBucket, SessionRow};
 
 /// Render the session list (or a placeholder when nothing matches) into `area`.
-pub(crate) fn render_list(frame: &mut Frame, app: &App, area: Rect) {
+pub fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     if app.filtered_len() == 0 {
         let message = if app.total_len() == 0 {
             "No sessions found."
@@ -43,8 +41,8 @@ pub(crate) fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 /// row — colored activity dot, pin marker (if pinned), title (or id), dimmed
 /// cwd. Each is its own `ListItem`/physical line rather than a header bundled
 /// into its row, matching the index space `App::click`/`App::scroll`/
-/// `App::ensure_visible` all use — see [`crate::app::ListLine`] for why that
-/// matters for mouse clicks.
+/// `App::ensure_visible` all use — see [`ListLine`] for why that matters for
+/// mouse clicks.
 fn list_item(line: ListLine<'_>) -> ListItem<'static> {
     match line {
         ListLine::Header(name) => ListItem::new(Line::from(Span::styled(
@@ -106,7 +104,7 @@ fn list_item(line: ListLine<'_>) -> ListItem<'static> {
 /// separation. A zero-height `area` (a too-short terminal, per the caller's
 /// layout) makes this a no-op. `now` is the caller's own clock read (view
 /// functions are pure `(frame, app, area, now)` — no query during drawing).
-pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
+pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
     if area.height == 0 {
         return;
     }
@@ -160,16 +158,11 @@ pub(crate) fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: Syst
 
 /// Build the summary panel's meta line: relative age, size, short id, and any
 /// markers (pinned/director/agent) that apply.
-fn summary_meta(
-    row: &session::SessionRow,
-    pinned: bool,
-    director: bool,
-    now: SystemTime,
-) -> String {
+fn summary_meta(row: &SessionRow, pinned: bool, director: bool, now: SystemTime) -> String {
     let mut parts = vec![
-        session::humanize_age(row.mtime, now),
-        session::humanize_size(row.size),
-        session::short_id(&row.id),
+        model::humanize_age(row.mtime, now),
+        model::humanize_size(row.size),
+        model::short_id(&row.id),
     ];
     if pinned {
         parts.push("pinned".to_string());
