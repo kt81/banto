@@ -449,6 +449,16 @@ impl Default for PrefixKey {
     }
 }
 
+/// An arrow direction resolved while the prefix is armed (see
+/// [`PrefixAction::Move`] and [`arrow_target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// What an armed prefix's follow-up key resolves to (see [`update_key`]'s
 /// prefix handling). Pure decision surface, no `KeyEvent`/`Stage` needed
 /// once resolved — the unit-test target for the whole prefix feature.
@@ -457,9 +467,16 @@ enum PrefixAction {
     /// The prefix chord again, or plain `b`: send the prefix's own byte
     /// through to the child literally (the tmux "send-prefix" convention).
     Literal,
-    /// `o` or Tab: cycle the focused pane within the staged brigade.
+    /// `o` or Tab: step forward through the focus ring (sidebar, then each
+    /// staged pane in order), wrapping — see [`cycle_forward`].
     CyclePane,
-    /// `1`-`9`, in range: focus the pane at this 0-based index.
+    /// An arrow key: move by grid geometry — see [`arrow_target`].
+    Move(Direction),
+    /// `1`-`9`, in range: focus the pane at this 0-based index. This
+    /// addresses `Stage`'s pane list directly (`1` is always `panes[0]`,
+    /// the director) and is deliberately untouched by the focus ring's
+    /// sidebar slot — ring position and pane number are different axes,
+    /// don't conflate them when touching this again.
     FocusPane(usize),
     /// `1`-`9`, but the staged brigade doesn't have that many panes.
     OutOfRange,
@@ -467,22 +484,31 @@ enum PrefixAction {
     Sidebar,
     /// `x`: open the kill-confirm dialog for the focused pane.
     Kill,
-    /// Anything else: swallowed, not forwarded — a fat-fingered prefix
-    /// command must never leak into the child as a raw keypress.
+    /// Anything else — including any of the plain-char bindings above with
+    /// a modifier held (a Ctrl/Alt-mangled `o`/`s`/`x`/digit is never a
+    /// binding, only ever noise) — swallowed, not forwarded, since a
+    /// fat-fingered prefix command must never leak into the child as a raw
+    /// keypress.
     Unbound,
 }
 
 /// Resolve one key pressed while the prefix is armed. `pane_count` is the
-/// staged brigade's pane count (0 for `Solo`/`Empty`, where digit-focus and
-/// pane-cycling are meaningless but still resolved consistently — a `1` on a
-/// solo stage is simply out of range, not a special case).
+/// staged brigade's pane count (1 for `Solo`, the lone pane; 0 for `Empty`,
+/// where digit-focus and pane-cycling are meaningless but still resolved
+/// consistently — a `1` on a solo stage is simply out of range, not a
+/// special case).
 fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> PrefixAction {
-    if prefix.matches(key) || key.code == KeyCode::Char('b') {
+    if prefix.matches(key) || (key.code == KeyCode::Char('b') && key.modifiers.is_empty()) {
         return PrefixAction::Literal;
     }
     match key.code {
-        KeyCode::Char('o') | KeyCode::Tab => PrefixAction::CyclePane,
-        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+        KeyCode::Tab => PrefixAction::CyclePane,
+        KeyCode::Char('o') if key.modifiers.is_empty() => PrefixAction::CyclePane,
+        KeyCode::Left => PrefixAction::Move(Direction::Left),
+        KeyCode::Right => PrefixAction::Move(Direction::Right),
+        KeyCode::Up => PrefixAction::Move(Direction::Up),
+        KeyCode::Down => PrefixAction::Move(Direction::Down),
+        KeyCode::Char(c) if key.modifiers.is_empty() && c.is_ascii_digit() && c != '0' => {
             let n = c.to_digit(10).expect("ascii digit") as usize;
             if n <= pane_count {
                 PrefixAction::FocusPane(n - 1)
@@ -490,9 +516,113 @@ fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> 
                 PrefixAction::OutOfRange
             }
         }
-        KeyCode::Char('s') | KeyCode::Esc => PrefixAction::Sidebar,
-        KeyCode::Char('x') => PrefixAction::Kill,
+        KeyCode::Esc => PrefixAction::Sidebar,
+        KeyCode::Char('s') if key.modifiers.is_empty() => PrefixAction::Sidebar,
+        KeyCode::Char('x') if key.modifiers.is_empty() => PrefixAction::Kill,
         _ => PrefixAction::Unbound,
+    }
+}
+
+/// A position in the arrow/cycle focus ring: the sidebar, or a 0-based pane
+/// index into the staged brigade (`0` is the director/solo pane, `1..` are
+/// workers in stack order). Distinct from [`PrefixAction::FocusPane`], which
+/// addresses panes directly and never includes the sidebar — see that
+/// variant's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusSlot {
+    Sidebar,
+    Pane(usize),
+}
+
+/// Where the ring currently sits, derived from `state`'s existing
+/// `focus`/`stage` rather than tracked separately.
+fn current_focus_slot(state: &EmporiumState) -> FocusSlot {
+    match state.focus {
+        Focus::Sidebar => FocusSlot::Sidebar,
+        Focus::Pane => match &state.stage {
+            Stage::Brigade { focused, .. } => FocusSlot::Pane(*focused),
+            // `Solo`/`Empty` have no numeric pane index; `Pane(0)` is the
+            // only slot `Focus::Pane` can mean for either.
+            Stage::Solo(_) | Stage::Empty => FocusSlot::Pane(0),
+        },
+    }
+}
+
+/// Write a resolved ring/arrow target back into `state`.
+fn apply_focus_slot(state: &mut EmporiumState, slot: FocusSlot) {
+    match slot {
+        FocusSlot::Sidebar => state.focus = Focus::Sidebar,
+        FocusSlot::Pane(n) => {
+            state.focus = Focus::Pane;
+            if let Stage::Brigade { focused, .. } = &mut state.stage {
+                *focused = n;
+            }
+        }
+    }
+}
+
+/// `o`/Tab: the next slot forward in the ring `[Sidebar, Pane(0), Pane(1),
+/// ...]` (length `1 + pane_count`), wrapping. A ring of length 1 (`Empty`,
+/// `pane_count == 0`) has nowhere else to go and stays put.
+fn cycle_forward(from: FocusSlot, pane_count: usize) -> FocusSlot {
+    let ring_len = 1 + pane_count;
+    if ring_len <= 1 {
+        return FocusSlot::Sidebar;
+    }
+    let pos = match from {
+        FocusSlot::Sidebar => 0,
+        FocusSlot::Pane(n) => 1 + n,
+    };
+    let next = (pos + 1) % ring_len;
+    if next == 0 {
+        FocusSlot::Sidebar
+    } else {
+        FocusSlot::Pane(next - 1)
+    }
+}
+
+/// One armed arrow key's target slot, navigating the three-column grid
+/// (sidebar | director-or-solo | worker stack) by geometry rather than ring
+/// order. Left/Right cross columns; Up/Down step within the worker stack
+/// only, clamped (no wrap). Every edge case (sidebar's Left, a solo/director
+/// pane's Up/Down, a worker's Right) is a deliberate no-op, not an omission.
+fn arrow_target(from: FocusSlot, direction: Direction, pane_count: usize) -> FocusSlot {
+    match (from, direction) {
+        (FocusSlot::Sidebar, Direction::Right) => {
+            if pane_count == 0 {
+                FocusSlot::Sidebar
+            } else {
+                FocusSlot::Pane(0)
+            }
+        }
+        (FocusSlot::Sidebar, _) => FocusSlot::Sidebar,
+
+        (FocusSlot::Pane(0), Direction::Left) => FocusSlot::Sidebar,
+        (FocusSlot::Pane(0), Direction::Right) => {
+            if pane_count >= 2 {
+                FocusSlot::Pane(1)
+            } else {
+                FocusSlot::Pane(0)
+            }
+        }
+        (FocusSlot::Pane(0), Direction::Up | Direction::Down) => FocusSlot::Pane(0),
+
+        (FocusSlot::Pane(_), Direction::Left) => FocusSlot::Pane(0),
+        (FocusSlot::Pane(n), Direction::Right) => FocusSlot::Pane(n),
+        (FocusSlot::Pane(n), Direction::Up) => {
+            if n > 1 {
+                FocusSlot::Pane(n - 1)
+            } else {
+                FocusSlot::Pane(n)
+            }
+        }
+        (FocusSlot::Pane(n), Direction::Down) => {
+            if n + 1 < pane_count {
+                FocusSlot::Pane(n + 1)
+            } else {
+                FocusSlot::Pane(n)
+            }
+        }
     }
 }
 
@@ -810,6 +940,18 @@ fn update_key(
     if state.prefix_armed.is_some() {
         return resolve_armed_prefix(state, app, key, now);
     }
+    // The prefix chord arms instead of dispatching normally — from either
+    // focus, not just `Focus::Pane` (tmux's prefix always arms, whichever
+    // pane/window has keyboard focus) — a tmux-style pane command follows
+    // (see `resolve_armed_prefix`), costing a double-tap for a literal
+    // prefix byte through, same as tmux. Checked before F2/F3 and the
+    // per-focus dispatch below so it always wins; a configured prefix that
+    // collides with another binding is the user's choice (`[keys] prefix`
+    // is deliberately unvalidated against the rest of the keymap).
+    if state.prefix.matches(&key) {
+        state.prefix_armed = Some(now);
+        return Vec::new();
+    }
     if code == KeyCode::F(2) {
         state.focus = match state.focus {
             Focus::Sidebar if state.stage.is_active() => Focus::Pane,
@@ -828,13 +970,6 @@ fn update_key(
 
     match state.focus {
         Focus::Pane => {
-            // The prefix chord arms instead of forwarding — a tmux-style
-            // pane command follows (see `resolve_armed_prefix`), costing a
-            // double-tap for a literal prefix byte through, same as tmux.
-            if state.prefix.matches(&key) {
-                state.prefix_armed = Some(now);
-                return Vec::new();
-            }
             if let Some(target) = state.stage.focused_key().cloned() {
                 let bytes = key_to_bytes(&key);
                 state.last_forwarded_input = Some(now);
@@ -849,60 +984,69 @@ fn update_key(
         }
         Focus::Sidebar => {
             state.status = None;
-            match code {
-                KeyCode::Char('q') | KeyCode::Esc => {
+            let mods = key.modifiers;
+            // Every plain-char binding below fires only with no modifier
+            // held (`'B'` alone is the exception: crossterm reports a
+            // shifted letter as the already-uppercased `Char` *plus*
+            // `SHIFT` set, not a bare `Char('b')`) — a Ctrl/Alt-modified
+            // char is never one of these bindings, just noise (e.g. the
+            // default prefix `C-b` must never also fire `b`'s add-worker).
+            match (code, mods) {
+                (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
                     app.request_quit();
                     Vec::new()
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                     app.select_prev();
                     Vec::new()
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                     app.select_next();
                     Vec::new()
                 }
-                KeyCode::PageUp => {
+                (KeyCode::PageUp, _) => {
                     app.page_up();
                     Vec::new()
                 }
-                KeyCode::PageDown => {
+                (KeyCode::PageDown, _) => {
                     app.page_down();
                     Vec::new()
                 }
-                KeyCode::Home => {
+                (KeyCode::Home, _) => {
                     app.select_first();
                     Vec::new()
                 }
-                KeyCode::End => {
+                (KeyCode::End, _) => {
                     app.select_last();
                     Vec::new()
                 }
-                KeyCode::Enter => activate_selected(state, app),
-                KeyCode::Char('B') => brigade_key(state, app),
-                KeyCode::Char('b') => add_worker(state, app, brigade),
-                KeyCode::Tab => {
+                (KeyCode::Enter, _) => activate_selected(state, app),
+                (KeyCode::Char('B'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    brigade_key(state, app)
+                }
+                (KeyCode::Char('b'), KeyModifiers::NONE) => add_worker(state, app, brigade),
+                (KeyCode::Tab, _) => {
                     app.toggle_grouped_view();
                     Vec::new()
                 }
-                KeyCode::Char('/') => {
+                (KeyCode::Char('/'), KeyModifiers::NONE) => {
                     app.enter_search();
                     Vec::new()
                 }
-                KeyCode::Char('a') => {
+                (KeyCode::Char('a'), KeyModifiers::NONE) => {
                     app.toggle_agent_filter();
                     Vec::new()
                 }
-                KeyCode::Char('p') => toggle_pin(app),
-                KeyCode::Char('d') => {
+                (KeyCode::Char('p'), KeyModifiers::NONE) => toggle_pin(app),
+                (KeyCode::Char('d'), KeyModifiers::NONE) => {
                     app.open_confirm_archive_modal();
                     Vec::new()
                 }
-                KeyCode::Char('g') => {
+                (KeyCode::Char('g'), KeyModifiers::NONE) => {
                     app.open_group_join_modal();
                     Vec::new()
                 }
-                KeyCode::Char('n') => {
+                (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     app.open_new_session_modal();
                     Vec::new()
                 }
@@ -940,14 +1084,17 @@ fn resolve_armed_prefix(
             }
         }
         PrefixAction::CyclePane => {
-            if let Stage::Brigade { panes, focused, .. } = &mut state.stage
-                && !panes.is_empty()
-            {
-                *focused = (*focused + 1) % panes.len();
-            }
+            let next = cycle_forward(current_focus_slot(state), pane_count);
+            apply_focus_slot(state, next);
+            Vec::new()
+        }
+        PrefixAction::Move(direction) => {
+            let next = arrow_target(current_focus_slot(state), direction, pane_count);
+            apply_focus_slot(state, next);
             Vec::new()
         }
         PrefixAction::FocusPane(index) => {
+            state.focus = Focus::Pane;
             if let Stage::Brigade { focused, .. } = &mut state.stage {
                 *focused = index;
             }
@@ -3170,5 +3317,328 @@ mod tests {
             Stage::Brigade { focused, .. } => assert_eq!(*focused, 1),
             _ => panic!("expected a Brigade stage"),
         }
+    }
+
+    // --- modifier gating (Phase 2b follow-up: modifier-blind matching) -----
+
+    #[test]
+    fn ctrl_b_in_the_sidebar_arms_the_prefix_instead_of_adding_a_worker() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director],
+            focused: 0,
+        };
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            ))),
+            now,
+        );
+
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::Store(_))),
+            "Ctrl+B must arm the prefix, not fire the plain-b add-worker binding"
+        );
+        assert_eq!(state.prefix_armed, Some(now));
+        assert_eq!(state.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn ctrl_d_in_the_sidebar_does_not_open_the_archive_modal() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))),
+            now,
+        );
+
+        assert!(app.modal().is_none());
+        assert_eq!(state.prefix_armed, None);
+    }
+
+    #[test]
+    fn armed_ctrl_o_swallows_without_cycling_or_forwarding() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+            ))),
+            now,
+        );
+
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "an unbound (modifier-mangled) prefix key must never forward"
+        );
+        assert_eq!(state.prefix_armed, None);
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 0, "must not cycle"),
+            _ => panic!("expected a Brigade stage"),
+        }
+        assert_eq!(state.status.as_deref(), Some("unbound prefix key"));
+    }
+
+    // --- the focus ring (Phase 2b follow-up: sidebar joins the ring) -------
+
+    #[test]
+    fn cycle_forward_wraps_through_sidebar_director_and_workers() {
+        let pane_count = 3; // director + 2 workers
+        assert_eq!(
+            cycle_forward(FocusSlot::Sidebar, pane_count),
+            FocusSlot::Pane(0)
+        );
+        assert_eq!(
+            cycle_forward(FocusSlot::Pane(0), pane_count),
+            FocusSlot::Pane(1)
+        );
+        assert_eq!(
+            cycle_forward(FocusSlot::Pane(1), pane_count),
+            FocusSlot::Pane(2)
+        );
+        assert_eq!(
+            cycle_forward(FocusSlot::Pane(2), pane_count),
+            FocusSlot::Sidebar
+        );
+    }
+
+    #[test]
+    fn cycle_forward_on_a_solo_stage_toggles_between_sidebar_and_the_pane() {
+        assert_eq!(cycle_forward(FocusSlot::Sidebar, 1), FocusSlot::Pane(0));
+        assert_eq!(cycle_forward(FocusSlot::Pane(0), 1), FocusSlot::Sidebar);
+    }
+
+    #[test]
+    fn cycle_forward_on_an_empty_stage_is_a_noop() {
+        assert_eq!(cycle_forward(FocusSlot::Sidebar, 0), FocusSlot::Sidebar);
+    }
+
+    #[test]
+    fn arming_from_the_sidebar_then_o_lands_on_the_first_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker],
+            focused: 0,
+        };
+        state.focus = Focus::Sidebar;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let armed_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            ))),
+            now,
+        );
+        assert!(!armed_cmds.iter().any(|cmd| matches!(cmd, Cmd::Store(_))));
+        assert_eq!(state.prefix_armed, Some(now));
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert_eq!(state.prefix_armed, None);
+        assert_eq!(state.focus, Focus::Pane);
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 0),
+            _ => panic!("expected a Brigade stage"),
+        }
+    }
+
+    // --- arrow navigation (Phase 2b follow-up) ------------------------------
+
+    #[test]
+    fn arrow_target_covers_the_full_navigation_matrix() {
+        use Direction::{Down, Left, Right, Up};
+        use FocusSlot::{Pane, Sidebar};
+
+        // (from, direction, pane_count, expected)
+        let cases = [
+            // Sidebar column (3-pane brigade: director + 2 workers)
+            (Sidebar, Left, 3, Sidebar),
+            (Sidebar, Right, 3, Pane(0)),
+            (Sidebar, Up, 3, Sidebar),
+            (Sidebar, Down, 3, Sidebar),
+            // Director column
+            (Pane(0), Left, 3, Sidebar),
+            (Pane(0), Right, 3, Pane(1)),
+            (Pane(0), Up, 3, Pane(0)),
+            (Pane(0), Down, 3, Pane(0)),
+            // Worker stack: first worker, clamped at the top
+            (Pane(1), Left, 3, Pane(0)),
+            (Pane(1), Right, 3, Pane(1)),
+            (Pane(1), Up, 3, Pane(1)),
+            (Pane(1), Down, 3, Pane(2)),
+            // Worker stack: last worker, clamped at the bottom
+            (Pane(2), Left, 3, Pane(0)),
+            (Pane(2), Right, 3, Pane(2)),
+            (Pane(2), Up, 3, Pane(1)),
+            (Pane(2), Down, 3, Pane(2)),
+            // Solo column: one pane, no worker stack to enter
+            (Sidebar, Right, 1, Pane(0)),
+            (Pane(0), Left, 1, Sidebar),
+            (Pane(0), Right, 1, Pane(0)),
+            (Pane(0), Up, 1, Pane(0)),
+            (Pane(0), Down, 1, Pane(0)),
+            // Empty stage: the sidebar is the only slot there is
+            (Sidebar, Left, 0, Sidebar),
+            (Sidebar, Right, 0, Sidebar),
+            (Sidebar, Up, 0, Sidebar),
+            (Sidebar, Down, 0, Sidebar),
+        ];
+
+        for (from, direction, pane_count, expected) in cases {
+            assert_eq!(
+                arrow_target(from, direction, pane_count),
+                expected,
+                "from {from:?}, {direction:?}, pane_count {pane_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn armed_right_arrow_from_the_sidebar_focuses_the_director_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker],
+            focused: 0,
+        };
+        state.focus = Focus::Sidebar;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Pane);
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 0),
+            _ => panic!("expected a Brigade stage"),
+        }
+    }
+
+    #[test]
+    fn armed_left_arrow_from_a_worker_returns_to_the_director() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker],
+            focused: 1,
+        };
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Pane);
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 0),
+            _ => panic!("expected a Brigade stage"),
+        }
+    }
+
+    #[test]
+    fn armed_left_arrow_from_the_director_or_solo_pane_returns_to_the_sidebar() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Sidebar);
     }
 }
