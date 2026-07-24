@@ -35,7 +35,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
-use banto_core::config::BrigadeConfig;
+use banto_core::config::{BrigadeConfig, KeysConfig};
 use banto_core::model::SessionId;
 use banto_core::provider::claude_code::ClaudeCodeProvider;
 use banto_core::status::{AgeThresholds, ProcessProbe, SysinfoProbe, read_live_sessions};
@@ -48,8 +48,8 @@ use crate::tui::LiveWatch;
 use crate::view;
 
 use super::engine::{
-    self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, RelayObservation, SessionKey,
-    Stage, StoreIntent, layout, stage_tiles,
+    self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
+    SessionKey, Stage, StoreIntent, layout, stage_tiles,
 };
 use super::pty::PortablePtyHost;
 use super::render::screen_to_text;
@@ -60,12 +60,14 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
 /// `brigade` is `[brigade]` from config.toml: how many fresh Workers `B`
 /// auto-spawns when forming a new brigade, the `--model` an auto-spawned
-/// Worker launches with, and whether the relay engine is enabled.
+/// Worker launches with, and whether the relay engine is enabled. `keys` is
+/// `[keys]`: the tmux-style prefix chord for pane operations.
 pub fn run(
     claude_home: &Path,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
     brigade: &BrigadeConfig,
+    keys: &KeysConfig,
 ) -> Result<()> {
     // Janitor: purge brigades with no members left (legacy pre-v7 data, or
     // residue from a crash mid-formation) before the sidebar's brigade-
@@ -102,6 +104,7 @@ pub fn run(
         thresholds,
         store,
         brigade,
+        keys,
     );
     let restored = restore_terminal();
     result.and(restored)
@@ -130,8 +133,9 @@ fn event_loop(
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
     brigade: &BrigadeConfig,
+    keys: &KeysConfig,
 ) -> Result<()> {
-    let mut state = EmporiumState::new();
+    let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
     let mut watch = LiveWatch::new(claude_home);
@@ -736,7 +740,13 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
         }
     }
 
-    render_status_bar(frame, app, state.status.as_deref(), areas.status);
+    render_status_bar(
+        frame,
+        app,
+        state.status.as_deref(),
+        state.prefix_armed.is_some(),
+        areas.status,
+    );
 
     if let Some(modal) = app.modal() {
         crate::tui::render_modal(frame, modal, full_area);
@@ -756,28 +766,41 @@ fn tile_title(stage: &Stage, key: &SessionKey) -> String {
     }
 }
 
-/// Bottom status bar: emporium key hints (or a transient status) on the left,
-/// the match count on the right.
-fn render_status_bar(frame: &mut ratatui::Frame, app: &App, status: Option<&str>, area: Rect) {
+/// Bottom status bar: emporium key hints (or a transient status, or — while
+/// a prefix chord is armed — the pending-prefix hint) on the left, the match
+/// count on the right.
+fn render_status_bar(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    status: Option<&str>,
+    prefix_armed: bool,
+    area: Rect,
+) {
     const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade/disband · b +worker · \
                                 F3 pane · / search · n new · d archive · g group · Tab view · \
                                 p pin · a agents · q quit";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
+    const PREFIX_HINTS: &str =
+        "prefix: o/Tab cycle · 1-9 pane · b literal · s sidebar · x kill · Esc cancel";
 
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
     let [left, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(counts_width)]).areas(area);
 
-    let (text, color) = match status {
-        Some(message) => (message.to_string(), Color::Yellow),
-        None => {
-            let hints = if app.mode() == Mode::Search {
-                SEARCH_HINTS
-            } else {
-                NORMAL_HINTS
-            };
-            (hints.to_string(), Color::Gray)
+    let (text, color) = if prefix_armed {
+        (PREFIX_HINTS.to_string(), Color::Cyan)
+    } else {
+        match status {
+            Some(message) => (message.to_string(), Color::Yellow),
+            None => {
+                let hints = if app.mode() == Mode::Search {
+                    SEARCH_HINTS
+                } else {
+                    NORMAL_HINTS
+                };
+                (hints.to_string(), Color::Gray)
+            }
         }
     };
     frame.render_widget(

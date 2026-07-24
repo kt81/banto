@@ -725,15 +725,15 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 }
 
 /// Confirm whichever modal is open, dispatching to its kind-specific logic.
-/// `ConfirmDisband` is the emporium's own modal — classic mode never opens
-/// it, so confirming it here is a no-op (Esc still closes it, via the shared
-/// `close_modal` in [`handle_modal_key`]).
+/// `ConfirmDisband`/`ConfirmKill` are the emporium's own modals — classic
+/// mode never opens either, so confirming them here is a no-op (Esc still
+/// closes it, via the shared `close_modal` in [`handle_modal_key`]).
 fn confirm_modal(app: &mut App, ctx: &Context) {
     match app.modal() {
         Some(Modal::NewSession(_)) => confirm_new_session_modal(app, ctx),
         Some(Modal::ConfirmArchive { .. }) => confirm_archive_modal(app, ctx),
         Some(Modal::GroupJoin(_)) => confirm_group_join_modal(app, ctx),
-        Some(Modal::ConfirmDisband { .. }) | None => {}
+        Some(Modal::ConfirmDisband { .. }) | Some(Modal::ConfirmKill { .. }) | None => {}
     }
 }
 
@@ -1790,6 +1790,7 @@ pub(crate) fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
         Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
         Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
+        Modal::ConfirmKill { title, .. } => render_confirm_kill_modal(frame, title, area),
     }
 }
 
@@ -1900,6 +1901,32 @@ fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
         Line::from(prompt),
         Line::from(Span::styled(
             "Its Workers keep running and simply reappear in the list.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the emporium's prefix-`x` kill confirm dialog: a one-line yes/no
+/// prompt naming the session. Killing only ends the process — brigade
+/// membership is untouched, so a killed Worker respawns fresh under the same
+/// token the next time its brigade is staged (the same disposable-Worker
+/// semantics `stage_brigade` already has for one that's simply gone).
+fn render_confirm_kill_modal(frame: &mut Frame, title: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Kill Session \u{2014} confirm ")
+        .title_bottom(" Enter kill  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let prompt = truncate_to_width(&format!("Kill \"{title}\"?"), inner.width);
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(Span::styled(
+            "Ends the process now. A Worker respawns fresh next time its \
+             brigade is staged; a Director does not.",
             Style::default().fg(Color::DarkGray),
         )),
     ];

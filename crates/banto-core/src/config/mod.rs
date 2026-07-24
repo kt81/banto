@@ -140,6 +140,33 @@ impl BrigadeConfig {
     }
 }
 
+/// Emporium keybinding settings. Just the tmux-style prefix chord this
+/// round — full user-remappable keymaps are out of scope (a scoped decision,
+/// not an oversight: see `crates/banto/src/embedded/engine.rs`'s
+/// `PrefixKey`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct KeysConfig {
+    /// The prefix chord for pane operations (tmux-style: press it, then a
+    /// second key — `o`/Tab cycles panes, `1`-`9` jumps to one, `s` returns
+    /// to the sidebar, `x` opens the kill-confirm dialog, the prefix itself
+    /// or a plain `b` sends the prefix's own byte through literally).
+    /// `"C-<char>"` for a Control chord (e.g. the default `"C-b"`), or a
+    /// bare single character for an unmodified key. Parsed leniently in the
+    /// `banto` bin crate, not here: `KeyCode`/`KeyModifiers` are `crossterm`
+    /// types, and `banto-core` never depends on `crossterm` — so this field
+    /// is just the raw string, validated no further than "is it a string".
+    pub prefix: String,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self {
+            prefix: "C-b".to_string(),
+        }
+    }
+}
+
 /// Top-level banto configuration. Every field has a default and unknown keys
 /// are ignored, so any subset of `config.toml` is valid.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -148,6 +175,7 @@ pub struct Config {
     pub opener: OpenerMode,
     pub activity: ActivityConfig,
     pub brigade: BrigadeConfig,
+    pub keys: KeysConfig,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
     /// Overrides [`default_db_path`].
@@ -206,8 +234,25 @@ mod tests {
         assert_eq!(config.brigade.workers, 1);
         assert_eq!(config.brigade.worker_model, "sonnet");
         assert_eq!(config.brigade.relay, RelayMode::Auto);
+        assert_eq!(config.keys.prefix, "C-b");
         assert_eq!(config.claude_home, None);
         assert_eq!(config.db_path, None);
+    }
+
+    #[test]
+    fn keys_prefix_parses_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[keys]\nprefix = \"C-a\"\n");
+        let config = load(&path).unwrap();
+        assert_eq!(config.keys.prefix, "C-a");
+    }
+
+    #[test]
+    fn keys_section_missing_yields_the_default_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "opener = \"psmux\"\n");
+        let config = load(&path).unwrap();
+        assert_eq!(config.keys.prefix, "C-b");
     }
 
     #[test]

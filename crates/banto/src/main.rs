@@ -201,7 +201,13 @@ fn main() -> Result<()> {
             if cli.emporium {
                 // The 大店 (emporium) mode: a separate top-level TUI chosen at
                 // launch (`--emporium` / `--oodana`).
-                embedded::run_emporium(&claude_home, &thresholds, &store, &config.brigade)
+                embedded::run_emporium(
+                    &claude_home,
+                    &thresholds,
+                    &store,
+                    &config.brigade,
+                    &config.keys,
+                )
             } else {
                 tui::run(&claude_home, &thresholds, config.opener, &store)
             }

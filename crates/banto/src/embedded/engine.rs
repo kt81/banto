@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 
@@ -349,10 +350,19 @@ pub(super) struct EmporiumState {
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
     pub(super) size: (u16, u16),
+    /// The configured prefix chord (`[keys] prefix`), fixed for the run.
+    prefix: PrefixKey,
+    /// When the prefix was last armed (see [`update_key`]'s prefix handling
+    /// and [`PREFIX_ARM_TIMEOUT`]) — `Some` only between the prefix chord
+    /// landing on a focused pane and the very next key resolving it (or the
+    /// timeout disarming it on a [`Event::Tick`]). `pub(super)` so the shell
+    /// can show the pending-prefix hint while armed (reading state for
+    /// drawing is legal; only `update` may write it).
+    pub(super) prefix_armed: Option<Instant>,
 }
 
 impl EmporiumState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(prefix: PrefixKey) -> Self {
         Self {
             screens: HashMap::new(),
             stage: Stage::Empty,
@@ -365,12 +375,124 @@ impl EmporiumState {
             pending_opens: HashMap::new(),
             pending_membership: None,
             size: (0, 0),
+            prefix,
+            prefix_armed: None,
         }
     }
 
     fn set_status(&mut self, message: impl Into<String>, now: Instant) {
         self.status = Some(message.into());
         self.status_set_at = Some(now);
+    }
+}
+
+/// How long the prefix stays armed with no follow-up key before
+/// [`update_tick`] disarms it on its own.
+const PREFIX_ARM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
+/// see `banto_core::config::KeysConfig`). Parsing lives here, not in
+/// `banto-core`, because the result is `crossterm` types and `banto-core`
+/// never depends on `crossterm` (`docs/DISCIPLINE.md` §2's crate table) —
+/// the config module only validates as far as "is it a string"; this is
+/// where "is it a chord" gets decided, lenient by the same design as
+/// `RelayMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PrefixKey {
+    code: KeyCode,
+    mods: KeyModifiers,
+}
+
+impl PrefixKey {
+    /// `"C-<char>"` for a Control chord, or a bare single character for an
+    /// unmodified key. Anything else (empty, multi-character, malformed
+    /// `"C-"` forms) falls back to the default (`C-b`) with no error.
+    pub(super) fn parse(raw: &str) -> Self {
+        if let Some(rest) = raw.strip_prefix("C-") {
+            let mut chars = rest.chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                return Self {
+                    code: KeyCode::Char(c),
+                    mods: KeyModifiers::CONTROL,
+                };
+            }
+            return Self::default();
+        }
+        let mut chars = raw.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Self {
+                code: KeyCode::Char(c),
+                mods: KeyModifiers::NONE,
+            };
+        }
+        Self::default()
+    }
+
+    fn matches(&self, key: &KeyEvent) -> bool {
+        key.code == self.code && key.modifiers == self.mods
+    }
+
+    /// The prefix's own key event — what "send the prefix through literally"
+    /// (prefix-prefix, or plain `b`) actually forwards, encoded the same way
+    /// any other keypress would be (see [`key_to_bytes`]).
+    fn as_key_event(&self) -> KeyEvent {
+        KeyEvent::new(self.code, self.mods)
+    }
+}
+
+impl Default for PrefixKey {
+    fn default() -> Self {
+        Self {
+            code: KeyCode::Char('b'),
+            mods: KeyModifiers::CONTROL,
+        }
+    }
+}
+
+/// What an armed prefix's follow-up key resolves to (see [`update_key`]'s
+/// prefix handling). Pure decision surface, no `KeyEvent`/`Stage` needed
+/// once resolved — the unit-test target for the whole prefix feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixAction {
+    /// The prefix chord again, or plain `b`: send the prefix's own byte
+    /// through to the child literally (the tmux "send-prefix" convention).
+    Literal,
+    /// `o` or Tab: cycle the focused pane within the staged brigade.
+    CyclePane,
+    /// `1`-`9`, in range: focus the pane at this 0-based index.
+    FocusPane(usize),
+    /// `1`-`9`, but the staged brigade doesn't have that many panes.
+    OutOfRange,
+    /// `s` or Esc: return focus to the sidebar.
+    Sidebar,
+    /// `x`: open the kill-confirm dialog for the focused pane.
+    Kill,
+    /// Anything else: swallowed, not forwarded — a fat-fingered prefix
+    /// command must never leak into the child as a raw keypress.
+    Unbound,
+}
+
+/// Resolve one key pressed while the prefix is armed. `pane_count` is the
+/// staged brigade's pane count (0 for `Solo`/`Empty`, where digit-focus and
+/// pane-cycling are meaningless but still resolved consistently — a `1` on a
+/// solo stage is simply out of range, not a special case).
+fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> PrefixAction {
+    if prefix.matches(key) || key.code == KeyCode::Char('b') {
+        return PrefixAction::Literal;
+    }
+    match key.code {
+        KeyCode::Char('o') | KeyCode::Tab => PrefixAction::CyclePane,
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let n = c.to_digit(10).expect("ascii digit") as usize;
+            if n <= pane_count {
+                PrefixAction::FocusPane(n - 1)
+            } else {
+                PrefixAction::OutOfRange
+            }
+        }
+        KeyCode::Char('s') | KeyCode::Esc => PrefixAction::Sidebar,
+        KeyCode::Char('x') => PrefixAction::Kill,
+        _ => PrefixAction::Unbound,
     }
 }
 
@@ -446,9 +568,10 @@ pub(super) enum Cmd {
         brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
         model: Option<String>,
     },
-    /// Unused until Phase 2b (session termination) emits it; the executor
-    /// exists ahead of it (see `super::pty`'s `Killer`).
-    #[allow(dead_code)]
+    /// Kill the child at `key` — active termination (prefix-`x` confirm, or
+    /// a disbanded brigade's Workers). The passive `Event::PtyExited` fold
+    /// is what actually cleans up the pane once this takes effect; this Cmd
+    /// is only ever "make the exit happen".
     KillPty {
         key: SessionKey,
     },
@@ -684,6 +807,9 @@ fn update_key(
         update_search_key(app, code);
         return Vec::new();
     }
+    if state.prefix_armed.is_some() {
+        return resolve_armed_prefix(state, app, key, now);
+    }
     if code == KeyCode::F(2) {
         state.focus = match state.focus {
             Focus::Sidebar if state.stage.is_active() => Focus::Pane,
@@ -702,6 +828,13 @@ fn update_key(
 
     match state.focus {
         Focus::Pane => {
+            // The prefix chord arms instead of forwarding — a tmux-style
+            // pane command follows (see `resolve_armed_prefix`), costing a
+            // double-tap for a literal prefix byte through, same as tmux.
+            if state.prefix.matches(&key) {
+                state.prefix_armed = Some(now);
+                return Vec::new();
+            }
             if let Some(target) = state.stage.focused_key().cloned() {
                 let bytes = key_to_bytes(&key);
                 state.last_forwarded_input = Some(now);
@@ -779,6 +912,73 @@ fn update_key(
     }
 }
 
+/// The key following an armed prefix (see [`resolve_prefix_key`] for the
+/// resolution table) — always disarms, regardless of what it resolves to.
+fn resolve_armed_prefix(
+    state: &mut EmporiumState,
+    app: &mut App,
+    key: KeyEvent,
+    now: Instant,
+) -> Vec<Cmd> {
+    state.prefix_armed = None;
+    let pane_count = match &state.stage {
+        Stage::Brigade { panes, .. } => panes.len(),
+        Stage::Solo(_) => 1,
+        Stage::Empty => 0,
+    };
+    match resolve_prefix_key(&key, &state.prefix, pane_count) {
+        PrefixAction::Literal => {
+            let Some(target) = state.stage.focused_key().cloned() else {
+                return Vec::new();
+            };
+            let bytes = key_to_bytes(&state.prefix.as_key_event());
+            state.last_forwarded_input = Some(now);
+            if bytes.is_empty() {
+                Vec::new()
+            } else {
+                vec![Cmd::WritePty { key: target, bytes }]
+            }
+        }
+        PrefixAction::CyclePane => {
+            if let Stage::Brigade { panes, focused, .. } = &mut state.stage
+                && !panes.is_empty()
+            {
+                *focused = (*focused + 1) % panes.len();
+            }
+            Vec::new()
+        }
+        PrefixAction::FocusPane(index) => {
+            if let Stage::Brigade { focused, .. } = &mut state.stage {
+                *focused = index;
+            }
+            Vec::new()
+        }
+        PrefixAction::OutOfRange => {
+            state.status = Some("prefix: no such pane".to_string());
+            Vec::new()
+        }
+        PrefixAction::Sidebar => {
+            state.focus = Focus::Sidebar;
+            Vec::new()
+        }
+        PrefixAction::Kill => {
+            let Some(target) = state.stage.focused_key().cloned() else {
+                return Vec::new();
+            };
+            let title = app
+                .row_for_id(target.as_str())
+                .map(|row| row.display_title().to_string())
+                .unwrap_or_else(|| target.as_str().to_string());
+            app.open_confirm_kill_modal(target.as_str().to_string(), title);
+            Vec::new()
+        }
+        PrefixAction::Unbound => {
+            state.status = Some("unbound prefix key".to_string());
+            Vec::new()
+        }
+    }
+}
+
 fn update_search_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Backspace => app.backspace(),
@@ -851,12 +1051,14 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Group,
         New,
         Disband,
+        Kill,
     }
     let kind = match app.modal() {
         Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
         Some(Modal::GroupJoin(_)) => Some(Kind::Group),
         Some(Modal::NewSession(_)) => Some(Kind::New),
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
+        Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
         None => None,
     };
     match kind {
@@ -864,6 +1066,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::Group) => confirm_group_join_modal(app),
         Some(Kind::New) => confirm_new_session_modal(state, app),
         Some(Kind::Disband) => confirm_disband_modal(app),
+        Some(Kind::Kill) => confirm_kill_modal(app),
         None => Vec::new(),
     }
 }
@@ -927,6 +1130,23 @@ fn confirm_disband_modal(app: &mut App) -> Vec<Cmd> {
     let brigade_id = *brigade_id;
     app.close_modal();
     vec![Cmd::Store(StoreIntent::Disband { brigade_id })]
+}
+
+/// Confirm the kill dialog: just make the exit happen. No store mutation —
+/// membership persists, and a killed Worker respawns fresh under the same
+/// token the next time its brigade is staged (the existing, field-tested
+/// disposable-Worker semantics `stage_brigade` already has for one whose
+/// process is simply gone). The passive `Event::PtyExited` fold (unchanged,
+/// see `update_pty_exited`) is what actually cleans up the pane once the
+/// kill takes effect — this is the only place `Cmd::KillPty` is emitted for
+/// a single pane; there is no second cleanup path here.
+fn confirm_kill_modal(app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmKill { key, .. }) = app.modal() else {
+        return Vec::new();
+    };
+    let key = SessionKey::from_id(key);
+    app.close_modal();
+    vec![Cmd::KillPty { key }]
 }
 
 /// Enter / double-click on the sidebar: request membership resolution
@@ -1448,6 +1668,13 @@ fn update_worker_added(
     }
 }
 
+/// On success while the disbanded brigade is staged: fall the stage back to
+/// `Solo(director)` (unchanged), and additionally kill every staged Worker
+/// pane (`panes[1..]` — the Director, `panes[0]`, is the operator's own
+/// session and survives). Workers are banto-spawned creatures that die with
+/// their brigade; the kills flow through the same passive `PtyExited` fold
+/// as any other exit — a killed-but-unstaged Worker (already gone, or one
+/// this stage never resolved) is simply skipped, nothing to kill.
 fn update_disbanded(
     state: &mut EmporiumState,
     app: &mut App,
@@ -1459,22 +1686,29 @@ fn update_disbanded(
         Ok((hidden, directors)) => {
             app.set_hidden_worker_ids(hidden);
             app.set_directors(directors);
-            let director_key = if let Stage::Brigade { id, panes, .. } = &state.stage
+            let (director_key, worker_keys) = if let Stage::Brigade { id, panes, .. } = &state.stage
                 && *id == brigade_id
             {
-                panes.first().cloned()
+                let mut panes = panes.iter();
+                (panes.next().cloned(), panes.cloned().collect())
             } else {
-                None
+                (None, Vec::new())
             };
-            state.stage = match director_key {
-                Some(key) => Stage::Solo(key),
+            state.stage = match &director_key {
+                Some(key) => Stage::Solo(key.clone()),
                 None => Stage::Empty,
             };
             state.set_status("brigade disbanded".to_string(), now);
+            worker_keys
+                .into_iter()
+                .map(|key| Cmd::KillPty { key })
+                .collect()
         }
-        Err(err) => state.set_status(format!("failed to disband: {err}"), now),
+        Err(err) => {
+            state.set_status(format!("failed to disband: {err}"), now);
+            Vec::new()
+        }
     }
-    Vec::new()
 }
 
 fn update_tick(
@@ -1532,6 +1766,12 @@ fn update_tick(
     {
         state.status = None;
         state.status_set_at = None;
+    }
+
+    if let Some(armed_at) = state.prefix_armed
+        && now.saturating_duration_since(armed_at) >= PREFIX_ARM_TIMEOUT
+    {
+        state.prefix_armed = None;
     }
 
     cmds
@@ -2057,7 +2297,7 @@ mod tests {
 
     #[test]
     fn activate_enter_on_a_known_row_resolves_membership_then_opens_then_stages_solo() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
         let now = Instant::now();
@@ -2108,7 +2348,7 @@ mod tests {
 
     #[test]
     fn spawn_failed_sets_status_and_leaves_stage_untouched() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Empty;
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
@@ -2132,7 +2372,7 @@ mod tests {
 
     #[test]
     fn pty_output_feeds_the_screen() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::from_id("sess-1");
         state.screens.insert(key.clone(), Screen::new(24, 80));
         let mut app = app_with(vec![]);
@@ -2156,7 +2396,7 @@ mod tests {
 
     #[test]
     fn pty_exited_on_a_staged_solo_collapses_to_empty_with_status() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::from_id("sess-1");
         state.screens.insert(key.clone(), Screen::new(24, 80));
         state.stage = Stage::Solo(key.clone());
@@ -2179,7 +2419,7 @@ mod tests {
 
     #[test]
     fn pty_exited_on_a_brigade_worker_removes_its_pane_and_clamps_focus() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let worker = SessionKey::from_id("w1");
         for key in [&director, &worker] {
@@ -2221,7 +2461,7 @@ mod tests {
 
     #[test]
     fn key_in_pane_focus_forwards_a_write_pty_cmd_with_the_right_encoding() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::from_id("sess-1");
         state.screens.insert(key.clone(), Screen::new(24, 80));
         state.stage = Stage::Solo(key.clone());
@@ -2249,7 +2489,7 @@ mod tests {
 
     #[test]
     fn paste_in_pane_focus_is_a_single_write_pty_bracketed_when_the_child_has_paste_mode_on() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::from_id("sess-1");
         let mut screen = Screen::new(24, 80);
         // Turn on bracketed paste mode (DECSET 2004) in the child's model.
@@ -2286,7 +2526,7 @@ mod tests {
 
     #[test]
     fn tick_nudges_then_flushes_the_delayed_submit() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let worker = SessionKey::from_id("w1");
         state.screens.insert(director.clone(), Screen::new(24, 80));
@@ -2376,7 +2616,7 @@ mod tests {
 
     #[test]
     fn archive_done_sets_status_and_reloads() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
 
@@ -2396,7 +2636,7 @@ mod tests {
 
     #[test]
     fn archive_done_failure_sets_status_but_still_reloads() {
-        let mut state = EmporiumState::new();
+        let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
 
@@ -2414,5 +2654,521 @@ mod tests {
         let status = state.status.unwrap();
         assert!(status.contains("failed to archive Fix login"));
         assert!(status.contains("disk full"));
+    }
+
+    // --- PrefixKey::parse ---------------------------------------------------
+
+    #[test]
+    fn prefix_key_parses_a_control_chord() {
+        assert_eq!(PrefixKey::parse("C-b"), PrefixKey::default());
+        assert_eq!(
+            PrefixKey::parse("C-x"),
+            PrefixKey {
+                code: KeyCode::Char('x'),
+                mods: KeyModifiers::CONTROL,
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_key_parses_a_bare_character() {
+        assert_eq!(
+            PrefixKey::parse("x"),
+            PrefixKey {
+                code: KeyCode::Char('x'),
+                mods: KeyModifiers::NONE,
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_key_falls_back_to_the_default_on_garbage() {
+        for raw in ["", "C-", "C-bb", "toolong"] {
+            assert_eq!(PrefixKey::parse(raw), PrefixKey::default(), "raw = {raw:?}");
+        }
+    }
+
+    // --- prefix arming / resolution (Focus::Pane, update_key) --------------
+
+    #[test]
+    fn prefix_chord_in_pane_focus_arms_instead_of_forwarding() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            ))),
+            now,
+        );
+
+        // A stray Cmd::ResizePty may come back regardless (the fresh 24x80
+        // Screen almost certainly doesn't match the pane geometry computed
+        // from EmporiumState::new()'s default `size`, see the paste test
+        // above) — what matters here is that nothing was forwarded.
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "arming the prefix must not forward a key"
+        );
+        assert_eq!(state.prefix_armed, Some(now));
+    }
+
+    #[test]
+    fn armed_prefix_pressed_again_sends_the_literal_prefix_byte() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            ))),
+            now,
+        );
+
+        let writes: Vec<&Cmd> = cmds
+            .iter()
+            .filter(|cmd| matches!(cmd, Cmd::WritePty { .. }))
+            .collect();
+        assert_eq!(writes.len(), 1, "expected exactly one WritePty");
+        assert!(matches!(
+            writes[0],
+            Cmd::WritePty { key: k, bytes } if *k == key && bytes.as_slice() == [0x02]
+        ));
+        assert_eq!(state.prefix_armed, None);
+    }
+
+    #[test]
+    fn armed_o_cycles_the_focused_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.prefix_armed, None);
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 1),
+            _ => panic!("expected a Brigade stage"),
+        }
+    }
+
+    #[test]
+    fn armed_digit_focuses_pane_by_one_based_index() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let w1 = SessionKey::from_id("w1");
+        let w2 = SessionKey::from_id("w2");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, w1, w2],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('3'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 2),
+            _ => panic!("expected a Brigade stage"),
+        }
+    }
+
+    #[test]
+    fn armed_digit_out_of_range_swallows_and_sets_status() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('5'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.status.as_deref(), Some("prefix: no such pane"));
+        assert_eq!(state.prefix_armed, None);
+    }
+
+    #[test]
+    fn armed_s_returns_focus_to_the_sidebar() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Sidebar);
+        assert_eq!(state.prefix_armed, None);
+    }
+
+    #[test]
+    fn armed_x_opens_the_kill_confirm_modal_for_the_focused_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(state.prefix_armed, None);
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmKill { key, .. }) if key == "sess-1"
+        ));
+    }
+
+    #[test]
+    fn armed_unbound_key_is_swallowed_not_forwarded() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(Instant::now());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "an unbound prefix key must never forward as a WritePty"
+        );
+        assert_eq!(state.status.as_deref(), Some("unbound prefix key"));
+        assert_eq!(state.prefix_armed, None);
+    }
+
+    // --- prefix arm timeout (Event::Tick) -----------------------------------
+
+    #[test]
+    fn tick_past_the_arm_timeout_disarms_the_prefix() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let armed_at = Instant::now();
+        state.prefix_armed = Some(armed_at);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            armed_at + PREFIX_ARM_TIMEOUT,
+        );
+
+        assert_eq!(state.prefix_armed, None);
+    }
+
+    #[test]
+    fn tick_before_the_arm_timeout_leaves_the_prefix_armed() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let armed_at = Instant::now();
+        state.prefix_armed = Some(armed_at);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            armed_at + Duration::from_secs(1),
+        );
+
+        assert_eq!(state.prefix_armed, Some(armed_at));
+    }
+
+    // --- kill-confirm modal --------------------------------------------------
+
+    #[test]
+    fn kill_confirm_enter_emits_kill_pty() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string());
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::KillPty { key }] if key.as_str() == "sess-1"
+        ));
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn kill_confirm_esc_closes_with_no_cmd() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string());
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+    }
+
+    // --- disband kills staged workers ----------------------------------------
+
+    #[test]
+    fn disband_while_staged_kills_workers_but_not_the_director() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let w1 = SessionKey::from_id("w1");
+        let w2 = SessionKey::from_id("w2");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), w1.clone(), w2.clone()],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+
+        let killed: Vec<&SessionKey> = cmds
+            .iter()
+            .map(|cmd| match cmd {
+                Cmd::KillPty { key } => key,
+                _ => panic!("expected only KillPty cmds from a disband"),
+            })
+            .collect();
+        assert_eq!(killed.len(), 2);
+        assert!(killed.contains(&&w1));
+        assert!(killed.contains(&&w2));
+        assert!(!killed.contains(&&director));
+        match &state.stage {
+            Stage::Solo(key) => assert_eq!(key, &director),
+            _ => panic!("expected the director to remain staged solo"),
+        }
+    }
+
+    #[test]
+    fn disband_of_an_unstaged_brigade_kills_nothing() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Empty;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert!(matches!(state.stage, Stage::Empty));
+    }
+
+    // --- F2/F3 regression (unaffected by the prefix-key change) -------------
+
+    #[test]
+    fn f2_toggles_focus_between_sidebar_and_pane_when_a_stage_is_active() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::F(2),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Pane);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::F(2),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn f3_cycles_the_focused_pane_within_a_staged_brigade() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(CtEvent::Key(KeyEvent::new(
+                KeyCode::F(3),
+                KeyModifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 1),
+            _ => panic!("expected a Brigade stage"),
+        }
     }
 }

@@ -151,8 +151,7 @@ impl PtyHandle {
         let _ = self.io.resizer.resize(rows, cols);
     }
 
-    /// Kill the child. Unused until Phase 2b emits `Cmd::KillPty`.
-    #[allow(dead_code)]
+    /// Kill the child (`Cmd::KillPty`'s executor).
     pub(crate) fn kill(&mut self) -> Result<()> {
         self.io.killer.kill()
     }

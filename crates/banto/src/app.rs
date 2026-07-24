@@ -101,6 +101,14 @@ pub enum Modal {
     /// Director's title, for the prompt. Classic mode never opens this, but
     /// still has to render/dispatch it since the two share `App`/`render_modal`.
     ConfirmDisband { brigade_id: i64, name: String },
+    /// The emporium's prefix-`x` kill confirm dialog: Enter kills the
+    /// session's process (`key`, its `SessionKey` as a plain string — see
+    /// `crate::embedded::engine::SessionKey`; kept as `String` here so
+    /// `Modal` doesn't need to depend on an `embedded`-internal type), Esc
+    /// cancels. `title` is the session's display title, for the prompt.
+    /// Classic mode never opens this either, for the same reason as
+    /// `ConfirmDisband`.
+    ConfirmKill { key: String, title: String },
 }
 
 /// State for the group-join modal: a free-text new-group-name input plus a
@@ -689,7 +697,10 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.push_char(c),
             Some(Modal::GroupJoin(state)) => state.push_char(c),
-            Some(Modal::ConfirmArchive { .. }) | Some(Modal::ConfirmDisband { .. }) | None => {}
+            Some(Modal::ConfirmArchive { .. })
+            | Some(Modal::ConfirmDisband { .. })
+            | Some(Modal::ConfirmKill { .. })
+            | None => {}
         }
     }
 
@@ -1030,6 +1041,12 @@ impl App {
     /// (bound to `B` on a session that is that brigade's Director).
     pub fn open_confirm_disband_modal(&mut self, brigade_id: i64, name: String) {
         self.modal = Some(Modal::ConfirmDisband { brigade_id, name });
+    }
+
+    /// Open the emporium's kill confirm dialog for the given session (bound
+    /// to prefix-`x` on the focused pane).
+    pub fn open_confirm_kill_modal(&mut self, key: String, title: String) {
+        self.modal = Some(Modal::ConfirmKill { key, title });
     }
 
     /// Toggle the pinned state of the selected session (no-op when nothing
