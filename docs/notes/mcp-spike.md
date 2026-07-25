@@ -79,3 +79,29 @@ non-interactive `-p` mode.
 
 Spike code (`crate::mcp` + the hidden `_mcp` subcommand) is kept as the seed of
 2c; the throwaway config file lived in the scratchpad (never committed).
+
+## Follow-up (2026-07-25): the open question, answered on the Director side
+
+This note's open questions included *"whether a Worker reliably chooses to
+pull `check_messages` at useful moments"*. Dogfooding turned up the same
+question one level up, with a sharper answer: across a full day of work in a
+live cell, the Director sent **zero** messages. Not a reliability problem —
+an information one. A member is launched with `--mcp-config` and nothing
+else, so the brigade exists in banto's store, in its argv, and on the
+operator's screen, but nowhere in the member's own context: what reaches the
+model is three tool names. And because the relay only wakes a member that
+*has* mail, a cell whose Director never sends the first message never starts.
+
+Two changes close it: members now launch with a role briefing
+(`--append-system-prompt`, verified to apply to a `--resume` as well as a
+fresh launch — that is what reaches an already-running Director), and
+`banto_ping` became `brigade_status`, which answers who you are, who your
+peers are, what each is doing, and who is holding unread mail from you. The
+old `banto_ping` name in the transcript above is historical; the tool is
+`mcp__banto__brigade_status` now.
+
+The Worker-side question the note originally asked stays answered the way it
+always was — by the relay forcing the turn, not by hoping. There is no
+equivalent forcing function on the Director side, and there shouldn't be:
+delegating is the operator's call to delegate. A standing instruction is the
+difference between *possible* and *expected*, which is all it needs to be.

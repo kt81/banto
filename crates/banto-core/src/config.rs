@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::model::BrigadeRole;
+
 /// Which backend resumes sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -97,7 +99,60 @@ pub struct BrigadeConfig {
     /// Whether the emporium's relay engine auto-nudges idle brigade members
     /// with unseen messages.
     pub relay: RelayMode,
+    /// Role briefing appended to a Director's system prompt at launch
+    /// (`claude --append-system-prompt`).
+    ///
+    /// Without one, a brigade exists only in banto's data model and UI: the
+    /// operator sees a Director pane beside its Workers, while the Director
+    /// itself is handed three tool names and no notion that it leads a cell
+    /// — and, since the relay only wakes a member that *has* mail, a cell
+    /// whose Director never sends the first message stays inert forever.
+    /// This is the text that closes that gap, so it is deliberately a
+    /// setting and not a constant: it states banto's delegation policy, and
+    /// that is the operator's call.
+    ///
+    /// `{brigade}` (id), `{token}` (this member), and `{peers}` (the
+    /// addressable peers, comma-joined) are substituted. An empty string
+    /// passes no flag at all.
+    pub director_prompt: String,
+    /// Role briefing appended to a Worker's system prompt at launch. Same
+    /// substitutions and the same empty-string escape hatch as
+    /// [`Self::director_prompt`]; deliberately states facts (who you are,
+    /// how the mail works) rather than a work policy, which is the
+    /// Director's to give.
+    pub worker_prompt: String,
 }
+
+/// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
+/// the operator's expectation on finding themselves in a brigade is that
+/// the Workers get used without having to be pointed at, and the conditions
+/// worth delegating under are named so that serial diagnostic work — where
+/// a handoff costs more context than it saves — stays home.
+const DEFAULT_DIRECTOR_PROMPT: &str = "\
+You are the Director of banto brigade {brigade}. Your Workers: {peers}. \
+They are live Claude Code sessions in this same working directory, \
+reachable through banto's MCP tools.
+
+Use them. When a task splits into parts that can proceed independently — a \
+broad search, an audit across many files, an independent second opinion, a \
+long mechanical edit — hand it to a Worker with send_to_peer instead of \
+working through it serially, and tell the operator in one line that you \
+did. Keep work that is genuinely sequential, or that hinges on context only \
+you hold, yourself.
+
+Workers cannot see this conversation. Every instruction must carry its own \
+context and say what you want back. Set `to` to address one Worker; omit it \
+to broadcast. Call check_messages when banto nudges you, and at natural \
+checkpoints while waiting on a Worker.";
+
+/// See [`BrigadeConfig::worker_prompt`].
+const DEFAULT_WORKER_PROMPT: &str = "\
+You are {token}, a Worker in banto brigade {brigade}, working under its \
+Director in this same working directory. banto relays between you: the \
+Director's instructions arrive through check_messages (banto nudges you \
+when something is waiting), and send_to_peer is how you report back — \
+findings, results, questions. Nobody reads your pane's transcript, so put \
+what matters in the message you send, not just in your own scrollback.";
 
 impl Default for BrigadeConfig {
     fn default() -> Self {
@@ -105,6 +160,8 @@ impl Default for BrigadeConfig {
             workers: 1,
             worker_model: "sonnet".to_string(),
             relay: RelayMode::Auto,
+            director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
+            worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
         }
     }
 }
@@ -113,6 +170,16 @@ impl BrigadeConfig {
     /// [`Self::workers`] clamped to a sane 1..=8 range for actual use.
     pub fn worker_count(&self) -> usize {
         self.workers.clamp(1, 8) as usize
+    }
+
+    /// The briefing template for `role`, or `None` when it is empty (the
+    /// "launch this member with no briefing at all" escape hatch).
+    pub fn prompt_for(&self, role: BrigadeRole) -> Option<&str> {
+        let template = match role {
+            BrigadeRole::Director => &self.director_prompt,
+            BrigadeRole::Worker => &self.worker_prompt,
+        };
+        (!template.is_empty()).then_some(template.as_str())
     }
 }
 
@@ -229,6 +296,32 @@ mod tests {
     fn brigade_worker_model_empty_string_is_the_inherit_default_escape_hatch() {
         let config = parse("[brigade]\nworker_model = \"\"\n");
         assert_eq!(config.brigade.worker_model, "");
+    }
+
+    #[test]
+    fn brigade_briefings_default_to_something_that_names_the_tools_and_substitutes() {
+        // Asserted structurally, not word for word: the prose is meant to be
+        // edited (it is banto's delegation policy, see `director_prompt`),
+        // and a test that pins its exact wording would just be a second copy
+        // to keep in sync.
+        let config = parse("");
+        let director = config.brigade.prompt_for(BrigadeRole::Director).unwrap();
+        assert!(director.contains("{brigade}") && director.contains("{peers}"));
+        assert!(director.contains("send_to_peer") && director.contains("check_messages"));
+
+        let worker = config.brigade.prompt_for(BrigadeRole::Worker).unwrap();
+        assert!(worker.contains("{brigade}") && worker.contains("{token}"));
+        assert!(worker.contains("send_to_peer") && worker.contains("check_messages"));
+    }
+
+    #[test]
+    fn brigade_briefings_are_overridable_and_an_empty_one_launches_with_no_flag() {
+        let config = parse("[brigade]\ndirector_prompt = \"lead {peers}\"\nworker_prompt = \"\"\n");
+        assert_eq!(
+            config.brigade.prompt_for(BrigadeRole::Director),
+            Some("lead {peers}")
+        );
+        assert_eq!(config.brigade.prompt_for(BrigadeRole::Worker), None);
     }
 
     #[test]
