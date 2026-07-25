@@ -714,6 +714,25 @@ impl App {
         self.modal.as_ref()
     }
 
+    /// Whether typed characters are currently being accepted as text:
+    /// [`Mode::Search`], or a modal with a text field ([`Modal::NewSession`]/
+    /// [`Modal::GroupJoin`]). `false` for a confirm-only modal
+    /// (`ConfirmArchive`/`ConfirmDisband`/`ConfirmKill`) — those ignore
+    /// [`Self::push_char`]/[`Self::modal_push_char`] entirely, and their
+    /// y/n/Enter keys must stay zero-latency. Named for its one consumer so
+    /// far, the emporium's paste accumulator (`paste_accum::is_in_scope`),
+    /// which widens paste synthesis to exactly this set of contexts on top
+    /// of a focused pane, without teaching the shell about modal variants.
+    pub fn accepts_text_input(&self) -> bool {
+        if self.mode == Mode::Search {
+            return true;
+        }
+        matches!(
+            self.modal,
+            Some(Modal::NewSession(_)) | Some(Modal::GroupJoin(_))
+        )
+    }
+
     /// Open the `n` new-session modal for an in-place launch, seeding its
     /// candidate list from every distinct cwd across all loaded sessions
     /// (bound to `n` in [`Mode::Normal`] — the default placement, matching
@@ -2935,6 +2954,42 @@ mod tests {
         app.open_confirm_disband_modal(1, "cell".to_string());
         app.close_modal();
         assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn accepts_text_input_truth_table_across_modes_and_modals() {
+        // Normal mode, no modal: not accepting text.
+        let mut app = App::new(vec![row("a", "Alpha", "")]);
+        app.set_viewport_height(10);
+        assert!(!app.accepts_text_input());
+
+        // Search mode: accepting.
+        app.enter_search();
+        assert!(app.accepts_text_input());
+        app.exit_search();
+        assert!(!app.accepts_text_input());
+
+        // Text-field modals: accepting.
+        app.open_new_session_modal();
+        assert!(app.accepts_text_input());
+        app.close_modal();
+
+        app.open_group_join_modal();
+        assert!(app.accepts_text_input());
+        app.close_modal();
+
+        // Confirm-only modals: not accepting — they ignore push_char
+        // entirely, and their y/n/Enter keys must stay zero-latency.
+        app.open_confirm_archive_modal();
+        assert!(!app.accepts_text_input());
+        app.close_modal();
+
+        app.open_confirm_disband_modal(1, "cell".to_string());
+        assert!(!app.accepts_text_input());
+        app.close_modal();
+
+        app.open_confirm_kill_modal("sess".to_string(), "Sess".to_string(), false);
+        assert!(!app.accepts_text_input());
     }
 
     #[test]

@@ -1759,15 +1759,30 @@ fn mouse_btn(button: MouseButton) -> u16 {
     }
 }
 
+/// The text up to (not including) the first CR or LF — conventional
+/// single-line-field paste behavior. Used by [`update_paste`]'s modal and
+/// search branches only: a trailing newline (the usual result of copying
+/// one line) becomes a no-op instead of dumping whatever followed it into
+/// the query or a stray character into a path. Deliberately changes Unix
+/// behavior too (a real `Event::Paste` there previously pushed the
+/// remainder straight through, since `push_char`/`modal_push_char` merely
+/// skip a control character rather than stopping at it) — so both
+/// platforms agree instead of diverging on which one happens to have a
+/// working paste-burst source.
+fn first_line(text: &str) -> &str {
+    let end = text.find(['\r', '\n']).unwrap_or(text.len());
+    &text[..end]
+}
+
 fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Instant) -> Vec<Cmd> {
     if app.modal().is_some() {
-        for c in text.chars() {
+        for c in first_line(&text).chars() {
             app.modal_push_char(c);
         }
         return Vec::new();
     }
     if app.mode() == Mode::Search {
-        for c in text.chars() {
+        for c in first_line(&text).chars() {
             app.push_char(c);
         }
         return Vec::new();
@@ -3433,6 +3448,62 @@ mod tests {
             Cmd::WritePty { key: k, bytes }
                 if *k == key && bytes == b"\x1b[200~a\rb\x1b[201~"
         ));
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_the_search_box_keeps_only_the_first_line() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("a")]);
+        app.enter_search();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Paste("first line\nsecond line".to_string())),
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.query(), "first line");
+        assert_eq!(
+            app.mode(),
+            Mode::Search,
+            "a truncated newline must not have confirmed/exited search"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_a_text_field_modal_keeps_only_the_first_line() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("a")]);
+        app.open_group_join_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Paste("myteam\nrest".to_string())),
+            now,
+        );
+
+        let Some(Modal::GroupJoin(gstate)) = app.modal() else {
+            panic!("expected the group-join modal to still be open");
+        };
+        assert_eq!(gstate.input(), "myteam");
+    }
+
+    #[test]
+    fn first_line_stops_at_either_line_ending_and_returns_the_whole_text_when_there_is_none() {
+        assert_eq!(first_line("abc\ndef"), "abc");
+        assert_eq!(first_line("abc\r\ndef"), "abc");
+        assert_eq!(first_line("abc\rdef"), "abc");
+        assert_eq!(first_line("no newline here"), "no newline here");
+        assert_eq!(first_line(""), "");
     }
 
     #[test]

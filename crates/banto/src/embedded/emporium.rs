@@ -254,7 +254,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             log_input(&mut input_log, &describe_raw_event(&raw));
             if let Some(input) = convert::from_crossterm(raw) {
                 log_input(&mut input_log, &describe_converted_event(&input));
-                if is_in_scope(&state, &input) {
+                if is_in_scope(&state, app, &input) {
                     // A stale buffer (idle past `PASTE_GAP` before this key
                     // arrived) flushes first, so it never silently merges
                     // into this key's run.

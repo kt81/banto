@@ -40,6 +40,7 @@
 
 use std::time::{Duration, Instant};
 
+use banto_core::app::App;
 use banto_core::engine::{EmporiumState, Focus};
 use banto_core::input::{InputEvent, KeyCode, KeyEvent};
 
@@ -53,18 +54,34 @@ pub(super) const PASTE_GAP: Duration = Duration::from_millis(25);
 pub(super) const PASTE_SIZE_CAP: usize = 65536;
 
 /// Whether `input` is eligible to join the accumulator: only a key that
-/// would otherwise be forwarded straight to a focused pane unchanged — a
-/// plain `Char` (no ctrl/alt; shift is fine, a shifted char already arrives
-/// pre-uppercased per crossterm's convention — see `convert.rs`'s
+/// would otherwise be forwarded straight to a focused pane, or typed
+/// straight into an open text field, unchanged — a plain `Char` (no
+/// ctrl/alt; shift is fine, a shifted char already arrives pre-uppercased
+/// per crossterm's convention — see `convert.rs`'s
 /// `shifted_uppercase_char_preserves_both_the_uppercase_code_and_shift`),
-/// `Enter`, or `Tab` — and only while a pane actually has focus with no
-/// prefix chord armed. Everything else (sidebar focus, an armed prefix, a
-/// ctrl/alt-modified key, arrows, F-keys, mouse, resize, a real
-/// `InputEvent::Paste` on a non-Windows backend) is out of scope and must
-/// never come near the buffer — this is what keeps sidebar `j`/`k`
-/// auto-repeat and an in-flight `Ctrl+B` prefix instant and untouched.
-pub(super) fn is_in_scope(state: &EmporiumState, input: &InputEvent) -> bool {
-    if state.focus != Focus::Pane || state.prefix_armed.is_some() {
+/// `Enter`, or `Tab` — and only while either a pane has focus OR `app` is in
+/// a text-entry context ([`App::accepts_text_input`] — Search mode, or a
+/// modal with a text field), with no prefix chord armed either way.
+/// Deliberately NOT widened to the whole sidebar: `j`/`k` list navigation
+/// (and any other sidebar command key) must keep dispatching immediately,
+/// not wait out a [`PASTE_GAP`] flush delay behind an accumulated run —
+/// that cost is already accepted inside a pane and imperceptible while
+/// typing text, but would make ordinary list browsing feel laggy. Widening
+/// past a pane at all is low-risk specifically because a false-positive
+/// coalesce in a text-entry context is benign (the same characters land
+/// either way, unlike a pane where Paste vs. Key changes the bracketed
+/// framing) — the one real trade-off is a typist landing Enter within
+/// [`PASTE_GAP`] (25ms) of the preceding character getting it absorbed into
+/// the burst instead of confirming immediately (the measured human floor
+/// was 31ms, so this is unlikely but possible; a second Enter confirms).
+/// Everything else (an armed prefix, a ctrl/alt-modified key, arrows,
+/// F-keys, mouse, resize, a real `InputEvent::Paste` on a non-Windows
+/// backend) is out of scope and must never come near the buffer.
+pub(super) fn is_in_scope(state: &EmporiumState, app: &App, input: &InputEvent) -> bool {
+    if state.prefix_armed.is_some() {
+        return false;
+    }
+    if state.focus != Focus::Pane && !app.accepts_text_input() {
         return false;
     }
     match input {
@@ -173,8 +190,22 @@ impl PasteAccumulator {
 mod tests {
     use banto_core::engine::PrefixKey;
     use banto_core::input::Modifiers;
+    use banto_core::model::{Activity, SessionRow};
 
     use super::*;
+
+    fn row(id: &str) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            title: Some(id.to_string()),
+            cwd: None,
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+        }
+    }
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), Modifiers::NONE)
@@ -196,21 +227,39 @@ mod tests {
         state
     }
 
+    /// Sidebar-focused state — the shell never widens accumulation on
+    /// `app`'s state alone; `Focus::Sidebar` plus an `App` that isn't in a
+    /// text-entry context is what a plain, nothing-open sidebar looks like.
+    fn sidebar_state() -> EmporiumState {
+        EmporiumState::new(PrefixKey::parse("C-b"))
+    }
+
+    /// A plain, no-modal, `Mode::Normal` `App` — does not accept text input.
+    /// Fine as the `app` argument for every *pane*-focused test below: when
+    /// `state.focus == Focus::Pane`, `is_in_scope` never even looks at
+    /// `app.accepts_text_input()`.
+    fn idle_app() -> App {
+        App::new(Vec::new())
+    }
+
     #[test]
     fn a_plain_char_in_pane_focus_is_in_scope() {
         let state = pane_state();
-        assert!(is_in_scope(&state, &InputEvent::Key(key('a'))));
+        assert!(is_in_scope(&state, &idle_app(), &InputEvent::Key(key('a'))));
     }
 
     #[test]
     fn enter_and_tab_are_in_scope() {
         let state = pane_state();
+        let app = idle_app();
         assert!(is_in_scope(
             &state,
+            &app,
             &InputEvent::Key(KeyEvent::new(KeyCode::Enter, Modifiers::NONE))
         ));
         assert!(is_in_scope(
             &state,
+            &app,
             &InputEvent::Key(KeyEvent::new(KeyCode::Tab, Modifiers::NONE))
         ));
     }
@@ -218,46 +267,98 @@ mod tests {
     #[test]
     fn a_shifted_char_is_still_in_scope() {
         let state = pane_state();
-        assert!(is_in_scope(&state, &InputEvent::Key(shifted('B'))));
+        assert!(is_in_scope(
+            &state,
+            &idle_app(),
+            &InputEvent::Key(shifted('B'))
+        ));
     }
 
     #[test]
-    fn sidebar_focus_is_out_of_scope() {
-        let mut state = pane_state();
-        state.focus = Focus::Sidebar;
-        assert!(!is_in_scope(&state, &InputEvent::Key(key('a'))));
+    fn plain_sidebar_focus_with_nothing_open_is_out_of_scope() {
+        // Deliberately NOT widened to the whole sidebar: j/k list
+        // navigation must keep dispatching immediately.
+        let state = sidebar_state();
+        assert!(!is_in_scope(
+            &state,
+            &idle_app(),
+            &InputEvent::Key(key('a'))
+        ));
     }
 
     #[test]
-    fn an_armed_prefix_is_out_of_scope() {
+    fn sidebar_focus_while_searching_is_in_scope() {
+        let state = sidebar_state();
+        let mut app = App::new(Vec::new());
+        app.enter_search();
+        assert!(is_in_scope(&state, &app, &InputEvent::Key(key('a'))));
+    }
+
+    #[test]
+    fn sidebar_focus_with_a_text_field_modal_open_is_in_scope() {
+        let state = sidebar_state();
+        let mut app = App::new(Vec::new());
+        app.open_new_session_modal();
+        assert!(is_in_scope(&state, &app, &InputEvent::Key(key('a'))));
+    }
+
+    #[test]
+    fn sidebar_focus_with_a_confirm_only_modal_open_is_out_of_scope() {
+        // A confirm modal ignores push_char and its y/n/Enter keys must
+        // stay zero-latency — it must not gain the accumulator's flush
+        // delay just because *some* modal happens to be open.
+        let state = sidebar_state();
+        let mut app = App::new(vec![row("a")]);
+        app.open_confirm_archive_modal();
+        assert!(!is_in_scope(&state, &app, &InputEvent::Key(key('a'))));
+    }
+
+    #[test]
+    fn an_armed_prefix_is_out_of_scope_even_in_a_pane() {
         let mut state = pane_state();
         state.prefix_armed = Some(t0());
-        assert!(!is_in_scope(&state, &InputEvent::Key(key('a'))));
+        assert!(!is_in_scope(
+            &state,
+            &idle_app(),
+            &InputEvent::Key(key('a'))
+        ));
+    }
+
+    #[test]
+    fn an_armed_prefix_is_out_of_scope_even_while_searching() {
+        let mut state = sidebar_state();
+        state.prefix_armed = Some(t0());
+        let mut app = App::new(Vec::new());
+        app.enter_search();
+        assert!(!is_in_scope(&state, &app, &InputEvent::Key(key('a'))));
     }
 
     #[test]
     fn a_ctrl_modified_char_is_out_of_scope() {
         let state = pane_state();
         let ctrl_v = KeyEvent::new(KeyCode::Char('v'), Modifiers::CONTROL);
-        assert!(!is_in_scope(&state, &InputEvent::Key(ctrl_v)));
+        assert!(!is_in_scope(&state, &idle_app(), &InputEvent::Key(ctrl_v)));
     }
 
     #[test]
     fn an_alt_modified_char_is_out_of_scope() {
         let state = pane_state();
         let alt_a = KeyEvent::new(KeyCode::Char('a'), Modifiers::ALT);
-        assert!(!is_in_scope(&state, &InputEvent::Key(alt_a)));
+        assert!(!is_in_scope(&state, &idle_app(), &InputEvent::Key(alt_a)));
     }
 
     #[test]
     fn arrows_and_f_keys_are_out_of_scope() {
         let state = pane_state();
+        let app = idle_app();
         assert!(!is_in_scope(
             &state,
+            &app,
             &InputEvent::Key(KeyEvent::new(KeyCode::Left, Modifiers::NONE))
         ));
         assert!(!is_in_scope(
             &state,
+            &app,
             &InputEvent::Key(KeyEvent::new(KeyCode::F(2), Modifiers::NONE))
         ));
     }
@@ -267,6 +368,7 @@ mod tests {
         let state = pane_state();
         assert!(!is_in_scope(
             &state,
+            &idle_app(),
             &InputEvent::Resize {
                 width: 80,
                 height: 24
