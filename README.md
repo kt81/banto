@@ -1,9 +1,9 @@
 # banto (番頭)
 
 A resident TUI that searches, groups, and resumes your local Claude Code
-sessions — and, in its **emporium mode**, hosts them as live embedded panes,
-including Director/Worker multi-session cells that banto itself wires
-together and keeps talking.
+sessions — and, in its **emporium mode** (大店, *oodana*), hosts them as
+live embedded panes, including Director/Worker multi-session cells that
+banto itself wires together and keeps talking.
 
 *Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese
 merchant house, who stays on the premises and runs the shop.*
@@ -17,16 +17,17 @@ Linux dogfooding is underway.
 ## What it does
 
 banto indexes the session files Claude Code CLI writes under `~/.claude`
-(read-only, always — see below), gives you a fast fuzzy-searchable list with
-your own grouping, pinning, and archiving on top, and opens whatever you
-pick — three ways:
+(read-only, always — see below) into the **chōba** (帳場, "the shop
+counter" — the default view): a fast fuzzy-searchable ledger of your
+sessions, with your own grouping, pinning, and archiving on top. Whatever
+you pick there opens one of three ways:
 
 - **In-place** (default, `Enter`): banto hands its own terminal to
   `claude --resume` and takes it back when the session exits. No
   multiplexer involved, full native fidelity.
 - **Split** (`s`): into a separate psmux pane / Windows Terminal tab, for
   multiplexer-layout users.
-- **Emporium** (`banto --emporium`, alias `--oodana`): banto becomes a
+- **Emporium** (大店 — `banto --emporium`, alias `--oodana`): banto becomes a
   minimal embedded multiplexer — a persistent sidebar plus sessions hosted
   in vt100-parsed panes, Vim-buffer-style swapping, sessions kept alive in
   the background across switches.
@@ -92,10 +93,10 @@ Requires a recent stable Rust toolchain (edition 2024).
 ```sh
 cargo build --release
 
-# Classic list TUI (default action)
+# Chōba: the default searchable session list
 cargo run --
 
-# Emporium mode: sidebar + embedded session panes
+# Emporium (oodana) mode: sidebar + embedded session panes
 cargo run -- --emporium
 
 # Plain-text session listing
@@ -107,7 +108,7 @@ cargo run -- --claude-home /path/to/.claude
 
 ## Keys
 
-### Classic list
+### Chōba (the list)
 
 | Key | Action |
 |---|---|

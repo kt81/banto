@@ -54,7 +54,7 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Open the 大店 (emporium) mode: banto as a persistent sidebar plus an
-    /// embedded session pane, instead of the classic list.
+    /// embedded session pane, instead of the default 帳場 (chōba) list.
     #[arg(long, visible_alias = "oodana")]
     emporium: bool,
 
