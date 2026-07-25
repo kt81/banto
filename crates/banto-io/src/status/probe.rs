@@ -16,6 +16,27 @@ pub trait ProcessProbe {
     /// isn't banto's own direct PTY child (e.g. launched via a cmd/npm
     /// shim) — see [`ancestry_reaches`].
     fn parent_pid(&self, pid: u32) -> Option<u32>;
+
+    /// True if `pid` is alive **and**, when identity can be established, it
+    /// is provably the same process that recorded `proc_start` — the
+    /// `procStart` field Claude Code itself writes to
+    /// `sessions/<pid>.json` (see `crate::status::live::LiveSession`).
+    ///
+    /// A bare [`Self::is_alive`] only answers "does some process own this
+    /// pid right now", which a pid recycled after a crash/kill can answer
+    /// `true` for even though it is a completely unrelated process — a risk
+    /// this crate's own audit flagged as more likely on Linux/WSL, which
+    /// recycles pids far faster than Windows typically does. This method
+    /// closes that gap where possible.
+    ///
+    /// Falls back to [`Self::is_alive`] whenever identity can't be
+    /// established: `proc_start` fails to parse, or this implementation has
+    /// no reliable way to read the compared-against process's own start
+    /// time on the current platform. Declining to strengthen the check is
+    /// always safe; a wrong mismatch is not — see
+    /// [`SysinfoProbe::is_alive_matching`]'s doc comment for what is and
+    /// isn't verified.
+    fn is_alive_matching(&self, pid: u32, proc_start: &str) -> bool;
 }
 
 /// [`ProcessProbe`] implementation backed by the `sysinfo` crate.
@@ -46,6 +67,79 @@ impl ProcessProbe for SysinfoProbe {
         );
         system.process(pid)?.parent().map(Pid::as_u32)
     }
+
+    /// Verified only on Linux (which WSL2 counts as: it has a real kernel
+    /// `/proc`), by comparing `proc_start` against the kernel's own
+    /// `starttime` field for `pid` (`/proc/<pid>/stat`, field 22 — clock
+    /// ticks since boot, per `man 5 proc`). This is the exact quantity
+    /// Claude Code's `procStart` records: confirmed by direct, on-device
+    /// comparison of live `sessions/<pid>.json` files against
+    /// `/proc/<pid>/stat` (identical values, same units, same reference
+    /// point) — not assumed.
+    ///
+    /// Deliberately does *not* go through `sysinfo`'s own
+    /// `Process::start_time()`: that method only returns whole *seconds
+    /// since the Unix epoch* (`boot_time + raw_ticks / CLK_TCK`), and
+    /// neither `boot_time` nor `CLK_TCK` (needed to convert `proc_start`'s
+    /// raw ticks into the same units for a lossless comparison) is part of
+    /// its public API — reconstructing them would mean hardcoding an
+    /// assumed `CLK_TCK` (typically 100 on Linux, but not guaranteed, and
+    /// not verifiable through this crate), turning an exact match into a
+    /// guess. Reading the raw ticks directly instead needs no such
+    /// assumption: both sides are the same unconverted integer.
+    ///
+    /// On any other platform, or if `pid`'s `/proc/<pid>/stat` can't be
+    /// read/parsed, or `proc_start` itself doesn't parse, falls back to
+    /// [`Self::is_alive`] — see the trait doc comment for why that fallback
+    /// is the safe direction to fail in.
+    fn is_alive_matching(&self, pid: u32, proc_start: &str) -> bool {
+        let Ok(expected) = proc_start.parse::<u64>() else {
+            return self.is_alive(pid);
+        };
+        match read_proc_start_ticks(pid) {
+            Some(actual) => actual == expected,
+            None => self.is_alive(pid),
+        }
+    }
+}
+
+/// Parse the `starttime` field (the 22nd, 1-indexed, per `man 5 proc`) out of
+/// the raw contents of a `/proc/<pid>/stat` file.
+///
+/// Robust against the second field (`comm`, the executable name in
+/// parentheses) itself containing spaces or parentheses, by locating the
+/// *last* `)` in the line before whitespace-splitting the remaining fields —
+/// mirrors the algorithm the `sysinfo` crate uses internally for the same
+/// file (it does not expose the raw value publicly; see
+/// [`SysinfoProbe::is_alive_matching`]'s doc comment for why that matters
+/// here). Field indices below were cross-checked against a real
+/// `/proc/<pid>/stat` line on-device, not derived from documentation alone.
+fn parse_starttime_ticks(stat: &str) -> Option<u64> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    // state(0) ppid(1) pgrp(2) session(3) tty(4) tpgid(5) flags(6) minflt(7)
+    // cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12) cutime(13)
+    // cstime(14) priority(15) nice(16) num_threads(17) itrealvalue(18)
+    // starttime(19) — the 20th field after `comm`, i.e. the 22nd overall.
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Read and parse `pid`'s kernel-reported start time, in clock ticks since
+/// boot. `None` if the process doesn't exist, the file can't be read, or its
+/// contents don't parse — all treated identically by
+/// [`SysinfoProbe::is_alive_matching`]'s caller.
+#[cfg(target_os = "linux")]
+fn read_proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_starttime_ticks(&stat)
+}
+
+/// No `/proc` on this platform to read a start time from at all — always
+/// declines, deferring identity verification to [`SysinfoProbe::is_alive`]'s
+/// bare liveness check (see that method's doc comment for why that fallback
+/// direction is the safe one).
+#[cfg(not(target_os = "linux"))]
+fn read_proc_start_ticks(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Whether `live_pid`'s own process ancestry — itself, then its parent, its
@@ -98,6 +192,10 @@ mod tests {
         fn parent_pid(&self, pid: u32) -> Option<u32> {
             self.0.get(&pid).copied()
         }
+
+        fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
+            self.is_alive(pid)
+        }
     }
 
     #[test]
@@ -136,5 +234,80 @@ mod tests {
         // target_pid — a genuine non-match, not just a depth exhaustion.
         let probe = MockAncestryProbe(HashMap::new());
         assert!(!ancestry_reaches(200, 100, &probe, 5));
+    }
+
+    // --- parse_starttime_ticks --------------------------------------------
+
+    #[test]
+    fn parse_starttime_ticks_reads_field_22_after_a_plain_comm() {
+        // A real (trimmed) /proc/<pid>/stat line shape: pid (comm) state
+        // ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
+        // utime stime cutime cstime priority nice num_threads itrealvalue
+        // starttime ...
+        let stat = "78739 (claude) S 77993 78739 78739 34818 78739 4194304 \
+                     374378 1315564 0 262 8309 4928 1791 1539 20 0 12 0 \
+                     1105463 6445989888 108819";
+        assert_eq!(parse_starttime_ticks(stat), Some(1_105_463));
+    }
+
+    #[test]
+    fn parse_starttime_ticks_handles_a_comm_containing_parens_and_spaces() {
+        // `comm` (the 2nd field) can itself contain spaces and parentheses;
+        // parsing must key off the *last* `)` in the line, not the first.
+        let stat = "999 (my (weird) prog) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 \
+                     15 16 17 18 4242 0 0";
+        assert_eq!(parse_starttime_ticks(stat), Some(4242));
+    }
+
+    #[test]
+    fn parse_starttime_ticks_is_none_without_a_comm_delimiter() {
+        assert_eq!(parse_starttime_ticks("not a stat line at all"), None);
+    }
+
+    #[test]
+    fn parse_starttime_ticks_is_none_when_too_few_fields_follow_comm() {
+        let stat = "1 (sh) S 1 2 3";
+        assert_eq!(parse_starttime_ticks(stat), None);
+    }
+
+    #[test]
+    fn parse_starttime_ticks_is_none_when_the_field_is_not_numeric() {
+        let stat = "1 (sh) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 \
+                     not-a-number 0 0";
+        assert_eq!(parse_starttime_ticks(stat), None);
+    }
+
+    // --- SysinfoProbe::is_alive_matching -----------------------------------
+
+    #[test]
+    fn is_alive_matching_falls_back_to_is_alive_when_proc_start_does_not_parse() {
+        let probe = SysinfoProbe;
+        // The current test process is genuinely alive; a garbage proc_start
+        // can't be compared against anything, so this must degrade to the
+        // same answer plain `is_alive` gives, never to `false`.
+        assert!(probe.is_alive_matching(std::process::id(), "not-a-pid-start"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_alive_matching_confirms_the_current_process_by_its_real_kernel_start_time() {
+        let pid = std::process::id();
+        let real_ticks =
+            read_proc_start_ticks(pid).expect("this test process must have a readable /proc entry");
+
+        assert!(SysinfoProbe.is_alive_matching(pid, &real_ticks.to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_alive_matching_rejects_a_mismatched_start_time_even_though_the_pid_is_alive() {
+        // Proves this isn't secretly just `is_alive` again: a live pid with
+        // a *wrong* recorded start time (as if the pid had been recycled
+        // since the record was written) must read as not-a-match.
+        let pid = std::process::id();
+        let real_ticks =
+            read_proc_start_ticks(pid).expect("this test process must have a readable /proc entry");
+
+        assert!(!SysinfoProbe.is_alive_matching(pid, &(real_ticks + 1).to_string()));
     }
 }

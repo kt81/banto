@@ -28,6 +28,16 @@ pub struct LiveSession {
     pub kind: Option<String>,
     /// Human-readable session name, if any.
     pub name: Option<String>,
+    /// The process's own kernel-reported start time, as Claude Code recorded
+    /// it (JSON key `procStart`) — on Linux/WSL this is `/proc/<pid>/stat`'s
+    /// `starttime` field (clock ticks since boot), confirmed by direct,
+    /// on-device comparison; its meaning on other platforms is unverified.
+    /// Kept as the raw string (never parsed here — this module's parsing is
+    /// lenient by contract, and interpreting the value is
+    /// `status::probe::SysinfoProbe::is_alive_matching`'s job), so a missing
+    /// or unrecognized value degrades to `None` rather than to a parse
+    /// error.
+    pub proc_start: Option<String>,
 }
 
 /// Raw serde target. Unknown fields are ignored (serde default behavior);
@@ -42,6 +52,7 @@ struct RawLiveSession {
     status: Option<String>,
     kind: Option<String>,
     name: Option<String>,
+    proc_start: Option<String>,
 }
 
 /// Read every `*.json` file in `sessions_dir` as a [`LiveSession`].
@@ -82,6 +93,7 @@ fn parse_live_session_file(path: &Path) -> Option<LiveSession> {
         status: raw.status,
         kind: raw.kind,
         name: raw.name,
+        proc_start: raw.proc_start,
     })
 }
 
@@ -113,7 +125,8 @@ mod tests {
                 "cwd": "/tmp/project",
                 "status": "busy",
                 "kind": "interactive",
-                "name": "fixture session"
+                "name": "fixture session",
+                "procStart": "1105463"
             }"#,
         );
 
@@ -127,6 +140,7 @@ mod tests {
                 status: Some("busy".into()),
                 kind: Some("interactive".into()),
                 name: Some("fixture session".into()),
+                proc_start: Some("1105463".into()),
             }]
         );
     }
@@ -192,8 +206,47 @@ mod tests {
                 status: None,
                 kind: None,
                 name: None,
+                proc_start: None,
             }]
         );
+    }
+
+    #[test]
+    fn proc_start_is_none_when_the_field_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "99.json", r#"{"pid": 99}"#);
+
+        let sessions = read_live_sessions(dir.path());
+        assert_eq!(sessions[0].proc_start, None);
+    }
+
+    #[test]
+    fn proc_start_is_captured_as_the_raw_string_unparsed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "99.json",
+            r#"{"pid": 99, "procStart": "1105463"}"#,
+        );
+
+        let sessions = read_live_sessions(dir.path());
+        assert_eq!(sessions[0].proc_start.as_deref(), Some("1105463"));
+    }
+
+    #[test]
+    fn skips_file_with_wrong_typed_proc_start() {
+        // Same leniency contract as every other captured field (see
+        // `skips_file_with_wrong_typed_captured_field`): a `procStart` that
+        // isn't a string invalidates the whole record rather than silently
+        // becoming `None`.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "99.json",
+            r#"{"pid": 99, "procStart": 1105463}"#,
+        );
+
+        assert!(read_live_sessions(dir.path()).is_empty());
     }
 
     #[test]

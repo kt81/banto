@@ -4,7 +4,10 @@
 //! - Every external process invocation goes through [`CommandRunner`], which
 //!   unit tests mock; tests never spawn real processes.
 //! - Backend priority: psmux (tmux-compatible CLI) first, Windows Terminal tab
-//!   as fallback. Auto detection checks `$TMUX` before `$WT_SESSION`.
+//!   as fallback. Auto detection checks `$TMUX` before `$WT_SESSION`, and
+//!   `$WT_SESSION` is only honored when actually running on Windows — under
+//!   WSL it can be set (forwarded from the host) without `wt.exe` being a
+//!   usable backend at all (see [`detect_backend`]).
 //! - psmux pane user options are unusable; panes are tagged with
 //!   `select-pane -T` and the store's pane map is the source of truth.
 //! - The resume command line and `banto _wrap` are built by the bin crate; this
@@ -132,24 +135,43 @@ pub trait Opener {
     fn focus(&self, handle: &SessionHandle) -> Result<(), OpenError>;
 }
 
-/// Detect the preferred backend from environment variables.
+/// Detect the preferred backend from environment variables and the host
+/// platform.
 ///
 /// Order matters: inside psmux both `TMUX` and `WT_SESSION` are set, so `TMUX`
 /// is checked first (docs/REQUIREMENTS.md "Opener spec"). `env` looks up a
-/// variable by name; it is injected so this stays a pure, testable function.
-pub fn detect_backend(env: impl Fn(&str) -> Option<String>) -> Option<Backend> {
+/// variable by name; `is_windows` is whether this process is actually running
+/// on Windows. Both are injected so this stays a pure, testable function
+/// (docs/DISCIPLINE.md Appendix A's house pattern) — see
+/// [`detect_backend_from_env`] for the real edge values.
+///
+/// `$WT_SESSION` alone is not enough to select the Windows Terminal backend:
+/// under WSL, a shell that forwards it from the Windows Terminal host (e.g.
+/// via `WSLENV=WT_SESSION`) sees it set even though the Linux binary itself
+/// cannot drive `wt.exe` — the variable is evidence about the host Windows
+/// Terminal *ancestry*, not about which platform this process is running on.
+/// `Backend::WindowsTerminal` is therefore only ever returned when
+/// `is_windows` is also true.
+pub fn detect_backend(env: impl Fn(&str) -> Option<String>, is_windows: bool) -> Option<Backend> {
     if env("TMUX").is_some() {
         Some(Backend::Psmux)
-    } else if env("WT_SESSION").is_some() {
+    } else if is_windows && env("WT_SESSION").is_some() {
         Some(Backend::WindowsTerminal)
     } else {
         None
     }
 }
 
-/// Detect the preferred backend from the current process environment.
+/// Detect the preferred backend from the current process environment and the
+/// real host platform, for a caller that has no injected values of its own.
+///
+/// Not the only edge that reads them for real: the bin crate's
+/// `opener::resolve_backend` keeps its own injected `env` (its callers mock
+/// it) and so supplies `cfg!(windows)` itself. Both are edges; the *decision*
+/// stays in one place, [`detect_backend`], which is what the tests exercise
+/// across every platform × environment combination.
 pub fn detect_backend_from_env() -> Option<Backend> {
-    detect_backend(|key| std::env::var(key).ok())
+    detect_backend(|key| std::env::var(key).ok(), cfg!(windows))
 }
 
 /// Build the [`Opener`] for `backend`, driven by `runner`.
@@ -166,24 +188,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_prefers_tmux_over_windows_terminal() {
-        // Inside psmux both variables are set; TMUX must win.
+    fn detect_prefers_tmux_over_windows_terminal_regardless_of_platform() {
+        // Inside psmux both variables are set; TMUX must win, on Windows or not.
         let env = |key: &str| match key {
             "TMUX" | "WT_SESSION" => Some("set".to_string()),
             _ => None,
         };
-        assert_eq!(detect_backend(env), Some(Backend::Psmux));
+        assert_eq!(detect_backend(env, true), Some(Backend::Psmux));
+        assert_eq!(detect_backend(env, false), Some(Backend::Psmux));
     }
 
     #[test]
-    fn detect_windows_terminal_when_no_tmux() {
+    fn detect_windows_terminal_when_wt_session_set_and_actually_on_windows() {
         let env = |key: &str| (key == "WT_SESSION").then(|| "set".to_string());
-        assert_eq!(detect_backend(env), Some(Backend::WindowsTerminal));
+        assert_eq!(detect_backend(env, true), Some(Backend::WindowsTerminal));
     }
 
     #[test]
-    fn detect_none_when_neither_present() {
-        assert_eq!(detect_backend(|_| None), None);
+    fn wt_session_set_but_not_on_windows_yields_none_the_wsl_case() {
+        // WSLENV can forward $WT_SESSION from the Windows Terminal host into
+        // a WSL shell even though no tmux/psmux session has been started
+        // yet; the Linux binary must not mistake that for "select `wt`".
+        let env = |key: &str| (key == "WT_SESSION").then(|| "set".to_string());
+        assert_eq!(detect_backend(env, false), None);
+    }
+
+    #[test]
+    fn detect_none_when_neither_present_regardless_of_platform() {
+        assert_eq!(detect_backend(|_| None, true), None);
+        assert_eq!(detect_backend(|_| None, false), None);
     }
 
     #[test]
