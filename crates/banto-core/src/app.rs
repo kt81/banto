@@ -126,7 +126,42 @@ pub enum Modal {
     /// cancels. `title` is the session's display title, for the prompt.
     /// The chōba never opens this either, for the same reason as
     /// `ConfirmDisband`.
-    ConfirmKill { key: String, title: String },
+    ConfirmKill {
+        key: String,
+        title: String,
+        /// `Some` only when the focused pane is a Worker's (the engine
+        /// decides this structurally, from which pane is focused — see
+        /// `crate::embedded::engine::PrefixAction::Kill`) — which of the
+        /// dialog's two choices is currently highlighted. `None` for a
+        /// Director or solo pane, whose dialog stays the single kill-only
+        /// confirm it always was: dismissing a Director is disband's job
+        /// (`B`), and a solo pane has no brigade to dismiss from at all.
+        worker_choice: Option<KillChoice>,
+    },
+}
+
+/// The two choices in a Worker's prefix-`x` kill confirm dialog (see
+/// [`Modal::ConfirmKill`]). Toggled by Up/Down, same as any other modal's
+/// candidate selection ([`App::modal_select_prev`]/[`App::modal_select_next`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillChoice {
+    /// End the process; membership survives — the token respawns fresh next
+    /// time its brigade is staged (today's only behavior, for every pane
+    /// kind). Highlighted by default: the less destructive of the two.
+    ClosePane,
+    /// Remove the Worker from the brigade for good (暇を出す): its
+    /// membership, read cursor, and any mail addressed specifically to it
+    /// are gone too, on top of ending the process.
+    Dismiss,
+}
+
+impl KillChoice {
+    fn toggle(self) -> Self {
+        match self {
+            KillChoice::ClosePane => KillChoice::Dismiss,
+            KillChoice::Dismiss => KillChoice::ClosePane,
+        }
+    }
 }
 
 /// State for the group-join modal: a free-text new-group-name input plus a
@@ -810,21 +845,31 @@ impl App {
     }
 
     /// Move the open modal's candidate selection. No-op when no modal is
-    /// open, or it has no candidate list.
+    /// open, or it has no candidate list. A Worker's kill-confirm dialog has
+    /// only two choices, so prev/next both just toggle between them.
     pub fn modal_select_prev(&mut self) {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_selection(-1),
             Some(Modal::GroupJoin(state)) => state.move_selection(-1),
+            Some(Modal::ConfirmKill {
+                worker_choice: Some(choice),
+                ..
+            }) => *choice = choice.toggle(),
             _ => {}
         }
     }
 
     /// Move the open modal's candidate selection. No-op when no modal is
-    /// open, or it has no candidate list.
+    /// open, or it has no candidate list. A Worker's kill-confirm dialog has
+    /// only two choices, so prev/next both just toggle between them.
     pub fn modal_select_next(&mut self) {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_selection(1),
             Some(Modal::GroupJoin(state)) => state.move_selection(1),
+            Some(Modal::ConfirmKill {
+                worker_choice: Some(choice),
+                ..
+            }) => *choice = choice.toggle(),
             _ => {}
         }
     }
@@ -1145,9 +1190,15 @@ impl App {
     }
 
     /// Open the emporium's kill confirm dialog for the given session (bound
-    /// to prefix-`x` on the focused pane).
-    pub fn open_confirm_kill_modal(&mut self, key: String, title: String) {
-        self.modal = Some(Modal::ConfirmKill { key, title });
+    /// to prefix-`x` on the focused pane). `is_worker` grows the dialog a
+    /// second choice, defaulted to [`KillChoice::ClosePane`] — see
+    /// [`Modal::ConfirmKill`].
+    pub fn open_confirm_kill_modal(&mut self, key: String, title: String, is_worker: bool) {
+        self.modal = Some(Modal::ConfirmKill {
+            key,
+            title,
+            worker_choice: is_worker.then_some(KillChoice::ClosePane),
+        });
     }
 
     /// Toggle the pinned state of the selected session (no-op when nothing

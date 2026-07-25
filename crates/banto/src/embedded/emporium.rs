@@ -655,6 +655,19 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 });
             vec![Event::Disbanded { brigade_id, result }]
         }
+        StoreIntent::DismissWorker { brigade_id, token } => {
+            let mut store = store.borrow_mut();
+            let result = store
+                .dismiss_worker(brigade_id, &token)
+                .map_err(|err| err.to_string())
+                .map(|()| {
+                    (
+                        crate::tui::load_hidden_worker_ids(&store),
+                        crate::tui::load_directors(&store),
+                    )
+                });
+            vec![Event::WorkerDismissed { brigade_id, result }]
+        }
         StoreIntent::SetMemberSession {
             brigade_id,
             token,
@@ -729,7 +742,11 @@ fn form_brigade_store(
 }
 
 /// Add one more Worker to an already-formed brigade, under the next
-/// `worker-N` token.
+/// `worker-N` token. `N` is the highest existing Worker number plus one, NOT
+/// a count of current Workers — dismissal (R27) can leave a gap (e.g.
+/// worker-1 dismissed while worker-2 survives), and counting would then mint
+/// worker-2 again, colliding with the survivor and letting the newcomer
+/// inherit its predecessor's stale store row.
 fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<MemberToken, String> {
     let mut store = store.borrow_mut();
     let members = store
@@ -738,7 +755,10 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
     let next_n = members
         .iter()
         .filter(|member| member.role == BrigadeRole::Worker)
-        .count()
+        .filter_map(|member| member.token.strip_prefix("worker-"))
+        .filter_map(|n| n.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
         + 1;
     let token = format!("worker-{next_n}");
     store
@@ -1669,6 +1689,91 @@ mod tests {
             .find(|(token, ..)| token == "worker-1")
             .unwrap();
         assert_eq!(worker.2, None, "nothing to heal for an unassigned member");
+    }
+
+    // --- dismiss a Worker (暇を出す) --------------------------------------
+
+    #[test]
+    fn dismiss_worker_store_intent_removes_membership_and_reports_refreshed_sets() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+
+        let events = execute_store_intent(
+            StoreIntent::DismissWorker {
+                brigade_id,
+                token: "worker-1".to_string(),
+            },
+            &store,
+        );
+
+        let [
+            Event::WorkerDismissed {
+                brigade_id: reported_id,
+                result: Ok((hidden, directors)),
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected a successful WorkerDismissed: {events:?}");
+        };
+        assert_eq!(*reported_id, brigade_id);
+        // w1 left the hidden-worker set (dismissed for good, honestly
+        // surfaced as an ordinary session); the director is untouched.
+        assert!(!hidden.contains("w1"));
+        assert!(directors.contains("dir"));
+        assert_eq!(
+            store
+                .borrow()
+                .brigade_member(brigade_id, "worker-1")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn add_worker_after_dismissing_a_gap_mints_past_the_survivor_not_into_it() {
+        // R27's correctness prerequisite: dismissing worker-1 while
+        // worker-2 survives must not make add_worker_store re-mint
+        // "worker-2" (a count-based next_n would, colliding with the
+        // survivor and handing it that member's stale store row/mail).
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+        store.dismiss_worker(brigade_id, "worker-1").unwrap();
+        let store = RefCell::new(store);
+
+        let token = add_worker_store(&store, brigade_id).unwrap();
+
+        assert_eq!(token, "worker-3");
+        assert!(
+            store
+                .borrow()
+                .brigade_member(brigade_id, "worker-2")
+                .unwrap()
+                .is_some(),
+            "the survivor must be untouched"
+        );
     }
 
     // --- id discovery: the handle map follows the core's rekey -----------

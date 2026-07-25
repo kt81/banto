@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use banto_core::app::{GroupJoinState, Modal, NewSessionPlacement, NewSessionState};
+use banto_core::app::{GroupJoinState, KillChoice, Modal, NewSessionPlacement, NewSessionState};
 
 use crate::text::truncate_to_width;
 
@@ -167,7 +167,11 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
         Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
         Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
-        Modal::ConfirmKill { title, .. } => render_confirm_kill_modal(frame, title, area),
+        Modal::ConfirmKill {
+            title,
+            worker_choice,
+            ..
+        } => render_confirm_kill_modal(frame, title, *worker_choice, area),
     }
 }
 
@@ -284,30 +288,84 @@ fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Render the emporium's prefix-`x` kill confirm dialog: a one-line yes/no
-/// prompt naming the session. Killing only ends the process — brigade
-/// membership is untouched, so a killed Worker respawns fresh under the same
-/// token the next time its brigade is staged (the same disposable-Worker
-/// semantics `stage_brigade` already has for one that's simply gone).
-fn render_confirm_kill_modal(frame: &mut Frame, title: &str, area: Rect) {
+/// Render the emporium's prefix-`x` kill confirm dialog. A Director or solo
+/// pane (`worker_choice: None`) keeps the original one-line yes/no prompt:
+/// killing only ends the process — brigade membership is untouched, so a
+/// killed Worker respawns fresh under the same token the next time its
+/// brigade is staged (the same disposable-Worker semantics `stage_brigade`
+/// already has for one that's simply gone). A Worker's pane
+/// (`worker_choice: Some`) instead shows both choices as a two-item list —
+/// close pane (the paragraph above) or dismiss it from the brigade for
+/// good — with Up/Down toggling which is highlighted, the same candidate-
+/// list idiom as every other modal here.
+fn render_confirm_kill_modal(
+    frame: &mut Frame,
+    title: &str,
+    worker_choice: Option<KillChoice>,
+    area: Rect,
+) {
+    let Some(choice) = worker_choice else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Kill Session \u{2014} confirm ")
+            .title_bottom(" Enter kill  Esc cancel ");
+        let inner = pad_horizontal(block.inner(area));
+        frame.render_widget(block, area);
+
+        let prompt = truncate_to_width(&format!("Kill \"{title}\"?"), inner.width);
+        let lines = vec![
+            Line::from(prompt),
+            Line::from(Span::styled(
+                "Ends the process now. A Worker respawns fresh next time its \
+                 brigade is staged; a Director does not.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" Kill Session \u{2014} confirm ")
-        .title_bottom(" Enter kill  Esc cancel ");
+        .title(" Kill Worker \u{2014} confirm ")
+        .title_bottom(" \u{2191}\u{2193} choose  Enter confirm  Esc cancel ");
     let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
-    let prompt = truncate_to_width(&format!("Kill \"{title}\"?"), inner.width);
-    let lines = vec![
-        Line::from(prompt),
-        Line::from(Span::styled(
-            "Ends the process now. A Worker respawns fresh next time its \
-             brigade is staged; a Director does not.",
-            Style::default().fg(Color::DarkGray),
-        )),
+    let [prompt_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    let prompt = truncate_to_width(
+        &format!("\"{title}\" \u{2014} what now?"),
+        prompt_area.width,
+    );
+    frame.render_widget(Paragraph::new(prompt), prompt_area);
+
+    let items = [
+        ListItem::new(vec![
+            Line::from("Close pane"),
+            Line::from(Span::styled(
+                "  Keeps its place in the brigade.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]),
+        ListItem::new(vec![
+            Line::from("Dismiss from the brigade"),
+            Line::from(Span::styled(
+                "  For good \u{2014} membership, cursor, and its mail are gone.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]),
     ];
-    frame.render_widget(Paragraph::new(lines), inner);
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    list_state.select(Some(match choice {
+        KillChoice::ClosePane => 0,
+        KillChoice::Dismiss => 1,
+    }));
+    frame.render_stateful_widget(list, list_area, &mut list_state);
 }
 
 /// Render the `g` group-join dialog: a one-line new-group-name input (same
@@ -449,6 +507,58 @@ mod tests {
         assert!(
             row_text.contains('\u{2026}'),
             "long content should end in a visible ellipsis, not a silent cutoff:\n{row_text}"
+        );
+    }
+
+    /// Flatten a rendered buffer into one string, row breaks included, for
+    /// content assertions.
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn worker_kill_modal_shows_both_choices() {
+        let area = Rect::new(2, 2, 50, 10);
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_confirm_kill_modal(frame, "worker-1", Some(KillChoice::ClosePane), area)
+            })
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(text.contains("Close pane"), "missing first choice:\n{text}");
+        assert!(
+            text.contains("Dismiss from the brigade"),
+            "missing second choice:\n{text}"
+        );
+    }
+
+    #[test]
+    fn director_or_solo_kill_modal_keeps_the_single_choice_prompt() {
+        let area = Rect::new(2, 2, 50, 10);
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render_confirm_kill_modal(frame, "sess-1", None, area))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            text.contains("Kill \"sess-1\"?"),
+            "missing plain prompt:\n{text}"
+        );
+        assert!(
+            !text.contains("Dismiss from the brigade"),
+            "a Director/solo pane must not show the dismiss choice:\n{text}"
         );
     }
 

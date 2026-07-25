@@ -155,6 +155,37 @@ impl Store {
         Ok(())
     }
 
+    /// Removes a Worker from its brigade for good (the emporium's prefix-`x`
+    /// "dismiss" choice, as opposed to just closing its pane): membership,
+    /// its read cursor, AND — unlike [`Self::remove_brigade_member`], which
+    /// this does not reuse, since that one is used elsewhere to tidy up a
+    /// resolved fork/collision and must leave mail alone — any message
+    /// addressed specifically to it (`to_member = token`). The mail purge is
+    /// load-bearing, not tidiness: `token` numbers get reused (a future
+    /// Worker can mint the same `worker-N` this one had), so leaving its
+    /// addressed-but-unread mail behind would hand it straight to whichever
+    /// stranger inherits the token next. Broadcasts (`to_member IS NULL`)
+    /// are untouched — they belong to the role, not this one member, and
+    /// every other member's own cursor still governs what they've seen of
+    /// them. Dismissing a non-member is a no-op.
+    pub fn dismiss_worker(&mut self, brigade_id: BrigadeId, token: &str) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, token],
+        )?;
+        tx.execute(
+            "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, token],
+        )?;
+        tx.execute(
+            "DELETE FROM brigade_messages WHERE brigade_id = ?1 AND to_member = ?2",
+            params![brigade_id, token],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns a brigade's members: the Director first, then Workers ordered
     /// by token (`worker-1`, `worker-2`, ... — lexicographic ordering is only
     /// numerically correct up to single-digit tokens, which the emporium's
@@ -793,6 +824,66 @@ mod tests {
         store.delete_brigade(br).unwrap();
         assert!(store.brigade_members(br).unwrap().is_empty());
         assert_eq!(store.brigade_of_claude_session(&sid("dir")).unwrap(), None);
+    }
+
+    #[test]
+    fn dismiss_worker_removes_membership_cursor_and_its_addressed_mail() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+            .unwrap();
+        store
+            .add_brigade_member(br, "worker-2", BrigadeRole::Worker, Some(&sid("w2")))
+            .unwrap();
+
+        // Addressed to the dismissed worker: must be purged.
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, Some("worker-1"), "hi")
+            .unwrap();
+        // Addressed to the surviving worker: must NOT be touched.
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, Some("worker-2"), "hey")
+            .unwrap();
+        // A broadcast: belongs to the role, must survive too.
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "all")
+            .unwrap();
+
+        store.dismiss_worker(br, "worker-1").unwrap();
+
+        // Membership and cursor are gone; the director and worker-2 remain.
+        let tokens: Vec<String> = store
+            .brigade_members(br)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.token)
+            .collect();
+        assert_eq!(tokens, ["director", "worker-2"]);
+
+        // worker-2 still sees its own addressed message and the broadcast —
+        // neither was collateral damage from worker-1's dismissal.
+        let worker2_messages = store
+            .fetch_brigade_messages(br, "worker-2", BrigadeRole::Worker)
+            .unwrap();
+        let bodies: Vec<String> = worker2_messages.into_iter().map(|m| m.body).collect();
+        assert_eq!(bodies, ["hey".to_string(), "all".to_string()]);
+    }
+
+    #[test]
+    fn dismiss_worker_of_a_non_member_is_a_noop() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+
+        store.dismiss_worker(br, "worker-1").unwrap();
+
+        assert_eq!(store.brigade_members(br).unwrap().len(), 1);
     }
 
     #[test]
