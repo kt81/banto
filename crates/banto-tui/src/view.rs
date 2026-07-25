@@ -23,15 +23,20 @@
 //!
 //! # Row layout
 //!
-//! One algorithm, driven by the render area's width, for both modes:
-//! `[dot 2][pin 3][role 3][title][gap 2][cwd?][gap>=2][age]`. Each marker
-//! slot (pin/role) is the emoji plus one trailing separator space when
-//! occupied, or three blank columns when not — a glued-together
-//! `📌🤝title` reads as one sticker, not two markers. See [`row_line`] for
-//! the exact budget arithmetic (title/cwd mutually exclusive truncation,
-//! age always flush at the right edge, saturating throughout with an
-//! explicit narrow-width degradation that drops the age column entirely
-//! rather than ever let it collide into the prefix).
+//! One algorithm, driven by the render area's width and whether grouped
+//! view is actually in effect (`App::grouped_view_in_effect`), for both
+//! modes: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`.
+//! The pin slot exists (3 columns) only in flat view — in grouped view
+//! every pinned row's section is "Pinned" (`App::section_name` gives it
+//! top priority), so a pin marker could never render there anyway; the
+//! column is dropped entirely rather than reserved-but-always-blank. The
+//! role slot is unconditional in both modes. A present marker slot is the
+//! emoji plus one trailing separator space — a glued-together `📌🤝title`
+//! reads as one sticker, not two markers. See [`row_line`] for the exact
+//! budget arithmetic (title/cwd mutually exclusive truncation, age always
+//! flush at the right edge, saturating throughout with an explicit
+//! narrow-width degradation that drops the age column entirely rather than
+//! ever let it collide into the prefix).
 
 use std::time::SystemTime;
 
@@ -54,11 +59,15 @@ const AGENT_EMOJI: &str = "\u{1F916}"; // 🤖
 const GROUP_EMOJI: &str = "\u{1F4C2}"; // 📂
 const UNGROUPED_EMOJI: &str = "\u{1F4C1}"; // 📁
 
-/// dot(2) + pin(3) + role(3), the row's fixed left-hand slots. Pin/role are
-/// each a 2-column emoji plus a 1-column trailing separator space (see the
-/// module doc's "Row layout" section) — 3, not 2, so a marker never sits
-/// glued against the title or against an adjacent marker.
-const FIXED_PREFIX_WIDTH: usize = 8;
+/// dot(2) + pin(0 or 3) + role(3), the row's fixed left-hand slots — see the
+/// module doc's "Row layout" section for why the pin slot is conditional.
+/// A present slot is a 2-column emoji plus a 1-column trailing separator
+/// space, not 2, so a marker never sits glued against the title or against
+/// an adjacent marker.
+fn fixed_prefix_width(show_pin_slot: bool) -> usize {
+    let pin_width = if show_pin_slot { 3 } else { 0 };
+    2 + pin_width + 3
+}
 /// Minimum columns of blank space a row must leave before the age column.
 const MIN_GAP_BEFORE_AGE: usize = 2;
 /// Columns between the title and cwd, when cwd is shown.
@@ -89,10 +98,14 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
         return;
     }
 
+    // Grouped view is actually in effect -> every pinned row's section is
+    // "Pinned", so a pin marker could never render on any row this frame —
+    // the whole column is dropped, not just individually blanked.
+    let show_pin_slot = !app.grouped_view_in_effect();
     let items: Vec<ListItem> = app
         .visible()
         .into_iter()
-        .map(|line| list_item(line, area.width, now))
+        .map(|line| list_item(line, area.width, now, show_pin_slot))
         .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
@@ -105,15 +118,20 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
 /// than a header bundled into its row, matching the index space
 /// `App::click`/`App::scroll`/`App::ensure_visible` all use — see
 /// [`ListLine`] for why that matters for mouse clicks.
-fn list_item(line: ListLine<'_>, area_width: u16, now: SystemTime) -> ListItem<'static> {
+fn list_item(
+    line: ListLine<'_>,
+    area_width: u16,
+    now: SystemTime,
+    show_pin_slot: bool,
+) -> ListItem<'static> {
     match line {
         ListLine::Header { name, count } => header_line(&name, count),
-        ListLine::Row(visible) => ListItem::new(row_line(visible, area_width, now)),
+        ListLine::Row(visible) => ListItem::new(row_line(visible, area_width, now, show_pin_slot)),
     }
 }
 
 /// One list-row marker slot: `emoji` plus a trailing separator space (3
-/// display columns total, matching [`FIXED_PREFIX_WIDTH`]'s pin/role
+/// display columns total, matching [`fixed_prefix_width`]'s pin/role
 /// budget) when occupied, or three blank columns when `None` — so an empty
 /// slot still holds its column budget exactly like an occupied one.
 fn marker_slot(emoji: Option<&str>) -> Span<'static> {
@@ -141,7 +159,9 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
     )))
 }
 
-/// Build one row: `[dot 2][pin 2][role 2][title][gap 2][cwd?][gap>=2][age]`.
+/// Build one row: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`
+/// — see the module doc's "Row layout" section for why the pin slot is
+/// conditional on `show_pin_slot`.
 ///
 /// `title` and `cwd` are mutually exclusive truncation targets: cwd is only
 /// shown when the title's *natural* (untruncated) width already leaves at
@@ -158,15 +178,16 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
 /// whatever width remains after the prefix — degrading further to an empty
 /// title, then (ratatui's own area-boundary clipping) to just the prefix,
 /// in a pathologically narrow area. Never panics, never underflows.
-fn row_line(visible: VisibleRow<'_>, area_width: u16, now: SystemTime) -> Line<'static> {
+fn row_line(
+    visible: VisibleRow<'_>,
+    area_width: u16,
+    now: SystemTime,
+    show_pin_slot: bool,
+) -> Line<'static> {
     let dot = Span::styled(
         "\u{25cf} ",
         Style::default().fg(activity_color(visible.row.activity)),
     );
-    // The Pinned section header already says "pinned"; repeating the emoji
-    // on every row under it is noise, so it's suppressed there (flat view
-    // has no header to speak for it, so it always shows).
-    let pin = marker_slot((visible.pinned && !visible.in_pinned_section).then_some(PIN_EMOJI));
     let role = marker_slot(if visible.director {
         Some(DIRECTOR_EMOJI)
     } else if visible.superseded {
@@ -176,6 +197,12 @@ fn row_line(visible: VisibleRow<'_>, area_width: u16, now: SystemTime) -> Line<'
     } else {
         None
     });
+    let mut prefix = vec![dot];
+    if show_pin_slot {
+        prefix.push(marker_slot(visible.pinned.then_some(PIN_EMOJI)));
+    }
+    prefix.push(role);
+    let prefix_width = fixed_prefix_width(show_pin_slot);
 
     let area_width = area_width as usize;
     let age_str = model::humanize_age_compact(visible.row.mtime, now);
@@ -185,24 +212,24 @@ fn row_line(visible: VisibleRow<'_>, area_width: u16, now: SystemTime) -> Line<'
     let title_width = title_full.width();
     let cwd_full = visible.row.cwd_display();
 
-    let max_left_content =
-        area_width.saturating_sub(FIXED_PREFIX_WIDTH + MIN_GAP_BEFORE_AGE + age_width);
+    let max_left_content = area_width.saturating_sub(prefix_width + MIN_GAP_BEFORE_AGE + age_width);
 
     if max_left_content == 0 {
         // Narrow-width degradation: no room for prefix + min gap + age at
         // all — drop age entirely rather than let it collide into the
         // prefix, and give the title whatever's left after the prefix.
-        let title_budget = area_width.saturating_sub(FIXED_PREFIX_WIDTH);
+        let title_budget = area_width.saturating_sub(prefix_width);
         let title = truncate_to_width(&title_full, title_budget as u16);
-        return Line::from(vec![dot, pin, role, Span::raw(title)]);
+        prefix.push(Span::raw(title));
+        return Line::from(prefix);
     }
 
     let show_cwd = area_width >= MIN_WIDTH_FOR_CWD
         && !cwd_full.is_empty()
         && title_width + TITLE_CWD_GAP + MIN_CWD_WIDTH <= max_left_content;
 
-    let mut spans = vec![dot, pin, role];
-    let mut used_width = FIXED_PREFIX_WIDTH;
+    let mut spans = prefix;
+    let mut used_width = prefix_width;
     if show_cwd {
         let cwd_budget = max_left_content - title_width - TITLE_CWD_GAP;
         used_width += title_width;
@@ -398,6 +425,31 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    /// The column (buffer x-coordinate) where `line_substr` starts, on the
+    /// rendered line that contains it. `buffer_text` pushes exactly one
+    /// `cell.symbol()` per x-coordinate for every column in the row (see
+    /// its own loop above), so a `char`-indexed (not byte-indexed) position
+    /// into the reconstructed line corresponds 1:1 to the real terminal
+    /// column — unlike a byte offset, which would drift once a preceding
+    /// multi-byte marker glyph is involved.
+    fn title_start_col(
+        app: &App,
+        width: u16,
+        height: u16,
+        now: SystemTime,
+        line_substr: &str,
+    ) -> usize {
+        let text = draw_list(app, width, height, now);
+        let line = text
+            .lines()
+            .find(|l| l.contains(line_substr))
+            .unwrap_or_else(|| panic!("no row contains {line_substr:?}:\n{text}"));
+        let first_char = line_substr.chars().next().unwrap();
+        line.chars()
+            .position(|c| c == first_char)
+            .unwrap_or_else(|| panic!("{first_char:?} not found in line {line:?}"))
+    }
+
     // --- marker slots ------------------------------------------------------
 
     #[test]
@@ -432,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_marker_is_suppressed_under_the_pinned_header_but_shown_in_flat_view() {
+    fn pin_marker_absent_in_grouped_view_but_shown_in_flat_view() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut app = App::new(vec![
             row("pinned", "Pinned Row", "", now),
@@ -442,23 +494,109 @@ mod tests {
         app.set_viewport_height(10);
 
         // Grouped view is on by default and two sections exist (Pinned,
-        // Ungrouped), so it's actually in effect — the row itself stays
-        // unmarked; the Pinned header (checked elsewhere) carries it.
+        // Ungrouped), so it's actually in effect — the pin slot doesn't
+        // exist at all this frame (R22: every pinned row's section is
+        // "Pinned", so the marker could never render), not merely blanked.
+        // The Pinned header (checked elsewhere) carries the marker instead.
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
         assert!(
             !line.contains(PIN_EMOJI),
-            "pin marker should be suppressed under the Pinned header:\n{text}"
+            "pin marker should not appear in grouped view:\n{text}"
         );
 
-        // Flat view has no header to speak for it, so the same row shows
-        // its own marker.
+        // Flat view restores the slot, so the same row shows its own
+        // marker.
         app.toggle_grouped_view();
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
         assert!(
             line.contains(PIN_EMOJI),
             "pin marker should show on the row in flat view:\n{text}"
+        );
+    }
+
+    #[test]
+    fn grouped_view_drops_the_pin_column_so_titles_start_three_columns_earlier() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("pinned", "Marked", "", now),
+            row("other", "Zzz", "", now),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+
+        // Grouped view (default): two sections exist, so it's actually in
+        // effect and the pin column is dropped for every row.
+        let grouped_col = title_start_col(&app, 60, 10, now, "Marked");
+
+        app.toggle_grouped_view(); // flat: the pin slot exists again
+        let flat_col = title_start_col(&app, 60, 10, now, "Marked");
+
+        assert_eq!(
+            flat_col - grouped_col,
+            3,
+            "flat view's title should start exactly 3 columns later than \
+             grouped view's (the dropped pin slot)"
+        );
+    }
+
+    #[test]
+    fn searching_flattens_the_view_so_the_pin_slot_stays_present() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("pinned", "Marked", "", now),
+            row("other", "Zzz", "", now),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+
+        // Grouped-view (no pin slot) baseline column.
+        let grouped_col = title_start_col(&app, 60, 10, now, "Marked");
+
+        // An active search always flattens the view, even with the
+        // grouped-view toggle still on.
+        app.enter_search();
+        for c in "Mark".chars() {
+            app.push_char(c);
+        }
+        let searching_col = title_start_col(&app, 60, 10, now, "Marked");
+        assert_eq!(
+            searching_col - grouped_col,
+            3,
+            "searching should flatten the view and restore the pin slot"
+        );
+
+        let text = draw_list(&app, 60, 10, now);
+        let line = text.lines().find(|l| l.contains("Marked")).unwrap();
+        assert!(
+            line.contains(PIN_EMOJI),
+            "pin marker should show while searching:\n{text}"
+        );
+    }
+
+    #[test]
+    fn pinned_and_ungrouped_section_rows_align_at_the_same_title_column() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("pinned", "Marked", "", now),
+            row("other", "Zzz", "", now),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+
+        // Grouped view is in effect by default (two sections exist): the
+        // pinned row (Pinned section) and the other row (Ungrouped
+        // section) must start their titles at the same column — the
+        // dropped pin column applies uniformly to every row, not just
+        // pinned ones, so nothing should ever misalign between sections.
+        let pinned_col = title_start_col(&app, 60, 10, now, "Marked");
+        let ungrouped_col = title_start_col(&app, 60, 10, now, "Zzz");
+        assert_eq!(
+            pinned_col,
+            ungrouped_col,
+            "Pinned-section and Ungrouped-section rows should align:\n{}",
+            draw_list(&app, 60, 10, now)
         );
     }
 

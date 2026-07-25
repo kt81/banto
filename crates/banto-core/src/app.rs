@@ -552,13 +552,6 @@ pub struct VisibleRow<'a> {
     /// shown regardless of *why* the row is visible (still live, or the
     /// `a` toggle is on).
     pub superseded: bool,
-    /// True when this row sits under the grouped view's "Pinned" section
-    /// header — i.e. `pinned` is true AND grouped view is actually in
-    /// effect (see [`App::grouped_view_active`]). The renderer suppresses
-    /// the 📌 marker in this case: the header already says it's pinned, so
-    /// repeating the emoji on every row under it is pure noise. Always
-    /// false in flat view, where there's no header to speak for it.
-    pub in_pinned_section: bool,
 }
 
 /// One physical line in the rendered list, in display order: either a real
@@ -919,6 +912,18 @@ impl App {
     /// the resize and panic.
     fn grouped_view_active(&self, ranked: &[usize]) -> bool {
         self.grouped_view && self.query.is_empty() && self.has_multiple_sections(ranked)
+    }
+
+    /// Public form of [`Self::grouped_view_active`] against the current
+    /// `filtered` set, for a renderer deciding view-mode-wide layout (e.g.
+    /// whether the pin marker's column exists at all this frame — see
+    /// `banto_tui::view`'s row layout doc). Every pinned row's section is
+    /// "Pinned" (`section_name` gives it top priority), so whenever this is
+    /// true, R21's per-row pin suppression under that header would apply to
+    /// every pinned row without exception — R22 turns that into "the slot
+    /// doesn't exist" instead of "the slot renders blank".
+    pub fn grouped_view_in_effect(&self) -> bool {
+        self.grouped_view_active(&self.filtered)
     }
 
     /// Whether `ranked` spans more than one grouped-view section.
@@ -1548,7 +1553,6 @@ impl App {
     pub fn visible(&self) -> Vec<ListLine<'_>> {
         let display = self.display_sequence();
         let end = (self.offset + self.viewport_height).min(display.len());
-        let grouped_active = self.grouped_view_active(&self.filtered);
         display[self.offset..end]
             .iter()
             .map(|line| match line {
@@ -1558,13 +1562,11 @@ impl App {
                 },
                 DisplayLine::Row(k) => {
                     let row = &self.rows[self.filtered[*k]];
-                    let pinned = self.pinned.contains(&row.id);
                     ListLine::Row(VisibleRow {
                         row,
-                        pinned,
+                        pinned: self.pinned.contains(&row.id),
                         director: self.directors.contains(&row.id),
                         superseded: self.superseded.contains(&row.id),
-                        in_pinned_section: pinned && grouped_active,
                     })
                 }
             })
@@ -2051,35 +2053,28 @@ mod tests {
     }
 
     #[test]
-    fn in_pinned_section_is_true_only_under_an_actually_active_pinned_header() {
+    fn grouped_view_in_effect_reflects_the_current_display_mode() {
         let mut app = App::new(numbered(3)); // id0, id1, id2
         app.set_viewport_height(10);
         app = app.with_pinned(["id1".to_string()].into_iter().collect());
 
         // Grouped view is on by default and there are two sections
-        // (Pinned, Ungrouped), so it's actually in effect: the pinned row
-        // sits under the Pinned header.
-        let flags: Vec<bool> = app
-            .visible()
-            .iter()
-            .filter_map(|line| match line {
-                ListLine::Row(r) => Some(r.in_pinned_section),
-                ListLine::Header { .. } => None,
-            })
-            .collect();
-        assert_eq!(flags, vec![true, false, false]);
+        // (Pinned, Ungrouped), so it's actually in effect — the renderer
+        // (banto_tui::view) uses this to decide whether the pin marker's
+        // column exists at all this frame (R22: every pinned row's section
+        // is "Pinned", so whenever this is true, no pin marker can ever
+        // render).
+        assert!(app.grouped_view_in_effect());
 
-        // Flat view: no header exists at all, so no row is ever "under" one.
+        // Flat view: never in effect.
         app.toggle_grouped_view();
-        let flags: Vec<bool> = app
-            .visible()
-            .iter()
-            .filter_map(|line| match line {
-                ListLine::Row(r) => Some(r.in_pinned_section),
-                ListLine::Header { .. } => None,
-            })
-            .collect();
-        assert!(flags.iter().all(|&f| !f));
+        assert!(!app.grouped_view_in_effect());
+
+        // Toggled back on, but an active search always flattens regardless
+        // of the toggle.
+        app.toggle_grouped_view();
+        app.push_char('i');
+        assert!(!app.grouped_view_in_effect());
     }
 
     #[test]
