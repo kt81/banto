@@ -1803,6 +1803,25 @@ fn update_discovery_result(
     // brigade membership. Discovery is supposed to make this unreachable
     // (the shell excludes ids it already hosts), but "supposed to" is not a
     // reason to let a destructive merge through.
+    //
+    // Refusing here is a dead end, not a deferral: by the time this event
+    // reaches `update`, the shell's `poll_discovery` has already dropped
+    // `old_key`'s tracker from its list (it `retain`s out every id it
+    // resolves, unconditionally, before the event is even dispatched) — so
+    // there is nothing left to retry. The degraded outcome is that
+    // `old_key`'s pane keeps its synthetic placeholder key forever: no
+    // `Cmd::Store(StoreIntent::SetMemberSession)` ever fires for it, so a
+    // brigade member hosted there stays unidentified (no store row) for the
+    // rest of the run. That is accepted on purpose rather than re-queued,
+    // because a permanently-unresolvable tracker re-queued for another
+    // attempt would re-run `find_new_sessions` — a full scan of the
+    // projects directory, the most expensive I/O `poll_discovery` does —
+    // on every poll tick (as often as ~50ms) for as long as the pane stays
+    // open. And this branch is meant to be a last-resort backstop, not the
+    // common case: the claimed-set guard `poll_discovery` already applies
+    // (ids already held by an open pane, sourced from the live handle map)
+    // is what is supposed to keep two trackers from ever resolving onto the
+    // same id in the first place.
     if state.screens.contains_key(&new_key) {
         state.set_status(
             format!("discovery collision on {session_id} — ignored"),
