@@ -124,13 +124,25 @@ fn parse_starttime_ticks(stat: &str) -> Option<u64> {
 }
 
 /// Read and parse `pid`'s kernel-reported start time, in clock ticks since
-/// boot. `None` if the process doesn't exist, the file can't be read, or its
-/// contents don't parse — all treated identically by
-/// [`SysinfoProbe::is_alive_matching`]'s caller.
-#[cfg(target_os = "linux")]
+/// boot. `None` if there is no `/proc` to read at all, the process doesn't
+/// exist, the file can't be read, or its contents don't parse — all treated
+/// identically by [`SysinfoProbe::is_alive_matching`]'s caller.
+///
+/// Only the *read* below is platform-split, and deliberately so: this
+/// function stays on every platform's compile path, which is what keeps
+/// [`parse_starttime_ticks`] reachable — and therefore compiled and tested —
+/// on Windows too. Gating the parse instead makes it dead code there, which
+/// is precisely what the Windows CI job caught and what a `clippy` run on
+/// Linux structurally cannot see: `-D warnings` can only judge the code its
+/// own `cfg`s left standing.
 fn read_proc_start_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_starttime_ticks(&stat)
+    parse_starttime_ticks(&proc_stat(pid)?)
+}
+
+/// The raw contents of `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn proc_stat(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()
 }
 
 /// No `/proc` on this platform to read a start time from at all — always
@@ -138,7 +150,7 @@ fn read_proc_start_ticks(pid: u32) -> Option<u64> {
 /// bare liveness check (see that method's doc comment for why that fallback
 /// direction is the safe one).
 #[cfg(not(target_os = "linux"))]
-fn read_proc_start_ticks(_pid: u32) -> Option<u64> {
+fn proc_stat(_pid: u32) -> Option<String> {
     None
 }
 
