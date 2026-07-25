@@ -180,13 +180,14 @@ fn main() -> Result<()> {
             role,
         }) => {
             let store = open_store(&config)?;
+            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let identity = mcp::Identity {
                 session,
                 brigade,
                 member,
                 role: role.as_deref().and_then(mcp::parse_role),
             };
-            mcp::run_stdio_server(store, identity)
+            mcp::run_stdio_server(store, identity, claude_home)
         }
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;

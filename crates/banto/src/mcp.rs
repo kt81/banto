@@ -28,11 +28,15 @@
 //! stdout, so diagnostics would go to stderr.
 
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use banto_core::model::{BrigadeId, BrigadeMessage, BrigadeRole, MemberToken, SessionId};
+use banto_core::model::{
+    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
+};
+use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
 use banto_io::store::{Store, StoreError};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
@@ -43,8 +47,7 @@ use banto_io::store::{Store, StoreError};
 /// alone, so a removal takes effect on the very next call, with no relaunch.
 /// `session` is a fallback for `--mcp-config` files written before `--member`
 /// existed: with no `member`, membership is instead resolved by matching
-/// `session` against a member's `claude_session_id`. `banto_ping` needs only
-/// `session`, to echo it.
+/// `session` against a member's `claude_session_id`.
 pub struct Identity {
     pub session: Option<String>,
     pub brigade: Option<BrigadeId>,
@@ -66,16 +69,23 @@ pub fn parse_role(token: &str) -> Option<BrigadeRole> {
     }
 }
 
-/// Per-connection state: the caller's identity plus the shared store.
+/// Per-connection state: the caller's identity, the shared store, and
+/// `claude_home` — [`tool_brigade_status`] reports what each peer is *doing*,
+/// which lives in the `sessions/<pid>.json` files under it.
 struct ServerContext {
     identity: Identity,
     store: Store,
+    claude_home: PathBuf,
 }
 
 /// Run the MCP server on stdio until the client closes the connection (EOF on
 /// stdin). Spawned by an embedded `claude` via `--mcp-config`.
-pub fn run_stdio_server(store: Store, identity: Identity) -> Result<()> {
-    let mut ctx = ServerContext { identity, store };
+pub fn run_stdio_server(store: Store, identity: Identity, claude_home: PathBuf) -> Result<()> {
+    let mut ctx = ServerContext {
+        identity,
+        store,
+        claude_home,
+    };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let stdout = io::stdout();
@@ -143,7 +153,8 @@ fn initialize_result(msg: &Value) -> Value {
     })
 }
 
-/// `tools/list`: the brigade mediation tools (plus a health check).
+/// `tools/list`: the brigade mediation tools, plus the roster call that
+/// tells a member it is in a brigade at all.
 fn tools_list_result() -> Value {
     json!({
         "tools": [
@@ -180,9 +191,12 @@ fn tools_list_result() -> Value {
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
             {
-                "name": "banto_ping",
-                "description": "Health check: returns a pong from banto, echoing the calling \
-                                session id.",
+                "name": "brigade_status",
+                "description": "Who you are in this brigade, who your peers are, and what each \
+                                of them is doing right now (idle, busy, not running) — plus \
+                                whether anyone is holding unread mail from you. Answering at \
+                                all also proves the banto channel is up. Call it when you want \
+                                to know whether there is anyone to delegate to.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
         ],
@@ -198,14 +212,94 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
     match name {
         "send_to_peer" => tool_send_to_peer(ctx, msg),
         "check_messages" => tool_check_messages(ctx),
-        "banto_ping" => {
-            let text = match &ctx.identity.session {
-                Some(session) => format!("pong from banto (session={session})"),
-                None => "pong from banto".to_string(),
-            };
-            tool_text(text, false)
-        }
+        "brigade_status" => tool_brigade_status(ctx),
         other => tool_error(&format!("unknown tool: {other}")),
+    }
+}
+
+/// `brigade_status`: the caller's own membership plus a roster of its
+/// addressable peers, each with what it is doing right now and whether it is
+/// sitting on unread mail from the caller.
+///
+/// Replaces what used to be a bare `banto_ping` echoing the session id back.
+/// The liveness answer is kept (a reply at all means the channel is up), but
+/// a health check was the wrong shape for the one tool a member reaches for
+/// first: a Director that has to *infer* it has Workers from three tool
+/// names mostly doesn't, and the roster was sitting unread in banto's own
+/// store the whole time.
+///
+/// Every read here is non-consuming — `has_unseen_brigade_messages`, never
+/// `fetch_brigade_messages` — so asking about the mail can never swallow it.
+fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
+    let (brigade, token, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    let members = match ctx.store.brigade_members(brigade) {
+        Ok(members) => members,
+        Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
+    };
+    let live = read_live_sessions(&ctx.claude_home.join("sessions"));
+
+    let mut out = format!(
+        "You are {token} ({}) in banto brigade {brigade}.\n",
+        role_label(role)
+    );
+    let unread_for_me = ctx
+        .store
+        .has_unseen_brigade_messages(brigade, &token, role)
+        .unwrap_or(false);
+    out.push_str(if unread_for_me {
+        "You have unread mail — call check_messages to pull it.\n"
+    } else {
+        "No unread mail for you.\n"
+    });
+
+    let peers: Vec<&BrigadeMember> = members.iter().filter(|m| m.role != role).collect();
+    if peers.is_empty() {
+        out.push_str("\nNo peers in this brigade yet — there is nobody to delegate to.");
+        return tool_text(out, false);
+    }
+    out.push_str(&format!("\nYour {}s:\n", role_label(peer_role(role))));
+    for peer in peers {
+        let activity = peer_activity(peer, &live);
+        let waiting = ctx
+            .store
+            .has_unseen_brigade_messages(brigade, &peer.token, peer.role)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "  {} — {activity}{}\n",
+            peer.token,
+            if waiting {
+                " — has unread mail from you"
+            } else {
+                ""
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "\nReach one with send_to_peer (`to` addresses a single member; \
+         omitting it broadcasts to every {}).",
+        role_label(peer_role(role))
+    ));
+    tool_text(out, false)
+}
+
+/// What a peer is doing, as far as banto can tell: its live-state entry's
+/// status when one exists, otherwise the honest "banto has spawned it but
+/// Claude hasn't named it yet" / "no live session" — never a guess.
+fn peer_activity(peer: &BrigadeMember, live: &[LiveSession]) -> String {
+    let Some(session_id) = peer.claude_session_id.as_ref() else {
+        return "starting up (no session id yet)".to_string();
+    };
+    let entry = live
+        .iter()
+        .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()));
+    match entry {
+        Some(entry) if !SysinfoProbe.is_alive(entry.pid) => "not running".to_string(),
+        Some(entry) => entry.status.clone().unwrap_or_else(|| "idle".to_string()),
+        None => "not running".to_string(),
     }
 }
 
@@ -449,6 +543,11 @@ mod tests {
                 role,
             },
             store,
+            // No `sessions/` dir under it: every peer reads as "not
+            // running", which is what a test without live fixtures should
+            // see. `brigade_status_reports_a_live_peers_activity` writes
+            // real live-state files into its own temp home instead.
+            claude_home: PathBuf::from("/nonexistent"),
         }
     }
 
@@ -484,19 +583,122 @@ mod tests {
             .collect();
         assert!(names.contains(&"send_to_peer"));
         assert!(names.contains(&"check_messages"));
-        assert!(names.contains(&"banto_ping"));
+        assert!(names.contains(&"brigade_status"));
+    }
+
+    /// `brigade_status` on a caller banto never registered: it can only
+    /// answer with the "you are not in a brigade" refusal every other tool
+    /// gives, since there is no membership to describe.
+    #[test]
+    fn brigade_status_refuses_a_caller_with_no_membership() {
+        let mut ctx = ctx("spike-session", None, None, None);
+        let response = call(&mut ctx, &status_call());
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not"), "got {text:?}");
+    }
+
+    fn status_call() -> String {
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"brigade_status","arguments":{}}}"#
+            .to_string()
     }
 
     #[test]
-    fn ping_echoes_the_session() {
-        let mut ctx = ctx("spike-session", None, None, None);
-        let response = call(
-            &mut ctx,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call",
-                "params":{"name":"banto_ping","arguments":{}}}"#,
+    fn brigade_status_tells_a_director_who_its_workers_are_and_who_is_holding_its_mail() {
+        // The whole point of the tool: a Director asking "is there anyone to
+        // delegate to" gets named Workers back, not a pong.
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
         );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        ctx.store
+            .add_brigade_member(1, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+        ctx.store
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, Some("worker-2"), "go")
+            .unwrap();
+
+        let response = call(&mut ctx, &status_call());
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("spike-session"), "got {text:?}");
+
+        assert!(text.contains("You are director (Director)"), "got {text:?}");
+        assert!(text.contains("worker-1"), "got {text:?}");
+        assert!(text.contains("worker-2"), "got {text:?}");
+        assert!(
+            text.contains("worker-2 — starting up (no session id yet) — has unread mail from you"),
+            "the addressed Worker is flagged, got {text:?}"
+        );
+        assert!(
+            !text.contains("worker-1 — starting up (no session id yet) — has unread"),
+            "the unaddressed Worker is not, got {text:?}"
+        );
+        assert!(text.contains("send_to_peer"), "got {text:?}");
+    }
+
+    #[test]
+    fn brigade_status_never_consumes_the_callers_own_mail() {
+        // It reports on the mail; `check_messages` is what pulls it. If the
+        // status call advanced the cursor, asking "anything for me?" would
+        // silently eat the answer.
+        let mut ctx = ctx(
+            "w1-session",
+            Some(1),
+            Some("worker-1"),
+            Some(BrigadeRole::Worker),
+        );
+        ctx.store
+            .add_brigade_member(1, "director", BrigadeRole::Director, None)
+            .unwrap();
+        ctx.store
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "do the thing")
+            .unwrap();
+
+        let response = call(&mut ctx, &status_call());
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("You have unread mail"), "got {text:?}");
+
+        let still_there = ctx
+            .store
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(still_there.len(), 1, "the message survived the status call");
+    }
+
+    #[test]
+    fn brigade_status_reports_a_live_peers_activity_from_its_live_state_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let pid = std::process::id(); // alive by construction: this test.
+        std::fs::write(
+            home.path().join("sessions").join(format!("{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"w1","status":"busy"}}"#),
+        )
+        .unwrap();
+
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.claude_home = home.path().to_path_buf();
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".into())),
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &status_call());
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worker-1 — busy"), "got {text:?}");
     }
 
     #[test]

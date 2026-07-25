@@ -41,8 +41,13 @@ Inside the emporium, `B` appoints the selected session as a **Director** and
 auto-spawns fresh **Worker** sessions beside it (count and model
 configurable). banto mediates a message channel between them over MCP — it
 launches each member with `--mcp-config` pointing back at `banto _mcp`, so
-members get `send_to_peer` / `check_messages` tools backed by banto's own
-sqlite queue. Delivery is pull-based with per-member cursors and firewall
+members get `send_to_peer` / `check_messages` / `brigade_status` tools backed
+by banto's own sqlite queue. Each member is also launched with a role
+briefing (`--append-system-prompt`) naming its brigade, its token, and its
+peers — without one a cell exists only in banto's data model and the
+operator's screen, and a Director handed three tool names and no context
+mostly never uses them; `brigade_status` answers the follow-up question
+(who is on my team, what are they doing, is anyone holding my mail). Delivery is pull-based with per-member cursors and firewall
 framing (a relayed message is labeled as coming from another AI, never
 mistaken for operator input), and banto's **auto-relay** watches for idle
 members with unread messages and wakes them by typing a short fixed nudge
@@ -156,6 +161,12 @@ week_days = 7
 workers = 1         # Workers auto-spawned per cell (1..=8)
 worker_model = "sonnet"   # --model for spawned Workers ("" = inherit)
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
+# Role briefings appended to each member's system prompt at launch.
+# {brigade} / {token} / {peers} are substituted; "" launches with no
+# briefing. The defaults tell a Director to delegate — that policy is
+# yours to set, which is why it is a setting.
+director_prompt = "..."
+worker_prompt = "..."
 
 [keys]
 prefix = "C-b"      # emporium prefix chord

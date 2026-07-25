@@ -132,9 +132,10 @@ pub fn run(
         thresholds,
         store,
         superseded_failed: &superseded_failed,
+        brigade,
     };
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, &deps, brigade, keys);
+    let result = event_loop(&mut terminal, &mut app, &deps, keys);
     let restored = restore_terminal();
     result.and(restored)
 }
@@ -171,15 +172,15 @@ struct Deps<'a> {
     /// See [`crate::tui::load_superseded`]'s doc: in-memory only, for this
     /// process's lifetime.
     superseded_failed: &'a RefCell<HashSet<SessionId>>,
+    /// `[brigade]` from config.toml. Lives here rather than as its own
+    /// `event_loop` parameter because `execute_cmd` needs it too now (a
+    /// member's launch argv carries its role briefing — see
+    /// [`render_briefing`]).
+    brigade: &'a BrigadeConfig,
 }
 
-fn event_loop(
-    terminal: &mut Tui,
-    app: &mut App,
-    deps: &Deps,
-    brigade: &BrigadeConfig,
-    keys: &KeysConfig,
-) -> Result<()> {
+fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig) -> Result<()> {
+    let brigade = deps.brigade;
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
@@ -432,15 +433,7 @@ fn execute_cmd(
             target,
             brigade,
             model,
-        } => execute_open_embedded(
-            key,
-            target,
-            brigade,
-            model,
-            deps.claude_home,
-            handles,
-            discovery,
-        ),
+        } => execute_open_embedded(key, target, brigade, model, deps, handles, discovery),
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
     }
@@ -455,12 +448,19 @@ fn execute_cmd(
 /// instead of the brigade's configured one (`engine::stage_brigade` never
 /// sets it for the Director, so this is never reached for one).
 ///
+/// `briefing` is the member's already-rendered role briefing
+/// (`--append-system-prompt`, see [`render_briefing`]) — rendered by the
+/// caller because it needs a store read for the roster, verified against
+/// `claude` 2.1.219 to apply to a `--resume` exactly as it does to a fresh
+/// launch, which is what makes it reach a resumed Director at all.
+///
 /// Pulled out of [`execute_open_embedded`] so this branch-and-append logic
 /// is unit-testable without spawning a real PTY; the `--mcp-config` append
 /// stays in the caller, since that needs real file I/O this doesn't.
 fn build_open_argv(
     target: &SessionToOpen,
     model: Option<&str>,
+    briefing: Option<&str>,
     probe: &dyn ProcessProbe,
     live: &[LiveSession],
 ) -> Option<Vec<String>> {
@@ -472,6 +472,10 @@ fn build_open_argv(
     if let Some(model) = model {
         argv.push("--model".to_string());
         argv.push(model.to_string());
+    }
+    if let Some(briefing) = briefing {
+        argv.push("--append-system-prompt".to_string());
+        argv.push(briefing.to_string());
     }
     Some(argv)
 }
@@ -488,10 +492,11 @@ fn execute_open_embedded(
     target: SessionToOpen,
     brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
     model: Option<String>,
-    claude_home: &Path,
+    deps: &Deps,
     handles: &mut HashMap<SessionKey, PtyHandle>,
     discovery: &mut Vec<DiscoveryTracker>,
 ) -> Vec<Event> {
+    let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
     // fresh (unresumed) spawn never does.
     let live = if target.id.is_empty() {
@@ -499,7 +504,16 @@ fn execute_open_embedded(
     } else {
         read_live_sessions(&claude_home.join("sessions"))
     };
-    let Some(mut argv) = build_open_argv(&target, model.as_deref(), &SysinfoProbe, &live) else {
+    let briefing = brigade
+        .as_ref()
+        .and_then(|(brigade_id, token, role)| member_briefing(deps, *brigade_id, token, *role));
+    let Some(mut argv) = build_open_argv(
+        &target,
+        model.as_deref(),
+        briefing.as_deref(),
+        &SysinfoProbe,
+        &live,
+    ) else {
         return vec![Event::SpawnFailed {
             key,
             error: "already running elsewhere".to_string(),
@@ -961,6 +975,53 @@ fn gather_fork_observations(
         }
     }
     events
+}
+
+/// This member's role briefing, ready for `--append-system-prompt`, or
+/// `None` when the configured template for its role is empty.
+///
+/// The store read is what keeps the roster honest: `{peers}` has to name
+/// the members that exist *at launch*, which is later than any of the
+/// core's own decisions about the cell (a Worker added with `b` changes it,
+/// and a Director resumed into an existing brigade never went through
+/// formation at all).
+fn member_briefing(
+    deps: &Deps,
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+) -> Option<String> {
+    let template = deps.brigade.prompt_for(role)?;
+    let peers: Vec<String> = deps
+        .store
+        .borrow()
+        .brigade_members(brigade_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|member| member.role != role)
+        .map(|member| member.token)
+        .collect();
+    Some(render_briefing(template, brigade_id, token, &peers))
+}
+
+/// Substitute `{brigade}` / `{token}` / `{peers}` into a briefing template.
+///
+/// Plain string replacement, deliberately: this is banto's own config text
+/// being filled in for banto's own launch, not a templating language, and
+/// an unrecognized `{...}` is left alone rather than treated as an error —
+/// the same leniency the rest of the config layer promises. A member with
+/// no addressable peers yet renders as "none yet" rather than an empty gap,
+/// so the sentence still reads as a sentence.
+fn render_briefing(template: &str, brigade_id: BrigadeId, token: &str, peers: &[String]) -> String {
+    let peers = if peers.is_empty() {
+        "none yet".to_string()
+    } else {
+        peers.join(", ")
+    };
+    template
+        .replace("{brigade}", &brigade_id.to_string())
+        .replace("{token}", token)
+        .replace("{peers}", &peers)
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
@@ -1626,11 +1687,13 @@ mod tests {
         let mut discovery = Vec::new();
         let superseded_failed = RefCell::new(HashSet::new());
         let thresholds = AgeThresholds::default();
+        let brigade = BrigadeConfig::default();
         let deps = Deps {
             claude_home: Path::new("/nonexistent"),
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            brigade: &brigade,
         };
 
         let events = execute_cmd(
@@ -1928,7 +1991,8 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv = build_open_argv(&open_target("sess-1"), Some("opus"), &probe, &[]).unwrap();
+        let argv =
+            build_open_argv(&open_target("sess-1"), Some("opus"), None, &probe, &[]).unwrap();
         assert_eq!(
             argv,
             ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
@@ -1940,7 +2004,7 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv = build_open_argv(&open_target(""), Some("opus"), &probe, &[]).unwrap();
+        let argv = build_open_argv(&open_target(""), Some("opus"), None, &probe, &[]).unwrap();
         assert_eq!(argv, ["claude", "--model", "opus"].map(str::to_string));
     }
 
@@ -1949,7 +2013,7 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv = build_open_argv(&open_target("sess-1"), None, &probe, &[]).unwrap();
+        let argv = build_open_argv(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
         assert_eq!(argv, ["claude", "--resume", "sess-1"].map(str::to_string));
     }
 
@@ -1966,7 +2030,128 @@ mod tests {
             kind: None,
             name: None,
         }];
-        assert!(build_open_argv(&open_target("sess-1"), Some("opus"), &probe, &live).is_none());
+        assert!(
+            build_open_argv(&open_target("sess-1"), Some("opus"), None, &probe, &live).is_none()
+        );
+    }
+
+    // --- role briefings (--append-system-prompt) -------------------------
+
+    #[test]
+    fn build_open_argv_appends_the_briefing_after_the_model() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let argv = build_open_argv(
+            &open_target("sess-1"),
+            Some("opus"),
+            Some("you are the Director"),
+            &probe,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            [
+                "claude",
+                "--resume",
+                "sess-1",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "you are the Director",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn render_briefing_substitutes_the_brigade_the_token_and_the_peer_roster() {
+        let peers = ["worker-1".to_string(), "worker-2".to_string()];
+        assert_eq!(
+            render_briefing("{token} of {brigade} leads {peers}", 7, "director", &peers),
+            "director of 7 leads worker-1, worker-2"
+        );
+    }
+
+    #[test]
+    fn render_briefing_says_none_yet_rather_than_leaving_a_gap() {
+        assert_eq!(
+            render_briefing("your peers: {peers}.", 1, "director", &[]),
+            "your peers: none yet."
+        );
+    }
+
+    #[test]
+    fn render_briefing_leaves_an_unknown_placeholder_alone() {
+        // Lenient like the rest of the config layer: a typo in the operator's
+        // own template is not worth failing a launch over.
+        assert_eq!(
+            render_briefing("{brigade}/{nope}", 3, "director", &[]),
+            "3/{nope}"
+        );
+    }
+
+    #[test]
+    fn member_briefing_names_the_opposite_role_as_peers_and_honors_the_empty_escape_hatch() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let brigade_id = {
+            let mut store = store.borrow_mut();
+            let id = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(id, "director", BrigadeRole::Director, None)
+                .unwrap();
+            store
+                .add_brigade_member(id, "worker-1", BrigadeRole::Worker, None)
+                .unwrap();
+            store
+                .add_brigade_member(id, "worker-2", BrigadeRole::Worker, None)
+                .unwrap();
+            id
+        };
+        let superseded_failed = RefCell::new(HashSet::new());
+        let thresholds = AgeThresholds::default();
+        let config = BrigadeConfig {
+            director_prompt: "I am {token}; my team is {peers}".to_string(),
+            worker_prompt: "I am {token}; I report to {peers}".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let silent = BrigadeConfig {
+            director_prompt: String::new(),
+            ..config.clone()
+        };
+        let deps = |brigade| Deps {
+            claude_home: Path::new("/nonexistent"),
+            thresholds: &thresholds,
+            store: &store,
+            superseded_failed: &superseded_failed,
+            brigade,
+        };
+
+        assert_eq!(
+            member_briefing(
+                &deps(&config),
+                brigade_id,
+                "director",
+                BrigadeRole::Director
+            ),
+            Some("I am director; my team is worker-1, worker-2".to_string())
+        );
+        assert_eq!(
+            member_briefing(&deps(&config), brigade_id, "worker-1", BrigadeRole::Worker),
+            Some("I am worker-1; I report to director".to_string()),
+            "a Worker's addressable peer is the Director, not its siblings"
+        );
+        assert_eq!(
+            member_briefing(
+                &deps(&silent),
+                brigade_id,
+                "director",
+                BrigadeRole::Director
+            ),
+            None,
+            "an empty template launches with no flag at all"
+        );
     }
 
     // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------
