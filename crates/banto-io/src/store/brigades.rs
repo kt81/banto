@@ -105,17 +105,33 @@ impl Store {
     /// Records the Claude session id Claude assigned to a member banto
     /// spawned ahead of time (a Worker's `claude_session_id`, initially
     /// `None`). A no-op if `(brigade_id, token)` doesn't exist.
+    ///
+    /// One Claude session belongs to at most one member: any other row
+    /// holding this id is cleared back to "awaiting discovery" in the same
+    /// transaction. A duplicate would make `brigade_of_claude_session`
+    /// answer with whichever row sorted first, so an `_mcp` connection
+    /// could speak as the wrong member — worth spending a transaction to
+    /// make unrepresentable, and it repairs a row a past duplicate left
+    /// behind.
     pub fn set_member_claude_session(
-        &self,
+        &mut self,
         brigade_id: BrigadeId,
         token: &str,
         claude_session_id: &SessionId,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE brigade_members SET claude_session_id = NULL
+             WHERE claude_session_id = ?1
+               AND NOT (brigade_id = ?2 AND member_token = ?3)",
+            params![claude_session_id.0, brigade_id, token],
+        )?;
+        tx.execute(
             "UPDATE brigade_members SET claude_session_id = ?1
              WHERE brigade_id = ?2 AND member_token = ?3",
             params![claude_session_id.0, brigade_id, token],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -468,6 +484,60 @@ mod tests {
         store
             .set_member_claude_session(br, "worker-1", &sid("w1"))
             .unwrap();
+        let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        assert_eq!(member.claude_session_id, Some(sid("w1")));
+    }
+
+    #[test]
+    fn one_claude_session_belongs_to_one_member_the_older_row_is_cleared() {
+        // Two Workers spawned into one cwd once resolved to a single
+        // discovered id, leaving both rows claiming it — after which
+        // `brigade_of_claude_session` answered with whichever sorted first
+        // and an `_mcp` connection could speak as the wrong member. The
+        // second assignment now clears the first row back to "awaiting
+        // discovery" instead, which also repairs data a past duplicate left.
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .add_brigade_member(br, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+
+        store
+            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .unwrap();
+        store
+            .set_member_claude_session(br, "worker-2", &sid("w1"))
+            .unwrap();
+
+        let first = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        let second = store.brigade_member(br, "worker-2").unwrap().unwrap();
+        assert_eq!(first.claude_session_id, None);
+        assert_eq!(second.claude_session_id, Some(sid("w1")));
+        assert_eq!(
+            store.brigade_of_claude_session(&sid("w1")).unwrap(),
+            Some((br, "worker-2".to_string(), BrigadeRole::Worker))
+        );
+    }
+
+    #[test]
+    fn re_recording_the_same_member_with_the_same_id_keeps_it() {
+        // The clear-others sweep must not clear the row it is about to set.
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+
+        store
+            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .unwrap();
+        store
+            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .unwrap();
+
         let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
         assert_eq!(member.claude_session_id, Some(sid("w1")));
     }

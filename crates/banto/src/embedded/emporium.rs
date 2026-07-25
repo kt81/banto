@@ -582,7 +582,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             token,
             session_id,
         } => {
-            let store = store.borrow();
+            let mut store = store.borrow_mut();
             let _ = store.set_member_claude_session(brigade_id, &token, &SessionId(session_id));
             vec![Event::MemberSessionRecorded {
                 hidden: crate::tui::load_hidden_worker_ids(&store),

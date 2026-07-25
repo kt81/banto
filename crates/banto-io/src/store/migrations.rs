@@ -171,6 +171,32 @@ const MIGRATIONS: &[&str] = &[
     // rebuild; every existing row is left NULL, which keeps meaning exactly
     // what it always meant: broadcast to every member of `to_role`.
     "ALTER TABLE brigade_messages ADD COLUMN to_member TEXT;",
+    // v9: one Claude session belongs to at most one member, enforced by the
+    // schema rather than by convention. The v4 comment above deliberately
+    // left single-membership "layered in code"; a real bug then wrote it
+    // wrong (two auto-spawned Workers resolved to the same discovered id,
+    // because the emporium's shell-side handle map wasn't rekeyed on
+    // discovery, so the resolved id never entered its "already taken" set).
+    // The damage a duplicate does is quiet and wide: `brigade_of_claude_
+    // session` answers with whichever row sorts first, so an `_mcp`
+    // connection can speak as the wrong member; the relay emits one
+    // observation per member token and so nudges a single pane twice; and
+    // staging the brigade opens one pane where two were expected.
+    //
+    // Existing duplicates are cleared back to NULL ("spawned, awaiting
+    // discovery" — the state a Worker respawns fresh from) on every row but
+    // the highest-rowid one, which is the most recent assignment and so the
+    // one whose pane actually ended up holding the id.
+    "UPDATE brigade_members SET claude_session_id = NULL
+     WHERE claude_session_id IS NOT NULL
+       AND rowid NOT IN (
+           SELECT MAX(rowid) FROM brigade_members
+           WHERE claude_session_id IS NOT NULL
+           GROUP BY claude_session_id
+       );
+     CREATE UNIQUE INDEX brigade_members_claude_session
+         ON brigade_members (claude_session_id)
+         WHERE claude_session_id IS NOT NULL;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -687,6 +713,97 @@ mod tests {
                 .fetch_brigade_messages(1, "worker-2", BrigadeRole::Worker)
                 .unwrap()
                 .is_empty()
+        );
+
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v8_to_v9_upgrade_clears_a_duplicated_claude_session_id_and_locks_it_out() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v8 code would have left it after the
+        // discovery bug: v1..=v8 applied, and two Workers both claiming the
+        // one session id discovery double-assigned them.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..8] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, member_token, role, claude_session_id) VALUES
+                 (1, 'director', 'director', 'dir'),
+                 (1, 'worker-1', 'worker',   'dup'),
+                 (1, 'worker-2', 'worker',   'dup')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+
+        // The later row keeps the id; the earlier one goes back to
+        // "awaiting discovery" and respawns fresh next time it's staged.
+        let id_of = |store: &Store, token: &str| {
+            store
+                .brigade_member(1, token)
+                .unwrap()
+                .unwrap()
+                .claude_session_id
+        };
+        assert_eq!(id_of(&store, "worker-1"), None);
+        assert_eq!(
+            id_of(&store, "worker-2"),
+            Some(SessionId("dup".to_string()))
+        );
+        assert_eq!(
+            id_of(&store, "director"),
+            Some(SessionId("dir".to_string()))
+        );
+        // ...so the id now resolves to exactly one member, not whichever
+        // row happened to sort first.
+        assert_eq!(
+            store
+                .brigade_of_claude_session(&SessionId("dup".to_string()))
+                .unwrap(),
+            Some((1, "worker-2".to_string(), BrigadeRole::Worker))
+        );
+
+        // And a fresh duplicate can no longer be written at all: the
+        // reassignment moves the id, it never lands in two rows.
+        store
+            .set_member_claude_session(1, "worker-1", &SessionId("dup".to_string()))
+            .unwrap();
+        assert_eq!(id_of(&store, "worker-2"), None);
+        assert_eq!(
+            id_of(&store, "worker-1"),
+            Some(SessionId("dup".to_string()))
+        );
+
+        // A second member inserted directly with a taken id is rejected by
+        // the index rather than silently duplicating.
+        assert!(
+            store
+                .add_brigade_member(
+                    1,
+                    "worker-3",
+                    BrigadeRole::Worker,
+                    Some(&SessionId("dup".to_string())),
+                )
+                .is_err()
         );
 
         let version: i64 = store
