@@ -24,10 +24,15 @@ pub enum OpenerMode {
     /// key.
     #[default]
     InPlace,
-    /// Detect a split/tab backend from the environment: `$TMUX` (psmux)
-    /// first, then `WT_SESSION`.
+    /// Detect a split/tab backend from the environment: `$TMUX` first
+    /// (resolving to real `tmux`, or to `psmux` on Windows), then
+    /// `WT_SESSION`.
     Auto,
     Psmux,
+    /// Real `tmux`, as distinct from `psmux`: the two address panes
+    /// differently (see `banto_io::opener::TmuxFlavor`), so which one is
+    /// driving has to be known, not guessed.
+    Tmux,
     WindowsTerminal,
 }
 

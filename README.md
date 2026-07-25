@@ -25,7 +25,7 @@ you pick there opens one of three ways:
 - **In-place** (default, `Enter`): banto hands its own terminal to
   `claude --resume` and takes it back when the session exits. No
   multiplexer involved, full native fidelity.
-- **Split** (`s`): into a separate psmux pane / Windows Terminal tab, for
+- **Split** (`s`): into a separate tmux/psmux pane or Windows Terminal tab, for
   multiplexer-layout users.
 - **Emporium** (大店 — `banto --emporium`, alias `--oodana`): banto becomes a
   minimal embedded multiplexer — a persistent sidebar plus sessions hosted
@@ -114,7 +114,7 @@ cargo run -- --claude-home /path/to/.claude
 |---|---|
 | `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`/`End` | Move selection |
 | `Enter` / double-click | Resume in-place (or focus if already running) |
-| `s` | Resume split into a psmux pane / WT tab |
+| `s` | Resume split into a tmux/psmux pane / WT tab |
 | `n` / `N` | New session, in-place / split (pick or type a cwd) |
 | `/` | Search (fuzzy, title + cwd) |
 | `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
@@ -163,8 +163,12 @@ fallbacks and stay lenient — a missing or broken file there just means
 defaults, same as today.
 
 ```toml
-# "in-place" (default) | "auto" | "psmux" | "windows-terminal"
-# — auto/psmux/windows-terminal pick the split backend `s` uses.
+# "in-place" (default) | "auto" | "tmux" | "psmux" | "windows-terminal"
+# — everything but in-place picks the split backend `s` uses. "auto" reads
+# $TMUX first (real tmux, or psmux on Windows), then $WT_SESSION. Name the
+# multiplexer explicitly for an unusual install: they take the same commands
+# but address panes differently, so banto has to know which one it is
+# talking to.
 opener = "in-place"
 
 claude_home = "C:/Users/you/.claude"   # optional override

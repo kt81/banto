@@ -18,7 +18,7 @@ mod tmux;
 mod windows_terminal;
 
 pub use command::{CommandOutput, CommandRunner, CommandSpec, SystemCommandRunner};
-pub use tmux::{TmuxOpener, TmuxPlacement};
+pub use tmux::{TmuxFlavor, TmuxOpener, TmuxPlacement};
 pub use windows_terminal::{WindowsTerminalOpener, WtPlacement};
 
 use std::fmt;
@@ -27,8 +27,13 @@ use std::path::PathBuf;
 /// Which terminal backend a session is opened into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// psmux, or any tmux-compatible CLI.
+    /// The `psmux` CLI (Windows-side tmux-compatible implementation).
     Psmux,
+    /// Real `tmux`. A separate variant rather than a flavor of
+    /// [`Backend::Psmux`] because the two disagree about how a pane is
+    /// addressed — see [`TmuxFlavor`], which is where that difference is
+    /// spelled out and measured.
+    Tmux,
     /// Windows Terminal (`wt`).
     WindowsTerminal,
 }
@@ -37,6 +42,7 @@ impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Backend::Psmux => "psmux",
+            Backend::Tmux => "tmux",
             Backend::WindowsTerminal => "Windows Terminal",
         })
     }
@@ -154,7 +160,17 @@ pub trait Opener {
 /// `is_windows` is also true.
 pub fn detect_backend(env: impl Fn(&str) -> Option<String>, is_windows: bool) -> Option<Backend> {
     if env("TMUX").is_some() {
-        Some(Backend::Psmux)
+        // Inside a multiplexer — but which CLI drives it? `$TMUX` holds a
+        // socket path, not an implementation name, so the platform decides:
+        // `psmux` is what banto drives on Windows, real `tmux` everywhere
+        // else. Wrong only for a deliberately exotic install (psmux on
+        // Linux, tmux under an msys shell on Windows), which is what the
+        // explicit `opener = "psmux"` / `"tmux"` config values are for.
+        Some(if is_windows {
+            Backend::Psmux
+        } else {
+            Backend::Tmux
+        })
     } else if is_windows && env("WT_SESSION").is_some() {
         Some(Backend::WindowsTerminal)
     } else {
@@ -177,7 +193,8 @@ pub fn detect_backend_from_env() -> Option<Backend> {
 /// Build the [`Opener`] for `backend`, driven by `runner`.
 pub fn opener_for<R: CommandRunner + 'static>(backend: Backend, runner: R) -> Box<dyn Opener> {
     match backend {
-        Backend::Psmux => Box::new(TmuxOpener::new(runner)),
+        Backend::Psmux => Box::new(TmuxOpener::new(runner, TmuxFlavor::Psmux)),
+        Backend::Tmux => Box::new(TmuxOpener::new(runner, TmuxFlavor::Tmux)),
         Backend::WindowsTerminal => Box::new(WindowsTerminalOpener::new(runner)),
     }
 }
@@ -194,8 +211,10 @@ mod tests {
             "TMUX" | "WT_SESSION" => Some("set".to_string()),
             _ => None,
         };
+        // The multiplexer wins on both platforms; which CLI drives it is the
+        // platform's answer (see `detect_backend`).
         assert_eq!(detect_backend(env, true), Some(Backend::Psmux));
-        assert_eq!(detect_backend(env, false), Some(Backend::Psmux));
+        assert_eq!(detect_backend(env, false), Some(Backend::Tmux));
     }
 
     #[test]

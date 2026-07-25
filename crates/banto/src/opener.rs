@@ -17,7 +17,7 @@ use banto_core::model::SessionId;
 pub use banto_core::model::SessionToOpen;
 use banto_io::opener::{
     self, Backend, CommandRunner, CommandSpec, OpenError, Opener, ResumeCommand, SessionHandle,
-    TmuxOpener, WindowsTerminalOpener,
+    TmuxFlavor, TmuxOpener, WindowsTerminalOpener,
 };
 use banto_io::status::{LiveSession, ProcessProbe};
 use banto_io::store::{PaneRecord, Store, StoreError};
@@ -63,6 +63,11 @@ pub enum SessionOpenError {
 /// whether a split is still available on request.
 ///
 /// The real host platform (`cfg!(windows)`) is supplied here, at this
+/// `is_windows` is injected rather than read here, for the same reason `env`
+/// is: `Auto`/`InPlace` now resolve `$TMUX` to a *different* backend
+/// depending on the platform (real `tmux`, or `psmux` on Windows), so a
+/// `cfg!(windows)` read inside this function would make its own behavior —
+/// and every test of it — silently host-dependent. Passed through, as its
 /// function's own edge, to [`opener::detect_backend`] — which takes it as an
 /// injected parameter rather than reading it itself, so its own platform
 /// gating (e.g. never selecting Windows Terminal under WSL just because
@@ -71,11 +76,28 @@ pub enum SessionOpenError {
 /// both of its callers (`crate::tui`) always want the real platform, so
 /// there is nothing for them to inject, and `detect_backend`'s own tests
 /// already cover every platform/env combination this delegates to.
-pub fn resolve_backend(mode: OpenerMode, env: impl Fn(&str) -> Option<String>) -> Option<Backend> {
+pub fn resolve_backend(
+    mode: OpenerMode,
+    env: impl Fn(&str) -> Option<String>,
+    is_windows: bool,
+) -> Option<Backend> {
     match mode {
-        OpenerMode::InPlace | OpenerMode::Auto => opener::detect_backend(env, cfg!(windows)),
+        OpenerMode::InPlace | OpenerMode::Auto => opener::detect_backend(env, is_windows),
         OpenerMode::Psmux => Some(Backend::Psmux),
+        OpenerMode::Tmux => Some(Backend::Tmux),
         OpenerMode::WindowsTerminal => Some(Backend::WindowsTerminal),
+    }
+}
+
+/// The tmux-compatible flavor `backend` drives, or `None` for a backend that
+/// is not one at all. Keeps the two `Opener` construction sites from having
+/// to enumerate every multiplexer variant separately — adding a flavor is a
+/// change here and in `banto_io::opener`, not at every call site.
+fn tmux_flavor(backend: Backend) -> Option<TmuxFlavor> {
+    match backend {
+        Backend::Psmux => Some(TmuxFlavor::Psmux),
+        Backend::Tmux => Some(TmuxFlavor::Tmux),
+        Backend::WindowsTerminal => None,
     }
 }
 
@@ -122,12 +144,12 @@ pub fn open_new_session<R: CommandRunner + 'static>(
         cwd: cwd.to_path_buf(),
         title,
     };
-    let opener: Box<dyn Opener> = match (backend, anchor_pane) {
-        (Backend::Psmux, Some(anchor)) => {
-            Box::new(TmuxOpener::new(runner).with_anchor_pane(anchor))
+    let opener: Box<dyn Opener> = match (tmux_flavor(backend), anchor_pane) {
+        (Some(flavor), Some(anchor)) => {
+            Box::new(TmuxOpener::new(runner, flavor).with_anchor_pane(anchor))
         }
-        (Backend::Psmux, None) => Box::new(TmuxOpener::new(runner)),
-        (Backend::WindowsTerminal, _) => Box::new(WindowsTerminalOpener::new(runner)),
+        (Some(flavor), None) => Box::new(TmuxOpener::new(runner, flavor)),
+        (None, _) => Box::new(WindowsTerminalOpener::new(runner)),
     };
     opener.open(&cmd)?;
     Ok(OpenOutcome::Opened)
@@ -347,12 +369,12 @@ fn open_fresh<R: CommandRunner + 'static>(
     // Anchor psmux splits on banto's own pane (resolved from TMUX_PANE by
     // the caller) so the resume pane lands next to banto instead of in
     // whatever window the user's client is currently focused on.
-    let opener: Box<dyn Opener> = match (backend, anchor_pane) {
-        (Backend::Psmux, Some(anchor)) => {
-            Box::new(TmuxOpener::new(runner).with_anchor_pane(anchor))
+    let opener: Box<dyn Opener> = match (tmux_flavor(backend), anchor_pane) {
+        (Some(flavor), Some(anchor)) => {
+            Box::new(TmuxOpener::new(runner, flavor).with_anchor_pane(anchor))
         }
-        (Backend::Psmux, None) => Box::new(TmuxOpener::new(runner)),
-        (Backend::WindowsTerminal, _) => Box::new(WindowsTerminalOpener::new(runner)),
+        (Some(flavor), None) => Box::new(TmuxOpener::new(runner, flavor)),
+        (None, _) => Box::new(WindowsTerminalOpener::new(runner)),
     };
     let handle = opener.open(&cmd)?;
 
@@ -440,6 +462,7 @@ fn new_session_wrap_argv(
 pub(crate) fn backend_key(backend: Backend) -> &'static str {
     match backend {
         Backend::Psmux => "psmux",
+        Backend::Tmux => "tmux",
         Backend::WindowsTerminal => "windows-terminal",
     }
 }
@@ -449,6 +472,7 @@ pub(crate) fn backend_key(backend: Backend) -> &'static str {
 pub(crate) fn parse_backend_key(key: &str) -> Option<Backend> {
     match key {
         "psmux" => Some(Backend::Psmux),
+        "tmux" => Some(Backend::Tmux),
         "windows-terminal" => Some(Backend::WindowsTerminal),
         _ => None,
     }
@@ -477,7 +501,11 @@ pub(crate) fn encode_target(handle: &SessionHandle) -> String {
 /// and opens a fresh pane instead of risking an ambiguous focus.
 fn decode_handle(backend: Backend, target: &str) -> Option<SessionHandle> {
     match backend {
-        Backend::Psmux => {
+        // Both multiplexer flavors store the same three parts: the encoded
+        // target is banto's own record of where a pane is, not a CLI target
+        // string, so it does not vary with how that CLI wants panes
+        // addressed (see `banto_io::opener::TmuxFlavor`).
+        Backend::Psmux | Backend::Tmux => {
             let mut parts = target.splitn(3, ':');
             match (parts.next(), parts.next(), parts.next()) {
                 (Some(session), Some(window_id), Some(pane_id))
@@ -1393,22 +1421,29 @@ mod tests {
     #[test]
     fn resolve_backend_forces_configured_backend_regardless_of_env() {
         assert_eq!(
-            resolve_backend(OpenerMode::Psmux, |_| Some("set".to_string())),
+            resolve_backend(OpenerMode::Psmux, |_| Some("set".to_string()), false),
             Some(Backend::Psmux)
         );
         assert_eq!(
-            resolve_backend(OpenerMode::WindowsTerminal, |_| None),
+            resolve_backend(OpenerMode::WindowsTerminal, |_| None, false),
             Some(Backend::WindowsTerminal)
         );
     }
 
     #[test]
     fn resolve_backend_auto_detects_from_env() {
+        let in_tmux = |k: &str| (k == "TMUX").then(|| "1".to_string());
+        // `$TMUX` says "inside a multiplexer", not which one: real tmux off
+        // Windows, psmux on it.
         assert_eq!(
-            resolve_backend(OpenerMode::Auto, |k| (k == "TMUX").then(|| "1".to_string())),
+            resolve_backend(OpenerMode::Auto, in_tmux, false),
+            Some(Backend::Tmux)
+        );
+        assert_eq!(
+            resolve_backend(OpenerMode::Auto, in_tmux, true),
             Some(Backend::Psmux)
         );
-        assert_eq!(resolve_backend(OpenerMode::Auto, |_| None), None);
+        assert_eq!(resolve_backend(OpenerMode::Auto, |_| None, false), None);
     }
 
     #[test]
@@ -1416,10 +1451,13 @@ mod tests {
         // `InPlace` has no split backend of its own; the `s` key still needs
         // one, so it detects from the environment exactly like `Auto`.
         assert_eq!(
-            resolve_backend(OpenerMode::InPlace, |k| (k == "TMUX")
-                .then(|| "1".to_string())),
-            Some(Backend::Psmux)
+            resolve_backend(
+                OpenerMode::InPlace,
+                |k| (k == "TMUX").then(|| "1".to_string()),
+                false
+            ),
+            Some(Backend::Tmux)
         );
-        assert_eq!(resolve_backend(OpenerMode::InPlace, |_| None), None);
+        assert_eq!(resolve_backend(OpenerMode::InPlace, |_| None, false), None);
     }
 }
