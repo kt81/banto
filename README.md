@@ -8,9 +8,11 @@ together and keeps talking.
 *Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese
 merchant house, who stays on the premises and runs the shop.*
 
-**Windows-first.** Developed and dogfooded on Windows Terminal + ConPTY; the
-codebase keeps a cross-platform structure (CI builds Linux too), but only
-Windows is exercised in anger.
+**Cross-platform, raised on Windows.** Development and the heaviest
+dogfooding happen on Windows Terminal + ConPTY, which makes Windows a
+first-class citizen — the workshop, though, not the goal. The codebase
+stays cross-platform (CI builds and tests both Windows and Linux), and
+Linux dogfooding is underway.
 
 ## What it does
 
@@ -58,8 +60,8 @@ ferrying at all. This repository was largely built through that loop.
 - The embedded mode speaks ConPTY, which has sharp edges (documented in
   [docs/notes/embedded-pty-spike.md](docs/notes/embedded-pty-spike.md):
   never answer DSR/DA, chunk boundaries carry meaning, child exit produces
-  no EOF). These are handled, but they are why Windows-first is taken
-  seriously here.
+  no EOF). These are handled — ConPTY is where the sharpest edges lived,
+  which is why the Windows side gets such deliberate care.
 
 ## Read-only guarantee
 
