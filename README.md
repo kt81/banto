@@ -116,7 +116,7 @@ cargo run -- --claude-home /path/to/.claude
 | `/` | Search (fuzzy, title + cwd) |
 | `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
-| `a` | Toggle showing agent-run sessions |
+| `a` | Toggle showing hidden sessions (agent-run, superseded ancestors) |
 | `q` / `Esc` | Quit |
 
 ### Emporium
