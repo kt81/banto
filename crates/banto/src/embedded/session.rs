@@ -125,17 +125,33 @@ impl PtyHandle {
         self.io.killer.kill()
     }
 
-    /// Begin the child's *normal* shutdown instead of killing it outright:
-    /// drop the writer and the PTY master (`resizer` is `PtyIo`'s sole owner
-    /// of the master — see `PortablePtyHost::open`). On Windows, closing the
-    /// master this way delivers the same console-close cascade
-    /// (`CTRL_CLOSE_EVENT`) a child sees when its hosting console window
-    /// closes, so an embedded `claude` finalizes its session data exactly as
-    /// it would on any ordinary window close, instead of an abrupt kill.
+    /// Begin the child's *normal* shutdown instead of killing it outright,
+    /// so an embedded `claude` finalizes its session data exactly as it
+    /// would on any ordinary window close: hang up its terminal, then drop
+    /// the writer and the PTY master (`resizer` is `PtyIo`'s sole owner of
+    /// the master — see `PortablePtyHost::open`).
+    ///
+    /// The explicit [`banto_io::pty::Hangup`] is what makes this work off
+    /// Windows at all. Dropping banto's own two copies of the master looks
+    /// like a hangup and is one on ConPTY, but on Unix the tty only hangs up
+    /// when the *last* fd closes — and the reader thread is parked in a
+    /// `read()` holding a third, which that very hangup was supposed to
+    /// release. Left to the drops alone the child never hears anything, sits
+    /// out the whole shutdown grace, and is force-killed (measured on WSL:
+    /// 5s and a `SIGKILL`, versus ~0.5s and a clean exit once the hangup is
+    /// sent).
+    ///
+    /// Skipped for a child already known to have exited: its pid may have
+    /// been recycled by now, and signalling a stranger's process group is
+    /// not a mistake worth risking to save a no-op.
+    ///
     /// Does not kill and does not wait — pair with [`Self::has_exited`] and a
     /// deadline, then fall back to [`Self::kill`] for stragglers (see
     /// `emporium::shutdown_handles`, which owns that policy).
     pub(crate) fn begin_graceful_close(&mut self) {
+        if !self.has_exited() {
+            let _ = self.io.hangup.hangup();
+        }
         self.io.input = Box::new(std::io::sink());
         self.io.resizer = Box::new(NullResizer);
     }
@@ -369,6 +385,49 @@ mod tests {
         assert!(handle.has_exited());
         // Latches: still true on a second check, not just the one that saw it.
         assert!(handle.has_exited());
+    }
+
+    #[test]
+    fn begin_graceful_close_hangs_the_child_up_rather_than_trusting_the_dropped_master() {
+        // The regression this pins is invisible on Windows and total on
+        // Unix: with only the drops, the reader thread's clone of the master
+        // keeps the tty from hanging up, the child never learns its terminal
+        // is gone, and the shutdown sweep force-kills it a full grace period
+        // later.
+        let hangups = Arc::new(Mutex::new(0));
+        let kills = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            hangups: hangups.clone(),
+            kills: kills.clone(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+
+        handle.begin_graceful_close();
+
+        assert_eq!(*hangups.lock().unwrap(), 1);
+        assert_eq!(
+            *kills.lock().unwrap(),
+            0,
+            "a hangup is a request, not a kill"
+        );
+    }
+
+    #[test]
+    fn begin_graceful_close_never_signals_a_child_that_has_already_exited() {
+        // Its pid is fair game for reuse the moment it is reaped; a hangup
+        // aimed at whoever holds it now would be someone else's problem.
+        let hangups = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            hangups: hangups.clone(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        host.fire_exit();
+
+        handle.begin_graceful_close();
+
+        assert_eq!(*hangups.lock().unwrap(), 0);
     }
 
     #[test]
