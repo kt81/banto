@@ -29,7 +29,9 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use banto_core::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessionPlacement};
+use banto_core::app::{
+    App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessionPlacement, OpenAction,
+};
 use banto_core::config::OpenerMode;
 use banto_core::model::{SessionId, SessionToOpen};
 use banto_core::status::AgeThresholds;
@@ -1449,6 +1451,39 @@ fn selected_session(app: &App) -> Option<SessionToOpen> {
     })
 }
 
+/// Guards an open action against silently resuming a brigade Director from
+/// the chōba: today that resumes it as plain `claude --resume` — no
+/// `--mcp-config`, no role briefing — handing back a Director that
+/// half-remembers its cell but has lost every tool it had to run it. The
+/// chōba is feature-frozen (docs/REQUIREMENTS.md) and never wires that up
+/// (the relay can't run there anyway), so the fix is a warning, not a
+/// feature: refuse the first attempt and name the escape (the emporium,
+/// where the cell is staged properly), then let a repeat through — the
+/// operator may well want a plain resume, e.g. to peek at a transcript.
+///
+/// Returns `true` when the caller (`activate`/`activate_split`) should
+/// proceed with its normal open path; `false` means it already posted the
+/// warning status and the caller must return without opening anything. A
+/// no-op (`true`) for any non-Director session, so `activate`/
+/// `activate_split` can call this unconditionally rather than duplicating
+/// `app.is_selected_director()` at each call site.
+fn guard_director_open(app: &mut App, id: &str, action: OpenAction) -> bool {
+    if !app.is_selected_director() {
+        return true;
+    }
+    let now = Instant::now();
+    if app.confirm_director_open(id, action, now) {
+        return true;
+    }
+    app.set_status(
+        "\u{1f91d} Director of a brigade — its cell lives in the oodana \
+         (banto --emporium); press again to open solo here"
+            .to_string(),
+        now,
+    );
+    false
+}
+
 /// Resume the selected session in place (Enter / double-click, the default
 /// action — docs/REQUIREMENTS.md, config default `OpenerMode::InPlace`):
 /// hand banto's own pane to the session instead of spawning a psmux/WT
@@ -1466,6 +1501,10 @@ fn activate(app: &mut App, ctx: &Context) {
         return;
     };
     let id = session.id.clone();
+
+    if !guard_director_open(app, &id, OpenAction::Resume) {
+        return;
+    }
 
     // Only consulted here — in-place mode has no pane map, so this is the
     // *only* double-resume guard, not a fallback for an untracked case.
@@ -1507,6 +1546,10 @@ fn activate_split(app: &mut App, ctx: &Context) {
         return;
     };
     let id = session.id.clone();
+
+    if !guard_director_open(app, &id, OpenAction::Split) {
+        return;
+    }
 
     let backend = opener::resolve_backend(
         ctx.opener_mode,
@@ -3034,6 +3077,86 @@ mod tests {
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
 
         assert!(ctx.pending_inplace.borrow().is_none());
+    }
+
+    #[test]
+    fn enter_on_a_director_row_warns_first_then_opens_on_a_repeat() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("dir-1", "Director", "/work/dir", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app = app.with_directors(["dir-1".to_string()].into_iter().collect());
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+        assert!(
+            ctx.pending_inplace.borrow().is_none(),
+            "first Enter on a Director must warn, not open"
+        );
+        let warning = app.status().expect("expected a warning status");
+        assert!(
+            warning.contains("oodana"),
+            "warning should name the emporium escape: {warning}"
+        );
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+        let launch = ctx
+            .pending_inplace
+            .borrow_mut()
+            .take()
+            .expect("second Enter should proceed to open");
+        assert_eq!(
+            launch.argv,
+            ["claude", "--resume", "dir-1"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn split_after_an_enter_warning_on_a_director_warns_again_instead_of_confirming() {
+        // Action isolation: a warning armed by Enter (Resume) must not let
+        // a subsequent `s` (Split) through — each action confirms
+        // independently. Confirming `s` itself would shell out to a real
+        // backend (see `enter_stages_an_in_place_resume_for_the_selected_
+        // session`'s note on why `activate_split`'s proceed path stays
+        // untested here); this only needs the warning, which returns before
+        // any of that I/O runs.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("dir-1", "Director", "/work/dir", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app = app.with_directors(["dir-1".to_string()].into_iter().collect());
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+        assert!(ctx.pending_inplace.borrow().is_none());
+
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &ctx);
+        let warning = app
+            .status()
+            .expect("expected a fresh warning for the split action");
+        assert!(warning.contains("oodana"));
+    }
+
+    #[test]
+    fn enter_on_a_non_director_row_opens_immediately_with_no_warning() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row(
+            "plain-1",
+            "Plain",
+            "/work/plain",
+            Activity::Alive,
+        )]);
+        app.set_viewport_height(10);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+
+        assert!(
+            ctx.pending_inplace.borrow().is_some(),
+            "a non-Director session must open on the first Enter"
+        );
+        assert!(app.status().is_none());
     }
 
     #[test]

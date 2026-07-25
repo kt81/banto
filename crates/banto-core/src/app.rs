@@ -75,6 +75,23 @@ pub enum ClickOutcome {
     Activated,
 }
 
+/// Which open path a risky-open confirmation ([`App::confirm_director_open`])
+/// applies to. Enter and double-click both resume in place, so they share
+/// [`Self::Resume`]; `s` (split) is tracked separately so confirming one
+/// never silently authorizes the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAction {
+    Resume,
+    Split,
+}
+
+/// An armed but unconfirmed risky open — see [`App::confirm_director_open`].
+struct PendingRiskyOpen {
+    session_id: String,
+    action: OpenAction,
+    armed_at: Instant,
+}
+
 /// Which input mode the TUI is in. Letter keys mean different things in
 /// each: `j`/`k`/`p`/`a`/`/`/`q` are commands in [`Mode::Normal`], while any
 /// character types into the query in [`Mode::Search`].
@@ -539,6 +556,9 @@ pub struct App {
     /// When `status` was posted, so [`Self::expire_status`] can clear it
     /// after [`STATUS_TIMEOUT`] even if the user never presses another key.
     status_set_at: Option<Instant>,
+    /// An armed-but-unconfirmed risky open (currently: opening a brigade
+    /// Director from the chōba) — see [`Self::confirm_director_open`].
+    pending_risky_open: Option<PendingRiskyOpen>,
     /// Set once the user asks to quit.
     should_quit: bool,
 }
@@ -612,6 +632,7 @@ impl App {
             last_click: None,
             status: None,
             status_set_at: None,
+            pending_risky_open: None,
             should_quit: false,
         };
         app.resort_rows();
@@ -1454,6 +1475,39 @@ impl App {
         }
     }
 
+    /// Arm or confirm a risky open. Director-agnostic on purpose: this only
+    /// tracks "has this exact `(id, action)` been requested twice within the
+    /// freshness window" — the shell decides which sessions/actions the
+    /// guard applies to (currently: opening a brigade Director from the
+    /// chōba, gated on [`Self::is_selected_director`]).
+    ///
+    /// The first call for a given `(id, action)` — or one whose prior arm
+    /// has gone stale — arms it and returns `false`. A second call for the
+    /// *same* `(id, action)` within the freshness window disarms and
+    /// returns `true`. A different id or a different action always re-arms
+    /// rather than confirming, since it isn't a repeat of the last request.
+    ///
+    /// The freshness window matches [`STATUS_TIMEOUT`] rather than a timer
+    /// of its own, so a caller that shows the warning via [`Self::status`]
+    /// at the same `now` it arms with gets a confirm window that expires in
+    /// lockstep with the visible warning — see `banto::tui`'s call sites.
+    pub fn confirm_director_open(&mut self, id: &str, action: OpenAction, now: Instant) -> bool {
+        if let Some(pending) = &self.pending_risky_open
+            && pending.session_id == id
+            && pending.action == action
+            && now.saturating_duration_since(pending.armed_at) < STATUS_TIMEOUT
+        {
+            self.pending_risky_open = None;
+            return true;
+        }
+        self.pending_risky_open = Some(PendingRiskyOpen {
+            session_id: id.to_string(),
+            action,
+            armed_at: now,
+        });
+        false
+    }
+
     /// Request that the render loop exit.
     pub fn request_quit(&mut self) {
         self.should_quit = true;
@@ -1942,6 +1996,57 @@ mod tests {
         let mut app = App::new(numbered(1));
         app.expire_status(Instant::now() + Duration::from_secs(100));
         assert_eq!(app.status(), None);
+    }
+
+    #[test]
+    fn confirm_director_open_arms_on_first_call_and_returns_false() {
+        let mut app = App::new(numbered(1));
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, Instant::now()));
+    }
+
+    #[test]
+    fn confirm_director_open_confirms_and_disarms_a_matching_repeat_within_the_window() {
+        let mut app = App::new(numbered(1));
+        let t0 = Instant::now();
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
+
+        // Comfortably inside the freshness window.
+        assert!(app.confirm_director_open("id0", OpenAction::Resume, t0 + Duration::from_secs(2)));
+
+        // Disarmed: a third call is a fresh arm, not another confirm.
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn confirm_director_open_re_arms_instead_of_confirming_once_the_window_has_expired() {
+        let mut app = App::new(numbered(1));
+        let t0 = Instant::now();
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
+
+        // Past the same 5s freshness window `expire_status` uses.
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0 + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn confirm_director_open_a_different_id_re_arms_rather_than_confirming() {
+        let mut app = App::new(numbered(2));
+        let t0 = Instant::now();
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
+
+        // Selection moved on to a different session — this looks like a
+        // fresh request, not a repeat of the id0 one.
+        assert!(!app.confirm_director_open("id1", OpenAction::Resume, t0));
+    }
+
+    #[test]
+    fn confirm_director_open_a_different_action_does_not_confirm() {
+        let mut app = App::new(numbered(1));
+        let t0 = Instant::now();
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
+
+        // Same id, but `s` (Split) was never the thing that warned — an
+        // Enter confirm must not silently authorize a split, or vice versa.
+        assert!(!app.confirm_director_open("id0", OpenAction::Split, t0));
     }
 
     #[test]
