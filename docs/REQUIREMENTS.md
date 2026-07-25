@@ -67,13 +67,15 @@ fragile than just running the session where banto already is.
 | First few records of the jsonl | `{"type":"custom-title","customTitle":...}` / `{"type":"ai-title","aiTitle":...}` — the title can be extracted by reading only the head chunk. Older formats fall back to the first user message |
 | First record of the jsonl | `{"type":"agent-setting",...}` marks a session run by a spawned agent (subagent / Agent-Teams teammate); interactive sessions open with a `mode` record instead. Sets `SessionMeta.is_agent`, persisted in the store (schema v2) |
 | `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` ("busy" etc.), `kind` ("interactive"/"bg"), `name`, `updatedAt` |
+| `~/.claude/history.jsonl` and others | Unused in the MVP |
 
-**Timing (measured 2026-07-25, Claude Code 2.1.219).** The two files above do
-not appear together: `sessions/<pid>.json` is written at **startup**, while
-the session's `<uuid>.jsonl` is only created at its **first recorded
-activity** — a turn, a slash command, a `/rename`. An untouched session
-therefore has an id and no history file at all, indefinitely (observed: a
-Worker sitting at its prompt for minutes with no jsonl anywhere).
+**Timing (measured 2026-07-25, Claude Code 2.1.219).** The session-body and
+live-state files do not appear together: `sessions/<pid>.json` is written at
+**startup**, while the session's `<uuid>.jsonl` is only created at its
+**first recorded activity** — a turn, a slash command, a `/rename`. An
+untouched session therefore has an id and no history file at all,
+indefinitely (observed: a Worker sitting at its prompt for minutes with no
+jsonl anywhere).
 
 That is why id discovery for a freshly-spawned session (emporium brigade
 Workers) matches `sessions/<pid>.json` by the pid banto itself spawned, and
@@ -81,7 +83,6 @@ falls back to scanning session files only when the direct child isn't
 `claude` itself. Waiting on the jsonl alone deadlocks: an unidentified Worker
 is invisible to the relay engine, so it can never be nudged into the first
 turn that would create the very file discovery is waiting for.
-| `~/.claude/history.jsonl` and others | Unused in the MVP |
 
 Note: the format is undocumented and subject to change. Defend with **lenient
 parsing** (ignore unknown records/fields, skip broken lines) plus tests against
