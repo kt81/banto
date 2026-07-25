@@ -1044,7 +1044,7 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
         app,
         ctx,
         list_area,
-        vec!['\u{1b}'],
+        vec![('\u{1b}', KeyModifiers::NONE)],
         sgr::parse_prefix,
         ESCAPE_GRACE,
     )? {
@@ -1072,7 +1072,7 @@ fn resolve_headless_bracket(app: &mut App, ctx: &Context, list_area: Rect) -> Re
         app,
         ctx,
         list_area,
-        vec!['['],
+        vec![('[', KeyModifiers::NONE)],
         sgr::parse_headless_prefix,
         HEADLESS_GRACE,
     )? {
@@ -1120,7 +1120,7 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
                     app,
                     ctx,
                     list_area,
-                    vec!['\u{1b}'],
+                    vec![('\u{1b}', KeyModifiers::NONE)],
                     sgr::parse_prefix,
                     ESCAPE_GRACE,
                 )? {
@@ -1139,7 +1139,7 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
                     app,
                     ctx,
                     list_area,
-                    vec!['['],
+                    vec![('[', KeyModifiers::NONE)],
                     sgr::parse_headless_prefix,
                     HEADLESS_GRACE,
                 )? {
@@ -1214,7 +1214,30 @@ fn normalize_key_code(code: KeyCode) -> KeyCode {
 /// letter landing in the search box or a modal's text input) and, worse,
 /// when the buffer was Esc-headed, the replayed `Esc` silently closing
 /// whatever modal was open (see the `g`-then-arrow-key regression test).
-fn arrow_key_for(pending: &[char]) -> Option<KeyCode> {
+///
+/// `modifiers` is the *terminating letter's own* modifiers — the
+/// discriminator a second dogfooding report (2026-07-26) forced: pasting
+/// the literal text `"[A [B [C [D"` into the search box was misrecognized
+/// as four arrow presses, eating everything but the spaces. Both halves of
+/// the discriminator were measured, not assumed: (a) a genuine leaked ANSI
+/// byte carries no modifiers at all (`swallow_one_sequence`'s own
+/// `BANTO_INPUT_LOG` captures never show any), while (b) Windows Terminal
+/// synthesizes SHIFT on each pasted uppercase letter (VkKeyScan-style — it
+/// derives the modifier state from what typing that character would
+/// require, so the physically-held key, if any, never merges in); in the
+/// captured burst `' '`/`'['` carried no modifiers while only `A`/`B`/`C`/`D`
+/// did, and the paste's own Shift+Insert Release landed 69ms *after* the
+/// burst, ruling out an ordinary released Shift as the source. So: any
+/// modifier on the terminating letter means this is real text, not a leaked
+/// byte — replay it. Residual, knowingly accepted: a CapsLock user
+/// hand-typing `[A` still produces a modifier-free `A` and still misfires;
+/// strictly better than today's 100%-certain paste corruption, and the same
+/// class of residual risk already accepted when this whole path was gated
+/// to Windows (PR #4).
+fn arrow_key_for(pending: &[char], modifiers: KeyModifiers) -> Option<KeyCode> {
+    if !modifiers.is_empty() {
+        return None;
+    }
     let rest: &[char] = match pending.first() {
         Some('\u{1b}') => &pending[1..],
         _ => pending,
@@ -1239,7 +1262,9 @@ enum EscapeOutcome {
 }
 
 /// Buffer characters starting from `pending` (already seeded with the bytes
-/// [`resolve_escape`]/[`resolve_headless_bracket`] have consumed so far) and
+/// [`resolve_escape`]/[`resolve_headless_bracket`] have consumed so far,
+/// paired with each byte's own modifiers — the seed byte is always
+/// modifier-free, since both entry points already require that) and
 /// re-check `parse` after each additional byte, waiting up to `grace` each
 /// time for the next one (see [`resolve_escape`]/[`resolve_headless_bracket`]
 /// — the same split-pacing risk applies at every byte boundary within the
@@ -1248,39 +1273,49 @@ enum EscapeOutcome {
 /// - a definite mismatch replays the buffered characters as ordinary key
 ///   presses (see [`replay`]);
 /// - if nothing more arrives in time, whatever was buffered is replayed the same way.
+///
+/// Modifiers are carried alongside each buffered character (rather than
+/// discarded, as before) solely so [`arrow_key_for`] can see the
+/// terminating letter's own — `parse`/[`replay`] still only ever see the
+/// plain `char`s, and replay's own dispatch is unchanged: it always sends
+/// `KeyModifiers::NONE`, regardless of what a replayed character actually
+/// arrived with (this round changes leaked-arrow *recognition*, not
+/// replay's dispatch semantics).
 fn swallow_one_sequence(
     app: &mut App,
     ctx: &Context,
     list_area: Rect,
-    mut pending: Vec<char>,
+    mut pending: Vec<(char, KeyModifiers)>,
     parse: fn(&[char]) -> SgrParse,
     grace: Duration,
 ) -> Result<EscapeOutcome> {
     loop {
-        match parse(&pending) {
+        let chars: Vec<char> = pending.iter().map(|&(c, _)| c).collect();
+        match parse(&chars) {
             SgrParse::Complete(event) => {
                 ctx.log(&format!("esc: swallowed complete sequence {event:?}"));
                 apply_sgr_action(app, ctx, list_area, event);
                 return Ok(EscapeOutcome::Swallowed);
             }
             SgrParse::NotSgr => {
-                if let Some(code) = arrow_key_for(&pending) {
+                let last_modifiers = pending.last().map_or(KeyModifiers::NONE, |&(_, m)| m);
+                if let Some(code) = arrow_key_for(&chars, last_modifiers) {
                     ctx.log(&format!(
-                        "esc: recognized leaked arrow key {code:?} from buffer {pending:?}"
+                        "esc: recognized leaked arrow key {code:?} from buffer {chars:?}"
                     ));
                     handle_key(app, code, KeyModifiers::NONE, ctx);
                     return Ok(EscapeOutcome::Swallowed);
                 }
-                ctx.log(&format!("esc: NotSgr, replaying buffer {pending:?}"));
-                replay(app, ctx, &pending);
+                ctx.log(&format!("esc: NotSgr, replaying buffer {chars:?}"));
+                replay(app, ctx, &chars);
                 return Ok(EscapeOutcome::Done);
             }
             SgrParse::Incomplete => {
                 if !event::poll(grace)? {
                     ctx.log(&format!(
-                        "esc: per-byte grace expired, replaying buffer {pending:?}"
+                        "esc: per-byte grace expired, replaying buffer {chars:?}"
                     ));
-                    replay(app, ctx, &pending);
+                    replay(app, ctx, &chars);
                     return Ok(EscapeOutcome::Done);
                 }
                 let read = event::read()?;
@@ -1298,20 +1333,22 @@ fn swallow_one_sequence(
                             // BANTO_INPUT_LOG shows no modifiers at all) —
                             // so only CONTROL routes a `Char` to the
                             // interrupting-event arm below instead of being
-                            // buffered as a candidate sequence byte.
+                            // buffered as a candidate sequence byte. Its own
+                            // modifiers (SHIFT included) still ride along in
+                            // `pending`, for `arrow_key_for` to judge.
                             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                pending.push(c)
+                                pending.push((c, key.modifiers))
                             }
-                            KeyCode::Esc => pending.push('\u{1b}'),
+                            KeyCode::Esc => pending.push(('\u{1b}', key.modifiers)),
                             other => {
-                                end_interrupted_buffer(app, ctx, &pending);
+                                end_interrupted_buffer(app, ctx, &chars);
                                 handle_key(app, other, key.modifiers, ctx);
                                 return Ok(EscapeOutcome::Done);
                             }
                         }
                     }
                     Event::Mouse(mouse) => {
-                        end_interrupted_buffer(app, ctx, &pending);
+                        end_interrupted_buffer(app, ctx, &chars);
                         handle_mouse(app, mouse, list_area, ctx);
                         return Ok(EscapeOutcome::Done);
                     }
@@ -3474,20 +3511,52 @@ mod tests {
 
     #[test]
     fn arrow_key_for_recognizes_all_four_directions_headless_and_esc_headed() {
-        assert_eq!(arrow_key_for(&['[', 'A']), Some(KeyCode::Up));
-        assert_eq!(arrow_key_for(&['[', 'B']), Some(KeyCode::Down));
-        assert_eq!(arrow_key_for(&['[', 'C']), Some(KeyCode::Right));
-        assert_eq!(arrow_key_for(&['[', 'D']), Some(KeyCode::Left));
-        assert_eq!(arrow_key_for(&['\u{1b}', '[', 'A']), Some(KeyCode::Up));
-        assert_eq!(arrow_key_for(&['\u{1b}', '[', 'D']), Some(KeyCode::Left));
+        assert_eq!(
+            arrow_key_for(&['[', 'A'], KeyModifiers::NONE),
+            Some(KeyCode::Up)
+        );
+        assert_eq!(
+            arrow_key_for(&['[', 'B'], KeyModifiers::NONE),
+            Some(KeyCode::Down)
+        );
+        assert_eq!(
+            arrow_key_for(&['[', 'C'], KeyModifiers::NONE),
+            Some(KeyCode::Right)
+        );
+        assert_eq!(
+            arrow_key_for(&['[', 'D'], KeyModifiers::NONE),
+            Some(KeyCode::Left)
+        );
+        assert_eq!(
+            arrow_key_for(&['\u{1b}', '[', 'A'], KeyModifiers::NONE),
+            Some(KeyCode::Up)
+        );
+        assert_eq!(
+            arrow_key_for(&['\u{1b}', '[', 'D'], KeyModifiers::NONE),
+            Some(KeyCode::Left)
+        );
     }
 
     #[test]
     fn arrow_key_for_rejects_shapes_that_are_not_a_bare_arrow_key() {
-        assert_eq!(arrow_key_for(&['[', 'x']), None);
-        assert_eq!(arrow_key_for(&['[', '<']), None); // SGR mouse lead-in
-        assert_eq!(arrow_key_for(&['[']), None);
-        assert_eq!(arrow_key_for(&[]), None);
+        assert_eq!(arrow_key_for(&['[', 'x'], KeyModifiers::NONE), None);
+        assert_eq!(arrow_key_for(&['[', '<'], KeyModifiers::NONE), None); // SGR mouse lead-in
+        assert_eq!(arrow_key_for(&['['], KeyModifiers::NONE), None);
+        assert_eq!(arrow_key_for(&[], KeyModifiers::NONE), None);
+    }
+
+    /// The R28 discriminator: a terminating letter that arrived with ANY
+    /// modifier is real text (a pasted/typed uppercase letter under Windows
+    /// Terminal's VkKeyScan-style SHIFT synthesis — see `arrow_key_for`'s
+    /// doc), not a leaked byte, regardless of the shape otherwise matching.
+    #[test]
+    fn arrow_key_for_rejects_a_terminating_letter_carrying_any_modifier() {
+        assert_eq!(arrow_key_for(&['[', 'A'], KeyModifiers::SHIFT), None);
+        assert_eq!(arrow_key_for(&['[', 'A'], KeyModifiers::CONTROL), None);
+        assert_eq!(
+            arrow_key_for(&['\u{1b}', '[', 'B'], KeyModifiers::SHIFT),
+            None
+        );
     }
 
     /// Exercises the headless-recovery *mechanism* directly (bypassing the
@@ -3513,7 +3582,7 @@ mod tests {
             &mut app,
             &ctx,
             list_area,
-            vec!['[', 'A'],
+            vec![('[', KeyModifiers::NONE), ('A', KeyModifiers::NONE)],
             sgr::parse_headless_prefix,
             HEADLESS_GRACE,
         )
@@ -3522,6 +3591,46 @@ mod tests {
         assert!(matches!(outcome, EscapeOutcome::Swallowed));
         assert_eq!(app.selected_row().unwrap().id, "a");
         assert_eq!(app.query(), "", "must not have been typed as garbage");
+    }
+
+    /// R28's paste-corruption dogfooding repro: pasting the literal text
+    /// `"[A [B [C [D"` moved the selection four times and left only the
+    /// spaces in the query, because Windows Terminal synthesizes SHIFT on
+    /// each pasted uppercase letter (see `arrow_key_for`'s doc) and the old
+    /// recognition never looked at modifiers at all. Each `"[X"` pair is its
+    /// own `swallow_one_sequence` call in production (mirroring
+    /// `drain_more`'s per-sequence loop); the space between them is an
+    /// ordinary keystroke the main loop would dispatch directly, simulated
+    /// here with a plain `push_char`.
+    #[test]
+    fn a_pasted_shift_modified_arrow_lookalike_burst_replays_as_literal_text() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+        let list_area = Rect::new(0, 4, 60, 3);
+
+        for letter in ['A', 'B', 'C', 'D'] {
+            let outcome = swallow_one_sequence(
+                &mut app,
+                &ctx,
+                list_area,
+                vec![('[', KeyModifiers::NONE), (letter, KeyModifiers::SHIFT)],
+                sgr::parse_headless_prefix,
+                HEADLESS_GRACE,
+            )
+            .unwrap();
+            assert!(matches!(outcome, EscapeOutcome::Done));
+            app.push_char(' '); // the literal space the paste sends between tokens
+        }
+
+        assert_eq!(
+            app.query(),
+            "[A [B [C [D ",
+            "the whole burst must land verbatim, not move the selection"
+        );
     }
 
     #[test]
@@ -3623,7 +3732,11 @@ mod tests {
             &mut app,
             &ctx,
             list_area,
-            vec!['\u{1b}', '[', 'B'],
+            vec![
+                ('\u{1b}', KeyModifiers::NONE),
+                ('[', KeyModifiers::NONE),
+                ('B', KeyModifiers::NONE),
+            ],
             sgr::parse_prefix,
             ESCAPE_GRACE,
         )
@@ -3659,7 +3772,11 @@ mod tests {
             &mut app,
             &ctx,
             list_area,
-            vec!['\u{1b}', '[', 'B'],
+            vec![
+                ('\u{1b}', KeyModifiers::NONE),
+                ('[', KeyModifiers::NONE),
+                ('B', KeyModifiers::NONE),
+            ],
             sgr::parse_prefix,
             ESCAPE_GRACE,
         )
