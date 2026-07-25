@@ -55,7 +55,9 @@ use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
-use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
+use banto_io::status::{
+    LiveSession, ProcessProbe, SysinfoProbe, ancestry_reaches, read_live_sessions,
+};
 use banto_io::store::Store;
 use banto_tui::render::screen_to_text;
 use banto_tui::view;
@@ -278,6 +280,12 @@ fn event_loop(
         // into the same tick (see `engine::update_tick`'s doc).
         if last_tick.is_none_or(|tick| now.duration_since(tick) >= TICK_INTERVAL) {
             last_tick = Some(now);
+            events.extend(gather_fork_observations(
+                &state,
+                store,
+                claude_home,
+                &handles,
+            ));
             let relay = gather_relay_observations(&state, store, claude_home);
             events.push_back(Event::Tick { relay });
         }
@@ -413,6 +421,36 @@ fn execute_cmd(
     }
 }
 
+/// Build the base argv for opening `target`: resuming it via
+/// [`opener::decide_inplace_resume`] when a real id is already known (`None`
+/// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
+/// otherwise — either way with `--model` appended when `model` is `Some`.
+/// `--model` applies the same way to a resume as to a fresh spawn: a Worker
+/// resumed without it falls back to the operator's own default model
+/// instead of the brigade's configured one (`engine::stage_brigade` never
+/// sets it for the Director, so this is never reached for one).
+///
+/// Pulled out of [`execute_open_embedded`] so this branch-and-append logic
+/// is unit-testable without spawning a real PTY; the `--mcp-config` append
+/// stays in the caller, since that needs real file I/O this doesn't.
+fn build_open_argv(
+    target: &SessionToOpen,
+    model: Option<&str>,
+    probe: &dyn ProcessProbe,
+    live: &[LiveSession],
+) -> Option<Vec<String>> {
+    let mut argv = if target.id.is_empty() {
+        opener::inplace_argv(None)
+    } else {
+        opener::decide_inplace_resume(target, probe, live)?.argv
+    };
+    if let Some(model) = model {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    Some(argv)
+}
+
 /// Spawn `target` under `key`, enforcing the no-double-resume guard for a
 /// known (non-empty) id — reusing the classic in-place decision — or
 /// skipping it entirely for a fresh (empty-id) spawn, which has no existing
@@ -429,24 +467,18 @@ fn execute_open_embedded(
     handles: &mut HashMap<SessionKey, PtyHandle>,
     discovery: &mut Vec<DiscoveryTracker>,
 ) -> Vec<Event> {
-    let mut argv = if target.id.is_empty() {
-        let mut argv = opener::inplace_argv(None);
-        if let Some(model) = &model {
-            argv.push("--model".to_string());
-            argv.push(model.clone());
-        }
-        argv
+    // Only read live sessions when a resume might actually need them — a
+    // fresh (unresumed) spawn never does.
+    let live = if target.id.is_empty() {
+        Vec::new()
     } else {
-        let live = read_live_sessions(&claude_home.join("sessions"));
-        match opener::decide_inplace_resume(&target, &SysinfoProbe, &live) {
-            Some(launch) => launch.argv,
-            None => {
-                return vec![Event::SpawnFailed {
-                    key,
-                    error: "already running elsewhere".to_string(),
-                }];
-            }
-        }
+        read_live_sessions(&claude_home.join("sessions"))
+    };
+    let Some(mut argv) = build_open_argv(&target, model.as_deref(), &SysinfoProbe, &live) else {
+        return vec![Event::SpawnFailed {
+            key,
+            error: "already running elsewhere".to_string(),
+        }];
     };
     if let Some((brigade_id, token, role)) = &brigade {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
@@ -795,6 +827,86 @@ fn gather_relay_observations(
         });
     }
     observations
+}
+
+/// How many parent-pid hops [`gather_fork_observations`] walks looking for a
+/// staged pane's own child pid in a live entry's ancestry — covers `claude`
+/// launched through a cmd/npm shim (a couple of hops) with headroom to
+/// spare, without letting a pathological chain spin forever.
+const FORK_ANCESTRY_DEPTH: u32 = 5;
+
+/// Detect a staged brigade member's Claude session having forked in place.
+///
+/// Claude Code's AUTO-compaction assigns a session a *new* id while leaving
+/// the process itself running (manual `/compact` does not) — the same
+/// `sessions/<pid>.json` live-state file the process has always published
+/// simply starts reporting a different `sessionId`. One
+/// `Event::MemberSessionForked` per staged member whose recorded id no
+/// longer matches what its own pane's process is actually reporting; the
+/// pid match tries the pane's direct child first, falling back to an
+/// ancestry walk for the cmd/npm-shim case (see [`FORK_ANCESTRY_DEPTH`]).
+/// Repeats every tick until the store row (and the core's rename it
+/// triggers) catch up — `engine::update_member_session_forked` is written
+/// to tolerate that.
+fn gather_fork_observations(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    claude_home: &Path,
+    handles: &HashMap<SessionKey, PtyHandle>,
+) -> Vec<Event> {
+    let Stage::Brigade { id, panes, .. } = &state.stage else {
+        return Vec::new();
+    };
+    let brigade_id = *id;
+    let members = match store.borrow().brigade_members(brigade_id) {
+        Ok(members) => members,
+        Err(_) => return Vec::new(),
+    };
+    let live = read_live_sessions(&claude_home.join("sessions"));
+    let probe = SysinfoProbe;
+    let mut events = Vec::new();
+    for member in &members {
+        let Some(claude_session_id) = member.claude_session_id.as_ref() else {
+            continue;
+        };
+        let old_key = SessionKey::from_id(&claude_session_id.0);
+        if !panes.contains(&old_key) {
+            continue;
+        }
+        let Some(pid) = handles.get(&old_key).and_then(PtyHandle::pid) else {
+            continue;
+        };
+        // Steady-state short-circuit: as long as *some* live entry still
+        // reports the recorded id, no fork has happened to this member — a
+        // process can't report the old and the new id at once, and a fork
+        // flips its one `sessions/<pid>.json` in place, so the recorded id
+        // vanishing from the live set is a precondition of a fork. Checking
+        // that first keeps the (sysinfo-backed) ancestry walks below off
+        // the every-second tick path entirely until something actually
+        // changed.
+        if live
+            .iter()
+            .any(|entry| entry.session_id.as_deref() == Some(claude_session_id.0.as_str()))
+        {
+            continue;
+        }
+        let forked = live.iter().find(|entry| {
+            entry
+                .session_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty() && id != claude_session_id.0)
+                && ancestry_reaches(entry.pid, pid, &probe, FORK_ANCESTRY_DEPTH)
+        });
+        if let Some(new_id) = forked.and_then(|entry| entry.session_id.clone()) {
+            events.push(Event::MemberSessionForked {
+                brigade_id,
+                token: member.token.clone(),
+                old_id: claude_session_id.0.clone(),
+                new_id,
+            });
+        }
+    }
+    events
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
@@ -1488,6 +1600,171 @@ mod tests {
             "worker-2 must take the unclaimed id, not re-take worker-1's: {events:?}"
         );
         assert!(trackers.is_empty());
+    }
+
+    // --- compact-fork tracking: gather_fork_observations ------------------
+
+    /// A staged brigade of a Director plus one Worker, and a matching store
+    /// row for the Worker holding `worker_session_id` — the shape
+    /// `gather_fork_observations` reads.
+    fn store_with_staged_worker(worker_session_id: &str) -> (RefCell<Store>, EmporiumState) {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId(worker_session_id.to_string())),
+            )
+            .unwrap();
+
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: brigade_id,
+            panes: vec![
+                SessionKey::from_id("dir"),
+                SessionKey::from_id(worker_session_id),
+            ],
+            focused: 0,
+        };
+        (RefCell::new(store), state)
+    }
+
+    #[test]
+    fn gather_fork_observations_detects_a_forked_worker_by_exact_pid_match() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state) = store_with_staged_worker("w1-old");
+        write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
+
+        let mut handles = HashMap::new();
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+
+        let events = gather_fork_observations(&state, &store, claude_home.path(), &handles);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::MemberSessionForked { token, old_id, new_id, .. }]
+                    if token == "worker-1" && old_id == "w1-old" && new_id == "w1-new"
+            ),
+            "expected exactly one fork observation: {events:?}"
+        );
+    }
+
+    #[test]
+    fn gather_fork_observations_is_silent_when_the_live_entry_still_reports_the_recorded_id() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state) = store_with_staged_worker("w1");
+        write_live_state(claude_home.path(), 4242, "w1", Path::new("/work/alpha"));
+
+        let mut handles = HashMap::new();
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        handles.insert(SessionKey::from_id("w1"), open(&host));
+
+        let events = gather_fork_observations(&state, &store, claude_home.path(), &handles);
+
+        assert!(events.is_empty(), "no fork happened: {events:?}");
+    }
+
+    #[test]
+    fn gather_fork_observations_ignores_a_pane_with_no_known_child_pid() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state) = store_with_staged_worker("w1-old");
+        write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
+
+        // No handle registered at all for the pane's key, so its pid can
+        // never be known — this must not panic, just find nothing.
+        let handles = HashMap::new();
+
+        let events = gather_fork_observations(&state, &store, claude_home.path(), &handles);
+
+        assert!(events.is_empty());
+    }
+
+    // --- worker model on resume: build_open_argv --------------------------
+
+    struct MockProbe {
+        alive: HashSet<u32>,
+    }
+
+    impl ProcessProbe for MockProbe {
+        fn is_alive(&self, pid: u32) -> bool {
+            self.alive.contains(&pid)
+        }
+
+        fn parent_pid(&self, _pid: u32) -> Option<u32> {
+            None
+        }
+    }
+
+    fn open_target(id: &str) -> SessionToOpen {
+        SessionToOpen {
+            id: id.to_string(),
+            title: "Fix login".to_string(),
+            cwd: PathBuf::from("/work/alpha"),
+        }
+    }
+
+    #[test]
+    fn build_open_argv_appends_model_to_a_resumed_sessions_argv() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let argv = build_open_argv(&open_target("sess-1"), Some("opus"), &probe, &[]).unwrap();
+        assert_eq!(
+            argv,
+            ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn build_open_argv_appends_model_to_a_fresh_launchs_argv_too() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let argv = build_open_argv(&open_target(""), Some("opus"), &probe, &[]).unwrap();
+        assert_eq!(argv, ["claude", "--model", "opus"].map(str::to_string));
+    }
+
+    #[test]
+    fn build_open_argv_omits_model_when_none() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let argv = build_open_argv(&open_target("sess-1"), None, &probe, &[]).unwrap();
+        assert_eq!(argv, ["claude", "--resume", "sess-1"].map(str::to_string));
+    }
+
+    #[test]
+    fn build_open_argv_is_none_when_the_resume_is_refused() {
+        let probe = MockProbe {
+            alive: HashSet::from([4242]),
+        };
+        let live = [LiveSession {
+            pid: 4242,
+            session_id: Some("sess-1".to_string()),
+            cwd: None,
+            status: None,
+            kind: None,
+            name: None,
+        }];
+        assert!(build_open_argv(&open_target("sess-1"), Some("opus"), &probe, &live).is_none());
     }
 
     // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------

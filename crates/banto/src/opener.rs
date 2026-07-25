@@ -611,6 +611,10 @@ mod tests {
         fn is_alive(&self, pid: u32) -> bool {
             self.alive.contains(&pid)
         }
+
+        fn parent_pid(&self, _pid: u32) -> Option<u32> {
+            None
+        }
     }
 
     fn session() -> SessionToOpen {

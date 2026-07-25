@@ -15,7 +15,7 @@ mod live;
 mod probe;
 
 pub use live::{LiveSession, read_live_sessions};
-pub use probe::{ProcessProbe, SysinfoProbe};
+pub use probe::{ProcessProbe, SysinfoProbe, ancestry_reaches};
 
 use std::time::SystemTime;
 
@@ -83,6 +83,10 @@ mod tests {
     impl ProcessProbe for MockProbe {
         fn is_alive(&self, pid: u32) -> bool {
             self.alive.contains(&pid)
+        }
+
+        fn parent_pid(&self, _pid: u32) -> Option<u32> {
+            None
         }
     }
 

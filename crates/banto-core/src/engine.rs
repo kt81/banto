@@ -801,6 +801,23 @@ pub enum Event {
         hidden: HashSet<String>,
         directors: HashSet<String>,
     },
+    /// A staged member's Claude session forked in place: AUTO-compaction
+    /// assigns a *new* session id to the same live process (manual
+    /// `/compact` does not) — the process's own `sessions/<pid>.json` live
+    /// file simply starts reporting a different `sessionId`, still under
+    /// the same pid. `old_id` is what the store/pane still know the member
+    /// by; `new_id` is what the process now reports. Gathered shell-side
+    /// (`emporium::gather_fork_observations`) alongside the relay tick, one
+    /// per tick a staged member's recorded id disagrees with its own live
+    /// process — so this may repeat for the same fork until the store row
+    /// (and the pane it keys) actually catch up; the handler must tolerate
+    /// that.
+    MemberSessionForked {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+        old_id: String,
+        new_id: String,
+    },
     /// ~1/s: relay observations for the staged brigade's members (gathered
     /// shell-side — store + live-session reads), plus the trigger to flush
     /// any due phase-two nudge submit and expire the status message.
@@ -889,6 +906,12 @@ pub fn update(
             app.set_directors(directors);
             Vec::new()
         }
+        Event::MemberSessionForked {
+            brigade_id,
+            token,
+            old_id,
+            new_id,
+        } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
     };
     cmds.extend(resize_staged_tiles(state));
@@ -1450,6 +1473,15 @@ fn stage_brigade(
                     state
                         .pending_opens
                         .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+                    // A resume's `--model` matters exactly like a fresh
+                    // spawn's (see `open_worker`): a Worker resumed without
+                    // it silently falls back to the operator's own default
+                    // model rather than the brigade's configured one. Never
+                    // for the Director — that's the operator's own session,
+                    // launched (and re-launched) entirely outside banto's
+                    // control.
+                    let model = (*role == BrigadeRole::Worker && !worker_model.is_empty())
+                        .then(|| worker_model.to_string());
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -1458,7 +1490,7 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                         brigade: Some((brigade_id, token.clone(), *role)),
-                        model: None,
+                        model,
                     });
                 }
             }
@@ -1797,6 +1829,70 @@ fn update_discovery_result(
             session_id,
         }));
     }
+    cmds
+}
+
+/// A staged member's Claude session forked in place (see
+/// [`Event::MemberSessionForked`]'s doc for why). The store write always
+/// happens — the fork is real regardless of what the emporium's own panes
+/// look like right now — but the pane/screen rename only applies if the
+/// brigade is still staged with `old_id`'s pane present; `focused` needs no
+/// fixing of its own, since renaming `panes[i]`'s *value* in place never
+/// moves what index it lives at. Idempotent under a repeated fact (the
+/// observation that produces this repeats until the store row changes):
+/// once `old_id`'s pane has already been renamed to `new_id`, `old_id` is no
+/// longer in `panes` and this becomes a store-only no-op, same as the
+/// "not staged" case below.
+fn update_member_session_forked(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    token: MemberToken,
+    old_id: String,
+    new_id: String,
+    now: Instant,
+) -> Vec<Cmd> {
+    let old_key = SessionKey::from_id(&old_id);
+    let new_key = SessionKey::from_id(&new_id);
+    let mut cmds = Vec::new();
+    let staged = matches!(
+        &state.stage,
+        Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&old_key)
+    );
+    if staged {
+        // Same refusal precedent as `update_discovery_result`'s collision
+        // guard just above: if `new_key` is already a live pane (the
+        // operator opened the continuation separately as a solo session,
+        // say), renaming onto it would collapse two panes into one. Unlike
+        // that guard, the store write below still goes through — a later
+        // re-stage heals the pane once the collision clears, but the store
+        // must record the truth now regardless.
+        if state.screens.contains_key(&new_key) {
+            state.set_status(
+                format!("session fork collision on {new_id} — pane not renamed"),
+                now,
+            );
+        } else {
+            if let Some(screen) = state.screens.remove(&old_key) {
+                state.screens.insert(new_key.clone(), screen);
+            }
+            if let Stage::Brigade { panes, .. } = &mut state.stage {
+                for pane in panes.iter_mut() {
+                    if *pane == old_key {
+                        *pane = new_key.clone();
+                    }
+                }
+            }
+            cmds.push(Cmd::RekeyPty {
+                from: old_key,
+                to: new_key,
+            });
+        }
+    }
+    cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
+        brigade_id,
+        token,
+        session_id: new_id,
+    }));
     cmds
 }
 
@@ -2760,6 +2856,226 @@ mod tests {
             panic!("expected a staged brigade");
         };
         assert_eq!(panes, &[director, worker]);
+    }
+
+    // --- compact-fork tracking: Event::MemberSessionForked -----------------
+
+    #[test]
+    fn member_session_forked_renames_the_pane_preserving_order_focus_and_screen() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let old = SessionKey::from_id("w1-old");
+        let other = SessionKey::from_id("w2");
+        staged_brigade(&mut state, &director, &[old.clone(), other.clone()]);
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1; // focus the forking worker's own pane
+        }
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                old_id: "w1-old".to_string(),
+                new_id: "w1-new".to_string(),
+            },
+            now,
+        );
+
+        let new_key = SessionKey::from_id("w1-new");
+        assert!(state.screens.contains_key(&new_key));
+        assert!(!state.screens.contains_key(&old));
+        let Stage::Brigade { panes, focused, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(panes, &[director, new_key.clone(), other]);
+        assert_eq!(*focused, 1, "focus stays on the same pane position");
+        assert!(
+            cmds.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::RekeyPty { from, to } if *from == old && *to == new_key
+            )),
+            "the shell must be told to rekey its handle: {cmds:?}"
+        );
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::Store(StoreIntent::SetMemberSession { token, session_id, .. })
+                if token == "worker-1" && session_id == "w1-new"
+        )));
+    }
+
+    #[test]
+    fn member_session_forked_collision_skips_the_rename_but_still_updates_the_store() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let old = SessionKey::from_id("w1-old");
+        staged_brigade(&mut state, &director, std::slice::from_ref(&old));
+        // The operator separately opened the continuation as its own solo
+        // pane before banto ever noticed the fork.
+        state
+            .screens
+            .insert(SessionKey::from_id("w1-new"), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                old_id: "w1-old".to_string(),
+                new_id: "w1-new".to_string(),
+            },
+            now,
+        );
+
+        assert!(
+            state.screens.contains_key(&old),
+            "the old pane is left alone"
+        );
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(panes, &[director, old]);
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })),
+            "a collision must not rekey: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::Store(StoreIntent::SetMemberSession { session_id, .. })
+                    if session_id == "w1-new"
+            )),
+            "the store must still learn the truth: {cmds:?}"
+        );
+        assert!(state.status.unwrap().contains("collision"));
+    }
+
+    #[test]
+    fn member_session_forked_when_old_id_is_not_staged_updates_only_the_store() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                old_id: "w1-old".to_string(),
+                new_id: "w1-new".to_string(),
+            },
+            now,
+        );
+
+        assert_eq!(cmds.len(), 1, "store-only: {cmds:?}");
+        assert!(matches!(
+            cmds[0],
+            Cmd::Store(StoreIntent::SetMemberSession { .. })
+        ));
+    }
+
+    #[test]
+    fn member_session_forked_fact_is_idempotent_under_duplicate_delivery() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let old = SessionKey::from_id("w1-old");
+        staged_brigade(&mut state, &director, std::slice::from_ref(&old));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let fact = || Event::MemberSessionForked {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            old_id: "w1-old".to_string(),
+            new_id: "w1-new".to_string(),
+        };
+
+        let first = update(&mut state, &mut app, &brigade, fact(), now);
+        assert!(first.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })));
+
+        // The observation that produces this fact repeats until the store
+        // row catches up: a second delivery must not panic, double-rename,
+        // or emit a second RekeyPty — `old_id`'s pane is already gone.
+        let second = update(&mut state, &mut app, &brigade, fact(), now);
+        assert!(
+            !second.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })),
+            "already renamed; a repeat must be store-only: {second:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::SetMemberSession { .. })))
+        );
+    }
+
+    // --- worker model on resume ---------------------------------------------
+
+    #[test]
+    fn stage_brigade_passes_the_configured_worker_model_to_a_resumed_worker_but_never_to_the_director()
+     {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir"), row("w1")]);
+        let brigade = brigade_config(); // worker_model defaults to "sonnet"
+        let now = Instant::now();
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            (
+                "worker-1".to_string(),
+                BrigadeRole::Worker,
+                Some("w1".to_string()),
+            ),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            now,
+        );
+
+        let models: Vec<(String, Option<String>)> = cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::OpenEmbedded { target, model, .. } => Some((target.id.clone(), model.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            models
+                .iter()
+                .any(|(id, model)| id == "dir" && model.is_none()),
+            "the Director must never carry --model: {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|(id, model)| id == "w1" && model.as_deref() == Some("sonnet")),
+            "a resumed Worker must carry the configured worker_model: {models:?}"
+        );
     }
 
     #[test]
