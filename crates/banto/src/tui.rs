@@ -34,7 +34,7 @@ use banto_core::app::{
     App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessionPlacement, OpenAction,
 };
 use banto_core::config::OpenerMode;
-use banto_core::model::{SessionId, SessionToOpen};
+use banto_core::model::{SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
@@ -142,7 +142,7 @@ struct Context<'a> {
     /// [`run_pending_inplace`].
     pending_inplace: RefCell<Option<opener::InPlaceLaunch>>,
     /// Session ids whose lineage scan found no parent this run (see
-    /// [`load_superseded`]) — kept in memory only, across every reload for
+    /// [`superseded_from_metas`]) — kept in memory only, across every reload for
     /// the lifetime of this process, so a permanently-unresolvable
     /// continuation isn't re-scanned (tens of MB) every reload; a fresh
     /// banto run starts with an empty set and retries it.
@@ -230,17 +230,18 @@ pub fn run(
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
 ) -> Result<()> {
-    let rows = session::load_rows(claude_home, thresholds)?;
+    let metas = ClaudeCodeProvider::new(claude_home.to_path_buf()).discover()?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
+        let superseded = superseded_from_metas(&metas, &store, &superseded_failed);
+        let rows = session::rows_from_metas(metas, claude_home, thresholds);
         let rows = exclude_archived(rows, &store);
         let pinned = load_pinned(&store);
         let groups = load_groups(&store);
         let session_groups = load_session_groups(&store, &groups);
         let hidden = load_hidden_worker_ids(&store);
         let directors = load_directors(&store);
-        let superseded = load_superseded(claude_home, &store, &superseded_failed);
         (
             rows,
             pinned,
@@ -374,23 +375,23 @@ pub(crate) fn load_directors(store: &Store) -> HashSet<String> {
         .collect()
 }
 
-/// Spend this reload's lineage-resolution budget, then return every session
-/// id with a known auto-compaction continuation — [`App`] hides these (see
-/// `App::superseded`). Runs its own discovery pass (`SessionMeta`'s
+/// Spend this reload's lineage-resolution budget against already-discovered
+/// `metas`, then return every session id with a known auto-compaction
+/// continuation — [`App`] hides these (see `App::superseded`). Takes
+/// `metas` rather than discovering its own: `SessionMeta`'s
 /// `continuation_of_uuid` doesn't survive into [`session::load_rows`]'s
-/// `SessionRow`s, and threading it through would touch that function's other
-/// callers) — an accepted extra `discover()` per reload in exchange for
-/// keeping `session::load_rows`'s signature untouched. Tolerant: a discovery
-/// failure just means no lineage progress this pass, not a blocked TUI.
-pub(crate) fn load_superseded(
-    claude_home: &Path,
+/// `SessionRow`s, but `banto_io::lineage::resolve_lineage` already wants
+/// exactly `&[SessionMeta]`, so every call site — which already needs a
+/// discover() pass for the rows anyway — can hand the same one here instead
+/// of paying for a second. Tolerant: a lineage-resolution failure just means
+/// no progress this pass, not a blocked TUI.
+pub(crate) fn superseded_from_metas(
+    metas: &[SessionMeta],
     store: &Store,
     failed: &RefCell<HashSet<SessionId>>,
 ) -> HashSet<String> {
-    if let Ok(metas) = ClaudeCodeProvider::new(claude_home.to_path_buf()).discover() {
-        let mut failed = failed.borrow_mut();
-        let _ = resolve_lineage(store, &metas, &mut failed);
-    }
+    let mut failed = failed.borrow_mut();
+    let _ = resolve_lineage(store, metas, &mut failed);
     store
         .lineage_parent_ids()
         .unwrap_or_default()
@@ -1659,20 +1660,20 @@ fn toggle_agent_filter(app: &mut App) {
 /// initial load in [`run`]. Also refreshes the hidden-worker/director id
 /// sets (a brigade may have formed, spawned a Worker, or disbanded since the
 /// last reload) and spends this reload's lineage-resolution budget (see
-/// [`load_superseded`]). A read failure is tolerated: the previous rows are
-/// kept rather than the TUI erroring out over a transient filesystem hiccup.
+/// [`superseded_from_metas`]) against the same discover() pass the rows come
+/// from. A read failure is tolerated: the previous rows (and superseded set)
+/// are kept rather than the TUI erroring out over a transient filesystem
+/// hiccup.
 fn reload(app: &mut App, ctx: &Context) {
-    if let Ok(rows) = session::load_rows(ctx.claude_home, ctx.thresholds) {
+    if let Ok(metas) = ClaudeCodeProvider::new(ctx.claude_home.to_path_buf()).discover() {
         let store = ctx.store.borrow();
+        let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);
+        let rows = session::rows_from_metas(metas, ctx.claude_home, ctx.thresholds);
         let rows = exclude_archived(rows, &store);
         app.replace_rows(rows);
         app.set_hidden_worker_ids(load_hidden_worker_ids(&store));
         app.set_directors(load_directors(&store));
-        app.set_superseded(load_superseded(
-            ctx.claude_home,
-            &store,
-            &ctx.superseded_failed,
-        ));
+        app.set_superseded(superseded);
     }
 }
 
@@ -1791,6 +1792,90 @@ mod tests {
             is_agent: true,
             ..row(id, title, cwd, activity)
         }
+    }
+
+    /// A synthetic [`SessionMeta`] fixture with no continuation.
+    fn plain_meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: SessionId(id.to_string()),
+            provider: "claude-code".to_string(),
+            title: None,
+            cwd: None,
+            source_path: PathBuf::from(format!("{id}.jsonl")),
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+            is_agent: false,
+            preview: None,
+            continuation_of_uuid: None,
+        }
+    }
+
+    /// Same as [`plain_meta`], but flagged as an auto-compaction
+    /// continuation of `parent_uuid`, at a real `source_path` on disk (so
+    /// `resolve_lineage`'s streaming scan, invoked through
+    /// [`superseded_from_metas`], has a project directory to search).
+    fn continuation_meta(id: &str, source_path: PathBuf, parent_uuid: &str) -> SessionMeta {
+        SessionMeta {
+            continuation_of_uuid: Some(parent_uuid.to_string()),
+            source_path,
+            ..plain_meta(id)
+        }
+    }
+
+    #[test]
+    fn superseded_from_metas_resolves_a_continuation_from_the_shared_discover_pass() {
+        // No independent discover() here: `metas` is handed in directly, the
+        // same way every call site now shares one discover() pass between
+        // rows and lineage — see `superseded_from_metas`'s doc.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("parent.jsonl"),
+            "{\"type\":\"user\",\"uuid\":\"P1\"}\n",
+        )
+        .unwrap();
+        let child_path = dir.path().join("child.jsonl");
+        std::fs::write(&child_path, "{\"type\":\"mode\"}\n").unwrap();
+        let metas = vec![continuation_meta("child", child_path, "P1")];
+
+        let store = Store::open_in_memory().unwrap();
+        let failed = RefCell::new(HashSet::new());
+
+        let superseded = superseded_from_metas(&metas, &store, &failed);
+
+        assert_eq!(superseded, HashSet::from(["parent".to_string()]));
+        assert!(failed.borrow().is_empty());
+    }
+
+    #[test]
+    fn superseded_from_metas_is_empty_for_sessions_without_a_continuation() {
+        let store = Store::open_in_memory().unwrap();
+        let failed = RefCell::new(HashSet::new());
+        let metas = vec![plain_meta("a"), plain_meta("b")];
+
+        let superseded = superseded_from_metas(&metas, &store, &failed);
+
+        assert!(superseded.is_empty());
+        assert!(failed.borrow().is_empty());
+    }
+
+    #[test]
+    fn superseded_from_metas_records_an_unresolvable_continuation_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_path = dir.path().join("child.jsonl");
+        std::fs::write(&child_path, "{\"type\":\"mode\"}\n").unwrap();
+        let metas = vec![continuation_meta(
+            "child",
+            child_path,
+            "nowhere-to-be-found",
+        )];
+
+        let store = Store::open_in_memory().unwrap();
+        let failed = RefCell::new(HashSet::new());
+
+        let superseded = superseded_from_metas(&metas, &store, &failed);
+
+        assert!(superseded.is_empty());
+        assert!(failed.borrow().contains(&SessionId("child".to_string())));
     }
 
     /// A `Context` for tests exercising `handle_key`/`handle_normal_key`/

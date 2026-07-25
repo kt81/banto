@@ -53,6 +53,7 @@ use banto_core::input::InputEvent;
 use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
+use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
 use banto_io::status::{
@@ -90,10 +91,10 @@ pub fn run(
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    let rows = session::load_rows(claude_home, thresholds)?;
+    let metas = ClaudeCodeProvider::new(claude_home.to_path_buf()).discover()?;
     // In-memory only, for this process's lifetime — see
-    // `crate::tui::load_superseded`'s doc. Created once here and threaded
-    // through every reload (the bootstrap below and every later
+    // `crate::tui::superseded_from_metas`'s doc. Created once here and
+    // threaded through every reload (the bootstrap below and every later
     // `gather_reload`) rather than per-call, so a permanently-unresolvable
     // continuation is scanned at most once per banto run.
     let superseded_failed = RefCell::new(HashSet::new());
@@ -103,13 +104,14 @@ pub fn run(
     // construction-only builders, not a repeating decision.
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
+        let superseded = crate::tui::superseded_from_metas(&metas, &store, &superseded_failed);
+        let rows = session::rows_from_metas(metas, claude_home, thresholds);
         let rows = crate::tui::exclude_archived(rows, &store);
         let pinned = crate::tui::load_pinned(&store);
         let groups = crate::tui::load_groups(&store);
         let session_groups = crate::tui::load_session_groups(&store, &groups);
         let hidden = crate::tui::load_hidden_worker_ids(&store);
         let directors = crate::tui::load_directors(&store);
-        let superseded = crate::tui::load_superseded(claude_home, &store, &superseded_failed);
         (
             rows,
             pinned,
@@ -169,8 +171,8 @@ struct Deps<'a> {
     claude_home: &'a Path,
     thresholds: &'a AgeThresholds,
     store: &'a RefCell<Store>,
-    /// See [`crate::tui::load_superseded`]'s doc: in-memory only, for this
-    /// process's lifetime.
+    /// See [`crate::tui::superseded_from_metas`]'s doc: in-memory only, for
+    /// this process's lifetime.
     superseded_failed: &'a RefCell<HashSet<SessionId>>,
     /// `[brigade]` from config.toml. Lives here rather than as its own
     /// `event_loop` parameter because `execute_cmd` needs it too now (a
@@ -748,16 +750,18 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 /// Reload the session list from disk. A read failure is tolerated (yields no
 /// event, keeping the previous rows) rather than erroring the whole loop out
 /// over a transient filesystem hiccup. Also spends this reload's
-/// lineage-resolution budget (see [`crate::tui::load_superseded`]).
+/// lineage-resolution budget against the same discover() pass (see
+/// [`crate::tui::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(rows) = session::load_rows(deps.claude_home, deps.thresholds) else {
+    let Ok(metas) = ClaudeCodeProvider::new(deps.claude_home.to_path_buf()).discover() else {
         return Vec::new();
     };
     let store = deps.store.borrow();
+    let superseded = crate::tui::superseded_from_metas(&metas, &store, deps.superseded_failed);
+    let rows = session::rows_from_metas(metas, deps.claude_home, deps.thresholds);
     let rows = crate::tui::exclude_archived(rows, &store);
     let hidden = crate::tui::load_hidden_worker_ids(&store);
     let directors = crate::tui::load_directors(&store);
-    let superseded = crate::tui::load_superseded(deps.claude_home, &store, deps.superseded_failed);
     vec![Event::RowsLoaded {
         rows,
         hidden,

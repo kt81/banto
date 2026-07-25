@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use banto_core::config::ActivityConfig;
 pub use banto_core::model::SessionRow;
-use banto_core::model::{Activity, AgeBucket};
+use banto_core::model::{Activity, AgeBucket, SessionMeta};
 use banto_core::status::AgeThresholds;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
@@ -45,7 +45,9 @@ pub fn activity_tag(activity: Activity) -> &'static str {
 
 /// Discover sessions under `claude_home`, classify their activity, and return
 /// them sorted by mtime descending (newest first), with session id as a
-/// deterministic tie-breaker.
+/// deterministic tie-breaker. A thin wrapper — discover, then
+/// [`rows_from_metas`] — kept for callers that only want rows and have no
+/// reason to run a second discover() pass of their own.
 ///
 /// Read-only: this reads `<claude_home>/projects` and `<claude_home>/sessions`
 /// and never writes anywhere.
@@ -54,14 +56,29 @@ pub fn load_rows(
     thresholds: &AgeThresholds,
 ) -> Result<Vec<SessionRow>, ProviderError> {
     let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
-    let mut metas = provider.discover()?;
+    let metas = provider.discover()?;
+    Ok(rows_from_metas(metas, claude_home, thresholds))
+}
+
+/// The conversion half of [`load_rows`] — classify and sort already-
+/// discovered `metas` into [`SessionRow`]s — extracted so a caller that has
+/// its own discover() pass to feed elsewhere too (e.g. lineage resolution —
+/// see `crate::tui::superseded_from_metas`) doesn't need a second discover()
+/// just for this. `claude_home`/`thresholds` are still needed here: they
+/// drive the live-status read and activity classification, neither of which
+/// discovery itself touches.
+pub fn rows_from_metas(
+    mut metas: Vec<SessionMeta>,
+    claude_home: &Path,
+    thresholds: &AgeThresholds,
+) -> Vec<SessionRow> {
     metas.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.id.0.cmp(&b.id.0)));
 
     let live = status::read_live_sessions(&claude_home.join("sessions"));
     let probe = SysinfoProbe;
     let now = SystemTime::now();
 
-    let rows = metas
+    metas
         .into_iter()
         .map(|meta| {
             let activity = status::classify(&meta, &live, &probe, now, thresholds);
@@ -76,15 +93,33 @@ pub fn load_rows(
                 size: meta.size,
             }
         })
-        .collect();
-    Ok(rows)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use banto_core::model::SessionId;
+
     use super::*;
+
+    /// A synthetic [`SessionMeta`], overriding just id/mtime — the rest are
+    /// values [`rows_from_metas`]'s tests can assert carry straight through.
+    fn meta(id: &str, mtime: SystemTime) -> SessionMeta {
+        SessionMeta {
+            id: SessionId(id.to_string()),
+            provider: "claude-code".to_string(),
+            title: Some(format!("Title {id}")),
+            cwd: None,
+            source_path: PathBuf::from(format!("{id}.jsonl")),
+            mtime,
+            size: 42,
+            is_agent: false,
+            preview: None,
+            continuation_of_uuid: None,
+        }
+    }
 
     #[test]
     fn haystack_joins_title_and_cwd() {
@@ -183,6 +218,25 @@ mod tests {
         let rows = load_rows(dir.path(), &AgeThresholds::default()).unwrap();
         let titles: Vec<_> = rows.iter().map(|r| r.display_title().to_string()).collect();
         assert_eq!(titles, vec!["New".to_string(), "Old".to_string()]);
+    }
+
+    #[test]
+    fn rows_from_metas_sorts_newest_first_and_carries_fields_through() {
+        // No `.jsonl` files on disk at all here — unlike
+        // `load_rows_sorts_newest_first`, this is the extracted conversion
+        // half in isolation: already-discovered `metas` in, `SessionRow`s
+        // out, no discover() of its own (that's the point of the split).
+        let dir = tempfile::tempdir().unwrap();
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let metas = vec![meta("old", older), meta("new", newer)];
+
+        let rows = rows_from_metas(metas, dir.path(), &AgeThresholds::default());
+
+        let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids, vec!["new".to_string(), "old".to_string()]);
+        assert_eq!(rows[0].title.as_deref(), Some("Title new"));
+        assert_eq!(rows[0].size, 42);
     }
 
     /// Set a file's mtime without pulling in an extra crate: reopen and write
