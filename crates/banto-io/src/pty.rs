@@ -10,9 +10,9 @@ use std::sync::mpsc::{self, Receiver};
 use anyhow::Result;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-/// The five channels to a hosted child: its output chunks, an input sink, a
-/// resize handle, a kill handle, and an exit signal. Returned by
-/// [`PtyHost::open`].
+/// Everything a hosted child is reachable by: its output chunks, an input
+/// sink, a resize handle, a kill handle, its pid, and an exit signal.
+/// Returned by [`PtyHost::open`].
 pub struct PtyIo {
     /// Chunks of the child's terminal output, pumped from a reader thread.
     pub output: Receiver<Vec<u8>>,
@@ -25,6 +25,15 @@ pub struct PtyIo {
     /// Phase 2b (session termination); the executor plumbing is deliberately
     /// ready ahead of it.
     pub killer: Box<dyn Killer>,
+    /// OS process id of the direct child, when the platform reports one.
+    /// `claude` writes `<claude_home>/sessions/<pid>.json` at startup, so
+    /// this is what lets a freshly-spawned session be identified before it
+    /// has written any session history (see
+    /// `banto::embedded::emporium::poll_discovery`). `None` whenever the
+    /// direct child isn't the `claude` process itself — a Windows `.cmd`
+    /// shim spawned through a shell, say — in which case id discovery falls
+    /// back to matching session files by cwd.
+    pub pid: Option<u32>,
     /// Fires exactly once, when the child has actually exited. On ConPTY, a
     /// child's exit does **not** produce EOF on `output` (the pseudoconsole
     /// keeps the pipe open), so `output` disconnecting is a Unix-only signal
@@ -73,10 +82,12 @@ impl PtyHost for PortablePtyHost {
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
-        // Cloned before `child` moves into the exit-waiter thread below: a
-        // `ChildKiller` is an independent handle to the same process, so the
-        // resize/kill capabilities don't need to fight over one `&mut Child`.
+        // Both read before `child` moves into the exit-waiter thread below:
+        // a `ChildKiller` is an independent handle to the same process, so
+        // the resize/kill capabilities don't need to fight over one
+        // `&mut Child`, and the pid is a plain value.
         let killer = child.clone_killer();
+        let pid = child.process_id();
 
         let mut reader = pair.master.try_clone_reader()?;
         let input = pair.master.take_writer()?;
@@ -117,6 +128,7 @@ impl PtyHost for PortablePtyHost {
                 master: pair.master,
             }),
             killer: Box::new(PortablePtyKiller(killer)),
+            pid,
             exited: exited_rx,
         })
     }
@@ -177,6 +189,10 @@ pub mod mock {
         /// (`..Default::default()`) requires every field to be nameable
         /// from the construction site, even ones taken from `Default`.
         pub exit_sender: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+        /// Reported as the spawned child's pid (real hosts read it from the
+        /// OS). `None` by default, matching a platform that can't report
+        /// one.
+        pub pid: Option<u32>,
         /// When `true`, `open`'s output sender drops as soon as `script` is
         /// sent — simulating a real Unix PTY's reader thread hitting EOF on
         /// child exit, independent of `exited`. When `false` (the default),
@@ -229,6 +245,7 @@ pub mod mock {
                 input: Box::new(CapturingWriter(self.captured.clone())),
                 resizer: Box::new(MockResizer(self.resizes.clone())),
                 killer: Box::new(MockKiller(self.kills.clone(), self.exit_sender.clone())),
+                pid: self.pid,
                 exited: exited_rx,
             })
         }

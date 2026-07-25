@@ -55,7 +55,7 @@ use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
-use banto_io::status::{ProcessProbe, SysinfoProbe, read_live_sessions};
+use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
 use banto_tui::render::screen_to_text;
 use banto_tui::view;
@@ -133,6 +133,10 @@ struct DiscoveryTracker {
     cwd: PathBuf,
     since: SystemTime,
     member: Option<(BrigadeId, MemberToken)>,
+    /// The spawned child's pid, when the platform reports one — the exact
+    /// match against `sessions/<pid>.json` that [`poll_discovery`] tries
+    /// before falling back to scanning session files by cwd.
+    pid: Option<u32>,
 }
 
 /// How often the relay engine (and the pending-submit flush / status expiry
@@ -251,11 +255,16 @@ fn event_loop(
         }
 
         // Discovery: poll for the ids Claude assigns to freshly-launched
-        // sessions still awaiting one.
+        // sessions still awaiting one. `claimed` — the ids already spoken
+        // for — is read off the handle map, which is only truthful because
+        // `Cmd::RekeyPty` renames a handle the moment its id is discovered:
+        // without that, a resolved id stays invisible here and the next
+        // pending tracker resolves onto it a second time.
         if !discovery.is_empty() {
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
-            events.extend(poll_discovery(&mut discovery, &provider, &claimed));
+            let live = read_live_sessions(&claude_home.join("sessions"));
+            events.extend(poll_discovery(&mut discovery, &provider, &claimed, &live));
         }
 
         // Live updates: reload the list once the watched dirs settle.
@@ -297,6 +306,10 @@ fn event_loop(
 
         // A `PtyExited` handler drops the session's `Screen`; the handle
         // itself (now pointing at a dead reader thread) is dropped here.
+        // This is also why every core-side `screens` rekey must reach the
+        // handle map (`Cmd::RekeyPty`): a handle left under a stale key
+        // reads as "screen gone" and is reaped here, which on Unix closes
+        // the PTY master and SIGHUPs a perfectly live child.
         handles.retain(|key, _| state.screens.contains_key(key));
 
         terminal.draw(|frame| draw(frame, app, &state, SystemTime::now()))?;
@@ -383,6 +396,12 @@ fn execute_cmd(
             }
             Vec::new()
         }
+        Cmd::RekeyPty { from, to } => {
+            if let Some(handle) = handles.remove(&from) {
+                handles.insert(to, handle);
+            }
+            Vec::new()
+        }
         Cmd::OpenEmbedded {
             key,
             target,
@@ -439,6 +458,7 @@ fn execute_open_embedded(
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), 24, 80) {
         Ok(handle) => {
+            let pid = handle.pid();
             handles.insert(key.clone(), handle);
             if key.is_synthetic() {
                 discovery.push(DiscoveryTracker {
@@ -446,6 +466,7 @@ fn execute_open_embedded(
                     cwd: target.cwd,
                     since: SystemTime::now(),
                     member: brigade.map(|(brigade_id, token, _)| (brigade_id, token)),
+                    pid,
                 });
             }
             vec![Event::Spawned { key }]
@@ -645,26 +666,50 @@ fn gather_reload(
     }]
 }
 
-/// Poll every pending discovery tracker for the id Claude assigned it,
-/// disambiguating a batch spawned into the same cwd at once by fetching
-/// every matching candidate (`find_new_sessions`, not the single-best
-/// `find_new_session`) and greedily assigning each to a still-pending
-/// tracker, skipping ids already claimed by another open session — mirrors
-/// the pre-migration `discover_new_ids`.
+/// Poll every pending discovery tracker for the id Claude assigned it.
+///
+/// Two sources, tried in that order:
+///
+/// 1. **The live-state file** `sessions/<pid>.json`, matched on the child's
+///    own pid. `claude` writes it at startup, and banto knows the pid it
+///    spawned, so this is exact — no cwd heuristics, no batch ambiguity. It
+///    is also the only source that works at all for a Worker nobody has
+///    typed into yet: a session's `.jsonl` doesn't appear until its first
+///    *turn*, so a brigade Worker sitting at its prompt is invisible to
+///    source 2 indefinitely — and, being unidentified, it can never be
+///    relay-nudged into taking that first turn either. The deadlock this
+///    breaks was live: every re-stage of the cell then respawned that
+///    Worker as a brand-new session.
+/// 2. **Session files** (`find_new_sessions`, not the single-best
+///    `find_new_session`), greedily assigned oldest-first, disambiguating a
+///    batch spawned into one cwd at once — mirrors the pre-migration
+///    `discover_new_ids`. The fallback whenever the direct child isn't the
+///    `claude` process itself (see `PtyIo::pid`).
+///
+/// Both skip ids already claimed by an open session or taken earlier in
+/// this same pass.
 fn poll_discovery(
     trackers: &mut Vec<DiscoveryTracker>,
     provider: &ClaudeCodeProvider,
     claimed: &HashSet<String>,
+    live: &[LiveSession],
 ) -> Vec<Event> {
     let mut used_this_pass: HashSet<String> = HashSet::new();
     let mut resolved: Vec<(usize, String)> = Vec::new();
     for (i, tracker) in trackers.iter().enumerate() {
-        if let Some(id) = provider
-            .find_new_sessions(&tracker.cwd, tracker.since)
-            .into_iter()
-            .map(|id| id.0)
-            .find(|id| !claimed.contains(id) && !used_this_pass.contains(id))
-        {
+        let by_pid = tracker
+            .pid
+            .and_then(|pid| live_session_id(live, pid, &tracker.cwd));
+        let id = by_pid
+            .filter(|id| !claimed.contains(id) && !used_this_pass.contains(id))
+            .or_else(|| {
+                provider
+                    .find_new_sessions(&tracker.cwd, tracker.since)
+                    .into_iter()
+                    .map(|id| id.0)
+                    .find(|id| !claimed.contains(id) && !used_this_pass.contains(id))
+            });
+        if let Some(id) = id {
             used_this_pass.insert(id.clone());
             resolved.push((i, id));
         }
@@ -688,6 +733,21 @@ fn poll_discovery(
         keep
     });
     events
+}
+
+/// The session id `claude` published for the process at `pid`, if that
+/// live-state entry is really the child banto spawned into `cwd`.
+///
+/// The cwd check is the guard against a stale file: a `sessions/<pid>.json`
+/// left behind by a session whose pid the OS has since recycled would
+/// otherwise hand a Worker somebody else's session id, and banto would go
+/// on to `--resume` it — the one thing it must never do twice. A mismatch
+/// (or a file with no cwd recorded) simply declines, leaving the session-file
+/// scan to answer.
+fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String> {
+    live.iter()
+        .find(|entry| entry.pid == pid && entry.cwd.as_deref() == Some(cwd))
+        .and_then(|entry| entry.session_id.clone())
 }
 
 /// Gather this tick's relay observations for the staged brigade's members
@@ -1236,6 +1296,198 @@ mod tests {
         );
         assert_eq!(*kills_a.lock().unwrap(), 0, "a exited on its own");
         assert_eq!(*kills_b.lock().unwrap(), 1, "b outlived the deadline");
+    }
+
+    // --- id discovery: the handle map follows the core's rekey -----------
+
+    /// A stand-in for the placeholder key the core mints for a Worker it
+    /// has spawned but Claude hasn't named yet (`SessionKey::new_worker` is
+    /// private to the core — only its shape matters here: not a real id).
+    fn pending_key(token: &str) -> SessionKey {
+        SessionKey::from_id(&format!("new-worker::1::{token}"))
+    }
+
+    #[test]
+    fn rekey_pty_moves_the_handle_from_the_synthetic_key_to_the_discovered_id() {
+        let host = MockPtyHost::default();
+        let mut handles = HashMap::new();
+        let pending = pending_key("worker-1");
+        let discovered = SessionKey::from_id("w1");
+        handles.insert(pending.clone(), open(&host));
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut discovery = Vec::new();
+
+        let events = execute_cmd(
+            Cmd::RekeyPty {
+                from: pending.clone(),
+                to: discovered.clone(),
+            },
+            Path::new("/nonexistent"),
+            &AgeThresholds::default(),
+            &store,
+            &mut handles,
+            &mut discovery,
+        );
+
+        assert!(events.is_empty());
+        assert!(!handles.contains_key(&pending));
+        assert!(
+            handles.contains_key(&discovered),
+            "the same live child, now reachable under its real id"
+        );
+    }
+
+    /// Write a session jsonl whose head records `cwd`, the shape
+    /// `find_new_sessions` matches on.
+    fn write_session_at(claude_home: &Path, id: &str, cwd: &Path) {
+        let dir = claude_home.join("projects").join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"mode\",\"cwd\":{}}}\n",
+                serde_json::to_string(&cwd.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Write a `sessions/<pid>.json` live-state file, the thing `claude`
+    /// publishes at startup — before any session history exists.
+    fn write_live_state(claude_home: &Path, pid: u32, session_id: &str, cwd: &Path) {
+        let dir = claude_home.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{pid}.json")),
+            format!(
+                "{{\"pid\":{pid},\"sessionId\":\"{session_id}\",\"cwd\":{},\"status\":\"idle\"}}",
+                serde_json::to_string(&cwd.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_worker_that_has_written_no_session_file_is_still_identified_by_its_pid() {
+        // The dogfooding bug: `claude` writes a session's jsonl at its first
+        // turn, but publishes `sessions/<pid>.json` at startup. A brigade
+        // Worker nobody has typed into yet therefore has an id but no
+        // session file — invisible to the file scan forever, so its store
+        // row stayed NULL and every re-stage of the cell spawned it again
+        // as a brand-new session.
+        let claude_home = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/work/alpha");
+        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        write_live_state(claude_home.path(), 4242, "w1", &cwd);
+        let live = read_live_sessions(&claude_home.path().join("sessions"));
+
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            cwd: cwd.clone(),
+            since: SystemTime::now(),
+            member: Some((1, "worker-1".to_string())),
+            pid: Some(4242),
+        }];
+
+        let events = poll_discovery(&mut trackers, &provider, &HashSet::new(), &live);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::DiscoveryResult { session_id, member, .. }]
+                    if session_id == "w1" && member.as_ref().unwrap().1 == "worker-1"
+            ),
+            "no jsonl exists at all; the live-state file is the only source: {events:?}"
+        );
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn a_live_state_file_for_a_recycled_pid_in_another_cwd_is_declined() {
+        // Stale `sessions/<pid>.json` whose pid the OS handed to our child:
+        // adopting it would hand this Worker an unrelated session that banto
+        // would later `--resume` a second time. The cwd it records is what
+        // gives it away.
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        write_live_state(
+            claude_home.path(),
+            4242,
+            "someone-elses-session",
+            Path::new("/work/beta"),
+        );
+        let live = read_live_sessions(&claude_home.path().join("sessions"));
+
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            cwd: PathBuf::from("/work/alpha"),
+            since: SystemTime::now(),
+            member: Some((1, "worker-1".to_string())),
+            pid: Some(4242),
+        }];
+
+        assert!(
+            poll_discovery(&mut trackers, &provider, &HashSet::new(), &live).is_empty(),
+            "a different cwd means a different session"
+        );
+        assert_eq!(trackers.len(), 1, "still pending, not resolved wrongly");
+    }
+
+    #[test]
+    fn two_workers_in_one_cwd_never_resolve_to_the_same_id_across_passes() {
+        // The dogfooding bug: two Workers auto-spawned into the Director's
+        // cwd. `used_this_pass` only separates them when both jsonl files
+        // already exist in the same pass; when the second appears a pass
+        // later, the *claimed* set is the only thing keeping the second
+        // tracker off the first one's id — and it is read from the handle
+        // map, so it is only correct because `Cmd::RekeyPty` renamed that
+        // handle. Before the fix both Workers resolved to one id: two tiles
+        // titled "worker 1", one live child, and two membership rows
+        // claiming the same session.
+        let claude_home = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/work/alpha");
+        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let since = SystemTime::now() - Duration::from_secs(1);
+        // `pid: None` is the fallback shape this test is about: no usable
+        // child pid, so only the session-file scan can answer.
+        let tracker = |token: &str| DiscoveryTracker {
+            key: pending_key(token),
+            cwd: cwd.clone(),
+            since,
+            member: Some((1, token.to_string())),
+            pid: None,
+        };
+        let mut trackers = vec![tracker("worker-1"), tracker("worker-2")];
+
+        // Pass 1: only the first Worker's session file exists yet.
+        write_session_at(claude_home.path(), "w1", &cwd);
+        let mut claimed: HashSet<String> = trackers
+            .iter()
+            .map(|tracker| tracker.key.as_str().to_string())
+            .collect();
+        let events = poll_discovery(&mut trackers, &provider, &claimed, &[]);
+        assert!(matches!(
+            events.as_slice(),
+            [Event::DiscoveryResult { session_id, .. }] if session_id == "w1"
+        ));
+        assert_eq!(trackers.len(), 1, "only worker-2 is still pending");
+
+        // `Cmd::RekeyPty` has since renamed the resolved pane's handle, so
+        // the next pass sees "w1" as taken.
+        claimed.remove(pending_key("worker-1").as_str());
+        claimed.insert("w1".to_string());
+
+        // Pass 2: the second Worker's file appears.
+        write_session_at(claude_home.path(), "w2", &cwd);
+        let events = poll_discovery(&mut trackers, &provider, &claimed, &[]);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::DiscoveryResult { session_id, .. }] if session_id == "w2"
+            ),
+            "worker-2 must take the unclaimed id, not re-take worker-1's: {events:?}"
+        );
+        assert!(trackers.is_empty());
     }
 
     // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------
