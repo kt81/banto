@@ -853,7 +853,11 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
             });
         }
         NewSessionPlacement::Split => {
-            let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
+            let backend = opener::resolve_backend(
+                ctx.opener_mode,
+                |key| std::env::var(key).ok(),
+                cfg!(windows),
+            );
             let tmux_pane = std::env::var("TMUX_PANE").ok();
             let anchor =
                 opener::resolve_own_anchor(backend, &SystemCommandRunner, tmux_pane.as_deref());
@@ -1504,7 +1508,11 @@ fn activate_split(app: &mut App, ctx: &Context) {
     };
     let id = session.id.clone();
 
-    let backend = opener::resolve_backend(ctx.opener_mode, |key| std::env::var(key).ok());
+    let backend = opener::resolve_backend(
+        ctx.opener_mode,
+        |key| std::env::var(key).ok(),
+        cfg!(windows),
+    );
     // Anchor psmux splits on banto's own session-qualified pane (psmux
     // reuses window/pane ids across sessions — docs/notes/psmux-spike.md,
     // 2026-07-20) so the resume pane lands next to banto, not in whatever

@@ -34,8 +34,8 @@ stays on the premises and directs and watches over the guests (sessions).
 - Mouse support including wheel scrolling
 - Runs on Windows; keeps a structure that also builds on macOS / Linux
 - The overall default is in-place (`opener = "in-place"`); setting `opener`
-  to `"auto"` / `"psmux"` / `"windows-terminal"` instead picks which split
-  backend `s` uses (see Opener spec)
+  to `"auto"` / `"tmux"` / `"psmux"` / `"windows-terminal"` instead picks
+  which split backend `s` uses (see Opener spec)
 
 Out of MVP scope: Claude Desktop (claude.ai) history, other agents (trait only),
 built-in PTY, remote/SSH.
@@ -58,6 +58,19 @@ terminal handed straight to a direct child process. Motivated by psmux's
 non-uniqueness of window/pane ids across sessions
 (docs/notes/psmux-spike.md) making split-mode targeting inherently more
 fragile than just running the session where banto already is.
+
+## Architecture decision (2026-07-26): the chōba is feature-frozen
+
+**The chōba (the classic list mode, `banto` with no flags) takes bug fixes
+and platform parity from here on, not new capability.** New behavior belongs
+in the emporium, which is where the hosted-pane work is going.
+
+"Platform parity" is what admitted the tmux backend above under the freeze:
+`s` invoking a `psmux` binary that does not exist on Linux is a mode that
+does not work off Windows, not a feature it lacks. The same reading covers
+the input-path fix that preceded it. Anything that would make the chōba do
+something new — rather than do what it already claims, on a platform where
+it currently cannot — is out of scope by default.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -105,8 +118,8 @@ crates/
 ## Opener spec
 
 Two actions, mirrored by a TUI key (Enter = in-place, `s` = split) and by
-`opener` in `config.toml` (default `"in-place"`; `"auto"` / `"psmux"` /
-`"windows-terminal"` pick a split backend instead — the exact `s`-vs-`opener`
+`opener` in `config.toml` (default `"in-place"`; `"auto"` / `"tmux"` /
+`"psmux"` / `"windows-terminal"` pick a split backend instead — the exact `s`-vs-`opener`
 interaction when `opener` is left at its `"in-place"` default is an
 implementation detail for the split-mode work, not fixed by this doc):
 
@@ -130,7 +143,21 @@ Priority: **1. psmux (tmux-compatible CLI) = primary target** 2. Windows
 Terminal tab 3. future: Ghostty etc.
 Auto detection (`opener = "auto"`) checks environment variables in the
 order **`$TMUX` → `WT_SESSION`** (inside psmux both are set, so the order
-matters).
+matters). `$TMUX` says only *that* a multiplexer is hosting us, never which
+one — it holds a socket path — so the platform resolves it: `psmux` on
+Windows, real `tmux` everywhere else. That guess is wrong only for a
+deliberately exotic install, which is what the explicit `opener = "psmux"` /
+`"tmux"` values are for.
+
+The two are not interchangeable behind one binary name. Measured against
+tmux 3.6 on 2026-07-26 (docs/notes/psmux-spike.md records both sides): the
+session-qualified pane target psmux *requires* — because it reuses window
+and pane ids across sessions — is **rejected** by tmux, which reads
+`<session>:<pane_id>` as "window `<pane_id>` of that session"
+(`can't find window: %1`). tmux wants the bare, globally-unique
+`<pane_id>`, which is in turn ambiguous on psmux. Each form is wrong on the
+other CLI, so the flavor is carried explicitly
+(`banto_io::opener::TmuxFlavor`), never inferred at call time.
 
 - psmux/tmux: spawn with `split-window` / `new-window`, tag with a
   session-qualified `select-pane -t '<session>:<pane_id>' -T <title>`,

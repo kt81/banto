@@ -114,3 +114,38 @@ environment — an env-var toggle never reaches `_wrap`. banto reads its own
 `BANTO_WRAP_LOG` and forwards it to the new-session `_wrap` as `--wrap-log`.
 Both `BANTO_INPUT_LOG` and `BANTO_WRAP_LOG` may point at the same file; the
 `tui:`/`wrap:` prefixes keep the origins unambiguous.
+
+## tmux (2026-07-26): the same commands, a different pane target
+
+banto grew a real-tmux backend when the chōba's `s` key turned out to invoke
+a `psmux` binary that does not exist on Linux. Probed against **tmux 3.6** on
+a dedicated socket (`tmux -L bantoprobe`, so no live session was touched),
+every command form this note verified on psmux works unchanged — with one
+exception, and it is the one that matters.
+
+| form | psmux | tmux 3.6 |
+|---|---|---|
+| `split-window -h -t <anchor> -c <cwd> -P -F '#{session_name}:#{window_id}:#{pane_id}' <argv…>` | works | works, returns `probe:@0:%1` |
+| `new-window -d -n <title> -c <cwd> -P -F …` | works | works |
+| `select-pane -t '<session>:<pane_id>'` | **required** (ids are reused across sessions) | **fails**: `can't find window: %1` |
+| `select-pane -t '<pane_id>'` | ambiguous — could hit another session's pane | **works**; `-T <title>` sticks |
+| `select-pane -t '<session>:<window_id>.<pane_id>'` | untested | works |
+
+tmux parses `<session>:<pane_id>` as *window* `<pane_id>` of that session, so
+the qualification psmux needs is exactly what tmux refuses. Neither form is
+merely preferred: each is wrong on the other CLI. Hence
+`banto_io::opener::TmuxFlavor` — the flavor is carried, not guessed.
+
+Two smaller findings while there:
+
+- tmux **sanitizes** `:` out of session names (`new-session -s 'a:b'` yields
+  `a_b`), so the `:`-joined `-P -F` output this note's parser splits on stays
+  unambiguous. No hardening needed.
+- `select-pane` on a pane in another *window* succeeds but does not switch
+  the active window — the same reach limitation already documented for psmux,
+  and the reason banto keeps its panes as splits of its own window.
+
+Verified end to end afterwards with banto's real `TmuxOpener` +
+`SystemCommandRunner` (not the mock) against a probe server, with `$TMUX`
+pointed at its socket: pane created, `sleep 120` running in it, title
+`banto e2e` applied, focus accepted.
