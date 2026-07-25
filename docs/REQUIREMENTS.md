@@ -98,7 +98,7 @@ crates/
 │  ├─ store/            # rusqlite: index cache, FTS5, groups/pins, session<->pane map
 │  ├─ search/           # nucleo fuzzy search
 │  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
-│  └─ config/           # config.toml (dirs::config_dir/banto), DB in dirs::data_local_dir/banto
+│  └─ config/           # config.toml (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir), DB in dirs::data_local_dir/banto
 └─ banto/               # bin: ratatui TUI + clap subcommands (banto, banto _wrap, ...)
 ```
 

@@ -75,7 +75,9 @@ live-state files, history — all strictly read-only. banto's own data lives
 under its own directories:
 
 - Config: `dirs::config_dir()/banto/config.toml`
-  (Windows: `%APPDATA%\banto\`)
+  (Windows: `%APPDATA%\banto\`) by default — see
+  [Configuration](#configuration) for the full resolution order
+  (`--config`, `$BANTO_CONFIG`, XDG, `~/.config`)
 - Data (sqlite): `dirs::data_local_dir()/banto/banto.db`
   (Windows: `%LOCALAPPDATA%\banto\`)
 
@@ -144,6 +146,20 @@ never reports pastes as pastes).
 ## Configuration
 
 `config.toml` is optional; missing or broken config falls back to defaults.
+Its location is resolved in this order, first hit wins:
+
+1. `--config <path>` — must exist and parse, or startup fails
+2. `$BANTO_CONFIG` — same strictness
+3. `$XDG_CONFIG_HOME/banto/config.toml`, when the variable is set, non-empty,
+   and the file exists (every platform, including Windows, for dotfiles
+   setups)
+4. `~/.config/banto/config.toml`, if it exists
+5. `dirs::config_dir()/banto/config.toml` (`%APPDATA%\banto\` on Windows) —
+   the default, used unconditionally as the last resort
+
+Only (1)/(2) are strict; (3)-(5) are existence-gated or unconditional
+fallbacks and stay lenient — a missing or broken file there just means
+defaults, same as today.
 
 ```toml
 # "in-place" (default) | "auto" | "psmux" | "windows-terminal"

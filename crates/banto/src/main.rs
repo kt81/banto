@@ -8,6 +8,11 @@
 //! Everything under the resolved Claude home is read strictly read-only.
 //! banto's own database (session <-> pane map, groups, pins) lives under
 //! `Config.db_path`, falling back to [`config::default_db_path`].
+//!
+//! `config.toml` itself is located by [`config::resolve_config_path`] (see
+//! [`load_config`]): `--config`, then `BANTO_CONFIG`, then
+//! `$XDG_CONFIG_HOME/banto/config.toml`, then `~/.config/banto/config.toml`,
+//! then the platform default.
 
 mod embedded;
 mod mcp;
@@ -40,6 +45,13 @@ struct Cli {
     /// Read-only: banto never writes under this path.
     #[arg(long, global = true, value_name = "PATH")]
     claude_home: Option<PathBuf>,
+
+    /// Explicit path to banto's own config.toml. Takes priority over
+    /// $BANTO_CONFIG and the XDG/~/.config/platform-default search — and
+    /// unlike those, the file must exist and parse (a bad path is a
+    /// startup error, not a silent fallback to defaults).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     /// Open the 大店 (emporium) mode: banto as a persistent sidebar plus an
     /// embedded session pane, instead of the classic list.
@@ -129,7 +141,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = load_config();
+    let config = load_config(cli.config.as_deref())?;
 
     match cli.command {
         Some(Command::List) => {
@@ -214,12 +226,29 @@ fn main() -> Result<()> {
     }
 }
 
-/// Load banto's own config, falling back to defaults if it is missing or the
-/// platform has no config dir. A broken config never blocks startup.
-fn load_config() -> Config {
-    match config::default_config_path() {
-        Some(path) => config::load_or_default(&path),
-        None => Config::default(),
+/// Load banto's own config via [`config::resolve_config_path`]'s resolution
+/// order. An explicit override (`--config` / `BANTO_CONFIG`) must exist and
+/// parse, or startup fails with a plain one-line error; every other tier
+/// (XDG/`~/.config` discovery, the platform default) is lenient — a missing
+/// or broken file there just means defaults, same as before this round.
+fn load_config(cli_override: Option<&Path>) -> Result<Config> {
+    let env_override = std::env::var_os("BANTO_CONFIG").map(PathBuf::from);
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = dirs::home_dir();
+
+    let source = config::resolve_config_path(
+        cli_override,
+        env_override.as_deref(),
+        xdg_config_home.as_deref(),
+        home.as_deref(),
+    );
+
+    match source {
+        config::ConfigSource::Explicit(path) => config::load_explicit(&path)
+            .with_context(|| format!("failed to load config file {}", path.display())),
+        config::ConfigSource::Discovered(path) => Ok(config::load_or_default(&path)),
+        config::ConfigSource::Default(Some(path)) => Ok(config::load_or_default(&path)),
+        config::ConfigSource::Default(None) => Ok(Config::default()),
     }
 }
 
