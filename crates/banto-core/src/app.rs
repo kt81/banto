@@ -2,7 +2,7 @@
 //!
 //! All filtering, sorting, selection and scroll math lives here as a plain,
 //! UI-free struct so it can be unit-tested without a terminal. The render loop
-//! in `banto::tui` (the classic list) is a thin shell over this state; the
+//! in `banto::tui` (the chōba list) is a thin shell over this state; the
 //! emporium's `crate::engine` uses it too.
 
 use std::collections::{HashMap, HashSet};
@@ -116,7 +116,7 @@ pub enum Modal {
     GroupJoin(GroupJoinState),
     /// The emporium's `B`-on-a-Director disband confirm dialog: Enter
     /// disbands the brigade (`brigade_id`), Esc cancels. `name` is the
-    /// Director's title, for the prompt. Classic mode never opens this, but
+    /// Director's title, for the prompt. The chōba never opens this, but
     /// still has to render/dispatch it since the two share `App`/`render_modal`.
     ConfirmDisband { brigade_id: i64, name: String },
     /// The emporium's prefix-`x` kill confirm dialog: Enter kills the
@@ -124,7 +124,7 @@ pub enum Modal {
     /// `crate::embedded::engine::SessionKey`; kept as `String` here so
     /// `Modal` doesn't need to depend on an `embedded`-internal type), Esc
     /// cancels. `title` is the session's display title, for the prompt.
-    /// Classic mode never opens this either, for the same reason as
+    /// The chōba never opens this either, for the same reason as
     /// `ConfirmDisband`.
     ConfirmKill { key: String, title: String },
 }

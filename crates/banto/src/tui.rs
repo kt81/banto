@@ -1,4 +1,5 @@
-//! ratatui render loop: terminal setup/teardown, event handling and drawing.
+//! ratatui render loop for the chōba (帳場, formerly the "classic" list) —
+//! terminal setup/teardown, event handling and drawing.
 //!
 //! This is a thin shell over [`crate::app::App`]; all list logic lives there.
 //! The terminal is restored both on normal exit and on panic (via a panic
@@ -801,8 +802,8 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 }
 
 /// Confirm whichever modal is open, dispatching to its kind-specific logic.
-/// `ConfirmDisband`/`ConfirmKill` are the emporium's own modals — classic
-/// mode never opens either, so confirming them here is a no-op (Esc still
+/// `ConfirmDisband`/`ConfirmKill` are the emporium's own modals — the chōba
+/// never opens either, so confirming them here is a no-op (Esc still
 /// closes it, via the shared `close_modal` in [`handle_modal_key`]).
 fn confirm_modal(app: &mut App, ctx: &Context) {
     match app.modal() {

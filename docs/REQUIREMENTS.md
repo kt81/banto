@@ -61,7 +61,7 @@ fragile than just running the session where banto already is.
 
 ## Architecture decision (2026-07-26): the chōba is feature-frozen
 
-**The chōba (the classic list mode, `banto` with no flags) takes bug fixes
+**The chōba (formerly the "classic" list mode; `banto` with no flags) takes bug fixes
 and platform parity from here on, not new capability.** New behavior belongs
 in the emporium, which is where the hosted-pane work is going.
 

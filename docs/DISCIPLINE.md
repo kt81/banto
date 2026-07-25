@@ -46,7 +46,7 @@ notes from the migration worth keeping:
   core uses `ratatui-core` (the backend-free layout/buffer subset) and
   banto-tui turns the feature off. The `cargo tree` acceptance check is what
   caught this; keep running it.
-- The classic `tui.rs` remains an un-migrated app-layer monolith by design
+- The chōba's `tui.rs` remains an un-migrated app-layer monolith by design
   (only the shared `render_modal` was extracted). Its future migration — or
   retirement — is a separate decision.
 

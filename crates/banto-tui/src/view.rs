@@ -1,9 +1,9 @@
-//! Shared session-list / summary rendering, used by both the classic list TUI
+//! Shared session-list / summary rendering, used by both the chōba list TUI
 //! (`banto::tui`) and the emporium sidebar (`banto::embedded::emporium`).
 //!
 //! These are pure `(frame, app, area, now)` widgets so either mode can place
 //! them in its own layout; all list/selection/scroll state lives in
-//! `banto_core::app::App`, which both modes drive. Extracted from the classic
+//! `banto_core::app::App`, which both modes drive. Extracted from the chōba
 //! TUI so the two modes render sessions identically rather than drifting.
 //!
 //! # Emoji markers

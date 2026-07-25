@@ -1,5 +1,5 @@
 //! Rendering [`Modal`] as a centered overlay — pure `(frame, modal, area)`
-//! rendering shared by both the classic list TUI (`banto::tui`) and the
+//! rendering shared by both the chōba list TUI (`banto::tui`) and the
 //! emporium (`banto::embedded::emporium`); each imports [`render_modal`]
 //! back rather than rendering modals independently, so both modes render
 //! identically. [`windowed_view`]/[`modal_area`] (and [`crate::text`]'s

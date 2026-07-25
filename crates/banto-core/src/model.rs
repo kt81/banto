@@ -190,7 +190,7 @@ pub fn humanize_size(bytes: u64) -> String {
 
 /// A session about to be opened or focused — pure data the emporium's
 /// `Cmd::OpenEmbedded` carries; the actual opening (spawning a PTY child,
-/// or in the classic list, resuming/focusing it in a real terminal backend)
+/// or in the chōba list, resuming/focusing it in a real terminal backend)
 /// is `banto` (bin) and `banto_io`'s job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToOpen {

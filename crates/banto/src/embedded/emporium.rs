@@ -9,7 +9,7 @@
 //! reads/writes, and drawing all live here; none of the *decisions* do (see
 //! `super::engine`, which owns `Stage`/`Focus`/the relay engine/etc.).
 //!
-//! The classic list TUI (`crate::tui`) owns the shared pieces this reuses —
+//! The chōba list TUI (`crate::tui`) owns the shared pieces this reuses —
 //! `App` (list state), the `view` renderers, the store-load helpers, and
 //! `render_modal`. It has its own, separate event loop and is untouched by
 //! this migration.
@@ -97,7 +97,7 @@ pub fn run(
     // `gather_reload`) rather than per-call, so a permanently-unresolvable
     // continuation is scanned at most once per banto run.
     let superseded_failed = RefCell::new(HashSet::new());
-    // Same store-backed state the classic list builds, so grouping / pins /
+    // Same store-backed state the chōba list builds, so grouping / pins /
     // archived-hiding / brigade hiding show identically in the sidebar. This
     // one-time bootstrap stays outside `update`: `App::with_*` are
     // construction-only builders, not a repeating decision.
@@ -162,7 +162,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read-only shell dependencies that don't change across an [`event_loop`]
 /// iteration — bundled (mirroring `crate::tui::Context`'s role in the
-/// classic list) so `event_loop`/`execute_cmd`/`gather_reload`'s argument
+/// chōba list) so `event_loop`/`execute_cmd`/`gather_reload`'s argument
 /// lists don't keep growing one-by-one as more reload-path state (like
 /// [`Self::superseded_failed`]) gets threaded through.
 struct Deps<'a> {
@@ -481,7 +481,7 @@ fn build_open_argv(
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard for a
-/// known (non-empty) id — reusing the classic in-place decision — or
+/// known (non-empty) id — reusing the chōba in-place decision — or
 /// skipping it entirely for a fresh (empty-id) spawn, which has no existing
 /// session to double-resume. `brigade` wires the launch to banto's own MCP
 /// server; a write failure there degrades gracefully (the pre-migration
@@ -1227,7 +1227,7 @@ fn border_style(focused: bool) -> Style {
 
 /// Enables bracketed paste on the HOST terminal (in addition to mouse
 /// capture) so a multiline paste arrives as one `Event::Paste` instead of a
-/// stream of individual key events. The classic list TUI (`crate::tui`) is
+/// stream of individual key events. The chōba list TUI (`crate::tui`) is
 /// untouched: it has its own, separate `setup_terminal`.
 fn setup_terminal() -> Result<Tui> {
     install_panic_hook();

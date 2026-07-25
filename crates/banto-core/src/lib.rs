@@ -9,7 +9,7 @@
 //! - [`config`] config.toml's types (loading them from disk is `banto_io::config`)
 //! - [`status`] activity age-bucketing math (live-process state is `banto_io::status`)
 //! - [`search`] nucleo fuzzy search
-//! - [`app`]    the classic list TUI's UI-free state (`App` and friends)
+//! - [`app`]    the chōba list TUI's UI-free state (`App` and friends)
 //! - [`engine`] the emporium's pure core: `update(state, ev, now) -> Vec<Cmd>`
 //! - [`screen`] the emporium's per-pane `vt100` terminal model
 //! - [`key_encode`] key-event -> PTY-child-stdin byte encoding

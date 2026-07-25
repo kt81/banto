@@ -206,7 +206,7 @@ fn main() -> Result<()> {
             let thresholds = thresholds_from(&config.activity);
             // `Store::set_session_group` (the `g` modal) takes `&mut self`
             // (it wraps a transaction), and the store is shared by both the
-            // classic TUI and emporium, so a `RefCell` gives interior
+            // chōba TUI and emporium, so a `RefCell` gives interior
             // mutability without threading `&mut Store` through every handler.
             let store = std::cell::RefCell::new(open_store(&config)?);
             if cli.emporium {
