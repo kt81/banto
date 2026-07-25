@@ -41,6 +41,11 @@ pub struct SessionMeta {
     /// Short single-line excerpt of the first user message, for the summary
     /// panel. Independent of `title` (which may come from custom/ai titles).
     pub preview: Option<String>,
+    /// The `logicalParentUuid` of the first `compact_boundary` record found
+    /// in the file head, if this session is an auto-compaction continuation
+    /// of another one. `None` for an ordinary session (including a manually
+    /// `/compact`-ed one, which keeps its original id rather than forking).
+    pub continuation_of_uuid: Option<String>,
 }
 
 /// Activity state rendered as the colored dot in the session list.

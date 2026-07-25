@@ -4,6 +4,7 @@
 //!
 //! Module map:
 //! - [`config`]  loading `banto_core::config`'s types from disk
+//! - [`lineage`] resolving auto-compaction parent links (beside the provider)
 //! - [`opener`]  opening/focusing sessions in a real terminal (psmux, WT)
 //! - [`process`] spawning the resumed session's process
 //! - [`provider`] session discovery + tolerant JSONL parsing
@@ -13,6 +14,7 @@
 //! - [`watch`]   filesystem watching (notify) for live TUI updates
 
 pub mod config;
+pub mod lineage;
 pub mod opener;
 pub mod process;
 pub mod provider;

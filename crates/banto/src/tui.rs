@@ -33,8 +33,11 @@ use banto_core::app::{App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessio
 use banto_core::config::OpenerMode;
 use banto_core::model::{SessionId, SessionToOpen};
 use banto_core::status::AgeThresholds;
+use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::{ProcessRunner, SystemProcessRunner};
+use banto_io::provider::SessionProvider;
+use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::status::{SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
 use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource};
@@ -128,6 +131,12 @@ struct Context<'a> {
     /// running it directly — drained once per `event_loop` iteration by
     /// [`run_pending_inplace`].
     pending_inplace: RefCell<Option<opener::InPlaceLaunch>>,
+    /// Session ids whose lineage scan found no parent this run (see
+    /// [`load_superseded`]) — kept in memory only, across every reload for
+    /// the lifetime of this process, so a permanently-unresolvable
+    /// continuation isn't re-scanned (tens of MB) every reload; a fresh
+    /// banto run starts with an empty set and retries it.
+    superseded_failed: RefCell<HashSet<SessionId>>,
 }
 
 impl Context<'_> {
@@ -196,7 +205,8 @@ pub fn run(
     store: &RefCell<Store>,
 ) -> Result<()> {
     let rows = session::load_rows(claude_home, thresholds)?;
-    let (rows, pinned, groups, session_groups, hidden, directors) = {
+    let superseded_failed = RefCell::new(HashSet::new());
+    let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
         let rows = exclude_archived(rows, &store);
         let pinned = load_pinned(&store);
@@ -204,13 +214,23 @@ pub fn run(
         let session_groups = load_session_groups(&store, &groups);
         let hidden = load_hidden_worker_ids(&store);
         let directors = load_directors(&store);
-        (rows, pinned, groups, session_groups, hidden, directors)
+        let superseded = load_superseded(claude_home, &store, &superseded_failed);
+        (
+            rows,
+            pinned,
+            groups,
+            session_groups,
+            hidden,
+            directors,
+            superseded,
+        )
     };
     let mut app = App::new(rows)
         .with_pinned(pinned)
         .with_groups(groups, session_groups)
         .with_hidden_worker_ids(hidden)
-        .with_directors(directors);
+        .with_directors(directors)
+        .with_superseded(superseded);
     let ctx = Context {
         claude_home,
         thresholds,
@@ -219,6 +239,7 @@ pub fn run(
         input_log: std::cell::RefCell::new(open_input_log()),
         last_genuine_esc: RefCell::new(None),
         pending_inplace: RefCell::new(None),
+        superseded_failed,
     };
     ctx.log(&format!(
         "=== banto TUI started === own TMUX={:?} TMUX_PANE={:?}",
@@ -320,6 +341,31 @@ pub(crate) fn load_hidden_worker_ids(store: &Store) -> HashSet<String> {
 pub(crate) fn load_directors(store: &Store) -> HashSet<String> {
     store
         .brigade_director_session_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Spend this reload's lineage-resolution budget, then return every session
+/// id with a known auto-compaction continuation — [`App`] hides these (see
+/// `App::superseded`). Runs its own discovery pass (`SessionMeta`'s
+/// `continuation_of_uuid` doesn't survive into [`session::load_rows`]'s
+/// `SessionRow`s, and threading it through would touch that function's other
+/// callers) — an accepted extra `discover()` per reload in exchange for
+/// keeping `session::load_rows`'s signature untouched. Tolerant: a discovery
+/// failure just means no lineage progress this pass, not a blocked TUI.
+pub(crate) fn load_superseded(
+    claude_home: &Path,
+    store: &Store,
+    failed: &RefCell<HashSet<SessionId>>,
+) -> HashSet<String> {
+    if let Ok(metas) = ClaudeCodeProvider::new(claude_home.to_path_buf()).discover() {
+        let mut failed = failed.borrow_mut();
+        let _ = resolve_lineage(store, &metas, &mut failed);
+    }
+    store
+        .lineage_parent_ids()
         .unwrap_or_default()
         .into_iter()
         .map(|id| id.0)
@@ -1493,15 +1539,15 @@ fn toggle_pin(app: &mut App, ctx: &Context) {
     app.set_status(message, Instant::now());
 }
 
-/// Toggle whether agent-run sessions are shown, posting the new state as a
-/// status message.
+/// Toggle whether agent-run and superseded sessions are shown, posting the
+/// new state as a status message.
 fn toggle_agent_filter(app: &mut App) {
     let showing = app.toggle_agent_filter();
     app.set_status(
         if showing {
-            "showing agent sessions".to_string()
+            "showing hidden sessions".to_string()
         } else {
-            "hiding agent sessions".to_string()
+            "hiding agent/superseded sessions".to_string()
         },
         Instant::now(),
     );
@@ -1512,8 +1558,9 @@ fn toggle_agent_filter(app: &mut App) {
 /// [`App::replace_rows`]. Archived sessions are excluded, same as the
 /// initial load in [`run`]. Also refreshes the hidden-worker/director id
 /// sets (a brigade may have formed, spawned a Worker, or disbanded since the
-/// last reload). A read failure is tolerated: the previous rows are kept
-/// rather than the TUI erroring out over a transient filesystem hiccup.
+/// last reload) and spends this reload's lineage-resolution budget (see
+/// [`load_superseded`]). A read failure is tolerated: the previous rows are
+/// kept rather than the TUI erroring out over a transient filesystem hiccup.
 fn reload(app: &mut App, ctx: &Context) {
     if let Ok(rows) = session::load_rows(ctx.claude_home, ctx.thresholds) {
         let store = ctx.store.borrow();
@@ -1521,6 +1568,11 @@ fn reload(app: &mut App, ctx: &Context) {
         app.replace_rows(rows);
         app.set_hidden_worker_ids(load_hidden_worker_ids(&store));
         app.set_directors(load_directors(&store));
+        app.set_superseded(load_superseded(
+            ctx.claude_home,
+            &store,
+            &ctx.superseded_failed,
+        ));
     }
 }
 
@@ -1569,7 +1621,7 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  s split  \
                                 / search  n new  N new-split  d archive  g group  Tab view  \
-                                p pin  a agents  q/Esc quit";
+                                p pin  a hidden  q/Esc quit";
     const SEARCH_HINTS: &str =
         "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
@@ -1590,10 +1642,10 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             if app.mode() == Mode::Normal && !app.grouped_view() {
                 hints.push_str("  (flat)");
             }
-            let hidden = app.hidden_agent_count();
+            let hidden = app.hidden_count();
             if hidden > 0 {
                 let plural = if hidden == 1 { "" } else { "s" };
-                hints.push_str(&format!("  ({hidden} agent session{plural} hidden)"));
+                hints.push_str(&format!("  ({hidden} session{plural} hidden)"));
             }
             (hints, Color::Gray)
         }
@@ -1657,6 +1709,7 @@ mod tests {
             input_log: std::cell::RefCell::new(None),
             last_genuine_esc: RefCell::new(None),
             pending_inplace: RefCell::new(None),
+            superseded_failed: RefCell::new(HashSet::new()),
         }
     }
 
@@ -1800,7 +1853,7 @@ mod tests {
         // over time), so leave real headroom rather than a tight fit.
         let wide_text = draw_with_width(&app, 200);
         assert!(
-            wide_text.contains("1 agent session hidden"),
+            wide_text.contains("1 session hidden"),
             "missing hidden indicator:\n{wide_text}"
         );
 

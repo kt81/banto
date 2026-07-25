@@ -758,6 +758,11 @@ pub enum Event {
         rows: Vec<SessionRow>,
         hidden: HashSet<String>,
         directors: HashSet<String>,
+        /// Session ids with a known auto-compaction continuation (see
+        /// `App::superseded`). `#[serde(default)]` so a record/replay
+        /// stream captured before this field existed still deserializes.
+        #[serde(default)]
+        superseded: HashSet<String>,
     },
     DiscoveryResult {
         key: SessionKey,
@@ -851,10 +856,12 @@ pub fn update(
             rows,
             hidden,
             directors,
+            superseded,
         } => {
             app.replace_rows(rows);
             app.set_hidden_worker_ids(hidden);
             app.set_directors(directors);
+            app.set_superseded(superseded);
             Vec::new()
         }
         Event::DiscoveryResult {
@@ -2649,6 +2656,34 @@ mod tests {
         );
         assert_eq!(state.focus, Focus::Pane);
         assert!(state.screens.contains_key(&SessionKey::from_id("sess-1")));
+    }
+
+    #[test]
+    fn rows_loaded_applies_the_superseded_set() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("a"), row("b")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+        assert!(!app.is_selected_superseded());
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::RowsLoaded {
+                rows: vec![row("a"), row("b")],
+                hidden: HashSet::new(),
+                directors: HashSet::new(),
+                superseded: ["a".to_string()].into_iter().collect(),
+            },
+            now,
+        );
+
+        // `row()` fixtures are `Activity::Alive`, so "a" stays visible
+        // (selected, since it sorts first) despite being superseded —
+        // this only checks the set reaches `App`, not the hidden-by-default
+        // interaction (covered by `App`'s own tests).
+        assert!(app.is_selected_superseded());
     }
 
     #[test]

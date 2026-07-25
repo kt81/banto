@@ -89,6 +89,7 @@ impl Store {
                 is_agent: row.get(7)?,
                 // Not persisted in the cache; the provider is the source.
                 preview: None,
+                continuation_of_uuid: None,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

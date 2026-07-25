@@ -108,6 +108,7 @@ mod tests {
             size: 0,
             is_agent: false,
             preview: None,
+            continuation_of_uuid: None,
         }
     }
 

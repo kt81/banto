@@ -91,11 +91,17 @@ pub fn run(
     let _ = store.borrow_mut().delete_empty_brigades();
 
     let rows = session::load_rows(claude_home, thresholds)?;
+    // In-memory only, for this process's lifetime — see
+    // `crate::tui::load_superseded`'s doc. Created once here and threaded
+    // through every reload (the bootstrap below and every later
+    // `gather_reload`) rather than per-call, so a permanently-unresolvable
+    // continuation is scanned at most once per banto run.
+    let superseded_failed = RefCell::new(HashSet::new());
     // Same store-backed state the classic list builds, so grouping / pins /
     // archived-hiding / brigade hiding show identically in the sidebar. This
     // one-time bootstrap stays outside `update`: `App::with_*` are
     // construction-only builders, not a repeating decision.
-    let (rows, pinned, groups, session_groups, hidden, directors) = {
+    let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
         let rows = crate::tui::exclude_archived(rows, &store);
         let pinned = crate::tui::load_pinned(&store);
@@ -103,24 +109,32 @@ pub fn run(
         let session_groups = crate::tui::load_session_groups(&store, &groups);
         let hidden = crate::tui::load_hidden_worker_ids(&store);
         let directors = crate::tui::load_directors(&store);
-        (rows, pinned, groups, session_groups, hidden, directors)
+        let superseded = crate::tui::load_superseded(claude_home, &store, &superseded_failed);
+        (
+            rows,
+            pinned,
+            groups,
+            session_groups,
+            hidden,
+            directors,
+            superseded,
+        )
     };
     let mut app = App::new(rows)
         .with_pinned(pinned)
         .with_groups(groups, session_groups)
         .with_hidden_worker_ids(hidden)
-        .with_directors(directors);
+        .with_directors(directors)
+        .with_superseded(superseded);
 
-    let mut terminal = setup_terminal()?;
-    let result = event_loop(
-        &mut terminal,
-        &mut app,
+    let deps = Deps {
         claude_home,
         thresholds,
         store,
-        brigade,
-        keys,
-    );
+        superseded_failed: &superseded_failed,
+    };
+    let mut terminal = setup_terminal()?;
+    let result = event_loop(&mut terminal, &mut app, &deps, brigade, keys);
     let restored = restore_terminal();
     result.and(restored)
 }
@@ -145,20 +159,32 @@ struct DiscoveryTracker {
 /// bundled into the same [`Event::Tick`]) re-evaluates.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Read-only shell dependencies that don't change across an [`event_loop`]
+/// iteration — bundled (mirroring `crate::tui::Context`'s role in the
+/// classic list) so `event_loop`/`execute_cmd`/`gather_reload`'s argument
+/// lists don't keep growing one-by-one as more reload-path state (like
+/// [`Self::superseded_failed`]) gets threaded through.
+struct Deps<'a> {
+    claude_home: &'a Path,
+    thresholds: &'a AgeThresholds,
+    store: &'a RefCell<Store>,
+    /// See [`crate::tui::load_superseded`]'s doc: in-memory only, for this
+    /// process's lifetime.
+    superseded_failed: &'a RefCell<HashSet<SessionId>>,
+}
+
 fn event_loop(
     terminal: &mut Tui,
     app: &mut App,
-    claude_home: &Path,
-    thresholds: &AgeThresholds,
-    store: &RefCell<Store>,
+    deps: &Deps,
     brigade: &BrigadeConfig,
     keys: &KeysConfig,
 ) -> Result<()> {
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
-    let mut watch = LiveWatch::new(claude_home);
-    let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
+    let mut watch = LiveWatch::new(deps.claude_home);
+    let provider = ClaudeCodeProvider::new(deps.claude_home.to_path_buf());
     let mut last_tick: Option<Instant> = None;
     let mut input_log = open_input_log();
     let mut paste_acc = PasteAccumulator::new();
@@ -265,13 +291,13 @@ fn event_loop(
         if !discovery.is_empty() {
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
-            let live = read_live_sessions(&claude_home.join("sessions"));
+            let live = read_live_sessions(&deps.claude_home.join("sessions"));
             events.extend(poll_discovery(&mut discovery, &provider, &claimed, &live));
         }
 
         // Live updates: reload the list once the watched dirs settle.
         if watch.poll_ready(SystemTime::now()) {
-            events.extend(gather_reload(claude_home, thresholds, store));
+            events.extend(gather_reload(deps));
         }
 
         // ~1s: relay observations for the staged brigade, gathered here
@@ -282,11 +308,11 @@ fn event_loop(
             last_tick = Some(now);
             events.extend(gather_fork_observations(
                 &state,
-                store,
-                claude_home,
+                deps.store,
+                deps.claude_home,
                 &handles,
             ));
-            let relay = gather_relay_observations(&state, store, claude_home);
+            let relay = gather_relay_observations(&state, deps.store, deps.claude_home);
             events.push_back(Event::Tick { relay });
         }
 
@@ -301,14 +327,7 @@ fn event_loop(
             }
             let cmds = engine::update(&mut state, app, brigade, ev, now);
             for cmd in cmds {
-                events.extend(execute_cmd(
-                    cmd,
-                    claude_home,
-                    thresholds,
-                    store,
-                    &mut handles,
-                    &mut discovery,
-                ));
+                events.extend(execute_cmd(cmd, deps, &mut handles, &mut discovery));
             }
         }
 
@@ -379,9 +398,7 @@ fn shutdown_handles(
 /// store.
 fn execute_cmd(
     cmd: Cmd,
-    claude_home: &Path,
-    thresholds: &AgeThresholds,
-    store: &RefCell<Store>,
+    deps: &Deps,
     handles: &mut HashMap<SessionKey, PtyHandle>,
     discovery: &mut Vec<DiscoveryTracker>,
 ) -> Vec<Event> {
@@ -415,9 +432,17 @@ fn execute_cmd(
             target,
             brigade,
             model,
-        } => execute_open_embedded(key, target, brigade, model, claude_home, handles, discovery),
-        Cmd::Store(intent) => execute_store_intent(intent, store),
-        Cmd::Reload => gather_reload(claude_home, thresholds, store),
+        } => execute_open_embedded(
+            key,
+            target,
+            brigade,
+            model,
+            deps.claude_home,
+            handles,
+            discovery,
+        ),
+        Cmd::Store(intent) => execute_store_intent(intent, deps.store),
+        Cmd::Reload => gather_reload(deps),
     }
 }
 
@@ -549,7 +574,10 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             vec![Event::GroupJoinDone { session_id, result }]
         }
         StoreIntent::ResolveMembership { session_id } => {
-            let store = store.borrow();
+            // `&mut` (not `&`): healing a member below persists a moved
+            // claude_session_id (`set_member_claude_session`), not just
+            // reads one.
+            let mut store = store.borrow_mut();
             let membership = store
                 .brigade_of_claude_session(&SessionId(session_id.clone()))
                 .ok()
@@ -560,11 +588,13 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                     .unwrap_or_default()
                     .into_iter()
                     .map(|member| {
-                        (
-                            member.token,
-                            member.role,
-                            member.claude_session_id.map(|sid| sid.0),
-                        )
+                        let healed_id = heal_member_session(
+                            &mut store,
+                            *brigade_id,
+                            &member.token,
+                            member.claude_session_id,
+                        );
+                        (member.token, member.role, healed_id)
                     })
                     .collect()
             });
@@ -624,6 +654,31 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
     }
 }
 
+/// Follow `claude_session_id` to its newest known auto-compaction
+/// continuation (`Store::lineage_leaf`) and, if it moved, persist the move
+/// (`Store::set_member_claude_session`, v9 move semantics: any other row
+/// holding the healed id is cleared) — closing the zombie loop for forks
+/// R19's live watcher missed (banto wasn't running when they happened), so
+/// re-staging resumes the true continuation instead of a stale ancestor.
+/// `None` in, `None` out: a member still awaiting discovery has nothing to
+/// heal. Tolerant: a lookup/write failure just leaves the id as recorded,
+/// rather than blocking membership resolution over it.
+fn heal_member_session(
+    store: &mut Store,
+    brigade_id: BrigadeId,
+    token: &str,
+    claude_session_id: Option<SessionId>,
+) -> Option<String> {
+    let recorded = claude_session_id?;
+    let leaf = store
+        .lineage_leaf(&recorded)
+        .unwrap_or_else(|_| recorded.clone());
+    if leaf != recorded {
+        let _ = store.set_member_claude_session(brigade_id, token, &leaf);
+    }
+    Some(leaf.0)
+}
+
 /// Create the brigade, its Director row, and `worker_count` Worker rows
 /// (schema v7), all-or-nothing. Mirrors the pre-migration `form_brigade`'s
 /// store writes, simplified to an atomic outcome rather than continuing past
@@ -678,23 +733,22 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 
 /// Reload the session list from disk. A read failure is tolerated (yields no
 /// event, keeping the previous rows) rather than erroring the whole loop out
-/// over a transient filesystem hiccup.
-fn gather_reload(
-    claude_home: &Path,
-    thresholds: &AgeThresholds,
-    store: &RefCell<Store>,
-) -> Vec<Event> {
-    let Ok(rows) = session::load_rows(claude_home, thresholds) else {
+/// over a transient filesystem hiccup. Also spends this reload's
+/// lineage-resolution budget (see [`crate::tui::load_superseded`]).
+fn gather_reload(deps: &Deps) -> Vec<Event> {
+    let Ok(rows) = session::load_rows(deps.claude_home, deps.thresholds) else {
         return Vec::new();
     };
-    let store = store.borrow();
+    let store = deps.store.borrow();
     let rows = crate::tui::exclude_archived(rows, &store);
     let hidden = crate::tui::load_hidden_worker_ids(&store);
     let directors = crate::tui::load_directors(&store);
+    let superseded = crate::tui::load_superseded(deps.claude_home, &store, deps.superseded_failed);
     vec![Event::RowsLoaded {
         rows,
         hidden,
         directors,
+        superseded,
     }]
 }
 
@@ -1064,7 +1118,7 @@ fn render_status_bar(
 ) {
     const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade/disband · b +worker · \
                                 F3 pane · / search · n new · d archive · g group · Tab view · \
-                                p pin · a agents · q quit";
+                                p pin · a hidden · q quit";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
     const PREFIX_HINTS: &str =
         "prefix: o/Tab cycle · arrows move · 1-9 pane · b literal · s sidebar · x kill";
@@ -1410,6 +1464,148 @@ mod tests {
         assert_eq!(*kills_b.lock().unwrap(), 1, "b outlived the deadline");
     }
 
+    // --- brigade member auto-heal: resolve_membership follows lineage ----
+
+    #[test]
+    fn resolve_membership_heals_a_members_session_id_to_its_lineage_leaf() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1-old".to_string())),
+            )
+            .unwrap();
+        store
+            .record_lineage(
+                &SessionId("w1-new".to_string()),
+                &SessionId("w1-old".to_string()),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+
+        // Resolve membership from the OLD id — the exact situation R19's
+        // live watcher misses: the fork happened while banto wasn't
+        // watching, so nothing ever rekeyed the pane, and the member row
+        // still records the ancestor.
+        let events = execute_store_intent(
+            StoreIntent::ResolveMembership {
+                session_id: "w1-old".to_string(),
+            },
+            &store,
+        );
+
+        let [
+            Event::MembershipResolved {
+                members: Some(members),
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected a resolved membership with a roster: {events:?}");
+        };
+        let worker = members
+            .iter()
+            .find(|(token, ..)| token == "worker-1")
+            .unwrap();
+        assert_eq!(
+            worker.2.as_deref(),
+            Some("w1-new"),
+            "the roster handed to the engine must carry the healed id"
+        );
+
+        // Persisted, not just reported this once — a later re-stage must
+        // see it too.
+        assert_eq!(
+            store
+                .borrow()
+                .brigade_member(brigade_id, "worker-1")
+                .unwrap()
+                .unwrap()
+                .claude_session_id,
+            Some(SessionId("w1-new".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_membership_leaves_an_up_to_date_session_id_untouched() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+
+        let events = execute_store_intent(
+            StoreIntent::ResolveMembership {
+                session_id: "w1".to_string(),
+            },
+            &store,
+        );
+
+        let [
+            Event::MembershipResolved {
+                members: Some(members),
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected a resolved membership with a roster: {events:?}");
+        };
+        let worker = members
+            .iter()
+            .find(|(token, ..)| token == "worker-1")
+            .unwrap();
+        assert_eq!(worker.2.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn resolve_membership_tolerates_a_worker_still_awaiting_discovery() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let store = RefCell::new(store);
+
+        let events = execute_store_intent(
+            StoreIntent::ResolveMembership {
+                session_id: "dir".to_string(),
+            },
+            &store,
+        );
+
+        let [
+            Event::MembershipResolved {
+                members: Some(members),
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected a resolved membership with a roster: {events:?}");
+        };
+        let worker = members
+            .iter()
+            .find(|(token, ..)| token == "worker-1")
+            .unwrap();
+        assert_eq!(worker.2, None, "nothing to heal for an unassigned member");
+    }
+
     // --- id discovery: the handle map follows the core's rekey -----------
 
     /// A stand-in for the placeholder key the core mints for a Worker it
@@ -1428,15 +1624,21 @@ mod tests {
         handles.insert(pending.clone(), open(&host));
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let mut discovery = Vec::new();
+        let superseded_failed = RefCell::new(HashSet::new());
+        let thresholds = AgeThresholds::default();
+        let deps = Deps {
+            claude_home: Path::new("/nonexistent"),
+            thresholds: &thresholds,
+            store: &store,
+            superseded_failed: &superseded_failed,
+        };
 
         let events = execute_cmd(
             Cmd::RekeyPty {
                 from: pending.clone(),
                 to: discovered.clone(),
             },
-            Path::new("/nonexistent"),
-            &AgeThresholds::default(),
-            &store,
+            &deps,
             &mut handles,
             &mut discovery,
         );

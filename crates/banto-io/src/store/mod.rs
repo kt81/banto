@@ -14,6 +14,7 @@
 mod archive;
 mod brigades;
 mod groups;
+mod lineage;
 mod migrations;
 mod panes;
 mod pins;
@@ -136,6 +137,7 @@ pub(crate) mod test_util {
             size: 42,
             is_agent: false,
             preview: None,
+            continuation_of_uuid: None,
         }
     }
 

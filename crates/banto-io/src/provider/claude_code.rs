@@ -273,6 +273,7 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
         size: metadata.len(),
         is_agent: fields.is_agent,
         preview,
+        continuation_of_uuid: fields.continuation_of_uuid,
     })
 }
 
@@ -348,6 +349,9 @@ struct HeadFields {
     user_text: Option<String>,
     cwd: Option<PathBuf>,
     is_agent: bool,
+    /// `logicalParentUuid` of the first `compact_boundary` record seen, if
+    /// any (see `SessionMeta::continuation_of_uuid`).
+    continuation_of_uuid: Option<String>,
 }
 
 impl HeadFields {
@@ -407,6 +411,21 @@ fn extract_head_fields(head: &str) -> HeadFields {
             }
             Some("user") if fields.user_text.is_none() => {
                 fields.user_text = message_text(&record);
+            }
+            // An auto-compaction continuation's head carries this record,
+            // which is also the record that sets `cwd` for such a file (no
+            // earlier record in a continuation's head does) — so it is
+            // always processed before the break below can fire, even though
+            // the break does not itself check `continuation_of_uuid`.
+            Some("system")
+                if fields.continuation_of_uuid.is_none()
+                    && record.get("subtype").and_then(Value::as_str)
+                        == Some("compact_boundary") =>
+            {
+                fields.continuation_of_uuid = record
+                    .get("logicalParentUuid")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             _ => {}
         }
@@ -538,6 +557,83 @@ mod tests {
             sessions[0].preview.as_deref(),
             Some("the actual first message text")
         );
+    }
+
+    #[test]
+    fn compact_boundary_head_sets_continuation_of_uuid() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"custom-title","customTitle":"Custom title"}
+{"type":"mode","mode":"default"}
+{"type":"system","subtype":"compact_boundary","logicalParentUuid":"94cc49bf-5dc1-4930-a942-7f3413594b86","cwd":"/tmp/proj","compactMetadata":{"trigger":"auto"}}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(
+            sessions[0].continuation_of_uuid.as_deref(),
+            Some("94cc49bf-5dc1-4930-a942-7f3413594b86")
+        );
+    }
+
+    #[test]
+    fn ordinary_session_has_no_continuation_of_uuid() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"mode","mode":"default","cwd":"/tmp/proj"}
+{"type":"user","message":{"content":"hello"}}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].continuation_of_uuid, None);
+    }
+
+    #[test]
+    fn a_system_record_with_a_different_subtype_is_not_mistaken_for_a_continuation() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"system","subtype":"other","logicalParentUuid":"should-be-ignored","cwd":"/tmp/proj"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].continuation_of_uuid, None);
+    }
+
+    #[test]
+    fn a_compact_boundary_missing_logical_parent_uuid_is_tolerated() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"system","subtype":"compact_boundary","cwd":"/tmp/proj"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].continuation_of_uuid, None);
+    }
+
+    #[test]
+    fn only_the_first_compact_boundary_uuid_is_captured() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"first","cwd":"/tmp/proj"}
+{"type":"system","subtype":"compact_boundary","logicalParentUuid":"second"}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].continuation_of_uuid.as_deref(), Some("first"));
     }
 
     #[test]

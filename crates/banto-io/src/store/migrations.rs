@@ -197,6 +197,20 @@ const MIGRATIONS: &[&str] = &[
      CREATE UNIQUE INDEX brigade_members_claude_session
          ON brigade_members (claude_session_id)
          WHERE claude_session_id IS NOT NULL;",
+    // v10: session lineage — resolved auto-compaction parent links
+    // (child_id -> parent_id), populated by a streaming uuid scan run
+    // outside this module (see banto_io's lineage resolution step). Only
+    // resolved links are ever written; a scan that finds nothing is
+    // retried later, never persisted as a failure. Lineage is immutable
+    // once discovered, so this table only ever grows. `parent_id` is
+    // indexed because the leaf-following read (newest descendant of a
+    // given id) walks child->child, i.e. the reverse of how the link was
+    // discovered.
+    "CREATE TABLE session_lineage (
+        child_id  TEXT PRIMARY KEY,
+        parent_id TEXT NOT NULL
+    );
+    CREATE INDEX session_lineage_parent ON session_lineage (parent_id);",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -805,6 +819,37 @@ mod tests {
                 )
                 .is_err()
         );
+
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v9_to_v10_upgrade_adds_session_lineage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v9 code would have left it: v1..=v9 applied,
+        // no session_lineage table yet, user_version left at 9.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..9] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+
+        // Opening through Store::open must run the v10 migration: the
+        // lineage table exists and is usable.
+        let store = Store::open(&db).unwrap();
+        assert!(store.lineage_parent_ids().unwrap().is_empty());
+        let child = SessionId("child".to_string());
+        let parent = SessionId("parent".to_string());
+        store.record_lineage(&child, &parent).unwrap();
+        assert_eq!(store.lineage_leaf(&parent).unwrap(), child);
 
         let version: i64 = store
             .conn
