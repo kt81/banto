@@ -22,7 +22,7 @@ The architecture discipline (TEA / sans-IO: Event → State + Cmd, I/O at the ed
 2. **Never bring real session data into the repository.** Tests must use hand-made synthetic fixtures
 3. Parse JSONL leniently: ignore unknown record types and fields, skip broken lines instead of erroring
 4. Never allow a double resume of the same session (it forks the session history)
-5. Do not break cross-platform builds: isolate Windows-specific code behind cfg, use PathBuf for all path handling
+5. Do not break cross-platform builds: isolate Windows-specific code behind cfg, use PathBuf for all path handling. **Gate the I/O, not the logic** — a pure helper reachable only from a `cfg(target_os)` arm is dead code on the other platform, and a `clippy -D warnings` run here can only judge the code its own cfgs left standing. CI's Windows job is the only gate that sees the other half
 
 ## Conventions
 

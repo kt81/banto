@@ -83,7 +83,14 @@ const ESCAPE_GRACE: Duration = Duration::from_millis(30);
 /// type the exact grammar (`[<digits;digits;digitsM`) with every one of the
 /// ~9 gaps in that run under this threshold — a coincidence rare enough that
 /// even a generous margin here carries negligible risk to real typing, while
-/// still resolving in far less time than a human notices as lag.
+/// still resolving in far less time than a human notices as lag. That
+/// "negligible risk" analysis covers the full SGR-mouse grammar only, not
+/// the shorter headless-arrow shape `[`+`A`/`B`/`C`/`D` (see
+/// `arrow_key_for`), which two-key genuine typing (`[Active`, `[Draft]`, a
+/// `[A-Z]` regex class, ...) reaches easily inside this window — the reason
+/// the whole headless path this grace period gates is itself gated to
+/// platforms where it applies (see [`Context::headless_leak_recovery`])
+/// rather than active unconditionally.
 const HEADLESS_GRACE: Duration = Duration::from_millis(120);
 
 /// How long after dispatching a genuine Esc (see [`dispatch_genuine_esc`])
@@ -137,6 +144,22 @@ struct Context<'a> {
     /// continuation isn't re-scanned (tens of MB) every reload; a fresh
     /// banto run starts with an empty set and retries it.
     superseded_failed: RefCell<HashSet<SessionId>>,
+    /// Whether the headless (`ESC`-less) leaked-sequence recovery path (see
+    /// [`is_headless_bracket`]/[`resolve_headless_bracket`]) is active for
+    /// this run. Only ConPTY is known to drop the leading `ESC` byte before
+    /// a leaked SGR/arrow report reaches us; on every other platform a bare,
+    /// unmodified `[` is just the character it looks like, so this stays
+    /// `false` there — retiring both the false-positive risk (two ordinary
+    /// keystrokes, `[` then `A`/`B`/`C`/`D`, misread as an arrow key) and
+    /// the [`HEADLESS_GRACE`] stall on every lone `[`. The `ESC`-prefixed
+    /// path ([`resolve_escape`]) is unaffected by this flag and stays active
+    /// everywhere, since a genuine multiplexer split can still deliver a
+    /// leaked sequence with its `ESC` intact regardless of host OS. Read
+    /// once at construction via `cfg!(windows)` (see [`run`]) rather than
+    /// re-derived ad hoc at each decision point — the house pattern for
+    /// injecting environment as a plain input (see
+    /// `banto_io::opener::detect_backend`'s `env` parameter).
+    headless_leak_recovery: bool,
 }
 
 impl Context<'_> {
@@ -240,6 +263,7 @@ pub fn run(
         last_genuine_esc: RefCell::new(None),
         pending_inplace: RefCell::new(None),
         superseded_failed,
+        headless_leak_recovery: cfg!(windows),
     };
     ctx.log(&format!(
         "=== banto TUI started === own TMUX={:?} TMUX_PANE={:?}",
@@ -617,12 +641,16 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                     // press, or the start of a leaked SGR mouse sequence.
                     if code == KeyCode::Esc {
                         resolve_escape(app, ctx, list_area)?;
-                    } else if is_headless_bracket(code, key.modifiers) {
+                    } else if headless_bracket_recovery_active(ctx, code, key.modifiers) {
                         // Confirmed from BANTO_INPUT_LOG evidence: under
-                        // psmux/ConPTY, leaked SGR sequences can arrive with
-                        // their leading `ESC` dropped entirely, as a plain
+                        // ConPTY, leaked SGR sequences can arrive with their
+                        // leading `ESC` dropped entirely, as a plain
                         // `Char('[')` press with no modifiers — see
-                        // `resolve_headless_bracket`.
+                        // `resolve_headless_bracket`. Gated to platforms
+                        // where that premise holds (see
+                        // `Context::headless_leak_recovery`); everywhere
+                        // else this falls through to the plain `handle_key`
+                        // below, same as any other character.
                         resolve_headless_bracket(app, ctx, list_area)?;
                     } else {
                         handle_key(app, code, key.modifiers, ctx);
@@ -1018,17 +1046,19 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
 }
 
 /// Resolve a `Char('[')` key event with no modifiers by buffering it as a
-/// possible SGR mouse sequence with its leading `ESC` already missing.
-/// Confirmed via `BANTO_INPUT_LOG`: under psmux/ConPTY, leaked SGR mouse
-/// reports can arrive as a headless stream of plain `Char` press events
-/// (`[`, `<`, digits, `;`, ..., `M`), with no `Esc` event, no modifier, and
-/// no `Event::Mouse` ever involved — the leading `ESC` byte is dropped
-/// somewhere upstream (ConPTY or crossterm's Windows input path) before it
-/// ever reaches us. Unlike [`resolve_escape`] there is no ambiguity to wait
-/// out at entry: an ordinary typed `[` looks identical to the start of a
-/// leaked sequence at this first byte either way, so buffering always
-/// begins — [`HEADLESS_GRACE`] is what keeps genuine typing from being
-/// mistaken for one (see [`swallow_one_sequence`]'s `NotSgr`/timeout path).
+/// possible SGR mouse sequence with its leading `ESC` already missing. Only
+/// called when [`headless_bracket_recovery_active`] has already said this
+/// platform needs it (see [`Context::headless_leak_recovery`]) — confirmed
+/// via `BANTO_INPUT_LOG`: under ConPTY, leaked SGR mouse reports can arrive
+/// as a headless stream of plain `Char` press events (`[`, `<`, digits, `;`,
+/// ..., `M`), with no `Esc` event, no modifier, and no `Event::Mouse` ever
+/// involved — the leading `ESC` byte is dropped somewhere upstream (ConPTY
+/// or crossterm's Windows input path) before it ever reaches us. Unlike
+/// [`resolve_escape`] there is no ambiguity to wait out at entry: an
+/// ordinary typed `[` looks identical to the start of a leaked sequence at
+/// this first byte either way, so buffering always begins —
+/// [`HEADLESS_GRACE`] is what keeps genuine typing from being mistaken for
+/// one (see [`swallow_one_sequence`]'s `NotSgr`/timeout path).
 fn resolve_headless_bracket(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     match swallow_one_sequence(
         app,
@@ -1090,7 +1120,13 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
                     EscapeOutcome::Swallowed => {}
                 }
             }
-            Event::Key(key) if is_headless_bracket(normalize_key_code(key.code), key.modifiers) => {
+            Event::Key(key)
+                if headless_bracket_recovery_active(
+                    ctx,
+                    normalize_key_code(key.code),
+                    key.modifiers,
+                ) =>
+            {
                 match swallow_one_sequence(
                     app,
                     ctx,
@@ -1119,9 +1155,21 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
 /// Whether a key event is the headless-leak shape `resolve_headless_bracket`
 /// handles: `'['` is the only character that can start the SGR grammar (with
 /// or without its leading `ESC`), so it's the only plain char worth
-/// buffering as a possible sequence start.
+/// buffering as a possible sequence start. Shape only — whether this
+/// platform actually needs treating it that way is a separate question, see
+/// [`headless_bracket_recovery_active`].
 fn is_headless_bracket(code: KeyCode, mods: KeyModifiers) -> bool {
     code == KeyCode::Char('[') && mods.is_empty()
+}
+
+/// Whether a key event should actually be buffered as a possible headless
+/// leaked sequence: it has the right shape ([`is_headless_bracket`]) AND
+/// headless recovery is active for this run
+/// ([`Context::headless_leak_recovery`]). Both [`event_loop`] and
+/// [`drain_more`] gate their headless-bracket arm through this single
+/// function so the two can't drift out of sync with each other.
+fn headless_bracket_recovery_active(ctx: &Context, code: KeyCode, mods: KeyModifiers) -> bool {
+    ctx.headless_leak_recovery && is_headless_bracket(code, mods)
 }
 
 /// Recover a key code this pipeline is known to sometimes deliver as a raw
@@ -1699,8 +1747,22 @@ mod tests {
     /// `read`), so they're testable without a real terminal, just an
     /// in-memory store (and caller-owned `thresholds`, so the returned
     /// `Context`'s lifetime doesn't outlive a temporary) to satisfy
-    /// `Context`'s shape.
+    /// `Context`'s shape. Defaults `headless_leak_recovery` to `true` (the
+    /// existing headless-recovery tests below all predate the platform
+    /// gate and assert that behavior); tests that need the flag off use
+    /// [`test_context_with_headless_recovery`] instead.
     fn test_context<'a>(store: &'a RefCell<Store>, thresholds: &'a AgeThresholds) -> Context<'a> {
+        test_context_with_headless_recovery(store, thresholds, true)
+    }
+
+    /// Same as [`test_context`], with `headless_leak_recovery` set
+    /// explicitly instead of defaulted — for tests asserting the
+    /// gate itself, or the flag-off (non-Windows) behavior it now guards.
+    fn test_context_with_headless_recovery<'a>(
+        store: &'a RefCell<Store>,
+        thresholds: &'a AgeThresholds,
+        headless_leak_recovery: bool,
+    ) -> Context<'a> {
         Context {
             claude_home: Path::new("."),
             thresholds,
@@ -1710,6 +1772,7 @@ mod tests {
             last_genuine_esc: RefCell::new(None),
             pending_inplace: RefCell::new(None),
             superseded_failed: RefCell::new(HashSet::new()),
+            headless_leak_recovery,
         }
     }
 
@@ -3210,6 +3273,11 @@ mod tests {
         assert_eq!(arrow_key_for(&[]), None);
     }
 
+    /// Exercises the headless-recovery *mechanism* directly (bypassing the
+    /// platform gate at its call sites) to prove it still correctly resolves
+    /// a leaked headless arrow shape when engaged. See the
+    /// `with_headless_recovery_disabled_*` tests below for the same "[A"
+    /// input on the platforms where the gate now keeps this from running.
     #[test]
     fn a_headless_leaked_up_arrow_moves_selection_instead_of_replaying_garbage() {
         let store = RefCell::new(Store::open_in_memory().unwrap());
@@ -3237,6 +3305,91 @@ mod tests {
         assert!(matches!(outcome, EscapeOutcome::Swallowed));
         assert_eq!(app.selected_row().unwrap().id, "a");
         assert_eq!(app.query(), "", "must not have been typed as garbage");
+    }
+
+    #[test]
+    fn headless_bracket_recovery_active_is_gated_by_the_platform_flag() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx_on = test_context_with_headless_recovery(&store, &thresholds, true);
+        let ctx_off = test_context_with_headless_recovery(&store, &thresholds, false);
+
+        assert!(headless_bracket_recovery_active(
+            &ctx_on,
+            KeyCode::Char('['),
+            KeyModifiers::NONE
+        ));
+        assert!(!headless_bracket_recovery_active(
+            &ctx_off,
+            KeyCode::Char('['),
+            KeyModifiers::NONE
+        ));
+        // The flag can't turn a non-bracket shape into a match either way.
+        assert!(!headless_bracket_recovery_active(
+            &ctx_on,
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        ));
+    }
+
+    /// The Unix-side regression test for the bug this gate exists to fix:
+    /// with headless recovery off, typing `[` then `A` (or `B`/`C`/`D`) in
+    /// the search box — e.g. "[Active]", "[Draft]", a `[A-Z]` regex class —
+    /// must land as literal query text, not get read as list navigation.
+    #[test]
+    fn with_headless_recovery_disabled_bracket_letter_types_instead_of_navigating() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context_with_headless_recovery(&store, &thresholds, false);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        assert!(!headless_bracket_recovery_active(
+            &ctx,
+            KeyCode::Char('['),
+            KeyModifiers::NONE
+        ));
+        // With the flag off this is exactly what `event_loop` dispatches:
+        // both keys go straight to `handle_key`, never through
+        // `resolve_headless_bracket`/`swallow_one_sequence`/`arrow_key_for`.
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE, &ctx);
+        handle_key(&mut app, KeyCode::Char('A'), KeyModifiers::NONE, &ctx);
+
+        // `push_char`'s own reset-selection-to-top-match on every keystroke
+        // (ordinary search-as-you-type UX) is a separate concern from what
+        // this test checks — the query landing as "[A" already proves
+        // `arrow_key_for` never ran: had it fired, the query would still be
+        // empty and selection would have moved via `select_prev`/
+        // `select_next` instead of a re-filter.
+        assert_eq!(
+            app.query(),
+            "[A",
+            "must be typed as text, not read as Up/Down/Left/Right"
+        );
+    }
+
+    /// Companion to the above: a lone `[` (nothing typed after it) must
+    /// still appear immediately when the flag is off — it never enters
+    /// `resolve_headless_bracket`, so it never pays the [`HEADLESS_GRACE`]
+    /// wait that path would otherwise impose on every single `[` keystroke.
+    #[test]
+    fn with_headless_recovery_disabled_a_lone_bracket_types_with_no_grace_wait() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context_with_headless_recovery(&store, &thresholds, false);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.enter_search();
+
+        assert!(!headless_bracket_recovery_active(
+            &ctx,
+            KeyCode::Char('['),
+            KeyModifiers::NONE
+        ));
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE, &ctx);
+
+        assert_eq!(app.query(), "[");
     }
 
     #[test]

@@ -1976,6 +1976,10 @@ mod tests {
         fn parent_pid(&self, _pid: u32) -> Option<u32> {
             None
         }
+
+        fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
+            self.is_alive(pid)
+        }
     }
 
     fn open_target(id: &str) -> SessionToOpen {
@@ -2029,6 +2033,7 @@ mod tests {
             status: None,
             kind: None,
             name: None,
+            proc_start: None,
         }];
         assert!(
             build_open_argv(&open_target("sess-1"), Some("opus"), None, &probe, &live).is_none()

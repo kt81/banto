@@ -88,6 +88,10 @@ mod tests {
         fn parent_pid(&self, _pid: u32) -> Option<u32> {
             None
         }
+
+        fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
+            self.is_alive(pid)
+        }
     }
 
     const SESSION_ID: &str = "00000000-0000-4000-8000-0000000000aa";
@@ -120,6 +124,7 @@ mod tests {
             status: status.map(str::to_string),
             kind: None,
             name: None,
+            proc_start: None,
         }
     }
 

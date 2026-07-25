@@ -61,9 +61,19 @@ pub enum SessionOpenError {
 /// its own, so `s` falls back to the same auto-detection as `Auto` — it's
 /// only the *default action* (Enter) that in-place mode changes, not
 /// whether a split is still available on request.
+///
+/// The real host platform (`cfg!(windows)`) is supplied here, at this
+/// function's own edge, to [`opener::detect_backend`] — which takes it as an
+/// injected parameter rather than reading it itself, so its own platform
+/// gating (e.g. never selecting Windows Terminal under WSL just because
+/// `$WT_SESSION` leaked in) stays unit-tested on every CI platform. This
+/// function's signature intentionally does not grow a matching parameter:
+/// both of its callers (`crate::tui`) always want the real platform, so
+/// there is nothing for them to inject, and `detect_backend`'s own tests
+/// already cover every platform/env combination this delegates to.
 pub fn resolve_backend(mode: OpenerMode, env: impl Fn(&str) -> Option<String>) -> Option<Backend> {
     match mode {
-        OpenerMode::InPlace | OpenerMode::Auto => opener::detect_backend(env),
+        OpenerMode::InPlace | OpenerMode::Auto => opener::detect_backend(env, cfg!(windows)),
         OpenerMode::Psmux => Some(Backend::Psmux),
         OpenerMode::WindowsTerminal => Some(Backend::WindowsTerminal),
     }
@@ -183,9 +193,22 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
 /// case. Unlike `banto_io::status::classify` (which is about which
 /// activity dot to show, so a busy entry outranks a merely-alive one), this
 /// only answers "is this session actually running right now".
+///
+/// When `entry` carries a `proc_start` (Claude Code's own record of its
+/// process's kernel start time), liveness is checked via
+/// [`ProcessProbe::is_alive_matching`] instead of a bare
+/// [`ProcessProbe::is_alive`] — so a pid recycled by an unrelated process
+/// since the live-state file was written is not mistaken for the original
+/// session still running, which would otherwise block a resume forever with
+/// no self-heal (see that method's doc comment).
 pub(crate) fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn ProcessProbe) -> bool {
-    live.iter()
-        .any(|entry| entry.session_id.as_deref() == Some(session_id) && probe.is_alive(entry.pid))
+    live.iter().any(|entry| {
+        entry.session_id.as_deref() == Some(session_id)
+            && match &entry.proc_start {
+                Some(proc_start) => probe.is_alive_matching(entry.pid, proc_start),
+                None => probe.is_alive(entry.pid),
+            }
+    })
 }
 
 /// A terminal hand-off ready to run in-place: the argv to execute with
@@ -597,12 +620,27 @@ mod tests {
 
     struct MockProbe {
         alive: HashSet<u32>,
+        /// Pids that are alive (per `is_alive`) but whose `is_alive_matching`
+        /// must still report `false` regardless of the given `proc_start` —
+        /// simulates a pid recycled by an unrelated process since a
+        /// live-state file's `proc_start` was recorded.
+        identity_mismatch: HashSet<u32>,
     }
 
     impl MockProbe {
         fn with_alive(pids: &[u32]) -> Self {
             Self {
                 alive: pids.iter().copied().collect(),
+                identity_mismatch: HashSet::new(),
+            }
+        }
+
+        /// A probe whose given pids are alive but never match on identity —
+        /// see [`Self::identity_mismatch`].
+        fn with_alive_but_identity_mismatch(pids: &[u32]) -> Self {
+            Self {
+                alive: pids.iter().copied().collect(),
+                identity_mismatch: pids.iter().copied().collect(),
             }
         }
     }
@@ -614,6 +652,10 @@ mod tests {
 
         fn parent_pid(&self, _pid: u32) -> Option<u32> {
             None
+        }
+
+        fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
+            self.is_alive(pid) && !self.identity_mismatch.contains(&pid)
         }
     }
 
@@ -662,6 +704,17 @@ mod tests {
             status: None,
             kind: None,
             name: None,
+            proc_start: None,
+        }
+    }
+
+    /// Same as [`live_entry`], but carrying a `proc_start` — exercises
+    /// `is_live`'s [`ProcessProbe::is_alive_matching`] path instead of the
+    /// bare [`ProcessProbe::is_alive`] one.
+    fn live_entry_with_proc_start(session_id: &str, pid: u32, proc_start: &str) -> LiveSession {
+        LiveSession {
+            proc_start: Some(proc_start.to_string()),
+            ..live_entry(session_id, pid)
         }
     }
 
@@ -676,6 +729,26 @@ mod tests {
         assert!(!is_live("sess-1", &[live_entry("sess-1", 999)], &probe));
         // No live entries at all.
         assert!(!is_live("sess-1", &[], &probe));
+    }
+
+    #[test]
+    fn is_live_confirms_a_proc_start_carrying_entry_via_is_alive_matching() {
+        let probe = MockProbe::with_alive(&[100]);
+        let entry = live_entry_with_proc_start("sess-1", 100, "1105463");
+
+        assert!(is_live("sess-1", &[entry], &probe));
+    }
+
+    #[test]
+    fn is_live_rejects_a_recycled_pid_even_though_it_is_alive() {
+        // The pid is alive per a bare liveness check, but the probe reports
+        // it belongs to a different process than the one that recorded
+        // `proc_start` (e.g. the original session crashed and the pid was
+        // reused) — is_live must not treat this as still running.
+        let probe = MockProbe::with_alive_but_identity_mismatch(&[100]);
+        let entry = live_entry_with_proc_start("sess-1", 100, "1105463");
+
+        assert!(!is_live("sess-1", &[entry], &probe));
     }
 
     // --- inplace_argv / decide_inplace_resume -----------------------------
