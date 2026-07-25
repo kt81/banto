@@ -149,3 +149,43 @@ Internal term — never surfaced externally.)
   DSR/DA responder. Keep in-place (full native terminal, no embedding) as the
   fidelity escape hatch, and split (psmux/tmux) for users already living in a
   multiplexer.
+
+## Unix follow-up (2026-07-25): the hangup ConPTY gives you for free
+
+Filling in the "non-Windows behavior" gap listed above, found by dogfooding
+the emporium on WSL: **quitting banto stalled for the full 5s shutdown grace
+and then `SIGKILL`ed every pane.**
+
+The teardown asks each child to close the way a terminal window closing would
+(`PtyHandle::begin_graceful_close`): drop the writer and the master, then wait.
+On ConPTY that *is* the request — dropping the master closes the pseudoconsole
+and raises the console-close cascade. On Unix it is silent, and for a reason
+that reads like a joke: the tty hangs up only when the **last** fd on the
+master closes, and one is held by the reader thread, parked in the `read()`
+that the hangup itself was going to release.
+
+Measured against a real `claude` at its prompt, driven through banto's own
+`PortablePtyHost` (so the reader thread and its cloned master are live, exactly
+as in the emporium):
+
+| teardown | outcome |
+|---|---|
+| drop writer + master only | still running at 8s; force-kill required |
+| `killpg(pid, SIGHUP)` first, then the same drops | exits in **0.52s**, status 0 |
+
+Also measured, with a bare `openpty` to isolate the mechanism: closing the sole
+master fd kills `claude` in ~0.5s, while closing it with one dup still open
+leaves the child running indefinitely — the dup, not `claude`, is what swallows
+the hangup.
+
+So the signal the tty would have sent is now sent by hand
+(`banto_io::pty::Hangup`, a no-op on Windows where the master close already
+means it). The process **group** is signalled rather than the lone pid: the
+child is a session leader owning the pty (portable-pty does setsid +
+TIOCSCTTY), so its pid is its pgid, and the group is what the tty driver itself
+would hang up — which also reaches the `banto _mcp` server the session spawned
+instead of orphaning it.
+
+Worth keeping in mind beyond this bug: **"the master is closed" is a Windows
+event and a Unix non-event.** Any future teardown path that leans on dropping
+the master needs its own Unix answer.

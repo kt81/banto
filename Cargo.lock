@@ -141,6 +141,7 @@ dependencies = [
  "anyhow",
  "banto-core",
  "dirs",
+ "libc",
  "notify",
  "portable-pty",
  "rusqlite",

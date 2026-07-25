@@ -25,6 +25,9 @@ pub struct PtyIo {
     /// Phase 2b (session termination); the executor plumbing is deliberately
     /// ready ahead of it.
     pub killer: Box<dyn Killer>,
+    /// Asks the child to shut down as if its terminal window closed — what
+    /// dropping the master alone fails to convey on Unix. See [`Hangup`].
+    pub hangup: Box<dyn Hangup>,
     /// OS process id of the direct child, when the platform reports one.
     /// `claude` writes `<claude_home>/sessions/<pid>.json` at startup, so
     /// this is what lets a freshly-spawned session be identified before it
@@ -51,6 +54,29 @@ pub trait Resizer: Send {
 /// Kills a hosted child's process.
 pub trait Killer: Send {
     fn kill(&mut self) -> Result<()>;
+}
+
+/// Tells a hosted child that its terminal went away — the polite "your
+/// window just closed" every terminal app already knows how to handle,
+/// short of a kill.
+///
+/// Exists because the two platforms disagree about what closing the master
+/// *means*, and only one of them says it out loud:
+///
+/// - **Windows.** Dropping the master closes the pseudoconsole, which
+///   raises the console-close cascade (`CTRL_CLOSE_EVENT`) at the child.
+///   Nothing more is needed, so the implementation is a no-op.
+/// - **Unix.** The tty driver hangs up (SIGHUP to the foreground process
+///   group) only when the *last* fd on the master closes — and one is held
+///   by the reader thread, parked in a `read()` that will not return until
+///   that very hangup happens. Dropping banto's own copies is therefore
+///   silent: the child keeps running, oblivious, until something
+///   force-kills it. Measured on WSL 2026-07-25: an embedded `claude` with
+///   the reader's clone still open sat through the whole 5s shutdown grace
+///   and died by `SIGKILL`; sent the hangup explicitly, it exits cleanly in
+///   ~0.5s. So the signal the tty would have sent is sent by hand.
+pub trait Hangup: Send {
+    fn hangup(&mut self) -> Result<()>;
 }
 
 /// Spawns a child inside a PTY.
@@ -128,9 +154,58 @@ impl PtyHost for PortablePtyHost {
                 master: pair.master,
             }),
             killer: Box::new(PortablePtyKiller(killer)),
+            hangup: new_hangup(pid),
             pid,
             exited: exited_rx,
         })
+    }
+}
+
+/// Unix: the hangup the tty driver won't deliver while the reader thread
+/// holds its clone of the master (see [`Hangup`]).
+#[cfg(unix)]
+fn new_hangup(pid: Option<u32>) -> Box<dyn Hangup> {
+    Box::new(SignalHangup(pid))
+}
+
+/// Everywhere else (Windows): dropping the master already is the hangup.
+#[cfg(not(unix))]
+fn new_hangup(_pid: Option<u32>) -> Box<dyn Hangup> {
+    Box::new(NoHangup)
+}
+
+#[cfg(unix)]
+struct SignalHangup(Option<u32>);
+
+#[cfg(unix)]
+impl Hangup for SignalHangup {
+    fn hangup(&mut self) -> Result<()> {
+        // `pid > 1` is a hard guard, not superstition: `killpg(0, ...)`
+        // signals the *caller's* own process group — banto and every pane
+        // it hosts, plus the shell that launched it.
+        let Some(pid) = self.0.filter(|pid| *pid > 1) else {
+            return Ok(());
+        };
+        // The child is a session leader owning the pty as its controlling
+        // terminal (portable-pty does setsid + TIOCSCTTY), so its pid is
+        // also its process-group id. Signalling the group — not the lone
+        // pid — is what the tty driver itself does on hangup, and it
+        // reaches whatever the session spawned (its `banto _mcp` server)
+        // instead of orphaning it.
+        if unsafe { libc::killpg(pid as i32, libc::SIGHUP) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+struct NoHangup;
+
+#[cfg(not(unix))]
+impl Hangup for NoHangup {
+    fn hangup(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -171,7 +246,7 @@ pub mod mock {
 
     use anyhow::Result;
 
-    use super::{Killer, PtyHost, PtyIo, Resizer};
+    use super::{Hangup, Killer, PtyHost, PtyIo, Resizer};
 
     /// A [`PtyHost`] that spawns nothing: it replays `script` as the child's
     /// output and records everything written to the child, every resize, and
@@ -184,6 +259,11 @@ pub mod mock {
         pub captured: Arc<Mutex<Vec<u8>>>,
         pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
         pub kills: Arc<Mutex<u32>>,
+        /// Counts [`super::Hangup::hangup`] calls. Deliberately does *not*
+        /// fire `exited` the way [`MockKiller`] does: a hangup is a request,
+        /// and a child free to ignore it is exactly the case the shutdown
+        /// sweep's deadline exists for.
+        pub hangups: Arc<Mutex<u32>>,
         /// Set by `open`; not meant to be set by test setup directly (use
         /// [`Self::fire_exit`]) — `pub` only because struct-update syntax
         /// (`..Default::default()`) requires every field to be nameable
@@ -245,6 +325,7 @@ pub mod mock {
                 input: Box::new(CapturingWriter(self.captured.clone())),
                 resizer: Box::new(MockResizer(self.resizes.clone())),
                 killer: Box::new(MockKiller(self.kills.clone(), self.exit_sender.clone())),
+                hangup: Box::new(MockHangup(self.hangups.clone())),
                 pid: self.pid,
                 exited: exited_rx,
             })
@@ -268,6 +349,15 @@ pub mod mock {
     impl Resizer for MockResizer {
         fn resize(&self, rows: u16, cols: u16) -> Result<()> {
             self.0.lock().unwrap().push((rows, cols));
+            Ok(())
+        }
+    }
+
+    struct MockHangup(Arc<Mutex<u32>>);
+
+    impl Hangup for MockHangup {
+        fn hangup(&mut self) -> Result<()> {
+            *self.0.lock().unwrap() += 1;
             Ok(())
         }
     }

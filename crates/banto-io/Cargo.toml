@@ -19,5 +19,11 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 thiserror = "2.0.19"
 toml = "0.9.8"
 
+[target.'cfg(unix)'.dependencies]
+# Only for `killpg(SIGHUP)` in `pty::Hangup` — a Unix pty hangs up when the
+# *last* fd on its master closes, which dropping banto's own copies cannot
+# guarantee (see that trait's doc).
+libc = "0.2.186"
+
 [dev-dependencies]
 tempfile = "3.24.0"
