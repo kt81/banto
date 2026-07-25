@@ -8,8 +8,10 @@
 //!
 //! # Emoji markers
 //!
-//! Exactly six, fixed: 👥 director (the cell metaphor — multiple people —
-//! not royalty), 🧬 superseded (an auto-compaction ancestor with a known
+//! Exactly six, fixed: 🤝 director (the partnership metaphor — Director and
+//! Worker as a cell — not royalty; a prior busts-in-silhouette choice was
+//! a dark, low-contrast glyph that all but vanished on a dark terminal
+//! background), 🧬 superseded (an auto-compaction ancestor with a known
 //! continuation), 📌 pinned, 🤖 agent, 📂 named-group header, 📁 Ungrouped
 //! header — all single-codepoint, East-Asian-Width=Wide,
 //! default-emoji-presentation characters (2 display columns, no VS16
@@ -22,11 +24,14 @@
 //! # Row layout
 //!
 //! One algorithm, driven by the render area's width, for both modes:
-//! `[dot 2][pin 2][role 2][title][gap 2][cwd?][gap>=2][age]`. See
-//! [`row_line`] for the exact budget arithmetic (title/cwd mutually
-//! exclusive truncation, age always flush at the right edge, saturating
-//! throughout with an explicit narrow-width degradation that drops the age
-//! column entirely rather than ever let it collide into the prefix).
+//! `[dot 2][pin 3][role 3][title][gap 2][cwd?][gap>=2][age]`. Each marker
+//! slot (pin/role) is the emoji plus one trailing separator space when
+//! occupied, or three blank columns when not — a glued-together
+//! `📌🤝title` reads as one sticker, not two markers. See [`row_line`] for
+//! the exact budget arithmetic (title/cwd mutually exclusive truncation,
+//! age always flush at the right edge, saturating throughout with an
+//! explicit narrow-width degradation that drops the age column entirely
+//! rather than ever let it collide into the prefix).
 
 use std::time::SystemTime;
 
@@ -43,14 +48,17 @@ use banto_core::model::{self, Activity, AgeBucket, SessionRow};
 use crate::text::{truncate_to_width, truncate_to_width_leading};
 
 const PIN_EMOJI: &str = "\u{1F4CC}"; // 📌
-const DIRECTOR_EMOJI: &str = "\u{1F465}"; // 👥
+const DIRECTOR_EMOJI: &str = "\u{1F91D}"; // 🤝
 const SUPERSEDED_EMOJI: &str = "\u{1F9EC}"; // 🧬
 const AGENT_EMOJI: &str = "\u{1F916}"; // 🤖
 const GROUP_EMOJI: &str = "\u{1F4C2}"; // 📂
 const UNGROUPED_EMOJI: &str = "\u{1F4C1}"; // 📁
 
-/// dot(2) + pin(2) + role(2), the row's fixed left-hand slots.
-const FIXED_PREFIX_WIDTH: usize = 6;
+/// dot(2) + pin(3) + role(3), the row's fixed left-hand slots. Pin/role are
+/// each a 2-column emoji plus a 1-column trailing separator space (see the
+/// module doc's "Row layout" section) — 3, not 2, so a marker never sits
+/// glued against the title or against an adjacent marker.
+const FIXED_PREFIX_WIDTH: usize = 8;
 /// Minimum columns of blank space a row must leave before the age column.
 const MIN_GAP_BEFORE_AGE: usize = 2;
 /// Columns between the title and cwd, when cwd is shown.
@@ -59,6 +67,12 @@ const TITLE_CWD_GAP: usize = 2;
 /// title (at its natural, untruncated width) and the title-cwd gap are
 /// accounted for.
 const MIN_CWD_WIDTH: usize = 8;
+/// cwd is never shown below this render width, regardless of how much room
+/// the title leaves — at sidebar widths (e.g. the emporium's 34-col list),
+/// a short title's leftover space isn't a genuine invitation to show cwd,
+/// it just produces a cramped, barely-readable fragment. Wide areas keep
+/// the existing [`MIN_CWD_WIDTH`]-based rule unchanged.
+const MIN_WIDTH_FOR_CWD: usize = 60;
 
 /// Render the session list (or a placeholder when nothing matches) into
 /// `area`. `now` drives the right-aligned compact age column — read once by
@@ -95,6 +109,17 @@ fn list_item(line: ListLine<'_>, area_width: u16, now: SystemTime) -> ListItem<'
     match line {
         ListLine::Header { name, count } => header_line(&name, count),
         ListLine::Row(visible) => ListItem::new(row_line(visible, area_width, now)),
+    }
+}
+
+/// One list-row marker slot: `emoji` plus a trailing separator space (3
+/// display columns total, matching [`FIXED_PREFIX_WIDTH`]'s pin/role
+/// budget) when occupied, or three blank columns when `None` — so an empty
+/// slot still holds its column budget exactly like an occupied one.
+fn marker_slot(emoji: Option<&str>) -> Span<'static> {
+    match emoji {
+        Some(emoji) => Span::raw(format!("{emoji} ")),
+        None => Span::raw("   "),
     }
 }
 
@@ -138,20 +163,19 @@ fn row_line(visible: VisibleRow<'_>, area_width: u16, now: SystemTime) -> Line<'
         "\u{25cf} ",
         Style::default().fg(activity_color(visible.row.activity)),
     );
-    let pin = if visible.pinned {
-        Span::raw(PIN_EMOJI)
-    } else {
-        Span::raw("  ")
-    };
-    let role = if visible.director {
-        Span::raw(DIRECTOR_EMOJI)
+    // The Pinned section header already says "pinned"; repeating the emoji
+    // on every row under it is noise, so it's suppressed there (flat view
+    // has no header to speak for it, so it always shows).
+    let pin = marker_slot((visible.pinned && !visible.in_pinned_section).then_some(PIN_EMOJI));
+    let role = marker_slot(if visible.director {
+        Some(DIRECTOR_EMOJI)
     } else if visible.superseded {
-        Span::raw(SUPERSEDED_EMOJI)
+        Some(SUPERSEDED_EMOJI)
     } else if visible.row.is_agent {
-        Span::raw(AGENT_EMOJI)
+        Some(AGENT_EMOJI)
     } else {
-        Span::raw("  ")
-    };
+        None
+    });
 
     let area_width = area_width as usize;
     let age_str = model::humanize_age_compact(visible.row.mtime, now);
@@ -173,8 +197,9 @@ fn row_line(visible: VisibleRow<'_>, area_width: u16, now: SystemTime) -> Line<'
         return Line::from(vec![dot, pin, role, Span::raw(title)]);
     }
 
-    let show_cwd =
-        !cwd_full.is_empty() && title_width + TITLE_CWD_GAP + MIN_CWD_WIDTH <= max_left_content;
+    let show_cwd = area_width >= MIN_WIDTH_FOR_CWD
+        && !cwd_full.is_empty()
+        && title_width + TITLE_CWD_GAP + MIN_CWD_WIDTH <= max_left_content;
 
     let mut spans = vec![dot, pin, role];
     let mut used_width = FIXED_PREFIX_WIDTH;
@@ -237,7 +262,7 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
     let director = app.is_selected_director();
     let superseded = app.is_selected_superseded();
 
-    // Marker slots after the dot — same 📌/👥/🧬/🤖 priority as the list row
+    // Marker slots after the dot — same 📌/🤝/🧬/🤖 priority as the list row
     // (director beats superseded beats agent), but as free-flowing spans
     // with no blank-slot padding: this is prose, not a column-aligned grid.
     let mut title_spans = vec![Span::styled(
@@ -404,6 +429,37 @@ mod tests {
         assert!(line_for("Pinned Row").contains(PIN_EMOJI));
         assert!(line_for("Director Row").contains(DIRECTOR_EMOJI));
         assert!(line_for("Agent Row").contains(AGENT_EMOJI));
+    }
+
+    #[test]
+    fn pin_marker_is_suppressed_under_the_pinned_header_but_shown_in_flat_view() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("pinned", "Pinned Row", "", now),
+            row("other", "Other Row", "", now),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+
+        // Grouped view is on by default and two sections exist (Pinned,
+        // Ungrouped), so it's actually in effect — the row itself stays
+        // unmarked; the Pinned header (checked elsewhere) carries it.
+        let text = draw_list(&app, 60, 10, now);
+        let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
+        assert!(
+            !line.contains(PIN_EMOJI),
+            "pin marker should be suppressed under the Pinned header:\n{text}"
+        );
+
+        // Flat view has no header to speak for it, so the same row shows
+        // its own marker.
+        app.toggle_grouped_view();
+        let text = draw_list(&app, 60, 10, now);
+        let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
+        assert!(
+            line.contains(PIN_EMOJI),
+            "pin marker should show on the row in flat view:\n{text}"
+        );
     }
 
     #[test]
@@ -592,8 +648,8 @@ mod tests {
         let mut app = App::new(vec![row("r", "Short", "", five_min_ago)]);
         app.set_viewport_height(10);
 
-        // area width 40: prefix(6) + "Short"(5) = 11 used, "5m" (2 cols)
-        // flush at the very end fills the row exactly (11 + 27-col gap + 2 =
+        // area width 40: prefix(8) + "Short"(5) = 13 used, "5m" (2 cols)
+        // flush at the very end fills the row exactly (13 + 25-col gap + 2 =
         // 40) — the rendered line's last two characters are the age itself.
         let text = draw_list(&app, 40, 10, now);
         let line = text.lines().find(|l| l.contains("Short")).unwrap();
@@ -628,13 +684,56 @@ mod tests {
     }
 
     #[test]
+    fn cwd_still_appears_at_and_above_the_width_floor() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let cwd = "/work/project";
+        let mut app = App::new(vec![row("r", "Short", cwd, now)]);
+        app.set_viewport_height(10);
+
+        // Guards against over-suppression: MIN_WIDTH_FOR_CWD (60) is a
+        // floor, not a ceiling — cwd must still show at and above it,
+        // provided the title otherwise leaves it enough room.
+        for width in [60, 80] {
+            let text = draw_list(&app, width, 10, now);
+            let line = text.lines().find(|l| l.contains("Short")).unwrap();
+            assert!(
+                line.contains("project"),
+                "cwd should still show at width {width} (>= the floor):\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn cwd_never_shown_below_the_sidebar_width_floor_even_with_room() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let cwd = "/some/long/project/path";
+        let mut app = App::new(vec![row("r", "Short", cwd, now)]);
+        app.set_viewport_height(10);
+
+        // 34 cols (the emporium sidebar's width, R21's motivating case) is
+        // below MIN_WIDTH_FOR_CWD — the short title alone would ordinarily
+        // leave more than enough room for cwd under the
+        // title-leaves-room rule, but the floor overrides it here.
+        let text = draw_list(&app, 34, 10, now);
+        let line = text.lines().find(|l| l.contains("Short")).unwrap();
+        assert!(
+            !line.contains("project"),
+            "cwd should never appear below the sidebar width floor:\n{line}"
+        );
+    }
+
+    #[test]
     fn cwd_is_dropped_and_the_title_is_truncated_when_there_is_no_room() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let long_title = "This Is A Very Long Session Title Indeed";
         let mut app = App::new(vec![row("r", long_title, "/some/path", now)]);
         app.set_viewport_height(10);
 
-        let text = draw_list(&app, 20, 10, now);
+        // Wide enough that "This Is" (the title's start) survives
+        // truncation and can anchor the line lookup, but still well under
+        // MIN_WIDTH_FOR_CWD and short of the full title's length, so cwd
+        // stays dropped and the title still gets truncated.
+        let text = draw_list(&app, 30, 10, now);
         let line = text.lines().find(|l| l.contains("This Is")).unwrap();
         assert!(
             !line.contains("/some/path"),
@@ -652,7 +751,7 @@ mod tests {
         let mut app = App::new(vec![row("r", "Title", "", now)]);
         app.set_viewport_height(10);
 
-        // Width 5 is less than fixed_prefix(6) + min_gap(2) + age_width(3
+        // Width 5 is less than fixed_prefix(8) + min_gap(2) + age_width(3
         // for "now") even before a title is considered: degrades to
         // prefix + truncated title, age dropped entirely, no panic.
         let text = draw_list(&app, 5, 10, now);

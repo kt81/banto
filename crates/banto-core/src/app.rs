@@ -552,6 +552,13 @@ pub struct VisibleRow<'a> {
     /// shown regardless of *why* the row is visible (still live, or the
     /// `a` toggle is on).
     pub superseded: bool,
+    /// True when this row sits under the grouped view's "Pinned" section
+    /// header — i.e. `pinned` is true AND grouped view is actually in
+    /// effect (see [`App::grouped_view_active`]). The renderer suppresses
+    /// the 📌 marker in this case: the header already says it's pinned, so
+    /// repeating the emoji on every row under it is pure noise. Always
+    /// false in flat view, where there's no header to speak for it.
+    pub in_pinned_section: bool,
 }
 
 /// One physical line in the rendered list, in display order: either a real
@@ -1541,6 +1548,7 @@ impl App {
     pub fn visible(&self) -> Vec<ListLine<'_>> {
         let display = self.display_sequence();
         let end = (self.offset + self.viewport_height).min(display.len());
+        let grouped_active = self.grouped_view_active(&self.filtered);
         display[self.offset..end]
             .iter()
             .map(|line| match line {
@@ -1550,11 +1558,13 @@ impl App {
                 },
                 DisplayLine::Row(k) => {
                     let row = &self.rows[self.filtered[*k]];
+                    let pinned = self.pinned.contains(&row.id);
                     ListLine::Row(VisibleRow {
                         row,
-                        pinned: self.pinned.contains(&row.id),
+                        pinned,
                         director: self.directors.contains(&row.id),
                         superseded: self.superseded.contains(&row.id),
+                        in_pinned_section: pinned && grouped_active,
                     })
                 }
             })
@@ -2038,6 +2048,38 @@ mod tests {
             .collect();
         // id1 sorted first (pinned), then id0, id2.
         assert_eq!(pinned_flags, vec![true, false, false]);
+    }
+
+    #[test]
+    fn in_pinned_section_is_true_only_under_an_actually_active_pinned_header() {
+        let mut app = App::new(numbered(3)); // id0, id1, id2
+        app.set_viewport_height(10);
+        app = app.with_pinned(["id1".to_string()].into_iter().collect());
+
+        // Grouped view is on by default and there are two sections
+        // (Pinned, Ungrouped), so it's actually in effect: the pinned row
+        // sits under the Pinned header.
+        let flags: Vec<bool> = app
+            .visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Row(r) => Some(r.in_pinned_section),
+                ListLine::Header { .. } => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![true, false, false]);
+
+        // Flat view: no header exists at all, so no row is ever "under" one.
+        app.toggle_grouped_view();
+        let flags: Vec<bool> = app
+            .visible()
+            .iter()
+            .filter_map(|line| match line {
+                ListLine::Row(r) => Some(r.in_pinned_section),
+                ListLine::Header { .. } => None,
+            })
+            .collect();
+        assert!(flags.iter().all(|&f| !f));
     }
 
     #[test]

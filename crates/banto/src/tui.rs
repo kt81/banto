@@ -1806,22 +1806,33 @@ mod tests {
         app = app.with_pinned(["id-beta".to_string()].into_iter().collect());
 
         let text = draw(&app);
-        // Pinned "Beta task" sorts first and carries the pin marker.
-        let beta_line = text
-            .lines()
-            .find(|line| line.contains("Beta task"))
+        // Pinned "Beta task" sorts first, under the Pinned section header
+        // (grouped view is on by default) — the header carries the pin
+        // marker; the row itself stays unmarked (R21: repeating it on every
+        // row under the header would be pure noise; see
+        // `App::VisibleRow::in_pinned_section`).
+        let lines: Vec<&str> = text.lines().collect();
+        let beta_pos = lines
+            .iter()
+            .position(|line| line.contains("Beta task"))
+            .unwrap();
+        let alpha_pos = lines
+            .iter()
+            .position(|line| line.contains("Alpha task"))
             .unwrap();
         assert!(
-            beta_line.contains('\u{1F4CC}'), // 📌
-            "missing pin marker:\n{text}"
+            beta_pos < alpha_pos,
+            "pinned row should be listed first:\n{text}"
         );
-        let alpha_line = text
-            .lines()
-            .find(|line| line.contains("Alpha task"))
-            .unwrap();
         assert!(
-            !alpha_line.contains('\u{1F4CC}'),
-            "unexpected marker:\n{text}"
+            !lines[beta_pos].contains('\u{1F4CC}'), // 📌
+            "pin marker should be suppressed on a row under the Pinned header:\n{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Pinned") && line.contains('\u{1F4CC}')),
+            "Pinned section header should carry the pin marker:\n{text}"
         );
         // The hint text is longer than the narrow 60-col terminal `draw`
         // uses, so check it wider (see `search_mode_hint_differs_...`) — and
