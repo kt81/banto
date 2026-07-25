@@ -711,6 +711,20 @@ pub enum Cmd {
     KillPty {
         key: SessionKey,
     },
+    /// The child hosted under `from` is now known by `to`: id discovery
+    /// resolved a freshly-launched session's synthetic placeholder key into
+    /// the real Claude session id (`Event::DiscoveryResult`). The core
+    /// renames its own `screens`/`Stage` entries itself; this Cmd is how the
+    /// shell's PTY handle — which the core cannot touch — follows along.
+    /// Without it the handle is orphaned under a key nothing references
+    /// again: the pane stops accepting input and stops being reaped-safe,
+    /// and the shell's "which ids are already open" set never learns the
+    /// discovered id, so the next pending discovery resolves onto it a
+    /// second time.
+    RekeyPty {
+        from: SessionKey,
+        to: SessionKey,
+    },
     Store(StoreIntent),
     Reload,
 }
@@ -830,7 +844,7 @@ pub fn update(
             key,
             session_id,
             member,
-        } => update_discovery_result(state, key, session_id, member),
+        } => update_discovery_result(state, key, session_id, member, now),
         Event::ArchiveDone { title, result } => {
             state.set_status(
                 match &result {
@@ -1449,7 +1463,22 @@ fn stage_brigade(
                 }
             }
             None if *role == BrigadeRole::Worker => {
-                cmds.extend(open_worker(state, brigade_id, token, &cwd, worker_model));
+                // A Worker with no id yet is identified only by its synthetic
+                // key, so "is it already open?" has to be asked against that
+                // key — the `Some(row)` arm's `screens` check above cannot
+                // see it. Re-staging a cell whose Worker is alive but still
+                // unidentified (Claude writes a session's jsonl at its first
+                // *turn*, so discovery stays pending for as long as nobody
+                // types into the pane) would otherwise spawn a second child
+                // under the same key: the shell's handle map would replace
+                // the live one — closing its PTY, killing it on Unix — and
+                // the pane would blink back to an empty prompt.
+                let key = SessionKey::new_worker(brigade_id, token);
+                if state.screens.contains_key(&key) {
+                    panes.push(key);
+                } else {
+                    cmds.extend(open_worker(state, brigade_id, token, &cwd, worker_model));
+                }
             }
             None => missing += 1,
         }
@@ -1722,10 +1751,33 @@ fn update_discovery_result(
     old_key: SessionKey,
     session_id: String,
     member: Option<(BrigadeId, MemberToken)>,
+    now: Instant,
 ) -> Vec<Cmd> {
     let new_key = SessionKey::from_id(&session_id);
+    if new_key == old_key {
+        return Vec::new();
+    }
+    // Refuse a discovery that would collapse two panes onto one key rather
+    // than merging them: the second pane would draw the first one's screen,
+    // be titled after it, have its own child's handle orphaned, and — via
+    // the store write below — claim the first one's session id as its own
+    // brigade membership. Discovery is supposed to make this unreachable
+    // (the shell excludes ids it already hosts), but "supposed to" is not a
+    // reason to let a destructive merge through.
+    if state.screens.contains_key(&new_key) {
+        state.set_status(
+            format!("discovery collision on {session_id} — ignored"),
+            now,
+        );
+        return Vec::new();
+    }
+    let mut cmds = Vec::new();
     if let Some(screen) = state.screens.remove(&old_key) {
         state.screens.insert(new_key.clone(), screen);
+        cmds.push(Cmd::RekeyPty {
+            from: old_key.clone(),
+            to: new_key.clone(),
+        });
     }
     match &mut state.stage {
         Stage::Solo(k) if *k == old_key => *k = new_key.clone(),
@@ -1738,14 +1790,14 @@ fn update_discovery_result(
         }
         _ => {}
     }
-    match member {
-        Some((brigade_id, token)) => vec![Cmd::Store(StoreIntent::SetMemberSession {
+    if let Some((brigade_id, token)) = member {
+        cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
             brigade_id,
             token,
             session_id,
-        })],
-        None => Vec::new(),
+        }));
     }
+    cmds
 }
 
 fn update_brigade_formed(
@@ -2525,6 +2577,189 @@ mod tests {
         assert!(cmds.is_empty());
         assert!(matches!(state.stage, Stage::Empty));
         assert!(state.status.unwrap().contains("already running elsewhere"));
+    }
+
+    /// A staged brigade of a Director plus `worker_keys`, every pane holding
+    /// a screen — the shape id discovery resolves into.
+    fn staged_brigade(
+        state: &mut EmporiumState,
+        director: &SessionKey,
+        worker_keys: &[SessionKey],
+    ) {
+        state.screens.insert(director.clone(), Screen::new(24, 80));
+        let mut panes = vec![director.clone()];
+        for key in worker_keys {
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+            panes.push(key.clone());
+        }
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes,
+            focused: 0,
+        };
+    }
+
+    #[test]
+    fn discovery_rekeys_the_shells_pty_handle_along_with_the_screen_and_stage() {
+        // The regression this pins: the core renames its own `screens`/
+        // `Stage` entries, but the PTY handle lives in the shell, keyed by
+        // the same `SessionKey`. Without a `RekeyPty` telling the shell, the
+        // handle is orphaned under the synthetic key — the pane stops
+        // accepting input and the shell's reaper drops the handle (closing
+        // the PTY master, which SIGHUPs a live child on Unix).
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let pending = SessionKey::new_worker(1, "worker-1");
+        staged_brigade(&mut state, &director, std::slice::from_ref(&pending));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: pending.clone(),
+                session_id: "w1".to_string(),
+                member: Some((1, "worker-1".to_string())),
+            },
+            Instant::now(),
+        );
+
+        let discovered = SessionKey::from_id("w1");
+        assert!(state.screens.contains_key(&discovered));
+        assert!(!state.screens.contains_key(&pending));
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(panes, &[director, discovered.clone()]);
+        assert!(
+            cmds.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::RekeyPty { from, to } if *from == pending && *to == discovered
+            )),
+            "the shell must be told to rekey its handle: {cmds:?}"
+        );
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::Store(StoreIntent::SetMemberSession { token, session_id, .. })
+                if token == "worker-1" && session_id == "w1"
+        )));
+    }
+
+    #[test]
+    fn discovery_onto_an_id_another_pane_already_holds_is_refused_whole() {
+        // Two Workers spawned into one cwd: if the second one's discovery
+        // resolved to the id the first already took, both panes would fold
+        // onto one key — same screen, same title, one child's handle
+        // orphaned, and a store write handing the first Worker's session id
+        // to the second's membership row.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let taken = SessionKey::from_id("w1");
+        let pending = SessionKey::new_worker(1, "worker-2");
+        staged_brigade(&mut state, &director, &[taken.clone(), pending.clone()]);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: pending.clone(),
+                session_id: "w1".to_string(),
+                member: Some((1, "worker-2".to_string())),
+            },
+            Instant::now(),
+        );
+
+        assert!(
+            !cmds.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::RekeyPty { .. } | Cmd::Store(StoreIntent::SetMemberSession { .. })
+            )),
+            "a colliding discovery must change nothing: {cmds:?}"
+        );
+        assert!(state.screens.contains_key(&pending), "pane 2 keeps its key");
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(panes, &[director, taken, pending]);
+        assert!(state.status.unwrap().contains("collision"));
+    }
+
+    #[test]
+    fn restaging_a_cell_reuses_a_worker_pane_that_has_no_id_yet_instead_of_respawning_it() {
+        // The dogfooding bug: a Worker nobody has typed into has no session
+        // file, so discovery can't name it and its store row stays NULL.
+        // Re-opening the cell then hit stage_brigade's "no id -> spawn one"
+        // arm again and started a *second* claude under the same synthetic
+        // key, which replaced the live child's handle in the shell (closing
+        // its PTY, killing it on Unix) and blanked its pane.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        state.screens.insert(director.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        let now = Instant::now();
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            ("worker-1".to_string(), BrigadeRole::Worker, None),
+        ];
+        let opens = |cmds: &[Cmd]| -> Vec<SessionKey> {
+            cmds.iter()
+                .filter_map(|cmd| match cmd {
+                    Cmd::OpenEmbedded { key, .. } => Some(key.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let activate = |state: &mut EmporiumState, app: &mut App| {
+            state.pending_membership = Some(PendingMembership::Activate);
+            update(
+                state,
+                app,
+                &brigade,
+                Event::MembershipResolved {
+                    session_id: "dir".to_string(),
+                    membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                    members: Some(roster.clone()),
+                },
+                now,
+            )
+        };
+
+        // First open: the Worker has no id, so it is spawned fresh.
+        let cmds = activate(&mut state, &mut app);
+        let worker = SessionKey::new_worker(1, "worker-1");
+        assert_eq!(opens(&cmds), std::slice::from_ref(&worker));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: worker.clone(),
+            },
+            now,
+        );
+        assert!(state.screens.contains_key(&worker));
+
+        // Re-open the same cell while that Worker is still unidentified:
+        // its pane is alive, so it must be reused, not spawned again.
+        let cmds = activate(&mut state, &mut app);
+        assert!(
+            opens(&cmds).is_empty(),
+            "the live Worker must not be respawned: {cmds:?}"
+        );
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(panes, &[director, worker]);
     }
 
     #[test]

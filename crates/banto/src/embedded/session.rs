@@ -92,6 +92,13 @@ impl PtyHandle {
         PtyPoll::Empty
     }
 
+    /// The child's OS pid, when the platform reports one — how a
+    /// freshly-spawned session is matched to the `sessions/<pid>.json` it
+    /// writes at startup (see `PtyIo::pid`).
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.io.pid
+    }
+
     /// Encode `key` and forward it to the child's stdin.
     pub(crate) fn send_key(&mut self, key: &KeyEvent) {
         let bytes = key_to_bytes(key);
