@@ -42,6 +42,14 @@ this is enforced everywhere.
 
 ### Director/Worker cells (emporium)
 
+![The emporium with a staged cell: the sidebar's ledger on the left — a
+🤝 Director row pinned under a counted header — and three live panes: a
+Director session flanked by two Workers reporting back](docs/assets/emporium-brigade.png)
+
+*A live cell at work (WSL + tmux): the Director reviews and directs; two
+Workers implement and report over banto's MCP channel. This screenshot is
+itself dogfooding — the session shown is building banto.*
+
 Inside the emporium, `B` appoints the selected session as a **Director** and
 auto-spawns fresh **Worker** sessions beside it (count and model
 configurable). banto mediates a message channel between them over MCP — it
