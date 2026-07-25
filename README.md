@@ -1,5 +1,9 @@
 # banto (番頭)
 
+![The bantō at his counter, writing in a ledger whose rows glow like a
+terminal list, while clerks carry boxed sessions between the shelves —
+one box glowing mid-handoff](docs/assets/banto-hero.png)
+
 A resident TUI that searches, groups, and resumes your local Claude Code
 sessions — and, in its **emporium mode** (大店, *oodana*), hosts them as
 live embedded panes, including Director/Worker multi-session cells that
