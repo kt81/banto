@@ -12,3 +12,12 @@ repository = "https://github.com/kt81/banto"
 [profile.release]
 lto = "thin"
 strip = true
+
+# crossterm 0.29.0's Windows input parser feeds surrogate KEY-UP halves into
+# its pairing logic, so anything injected via KEYEVENTF_UNICODE (the Windows
+# emoji panel, notably) pairs as (high, high)/(low, low) and vanishes —
+# diagnosed with a raw ReadConsoleInputW probe, 2026-07-25. Upstream releases
+# are infrequent, so banto rides a pinned one-commit fork of the 0.29 tag
+# (fix also PR'd upstream; drop this patch when a release carries it).
+[patch.crates-io]
+crossterm = { git = "https://github.com/kt81/crossterm", branch = "banto/0.29-emoji-panel-fix" }
