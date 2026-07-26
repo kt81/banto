@@ -37,11 +37,10 @@ use banto_core::config::OpenerMode;
 use banto_core::model::{SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
 use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::{ProcessRunner, SystemProcessRunner};
-use banto_io::provider::SessionProvider;
-use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::status::{SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
 use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource};
@@ -124,6 +123,10 @@ struct Context<'a> {
     /// sites below don't each need a place of their own to hold one just to
     /// satisfy a borrow.
     claude_home: ClaudeHome,
+    /// `None` when Codex home resolution failed entirely (no home
+    /// directory) or `$CODEX_HOME`/`~/.codex` simply doesn't exist yet —
+    /// either way, no Codex sessions, not an error.
+    codex_home: Option<CodexHome>,
     thresholds: &'a AgeThresholds,
     /// `RefCell`-wrapped — see `main`'s construction site for why.
     store: &'a RefCell<Store>,
@@ -227,11 +230,12 @@ impl LiveWatch {
 
 pub fn run(
     claude_home: &ClaudeHome,
+    codex_home: Option<CodexHome>,
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
 ) -> Result<()> {
-    let metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
+    let metas = session::discover_all(claude_home, codex_home.as_ref())?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
@@ -261,6 +265,7 @@ pub fn run(
         .with_superseded(superseded);
     let ctx = Context {
         claude_home: claude_home.clone(),
+        codex_home,
         thresholds,
         store,
         opener_mode,
@@ -1672,7 +1677,7 @@ fn toggle_agent_filter(app: &mut App) {
 /// are kept rather than the TUI erroring out over a transient filesystem
 /// hiccup.
 fn reload(app: &mut App, ctx: &Context) {
-    if let Ok(metas) = ClaudeCodeProvider::new(ctx.claude_home.clone()).discover() {
+    if let Ok(metas) = session::discover_all(&ctx.claude_home, ctx.codex_home.as_ref()) {
         let store = ctx.store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);
         let rows = session::rows_from_metas(metas, &ctx.claude_home, ctx.thresholds);
@@ -1910,6 +1915,7 @@ mod tests {
     ) -> Context<'a> {
         Context {
             claude_home: ClaudeHome::new(PathBuf::from(".")),
+            codex_home: None,
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,

@@ -5,8 +5,13 @@
 //! 2. `Config.claude_home` from banto's own `config.toml`,
 //! 3. the provider default (`~/.claude`).
 //!
-//! Everything under the resolved Claude home is treated as strictly
-//! read-only.
+//! Codex home resolution has no flag or config field yet: `$CODEX_HOME` if
+//! set, else the provider default (`~/.codex`) — see
+//! [`CodexHome::default_home`]. A Codex home that fails to resolve at all
+//! simply means no Codex sessions, not a startup error.
+//!
+//! Everything under the resolved Claude home, and under the resolved Codex
+//! home, is treated as strictly read-only.
 //! banto's own database (session <-> pane map, groups, pins) lives under
 //! `Config.db_path`, falling back to [`config::default_db_path`].
 //!
@@ -29,6 +34,7 @@ use clap::{Parser, Subcommand};
 use banto_core::config::Config;
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
 use banto_io::config;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::SystemProcessRunner;
@@ -146,8 +152,9 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::List) => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let codex_home = CodexHome::default_home();
             let thresholds = thresholds_from(&config.activity);
-            run_list(&claude_home, &thresholds)
+            run_list(&claude_home, codex_home.as_ref(), &thresholds)
         }
         Some(Command::Wrap {
             session,
@@ -218,7 +225,8 @@ fn main() -> Result<()> {
                     &config.keys,
                 )
             } else {
-                tui::run(&claude_home, &thresholds, config.opener, &store)
+                let codex_home = CodexHome::default_home();
+                tui::run(&claude_home, codex_home, &thresholds, config.opener, &store)
             }
         }
     }
@@ -270,8 +278,12 @@ fn open_store(config: &Config) -> Result<Store> {
 }
 
 /// `banto list`: one line per session — activity tag, id, title, cwd.
-fn run_list(claude_home: &ClaudeHome, thresholds: &AgeThresholds) -> Result<()> {
-    let rows = load_rows(claude_home, thresholds).context("failed to read sessions")?;
+fn run_list(
+    claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+    thresholds: &AgeThresholds,
+) -> Result<()> {
+    let rows = load_rows(claude_home, codex_home, thresholds).context("failed to read sessions")?;
     for row in &rows {
         let title = row.title.as_deref().unwrap_or("(no title)");
         let cwd = row

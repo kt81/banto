@@ -1,9 +1,11 @@
 //! Session discovery and parsing.
 //!
-//! [`SessionProvider`] abstracts the agent product whose sessions we index.
-//! The only implementation for now is Claude Code ([`claude_code`]).
+//! [`SessionProvider`] abstracts the agent product whose sessions we index:
+//! Claude Code ([`claude_code`], tolerant JSONL parsing) and Codex
+//! ([`codex`], a sqlite index).
 
 pub mod claude_code;
+pub mod codex;
 
 use std::path::Path;
 use std::time::SystemTime;
@@ -59,9 +61,17 @@ pub trait SessionProvider {
     }
 }
 
-/// Errors that abort discovery entirely (per-file problems are skipped).
+/// Errors that abort discovery entirely (per-file/per-row problems are
+/// skipped).
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("provider root not accessible: {0}")]
     Io(#[from] std::io::Error),
+    /// A provider database exists but could not be opened or queried — e.g.
+    /// corrupt, or locked in a way the read-only open path doesn't tolerate.
+    /// A database that simply does not exist yet (Codex never run) is not
+    /// this: [`codex`] degrades that to an empty result, the same way
+    /// [`claude_code`] degrades a missing `projects/` directory.
+    #[error("provider database not accessible: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }

@@ -115,6 +115,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "ratatui",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

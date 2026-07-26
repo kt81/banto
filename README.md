@@ -112,9 +112,9 @@ ferrying at all. This repository was largely built through that loop.
 
 ## Read-only guarantee
 
-**banto never writes anything under `~/.claude`.** Session `.jsonl` files,
-live-state files, history — all strictly read-only. banto's own data lives
-under its own directories:
+**banto never writes anything under `~/.claude` or `~/.codex`.** Session
+`.jsonl` files, live-state files, history, Codex's `threads` sqlite index —
+all strictly read-only. banto's own data lives under its own directories:
 
 - Config: `dirs::config_dir()/banto/config.toml`
   (Windows: `%APPDATA%\banto\`) by default — see
@@ -126,6 +126,19 @@ under its own directories:
 Even the MCP wiring honors this: member `--mcp-config` files are written
 under banto's data dir and passed by argv, never installed into Claude's own
 configuration.
+
+**One named exception.** Reading Codex's `threads` database while Codex
+itself might be writing it needs SQLite's own read-only machinery, chosen by
+which sidecar files are present: `mode=ro` when a `-wal` file exists (a
+database Codex may be actively writing), `immutable=1` when it does not (a
+cleanly-closed database, where `immutable=1` alone could otherwise return a
+stale snapshot if a writer started between the check and the open). The one
+case this doesn't cover for free is crash residue — a `-wal` left behind
+without its `-shm` sidecar (e.g. Codex was killed mid-write) — where the
+first `mode=ro` open recreates a fresh `-shm`: a single ~32KB write, SQLite's
+own coordination index rather than banto's data, and one Codex's own next
+run would create regardless. Named here rather than smoothed over, because
+"banto never writes" should mean exactly what it says everywhere else.
 
 ## Install & run
 

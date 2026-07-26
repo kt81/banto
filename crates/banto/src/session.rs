@@ -13,7 +13,9 @@ pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket, SessionMeta};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::provider::codex::CodexProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
 use banto_io::status::{self, SysinfoProbe};
 
@@ -43,21 +45,38 @@ pub fn activity_tag(activity: Activity) -> &'static str {
     }
 }
 
-/// Discover sessions under `claude_home`, classify their activity, and return
-/// them sorted by mtime descending (newest first), with session id as a
-/// deterministic tie-breaker. A thin wrapper — discover, then
-/// [`rows_from_metas`] — kept for callers that only want rows and have no
-/// reason to run a second discover() pass of their own.
+/// Discover sessions under `claude_home` (and `codex_home`, when resolved),
+/// classify their activity, and return them sorted by mtime descending
+/// (newest first), with session id as a deterministic tie-breaker. A thin
+/// wrapper — [`discover_all`], then [`rows_from_metas`] — kept for callers
+/// that only want rows and have no reason to run a second discovery pass of
+/// their own.
 ///
-/// Read-only: this reads `<claude_home>/projects` and `<claude_home>/sessions`
-/// and never writes anywhere.
+/// Read-only: this reads `<claude_home>/projects`, `<claude_home>/sessions`,
+/// and `codex_home`'s `threads` database, and never writes anywhere.
 pub fn load_rows(
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
 ) -> Result<Vec<SessionRow>, ProviderError> {
-    let provider = ClaudeCodeProvider::new(claude_home.clone());
-    let metas = provider.discover()?;
+    let metas = discover_all(claude_home, codex_home)?;
     Ok(rows_from_metas(metas, claude_home, thresholds))
+}
+
+/// Every session both providers know about, merged (not deduplicated: the
+/// two products never share a session id). Codex is skipped entirely when
+/// `codex_home` is `None` — an absent Codex home degrades to "no Codex
+/// sessions", not an error, the same way a missing `threads` database
+/// inside [`CodexProvider::discover`] does.
+pub fn discover_all(
+    claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+) -> Result<Vec<SessionMeta>, ProviderError> {
+    let mut metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
+    if let Some(codex_home) = codex_home {
+        metas.extend(CodexProvider::new(codex_home.clone()).discover()?);
+    }
+    Ok(metas)
 }
 
 /// The conversion half of [`load_rows`] — classify and sort already-
@@ -220,9 +239,58 @@ mod tests {
         filetime_set(&projects.join("new.jsonl"), newer);
 
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
-        let rows = load_rows(&claude_home, &AgeThresholds::default()).unwrap();
+        let rows = load_rows(&claude_home, None, &AgeThresholds::default()).unwrap();
         let titles: Vec<_> = rows.iter().map(|r| r.display_title().to_string()).collect();
         assert_eq!(titles, vec!["New".to_string(), "Old".to_string()]);
+    }
+
+    #[test]
+    fn discover_all_merges_claude_and_codex_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let projects = claude_root.join("projects").join("proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("claude-1.jsonl"),
+            "{\"type\":\"custom-title\",\"customTitle\":\"Claude session\"}\n",
+        )
+        .unwrap();
+
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let rollout = codex_root.join("rollout.jsonl");
+        std::fs::write(&rollout, "x").unwrap();
+        let codex_home = banto_io::codex_home::CodexHome::new(codex_root);
+        let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, \
+             rollout_path TEXT, first_user_message TEXT, updated_at_ms INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, rollout_path, updated_at_ms) \
+             VALUES ('codex-1', 'Codex session', ?1, 0)",
+            rusqlite::params![rollout.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn); // clean close: no -wal left behind for discover() to open around
+
+        let claude_home = ClaudeHome::new(claude_root);
+        let metas = discover_all(&claude_home, Some(&codex_home)).unwrap();
+        let mut ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["claude-1".to_string(), "codex-1".to_string()]);
+        let agents: Vec<_> = metas.iter().map(|m| m.agent).collect();
+        assert!(agents.contains(&AgentKind::ClaudeCode));
+        assert!(agents.contains(&AgentKind::Codex));
+    }
+
+    #[test]
+    fn discover_all_skips_codex_entirely_when_its_home_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let metas = discover_all(&claude_home, None).unwrap();
+        assert!(metas.is_empty());
     }
 
     #[test]

@@ -142,6 +142,52 @@ Note: the format is undocumented and subject to change. Defend with **lenient
 parsing** (ignore unknown records/fields, skip broken lines) plus tests against
 synthetic fixtures. **Never bring real session data into the repository.**
 
+## Codex data sources (observed 2026-07-26, this machine's installed Codex CLI)
+
+Nothing like Claude Code's layout: no `projects/`, no per-session `.jsonl`
+directory tree banto walks itself. One sqlite database, one table.
+
+| Source | Content |
+|---|---|
+| `$CODEX_HOME` (else `~/.codex`)`/state_5.sqlite`, `threads` table | One row per session. Columns banto reads: `id`, `title`, `cwd`, `rollout_path`, `first_user_message`, `updated_at_ms`. The filename (`state_5.sqlite`) is what this machine's installed version uses; a future Codex CLI could rename it |
+| `threads.rollout_path` | The session transcript file itself, under a `sessions/` tree whose internal (date-partitioned) layout banto does not rely on — the path comes from the column directly, never from walking the tree |
+| `threads.cwd` | Carries a Windows extended-length path prefix (`\\?\`) that a rollout file's own recorded cwd does not — normalized once, in `provider::codex`, at the point this becomes `SessionMeta.cwd` |
+| `threads.updated_at_ms` | Milliseconds since the Unix epoch, application-reported by Codex — not a filesystem mtime the way Claude Code's is. `SessionMeta.mtime` says so |
+| `$CODEX_HOME/logs_2.sqlite`, `logs.process_uuid` (`pid:<PID>:<suffix>`) | Process liveness — not read by discovery; for the liveness round that follows this one, which must re-verify its own version of the read-only-access question below rather than assume `state_5.sqlite`'s answer transfers to a different database file |
+
+**Reading a database Codex itself may be writing (measured directly, this
+session, rusqlite 0.40.1 bundled — the version this workspace pins).** Two
+open forms, both able to read correctly, neither always safe alone:
+- `mode=ro` is always correct — it sees every committed row, including a
+  writer's in-flight commits — and on its own writes nothing, but opening it
+  against a **cold** database (no `-wal`/`-shm` sidecars yet) creates those
+  sidecars on first touch: a write into a directory banto promises never to
+  write to.
+- `immutable=1` never creates a sidecar, but read against an **actively
+  written** database it can silently return a stale or incomplete snapshot —
+  wrong, not just old.
+
+The resolution: stat for the `-wal` sidecar first. Present -> `mode=ro`
+(warm, correct, no new sidecar since one already exists). Absent ->
+`immutable=1` (cold, correct, no sidecar created). This is correct in every
+case and zero-write in every case but one: **crash residue** — `-wal`
+present, its `-shm` sidecar absent (e.g. Codex was killed mid-write) — where
+`mode=ro` recreates a fresh `-shm` on that first read, a single ~32KB write.
+It is SQLite's own coordination index, not banto's data, and Codex's own
+next run would create it regardless, but it is a write, so the README's
+read-only section names it rather than smoothing it over.
+
+One more edge, benign: a **TOCTOU** gap between the stat and the open — a
+database that was cold a moment ago gets a writer between the two, and this
+approach opens it `immutable=1` anyway, returning the pre-write snapshot
+rather than an error. Stale for one poll cycle, not wrong, and
+self-correcting the next time discovery stats and finds `-wal` now present.
+
+Note: like Claude Code's format, this is undocumented and can change between
+Codex CLI versions. Same defense: **lenient parsing** (a malformed row is
+skipped, not fatal) plus synthetic-fixture tests. **Never bring a real
+`~/.codex` database into the repository.**
+
 ## Module layout
 
 Four crates, split along the TEA / sans-IO boundary
@@ -153,12 +199,13 @@ provider/status/store/opener/config modules once sketched here as
 crates/
 ├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/search/replay
 ├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
-│  ├─ provider/         # SessionProvider trait + claude_code impl (discovery/parsing)
-│  ├─ status/           # live state (sessions/<pid>.json + PID liveness)
+│  ├─ provider/         # SessionProvider trait + claude_code impl (JSONL) + codex impl (sqlite)
+│  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
 │  ├─ store/            # rusqlite: groups/pins/archived, brigades, session<->pane map
 │  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
 │  ├─ watch/            # filesystem watching (notify) for live TUI updates
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
+│  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
 │  ├─ process.rs        # resumed-session process spawning

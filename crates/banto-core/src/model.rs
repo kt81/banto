@@ -17,14 +17,14 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// Which agent product a session belongs to. One variant today; a second
-/// agent product is planned, and this is the axis it lands on — which is
-/// why it is an enum rather than the bare string it replaced.
-/// `SessionProvider` (`banto-io`) keeps its own name: a provider *provides*
-/// sessions, this says *whose*.
+/// Which agent product a session belongs to — the axis this exists to
+/// distinguish, which is why it is an enum rather than the bare string it
+/// replaced. `SessionProvider` (`banto-io`) keeps its own name: a provider
+/// *provides* sessions, this says *whose*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     ClaudeCode,
+    Codex,
 }
 
 /// Metadata for one discovered session, provider-agnostic.
@@ -37,16 +37,25 @@ pub struct SessionMeta {
     pub title: Option<String>,
     /// Working directory the session ran in, if it could be determined.
     pub cwd: Option<PathBuf>,
-    /// Path to the session's source file (.jsonl for Claude Code).
+    /// Path to the session's source file: the `.jsonl` for Claude Code, the
+    /// rollout file for Codex.
     pub source_path: PathBuf,
-    /// Last modification time of the source file.
+    /// When this session was last touched — not the same *kind* of fact for
+    /// every product: a filesystem mtime for Claude Code (the source file's
+    /// own), an application-reported timestamp for Codex
+    /// (`threads.updated_at_ms`, whatever Codex itself considers last
+    /// activity). Not reconciled to a common meaning here.
     pub mtime: SystemTime,
     /// Source file size in bytes.
     pub size: u64,
-    /// True when this session was run by a spawned agent (subagent /
-    /// Agent-Teams teammate) rather than started interactively by the user.
-    /// Detected from a `{"type":"agent-setting"}` record in the file head
-    /// (observed 2026-07-19); interactive sessions start with `mode` records.
+    /// Whether this session was run by a spawned agent (Claude Code's
+    /// subagent / Agent-Teams teammate) rather than a human at the
+    /// keyboard — narrower than the field's own name suggests: "no signal
+    /// either way" must default to `false` (assume a human was there, keep
+    /// the session visible), never to `true`. Claude Code sets this from a
+    /// `{"type":"agent-setting"}` record in the file head (observed
+    /// 2026-07-19; interactive sessions start with `mode` records instead).
+    /// Codex always reports `false` — it has no equivalent signal yet.
     pub is_agent: bool,
     /// Short single-line excerpt of the first user message, for the summary
     /// panel. Independent of `title` (which may come from custom/ai titles).
