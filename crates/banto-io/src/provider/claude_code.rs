@@ -57,35 +57,27 @@ impl ClaudeCodeProvider {
     pub fn default_home() -> Option<PathBuf> {
         dirs::home_dir().map(|home| home.join(".claude"))
     }
+}
 
-    /// Find the session Claude Code most recently created or updated for
-    /// `cwd` at or after `since`.
-    ///
-    /// Used to discover the session id assigned to a `claude` process that
-    /// was launched without a known session id (e.g. banto's "new session"
-    /// flow). Matching is done on the `cwd` recorded *inside* each candidate
-    /// file's head record (the same field `read_session` extracts), not by
-    /// decoding the project directory name: Claude's cwd-to-directory-name
-    /// encoding is lossy (`:`, `\`, `/`, and `.` all collapse to `-`), so a
-    /// renamed project can leave files with different recorded cwd values
-    /// in the same directory.
-    ///
-    /// `since` is compared against each file's filesystem mtime, which can
-    /// have coarse resolution; callers should capture `since` a moment
-    /// *before* launching the new session so a file created in the same
-    /// clock tick is not missed.
-    ///
-    /// Read-only like the rest of this provider: unreadable or broken files
-    /// are skipped, and a missing `projects` directory yields `None`. When
-    /// several candidates match, the one with the greatest mtime wins.
-    pub fn find_new_session(&self, cwd: &Path, since: SystemTime) -> Option<SessionId> {
+impl SessionProvider for ClaudeCodeProvider {
+    fn name(&self) -> &'static str {
+        PROVIDER_NAME
+    }
+
+    fn discover(&self) -> Result<Vec<SessionMeta>, ProviderError> {
         let projects = self.claude_home.join("projects");
-        let entries = fs::read_dir(&projects).ok()?;
+        let entries = match fs::read_dir(&projects) {
+            Ok(entries) => entries,
+            // A Claude home without a projects dir simply has no sessions.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(ProviderError::Io(err)),
+        };
 
-        let mut best: Option<(SystemTime, SessionId)> = None;
+        let mut sessions = Vec::new();
         for project in entries {
             let Ok(project) = project else { continue };
             let project_path = project.path();
+            // One level of project directories; stray files are ignored.
             if !project_path.is_dir() {
                 continue;
             }
@@ -94,60 +86,15 @@ impl ClaudeCodeProvider {
             };
             for file in files {
                 let Ok(file) = file else { continue };
-                let path = file.path();
-                if !path.extension().is_some_and(|ext| ext == "jsonl") {
-                    continue;
-                }
-                let Ok(metadata) = fs::metadata(&path) else {
-                    continue;
-                };
-                if !metadata.is_file() {
-                    continue;
-                }
-                let Ok(mtime) = metadata.modified() else {
-                    continue;
-                };
-                if mtime < since {
-                    continue;
-                }
-                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let Ok(head) = read_head(&path, HEAD_CAP_BYTES) else {
-                    continue;
-                };
-                let fields = extract_head_fields(&head);
-                if fields.cwd.as_deref() != Some(cwd) {
-                    continue;
-                }
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_mtime, _)| mtime > *best_mtime)
-                {
-                    best = Some((mtime, SessionId(id.to_string())));
+                if let Some(meta) = read_session(&file.path()) {
+                    sessions.push(meta);
                 }
             }
         }
-        best.map(|(_, id)| id)
+        Ok(sessions)
     }
 
-    /// Find every session Claude Code created or updated for `cwd` at or
-    /// after `since`, sorted oldest-first by mtime (ties broken by id).
-    ///
-    /// [`Self::find_new_session`] alone can only ever report the single
-    /// newest match, which collides when several new sessions are launched
-    /// into the *same* cwd around the same instant (e.g. an emporium brigade
-    /// auto-spawning several fresh Workers in the Director's cwd at once) —
-    /// each caller's independent `find_new_session` call would then resolve
-    /// to the identical "newest" file, double-assigning it to more than one
-    /// pending session. Callers needing to disambiguate a batch should fetch
-    /// every match once via this method and assign candidates to pending
-    /// entries themselves, excluding ids already claimed elsewhere.
-    ///
-    /// Otherwise identical to [`Self::find_new_session`]: read-only, tolerant
-    /// of unreadable/broken files, matches on the cwd recorded inside each
-    /// candidate's head record.
-    pub fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
+    fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
         let projects = self.claude_home.join("projects");
         let Ok(entries) = fs::read_dir(&projects) else {
             return Vec::new();
@@ -196,42 +143,6 @@ impl ClaudeCodeProvider {
         }
         matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.0.cmp(&b.1.0)));
         matches.into_iter().map(|(_, id)| id).collect()
-    }
-}
-
-impl SessionProvider for ClaudeCodeProvider {
-    fn name(&self) -> &'static str {
-        PROVIDER_NAME
-    }
-
-    fn discover(&self) -> Result<Vec<SessionMeta>, ProviderError> {
-        let projects = self.claude_home.join("projects");
-        let entries = match fs::read_dir(&projects) {
-            Ok(entries) => entries,
-            // A Claude home without a projects dir simply has no sessions.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(ProviderError::Io(err)),
-        };
-
-        let mut sessions = Vec::new();
-        for project in entries {
-            let Ok(project) = project else { continue };
-            let project_path = project.path();
-            // One level of project directories; stray files are ignored.
-            if !project_path.is_dir() {
-                continue;
-            }
-            let Ok(files) = fs::read_dir(&project_path) else {
-                continue;
-            };
-            for file in files {
-                let Ok(file) = file else { continue };
-                if let Some(meta) = read_session(&file.path()) {
-                    sessions.push(meta);
-                }
-            }
-        }
-        Ok(sessions)
     }
 }
 
@@ -977,6 +888,42 @@ mod tests {
 
         let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
         assert_eq!(found, Some(SessionId("later".to_string())));
+    }
+
+    #[test]
+    fn find_new_session_breaks_a_tied_mtime_deterministically_by_id() {
+        // `find_new_session` is a default method built on `find_new_sessions`
+        // (which already breaks ties by id) rather than its own independent
+        // walk that used to keep whichever candidate `read_dir` happened to
+        // yield last on a tie — i.e. nondeterministically. The
+        // lexicographically greatest id must now win regardless of
+        // creation/write order.
+        let root = TempDir::new().unwrap();
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let tie_time = since + Duration::from_secs(1);
+
+        // Write the lexicographically *later* id first, so an
+        // iteration/creation-order-dependent implementation would be likely
+        // to pick the wrong one.
+        let later = write_session(
+            &root,
+            "proj",
+            "zzz.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&later, tie_time);
+        let earlier = write_session(
+            &root,
+            "proj",
+            "aaa.jsonl",
+            r#"{"type":"user","cwd":"/work/proj","message":{"content":"hi"}}
+"#,
+        );
+        set_mtime(&earlier, tie_time);
+
+        let found = provider(&root).find_new_session(Path::new("/work/proj"), since);
+        assert_eq!(found, Some(SessionId("zzz".to_string())));
     }
 
     #[test]

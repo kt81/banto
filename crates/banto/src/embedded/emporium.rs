@@ -818,7 +818,7 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
 /// this same pass.
 fn poll_discovery(
     trackers: &mut Vec<DiscoveryTracker>,
-    provider: &ClaudeCodeProvider,
+    provider: &dyn SessionProvider,
     claimed: &HashSet<String>,
     live: &[LiveSession],
 ) -> Vec<Event> {

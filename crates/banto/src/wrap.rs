@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use banto_core::model::SessionId;
 use banto_io::opener::{Backend, CommandRunner, CommandSpec, SessionHandle};
 use banto_io::process::{ProcessRunner, SpawnedProcess};
-use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::provider::SessionProvider;
 use banto_io::store::{PaneRecord, Store};
 
 /// Register this process's PID, run `argv` to completion, then clean up the
@@ -110,7 +110,7 @@ const DISCOVERY_TIMEOUT_POLLS: u32 = 600;
 /// passed to `find_new_session` as `since`. Filesystem mtime resolution can
 /// be coarse enough that a session file created in the very same tick as
 /// the capture would otherwise be missed (see
-/// `ClaudeCodeProvider::find_new_session`'s own doc comment) — 2s is a
+/// [`SessionProvider::find_new_session`]'s own doc comment) — 2s is a
 /// generous margin for that without meaningfully risking a false match
 /// against some unrelated pre-existing session in the same cwd (which
 /// would need to have been touched within that same couple of seconds).
@@ -123,7 +123,7 @@ const DISCOVERY_SINCE_SLOP: Duration = Duration::from_secs(2);
 pub struct NewSessionDeps<'a> {
     pub process_runner: &'a dyn ProcessRunner,
     pub command_runner: &'a dyn CommandRunner,
-    pub provider: &'a ClaudeCodeProvider,
+    pub provider: &'a dyn SessionProvider,
 }
 
 /// Diagnostic log for [`run`]/[`run_new_session`]'s tracking flow, enabled
@@ -195,7 +195,7 @@ impl WrapLog {
 /// session id up front (`argv` is plain `claude`, no `--resume <id>`), so
 /// this process discovers both where it itself landed
 /// ([`resolve_own_pane`]) and which session id Claude assigns to `cwd`
-/// ([`ClaudeCodeProvider::find_new_session`]) while the child is still
+/// ([`SessionProvider::find_new_session`]) while the child is still
 /// running ([`track_new_session`]), then writes the pane record itself —
 /// there is no pre-existing one from an `open_*` call to attach to, since
 /// the opener that spawned this process had no session id to key one
@@ -478,6 +478,7 @@ mod tests {
     use super::*;
     use banto_io::opener::{CommandOutput, OpenError};
     use banto_io::process::mock::{MockProcessRunner, MockSpawnedProcess};
+    use banto_io::provider::claude_code::ClaudeCodeProvider;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::fs;
