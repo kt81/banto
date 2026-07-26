@@ -103,16 +103,27 @@ synthetic fixtures. **Never bring real session data into the repository.**
 
 ## Module layout
 
+Four crates, split along the TEA / sans-IO boundary
+(`docs/DISCIPLINE.md`) — `banto-core` is UI-free *and* I/O-free; the
+provider/status/store/opener/config modules once sketched here as
+`banto-core` submodules live in `banto-io`, not there:
+
 ```
 crates/
-├─ banto-core/          # UI-free logic (everything testable)
+├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/search/replay
+├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
 │  ├─ provider/         # SessionProvider trait + claude_code impl (discovery/parsing)
-│  ├─ status/           # live state (sessions/<pid>.json + PID liveness + mtime buckets)
+│  ├─ status/           # live state (sessions/<pid>.json + PID liveness)
 │  ├─ store/            # rusqlite: groups/pins/archived, brigades, session<->pane map
-│  ├─ search/           # nucleo fuzzy search
 │  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
-│  └─ config/           # config.toml (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir), DB in dirs::data_local_dir/banto
-└─ banto/               # bin: ratatui TUI + clap subcommands (banto, banto _wrap, ...)
+│  ├─ watch/            # filesystem watching (notify) for live TUI updates
+│  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
+│  ├─ lineage.rs        # auto-compaction parent-link resolution
+│  ├─ pty.rs            # PTY host abstraction (portable-pty)
+│  ├─ process.rs        # resumed-session process spawning
+│  └─ config.rs         # config.toml (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir), DB in dirs::data_local_dir/banto
+├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view/render_modal
+└─ banto/               # bin: ratatui TUI + clap subcommands (banto, banto _wrap, banto _mcp, ...) — chōba's tui.rs + the emporium's embedded/
 ```
 
 ## Opener spec

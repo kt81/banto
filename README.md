@@ -221,9 +221,14 @@ crates/
 └─ banto/       # the bin: event loops, executors, the crossterm boundary
 ```
 
-The boundary is compiler-enforced: `banto-core` cannot name crossterm,
-rusqlite, a clock, or a file without failing to build. Event streams can be
-recorded (`BANTO_RECORD_EVENTS`) and replayed deterministically
+Part of the boundary is compiler-enforced: `banto-core`'s `Cargo.toml`
+carries no dependency on crossterm, rusqlite, or a terminal/PTY backend, so
+naming any of them fails to build. It is not enforced against a clock or a
+file the same way — `std::time` and `std::fs`/`std::path` are always in
+scope for any Rust crate regardless of its dependency list — so those
+prohibitions are maintained by review (see `docs/DISCIPLINE.md` §2 for the
+full breakdown, including a real breach that survived it). Event streams can
+be recorded (`BANTO_RECORD_EVENTS`) and replayed deterministically
 (`banto_core::replay`) — timeouts and debounces are tested by arithmetic,
 not by sleeping.
 

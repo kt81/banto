@@ -10,7 +10,11 @@ Not beauty — **decisions made in advance**:
 
 - New code has exactly one place to go (an AI collaborator never has to
   invent structure).
-- Violations are detected mechanically (the compiler, not review).
+- Some violations are detected mechanically — the compiler catches a
+  forbidden *dependency* (see §2). The rest — a forbidden *std* API like
+  file, clock, process, or network access — cannot be caught that way and
+  rely on review; §2 says which is which, and records a real one that got
+  through.
 - **No exceptions.** "Usually X, but it depends" is worse than no rule: it
   reintroduces the reasoning cost the rule existed to remove. The two scoped
   relaxations in §6 are *part of the rule*, stated once, not judgment calls.
@@ -24,12 +28,31 @@ Everything below is this sentence unpacked, plus how it is enforced.
 
 ## 2. Crate layout
 
-Enforcement belongs to Cargo, not documentation: the dependency graph makes
-violations fail to build.
+Enforcement is split, and the two halves are not equally strong.
 
-| crate | responsibility | must never depend on |
+Cargo's dependency graph makes it fail to build for `banto-core`/`banto-tui`
+to name a *crate* they don't depend on — `crossterm`, `rusqlite`,
+`portable-pty`, `notify`, `sysinfo` are all absent from those two crates'
+`Cargo.toml`, so using any of them is a compile error, not a review finding.
+This is real, mechanical enforcement.
+
+It does **not** cover §3's std-level prohibitions. `std::fs`, `std::time`,
+`std::process`, and `std::net` ship with every Rust crate regardless of its
+`Cargo.toml` — there is no dependency to remove, so there is nothing for the
+compiler to reject. "No file reads or writes," "no clock access," "no
+process spawning," and "no network" are maintained by review alone.
+
+**This is not hypothetical.** R37 (2026-07-26) found `Path::is_dir()` sitting
+in `banto-core/src/engine.rs`'s new-session confirm path — it compiled
+cleanly and shipped through several prior cleanup rounds before anyone read
+past it. It was fixed by moving the check to a `Cmd`/`Event` round trip
+(§4); the point stands regardless: a std-level prohibition can be violated
+and built successfully for as long as nobody happens to read that exact
+line.
+
+| crate | responsibility | crate-level dependency it must never carry |
 |---|---|---|
-| `banto-core` | `Event` → `State` transitions, `Cmd` production | process spawning, file I/O, clocks, `crossterm`, sqlite |
+| `banto-core` | `Event` → `State` transitions, `Cmd` production | `crossterm`, `rusqlite`, `portable-pty`, `notify`, `sysinfo` |
 | `banto-tui` | rendering from `&State` | same (no queries during drawing) |
 | `banto-io` | PTY/process spawning, jsonl reads, sqlite, clock, input events, fs watch, MCP stdio | `banto-core` internals (only `Event`/`Cmd`) |
 | `banto-app` | wiring: `banto-io` ↔ `banto-core` ↔ `banto-tui` | — |
@@ -55,6 +78,8 @@ state out); it lives in core as `State` (`banto_core::screen`), fed by
 output-chunk `Event`s.
 
 ## 3. Prohibitions (core and tui)
+
+None of the following is compiler-checked (see §2) — each relies on review.
 
 - No process spawning.
 - No file reads or writes.
@@ -191,7 +216,8 @@ suite) before the next begins.
     `Ctrl+B` prefix, double-tap to send a literal `Ctrl+B` through), which
     also retires the F-key dependency.
 - **Phase 3 — physical crate split** per §2; the compiler becomes the
-  enforcer.
+  enforcer for the crate-level prohibitions §2's table lists (not the
+  std-level ones in §3 — see §2's R37 note).
 - **Phase 4 — record/replay infrastructure** per §8.
 
 ## Appendix A — I/O inventory (verified against code in Phase 0)
