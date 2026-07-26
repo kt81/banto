@@ -1,15 +1,22 @@
 //! Persistent store: sqlite (rusqlite, bundled) under `dirs::data_local_dir()/banto`.
 //!
 //! Responsibilities (docs/REQUIREMENTS.md "Module layout"):
-//! - session index cache (metadata mirror of provider discovery) + FTS5 text index
 //! - groups / pins / archived sessions (banto-owned; never written to
 //!   Claude's files)
 //! - session <-> pane mapping for the opener (phase 2 consumes this)
 //!
-//! Paths are persisted lossily via `to_string_lossy`: non-UTF-8 path
-//! components round-trip as U+FFFD replacement characters. This is acceptable
-//! because the store is a display/search cache; the provider remains the
-//! source of truth for real paths.
+//! A session index cache + FTS5 text index (mirroring provider discovery)
+//! lived here through schema v10; it had no production callers (discovery
+//! always fed the UI directly, and search runs live through nucleo) and was
+//! removed in v11 (see `migrations::MIGRATIONS`).
+//!
+//! With it went the last thing here that mirrored the provider, and the only
+//! place a filesystem path was ever persisted. What remains is banto's own
+//! state, keyed by session id and holding no paths at all — so the store is
+//! no longer a cache of anything, and nothing in it can go stale against
+//! `~/.claude`. Rows deliberately keep no foreign key to a session, which is
+//! what lets a pin or a group survive a source that is temporarily
+//! unavailable.
 
 mod archive;
 mod brigades;
@@ -18,7 +25,6 @@ mod lineage;
 mod migrations;
 mod panes;
 mod pins;
-mod sessions;
 
 pub use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
@@ -138,14 +144,6 @@ pub(crate) mod test_util {
             is_agent: false,
             preview: None,
             continuation_of_uuid: None,
-        }
-    }
-
-    /// Same as [`meta`], but flagged as run by a spawned agent.
-    pub fn agent_meta(id: &str, title: Option<&str>, cwd: Option<&str>) -> SessionMeta {
-        SessionMeta {
-            is_agent: true,
-            ..meta(id, title, cwd)
         }
     }
 }

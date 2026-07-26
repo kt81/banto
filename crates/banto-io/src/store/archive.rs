@@ -4,7 +4,6 @@
 //! anything or touching pins/groups/panes; `unarchive_session` reverses it.
 //! Mirrors the `pins` table/API shape: a loose reference (no foreign key),
 //! so an archived id survives a source that is temporarily unavailable.
-//! `sync_sessions` never touches this table.
 
 use std::time::SystemTime;
 
@@ -77,18 +76,6 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.archive_session(&sid("a")).unwrap();
         store.archive_session(&sid("a")).unwrap();
-        assert_eq!(store.archived_ids().unwrap(), [sid("a")]);
-    }
-
-    #[test]
-    fn sync_sessions_never_touches_archived_ids() {
-        let mut store = Store::open_in_memory().unwrap();
-        store.archive_session(&sid("a")).unwrap();
-
-        store
-            .sync_sessions(&[super::super::test_util::meta("b", Some("b"), None)])
-            .unwrap();
-
         assert_eq!(store.archived_ids().unwrap(), [sid("a")]);
     }
 }

@@ -52,9 +52,8 @@ const MIGRATIONS: &[&str] = &[
     // Agent-Teams teammate) rather than started interactively.
     "ALTER TABLE sessions ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;",
     // v3: archived sessions (soft-hide; the source file under ~/.claude is
-    // never touched). Mirrors `pins`: a loose reference (no foreign key),
-    // and `sync_sessions` never touches it, so an archived id survives a
-    // source that is temporarily unavailable.
+    // never touched). Mirrors `pins`: a loose reference (no foreign key), so
+    // an archived id survives a source that is temporarily unavailable.
     "CREATE TABLE archived (
         session_id     TEXT PRIMARY KEY,
         archived_at_ms INTEGER NOT NULL
@@ -211,6 +210,21 @@ const MIGRATIONS: &[&str] = &[
         parent_id TEXT NOT NULL
     );
     CREATE INDEX session_lineage_parent ON session_lineage (parent_id);",
+    // v11: the sessions cache mirror and its FTS5 index were a historical
+    // relic — `Store::sync_sessions`/`list_sessions`/`fts_search` had zero
+    // production callers (every provider `discover()` call site feeds the
+    // UI directly; search runs live through nucleo, not FTS5), so the
+    // operator asked to remove the dead tables outright rather than carry
+    // them forward. v1 above still creates `sessions`/`sessions_fts`, and v2
+    // still alters `sessions` to add `is_agent` — DO NOT "clean up" v1/v2 to
+    // match this: a database that has never advanced past v1 still needs
+    // those CREATE/ALTER steps to run before this migration can drop what
+    // they made, and a fresh database always replays every script from v1
+    // forward regardless of what the final schema looks like. Dropping the
+    // FTS5 virtual table first cleans up its shadow tables before the table
+    // it indexes disappears.
+    "DROP TABLE sessions_fts;
+    DROP TABLE sessions;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -236,7 +250,6 @@ pub(super) fn apply(conn: &Connection) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::meta;
     use super::super::{Store, StoreError};
     use super::MIGRATIONS;
     use banto_core::model::SessionId;
@@ -264,15 +277,13 @@ mod tests {
         let db = dir.path().join("nested").join("banto.db");
 
         {
-            let mut store = Store::open(&db).unwrap();
-            store
-                .sync_sessions(&[meta("s1", Some("first"), None)])
-                .unwrap();
+            let store = Store::open(&db).unwrap();
+            store.pin(&SessionId("s1".to_string())).unwrap();
         }
 
         // Reopening must not re-run migrations or lose data.
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.list_sessions().unwrap().len(), 1);
+        assert_eq!(store.pinned_ids().unwrap(), [SessionId("s1".to_string())]);
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -282,12 +293,46 @@ mod tests {
 
     #[test]
     fn v1_to_v2_upgrade_preserves_existing_rows_with_is_agent_defaulting_to_zero() {
+        // v11 later drops `sessions` entirely (see the last entry in
+        // MIGRATIONS), so unlike the other version-transition tests in this
+        // file, this one applies the v1 and v2 scripts directly against a
+        // raw connection instead of going through `Store::open` (which
+        // always advances a database all the way to the latest version) —
+        // the ALTER TABLE itself still has to work correctly for every real
+        // v1 database on its way through to v11, even though nothing can
+        // observe `is_agent` through the public `Store` API once that table
+        // is gone.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        // Build a database as v1 code would have left it: only the v1
+        // script applied, a row inserted without an `is_agent` column.
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, provider, title, cwd, source_path, mtime_ms, size)
+             VALUES ('s1', 'claude-code', 'title', NULL, 'C:/s1.jsonl', 1000, 42)",
+            [],
+        )
+        .unwrap();
+
+        // Apply the v2 script directly: the pre-existing row survives, and
+        // the new column defaults to false.
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        let is_agent: bool = conn
+            .query_row("SELECT is_agent FROM sessions WHERE id = 's1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!is_agent);
+    }
+
+    #[test]
+    fn v1_genesis_database_migrates_all_the_way_to_v11_and_drops_the_sessions_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("banto.db");
 
-        // Build a database as v1 code would have left it: only the v1 script
-        // applied, a row inserted without an `is_agent` column, and
-        // `user_version` left at 1.
+        // Build a database exactly as v1 code would have left it: only the
+        // v1 script applied, `user_version` left at 1, with a real row in
+        // the table v11 is about to drop.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch(MIGRATIONS[0]).unwrap();
@@ -300,20 +345,40 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
 
-        // Opening through Store::open must run the v2 migration (and any
-        // later ones, since `apply` always brings a database to the latest
-        // version) and keep the pre-existing row, defaulting its new column
-        // to false.
+        let table_exists = |store: &Store, name: &str| -> bool {
+            store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // Opening through Store::open must carry a v1-genesis database all
+        // the way to the latest version in one pass, dropping `sessions`
+        // and `sessions_fts` along the way (v11).
         let store = Store::open(&db).unwrap();
-        let listed = store.list_sessions().unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id.0, "s1");
-        assert!(!listed[0].is_agent);
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(!table_exists(&store, "sessions"));
+        assert!(!table_exists(&store, "sessions_fts"));
+
+        // Reopening an already-v11 database is a no-op: no error, same
+        // version, tables still gone.
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(!table_exists(&store, "sessions"));
+        assert!(!table_exists(&store, "sessions_fts"));
     }
 
     #[test]

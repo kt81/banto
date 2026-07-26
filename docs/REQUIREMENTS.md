@@ -108,7 +108,7 @@ crates/
 ├─ banto-core/          # UI-free logic (everything testable)
 │  ├─ provider/         # SessionProvider trait + claude_code impl (discovery/parsing)
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness + mtime buckets)
-│  ├─ store/            # rusqlite: index cache, FTS5, groups/pins, session<->pane map
+│  ├─ store/            # rusqlite: groups/pins/archived, brigades, session<->pane map
 │  ├─ search/           # nucleo fuzzy search
 │  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
 │  └─ config/           # config.toml (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir), DB in dirs::data_local_dir/banto
@@ -198,7 +198,7 @@ Watch `projects/` and `sessions/` with `notify` for realtime updates.
 ## Stack
 
 Rust workspace (edition 2024). ratatui + crossterm / nucleo /
-rusqlite(bundled)+FTS5 / notify / serde, serde_json / clap / dirs /
+rusqlite(bundled) / notify / serde, serde_json / clap / dirs /
 sysinfo (PID liveness) / thiserror, anyhow.
 
 ## Phases
