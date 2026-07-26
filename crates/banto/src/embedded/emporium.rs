@@ -53,6 +53,7 @@ use banto_core::input::InputEvent;
 use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
+use banto_io::claude_home::ClaudeHome;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
@@ -79,7 +80,7 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// Worker launches with, and whether the relay engine is enabled. `keys` is
 /// `[keys]`: the tmux-style prefix chord for pane operations.
 pub fn run(
-    claude_home: &Path,
+    claude_home: &ClaudeHome,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
     brigade: &BrigadeConfig,
@@ -91,7 +92,7 @@ pub fn run(
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    let metas = ClaudeCodeProvider::new(claude_home.to_path_buf()).discover()?;
+    let metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
     // In-memory only, for this process's lifetime — see
     // `crate::tui::superseded_from_metas`'s doc. Created once here and
     // threaded through every reload (the bootstrap below and every later
@@ -168,7 +169,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// lists don't keep growing one-by-one as more reload-path state (like
 /// [`Self::superseded_failed`]) gets threaded through.
 struct Deps<'a> {
-    claude_home: &'a Path,
+    claude_home: &'a ClaudeHome,
     thresholds: &'a AgeThresholds,
     store: &'a RefCell<Store>,
     /// See [`crate::tui::superseded_from_metas`]'s doc: in-memory only, for
@@ -187,7 +188,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
     let mut watch = LiveWatch::new(deps.claude_home);
-    let provider = ClaudeCodeProvider::new(deps.claude_home.to_path_buf());
+    let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
     let mut input_log = open_input_log();
     let mut paste_acc = PasteAccumulator::new();
@@ -294,7 +295,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         if !discovery.is_empty() {
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
-            let live = read_live_sessions(&deps.claude_home.join("sessions"));
+            let live = read_live_sessions(&deps.claude_home.sessions_dir());
             events.extend(poll_discovery(&mut discovery, &provider, &claimed, &live));
         }
 
@@ -508,7 +509,7 @@ fn execute_open_embedded(
     let live = if target.id.is_empty() {
         Vec::new()
     } else {
-        read_live_sessions(&claude_home.join("sessions"))
+        read_live_sessions(&claude_home.sessions_dir())
     };
     let briefing = brigade
         .as_ref()
@@ -777,7 +778,7 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 /// lineage-resolution budget against the same discover() pass (see
 /// [`crate::tui::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(metas) = ClaudeCodeProvider::new(deps.claude_home.to_path_buf()).discover() else {
+    let Ok(metas) = ClaudeCodeProvider::new(deps.claude_home.clone()).discover() else {
         return Vec::new();
     };
     let store = deps.store.borrow();
@@ -885,7 +886,7 @@ fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String>
 fn gather_relay_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
-    claude_home: &Path,
+    claude_home: &ClaudeHome,
 ) -> Vec<RelayObservation> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         return Vec::new();
@@ -895,7 +896,7 @@ fn gather_relay_observations(
         Ok(members) => members,
         Err(_) => return Vec::new(),
     };
-    let live = read_live_sessions(&claude_home.join("sessions"));
+    let live = read_live_sessions(&claude_home.sessions_dir());
     let mut observations = Vec::new();
     for member in &members {
         let Some(claude_session_id) = member.claude_session_id.as_ref() else {
@@ -947,7 +948,7 @@ const FORK_ANCESTRY_DEPTH: u32 = 5;
 fn gather_fork_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
-    claude_home: &Path,
+    claude_home: &ClaudeHome,
     handles: &HashMap<SessionKey, PtyHandle>,
 ) -> Vec<Event> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
@@ -958,7 +959,7 @@ fn gather_fork_observations(
         Ok(members) => members,
         Err(_) => return Vec::new(),
     };
-    let live = read_live_sessions(&claude_home.join("sessions"));
+    let live = read_live_sessions(&claude_home.sessions_dir());
     let probe = SysinfoProbe;
     let mut events = Vec::new();
     for member in &members {
@@ -1801,8 +1802,9 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
         let deps = Deps {
-            claude_home: Path::new("/nonexistent"),
+            claude_home: &claude_home,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
@@ -1867,7 +1869,7 @@ mod tests {
         // as a brand-new session.
         let claude_home = tempfile::tempdir().unwrap();
         let cwd = PathBuf::from("/work/alpha");
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         write_live_state(claude_home.path(), 4242, "w1", &cwd);
         let live = read_live_sessions(&claude_home.path().join("sessions"));
 
@@ -1899,7 +1901,7 @@ mod tests {
         // would later `--resume` a second time. The cwd it records is what
         // gives it away.
         let claude_home = tempfile::tempdir().unwrap();
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         write_live_state(
             claude_home.path(),
             4242,
@@ -1936,7 +1938,7 @@ mod tests {
         // claiming the same session.
         let claude_home = tempfile::tempdir().unwrap();
         let cwd = PathBuf::from("/work/alpha");
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let since = SystemTime::now() - Duration::from_secs(1);
         // `pid: None` is the fallback shape this test is about: no usable
         // child pid, so only the session-file scan can answer.
@@ -2030,7 +2032,12 @@ mod tests {
         };
         handles.insert(SessionKey::from_id("w1-old"), open(&host));
 
-        let events = gather_fork_observations(&state, &store, claude_home.path(), &handles);
+        let events = gather_fork_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+        );
 
         assert!(
             matches!(
@@ -2055,7 +2062,12 @@ mod tests {
         };
         handles.insert(SessionKey::from_id("w1"), open(&host));
 
-        let events = gather_fork_observations(&state, &store, claude_home.path(), &handles);
+        let events = gather_fork_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+        );
 
         assert!(events.is_empty(), "no fork happened: {events:?}");
     }
@@ -2070,7 +2082,12 @@ mod tests {
         // never be known — this must not panic, just find nothing.
         let handles = HashMap::new();
 
-        let events = gather_fork_observations(&state, &store, claude_home.path(), &handles);
+        let events = gather_fork_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+        );
 
         assert!(events.is_empty());
     }
@@ -2253,8 +2270,9 @@ mod tests {
             director_prompt: String::new(),
             ..config.clone()
         };
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
         let deps = |brigade| Deps {
-            claude_home: Path::new("/nonexistent"),
+            claude_home: &claude_home,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,

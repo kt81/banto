@@ -18,6 +18,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use super::{ProviderError, SessionProvider};
+use crate::claude_home::ClaudeHome;
 use banto_core::model::{SessionId, SessionMeta};
 
 /// Stable provider name stored in the DB.
@@ -43,19 +44,14 @@ const TITLE_MAX_CHARS: usize = 200;
 /// Reads session `.jsonl` files under `<claude_home>/projects/`. Everything
 /// under `claude_home` is treated as strictly read-only.
 pub struct ClaudeCodeProvider {
-    claude_home: PathBuf,
+    claude_home: ClaudeHome,
 }
 
 impl ClaudeCodeProvider {
     /// Create a provider rooted at `claude_home`, the directory that
     /// contains `projects/` (normally `~/.claude`).
-    pub fn new(claude_home: PathBuf) -> Self {
+    pub fn new(claude_home: ClaudeHome) -> Self {
         Self { claude_home }
-    }
-
-    /// Default Claude Code home: `~/.claude`, if a home directory exists.
-    pub fn default_home() -> Option<PathBuf> {
-        dirs::home_dir().map(|home| home.join(".claude"))
     }
 }
 
@@ -65,7 +61,7 @@ impl SessionProvider for ClaudeCodeProvider {
     }
 
     fn discover(&self) -> Result<Vec<SessionMeta>, ProviderError> {
-        let projects = self.claude_home.join("projects");
+        let projects = self.claude_home.projects_dir();
         let entries = match fs::read_dir(&projects) {
             Ok(entries) => entries,
             // A Claude home without a projects dir simply has no sessions.
@@ -95,7 +91,7 @@ impl SessionProvider for ClaudeCodeProvider {
     }
 
     fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
-        let projects = self.claude_home.join("projects");
+        let projects = self.claude_home.projects_dir();
         let Ok(entries) = fs::read_dir(&projects) else {
             return Vec::new();
         };
@@ -389,7 +385,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn provider(root: &TempDir) -> ClaudeCodeProvider {
-        ClaudeCodeProvider::new(root.path().to_path_buf())
+        ClaudeCodeProvider::new(ClaudeHome::new(root.path().to_path_buf()))
     }
 
     /// Set a file's mtime deterministically (`File::set_modified`, stable
@@ -802,14 +798,6 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id.0, "a");
         assert_eq!(sessions[1].id.0, "b");
-    }
-
-    #[test]
-    fn default_home_ends_with_dot_claude() {
-        // Only inspects the constructed path; never reads the real ~/.claude.
-        if let Some(home) = ClaudeCodeProvider::default_home() {
-            assert!(home.ends_with(".claude"));
-        }
     }
 
     #[test]

@@ -6,13 +6,13 @@
 //! here writes to disk. Everything under `claude_home` is treated as
 //! strictly read-only.
 
-use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::ActivityConfig;
 pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket, SessionMeta};
 use banto_core::status::AgeThresholds;
+use banto_io::claude_home::ClaudeHome;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
 use banto_io::status::{self, SysinfoProbe};
@@ -52,10 +52,10 @@ pub fn activity_tag(activity: Activity) -> &'static str {
 /// Read-only: this reads `<claude_home>/projects` and `<claude_home>/sessions`
 /// and never writes anywhere.
 pub fn load_rows(
-    claude_home: &Path,
+    claude_home: &ClaudeHome,
     thresholds: &AgeThresholds,
 ) -> Result<Vec<SessionRow>, ProviderError> {
-    let provider = ClaudeCodeProvider::new(claude_home.to_path_buf());
+    let provider = ClaudeCodeProvider::new(claude_home.clone());
     let metas = provider.discover()?;
     Ok(rows_from_metas(metas, claude_home, thresholds))
 }
@@ -69,12 +69,12 @@ pub fn load_rows(
 /// discovery itself touches.
 pub fn rows_from_metas(
     mut metas: Vec<SessionMeta>,
-    claude_home: &Path,
+    claude_home: &ClaudeHome,
     thresholds: &AgeThresholds,
 ) -> Vec<SessionRow> {
     metas.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.id.0.cmp(&b.id.0)));
 
-    let live = status::read_live_sessions(&claude_home.join("sessions"));
+    let live = status::read_live_sessions(&claude_home.sessions_dir());
     let probe = SysinfoProbe;
     let now = SystemTime::now();
 
@@ -98,7 +98,7 @@ pub fn rows_from_metas(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use banto_core::model::SessionId;
 
@@ -215,7 +215,8 @@ mod tests {
         .unwrap();
         filetime_set(&projects.join("new.jsonl"), newer);
 
-        let rows = load_rows(dir.path(), &AgeThresholds::default()).unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let rows = load_rows(&claude_home, &AgeThresholds::default()).unwrap();
         let titles: Vec<_> = rows.iter().map(|r| r.display_title().to_string()).collect();
         assert_eq!(titles, vec!["New".to_string(), "Old".to_string()]);
     }
@@ -231,7 +232,8 @@ mod tests {
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
         let metas = vec![meta("old", older), meta("new", newer)];
 
-        let rows = rows_from_metas(metas, dir.path(), &AgeThresholds::default());
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let rows = rows_from_metas(metas, &claude_home, &AgeThresholds::default());
 
         let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
         assert_eq!(ids, vec!["new".to_string(), "old".to_string()]);

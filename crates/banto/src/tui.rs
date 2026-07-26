@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -36,6 +36,7 @@ use banto_core::app::{
 use banto_core::config::OpenerMode;
 use banto_core::model::{SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
+use banto_io::claude_home::ClaudeHome;
 use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::{ProcessRunner, SystemProcessRunner};
@@ -118,7 +119,12 @@ const ESC_RELEASE_SUPPRESS_WINDOW: Duration = Duration::from_millis(500);
 /// Everything the render loop needs beyond [`App`] itself: dependencies for
 /// opening/focusing sessions and reloading rows from disk.
 struct Context<'a> {
-    claude_home: &'a Path,
+    /// Owned rather than borrowed like the rest of this struct's fields:
+    /// `ClaudeHome` is a cheap path wrapper, and owning it here means the
+    /// dozens of `test_context`/`test_context_with_headless_recovery` call
+    /// sites below don't each need a place of their own to hold one just to
+    /// satisfy a borrow.
+    claude_home: ClaudeHome,
     thresholds: &'a AgeThresholds,
     /// `RefCell`-wrapped so `Store::set_session_group` (which takes `&mut
     /// self`, since it wraps a transaction) can be called from the many key
@@ -203,7 +209,7 @@ pub(crate) struct LiveWatch {
 }
 
 impl LiveWatch {
-    pub(crate) fn new(claude_home: &Path) -> Self {
+    pub(crate) fn new(claude_home: &ClaudeHome) -> Self {
         Self {
             source: NotifyChangeSource::new(claude_home).ok(),
             debouncer: Debouncer::new(DEBOUNCE_QUIET),
@@ -225,12 +231,12 @@ impl LiveWatch {
 
 /// Load sessions under `claude_home` and run the interactive TUI.
 pub fn run(
-    claude_home: &Path,
+    claude_home: &ClaudeHome,
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
 ) -> Result<()> {
-    let metas = ClaudeCodeProvider::new(claude_home.to_path_buf()).discover()?;
+    let metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
@@ -259,7 +265,7 @@ pub fn run(
         .with_directors(directors)
         .with_superseded(superseded);
     let ctx = Context {
-        claude_home,
+        claude_home: claude_home.clone(),
         thresholds,
         store,
         opener_mode,
@@ -585,7 +591,7 @@ fn layout_areas(area: Rect) -> [Rect; 4] {
 /// `event::read()`) is what lets live updates land without waiting for the
 /// next keypress.
 fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
-    let mut watch = LiveWatch::new(ctx.claude_home);
+    let mut watch = LiveWatch::new(&ctx.claude_home);
 
     loop {
         // Compute the layout up front so the viewport height and mouse
@@ -1547,7 +1553,7 @@ fn activate(app: &mut App, ctx: &Context) {
 
     // Only consulted here — in-place mode has no pane map, so this is the
     // *only* double-resume guard, not a fallback for an untracked case.
-    let live = read_live_sessions(&ctx.claude_home.join("sessions"));
+    let live = read_live_sessions(&ctx.claude_home.sessions_dir());
     match opener::decide_inplace_resume(&session, &SysinfoProbe, &live) {
         Some(launch) => {
             ctx.log(&format!(
@@ -1614,7 +1620,7 @@ fn activate_split(app: &mut App, ctx: &Context) {
     // Only consulted when there's no pane record for this session (see
     // `opener::open_session`), so a fresh read here (rather than caching
     // across activations) keeps it current without needing to invalidate.
-    let live = read_live_sessions(&ctx.claude_home.join("sessions"));
+    let live = read_live_sessions(&ctx.claude_home.sessions_dir());
     let outcome = opener::open_session(
         &ctx.store.borrow(),
         &SysinfoProbe,
@@ -1702,10 +1708,10 @@ fn toggle_agent_filter(app: &mut App) {
 /// are kept rather than the TUI erroring out over a transient filesystem
 /// hiccup.
 fn reload(app: &mut App, ctx: &Context) {
-    if let Ok(metas) = ClaudeCodeProvider::new(ctx.claude_home.to_path_buf()).discover() {
+    if let Ok(metas) = ClaudeCodeProvider::new(ctx.claude_home.clone()).discover() {
         let store = ctx.store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);
-        let rows = session::rows_from_metas(metas, ctx.claude_home, ctx.thresholds);
+        let rows = session::rows_from_metas(metas, &ctx.claude_home, ctx.thresholds);
         let rows = exclude_archived(rows, &store);
         app.replace_rows(rows);
         app.set_hidden_worker_ids(load_hidden_worker_ids(&store));
@@ -1938,7 +1944,7 @@ mod tests {
         headless_leak_recovery: bool,
     ) -> Context<'a> {
         Context {
-            claude_home: Path::new("."),
+            claude_home: ClaudeHome::new(PathBuf::from(".")),
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,

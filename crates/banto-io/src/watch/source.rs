@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{RawChange, WatchRoot};
+use crate::claude_home::ClaudeHome;
 
 /// Errors setting up the real filesystem watcher.
 #[derive(Debug, thiserror::Error)]
@@ -46,9 +47,9 @@ impl NotifyChangeSource {
     /// [`crate::provider::claude_code::ClaudeCodeProvider`] and
     /// [`crate::status::read_live_sessions`] tolerate the same case. Roots
     /// created after this call is made are not picked up.
-    pub fn new(claude_home: &Path) -> Result<Self, WatchError> {
-        let projects_dir = claude_home.join("projects");
-        let sessions_dir = claude_home.join("sessions");
+    pub fn new(claude_home: &ClaudeHome) -> Result<Self, WatchError> {
+        let projects_dir = claude_home.projects_dir();
+        let sessions_dir = claude_home.sessions_dir();
         let (tx, rx) = mpsc::channel();
 
         let watch_projects_dir = projects_dir.clone();
@@ -128,7 +129,7 @@ mod tests {
     fn detects_a_new_file_under_projects() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("projects")).unwrap();
-        let source = NotifyChangeSource::new(root.path()).unwrap();
+        let source = NotifyChangeSource::new(&ClaudeHome::new(root.path().to_path_buf())).unwrap();
 
         fs::write(root.path().join("projects/new-session.jsonl"), "{}").unwrap();
 
@@ -143,7 +144,7 @@ mod tests {
     fn detects_a_new_file_under_sessions() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("sessions")).unwrap();
-        let source = NotifyChangeSource::new(root.path()).unwrap();
+        let source = NotifyChangeSource::new(&ClaudeHome::new(root.path().to_path_buf())).unwrap();
 
         fs::write(root.path().join("sessions/1234.json"), "{}").unwrap();
 
@@ -158,7 +159,7 @@ mod tests {
     fn missing_roots_construct_successfully_and_never_report_changes() {
         let root = tempfile::tempdir().unwrap();
 
-        let source = NotifyChangeSource::new(root.path()).unwrap();
+        let source = NotifyChangeSource::new(&ClaudeHome::new(root.path().to_path_buf())).unwrap();
 
         std::thread::sleep(Duration::from_millis(50));
         assert!(source.drain().is_empty());

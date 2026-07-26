@@ -476,6 +476,7 @@ fn track_new_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_io::claude_home::ClaudeHome;
     use banto_io::opener::{CommandOutput, OpenError};
     use banto_io::process::mock::{MockProcessRunner, MockSpawnedProcess};
     use banto_io::provider::claude_code::ClaudeCodeProvider;
@@ -843,7 +844,7 @@ mod tests {
         // Windows Terminal, which exposes no handle to record anything
         // useful against — the explicit flag must win over the env var.
         let claude_home = TempDir::new().unwrap();
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let store = Store::open_in_memory().unwrap();
         let process_runner = MockProcessRunner::new(Some(0));
         let command_runner = MockCommandRunner::default();
@@ -874,7 +875,7 @@ mod tests {
     #[test]
     fn run_new_session_tracks_via_spawn_when_a_focusable_pane_is_resolved() {
         let claude_home = TempDir::new().unwrap();
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let store = Store::open_in_memory().unwrap();
         // Exits on the very first poll (0 still-running polls): no session
         // file exists to be found either, so nothing should be recorded.
@@ -934,7 +935,7 @@ mod tests {
             .set_modified(future)
             .unwrap();
 
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let store = Store::open_in_memory().unwrap();
         // Runs for one "still running" poll (long enough for discovery to
         // happen before exit) then exits.
@@ -978,7 +979,7 @@ mod tests {
         // opener instead) must be honored regardless of what's in this
         // process's own environment.
         let claude_home = TempDir::new().unwrap();
-        let provider = ClaudeCodeProvider::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let store = Store::open_in_memory().unwrap();
         let process_runner = MockProcessRunner::new(Some(0));
         let command_runner = MockCommandRunner::default();

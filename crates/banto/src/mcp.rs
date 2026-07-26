@@ -28,7 +28,6 @@
 //! stdout, so diagnostics would go to stderr.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -36,6 +35,7 @@ use serde_json::{Value, json};
 use banto_core::model::{
     BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
 };
+use banto_io::claude_home::ClaudeHome;
 use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
 use banto_io::store::{Store, StoreError};
 
@@ -75,12 +75,12 @@ pub fn parse_role(token: &str) -> Option<BrigadeRole> {
 struct ServerContext {
     identity: Identity,
     store: Store,
-    claude_home: PathBuf,
+    claude_home: ClaudeHome,
 }
 
 /// Run the MCP server on stdio until the client closes the connection (EOF on
 /// stdin). Spawned by an embedded `claude` via `--mcp-config`.
-pub fn run_stdio_server(store: Store, identity: Identity, claude_home: PathBuf) -> Result<()> {
+pub fn run_stdio_server(store: Store, identity: Identity, claude_home: ClaudeHome) -> Result<()> {
     let mut ctx = ServerContext {
         identity,
         store,
@@ -240,7 +240,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
         Ok(members) => members,
         Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
     };
-    let live = read_live_sessions(&ctx.claude_home.join("sessions"));
+    let live = read_live_sessions(&ctx.claude_home.sessions_dir());
 
     let mut out = format!(
         "You are {token} ({}) in banto brigade {brigade}.\n",
@@ -515,6 +515,7 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Builds a `ServerContext` from `(session, brigade, member, role)`
     /// launch-argv fields. When `brigade`/`member`/`role` are all given, also
@@ -547,7 +548,7 @@ mod tests {
             // running", which is what a test without live fixtures should
             // see. `brigade_status_reports_a_live_peers_activity` writes
             // real live-state files into its own temp home instead.
-            claude_home: PathBuf::from("/nonexistent"),
+            claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
         }
     }
 
@@ -686,7 +687,7 @@ mod tests {
             Some("director"),
             Some(BrigadeRole::Director),
         );
-        ctx.claude_home = home.path().to_path_buf();
+        ctx.claude_home = ClaudeHome::new(home.path().to_path_buf());
         ctx.store
             .add_brigade_member(
                 1,

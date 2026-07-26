@@ -3,6 +3,7 @@
 //! this crate (`docs/DISCIPLINE.md` §2); this crate depends on it.
 //!
 //! Module map:
+//! - [`claude_home`] the root Claude Code stores its state under, plus its subdirs
 //! - [`config`]  loading `banto_core::config`'s types from disk
 //! - [`lineage`] resolving auto-compaction parent links (beside the provider)
 //! - [`opener`]  opening/focusing sessions in a real terminal (psmux, WT)
@@ -10,9 +11,10 @@
 //! - [`provider`] session discovery + tolerant JSONL parsing
 //! - [`pty`]     PTY host abstraction (portable-pty)
 //! - [`status`]  live-session state (the I/O half; bucketing is core's)
-//! - [`store`]   sqlite cache, FTS5, groups/pins, session<->pane map
+//! - [`store`]   sqlite: groups/pins/archived, brigades, session<->pane map
 //! - [`watch`]   filesystem watching (notify) for live TUI updates
 
+pub mod claude_home;
 pub mod config;
 pub mod lineage;
 pub mod opener;

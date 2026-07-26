@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 
 use banto_core::config::Config;
 use banto_core::status::AgeThresholds;
+use banto_io::claude_home::ClaudeHome;
 use banto_io::config;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::SystemProcessRunner;
@@ -253,9 +254,10 @@ fn load_config(cli_override: Option<&Path>) -> Result<Config> {
 }
 
 /// Resolve the Claude home directory per the documented priority order.
-fn resolve_claude_home(flag: Option<PathBuf>, config: &Config) -> Result<PathBuf> {
+fn resolve_claude_home(flag: Option<PathBuf>, config: &Config) -> Result<ClaudeHome> {
     flag.or_else(|| config.claude_home.clone())
-        .or_else(ClaudeCodeProvider::default_home)
+        .map(ClaudeHome::new)
+        .or_else(ClaudeHome::default_home)
         .context("could not determine the Claude home directory; pass --claude-home <PATH>")
 }
 
@@ -271,7 +273,7 @@ fn open_store(config: &Config) -> Result<Store> {
 }
 
 /// `banto list`: one line per session — activity tag, id, title, cwd.
-fn run_list(claude_home: &Path, thresholds: &AgeThresholds) -> Result<()> {
+fn run_list(claude_home: &ClaudeHome, thresholds: &AgeThresholds) -> Result<()> {
     let rows = load_rows(claude_home, thresholds).context("failed to read sessions")?;
     for row in &rows {
         let title = row.title.as_deref().unwrap_or("(no title)");
