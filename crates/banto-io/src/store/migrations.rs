@@ -281,7 +281,6 @@ mod tests {
             store.pin(&SessionId("s1".to_string())).unwrap();
         }
 
-        // Reopening must not re-run migrations or lose data.
         let store = Store::open(&db).unwrap();
         assert_eq!(store.pinned_ids().unwrap(), [SessionId("s1".to_string())]);
         let version: i64 = store
@@ -304,8 +303,6 @@ mod tests {
         // is gone.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        // Build a database as v1 code would have left it: only the v1
-        // script applied, a row inserted without an `is_agent` column.
         conn.execute_batch(MIGRATIONS[0]).unwrap();
         conn.execute(
             "INSERT INTO sessions (id, provider, title, cwd, source_path, mtime_ms, size)
@@ -314,8 +311,6 @@ mod tests {
         )
         .unwrap();
 
-        // Apply the v2 script directly: the pre-existing row survives, and
-        // the new column defaults to false.
         conn.execute_batch(MIGRATIONS[1]).unwrap();
         let is_agent: bool = conn
             .query_row("SELECT is_agent FROM sessions WHERE id = 's1'", [], |row| {
@@ -356,9 +351,6 @@ mod tests {
                 .unwrap()
         };
 
-        // Opening through Store::open must carry a v1-genesis database all
-        // the way to the latest version in one pass, dropping `sessions`
-        // and `sessions_fts` along the way (v11).
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
@@ -368,8 +360,6 @@ mod tests {
         assert!(!table_exists(&store, "sessions"));
         assert!(!table_exists(&store, "sessions_fts"));
 
-        // Reopening an already-v11 database is a no-op: no error, same
-        // version, tables still gone.
         drop(store);
         let store = Store::open(&db).unwrap();
         let version: i64 = store
@@ -407,9 +397,6 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
 
-        // Opening through Store::open must run the v3 migration: the
-        // archived table exists and is usable, and the pre-existing
-        // (multi-)group membership rows are untouched.
         let store = Store::open(&db).unwrap();
         assert_eq!(
             store.group_members(1).unwrap(),
@@ -439,9 +426,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("banto.db");
 
-        // Build a database as v3 code would have left it: v1..=v3 scripts
-        // applied, a session archived, `user_version` left at 3. The brigade
-        // tables do not exist yet.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch(MIGRATIONS[0]).unwrap();
@@ -455,9 +439,6 @@ mod tests {
             conn.pragma_update(None, "user_version", 3).unwrap();
         }
 
-        // Opening through Store::open must run the v4 migration: the brigade
-        // tables exist and are usable, and the pre-existing archived row is
-        // untouched.
         let mut store = Store::open(&db).unwrap();
         assert_eq!(store.archived_ids().unwrap(), [SessionId("s1".to_string())]);
         assert!(store.list_brigades().unwrap().is_empty());
@@ -490,9 +471,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("banto.db");
 
-        // Build a database as v4 code would have left it: v1..=v4 scripts
-        // applied, a brigade with a Director, `user_version` left at 4. The
-        // message-queue tables do not exist yet.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             for script in &MIGRATIONS[0..4] {
@@ -512,8 +490,6 @@ mod tests {
             conn.pragma_update(None, "user_version", 4).unwrap();
         }
 
-        // Opening through Store::open must run the v5 migration: the queue is
-        // usable, and the pre-existing brigade membership is untouched.
         let mut store = Store::open(&db).unwrap();
         assert_eq!(
             store
@@ -663,10 +639,6 @@ mod tests {
             conn.pragma_update(None, "user_version", 6).unwrap();
         }
 
-        // Opening through Store::open must run the v7 migration: the
-        // director becomes token "director", the two workers become
-        // "worker-1"/"worker-2" in session-id order ("alice" < "bob"), each
-        // keeping its claude session id and its own cursor value.
         let store = Store::open(&db).unwrap();
         assert_eq!(
             store
@@ -752,10 +724,6 @@ mod tests {
             conn.pragma_update(None, "user_version", 7).unwrap();
         }
 
-        // Opening through Store::open must run the v8 migration: the
-        // pre-existing message (no `to_member` at insert time, so it lands
-        // NULL) stays visible to BOTH workers as a broadcast, and a freshly
-        // enqueued member-addressed message is usable immediately.
         let mut store = Store::open(&db).unwrap();
         assert_eq!(
             store
@@ -897,8 +865,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("banto.db");
 
-        // Build a database as v9 code would have left it: v1..=v9 applied,
-        // no session_lineage table yet, user_version left at 9.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             for script in &MIGRATIONS[0..9] {
@@ -907,8 +873,6 @@ mod tests {
             conn.pragma_update(None, "user_version", 9).unwrap();
         }
 
-        // Opening through Store::open must run the v10 migration: the
-        // lineage table exists and is usable.
         let store = Store::open(&db).unwrap();
         assert!(store.lineage_parent_ids().unwrap().is_empty());
         let child = SessionId("child".to_string());

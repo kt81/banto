@@ -363,9 +363,6 @@ enum PendingMembership {
     DismissWorker,
 }
 
-/// The emporium's own state — the sans-IO replacement for the old `Emporium`
-/// struct. `screens` may lose entries (a session can exit); `Stage` holds
-/// [`SessionKey`]s, so removal never invalidates anything else holding one.
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -598,7 +595,6 @@ fn current_focus_slot(state: &EmporiumState) -> FocusSlot {
     }
 }
 
-/// Write a resolved ring/arrow target back into `state`.
 fn apply_focus_slot(state: &mut EmporiumState, slot: FocusSlot) {
     match slot {
         FocusSlot::Sidebar => state.focus = Focus::Sidebar,
@@ -692,10 +688,6 @@ pub enum StoreIntent {
         session_id: String,
         target: GroupJoinTargetData,
     },
-    /// Resolve whether `session_id` is a brigade member and, if so, its
-    /// `(brigade_id, token, role)` — the honest cost of moving what used to
-    /// be a synchronous inline store read out of the handler (see the
-    /// module doc).
     ResolveMembership {
         session_id: String,
     },
@@ -2303,8 +2295,10 @@ fn update_tick(
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
 
-    // Phase two of a nudge: send the delayed submitting `\r`. See the
-    // pre-migration `flush_pending_submits`'s doc for why the delay matters.
+    // Phase two of a nudge: send the delayed submitting `\r` in its own PTY
+    // write. A chunk boundary can carry meaning for the embedded PTY, so
+    // bundling it with the nudge text risks the child reading both as one
+    // paste instead of text-then-submit (docs/REQUIREMENTS.md, "Auto-relay").
     let mut i = 0;
     while i < state.pending_submits.len() {
         if now.saturating_duration_since(state.pending_submits[i].nudged_at) >= RELAY_SUBMIT_DELAY {
@@ -4183,7 +4177,7 @@ mod tests {
         assert_eq!(state.prefix_armed, Some(armed_at));
     }
 
-    // --- new-session modal: cwd-check round trip (R37) ----------------------
+    // --- new-session modal: cwd-check round trip ----------------------------
 
     fn press_enter(
         state: &mut EmporiumState,
@@ -4348,7 +4342,7 @@ mod tests {
         let now = test_instant();
 
         press_enter(&mut state, &mut app, &brigade, now);
-        app.close_modal(); // Esc, simulated directly
+        app.close_modal();
 
         let cmds = update(
             &mut state,
@@ -4416,7 +4410,7 @@ mod tests {
         assert!(app.modal().is_none());
     }
 
-    // --- dismiss a Worker (暇を出す) ------------------------------------------
+    // --- dismiss a Worker ----------------------------------------------------
 
     #[test]
     fn kill_confirm_dismiss_on_a_synthetic_worker_key_emits_dismiss_worker_directly() {
@@ -4682,7 +4676,7 @@ mod tests {
         assert!(matches!(state.stage, Stage::Empty));
     }
 
-    // --- F2/F3 regression (unaffected by the prefix-key change) -------------
+    // --- F2/F3 regression ----------------------------------------------------
 
     #[test]
     fn f2_toggles_focus_between_sidebar_and_pane_when_a_stage_is_active() {
@@ -4752,7 +4746,7 @@ mod tests {
         }
     }
 
-    // --- modifier gating (Phase 2b follow-up: modifier-blind matching) -----
+    // --- modifier gating: modifier-blind matching ---------------------------
 
     #[test]
     fn ctrl_b_in_the_sidebar_arms_the_prefix_instead_of_adding_a_worker() {
@@ -4847,7 +4841,7 @@ mod tests {
         assert_eq!(state.status.as_deref(), Some("unbound prefix key"));
     }
 
-    // --- the focus ring (Phase 2b follow-up: sidebar joins the ring) -------
+    // --- the focus ring: sidebar joins the ring -----------------------------
 
     #[test]
     fn cycle_forward_wraps_through_sidebar_director_and_workers() {
@@ -4928,7 +4922,7 @@ mod tests {
         }
     }
 
-    // --- arrow navigation (Phase 2b follow-up) ------------------------------
+    // --- arrow navigation ----------------------------------------------------
 
     #[test]
     fn arrow_target_covers_the_full_navigation_matrix() {

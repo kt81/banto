@@ -37,7 +37,6 @@ fn byte_offset(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len())
 }
 
-/// Insert `c` at char-index `cursor` within `s`.
 fn insert_at_cursor(s: &mut String, cursor: usize, c: char) {
     s.insert(byte_offset(s, cursor), c);
 }
@@ -69,7 +68,6 @@ fn remove_at_cursor(s: &mut String, cursor: usize) -> bool {
 /// Outcome of a left-click on the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickOutcome {
-    /// The row was selected (single click).
     Selected,
     /// The row was activated (double click) — equivalent to pressing Enter.
     Activated,
@@ -167,7 +165,6 @@ impl KillChoice {
 /// State for the group-join modal: a free-text new-group-name input plus a
 /// substring-filtered list of existing groups to pick from instead.
 pub struct GroupJoinState {
-    /// The session being assigned to a group.
     session_id: String,
     /// Every existing group, alphabetical (same order as `App::groups`) —
     /// captured once when the modal opens.
@@ -220,7 +217,6 @@ impl GroupJoinState {
         self.selected = 0;
     }
 
-    /// Insert `c` at the cursor and re-filter.
     fn push_char(&mut self, c: char) {
         insert_at_cursor(&mut self.input, self.cursor, c);
         self.cursor += 1;
@@ -244,22 +240,18 @@ impl GroupJoinState {
         }
     }
 
-    /// Move the cursor one character left, clamped at the start.
     fn move_cursor_left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    /// Move the cursor one character right, clamped at the end.
     fn move_cursor_right(&mut self) {
         self.cursor = (self.cursor + 1).min(char_len(&self.input));
     }
 
-    /// Move the cursor to the start of the input.
     fn move_cursor_home(&mut self) {
         self.cursor = 0;
     }
 
-    /// Move the cursor to the end of the input.
     fn move_cursor_end(&mut self) {
         self.cursor = char_len(&self.input);
     }
@@ -414,7 +406,6 @@ impl NewSessionState {
         }
     }
 
-    /// Insert `c` at the cursor and re-filter.
     fn push_char(&mut self, c: char) {
         insert_at_cursor(&mut self.input, self.cursor, c);
         self.cursor += 1;
@@ -438,22 +429,18 @@ impl NewSessionState {
         }
     }
 
-    /// Move the cursor one character left, clamped at the start.
     fn move_cursor_left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    /// Move the cursor one character right, clamped at the end.
     fn move_cursor_right(&mut self) {
         self.cursor = (self.cursor + 1).min(char_len(&self.input));
     }
 
-    /// Move the cursor to the start of the input.
     fn move_cursor_home(&mut self) {
         self.cursor = 0;
     }
 
-    /// Move the cursor to the end of the input.
     fn move_cursor_end(&mut self) {
         self.cursor = char_len(&self.input);
     }
