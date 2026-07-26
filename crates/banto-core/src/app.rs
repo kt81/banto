@@ -6,7 +6,7 @@
 //! emporium's `crate::engine` uses it too.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::model::{Activity, SessionRow};
@@ -354,6 +354,12 @@ pub struct NewSessionState {
     error: Option<String>,
     /// Fixed for the lifetime of the modal (see [`NewSessionPlacement`]).
     placement: NewSessionPlacement,
+    /// Set while a `Cmd::CheckNewSessionCwd` round trip is in flight for
+    /// this modal (Enter sent it, `Event::NewSessionCwdChecked` hasn't
+    /// answered yet) — see `engine::confirm_new_session_modal`'s doc. Gates
+    /// a second Enter from firing a second round trip before the first
+    /// answers.
+    checking: bool,
 }
 
 impl NewSessionState {
@@ -366,6 +372,7 @@ impl NewSessionState {
             selected: 0,
             error: None,
             placement,
+            checking: false,
         };
         state.refilter();
         state
@@ -911,6 +918,41 @@ impl App {
             Some(Modal::NewSession(state)) => state.target(),
             _ => None,
         }
+    }
+
+    /// Whether the new-session modal has a `Cmd::CheckNewSessionCwd` round
+    /// trip already in flight — `false` when no modal is open, since there
+    /// is nothing to gate. See [`NewSessionState::checking`].
+    pub fn modal_new_session_check_pending(&self) -> bool {
+        matches!(&self.modal, Some(Modal::NewSession(state)) if state.checking)
+    }
+
+    /// Mark the open new-session modal as awaiting a check-cwd verdict. No-op
+    /// when no such modal is open.
+    pub fn modal_begin_new_session_check(&mut self) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal {
+            state.checking = true;
+        }
+    }
+
+    /// Resolve a `Cmd::CheckNewSessionCwd` round trip for `cwd`: `true` if
+    /// this verdict still applies (the new-session modal is open, was
+    /// awaiting one, and `cwd` still matches its *current* target) and the
+    /// caller should act on it; `false` — with nothing touched beyond
+    /// clearing the pending marker, if it was set — for a stale verdict
+    /// (the operator kept typing and the target moved on) or one with
+    /// nothing left to resolve (no such modal open, or none pending). Either
+    /// way the pending marker ends up cleared, so a fresh Enter is live
+    /// again immediately.
+    pub fn modal_new_session_check_resolves(&mut self, cwd: &Path) -> bool {
+        let Some(Modal::NewSession(state)) = &mut self.modal else {
+            return false;
+        };
+        if !state.checking {
+            return false;
+        }
+        state.checking = false;
+        state.target().as_deref() == Some(cwd)
     }
 
     /// What confirming the open group-join modal would do (see

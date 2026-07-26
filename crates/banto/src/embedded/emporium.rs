@@ -431,6 +431,10 @@ fn execute_cmd(
             }
             Vec::new()
         }
+        Cmd::CheckNewSessionCwd { cwd } => {
+            let is_dir = cwd.is_dir();
+            vec![Event::NewSessionCwdChecked { cwd, is_dir }]
+        }
         Cmd::OpenEmbedded {
             key,
             target,
@@ -1788,6 +1792,60 @@ mod tests {
     /// private to the core — only its shape matters here: not a real id).
     fn pending_key(token: &str) -> SessionKey {
         SessionKey::from_id(&format!("new-worker::1::{token}"))
+    }
+
+    // --- Cmd::CheckNewSessionCwd (R37: is_dir() moved to the edge) ---------
+
+    #[test]
+    fn check_new_session_cwd_reports_whether_the_stat_finds_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut discovery = Vec::new();
+        let superseded_failed = RefCell::new(HashSet::new());
+        let thresholds = AgeThresholds::default();
+        let brigade = BrigadeConfig::default();
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let deps = Deps {
+            claude_home: &claude_home,
+            thresholds: &thresholds,
+            store: &store,
+            superseded_failed: &superseded_failed,
+            brigade: &brigade,
+        };
+        let mut handles = HashMap::new();
+
+        let events = execute_cmd(
+            Cmd::CheckNewSessionCwd {
+                cwd: dir.path().to_path_buf(),
+            },
+            &deps,
+            &mut handles,
+            &mut discovery,
+        );
+        assert_eq!(
+            events,
+            vec![Event::NewSessionCwdChecked {
+                cwd: dir.path().to_path_buf(),
+                is_dir: true,
+            }]
+        );
+
+        let missing = dir.path().join("does-not-exist");
+        let events = execute_cmd(
+            Cmd::CheckNewSessionCwd {
+                cwd: missing.clone(),
+            },
+            &deps,
+            &mut handles,
+            &mut discovery,
+        );
+        assert_eq!(
+            events,
+            vec![Event::NewSessionCwdChecked {
+                cwd: missing,
+                is_dir: false,
+            }]
+        );
     }
 
     #[test]

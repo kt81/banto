@@ -756,6 +756,16 @@ pub enum Cmd {
         rows: u16,
         cols: u16,
     },
+    /// Stat `cwd` (the new-session modal's target when Enter was pressed) to
+    /// confirm it's a real directory before launching into it —
+    /// `Path::is_dir()` is filesystem I/O, which this crate may never do
+    /// itself (`docs/DISCIPLINE.md` §3's "no file reads or writes"). The
+    /// shell answers with `Event::NewSessionCwdChecked`. See
+    /// `confirm_new_session_modal`'s doc for the full round trip, including
+    /// why a stale answer must not be trusted blindly.
+    CheckNewSessionCwd {
+        cwd: PathBuf,
+    },
     /// Spawn (or, if already running elsewhere, refuse) `target` under
     /// `key`. `brigade` wires the launch to banto's own MCP server; `model`
     /// is `--model <model>` for a freshly-spawned Worker (never set for a
@@ -809,6 +819,15 @@ pub enum Event {
     },
     PtyExited {
         key: SessionKey,
+    },
+    /// The shell's answer to `Cmd::CheckNewSessionCwd`. `cwd` is echoed back
+    /// so `update` can tell whether this answer still applies to whatever
+    /// the new-session modal's target is *now* — the operator may have kept
+    /// typing while the stat was in flight (see
+    /// `App::modal_new_session_check_resolves`).
+    NewSessionCwdChecked {
+        cwd: PathBuf,
+        is_dir: bool,
     },
     Spawned {
         key: SessionKey,
@@ -921,6 +940,9 @@ pub fn update(
             Vec::new()
         }
         Event::PtyExited { key } => update_pty_exited(state, app, key, now),
+        Event::NewSessionCwdChecked { cwd, is_dir } => {
+            update_new_session_cwd_checked(state, app, cwd, is_dir)
+        }
         Event::Spawned { key } => update_spawned(state, brigade, key),
         Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
@@ -1345,7 +1367,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     match kind {
         Some(Kind::Archive) => confirm_archive_modal(app),
         Some(Kind::Group) => confirm_group_join_modal(app),
-        Some(Kind::New) => confirm_new_session_modal(state, app),
+        Some(Kind::New) => confirm_new_session_modal(app),
         Some(Kind::Disband) => confirm_disband_modal(app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
         None => Vec::new(),
@@ -1378,14 +1400,51 @@ fn confirm_group_join_modal(app: &mut App) -> Vec<Cmd> {
     vec![Cmd::Store(StoreIntent::JoinGroup { session_id, target })]
 }
 
-fn confirm_new_session_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+/// `is_dir()` is a stat — file I/O this crate may never do itself
+/// (`docs/DISCIPLINE.md` §3) — so Enter sends [`Cmd::CheckNewSessionCwd`]
+/// and leaves the modal open rather than deciding on the spot;
+/// [`update_new_session_cwd_checked`] is where the verdict actually lands
+/// and the pre-round-trip success path (mint the key, stage the open) now
+/// lives. `App::modal_new_session_check_pending` blocks a second Enter
+/// while one round trip is already in flight — without it, Enter twice in a
+/// row before the first answer lands would kick off two checks (and, since
+/// the discriminator from the previous round fixed the double-open bug that
+/// used to *corrupt* state, two merely-redundant panes rather than one
+/// corrupted one — still wrong, still worth preventing outright).
+fn confirm_new_session_modal(app: &mut App) -> Vec<Cmd> {
     let Some(Modal::NewSession(_)) = app.modal() else {
         return Vec::new();
     };
+    if app.modal_new_session_check_pending() {
+        return Vec::new();
+    }
     let Some(cwd) = app.modal_new_session_target() else {
         return Vec::new();
     };
-    if !cwd.is_dir() {
+    app.modal_begin_new_session_check();
+    vec![Cmd::CheckNewSessionCwd { cwd }]
+}
+
+/// The other half of [`confirm_new_session_modal`]'s round trip: the
+/// shell's answer to whether the checked cwd is a real directory.
+///
+/// `App::modal_new_session_check_resolves` is the stale-result guard: the
+/// operator can keep typing while the stat is in flight, so `cwd` (what was
+/// actually checked) is compared against the modal's *current* target
+/// before this verdict is trusted, and the pending-check marker is cleared
+/// either way — a verdict that no longer applies is simply dropped, not
+/// requeued, leaving the modal open and Enter live again for a fresh check
+/// against whatever the operator has typed since.
+fn update_new_session_cwd_checked(
+    state: &mut EmporiumState,
+    app: &mut App,
+    cwd: PathBuf,
+    is_dir: bool,
+) -> Vec<Cmd> {
+    if !app.modal_new_session_check_resolves(&cwd) {
+        return Vec::new();
+    }
+    if !is_dir {
         app.modal_set_error(format!("{} is not a directory", cwd.display()));
         return Vec::new();
     }
@@ -4105,6 +4164,188 @@ mod tests {
         );
 
         assert_eq!(state.prefix_armed, Some(armed_at));
+    }
+
+    // --- new-session modal: cwd-check round trip (R37) ----------------------
+
+    fn press_enter(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))),
+            now,
+        )
+    }
+
+    #[test]
+    fn new_session_confirm_emits_check_cwd_and_leaves_the_modal_open() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]); // seeds candidate cwd "/work/alpha"
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let cmds = press_enter(&mut state, &mut app, &brigade, now);
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::CheckNewSessionCwd { cwd }] if cwd == &PathBuf::from("/work/alpha")
+        ));
+        assert!(matches!(app.modal(), Some(Modal::NewSession(_))));
+        assert!(app.modal_new_session_check_pending());
+    }
+
+    #[test]
+    fn new_session_confirm_is_a_noop_while_a_check_is_already_pending() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]);
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        let first = press_enter(&mut state, &mut app, &brigade, now);
+        assert_eq!(first.len(), 1);
+
+        let second = press_enter(&mut state, &mut app, &brigade, now);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn new_session_cwd_checked_true_closes_the_modal_and_opens() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]);
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        press_enter(&mut state, &mut app, &brigade, now);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked {
+                cwd: PathBuf::from("/work/alpha"),
+                is_dir: true,
+            },
+            now,
+        );
+
+        assert!(app.modal().is_none());
+        assert_eq!(state.pending_opens.len(), 1);
+        match cmds.as_slice() {
+            [
+                Cmd::OpenEmbedded {
+                    key,
+                    target,
+                    brigade: None,
+                    model: None,
+                },
+            ] => {
+                assert!(key.is_synthetic());
+                assert_eq!(target.id, "");
+                assert_eq!(target.cwd, PathBuf::from("/work/alpha"));
+            }
+            other => panic!("expected a single OpenEmbedded cmd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_cwd_checked_false_sets_the_error_and_leaves_enter_live_again() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]);
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        press_enter(&mut state, &mut app, &brigade, now);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked {
+                cwd: PathBuf::from("/work/alpha"),
+                is_dir: false,
+            },
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        let Some(Modal::NewSession(ns)) = app.modal() else {
+            panic!("expected the new-session modal to stay open");
+        };
+        assert_eq!(ns.error(), Some("/work/alpha is not a directory"));
+        assert!(!app.modal_new_session_check_pending());
+    }
+
+    #[test]
+    fn new_session_cwd_checked_ignores_a_stale_verdict_after_the_target_changed() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]); // candidate cwd "/work/alpha"
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        press_enter(&mut state, &mut app, &brigade, now);
+        // The operator keeps typing while the stat is in flight, moving the
+        // target away from what was actually sent for checking.
+        for c in "/elsewhere".chars() {
+            app.modal_push_char(c);
+        }
+        assert_eq!(
+            app.modal_new_session_target(),
+            Some(PathBuf::from("/elsewhere"))
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked {
+                cwd: PathBuf::from("/work/alpha"),
+                is_dir: true,
+            },
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert!(matches!(app.modal(), Some(Modal::NewSession(_))));
+        // Cleared regardless of relevance, so a fresh Enter is live again.
+        assert!(!app.modal_new_session_check_pending());
+    }
+
+    #[test]
+    fn new_session_cwd_checked_is_a_noop_after_the_modal_was_cancelled() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]);
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = Instant::now();
+
+        press_enter(&mut state, &mut app, &brigade, now);
+        app.close_modal(); // Esc, simulated directly
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked {
+                cwd: PathBuf::from("/work/alpha"),
+                is_dir: true,
+            },
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
     }
 
     // --- kill-confirm modal --------------------------------------------------
