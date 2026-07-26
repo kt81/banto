@@ -50,17 +50,10 @@ pub trait SessionProvider {
     fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId>;
 
     /// Find the single most-recently created/updated session for `cwd` at or
-    /// after `since` — the newest element of [`Self::find_new_sessions`], so
-    /// a tie (identical mtime) resolves the same deterministic way as there:
-    /// by id, never by filesystem iteration order.
-    ///
-    /// Only ever reports one match, which collides when several new sessions
-    /// are launched into the *same* cwd around the same instant (e.g. an
-    /// emporium brigade auto-spawning several fresh Workers in the
-    /// Director's cwd at once) — each caller's independent call would then
-    /// resolve to the identical newest file, double-assigning it to more
-    /// than one pending session. Callers needing to disambiguate a batch
-    /// should call [`Self::find_new_sessions`] directly instead.
+    /// after `since` — the newest element of [`Self::find_new_sessions`]
+    /// (same id tie-break). Collides when several sessions land in the same
+    /// cwd at once — see [`Self::find_new_sessions`] for that scenario and
+    /// the batch alternative.
     fn find_new_session(&self, cwd: &Path, since: SystemTime) -> Option<SessionId> {
         self.find_new_sessions(cwd, since).pop()
     }

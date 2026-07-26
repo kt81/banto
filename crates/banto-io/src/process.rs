@@ -93,11 +93,9 @@ impl SpawnedProcess for SystemSpawnedProcess {
     }
 }
 
-/// Not `#[cfg(test)]`: `wrap.rs` (a *different* crate, `banto`) needs this
-/// for its own tests, and `#[cfg(test)]` is crate-local in Rust — it never
-/// survives across a crate boundary, even into a downstream crate's own
-/// test build. Always compiled instead (harmless: nothing in a real build
-/// path ever references it, so it never reaches the linked binary).
+/// Not `#[cfg(test)]`: `wrap.rs` (a different crate, `banto`) needs this for
+/// its own tests — see [`crate::pty::mock`]'s doc for why `#[cfg(test)]`
+/// can't be used here.
 pub mod mock {
     use std::cell::RefCell;
     use std::io;

@@ -43,7 +43,6 @@ impl<R> WindowsTerminalOpener<R> {
         Self::with_placement(runner, WtPlacement::Tab)
     }
 
-    /// An opener using an explicit placement.
     pub fn with_placement(runner: R, placement: WtPlacement) -> Self {
         Self { runner, placement }
     }

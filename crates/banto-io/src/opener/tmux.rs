@@ -110,7 +110,6 @@ impl<R> TmuxOpener<R> {
         Self::with_placement(runner, flavor, TmuxPlacement::Pane)
     }
 
-    /// An opener using an explicit placement.
     pub fn with_placement(runner: R, flavor: TmuxFlavor, placement: TmuxPlacement) -> Self {
         Self {
             runner,
@@ -224,14 +223,10 @@ impl<R: CommandRunner> Opener for TmuxOpener<R> {
             });
         };
 
-        // Session-qualified `select-pane` only (docs/notes/psmux-spike.md,
-        // 2026-07-20): `select-window -t 'session:@window_id'` fails
-        // outright on psmux, and `switch-client` corrupted the live server
-        // badly enough to destroy a session during a spike, so neither is
-        // used. banto's own panes are splits within banto's own session
+        // select-window/switch-client are avoided for the reasons in the
+        // module doc; banto's own panes are splits within their own session
         // (TmuxPlacement::Pane), so a plain session-qualified `select-pane`
-        // is sufficient to surface the target pane without switching
-        // windows or clients.
+        // alone suffices.
         self.run(CommandSpec::new(
             self.flavor.program(),
             [
@@ -531,10 +526,7 @@ mod tests {
 
         opener.focus(&handle).unwrap();
 
-        // No `select-window`, no `switch-client` (docs/notes/psmux-spike.md,
-        // 2026-07-20): the former fails on psmux for `session:@id` targets,
-        // the latter corrupted the live server. A session-qualified
-        // `select-pane` alone is the only call.
+        // select-window/switch-client are avoided — see the module doc.
         let calls = opener.runner.calls();
         assert_eq!(
             calls,

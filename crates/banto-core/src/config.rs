@@ -102,8 +102,7 @@ pub struct BrigadeConfig {
     /// an invalid model name is `claude`'s problem, surfaced in the Worker's
     /// own pane.
     pub worker_model: String,
-    /// Whether the emporium's relay engine auto-nudges idle brigade members
-    /// with unseen messages.
+    /// See [`RelayMode`].
     pub relay: RelayMode,
     /// Role briefing appended to a Director's system prompt at launch
     /// (`claude --append-system-prompt`).

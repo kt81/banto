@@ -31,7 +31,7 @@ pub enum AgentKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMeta {
     pub id: SessionId,
-    /// Which agent product this session belongs to.
+    /// See [`AgentKind`].
     pub agent: AgentKind,
     /// Best-effort title: custom-title > ai-title > first user message.
     pub title: Option<String>,

@@ -5,14 +5,13 @@
 //! 2. `Config.claude_home` from banto's own `config.toml`,
 //! 3. the provider default (`~/.claude`).
 //!
-//! Everything under the resolved Claude home is read strictly read-only.
+//! Everything under the resolved Claude home is treated as strictly
+//! read-only.
 //! banto's own database (session <-> pane map, groups, pins) lives under
 //! `Config.db_path`, falling back to [`config::default_db_path`].
 //!
-//! `config.toml` itself is located by [`config::resolve_config_path`] (see
-//! [`load_config`]): `--config`, then `BANTO_CONFIG`, then
-//! `$XDG_CONFIG_HOME/banto/config.toml`, then `~/.config/banto/config.toml`,
-//! then the platform default.
+//! `config.toml` itself is located by [`config::resolve_config_path`]'s
+//! resolution order (see [`load_config`]).
 
 mod embedded;
 mod mcp;
@@ -211,8 +210,6 @@ fn main() -> Result<()> {
             // mutability without threading `&mut Store` through every handler.
             let store = std::cell::RefCell::new(open_store(&config)?);
             if cli.emporium {
-                // The 大店 (emporium) mode: a separate top-level TUI chosen at
-                // launch (`--emporium` / `--oodana`).
                 embedded::run_emporium(
                     &claude_home,
                     &thresholds,

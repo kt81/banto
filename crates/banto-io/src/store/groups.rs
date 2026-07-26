@@ -1,4 +1,4 @@
-//! Session groups and their membership (banto-owned state).
+//! Session groups and their membership.
 //!
 //! `group_members` is a plain many-to-many join table (a session could in
 //! principle join more than one group via [`add_group_member`]). The

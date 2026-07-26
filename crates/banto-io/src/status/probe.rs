@@ -13,8 +13,7 @@ pub trait ProcessProbe {
     /// The parent process id of `pid`, if it could be determined (the
     /// process may no longer exist, or the platform may not expose this).
     /// Used to recognize a brigade member's `claude` process even when it
-    /// isn't banto's own direct PTY child (e.g. launched via a cmd/npm
-    /// shim) — see [`ancestry_reaches`].
+    /// isn't banto's own direct PTY child — see [`ancestry_reaches`].
     fn parent_pid(&self, pid: u32) -> Option<u32>;
 
     /// True if `pid` is alive **and**, when identity can be established, it

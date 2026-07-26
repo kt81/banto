@@ -1,4 +1,4 @@
-//! Pinned sessions (banto-owned state; never written to Claude's files).
+//! Pinned sessions.
 
 use std::time::SystemTime;
 

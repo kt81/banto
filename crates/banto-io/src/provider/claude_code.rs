@@ -385,8 +385,8 @@ mod tests {
         ClaudeCodeProvider::new(ClaudeHome::new(root.path().to_path_buf()))
     }
 
-    /// Set a file's mtime deterministically (`File::set_modified`, stable
-    /// since Rust 1.75), matching the pattern used in `banto::session`.
+    /// Set a file's mtime deterministically, matching `banto::session`'s
+    /// `filetime_set` helper.
     fn set_mtime(path: &Path, time: SystemTime) {
         let file = fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();

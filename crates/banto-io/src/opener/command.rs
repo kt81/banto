@@ -1,8 +1,6 @@
-//! External command execution behind a mockable trait.
-//!
-//! Every process the opener runs (psmux / Windows Terminal CLIs) goes through
-//! [`CommandRunner`], so unit tests substitute a mock and never spawn a real
-//! process (CLAUDE.md invariant: external invocations sit behind an abstraction).
+//! External command execution behind a mockable trait (CLAUDE.md invariant:
+//! external invocations sit behind an abstraction) — see [`CommandRunner`],
+//! and `opener`'s own module doc for the design contract this serves.
 
 use super::OpenError;
 
@@ -59,7 +57,7 @@ impl CommandOutput {
     }
 }
 
-/// Runs external commands. Mocked in tests.
+/// Runs external commands.
 pub trait CommandRunner {
     /// Run `spec` to completion, capturing stdout/stderr.
     ///

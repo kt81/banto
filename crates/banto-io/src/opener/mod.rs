@@ -206,13 +206,13 @@ mod tests {
 
     #[test]
     fn detect_prefers_tmux_over_windows_terminal_regardless_of_platform() {
-        // Inside psmux both variables are set; TMUX must win, on Windows or not.
+        // Inside psmux both variables are set; TMUX must win on both
+        // platforms — which CLI it resolves to is the platform's answer
+        // (see detect_backend).
         let env = |key: &str| match key {
             "TMUX" | "WT_SESSION" => Some("set".to_string()),
             _ => None,
         };
-        // The multiplexer wins on both platforms; which CLI drives it is the
-        // platform's answer (see `detect_backend`).
         assert_eq!(detect_backend(env, true), Some(Backend::Psmux));
         assert_eq!(detect_backend(env, false), Some(Backend::Tmux));
     }
@@ -225,9 +225,9 @@ mod tests {
 
     #[test]
     fn wt_session_set_but_not_on_windows_yields_none_the_wsl_case() {
-        // WSLENV can forward $WT_SESSION from the Windows Terminal host into
-        // a WSL shell even though no tmux/psmux session has been started
-        // yet; the Linux binary must not mistake that for "select `wt`".
+        // WSLENV can forward $WT_SESSION into a WSL shell with no session
+        // started yet — see detect_backend's doc for why is_windows gates
+        // this.
         let env = |key: &str| (key == "WT_SESSION").then(|| "set".to_string());
         assert_eq!(detect_backend(env, false), None);
     }

@@ -1,4 +1,4 @@
-//! Archived sessions (banto-owned state; never written to Claude's files).
+//! Archived sessions.
 //!
 //! Archiving hides a session from the default list without deleting
 //! anything or touching pins/groups/panes; `unarchive_session` reverses it.

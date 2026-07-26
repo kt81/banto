@@ -5,8 +5,7 @@
 //!
 //! Module map:
 //! - [`render_modal`] rendering `Modal` as a centered overlay — shared by
-//!   both modes; `banto::tui` (the chōba list, otherwise un-migrated by
-//!   design) imports it back rather than rendering modals independently
+//!   both modes (see its own module doc for why)
 //! - [`render`] `vt100` screen -> ratatui text (the emporium's embedded panes)
 //! - [`view`] the shared session-list / summary panel widgets
 //! - [`text`] column-aware text truncation, shared by `render_modal`/`view`
