@@ -35,8 +35,9 @@ use ratatui::layout::Position;
 use ratatui::widgets::{Block, Paragraph};
 
 /// Host `argv` in a full-screen embedded pane until the user presses F12.
-/// Reached via the hidden `banto _embed` subcommand; the list/brigade wiring
-/// (Slice 1b / Slice 2) will call the same [`EmbeddedSession`] primitives.
+/// Reached via the hidden `banto _embed` subcommand — the only caller of
+/// [`EmbeddedSession`]; the emporium (`embedded::emporium`) uses
+/// `Screen`/`PtyHandle` directly instead (see `session.rs`'s module doc).
 pub fn run_embedded(argv: &[String], cwd: Option<&Path>) -> Result<()> {
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;

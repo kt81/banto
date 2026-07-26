@@ -36,8 +36,9 @@ pub enum OpenerMode {
     WindowsTerminal,
 }
 
-/// Thresholds for the activity age buckets (plain numbers here; the status
-/// module consumes them when wiring happens later).
+/// Thresholds for the activity age buckets (plain numbers here; converted to
+/// `banto_core::status::AgeThresholds` by `banto::session::thresholds_from`,
+/// which feeds `status::age_bucket`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ActivityConfig {

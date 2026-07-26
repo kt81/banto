@@ -20,10 +20,7 @@ pub struct PtyIo {
     pub input: Box<dyn Write + Send>,
     /// Resizes the child's PTY (and keeps the child process alive).
     pub resizer: Box<dyn Resizer>,
-    /// Kills the child. Added alongside the resize handle (touching this
-    /// file once) even though nothing emits `Cmd::KillPty` yet — that's
-    /// Phase 2b (session termination); the executor plumbing is deliberately
-    /// ready ahead of it.
+    /// Kills the child (`Cmd::KillPty`'s executor).
     pub killer: Box<dyn Killer>,
     /// Asks the child to shut down as if its terminal window closed — what
     /// dropping the master alone fails to convey on Unix. See [`Hangup`].
@@ -41,8 +38,9 @@ pub struct PtyIo {
     /// child's exit does **not** produce EOF on `output` (the pseudoconsole
     /// keeps the pipe open), so `output` disconnecting is a Unix-only signal
     /// — this channel is the active, cross-platform one. See
-    /// `PortablePtyHost::open`'s exit-waiter thread and
-    /// `super::session::PtyHandle::poll`'s doc for how the two combine.
+    /// `PortablePtyHost::open`'s exit-waiter thread and, in the `banto`
+    /// crate, `embedded::session::PtyHandle::poll`'s doc for how the two
+    /// combine.
     pub exited: Receiver<()>,
 }
 
@@ -233,11 +231,12 @@ impl Killer for PortablePtyKiller {
     }
 }
 
-/// Not `#[cfg(test)]`: `session.rs` (a *different* crate, `banto`) needs
-/// this for its own tests, and `#[cfg(test)]` is crate-local in Rust — it
-/// never survives across a crate boundary, even into a downstream crate's
-/// own test build. Always compiled instead (harmless: nothing in a real
-/// build path ever references it, so it never reaches the linked binary).
+/// Not `#[cfg(test)]`: the `banto` crate's `embedded::session` and
+/// `embedded::emporium` (a *different* crate) both need this for their own
+/// tests, and `#[cfg(test)]` is crate-local in Rust — it never survives
+/// across a crate boundary, even into a downstream crate's own test build.
+/// Always compiled instead (harmless: nothing in a real build path ever
+/// references it, so it never reaches the linked binary).
 pub mod mock {
     use std::io::{self, Write};
     use std::path::Path;
@@ -364,7 +363,7 @@ pub mod mock {
 
     /// Mirrors reality: killing a child makes it exit, so `kill` also fires
     /// the same `exited` signal a real `child.wait()` returning would —
-    /// keeps a future active-kill test's expectations honest.
+    /// keeps `session.rs`'s `poll_reaches_disconnected_after_kill` honest.
     struct MockKiller(Arc<Mutex<u32>>, Arc<Mutex<Option<mpsc::Sender<()>>>>);
 
     impl Killer for MockKiller {
