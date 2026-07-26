@@ -442,7 +442,7 @@ impl NewSessionState {
         self.cursor = char_len(&self.input);
     }
 
-    /// Char-index position of the text cursor within [`Self::input`].
+    // Same as GroupJoinState::cursor.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -709,11 +709,12 @@ impl App {
     /// [`Mode::Search`], or a modal with a text field ([`Modal::NewSession`]/
     /// [`Modal::GroupJoin`]). `false` for a confirm-only modal
     /// (`ConfirmArchive`/`ConfirmDisband`/`ConfirmKill`) — those ignore
-    /// [`Self::push_char`]/[`Self::modal_push_char`] entirely, and their
-    /// y/n/Enter keys must stay zero-latency. Named for its one consumer so
-    /// far, the emporium's paste accumulator (`paste_accum::is_in_scope`),
-    /// which widens paste synthesis to exactly this set of contexts on top
-    /// of a focused pane, without teaching the shell about modal variants.
+    /// [`Self::push_char`]/[`Self::modal_push_char`] entirely. Named for its
+    /// one consumer so far, the emporium's paste accumulator
+    /// (`paste_accum::is_in_scope`, see its doc for why a confirm-only
+    /// modal's y/n/Enter keys must stay out of scope), which widens paste
+    /// synthesis to exactly this set of contexts on top of a focused pane,
+    /// without teaching the shell about modal variants.
     pub fn accepts_text_input(&self) -> bool {
         if self.mode == Mode::Search {
             return true;
@@ -3016,8 +3017,7 @@ mod tests {
         assert!(app.accepts_text_input());
         app.close_modal();
 
-        // Confirm-only modals: not accepting — they ignore push_char
-        // entirely, and their y/n/Enter keys must stay zero-latency.
+        // Confirm-only modals: not accepting (see accepts_text_input's doc).
         app.open_confirm_archive_modal();
         assert!(!app.accepts_text_input());
         app.close_modal();

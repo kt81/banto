@@ -1,8 +1,6 @@
-//! Session <-> pane mapping for the opener (phase 2).
-//!
-//! One pane per session, mirroring the "no double resume" invariant: before
-//! resuming, the opener checks this table and focuses the existing pane
-//! instead of spawning a second one.
+//! Session <-> pane mapping for the opener (phase 2) — one pane per session.
+//! See `banto::opener`'s module doc for the "no double resume" mechanism
+//! this table backs.
 
 use std::time::SystemTime;
 

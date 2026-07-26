@@ -5,17 +5,11 @@
 //!   Claude's files)
 //! - session <-> pane mapping for the opener (phase 2 consumes this)
 //!
-//! A session index cache + FTS5 text index (mirroring provider discovery)
-//! lived here through schema v10; it had no production callers (discovery
-//! always fed the UI directly, and search runs live through nucleo) and was
-//! removed in v11 (see `migrations::MIGRATIONS`).
-//!
-//! With it went the last thing here that mirrored the provider, and the only
-//! place a filesystem path was ever persisted. What remains is banto's own
-//! state, keyed by session id and holding no paths at all — so the store is
-//! no longer a cache of anything, and nothing in it can go stale against
-//! `~/.claude`. Rows deliberately keep no foreign key to a session, which is
-//! what lets a pin or a group survive a source that is temporarily
+//! No session index cache or filesystem path ever lives here (see
+//! `migrations::MIGRATIONS`'s v11 for why) — every row is keyed by session
+//! id and holds no paths at all, so nothing in the store can go stale
+//! against `~/.claude`. Rows deliberately keep no foreign key to a session,
+//! which is what lets a pin or a group survive a source that is temporarily
 //! unavailable.
 
 mod archive;

@@ -29,3 +29,14 @@ The architecture discipline (TEA / sans-IO: Event → State + Cmd, I/O at the ed
 - Documentation, commit messages, identifiers, and code comments are all written in English
 - Keep clippy clean with `-D warnings`
 - Put every external process invocation (tmux etc.) behind an abstraction (trait) and mock it in unit tests
+- **Comments earn their place.** Say what the code cannot: why it has this
+  shape, a fact measured on a real machine, an incident that happened, a
+  constraint an innocent edit would break, a rejected alternative someone
+  would retry. Not the signature restated, not history git already holds,
+  not what another comment in the crate already says. Length is proportional
+  to surprise — obvious code gets none. Judge by content, not tense: the
+  best comments here are past tense because their reason is a past event.
+  Cite checked-in docs (`docs/DISCIPLINE.md §3`), never round numbers or
+  card ids a reader cannot resolve. **A comment that has gone false costs
+  more than a verbose one** — when behaviour lands, reread whatever
+  described it as future.

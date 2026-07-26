@@ -208,19 +208,17 @@ const MIGRATIONS: &[&str] = &[
         parent_id TEXT NOT NULL
     );
     CREATE INDEX session_lineage_parent ON session_lineage (parent_id);",
-    // v11: the sessions cache mirror and its FTS5 index were a historical
-    // relic — `Store::sync_sessions`/`list_sessions`/`fts_search` had zero
-    // production callers (every provider `discover()` call site feeds the
-    // UI directly; search runs live through nucleo, not FTS5), so the
-    // operator asked to remove the dead tables outright rather than carry
-    // them forward. v1 above still creates `sessions`/`sessions_fts`, and v2
-    // still alters `sessions` to add `is_agent` — DO NOT "clean up" v1/v2 to
-    // match this: a database that has never advanced past v1 still needs
-    // those CREATE/ALTER steps to run before this migration can drop what
-    // they made, and a fresh database always replays every script from v1
-    // forward regardless of what the final schema looks like. Dropping the
-    // FTS5 virtual table first cleans up its shadow tables before the table
-    // it indexes disappears.
+    // v11: drops the sessions cache mirror and its FTS5 index — see
+    // `banto_io::store`'s module doc for what the store looks like after
+    // this. v1 above still
+    // creates `sessions`/`sessions_fts`, and v2 still alters `sessions` to
+    // add `is_agent` — DO NOT "clean up" v1/v2 to match this: a database
+    // that has never advanced past v1 still needs those CREATE/ALTER steps
+    // to run before this migration can drop what they made, and a fresh
+    // database always replays every script from v1 forward regardless of
+    // what the final schema looks like. Dropping the FTS5 virtual table
+    // first cleans up its shadow tables before the table it indexes
+    // disappears.
     "DROP TABLE sessions_fts;
     DROP TABLE sessions;",
 ];

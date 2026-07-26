@@ -195,14 +195,12 @@ impl BrigadeConfig {
 #[serde(default)]
 pub struct KeysConfig {
     /// The prefix chord for pane operations (tmux-style: press it, then a
-    /// second key — `o`/Tab cycles panes, `1`-`9` jumps to one, `s` returns
-    /// to the sidebar, `x` opens the kill-confirm dialog, the prefix itself
-    /// or a plain `b` sends the prefix's own byte through literally).
-    /// `"C-<char>"` for a Control chord (e.g. the default `"C-b"`), or a
-    /// bare single character for an unmodified key. Parsed leniently in the
-    /// `banto` bin crate, not here: `KeyCode`/`Modifiers` parsing from a raw
-    /// chord string is `crate::engine::PrefixKey`'s job — this field is just
-    /// the raw string, validated no further than "is it a string".
+    /// second key — see `crate::engine::PrefixAction` for what each one
+    /// does). `"C-<char>"` for a Control chord (e.g. the default `"C-b"`),
+    /// or a bare single character for an unmodified key. Parsed leniently in
+    /// the `banto` bin crate, not here: `KeyCode`/`Modifiers` parsing from a
+    /// raw chord string is `crate::engine::PrefixKey`'s job — this field is
+    /// just the raw string, validated no further than "is it a string".
     pub prefix: String,
 }
 

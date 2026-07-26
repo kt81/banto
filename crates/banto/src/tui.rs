@@ -125,9 +125,7 @@ struct Context<'a> {
     /// satisfy a borrow.
     claude_home: ClaudeHome,
     thresholds: &'a AgeThresholds,
-    /// `RefCell`-wrapped so `Store::set_session_group` (which takes `&mut
-    /// self`, since it wraps a transaction) can be called from the many key
-    /// handlers that only hold a plain `&Context` — see [`run`].
+    /// `RefCell`-wrapped — see `main`'s construction site for why.
     store: &'a RefCell<Store>,
     opener_mode: OpenerMode,
     /// Diagnostic input-event log, enabled via the `BANTO_INPUT_LOG` env var

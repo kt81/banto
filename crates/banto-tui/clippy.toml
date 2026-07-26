@@ -41,7 +41,7 @@ disallowed-methods = [
     # PathBuf predicates and the common std::fs/File entry points a
     # SessionRow/path-handling crate would plausibly reach for.
     # `Path::is_dir` is the one that actually got through — see R37. ---
-    { path = "std::path::Path::is_dir", reason = "DISCIPLINE.md §3: no file reads or writes (R37 found this one live in engine.rs)" },
+    { path = "std::path::Path::is_dir", reason = "DISCIPLINE.md §3: no file reads or writes — this is the one that got through once" },
     { path = "std::path::Path::is_file", reason = "DISCIPLINE.md §3: no file reads or writes" },
     { path = "std::path::Path::exists", reason = "DISCIPLINE.md §3: no file reads or writes" },
     { path = "std::path::Path::try_exists", reason = "DISCIPLINE.md §3: no file reads or writes" },

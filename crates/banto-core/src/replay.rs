@@ -163,13 +163,8 @@ mod tests {
     use crate::engine::{Focus, Stage};
     use crate::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 
-    /// `Instant` has no stable constructor for an arbitrary value other than
-    /// `now()` — this gives tests a concrete instant to seed the `now` they
-    /// feed into recorded/replayed events, without silencing
-    /// `disallowed-methods` for the rest of this module. Not the clock
-    /// access DISCIPLINE.md §3 forbids: that's about production code
-    /// reading the clock itself, not a test choosing its own fixed starting
-    /// point.
+    /// See `app::tests::test_instant`'s doc for why this exists and why it's
+    /// not the clock access DISCIPLINE.md §3 forbids.
     #[allow(clippy::disallowed_methods)]
     fn test_instant() -> Instant {
         Instant::now()
