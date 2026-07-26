@@ -812,11 +812,9 @@ pub enum Event {
     PtyExited {
         key: SessionKey,
     },
-    /// The shell's answer to `Cmd::CheckNewSessionCwd`. `cwd` is echoed back
-    /// so `update` can tell whether this answer still applies to whatever
-    /// the new-session modal's target is *now* — the operator may have kept
-    /// typing while the stat was in flight (see
-    /// `App::modal_new_session_check_resolves`).
+    /// The shell's answer to `Cmd::CheckNewSessionCwd` — see
+    /// `update_new_session_cwd_checked`'s doc for why `cwd` is echoed back
+    /// and how a stale answer is handled.
     NewSessionCwdChecked {
         cwd: PathBuf,
         is_dir: bool,

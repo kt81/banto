@@ -52,8 +52,7 @@ const MIGRATIONS: &[&str] = &[
     // Agent-Teams teammate) rather than started interactively.
     "ALTER TABLE sessions ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;",
     // v3: archived sessions (soft-hide; the source file under ~/.claude is
-    // never touched). Mirrors `pins`: a loose reference (no foreign key), so
-    // an archived id survives a source that is temporarily unavailable.
+    // never touched). Loose reference to `sessions`, same reason as v1.
     "CREATE TABLE archived (
         session_id     TEXT PRIMARY KEY,
         archived_at_ms INTEGER NOT NULL
@@ -61,11 +60,10 @@ const MIGRATIONS: &[&str] = &[
     // v4: brigades — an internal operational cell of one Director session and
     // one or more Worker sessions, hosted together as tiled panes in the
     // emporium mode. A *separate* concept from groups (which are the user's own
-    // project/phase filing): a brigade is a live operational unit. Like
-    // groups/pins, a loose reference (no foreign keys) so a brigade survives a
-    // source that is temporarily unavailable. A session belongs to at most one
-    // brigade; that single-membership invariant (and "exactly one Director per
-    // brigade") is layered in code, not a schema constraint.
+    // project/phase filing): a brigade is a live operational unit. Loose
+    // reference to `sessions`, same reason as v1. A session belongs to at
+    // most one brigade; that single-membership invariant (and "exactly one
+    // Director per brigade") is layered in code, not a schema constraint.
     "CREATE TABLE brigades (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         name          TEXT NOT NULL,

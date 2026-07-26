@@ -544,12 +544,11 @@ pub(crate) fn encode_target(handle: &SessionHandle) -> String {
 
 /// Inverse of [`encode_target`].
 ///
-/// A pane record written before psmux's non-unique-id finding
-/// (docs/notes/psmux-spike.md, 2026-07-20) encodes the old, un-qualified
-/// `<window_id>:<pane_id>` form (two `:`-joined parts). That target can no
-/// longer be resolved to a specific session, so it decodes to `None` here —
-/// the caller ([`focus_existing`]) treats a `None` decode as a stale record
-/// and opens a fresh pane instead of risking an ambiguous focus.
+/// A pane record written before pane/window ids were session-qualified (see
+/// [`resolve_own_anchor`]'s doc) encodes the old, un-qualified
+/// `<window_id>:<pane_id>` form (two `:`-joined parts) and decodes to `None`
+/// here — the caller ([`focus_existing`]) treats a `None` decode as a stale
+/// record and opens a fresh pane instead of risking an ambiguous focus.
 fn decode_handle(backend: Backend, target: &str) -> Option<SessionHandle> {
     match backend {
         // Both multiplexer flavors store the same three parts: the encoded
@@ -1350,11 +1349,8 @@ mod tests {
 
     #[test]
     fn decode_handle_rejects_a_pre_session_qualification_two_part_target() {
-        // A pane record written before psmux's non-unique-id finding
-        // (docs/notes/psmux-spike.md, 2026-07-20) encodes the old
-        // `<window_id>:<pane_id>` form. It can no longer be resolved to a
-        // specific session, so it must decode to `None`, not be
-        // misinterpreted as `<session>:<pane_id>` with a missing pane.
+        // See decode_handle's doc — must not be misinterpreted as
+        // `<session>:<pane_id>` with a missing pane.
         assert_eq!(decode_handle(Backend::Psmux, "@3:%8"), None);
     }
 

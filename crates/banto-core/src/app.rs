@@ -412,8 +412,7 @@ impl NewSessionState {
         self.refilter();
     }
 
-    /// Delete the character before the cursor and re-filter (no-op at the
-    /// start of the input).
+    // Same as GroupJoinState::backspace/delete_forward.
     fn backspace(&mut self) {
         if remove_before_cursor(&mut self.input, self.cursor) {
             self.cursor -= 1;
@@ -421,8 +420,6 @@ impl NewSessionState {
         }
     }
 
-    /// Delete the character at the cursor and re-filter (no-op at the end of
-    /// the input).
     fn delete_forward(&mut self) {
         if remove_at_cursor(&mut self.input, self.cursor) {
             self.refilter();

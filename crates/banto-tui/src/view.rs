@@ -96,9 +96,8 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
         return;
     }
 
-    // Grouped view is actually in effect -> every pinned row's section is
-    // "Pinned", so a pin marker could never render on any row this frame —
-    // the whole column is dropped, not just individually blanked.
+    // See the module doc's "Row layout" section for why the pin slot is
+    // conditional on this.
     let show_pin_slot = !app.grouped_view_in_effect();
     let items: Vec<ListItem> = app
         .visible()
@@ -491,11 +490,6 @@ mod tests {
         .with_pinned(["pinned".to_string()].into_iter().collect());
         app.set_viewport_height(10);
 
-        // Grouped view is on by default and two sections exist (Pinned,
-        // Ungrouped), so it's actually in effect — the pin slot doesn't
-        // exist at all this frame (every pinned row's section is "Pinned",
-        // so the marker could never render), not merely blanked.
-        // The Pinned header (checked elsewhere) carries the marker instead.
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
         assert!(
@@ -522,8 +516,6 @@ mod tests {
         .with_pinned(["pinned".to_string()].into_iter().collect());
         app.set_viewport_height(10);
 
-        // Grouped view (default): two sections exist, so it's actually in
-        // effect and the pin column is dropped for every row.
         let grouped_col = title_start_col(&app, 60, 10, now, "Marked");
 
         app.toggle_grouped_view(); // flat: the pin slot exists again
@@ -581,11 +573,8 @@ mod tests {
         .with_pinned(["pinned".to_string()].into_iter().collect());
         app.set_viewport_height(10);
 
-        // Grouped view is in effect by default (two sections exist): the
-        // pinned row (Pinned section) and the other row (Ungrouped
-        // section) must start their titles at the same column — the
-        // dropped pin column applies uniformly to every row, not just
-        // pinned ones, so nothing should ever misalign between sections.
+        // The dropped pin column applies uniformly across sections, not
+        // just to pinned rows.
         let pinned_col = title_start_col(&app, 60, 10, now, "Marked");
         let ungrouped_col = title_start_col(&app, 60, 10, now, "Zzz");
         assert_eq!(

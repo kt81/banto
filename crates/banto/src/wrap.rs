@@ -595,12 +595,8 @@ mod tests {
 
     #[test]
     fn resolve_own_pane_is_none_for_windows_terminal_even_with_tmux_pane_set() {
-        // The explicit `backend` flag is authoritative, not a guess from
-        // `$TMUX_PANE`'s presence: banto could itself be running inside an
-        // unrelated tmux session (so `$TMUX_PANE` is set and would be
-        // inherited here) while still configured to open new sessions via
-        // Windows Terminal. Trusting the env var anyway would resolve (and
-        // wrongly record against) some unrelated tmux pane.
+        // See resolve_own_pane's doc: the backend flag wins over a guess
+        // from $TMUX_PANE's presence.
         let runner = MockCommandRunner::default();
         let env = |key: &str| (key == "TMUX_PANE").then(|| "%8".to_string());
 
@@ -966,12 +962,8 @@ mod tests {
 
     #[test]
     fn run_new_session_logs_to_the_explicit_wrap_log_path_argument() {
-        // psmux does not reliably forward banto's own environment to the
-        // pane it spawns `_wrap --new-session` into (docs/notes/psmux-spike.md),
-        // so `BANTO_WRAP_LOG` alone can silently produce no log at all for
-        // this path. `--wrap-log <path>` (threaded through argv by the
-        // opener instead) must be honored regardless of what's in this
-        // process's own environment.
+        // See WrapLog::new's doc — `--wrap-log <path>` must be honored
+        // regardless of this process's own environment.
         let claude_home = TempDir::new().unwrap();
         let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let store = Store::open_in_memory().unwrap();

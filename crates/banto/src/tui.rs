@@ -610,25 +610,12 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                     // handling (see the comment on that branch below).
                     if key.kind == KeyEventKind::Release {
                         if code == KeyCode::Esc {
-                            // Confirmed via BANTO_INPUT_LOG: during active
-                            // mouse motion, Esc's *press* can be dropped
-                            // upstream entirely (same family as the
-                            // dropped-ESC-byte finding for leaked mouse
-                            // reports) — no Esc press of any shape reaches
-                            // us, only its Release. That's a genuine
-                            // dropped-press case and this bare Release is
-                            // the only real signal of it — BUT a bare
-                            // Release also reaches here whenever a normal,
-                            // successfully-dispatched Esc's physical hold
-                            // outlasts `ESCAPE_GRACE` (routine for an
-                            // ordinary human tap, not just a held key):
-                            // `resolve_escape` times out and dispatches
-                            // before that Esc's own Release has arrived,
-                            // so the Release shows up here on its own with
-                            // nothing else to say it was already handled.
-                            // `consume_recent_genuine_esc` tells the two
-                            // cases apart via the timestamp
-                            // `dispatch_genuine_esc` leaves behind.
+                            // A bare Esc Release here is ambiguous: a genuine
+                            // dropped press (mouse motion can drop it
+                            // upstream) or the trailing Release of an Esc
+                            // already dispatched by `resolve_escape`'s
+                            // timeout — see `ESC_RELEASE_SUPPRESS_WINDOW`'s
+                            // doc for why both look identical at this point.
                             if consume_recent_genuine_esc(ctx, Instant::now()) {
                                 ctx.log(
                                     "loop: bare Esc Release matches a just-dispatched genuine Esc -> consuming, not re-dispatching",
@@ -647,15 +634,8 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
                     if code == KeyCode::Esc {
                         resolve_escape(app, ctx, list_area)?;
                     } else if headless_bracket_recovery_active(ctx, code, key.modifiers) {
-                        // Confirmed from BANTO_INPUT_LOG evidence: under
-                        // ConPTY, leaked SGR sequences can arrive with their
-                        // leading `ESC` dropped entirely, as a plain
-                        // `Char('[')` press with no modifiers — see
-                        // `resolve_headless_bracket`. Gated to platforms
-                        // where that premise holds (see
-                        // `Context::headless_leak_recovery`); everywhere
-                        // else this falls through to the plain `handle_key`
-                        // below, same as any other character.
+                        // See `Context::headless_leak_recovery`'s doc for why
+                        // this platform-gated path exists at all.
                         resolve_headless_bracket(app, ctx, list_area)?;
                     } else {
                         handle_key(app, code, key.modifiers, ctx);
@@ -1054,17 +1034,13 @@ fn resolve_escape(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
 /// Resolve a `Char('[')` key event with no modifiers by buffering it as a
 /// possible SGR mouse sequence with its leading `ESC` already missing. Only
 /// called when [`headless_bracket_recovery_active`] has already said this
-/// platform needs it (see [`Context::headless_leak_recovery`]) — confirmed
-/// via `BANTO_INPUT_LOG`: under ConPTY, leaked SGR mouse reports can arrive
-/// as a headless stream of plain `Char` press events (`[`, `<`, digits, `;`,
-/// ..., `M`), with no `Esc` event, no modifier, and no `Event::Mouse` ever
-/// involved — the leading `ESC` byte is dropped somewhere upstream (ConPTY
-/// or crossterm's Windows input path) before it ever reaches us. Unlike
-/// [`resolve_escape`] there is no ambiguity to wait out at entry: an
-/// ordinary typed `[` looks identical to the start of a leaked sequence at
-/// this first byte either way, so buffering always begins —
-/// [`HEADLESS_GRACE`] is what keeps genuine typing from being mistaken for
-/// one (see [`swallow_one_sequence`]'s `NotSgr`/timeout path).
+/// platform needs it — see [`Context::headless_leak_recovery`]'s doc for why
+/// the leading `ESC` goes missing at all. Unlike [`resolve_escape`] there is
+/// no ambiguity to wait out at entry: an ordinary typed `[` looks identical
+/// to the start of a leaked sequence at this first byte either way, so
+/// buffering always begins — [`HEADLESS_GRACE`] is what keeps genuine typing
+/// from being mistaken for one (see [`swallow_one_sequence`]'s
+/// `NotSgr`/timeout path).
 fn resolve_headless_bracket(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
     match swallow_one_sequence(
         app,
@@ -1096,10 +1072,9 @@ fn drain_more(app: &mut App, ctx: &Context, list_area: Rect) -> Result<()> {
         match read {
             Event::Key(key) if key.kind == KeyEventKind::Release => {
                 if normalize_key_code(key.code) == KeyCode::Esc {
-                    // See the identical branch in `event_loop`: this bare
-                    // Release is either a genuinely dropped press (dispatch
-                    // it) or the trailing Release of an Esc already handled
-                    // via `dispatch_genuine_esc` (consume it silently).
+                    // Same ambiguous bare Esc Release as `event_loop`'s
+                    // matching branch — see `ESC_RELEASE_SUPPRESS_WINDOW`'s
+                    // doc for why.
                     if consume_recent_genuine_esc(ctx, Instant::now()) {
                         ctx.log(
                             "esc: drain saw a bare Esc Release matching a just-dispatched genuine Esc -> consuming, not re-dispatching",
@@ -2820,17 +2795,9 @@ mod tests {
         assert!(!consume_recent_genuine_esc(&ctx, Instant::now()));
     }
 
-    /// Regression: a held Esc press that outlasts `ESCAPE_GRACE` (routine
-    /// for an ordinary human tap, not just a deliberately held key) makes
-    /// `resolve_escape` dispatch the press before its own trailing Release
-    /// has arrived; that Release then reaches the top-level loop's "press
-    /// must have been lost" fallback with nothing left to say it was
-    /// already handled. Reproduces the sequence directly: a genuine
-    /// dispatch (as `resolve_escape`'s entry-grace-timeout branch would
-    /// perform) closes the modal, then the same guard the fixed
-    /// `event_loop`/`drain_more` branches run before falling back to a
-    /// second dispatch — proving that second Esc never reaches
-    /// `handle_key`.
+    /// Regression for the race `ESC_RELEASE_SUPPRESS_WINDOW`'s doc
+    /// describes: proves the trailing Release is swallowed rather than
+    /// firing a second Esc.
     #[test]
     fn a_delayed_esc_release_after_a_genuine_dispatch_does_not_fire_a_second_esc() {
         let store = RefCell::new(Store::open_in_memory().unwrap());

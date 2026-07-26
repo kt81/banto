@@ -14,13 +14,9 @@
 //! `render_modal`. It has its own, separate event loop and is untouched by
 //! this migration.
 //!
-//! `BANTO_RECORD_EVENTS=<path>` (see [`EventRecorder`]) captures every
-//! `Event` fed into [`engine::update`] as a `docs/DISCIPLINE.md` §8 replay
-//! stream — **a captured file is a LOCAL DIAGNOSTIC ARTIFACT and must never
-//! be committed**: unlike `BANTO_INPUT_LOG`, it contains real session
-//! content in full (keystrokes, pasted text, PTY output), not redacted
-//! lengths. Repo invariant 2 applies with full force — `banto_core::replay`'s
-//! own fixtures are hand-written synthetic streams only.
+//! `BANTO_RECORD_EVENTS=<path>` (see [`EventRecorder`]'s doc for what it
+//! captures and why it must never be committed) captures every `Event` fed
+//! into [`engine::update`] as a `docs/DISCIPLINE.md` §8 replay stream.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -715,11 +711,10 @@ fn heal_member_session(
 }
 
 /// Create the brigade, its Director row, and `worker_count` Worker rows
-/// (schema v7), all-or-nothing. Mirrors the pre-migration `form_brigade`'s
-/// store writes, simplified to an atomic outcome rather than continuing past
-/// a single worker row's insert failure — an edge case rare enough (same
-/// connection, no concurrent writers expected) that the extra per-worker
-/// partial-failure bookkeeping isn't worth the complexity this round.
+/// (schema v7), all-or-nothing rather than continuing past a single worker
+/// row's insert failure — an edge case rare enough (same connection, no
+/// concurrent writers expected) that the extra per-worker partial-failure
+/// bookkeeping isn't worth the complexity.
 fn form_brigade_store(
     store: &RefCell<Store>,
     director_row_id: &str,
@@ -1914,12 +1909,7 @@ mod tests {
 
     #[test]
     fn a_worker_that_has_written_no_session_file_is_still_identified_by_its_pid() {
-        // The dogfooding bug: `claude` writes a session's jsonl at its first
-        // turn, but publishes `sessions/<pid>.json` at startup. A brigade
-        // Worker nobody has typed into yet therefore has an id but no
-        // session file — invisible to the file scan forever, so its store
-        // row stayed NULL and every re-stage of the cell spawned it again
-        // as a brand-new session.
+        // See poll_discovery's doc for the deadlock this covers.
         let claude_home = tempfile::tempdir().unwrap();
         let cwd = PathBuf::from("/work/alpha");
         let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));

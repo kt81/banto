@@ -814,7 +814,7 @@ mod tests {
                 claude_session_id: Some(sid("dir")),
             }]
         );
-        // Removing a non-member is a no-op.
+        // See remove_brigade_member's doc: a non-member is a no-op.
         store.remove_brigade_member(br, "nobody").unwrap();
 
         store.delete_brigade(br).unwrap();
@@ -995,7 +995,7 @@ mod tests {
             .unwrap();
         assert_eq!(cursors, 0);
 
-        // The populated brigade and its rows are untouched.
+        // See delete_empty_brigades's doc: a populated brigade is untouched.
         assert_eq!(store.brigade_members(populated).unwrap().len(), 1);
     }
 
