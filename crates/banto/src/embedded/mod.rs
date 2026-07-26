@@ -2,7 +2,7 @@
 //! banto's own ratatui TUI — spawn it in a PTY, parse its output with `vt100`,
 //! render the grid, and forward input. This is the productionised form of the
 //! `docs/notes/embedded-pty-spike.md` case-A spike (banto as a minimal
-//! multiplexer), Slice 1: a single embedded pane.
+//! multiplexer), in its single-pane form.
 //!
 //! Windows/ConPTY note (from the spike): banto must NOT answer the child's
 //! DSR/DA queries — ConPTY is the child's terminal and passes host input

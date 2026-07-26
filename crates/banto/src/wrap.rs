@@ -510,7 +510,6 @@ mod tests {
 
         assert_eq!(code, 0);
         assert_eq!(runner.calls(), vec![argv]);
-        // Cleaned up: the pane record is gone once the child exits.
         assert_eq!(store.get_pane(&SessionId("s1".to_string())).unwrap(), None);
     }
 
@@ -866,7 +865,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(code, 0);
-        // The plain, blocking path was used, not spawn+tracking.
         assert_eq!(process_runner.calls(), vec![vec!["claude".to_string()]]);
         assert!(process_runner.spawn_calls().is_empty());
         assert!(command_runner.calls().is_empty());
@@ -900,16 +898,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(code, 0);
-        // The spawn+tracking path was used, not the plain blocking one.
         assert_eq!(
             process_runner.spawn_calls(),
             vec![vec!["claude".to_string()]]
         );
         assert!(process_runner.calls().is_empty());
-        // Resolved its own pane via display-message before tracking.
         assert_eq!(command_runner.calls().len(), 1);
-        // Never found a match (no session file exists), so nothing was
-        // ever recorded to begin with.
         assert!(store.list_panes().unwrap().is_empty());
     }
 

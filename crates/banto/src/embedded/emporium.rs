@@ -2,8 +2,8 @@
 //! persistent left sidebar (the session list) plus a right pane hosting the
 //! selected session embedded.
 //!
-//! Since Phase 2a of the sans-IO migration (`docs/DISCIPLINE.md` §4), this
-//! module is a thin **shell**: it gathers facts about the outside world into
+//! Per `docs/DISCIPLINE.md` §4, this module is a thin **shell**: it gathers
+//! facts about the outside world into
 //! [`engine::Event`]s, calls the pure [`engine::update`], and executes the
 //! [`engine::Cmd`]s it returns — process spawning, PTY reads/writes, store
 //! reads/writes, and drawing all live here; none of the *decisions* do (see
@@ -299,7 +299,6 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             events.extend(poll_discovery(&mut discovery, &provider, &claimed, &live));
         }
 
-        // Live updates: reload the list once the watched dirs settle.
         if watch.poll_ready(SystemTime::now()) {
             events.extend(gather_reload(deps));
         }
@@ -377,9 +376,9 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Deliberately NOT how the prefix-x kill path (`Cmd::KillPty`) works: that
 /// is explicit user intent for an immediate stop, and session jsonl is
 /// append-only and parsed leniently on both sides, so a hard kill there
-/// risks at most one truncated trailing line — an already-accepted
-/// (Phase 2b) trade for responsiveness that this sweep does not need to
-/// make, since nothing here is time-sensitive to the user.
+/// risks at most one truncated trailing line — an already-accepted trade for
+/// responsiveness that this sweep does not need to make, since nothing here
+/// is time-sensitive to the user.
 fn shutdown_handles(
     handles: &mut HashMap<SessionKey, PtyHandle>,
     grace: Duration,
@@ -560,8 +559,6 @@ fn execute_open_embedded(
     }
 }
 
-/// Execute one store intent, reusing the store's existing transactional
-/// functions, and return the fact it produced.
 fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Event> {
     match intent {
         StoreIntent::SetPin { id, pinned } => {
@@ -695,8 +692,8 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
 /// Follow `claude_session_id` to its newest known auto-compaction
 /// continuation (`Store::lineage_leaf`) and, if it moved, persist the move
 /// (`Store::set_member_claude_session`, v9 move semantics: any other row
-/// holding the healed id is cleared) — closing the zombie loop for forks
-/// R19's live watcher missed (banto wasn't running when they happened), so
+/// holding the healed id is cleared) — closing the zombie loop for forks the
+/// live watcher missed (banto wasn't running when they happened), so
 /// re-staging resumes the true continuation instead of a stale ancestor.
 /// `None` in, `None` out: a member still awaiting discovery has nothing to
 /// heal. Tolerant: a lookup/write failure just leaves the id as recorded,
@@ -752,8 +749,8 @@ fn form_brigade_store(
 
 /// Add one more Worker to an already-formed brigade, under the next
 /// `worker-N` token. `N` is the highest existing Worker number plus one, NOT
-/// a count of current Workers — dismissal (R27) can leave a gap (e.g.
-/// worker-1 dismissed while worker-2 survives), and counting would then mint
+/// a count of current Workers — dismissal can leave a gap (e.g. worker-1
+/// dismissed while worker-2 survives), and counting would then mint
 /// worker-2 again, colliding with the survivor and letting the newcomer
 /// inherit its predecessor's stale store row.
 fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<MemberToken, String> {
@@ -1187,8 +1184,6 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
     }
 }
 
-/// The title shown on a staged tile: its role within a brigade ("director" /
-/// "worker N"), or just "session" for a solo pane.
 fn tile_title(stage: &Stage, key: &SessionKey) -> String {
     match stage {
         Stage::Brigade { panes, .. } => match panes.iter().position(|k| k == key) {
@@ -1303,7 +1298,6 @@ fn open_input_log() -> Option<std::fs::File> {
         .ok()
 }
 
-/// Append one line to the diagnostic input log (no-op when disabled).
 fn log_input(file: &mut Option<std::fs::File>, message: &str) {
     use std::io::Write as _;
     if let Some(file) = file {
@@ -1581,10 +1575,10 @@ mod tests {
             .unwrap();
         let store = RefCell::new(store);
 
-        // Resolve membership from the OLD id — the exact situation R19's
-        // live watcher misses: the fork happened while banto wasn't
-        // watching, so nothing ever rekeyed the pane, and the member row
-        // still records the ancestor.
+        // Resolve membership from the OLD id — the exact situation the live
+        // watcher misses: the fork happened while banto wasn't watching, so
+        // nothing ever rekeyed the pane, and the member row still records
+        // the ancestor.
         let events = execute_store_intent(
             StoreIntent::ResolveMembership {
                 session_id: "w1-old".to_string(),
@@ -1758,10 +1752,10 @@ mod tests {
 
     #[test]
     fn add_worker_after_dismissing_a_gap_mints_past_the_survivor_not_into_it() {
-        // R27's correctness prerequisite: dismissing worker-1 while
-        // worker-2 survives must not make add_worker_store re-mint
-        // "worker-2" (a count-based next_n would, colliding with the
-        // survivor and handing it that member's stale store row/mail).
+        // Correctness prerequisite: dismissing worker-1 while worker-2
+        // survives must not make add_worker_store re-mint "worker-2" (a
+        // count-based next_n would, colliding with the survivor and
+        // handing it that member's stale store row/mail).
         let mut store = Store::open_in_memory().unwrap();
         let brigade_id = store.create_brigade("cell").unwrap();
         store
@@ -1795,7 +1789,7 @@ mod tests {
         SessionKey::from_id(&format!("new-worker::1::{token}"))
     }
 
-    // --- Cmd::CheckNewSessionCwd (R37: is_dir() moved to the edge) ---------
+    // --- Cmd::CheckNewSessionCwd: is_dir() moved to the edge ----------------
 
     #[test]
     fn check_new_session_cwd_reports_whether_the_stat_finds_a_directory() {

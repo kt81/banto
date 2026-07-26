@@ -2568,7 +2568,7 @@ mod tests {
 
     #[test]
     fn two_plain_opens_into_the_same_cwd_survive_independently_in_pending_opens_and_screens() {
-        // The exact collision R36 traced: before the discriminator, two
+        // The exact collision this guards: before the discriminator, two
         // `n`-opens into the same cwd (before either resolves a real id)
         // minted the identical `SessionKey`, so the second `pending_opens`
         // insert silently overwrote the first, and the second `Event::Spawned`

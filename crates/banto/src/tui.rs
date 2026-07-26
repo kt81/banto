@@ -53,7 +53,6 @@ use crate::opener::{self, OpenOutcome};
 use crate::session;
 use crate::sgr::{self, SgrParse};
 
-/// The concrete terminal type used throughout this module.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// How long each event-loop tick waits for input before checking for
@@ -189,7 +188,6 @@ impl Context<'_> {
     }
 }
 
-/// Open the diagnostic log file when `BANTO_INPUT_LOG` is set.
 fn open_input_log() -> Option<std::fs::File> {
     let path = std::env::var_os("BANTO_INPUT_LOG")?;
     std::fs::OpenOptions::new()
@@ -229,7 +227,6 @@ impl LiveWatch {
     }
 }
 
-/// Load sessions under `claude_home` and run the interactive TUI.
 pub fn run(
     claude_home: &ClaudeHome,
     thresholds: &AgeThresholds,
@@ -332,8 +329,6 @@ pub(crate) fn load_session_groups(store: &Store, groups: &[(i64, String)]) -> Ha
     map
 }
 
-/// Enter raw mode + the alternate screen with mouse capture, installing a
-/// panic hook that restores the terminal first.
 fn setup_terminal() -> Result<Tui> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -716,7 +711,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     // that happens further down this same call and overwrites the clear.
     app.clear_status();
     if mods.contains(KeyModifiers::CONTROL) {
-        // Ctrl+C always quits; other Ctrl combos are ignored for now.
         if code == KeyCode::Char('c') {
             app.request_quit();
         }
@@ -766,8 +760,6 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
     }
 }
 
-/// Toggle grouped view, posting the new state as a status message (bound to
-/// Tab in [`Mode::Normal`]; see [`App::toggle_grouped_view`]).
 fn toggle_grouped_view(app: &mut App) {
     let grouped = app.toggle_grouped_view();
     app.set_status(
@@ -1684,8 +1676,6 @@ fn toggle_pin(app: &mut App, ctx: &Context) {
     app.set_status(message, Instant::now());
 }
 
-/// Toggle whether agent-run and superseded sessions are shown, posting the
-/// new state as a status message.
 fn toggle_agent_filter(app: &mut App) {
     let showing = app.toggle_agent_filter();
     app.set_status(
@@ -2053,8 +2043,8 @@ mod tests {
         let text = draw(&app);
         // Pinned "Beta task" sorts first, under the Pinned section header
         // (grouped view is on by default) — the header carries the pin
-        // marker; the row itself stays unmarked (R21: repeating it on every
-        // row under the header would be pure noise; see
+        // marker; the row itself stays unmarked (repeating it on every row
+        // under the header would be pure noise; see
         // `App::VisibleRow::in_pinned_section`).
         let lines: Vec<&str> = text.lines().collect();
         let beta_pos = lines
@@ -3553,10 +3543,10 @@ mod tests {
         assert_eq!(arrow_key_for(&[], KeyModifiers::NONE), None);
     }
 
-    /// The R28 discriminator: a terminating letter that arrived with ANY
-    /// modifier is real text (a pasted/typed uppercase letter under Windows
-    /// Terminal's VkKeyScan-style SHIFT synthesis — see `arrow_key_for`'s
-    /// doc), not a leaked byte, regardless of the shape otherwise matching.
+    /// A terminating letter that arrived with ANY modifier is real text (a
+    /// pasted/typed uppercase letter under Windows Terminal's
+    /// VkKeyScan-style SHIFT synthesis — see `arrow_key_for`'s doc), not a
+    /// leaked byte, regardless of the shape otherwise matching.
     #[test]
     fn arrow_key_for_rejects_a_terminating_letter_carrying_any_modifier() {
         assert_eq!(arrow_key_for(&['[', 'A'], KeyModifiers::SHIFT), None);
@@ -3601,15 +3591,14 @@ mod tests {
         assert_eq!(app.query(), "", "must not have been typed as garbage");
     }
 
-    /// R28's paste-corruption dogfooding repro: pasting the literal text
-    /// `"[A [B [C [D"` moved the selection four times and left only the
-    /// spaces in the query, because Windows Terminal synthesizes SHIFT on
-    /// each pasted uppercase letter (see `arrow_key_for`'s doc) and the old
-    /// recognition never looked at modifiers at all. Each `"[X"` pair is its
-    /// own `swallow_one_sequence` call in production (mirroring
-    /// `drain_more`'s per-sequence loop); the space between them is an
-    /// ordinary keystroke the main loop would dispatch directly, simulated
-    /// here with a plain `push_char`.
+    /// Pasting the literal text `"[A [B [C [D"` moved the selection four
+    /// times and left only the spaces in the query, because Windows
+    /// Terminal synthesizes SHIFT on each pasted uppercase letter (see
+    /// `arrow_key_for`'s doc) and the old recognition never looked at
+    /// modifiers at all. Each `"[X"` pair is its own `swallow_one_sequence`
+    /// call in production (mirroring `drain_more`'s per-sequence loop); the
+    /// space between them is an ordinary keystroke the main loop would
+    /// dispatch directly, simulated here with a plain `push_char`.
     #[test]
     fn a_pasted_shift_modified_arrow_lookalike_burst_replays_as_literal_text() {
         let store = RefCell::new(Store::open_in_memory().unwrap());

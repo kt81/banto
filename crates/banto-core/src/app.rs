@@ -1033,9 +1033,9 @@ impl App {
     /// whether the pin marker's column exists at all this frame — see
     /// `banto_tui::view`'s row layout doc). Every pinned row's section is
     /// "Pinned" (`section_name` gives it top priority), so whenever this is
-    /// true, R21's per-row pin suppression under that header would apply to
-    /// every pinned row without exception — R22 turns that into "the slot
-    /// doesn't exist" instead of "the slot renders blank".
+    /// true, per-row pin suppression under that header would apply to every
+    /// pinned row without exception — hence "the slot doesn't exist" rather
+    /// than "the slot renders blank".
     pub fn grouped_view_in_effect(&self) -> bool {
         self.grouped_view_active(&self.filtered)
     }
@@ -2277,8 +2277,8 @@ mod tests {
         // Grouped view is on by default and there are two sections
         // (Pinned, Ungrouped), so it's actually in effect — the renderer
         // (banto_tui::view) uses this to decide whether the pin marker's
-        // column exists at all this frame (R22: every pinned row's section
-        // is "Pinned", so whenever this is true, no pin marker can ever
+        // column exists at all this frame (every pinned row's section is
+        // "Pinned", so whenever this is true, no pin marker can ever
         // render).
         assert!(app.grouped_view_in_effect());
 

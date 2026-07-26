@@ -68,9 +68,7 @@ fn fixed_prefix_width(show_pin_slot: bool) -> usize {
     let pin_width = if show_pin_slot { 3 } else { 0 };
     2 + pin_width + 3
 }
-/// Minimum columns of blank space a row must leave before the age column.
 const MIN_GAP_BEFORE_AGE: usize = 2;
-/// Columns between the title and cwd, when cwd is shown.
 const TITLE_CWD_GAP: usize = 2;
 /// cwd is only shown if at least this many columns remain for it once the
 /// title (at its natural, untruncated width) and the title-cwd gap are
@@ -331,9 +329,8 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
 }
 
 /// Build the summary panel's meta line: relative age, size, short id, and any
-/// markers (pinned/director/superseded/agent) that apply. Unchanged by the
-/// R18 refresh — textual, not iconic, by design (the title line above
-/// carries the icons).
+/// markers (pinned/director/superseded/agent) that apply. Textual, not
+/// iconic, by design (the title line above carries the icons).
 fn summary_meta(
     row: &SessionRow,
     pinned: bool,
@@ -361,7 +358,6 @@ fn summary_meta(
     parts.join("  \u{b7}  ")
 }
 
-/// Map an [`Activity`] to its list-dot color.
 fn activity_color(activity: Activity) -> Color {
     match activity {
         Activity::Busy => Color::Green,
@@ -497,8 +493,8 @@ mod tests {
 
         // Grouped view is on by default and two sections exist (Pinned,
         // Ungrouped), so it's actually in effect — the pin slot doesn't
-        // exist at all this frame (R22: every pinned row's section is
-        // "Pinned", so the marker could never render), not merely blanked.
+        // exist at all this frame (every pinned row's section is "Pinned",
+        // so the marker could never render), not merely blanked.
         // The Pinned header (checked elsewhere) carries the marker instead.
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
@@ -507,8 +503,6 @@ mod tests {
             "pin marker should not appear in grouped view:\n{text}"
         );
 
-        // Flat view restores the slot, so the same row shows its own
-        // marker.
         app.toggle_grouped_view();
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Pinned Row")).unwrap();
@@ -850,8 +844,8 @@ mod tests {
         let mut app = App::new(vec![row("r", "Short", cwd, now)]);
         app.set_viewport_height(10);
 
-        // 34 cols (the emporium sidebar's width, R21's motivating case) is
-        // below MIN_WIDTH_FOR_CWD — the short title alone would ordinarily
+        // 34 cols (the emporium sidebar's width) is below MIN_WIDTH_FOR_CWD
+        // — the short title alone would ordinarily
         // leave more than enough room for cwd under the
         // title-leaves-room rule, but the floor overrides it here.
         let text = draw_list(&app, 34, 10, now);

@@ -95,7 +95,7 @@ pub fn run_stdio_server(store: Store, identity: Identity, claude_home: ClaudeHom
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
-            break; // EOF: the client closed the connection.
+            break;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -203,7 +203,6 @@ fn tools_list_result() -> Value {
     })
 }
 
-/// `tools/call`: dispatch the requested tool.
 fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
     let name = msg
         .pointer("/params/name")
@@ -444,7 +443,6 @@ fn live_membership(
     ctx.store.brigade_of_claude_session(&SessionId(session))
 }
 
-/// The role a message from `role` is addressed to.
 fn peer_role(role: BrigadeRole) -> BrigadeRole {
     match role {
         BrigadeRole::Director => BrigadeRole::Worker,
@@ -674,7 +672,7 @@ mod tests {
     fn brigade_status_reports_a_live_peers_activity_from_its_live_state_file() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
-        let pid = std::process::id(); // alive by construction: this test.
+        let pid = std::process::id();
         std::fs::write(
             home.path().join("sessions").join(format!("{pid}.json")),
             format!(r#"{{"pid":{pid},"sessionId":"w1","status":"busy"}}"#),
@@ -716,7 +714,6 @@ mod tests {
                 "params":{"name":"send_to_peer","arguments":{"text":"run the tests"}}}"#,
         );
         assert_eq!(response["result"]["isError"], false);
-        // A Worker in the same brigade can now pull it.
         let pulled = ctx
             .store
             .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
@@ -751,7 +748,6 @@ mod tests {
             "carries firewall framing: {text:?}"
         );
 
-        // A second check finds nothing new (the cursor advanced).
         let response = call(
             &mut ctx,
             r#"{"jsonrpc":"2.0","id":6,"method":"tools/call",
@@ -845,7 +841,6 @@ mod tests {
             "names the valid target: {text:?}"
         );
 
-        // Nothing was enqueued.
         assert!(
             ctx.store
                 .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
@@ -981,7 +976,6 @@ mod tests {
         ctx.store
             .set_member_claude_session(1, "worker-1", &SessionId("s".to_string()))
             .unwrap();
-        // Overwrite what `ctx()` inserted (as Director) with the true role.
         ctx.store.remove_brigade_member(1, "worker-1").unwrap();
         ctx.store
             .add_brigade_member(

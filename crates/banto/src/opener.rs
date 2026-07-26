@@ -25,9 +25,7 @@ use banto_io::store::{PaneRecord, Store, StoreError};
 /// Outcome of an open/focus attempt, for the caller to turn into a status message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenOutcome {
-    /// An existing pane was brought to the front.
     Focused,
-    /// A new pane/tab was created.
     Opened,
     /// A pane exists and is (presumed) alive, but this backend cannot focus
     /// an existing pane (Windows Terminal). Refuses to open a second one.
@@ -44,7 +42,6 @@ pub enum OpenOutcome {
     NoBackendDetected,
 }
 
-/// Errors from [`open_session`].
 #[derive(Debug, thiserror::Error)]
 pub enum SessionOpenError {
     #[error(transparent)]
@@ -650,7 +647,7 @@ mod tests {
         calls: Rc<RefCell<Vec<CommandSpec>>>,
         fail_select_pane: Rc<Cell<bool>>,
         /// Queued responses consumed before falling back to the default
-        /// create-format success (see [`MockRunner::with_responses`]).
+        /// create-format success (see [`MockRunner::with_target_responses`]).
         responses: Rc<RefCell<VecDeque<CommandOutput>>>,
     }
 
@@ -1141,7 +1138,6 @@ mod tests {
             .get_pane(&SessionId("sess-1".to_string()))
             .unwrap()
             .unwrap();
-        // Replaced with the freshly opened pane, not the stale one.
         assert_eq!(record.target, "play:@1:%1");
     }
 
@@ -1178,7 +1174,6 @@ mod tests {
             .get_pane(&SessionId("sess-1".to_string()))
             .unwrap()
             .unwrap();
-        // Replaced with the freshly opened pane, not the stale one.
         assert_eq!(record.target, "play:@1:%1");
         assert_ne!(record.target, "play:@3:%8");
     }

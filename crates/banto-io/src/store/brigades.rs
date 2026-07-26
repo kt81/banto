@@ -31,7 +31,6 @@ use banto_core::model::{
 use super::{Store, StoreError, system_time_to_unix_ms};
 
 impl Store {
-    /// Creates an (empty) brigade and returns its id.
     pub fn create_brigade(&self, name: &str) -> Result<BrigadeId, StoreError> {
         self.conn.execute(
             "INSERT INTO brigades (name, created_at_ms) VALUES (?1, ?2)",
@@ -209,7 +208,6 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Looks up one member of `brigade_id` by its token.
     pub fn brigade_member(
         &self,
         brigade_id: BrigadeId,
@@ -624,7 +622,6 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
 
-        // Director sends to the Worker role.
         store
             .enqueue_brigade_message(
                 br,
@@ -635,7 +632,6 @@ mod tests {
             )
             .unwrap();
 
-        // The Worker pulls it once.
         let got = store
             .fetch_brigade_messages(br, "worker-1", BrigadeRole::Worker)
             .unwrap();
@@ -1158,7 +1154,6 @@ mod tests {
             .unwrap();
         assert_eq!(cursors_a, 0);
 
-        // Brigade B's rows are untouched.
         let messages_b: i64 = store
             .conn
             .query_row(
