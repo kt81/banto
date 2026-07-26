@@ -441,10 +441,10 @@ fn execute_cmd(
     }
 }
 
-/// Build the base argv for opening `target`: resuming it via
+/// Build the [`opener::AgentLaunch`] for opening `target`: resuming it via
 /// [`opener::decide_inplace_resume`] when a real id is already known (`None`
 /// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
-/// otherwise — either way with `--model` appended when `model` is `Some`.
+/// otherwise — either way with `model`/`briefing` carried on the result.
 /// `--model` applies the same way to a resume as to a fresh spawn: a Worker
 /// resumed without it falls back to the operator's own default model
 /// instead of the brigade's configured one (`engine::stage_brigade` never
@@ -456,30 +456,34 @@ fn execute_cmd(
 /// `claude` 2.1.219 to apply to a `--resume` exactly as it does to a fresh
 /// launch, which is what makes it reach a resumed Director at all.
 ///
-/// Pulled out of [`execute_open_embedded`] so this branch-and-append logic
-/// is unit-testable without spawning a real PTY; the `--mcp-config` append
-/// stays in the caller, since that needs real file I/O this doesn't.
-fn build_open_argv(
+/// Pulled out of [`execute_open_embedded`] so this decision logic is
+/// unit-testable without spawning a real PTY; the returned launch's
+/// `mcp_config` is left `None` here and filled in by the caller, since
+/// writing that file needs real I/O this doesn't.
+fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
     briefing: Option<&str>,
     probe: &dyn ProcessProbe,
     live: &[LiveSession],
-) -> Option<Vec<String>> {
-    let mut argv = if target.id.is_empty() {
-        opener::inplace_argv(None)
+) -> Option<opener::AgentLaunch> {
+    let resume = if target.id.is_empty() {
+        None
     } else {
-        opener::decide_inplace_resume(target, probe, live)?.argv
+        // Called for its refusal, not its value: this is the no-double-resume
+        // guard (CLAUDE.md invariant 4), and `?` is what turns a session that
+        // is already live somewhere else into `None`. The `InPlaceLaunch` it
+        // hands back is dropped because its argv is by construction
+        // `inplace_argv(Some(&target.id))` — the same id we resume below.
+        opener::decide_inplace_resume(target, probe, live)?;
+        Some(target.id.clone())
     };
-    if let Some(model) = model {
-        argv.push("--model".to_string());
-        argv.push(model.to_string());
-    }
-    if let Some(briefing) = briefing {
-        argv.push("--append-system-prompt".to_string());
-        argv.push(briefing.to_string());
-    }
-    Some(argv)
+    Some(opener::AgentLaunch {
+        resume,
+        model: model.map(str::to_string),
+        append_system_prompt: briefing.map(str::to_string),
+        mcp_config: None,
+    })
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard for a
@@ -509,7 +513,7 @@ fn execute_open_embedded(
     let briefing = brigade
         .as_ref()
         .and_then(|(brigade_id, token, role)| member_briefing(deps, *brigade_id, token, *role));
-    let Some(mut argv) = build_open_argv(
+    let Some(mut launch) = build_open_launch(
         &target,
         model.as_deref(),
         briefing.as_deref(),
@@ -524,10 +528,10 @@ fn execute_open_embedded(
     if let Some((brigade_id, token, role)) = &brigade {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
         if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
-            argv.push("--mcp-config".to_string());
-            argv.push(path.to_string_lossy().into_owned());
+            launch.mcp_config = Some(path);
         }
     }
+    let argv = launch.argv();
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), 24, 80) {
         Ok(handle) => {
@@ -2071,7 +2075,7 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // --- worker model on resume: build_open_argv --------------------------
+    // --- worker model on resume: build_open_launch -------------------------
 
     struct MockProbe {
         alive: HashSet<u32>,
@@ -2100,38 +2104,44 @@ mod tests {
     }
 
     #[test]
-    fn build_open_argv_appends_model_to_a_resumed_sessions_argv() {
+    fn build_open_launch_appends_model_to_a_resumed_sessions_argv() {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv =
-            build_open_argv(&open_target("sess-1"), Some("opus"), None, &probe, &[]).unwrap();
+        let launch =
+            build_open_launch(&open_target("sess-1"), Some("opus"), None, &probe, &[]).unwrap();
         assert_eq!(
-            argv,
+            launch.argv(),
             ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
         );
     }
 
     #[test]
-    fn build_open_argv_appends_model_to_a_fresh_launchs_argv_too() {
+    fn build_open_launch_appends_model_to_a_fresh_launchs_argv_too() {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv = build_open_argv(&open_target(""), Some("opus"), None, &probe, &[]).unwrap();
-        assert_eq!(argv, ["claude", "--model", "opus"].map(str::to_string));
+        let launch = build_open_launch(&open_target(""), Some("opus"), None, &probe, &[]).unwrap();
+        assert_eq!(
+            launch.argv(),
+            ["claude", "--model", "opus"].map(str::to_string)
+        );
     }
 
     #[test]
-    fn build_open_argv_omits_model_when_none() {
+    fn build_open_launch_omits_model_when_none() {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv = build_open_argv(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
-        assert_eq!(argv, ["claude", "--resume", "sess-1"].map(str::to_string));
+        let launch = build_open_launch(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
+        assert_eq!(
+            launch.argv(),
+            ["claude", "--resume", "sess-1"].map(str::to_string)
+        );
     }
 
     #[test]
-    fn build_open_argv_is_none_when_the_resume_is_refused() {
+    fn build_open_launch_is_none_when_the_resume_is_refused() {
         let probe = MockProbe {
             alive: HashSet::from([4242]),
         };
@@ -2145,18 +2155,18 @@ mod tests {
             proc_start: None,
         }];
         assert!(
-            build_open_argv(&open_target("sess-1"), Some("opus"), None, &probe, &live).is_none()
+            build_open_launch(&open_target("sess-1"), Some("opus"), None, &probe, &live).is_none()
         );
     }
 
     // --- role briefings (--append-system-prompt) -------------------------
 
     #[test]
-    fn build_open_argv_appends_the_briefing_after_the_model() {
+    fn build_open_launch_appends_the_briefing_after_the_model() {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let argv = build_open_argv(
+        let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
             Some("you are the Director"),
@@ -2165,7 +2175,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            argv,
+            launch.argv(),
             [
                 "claude",
                 "--resume",
@@ -2177,6 +2187,15 @@ mod tests {
             ]
             .map(str::to_string)
         );
+    }
+
+    #[test]
+    fn build_open_launch_leaves_mcp_config_for_the_caller_to_fill_in() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let launch = build_open_launch(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
+        assert_eq!(launch.mcp_config, None);
     }
 
     #[test]

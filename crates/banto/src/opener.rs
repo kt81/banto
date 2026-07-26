@@ -270,6 +270,54 @@ pub(crate) fn new_session_startup_message(cwd: &Path) -> String {
     format!("banto: starting a new session in {} ...", cwd.display())
 }
 
+/// A pending `claude` invocation, independent of *how* it will be run
+/// in-place, wrapped via `_wrap --session`, or wrapped via `_wrap
+/// --new-session` (see [`inplace_argv`]/[`wrap_argv`]/[`new_session_wrap_argv`],
+/// the three sites that build one of these and turn it into argv). This is
+/// the single place in the workspace that knows which flags `claude` itself
+/// takes and in what order; everything else either sets fields on this or
+/// prepends a `banto _wrap ... --` prefix in front of its rendered argv.
+/// Fields are independent — set the ones that apply and leave the rest
+/// `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AgentLaunch {
+    pub resume: Option<String>,
+    pub model: Option<String>,
+    pub append_system_prompt: Option<String>,
+    pub mcp_config: Option<PathBuf>,
+}
+
+/// The `claude` binary name. The only occurrence of this literal left in the
+/// workspace outside tests and user-facing help/flag text (`main.rs`'s
+/// `--claude-home` and about string) — see [`AgentLaunch`].
+const AGENT_BINARY: &str = "claude";
+
+impl AgentLaunch {
+    /// Render as `claude`'s own argv, in the fixed order every existing call
+    /// site already agreed on before this type existed: `--resume`, then
+    /// `--model`, then `--append-system-prompt`, then `--mcp-config`.
+    pub(crate) fn argv(&self) -> Vec<String> {
+        let mut argv = vec![AGENT_BINARY.to_string()];
+        if let Some(id) = &self.resume {
+            argv.push("--resume".to_string());
+            argv.push(id.clone());
+        }
+        if let Some(model) = &self.model {
+            argv.push("--model".to_string());
+            argv.push(model.clone());
+        }
+        if let Some(prompt) = &self.append_system_prompt {
+            argv.push("--append-system-prompt".to_string());
+            argv.push(prompt.clone());
+        }
+        if let Some(path) = &self.mcp_config {
+            argv.push("--mcp-config".to_string());
+            argv.push(path.to_string_lossy().into_owned());
+        }
+        argv
+    }
+}
+
 /// Build the in-place launch argv. Unlike [`wrap_argv`]/[`new_session_wrap_argv`]
 /// (the split-placement equivalents), there is no `banto _wrap` wrapper:
 /// in-place mode blocks on the child directly as banto's own terminal (see
@@ -277,10 +325,11 @@ pub(crate) fn new_session_startup_message(cwd: &Path) -> String {
 /// long-lived process for a wrapper to attach a pane record to in the first
 /// place.
 pub(crate) fn inplace_argv(session_id: Option<&str>) -> Vec<String> {
-    match session_id {
-        Some(id) => vec!["claude".to_string(), "--resume".to_string(), id.to_string()],
-        None => vec!["claude".to_string()],
+    AgentLaunch {
+        resume: session_id.map(str::to_string),
+        ..Default::default()
     }
+    .argv()
 }
 
 /// Decide whether to resume `session` in place, or `None` to refuse: taking
@@ -400,16 +449,21 @@ fn open_fresh<R: CommandRunner + 'static>(
 /// `banto` (relies on `$PATH`).
 fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
     let banto_exe = exe.unwrap_or("banto").to_string();
-    vec![
+    let mut argv = vec![
         banto_exe,
         "_wrap".to_string(),
         "--session".to_string(),
         session_id.to_string(),
         "--".to_string(),
-        "claude".to_string(),
-        "--resume".to_string(),
-        session_id.to_string(),
-    ]
+    ];
+    argv.extend(
+        AgentLaunch {
+            resume: Some(session_id.to_string()),
+            ..Default::default()
+        }
+        .argv(),
+    );
+    argv
 }
 
 /// Build the `<banto> _wrap --new-session --cwd <cwd> --backend <key>
@@ -450,7 +504,7 @@ fn new_session_wrap_argv(
         argv.push(path.to_string());
     }
     argv.push("--".to_string());
-    argv.push("claude".to_string());
+    argv.extend(AgentLaunch::default().argv());
     argv
 }
 
@@ -777,6 +831,58 @@ mod tests {
         let entry = live_entry_with_proc_start("sess-1", 100, "1105463");
 
         assert!(!is_live("sess-1", &[entry], &probe));
+    }
+
+    // --- AgentLaunch::argv --------------------------------------------------
+
+    #[test]
+    fn agent_launch_with_no_fields_is_bare_claude() {
+        assert_eq!(
+            AgentLaunch::default().argv(),
+            ["claude"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_appends_mcp_config_last_on_its_own() {
+        let launch = AgentLaunch {
+            mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
+            ..Default::default()
+        };
+        assert_eq!(
+            launch.argv(),
+            [
+                "claude",
+                "--mcp-config",
+                "C:/data/banto/mcp/1-worker-1.json"
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_combines_every_flag_in_the_fixed_order() {
+        let launch = AgentLaunch {
+            resume: Some("sess-1".to_string()),
+            model: Some("opus".to_string()),
+            append_system_prompt: Some("you are the Director".to_string()),
+            mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
+        };
+        assert_eq!(
+            launch.argv(),
+            [
+                "claude",
+                "--resume",
+                "sess-1",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "you are the Director",
+                "--mcp-config",
+                "C:/data/banto/mcp/1-director.json",
+            ]
+            .map(str::to_string)
+        );
     }
 
     // --- inplace_argv / decide_inplace_resume -----------------------------
