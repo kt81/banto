@@ -4,10 +4,23 @@
 terminal list, while clerks carry boxed sessions between the shelves —
 one box glowing mid-handoff](docs/assets/banto-hero.png)
 
-A resident TUI that searches, groups, and resumes your local Claude Code
-sessions — and, in its **emporium mode** (大店, *oodana*), hosts them as
-live embedded panes, including Director/Worker multi-session cells that
-banto itself wires together and keeps talking.
+**banto knows which Claude Code sessions exist on this machine, which are
+still alive, and which one you actually meant.**
+
+`claude --resume` will reopen a session if you can produce its id. banto is
+the part that finds it — a fuzzy-searchable ledger of every session under
+`~/.claude`, with your own pinning, grouping and archiving layered on top —
+and the part that refuses to open one twice, because resuming a session that
+is already running forks its history.
+
+In its **emporium mode** (大店, *oodana*) it goes further: sessions become
+live embedded panes that keep running while you switch between them, and can
+be wired into Director/Worker cells that talk to each other through banto.
+
+Claude Desktop makes multi-session work feel like a workspace — sessions
+side by side, their state legible at a glance, panes you arrange to suit the
+job. banto is an attempt to have that against the real `claude` CLI sessions
+already on disk, without leaving the terminal to get it.
 
 *Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese
 merchant house, who stays on the premises and runs the shop.*
@@ -18,13 +31,23 @@ first-class citizen — the workshop, though, not the goal. The codebase
 stays cross-platform (CI builds and tests both Windows and Linux), and
 Linux dogfooding is underway.
 
+## Why not just tmux?
+
+tmux is a window manager for terminals. banto is a lifecycle manager for
+Claude Code sessions: it knows their ids, the directories they were started
+in, which are still running, and which of them you filed under what. Picking
+a row does not open a shell that happens to run `claude` — it returns you to
+one specific conversation, or to the process already having it.
+
+They are not rivals. `s` opens into a tmux/psmux pane, and the emporium is
+there for the times you would rather not run a multiplexer at all.
+
 ## What it does
 
-banto indexes the session files Claude Code CLI writes under `~/.claude`
-(read-only, always — see below) into the **chōba** (帳場, "the shop
-counter" — the default view): a fast fuzzy-searchable ledger of your
-sessions, with your own grouping, pinning, and archiving on top. Whatever
-you pick there opens one of three ways:
+The ledger has a name: the **chōba** (帳場, "the shop counter"), banto's
+default view, built by indexing the session files Claude Code CLI writes
+under `~/.claude` — read-only, always; see below. Whatever you pick there
+opens one of three ways:
 
 - **In-place** (default, `Enter`): banto hands its own terminal to
   `claude --resume` and takes it back when the session exits. No
@@ -36,9 +59,10 @@ you pick there opens one of three ways:
   in vt100-parsed panes, Vim-buffer-style swapping, sessions kept alive in
   the background across switches.
 
-If a session is already running somewhere, banto focuses it instead of
-resuming it a second time — a double resume forks the session history, so
-this is enforced everywhere.
+If a session is already running somewhere — another pane, another banto,
+a bare `claude` in some other window — banto focuses that process instead of
+starting a second one. That is the guarantee from the top of this page, and
+it is enforced on every one of these paths, not just the one you came in by.
 
 ### Director/Worker cells (emporium)
 
@@ -71,6 +95,11 @@ ferrying at all. This repository was largely built through that loop.
 
 - A personal tool, pre-1.0, moving fast. Interfaces and the on-disk schema
   migrate forward but nothing is promised yet.
+- **No supervisor, by design.** Sessions hosted in the emporium end when
+  banto does. Each one gets an ordinary console-close first, so `claude`
+  finalizes its history exactly as it would on any window close and the
+  session resumes cleanly next time — but banto is a workbench you sit at,
+  not a daemon that keeps work running behind you.
 - Claude Code's session-file formats are **undocumented and subject to
   change**; banto defends with lenient parsing (unknown records and broken
   lines are skipped, never fatal) and synthetic-fixture tests, but a future
