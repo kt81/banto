@@ -8,12 +8,12 @@ pub mod claude_code;
 use std::path::Path;
 use std::time::SystemTime;
 
-use banto_core::model::{SessionId, SessionMeta};
+use banto_core::model::{AgentKind, SessionId, SessionMeta};
 
 /// A source of sessions (Claude Code today, other agents later).
 pub trait SessionProvider {
-    /// Stable provider name stored in the DB, e.g. `"claude-code"`.
-    fn name(&self) -> &'static str;
+    /// Which [`AgentKind`] this provider discovers sessions for.
+    fn name(&self) -> AgentKind;
 
     /// Enumerate all sessions under this provider.
     ///

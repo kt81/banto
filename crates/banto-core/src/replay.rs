@@ -311,7 +311,7 @@ mod tests {
     // capture of the same flow looks like.
     const CANONICAL_FIXTURE: &str = concat!(
         "{\"banto_event_stream\":1}\n",
-        "{\"offset_ms\":0,\"event\":{\"RowsLoaded\":{\"rows\":[{\"id\":\"row-1\",\"title\":\"Demo Session\",\"cwd\":\"/tmp/demo\",\"activity\":{\"Idle\":\"Today\"},\"is_agent\":false,\"preview\":null,\"mtime\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"size\":1234}],\"hidden\":[],\"directors\":[]}}}\n",
+        "{\"offset_ms\":0,\"event\":{\"RowsLoaded\":{\"rows\":[{\"id\":\"row-1\",\"agent\":\"ClaudeCode\",\"title\":\"Demo Session\",\"cwd\":\"/tmp/demo\",\"activity\":{\"Idle\":\"Today\"},\"is_agent\":false,\"preview\":null,\"mtime\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"size\":1234}],\"hidden\":[],\"directors\":[]}}}\n",
         "{\"offset_ms\":100,\"event\":{\"Input\":{\"Key\":{\"code\":\"Enter\",\"modifiers\":{\"ctrl\":false,\"alt\":false,\"shift\":false}}}}}\n",
         "{\"offset_ms\":200,\"event\":{\"MembershipResolved\":{\"session_id\":\"row-1\",\"membership\":null,\"members\":null}}}\n",
         "{\"offset_ms\":300,\"event\":{\"Spawned\":{\"key\":\"row-1\"}}}\n",

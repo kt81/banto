@@ -1478,6 +1478,7 @@ fn install_panic_hook() {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use banto_core::model::AgentKind;
     use banto_io::pty::mock::MockPtyHost;
 
     use super::*;
@@ -2173,6 +2174,7 @@ mod tests {
     fn open_target(id: &str) -> SessionToOpen {
         SessionToOpen {
             id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
             title: "Fix login".to_string(),
             cwd: PathBuf::from("/work/alpha"),
         }

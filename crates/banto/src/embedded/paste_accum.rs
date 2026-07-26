@@ -190,13 +190,14 @@ impl PasteAccumulator {
 mod tests {
     use banto_core::engine::PrefixKey;
     use banto_core::input::Modifiers;
-    use banto_core::model::{Activity, SessionRow};
+    use banto_core::model::{Activity, AgentKind, SessionRow};
 
     use super::*;
 
     fn row(id: &str) -> SessionRow {
         SessionRow {
             id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
             title: Some(id.to_string()),
             cwd: None,
             activity: Activity::Alive,

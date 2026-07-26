@@ -31,7 +31,7 @@ use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crate::key_encode::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
-use crate::model::{BrigadeId, BrigadeRole, MemberToken, SessionRow, SessionToOpen};
+use crate::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionRow, SessionToOpen};
 
 /// Fixed width of the left sidebar (the session list), in columns.
 pub const SIDEBAR_WIDTH: u16 = 36;
@@ -1455,6 +1455,7 @@ fn update_new_session_cwd_checked(
         key,
         target: SessionToOpen {
             id: String::new(),
+            agent: AgentKind::ClaudeCode,
             title: cwd.display().to_string(),
             cwd,
         },
@@ -1616,6 +1617,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         key,
         target: SessionToOpen {
             id: row.id.clone(),
+            agent: row.agent,
             title: row.display_title().to_string(),
             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
         },
@@ -1677,6 +1679,7 @@ fn stage_brigade(
                         key,
                         target: SessionToOpen {
                             id: row.id.clone(),
+                            agent: row.agent,
                             title: row.display_title().to_string(),
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
@@ -1949,6 +1952,7 @@ fn open_worker(
         key,
         target: SessionToOpen {
             id: String::new(),
+            agent: AgentKind::ClaudeCode,
             title: format!("worker {token}"),
             cwd: cwd.to_path_buf(),
         },
@@ -2166,6 +2170,7 @@ fn update_brigade_formed(
             key: director_key,
             target: SessionToOpen {
                 id: director_row_id,
+                agent: row.agent,
                 title: row.display_title().to_string(),
                 cwd,
             },
@@ -2379,6 +2384,7 @@ mod tests {
     fn row(id: &str) -> SessionRow {
         SessionRow {
             id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
             title: Some(id.to_string()),
             cwd: Some(PathBuf::from("/work/alpha")),
             activity: Activity::Alive,

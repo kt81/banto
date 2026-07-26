@@ -1487,6 +1487,7 @@ fn selected_session(app: &App) -> Option<SessionToOpen> {
     let row = app.selected_row()?;
     Some(SessionToOpen {
         id: row.id.clone(),
+        agent: row.agent,
         title: row.display_title().to_string(),
         cwd: row
             .cwd
@@ -1811,7 +1812,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::session::SessionRow;
-    use banto_core::model::{Activity, AgeBucket};
+    use banto_core::model::{Activity, AgeBucket, AgentKind};
     use banto_tui::render_modal::modal_area;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1820,6 +1821,7 @@ mod tests {
     fn row(id: &str, title: &str, cwd: &str, activity: Activity) -> SessionRow {
         SessionRow {
             id: id.into(),
+            agent: AgentKind::ClaudeCode,
             title: Some(title.into()),
             cwd: Some(PathBuf::from(cwd)),
             activity,
@@ -1841,7 +1843,7 @@ mod tests {
     fn plain_meta(id: &str) -> SessionMeta {
         SessionMeta {
             id: SessionId(id.to_string()),
-            provider: "claude-code".to_string(),
+            agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
             source_path: PathBuf::from(format!("{id}.jsonl")),

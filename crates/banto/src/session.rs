@@ -84,6 +84,7 @@ pub fn rows_from_metas(
             let activity = status::classify(&meta, &live, &probe, now, thresholds);
             SessionRow {
                 id: meta.id.0,
+                agent: meta.agent,
                 title: meta.title,
                 cwd: meta.cwd,
                 activity,
@@ -100,7 +101,7 @@ pub fn rows_from_metas(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use banto_core::model::SessionId;
+    use banto_core::model::{AgentKind, SessionId};
 
     use super::*;
 
@@ -109,7 +110,7 @@ mod tests {
     fn meta(id: &str, mtime: SystemTime) -> SessionMeta {
         SessionMeta {
             id: SessionId(id.to_string()),
-            provider: "claude-code".to_string(),
+            agent: AgentKind::ClaudeCode,
             title: Some(format!("Title {id}")),
             cwd: None,
             source_path: PathBuf::from(format!("{id}.jsonl")),
@@ -125,6 +126,7 @@ mod tests {
     fn haystack_joins_title_and_cwd() {
         let row = SessionRow {
             id: "id1".into(),
+            agent: AgentKind::ClaudeCode,
             title: Some("Fix login".into()),
             cwd: Some(PathBuf::from("/work/app")),
             activity: Activity::Alive,
@@ -140,6 +142,7 @@ mod tests {
     fn haystack_tolerates_missing_fields() {
         let row = SessionRow {
             id: "id1".into(),
+            agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
             activity: Activity::Alive,
@@ -155,6 +158,7 @@ mod tests {
     fn display_title_falls_back_to_id() {
         let row = SessionRow {
             id: "the-id".into(),
+            agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
             activity: Activity::Alive,
@@ -238,6 +242,7 @@ mod tests {
         let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
         assert_eq!(ids, vec!["new".to_string(), "old".to_string()]);
         assert_eq!(rows[0].title.as_deref(), Some("Title new"));
+        assert_eq!(rows[0].agent, AgentKind::ClaudeCode);
         assert_eq!(rows[0].size, 42);
     }
 

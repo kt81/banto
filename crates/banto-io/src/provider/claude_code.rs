@@ -19,10 +19,7 @@ use serde_json::Value;
 
 use super::{ProviderError, SessionProvider};
 use crate::claude_home::ClaudeHome;
-use banto_core::model::{SessionId, SessionMeta};
-
-/// Stable provider name stored in the DB.
-const PROVIDER_NAME: &str = "claude-code";
+use banto_core::model::{AgentKind, SessionId, SessionMeta};
 
 /// Maximum number of bytes read from the head of each session file.
 /// Titles and cwd appear in the first few records, so this is plenty.
@@ -56,8 +53,8 @@ impl ClaudeCodeProvider {
 }
 
 impl SessionProvider for ClaudeCodeProvider {
-    fn name(&self) -> &'static str {
-        PROVIDER_NAME
+    fn name(&self) -> AgentKind {
+        AgentKind::ClaudeCode
     }
 
     fn discover(&self) -> Result<Vec<SessionMeta>, ProviderError> {
@@ -172,7 +169,7 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
     let preview = fields.preview();
     Some(SessionMeta {
         id: SessionId(id),
-        provider: PROVIDER_NAME.to_string(),
+        agent: AgentKind::ClaudeCode,
         title,
         cwd: fields.cwd,
         source_path: path.to_path_buf(),
@@ -754,7 +751,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         let meta = &sessions[0];
         assert_eq!(meta.id.0, "abcd-1234");
-        assert_eq!(meta.provider, "claude-code");
+        assert_eq!(meta.agent, AgentKind::ClaudeCode);
         assert_eq!(meta.source_path, path);
         assert_eq!(meta.size, content.len() as u64);
         assert_eq!(meta.mtime, fs::metadata(&path).unwrap().modified().unwrap());

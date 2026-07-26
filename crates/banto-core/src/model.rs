@@ -17,12 +17,22 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// Which agent product a session belongs to. One variant today; a second
+/// agent product is planned, and this is the axis it lands on — which is
+/// why it is an enum rather than the bare string it replaced.
+/// `SessionProvider` (`banto-io`) keeps its own name: a provider *provides*
+/// sessions, this says *whose*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentKind {
+    ClaudeCode,
+}
+
 /// Metadata for one discovered session, provider-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMeta {
     pub id: SessionId,
-    /// Stable provider name, e.g. "claude-code".
-    pub provider: String,
+    /// Which agent product this session belongs to.
+    pub agent: AgentKind,
     /// Best-effort title: custom-title > ai-title > first user message.
     pub title: Option<String>,
     /// Working directory the session ran in, if it could be determined.
@@ -79,6 +89,8 @@ pub enum AgeBucket {
 pub struct SessionRow {
     /// Session id (UUID for Claude Code).
     pub id: String,
+    /// Which agent product this session belongs to. See [`SessionMeta::agent`].
+    pub agent: AgentKind,
     /// Best-effort title (`None` when it could not be extracted).
     pub title: Option<String>,
     /// Working directory the session ran in, if known.
@@ -195,6 +207,8 @@ pub fn humanize_size(bytes: u64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToOpen {
     pub id: String,
+    /// Which agent product to launch. See [`SessionMeta::agent`].
+    pub agent: AgentKind,
     pub title: String,
     pub cwd: PathBuf,
 }
@@ -283,6 +297,7 @@ mod tests {
     fn haystack_joins_title_and_cwd() {
         let row = SessionRow {
             id: "id1".into(),
+            agent: AgentKind::ClaudeCode,
             title: Some("Fix login".into()),
             cwd: Some(PathBuf::from("/work/app")),
             activity: Activity::Alive,
@@ -298,6 +313,7 @@ mod tests {
     fn haystack_tolerates_missing_fields() {
         let row = SessionRow {
             id: "id1".into(),
+            agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
             activity: Activity::Alive,
@@ -313,6 +329,7 @@ mod tests {
     fn display_title_falls_back_to_id() {
         let row = SessionRow {
             id: "the-id".into(),
+            agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
             activity: Activity::Alive,

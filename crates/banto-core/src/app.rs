@@ -1755,7 +1755,7 @@ fn rank_indices(query: &str, haystacks: &[String]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Activity, AgeBucket};
+    use crate::model::{Activity, AgeBucket, AgentKind};
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -1773,6 +1773,7 @@ mod tests {
     fn row(id: &str, title: &str, cwd: &str) -> SessionRow {
         SessionRow {
             id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
             title: (!title.is_empty()).then(|| title.to_string()),
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
             activity: Activity::Idle(AgeBucket::Older),

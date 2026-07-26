@@ -382,10 +382,12 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use super::*;
+    use banto_core::model::AgentKind;
 
     fn row(id: &str, title: &str, cwd: &str, mtime: SystemTime) -> SessionRow {
         SessionRow {
             id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
             title: (!title.is_empty()).then(|| title.to_string()),
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
             activity: Activity::Idle(AgeBucket::Older),

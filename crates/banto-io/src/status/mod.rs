@@ -63,7 +63,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use banto_core::model::{AgeBucket, SessionId};
+    use banto_core::model::{AgeBucket, AgentKind, SessionId};
 
     use super::*;
 
@@ -104,7 +104,7 @@ mod tests {
     fn meta_with_age(age: Duration) -> SessionMeta {
         SessionMeta {
             id: SessionId(SESSION_ID.to_string()),
-            provider: "claude-code".to_string(),
+            agent: AgentKind::ClaudeCode,
             title: Some("synthetic".to_string()),
             cwd: None,
             source_path: PathBuf::from("synthetic.jsonl"),

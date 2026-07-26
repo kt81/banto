@@ -128,14 +128,14 @@ pub(crate) mod test_util {
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use banto_core::model::{SessionId, SessionMeta};
+    use banto_core::model::{AgentKind, SessionId, SessionMeta};
 
     /// Builds a synthetic `SessionMeta` fixture (never real session data).
     /// The mtime is aligned to whole milliseconds so it round-trips exactly.
     pub fn meta(id: &str, title: Option<&str>, cwd: Option<&str>) -> SessionMeta {
         SessionMeta {
             id: SessionId(id.to_string()),
-            provider: "claude-code".to_string(),
+            agent: AgentKind::ClaudeCode,
             title: title.map(str::to_string),
             cwd: cwd.map(PathBuf::from),
             source_path: PathBuf::from(format!("C:/synthetic-fixtures/{id}.jsonl")),

@@ -631,6 +631,7 @@ fn resolve_own_session<R: CommandRunner>(runner: &R) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_core::model::AgentKind;
     use banto_io::opener::{CommandOutput, CommandSpec};
     use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
@@ -744,6 +745,7 @@ mod tests {
     fn session() -> SessionToOpen {
         SessionToOpen {
             id: "sess-1".to_string(),
+            agent: AgentKind::ClaudeCode,
             title: "Fix login".to_string(),
             cwd: PathBuf::from("/work/alpha"),
         }
