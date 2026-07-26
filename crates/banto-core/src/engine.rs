@@ -52,8 +52,17 @@ impl SessionKey {
         Self(id.to_string())
     }
 
-    fn new_plain(cwd: &std::path::Path) -> Self {
-        Self(format!("new::{}", cwd.display()))
+    /// `discriminator` distinguishes two fresh opens into the *same* cwd
+    /// before either has a real id yet (e.g. `n` pressed twice in a row) —
+    /// without one, both keys would be identical and collide in every
+    /// structure keyed by `SessionKey` (`pending_opens`, `screens`, the
+    /// shell's PTY handle map, `Stage`), silently dropping one pane's data
+    /// or cross-wiring the other's discovered id onto it. Callers get one
+    /// from [`EmporiumState::mint_plain_key`], never a clock or random value
+    /// (this crate is replayed deterministically from a recorded event
+    /// stream — see `crate::replay` — and cannot name a clock anyway).
+    fn new_plain(cwd: &std::path::Path, discriminator: u64) -> Self {
+        Self(format!("new::{}::{discriminator}", cwd.display()))
     }
 
     fn new_worker(brigade_id: BrigadeId, token: &str) -> Self {
@@ -386,6 +395,11 @@ pub struct EmporiumState {
     /// can show the pending-prefix hint while armed (reading state for
     /// drawing is legal; only `update` may write it).
     pub prefix_armed: Option<Instant>,
+    /// The next discriminator [`Self::mint_plain_key`] hands out. Only ever
+    /// increments, even past a closed pane's key going out of scope — a
+    /// reused discriminator could attach a stale mapping (an old screen, a
+    /// stale PTY handle) to a new pane that happens to mint the same key.
+    next_plain_id: u64,
 }
 
 impl EmporiumState {
@@ -405,12 +419,22 @@ impl EmporiumState {
             size: (0, 0),
             prefix,
             prefix_armed: None,
+            next_plain_id: 0,
         }
     }
 
     fn set_status(&mut self, message: impl Into<String>, now: Instant) {
         self.status = Some(message.into());
         self.status_set_at = Some(now);
+    }
+
+    /// Mint a fresh, never-reused [`SessionKey`] for a plain (non-brigade)
+    /// new-session open into `cwd` — see [`SessionKey::new_plain`] for why
+    /// this can't just be `SessionKey::new_plain(cwd)` on its own.
+    fn mint_plain_key(&mut self, cwd: &std::path::Path) -> SessionKey {
+        let discriminator = self.next_plain_id;
+        self.next_plain_id += 1;
+        SessionKey::new_plain(cwd, discriminator)
     }
 }
 
@@ -1366,7 +1390,7 @@ fn confirm_new_session_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cm
         return Vec::new();
     }
     app.close_modal();
-    let key = SessionKey::new_plain(&cwd);
+    let key = state.mint_plain_key(&cwd);
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
     vec![Cmd::OpenEmbedded {
         key,
@@ -2454,9 +2478,53 @@ mod tests {
 
     #[test]
     fn session_key_classifies_synthetic_keys() {
-        assert!(SessionKey::new_plain(std::path::Path::new("/work/a")).is_synthetic());
+        assert!(SessionKey::new_plain(std::path::Path::new("/work/a"), 0).is_synthetic());
         assert!(SessionKey::new_worker(1, "worker-1").is_synthetic());
         assert!(!SessionKey::from_id("00000000-real-uuid").is_synthetic());
+    }
+
+    #[test]
+    fn mint_plain_key_produces_distinct_keys_for_repeated_opens_into_the_same_cwd() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let cwd = std::path::Path::new("/work/same");
+
+        let k1 = state.mint_plain_key(cwd);
+        let k2 = state.mint_plain_key(cwd);
+
+        assert_ne!(k1, k2);
+        assert!(k1.is_synthetic());
+        assert!(k2.is_synthetic());
+    }
+
+    #[test]
+    fn two_plain_opens_into_the_same_cwd_survive_independently_in_pending_opens_and_screens() {
+        // The exact collision R36 traced: before the discriminator, two
+        // `n`-opens into the same cwd (before either resolves a real id)
+        // minted the identical `SessionKey`, so the second `pending_opens`
+        // insert silently overwrote the first, and the second `Event::Spawned`
+        // reset the first pane's already-rendered `screens` entry.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let cwd = std::path::Path::new("/work/same");
+
+        let k1 = state.mint_plain_key(cwd);
+        state.pending_opens.insert(k1.clone(), PendingOpen::Solo);
+        let k2 = state.mint_plain_key(cwd);
+        state.pending_opens.insert(k2.clone(), PendingOpen::Solo);
+
+        assert_eq!(state.pending_opens.len(), 2);
+        assert!(state.pending_opens.contains_key(&k1));
+        assert!(state.pending_opens.contains_key(&k2));
+
+        // Mirrors `update_spawned`'s unconditional `screens.insert` once per
+        // `Event::Spawned` — both must retain their own entry, not collapse
+        // onto one.
+        state
+            .screens
+            .insert(k1.clone(), crate::screen::Screen::new(24, 80));
+        state
+            .screens
+            .insert(k2.clone(), crate::screen::Screen::new(24, 80));
+        assert_eq!(state.screens.len(), 2);
     }
 
     // --- Relay engine: should_nudge / tick_relay_decision (unchanged logic) -
