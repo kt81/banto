@@ -60,7 +60,7 @@ line.
 **Status: DONE (Phase 3, 2026-07-25).** The split is physical. `banto-core`
 kept its name and purified in place (model, input, config types, age
 bucketing, search, `App`, the emporium engine + `Screen`, key/paste
-encoders — deps: serde, vt100, nucleo, unicode-width, ratatui-core);
+encoders — deps: serde, vt100, nucleo, ratatui-core);
 `banto-io` and `banto-tui` are real crates; the bin package `banto` carries
 the app role (the table's "banto-app" is that role, not a rename). Two
 notes from the migration worth keeping:
@@ -194,9 +194,13 @@ suite) before the next begins.
 - **Phase 0 — inventory.** Enumerate every point where banto touches the
   outside world (Appendix A is the working list; verify against code). The
   finished list *defines* `Event`: "there is no I/O beyond this list."
+  **Status: DONE (2026-07-24, `38146fd` "docs: mark the I/O inventory as
+  verified").**
 - **Phase 1 — purity fixes in place.** Remove in-core clock reads (e.g.
   `App::set_status` currently calls `Instant::now()` internally), thread
   time as arguments. No structural moves.
+  **Status: DONE (2026-07-24, `8fd108b` "refactor(core): inject the clock
+  into set_status and the summary view").**
 - **Phase 2 — the emporium event loop becomes `update`.** Unify
   key/mouse/paste/relay/discovery handling into `Event` dispatch. One
   design decision is owed here (flagged by the Phase 0 sweep): `tui.rs`'s
@@ -215,10 +219,24 @@ suite) before the next begins.
     keymap into semantic `Action`s (default pane-switch: a tmux-style
     `Ctrl+B` prefix, double-tap to send a literal `Ctrl+B` through), which
     also retires the F-key dependency.
+  **Status: DONE (2026-07-24, `10b91e9` "refactor(emporium): the event loop
+  becomes a pure update() engine" (2a) + `62b2575` "feat(emporium): tmux-style
+  prefix key, active kill, disband ends its workers" (2b)).**
 - **Phase 3 — physical crate split** per §2; the compiler becomes the
   enforcer for the crate-level prohibitions §2's table lists (not the
-  std-level ones in §3 — see §2's R37 note).
-- **Phase 4 — record/replay infrastructure** per §8.
+  std-level ones in §3 — see §2's R37 note). **Status: DONE (2026-07-24,
+  `1d873ba` "refactor(core): evacuate domain and input types ahead of the
+  crate split" (3a) + `40a05ed` "refactor: the physical crate split — the
+  compiler now enforces the discipline" (3b); §2's marker dates this
+  2026-07-25, the day it was recorded there rather than the day it
+  landed).**
+- **Phase 4 — record/replay infrastructure** per §8. **Status: DONE
+  (2026-07-25, `450bd9e` "feat(replay): record and replay event streams
+  (Phase 4 — the roadmap closes)").**
+
+**The migration this section plans is complete: all five phases landed
+2026-07-24 through 2026-07-25** (2 and 3 in two commits each), closing the
+adoption plan this section opened with.
 
 ## Appendix A — I/O inventory (verified against code in Phase 0)
 
