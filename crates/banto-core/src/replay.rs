@@ -163,6 +163,18 @@ mod tests {
     use crate::engine::{Focus, Stage};
     use crate::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 
+    /// `Instant` has no stable constructor for an arbitrary value other than
+    /// `now()` — this gives tests a concrete instant to seed the `now` they
+    /// feed into recorded/replayed events, without silencing
+    /// `disallowed-methods` for the rest of this module. Not the clock
+    /// access DISCIPLINE.md §3 forbids: that's about production code
+    /// reading the clock itself, not a test choosing its own fixed starting
+    /// point.
+    #[allow(clippy::disallowed_methods)]
+    fn test_instant() -> Instant {
+        Instant::now()
+    }
+
     fn header_line() -> String {
         format!("{{\"banto_event_stream\":{STREAM_VERSION}}}")
     }
@@ -263,7 +275,7 @@ mod tests {
     #[test]
     fn a_tick_driven_status_expiry_lands_exactly_where_the_offset_says() {
         let brigade = BrigadeConfig::default();
-        let base = Instant::now();
+        let base = test_instant();
         let archived = |offset_ms| TimedEvent {
             offset_ms,
             event: Event::ArchiveDone {
@@ -312,7 +324,7 @@ mod tests {
         assert_eq!(events.len(), 5);
         let expected_key = engine::SessionKey::from_id("row-1");
         let brigade = BrigadeConfig::default();
-        let base = Instant::now();
+        let base = test_instant();
 
         // Through `MembershipResolved` (offset 200) and `Spawned` (offset
         // 300): the row wasn't a brigade member, so `MembershipResolved`

@@ -1,0 +1,71 @@
+# Mechanical enforcement for the std-level prohibitions docs/DISCIPLINE.md §3
+# lists but the compiler cannot catch on its own (see docs/DISCIPLINE.md §2):
+# `std::fs`, `std::time`, `std::process`, and `std::net` are always in scope
+# for any Rust crate regardless of its Cargo.toml, so nothing named below is
+# a *dependency* the compiler can refuse to resolve. This list is what closes
+# that gap, for the methods someone thought to add to it.
+#
+# THIS FILE FULLY SHADOWS A WORKSPACE-ROOT clippy.toml, IT DOES NOT MERGE
+# WITH ONE. Clippy resolves clippy.toml by walking up from a crate's own
+# manifest directory and uses the FIRST (nearest) file it finds — verified
+# empirically in R38 (see that round's report): a setting present only in a
+# root-level clippy.toml is silently ignored here. If a root file is ever
+# added for an unrelated reason (an `msrv`, a threshold), whatever it sets
+# must be duplicated in this file too, or this crate simply won't see it.
+#
+# THIS IS A PARTIAL GUARD, NOT A CLOSED ONE. `disallowed-methods` has no
+# wildcard/module-path form — `"std::fs::*"` is rejected outright as "not a
+# reachable function" — so this only ever covers methods someone thought to
+# list below. A new std method used here for the first time slips through
+# until it's added. docs/DISCIPLINE.md §3 still relies on review; this
+# narrows the gap, it does not close it.
+
+disallowed-methods = [
+    # --- Clock (§3: "time arrives as an argument") — closed: these are the
+    # only two general-purpose "what time is it" calls in std. ---
+    { path = "std::time::Instant::now", reason = "DISCIPLINE.md §3: time arrives as an argument, never read from a clock" },
+    { path = "std::time::SystemTime::now", reason = "DISCIPLINE.md §3: time arrives as an argument, never read from a clock" },
+
+    # --- Process spawning (§3: "no process spawning") — effectively closed:
+    # every std process launch goes through this one constructor. ---
+    { path = "std::process::Command::new", reason = "DISCIPLINE.md §3: no process spawning" },
+
+    # --- Network (§3: "no network") — effectively closed: the handful of
+    # std::net entry points that actually open a socket. ---
+    { path = "std::net::TcpStream::connect", reason = "DISCIPLINE.md §3: no network" },
+    { path = "std::net::TcpListener::bind", reason = "DISCIPLINE.md §3: no network" },
+    { path = "std::net::UdpSocket::bind", reason = "DISCIPLINE.md §3: no network" },
+
+    # --- Filesystem (§3: "no file reads or writes") — open-ended by
+    # construction (see the PARTIAL GUARD note above). Covers the Path/
+    # PathBuf predicates and the common std::fs/File entry points a
+    # SessionRow/path-handling crate would plausibly reach for.
+    # `Path::is_dir` is the one that actually got through — see R37. ---
+    { path = "std::path::Path::is_dir", reason = "DISCIPLINE.md §3: no file reads or writes (R37 found this one live in engine.rs)" },
+    { path = "std::path::Path::is_file", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::path::Path::exists", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::path::Path::try_exists", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::path::Path::metadata", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::path::Path::read_dir", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::path::Path::canonicalize", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::read", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::read_to_string", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::write", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::read_dir", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::metadata", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::create_dir", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::create_dir_all", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::remove_file", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::remove_dir", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::remove_dir_all", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::copy", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::rename", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::File::open", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::File::create", reason = "DISCIPLINE.md §3: no file reads or writes" },
+    { path = "std::fs::OpenOptions::new", reason = "DISCIPLINE.md §3: no file reads or writes" },
+]
+
+# Randomness (§3: "no randomness") needs no entries: neither this crate nor
+# banto-tui depends on a `rand`-family crate, and stable std exposes no
+# general-purpose randomness API to name here. This is an intentional
+# absence, not a gap the list forgot.

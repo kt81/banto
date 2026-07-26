@@ -1759,6 +1759,17 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
+    /// `Instant` has no stable constructor for an arbitrary value other than
+    /// `now()` — this gives tests a concrete instant to seed the `now` they
+    /// pass into `App`'s methods, without silencing `disallowed-methods` for
+    /// the rest of this module. Not the clock access DISCIPLINE.md §3
+    /// forbids: that's about production code reading the clock itself, not
+    /// a test choosing its own fixed starting point.
+    #[allow(clippy::disallowed_methods)]
+    fn test_instant() -> Instant {
+        Instant::now()
+    }
+
     fn row(id: &str, title: &str, cwd: &str) -> SessionRow {
         SessionRow {
             id: id.to_string(),
@@ -1977,7 +1988,7 @@ mod tests {
     fn double_click_activates_only_within_threshold_on_same_row() {
         let mut app = App::new(numbered(5));
         app.set_viewport_height(5);
-        let t0 = Instant::now();
+        let t0 = test_instant();
 
         // First click selects.
         assert_eq!(app.click(2, t0), Some(ClickOutcome::Selected));
@@ -2005,7 +2016,7 @@ mod tests {
     fn click_past_last_row_is_ignored() {
         let mut app = App::new(numbered(2));
         app.set_viewport_height(5);
-        assert_eq!(app.click(4, Instant::now()), None);
+        assert_eq!(app.click(4, test_instant()), None);
     }
 
     /// Sets up 4 rows spanning 3 grouped-view sections (Pinned / "work" /
@@ -2032,24 +2043,24 @@ mod tests {
     fn click_below_a_header_selects_the_right_session() {
         let mut app = grouped_app_for_click_tests();
         // Display line 3 is Row(id1), just below the "work" header at line 2.
-        assert_eq!(app.click(3, Instant::now()), Some(ClickOutcome::Selected));
+        assert_eq!(app.click(3, test_instant()), Some(ClickOutcome::Selected));
         assert_eq!(app.selected_row().unwrap().id, "id1");
     }
 
     #[test]
     fn click_on_a_header_is_a_noop() {
         let mut app = grouped_app_for_click_tests();
-        app.click(1, Instant::now()); // select id3 first, as a baseline
+        app.click(1, test_instant()); // select id3 first, as a baseline
         assert_eq!(app.selected_row().unwrap().id, "id3");
 
         // Display line 2 is the "work" header, not a row.
-        assert_eq!(app.click(2, Instant::now()), None);
+        assert_eq!(app.click(2, test_instant()), None);
         // Selection untouched by the no-op click.
         assert_eq!(app.selected_row().unwrap().id, "id3");
 
         // Same for line 0, the "Pinned" header, and line 4, "Ungrouped".
-        assert_eq!(app.click(0, Instant::now()), None);
-        assert_eq!(app.click(4, Instant::now()), None);
+        assert_eq!(app.click(0, test_instant()), None);
+        assert_eq!(app.click(4, test_instant()), None);
         assert_eq!(app.selected_row().unwrap().id, "id3");
     }
 
@@ -2084,14 +2095,14 @@ mod tests {
         app.set_viewport_height(10);
         app.select_next(); // id1
         let id = app.selected_row().unwrap().id.clone();
-        app.set_status(format!("opened session {id}"), Instant::now());
+        app.set_status(format!("opened session {id}"), test_instant());
         assert_eq!(app.status(), Some("opened session id1"));
     }
 
     #[test]
     fn status_expires_after_the_timeout_but_not_before() {
         let mut app = App::new(numbered(1));
-        let t0 = Instant::now();
+        let t0 = test_instant();
         app.set_status("hello".to_string(), t0);
 
         // Comfortably before the 5s timeout: still showing.
@@ -2106,20 +2117,20 @@ mod tests {
     #[test]
     fn expire_status_is_a_noop_when_no_status_is_set() {
         let mut app = App::new(numbered(1));
-        app.expire_status(Instant::now() + Duration::from_secs(100));
+        app.expire_status(test_instant() + Duration::from_secs(100));
         assert_eq!(app.status(), None);
     }
 
     #[test]
     fn confirm_director_open_arms_on_first_call_and_returns_false() {
         let mut app = App::new(numbered(1));
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, Instant::now()));
+        assert!(!app.confirm_director_open("id0", OpenAction::Resume, test_instant()));
     }
 
     #[test]
     fn confirm_director_open_confirms_and_disarms_a_matching_repeat_within_the_window() {
         let mut app = App::new(numbered(1));
-        let t0 = Instant::now();
+        let t0 = test_instant();
         assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
 
         // Comfortably inside the freshness window.
@@ -2132,7 +2143,7 @@ mod tests {
     #[test]
     fn confirm_director_open_re_arms_instead_of_confirming_once_the_window_has_expired() {
         let mut app = App::new(numbered(1));
-        let t0 = Instant::now();
+        let t0 = test_instant();
         assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
 
         // Past the same 5s freshness window `expire_status` uses.
@@ -2142,7 +2153,7 @@ mod tests {
     #[test]
     fn confirm_director_open_a_different_id_re_arms_rather_than_confirming() {
         let mut app = App::new(numbered(2));
-        let t0 = Instant::now();
+        let t0 = test_instant();
         assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
 
         // Selection moved on to a different session — this looks like a
@@ -2153,7 +2164,7 @@ mod tests {
     #[test]
     fn confirm_director_open_a_different_action_does_not_confirm() {
         let mut app = App::new(numbered(1));
-        let t0 = Instant::now();
+        let t0 = test_instant();
         assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
 
         // Same id, but `s` (Split) was never the thing that warned — an

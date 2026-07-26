@@ -2365,6 +2365,17 @@ mod tests {
 
     use super::*;
 
+    /// `Instant` has no stable constructor for an arbitrary value other than
+    /// `now()` — this gives tests a concrete instant to seed the `now`
+    /// argument `update()` takes, without silencing `disallowed-methods` for
+    /// the rest of this module. Not the clock access DISCIPLINE.md §3
+    /// forbids: that's about production code reading the clock itself, not
+    /// a test choosing its own fixed starting point.
+    #[allow(clippy::disallowed_methods)]
+    fn test_instant() -> Instant {
+        Instant::now()
+    }
+
     fn row(id: &str) -> SessionRow {
         SessionRow {
             id: id.to_string(),
@@ -2590,7 +2601,7 @@ mod tests {
 
     #[test]
     fn should_nudge_happy_path() {
-        let now = Instant::now();
+        let now = test_instant();
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
@@ -2603,7 +2614,7 @@ mod tests {
 
     #[test]
     fn should_nudge_blocks_without_unseen_messages() {
-        let now = Instant::now();
+        let now = test_instant();
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
@@ -2616,7 +2627,7 @@ mod tests {
 
     #[test]
     fn should_nudge_busy_blocks() {
-        let now = Instant::now();
+        let now = test_instant();
         assert!(!should_nudge(
             now,
             0,
@@ -2629,7 +2640,7 @@ mod tests {
 
     #[test]
     fn should_nudge_single_tick_idle_blocks_debounce() {
-        let now = Instant::now();
+        let now = test_instant();
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED - 1,
@@ -2642,7 +2653,7 @@ mod tests {
 
     #[test]
     fn should_nudge_focused_with_recent_input_blocks() {
-        let now = Instant::now();
+        let now = test_instant();
         let last_input = now - Duration::from_millis(500);
         assert!(!should_nudge(
             now,
@@ -2656,7 +2667,7 @@ mod tests {
 
     #[test]
     fn should_nudge_focused_without_recent_input_is_allowed() {
-        let now = Instant::now();
+        let now = test_instant();
         let last_input = now - RELAY_INPUT_QUIET_PERIOD - Duration::from_secs(1);
         assert!(should_nudge(
             now,
@@ -2670,7 +2681,7 @@ mod tests {
 
     #[test]
     fn should_nudge_unfocused_ignores_recent_input() {
-        let now = Instant::now();
+        let now = test_instant();
         let last_input = now - Duration::from_millis(10);
         assert!(should_nudge(
             now,
@@ -2684,7 +2695,7 @@ mod tests {
 
     #[test]
     fn should_nudge_attempt_cap_blocks() {
-        let now = Instant::now();
+        let now = test_instant();
         let state = NudgeState {
             last_nudge: Some(now - RELAY_NUDGE_COOLDOWN - Duration::from_secs(1)),
             attempts: RELAY_MAX_ATTEMPTS,
@@ -2701,7 +2712,7 @@ mod tests {
 
     #[test]
     fn should_nudge_cooldown_blocks_a_too_soon_second_attempt() {
-        let now = Instant::now();
+        let now = test_instant();
         let state = NudgeState {
             last_nudge: Some(now - Duration::from_secs(10)),
             attempts: 1,
@@ -2718,7 +2729,7 @@ mod tests {
 
     #[test]
     fn should_nudge_cooldown_elapsed_allows_another_attempt() {
-        let now = Instant::now();
+        let now = test_instant();
         let state = NudgeState {
             last_nudge: Some(now - RELAY_NUDGE_COOLDOWN - Duration::from_secs(1)),
             attempts: 1,
@@ -2735,7 +2746,7 @@ mod tests {
 
     #[test]
     fn should_nudge_first_nudge_is_exempt_from_the_cooldown_wait() {
-        let now = Instant::now();
+        let now = test_instant();
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
@@ -2753,7 +2764,7 @@ mod tests {
     fn tick_relay_decision_requires_two_consecutive_idle_ticks() {
         let mut states = HashMap::new();
         let token = "worker-1".to_string();
-        let now = Instant::now();
+        let now = test_instant();
 
         assert!(!tick_relay_decision(
             &mut states,
@@ -2779,7 +2790,7 @@ mod tests {
     fn tick_relay_decision_busy_tick_resets_the_idle_streak() {
         let mut states = HashMap::new();
         let token = "worker-1".to_string();
-        let now = Instant::now();
+        let now = test_instant();
 
         assert!(!tick_relay_decision(
             &mut states,
@@ -2814,7 +2825,7 @@ mod tests {
     fn tick_relay_decision_unknown_live_entry_never_counts_as_idle() {
         let mut states = HashMap::new();
         let token = "worker-1".to_string();
-        let now = Instant::now();
+        let now = test_instant();
 
         for _ in 0..5 {
             assert!(!tick_relay_decision(
@@ -2833,7 +2844,7 @@ mod tests {
     fn tick_relay_decision_resets_on_drain_so_the_next_batch_starts_fresh() {
         let mut states = HashMap::new();
         let token = "worker-1".to_string();
-        let now = Instant::now();
+        let now = test_instant();
 
         tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
         assert!(tick_relay_decision(
@@ -2875,7 +2886,7 @@ mod tests {
     fn tick_relay_decision_stops_after_the_attempt_cap_even_past_cooldown() {
         let mut states = HashMap::new();
         let token = "worker-1".to_string();
-        let mut now = Instant::now();
+        let mut now = test_instant();
 
         tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
         for _ in 0..RELAY_MAX_ATTEMPTS {
@@ -2922,7 +2933,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         // Enter on the sidebar: the row isn't a known brigade member yet, so
         // the first step is always resolving membership (see the module doc).
@@ -2973,7 +2984,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("a"), row("b")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
         assert!(!app.is_selected_superseded());
 
         update(
@@ -3002,7 +3013,7 @@ mod tests {
         state.stage = Stage::Empty;
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let key = SessionKey::from_id("sess-1");
         let cmds = update(
@@ -3064,7 +3075,7 @@ mod tests {
                 session_id: "w1".to_string(),
                 member: Some((1, "worker-1".to_string())),
             },
-            Instant::now(),
+            test_instant(),
         );
 
         let discovered = SessionKey::from_id("w1");
@@ -3112,7 +3123,7 @@ mod tests {
                 session_id: "w1".to_string(),
                 member: Some((1, "worker-2".to_string())),
             },
-            Instant::now(),
+            test_instant(),
         );
 
         assert!(
@@ -3143,7 +3154,7 @@ mod tests {
         state.screens.insert(director.clone(), Screen::new(24, 80));
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
         let roster = vec![
             (
                 "director".to_string(),
@@ -3217,7 +3228,7 @@ mod tests {
         }
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3267,7 +3278,7 @@ mod tests {
             .insert(SessionKey::from_id("w1-new"), Screen::new(24, 80));
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3310,7 +3321,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3340,7 +3351,7 @@ mod tests {
         staged_brigade(&mut state, &director, std::slice::from_ref(&old));
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let fact = || Event::MemberSessionForked {
             brigade_id: 1,
@@ -3375,7 +3386,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir"), row("w1")]);
         let brigade = brigade_config(); // worker_model defaults to "sonnet"
-        let now = Instant::now();
+        let now = test_instant();
         state.pending_membership = Some(PendingMembership::Activate);
 
         let roster = vec![
@@ -3439,7 +3450,7 @@ mod tests {
                 key: key.clone(),
                 chunk: b"hi".to_vec(),
             },
-            Instant::now(),
+            test_instant(),
         );
 
         let screen = state.screens.get(&key).unwrap();
@@ -3462,7 +3473,7 @@ mod tests {
             &mut app,
             &brigade,
             Event::PtyExited { key: key.clone() },
-            Instant::now(),
+            test_instant(),
         );
 
         assert!(matches!(state.stage, Stage::Empty));
@@ -3493,7 +3504,7 @@ mod tests {
             Event::PtyExited {
                 key: worker.clone(),
             },
-            Instant::now(),
+            test_instant(),
         );
 
         match &state.stage {
@@ -3521,7 +3532,7 @@ mod tests {
         state.focus = Focus::Pane;
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3552,7 +3563,7 @@ mod tests {
         state.focus = Focus::Pane;
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3583,7 +3594,7 @@ mod tests {
         let mut app = app_with(vec![row("a")]);
         app.enter_search();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3608,7 +3619,7 @@ mod tests {
         let mut app = app_with(vec![row("a")]);
         app.open_group_join_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         update(
             &mut state,
@@ -3647,7 +3658,7 @@ mod tests {
         };
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let mut now = Instant::now();
+        let mut now = test_instant();
 
         let observation = || RelayObservation {
             token: "worker-1".to_string(),
@@ -3737,7 +3748,7 @@ mod tests {
                 title: "Fix login".to_string(),
                 result: Ok(()),
             },
-            Instant::now(),
+            test_instant(),
         );
         assert!(matches!(cmds.as_slice(), [Cmd::Reload]));
         assert_eq!(state.status.as_deref(), Some("archived Fix login"));
@@ -3757,7 +3768,7 @@ mod tests {
                 title: "Fix login".to_string(),
                 result: Err("disk full".to_string()),
             },
-            Instant::now(),
+            test_instant(),
         );
         assert!(matches!(cmds.as_slice(), [Cmd::Reload]));
         let status = state.status.unwrap();
@@ -3808,7 +3819,7 @@ mod tests {
         state.focus = Focus::Pane;
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3839,10 +3850,10 @@ mod tests {
         state.screens.insert(key.clone(), Screen::new(24, 80));
         state.stage = Stage::Solo(key.clone());
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3878,10 +3889,10 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3914,10 +3925,10 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3943,10 +3954,10 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3970,10 +3981,10 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -3997,10 +4008,10 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4032,10 +4043,10 @@ mod tests {
             focused: 1,
         };
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![row("dir"), row("w1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         update(
             &mut state,
@@ -4069,10 +4080,10 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![row("dir"), row("w1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         update(
             &mut state,
@@ -4102,10 +4113,10 @@ mod tests {
         state.screens.insert(key.clone(), Screen::new(24, 80));
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4133,7 +4144,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let armed_at = Instant::now();
+        let armed_at = test_instant();
         state.prefix_armed = Some(armed_at);
 
         update(
@@ -4152,7 +4163,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let armed_at = Instant::now();
+        let armed_at = test_instant();
         state.prefix_armed = Some(armed_at);
 
         update(
@@ -4192,7 +4203,7 @@ mod tests {
         let mut app = app_with(vec![row("s1")]); // seeds candidate cwd "/work/alpha"
         app.open_new_session_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = press_enter(&mut state, &mut app, &brigade, now);
 
@@ -4210,7 +4221,7 @@ mod tests {
         let mut app = app_with(vec![row("s1")]);
         app.open_new_session_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let first = press_enter(&mut state, &mut app, &brigade, now);
         assert_eq!(first.len(), 1);
@@ -4225,7 +4236,7 @@ mod tests {
         let mut app = app_with(vec![row("s1")]);
         app.open_new_session_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         press_enter(&mut state, &mut app, &brigade, now);
         let cmds = update(
@@ -4264,7 +4275,7 @@ mod tests {
         let mut app = app_with(vec![row("s1")]);
         app.open_new_session_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         press_enter(&mut state, &mut app, &brigade, now);
         let cmds = update(
@@ -4292,7 +4303,7 @@ mod tests {
         let mut app = app_with(vec![row("s1")]); // candidate cwd "/work/alpha"
         app.open_new_session_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         press_enter(&mut state, &mut app, &brigade, now);
         // The operator keeps typing while the stat is in flight, moving the
@@ -4328,7 +4339,7 @@ mod tests {
         let mut app = app_with(vec![row("s1")]);
         app.open_new_session_modal();
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         press_enter(&mut state, &mut app, &brigade, now);
         app.close_modal(); // Esc, simulated directly
@@ -4356,7 +4367,7 @@ mod tests {
         let mut app = app_with(vec![]);
         app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string(), false);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4382,7 +4393,7 @@ mod tests {
         let mut app = app_with(vec![]);
         app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string(), false);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4411,7 +4422,7 @@ mod tests {
         app.open_confirm_kill_modal(key.as_str().to_string(), "worker-1".to_string(), true);
         app.modal_select_next(); // ClosePane -> Dismiss
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4445,7 +4456,7 @@ mod tests {
         app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), true);
         app.modal_select_next(); // ClosePane -> Dismiss
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4497,7 +4508,7 @@ mod tests {
         let mut app = app_with(vec![]);
         app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), true);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4535,7 +4546,7 @@ mod tests {
             .with_hidden_worker_ids(["w1".to_string(), "w2".to_string()].into_iter().collect());
         assert_eq!(app.filtered_len(), 1); // only "dir" visible before dismissal
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4572,7 +4583,7 @@ mod tests {
         state.pending_dismiss = Some(w1);
         let mut app = app_with(vec![row("dir"), row("w1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4612,7 +4623,7 @@ mod tests {
         };
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4648,7 +4659,7 @@ mod tests {
         state.stage = Stage::Empty;
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4674,7 +4685,7 @@ mod tests {
         state.stage = Stage::Solo(key);
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4715,7 +4726,7 @@ mod tests {
         };
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4748,7 +4759,7 @@ mod tests {
         };
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4774,7 +4785,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         update(
             &mut state,
@@ -4802,10 +4813,10 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -4877,7 +4888,7 @@ mod tests {
         state.focus = Focus::Sidebar;
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let armed_cmds = update(
             &mut state,
@@ -4973,10 +4984,10 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Sidebar;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -5008,10 +5019,10 @@ mod tests {
             focused: 1,
         };
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
@@ -5038,10 +5049,10 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        state.prefix_armed = Some(Instant::now());
+        state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let now = Instant::now();
+        let now = test_instant();
 
         let cmds = update(
             &mut state,
