@@ -315,19 +315,22 @@ fn agent_label(row: &SessionRow) -> String {
     format!("[{}]", row.agent.label())
 }
 
-/// Per-product accent for the agent label — muted, not vivid, and
-/// deliberately clear of every colour the activity dot already uses
-/// (Green/Cyan/Yellow/Gray/DarkGray, see the module doc's "Emoji markers"
-/// section) so the two colours sharing a row don't compete for attention.
-/// Plain `Blue` is skipped for either variant on purpose: it's the classic
-/// hard-to-read-on-a-dark-terminal colour (many default 16-colour schemes
-/// render it close to black) — exactly the kind of failure that got an
-/// emoji rejected outright once already (see the module doc); `LightBlue`
-/// is the brighter variant terminal themes generally exist to fix that
-/// with.
+/// Per-product accent for the agent label — clear of every colour the
+/// activity dot already uses (Green/Cyan/Yellow/Gray/DarkGray) so the two
+/// colours sharing a row don't compete. Plain `Blue` is avoided on purpose:
+/// many default 16-colour schemes render it close to black, the same
+/// unreadable-on-dark failure that got an emoji rejected here once.
+///
+/// Claude's is the one place this file names an absolute colour rather than
+/// a themed one. The operator asked for orange, and orange has no ANSI
+/// name — the nearest candidates are a dark olive `Yellow` (already the
+/// dot's) and a pink-red `LightRed`. An identity marker is also the case
+/// where following the reader's theme is least useful: the point is that
+/// Claude looks like Claude. Codex keeps a themed colour because nothing
+/// about it needs a specific hue, only contrast with the other one.
 fn agent_label_color(agent: AgentKind) -> Color {
     match agent {
-        AgentKind::ClaudeCode => Color::Magenta,
+        AgentKind::ClaudeCode => Color::Rgb(217, 119, 87),
         AgentKind::Codex => Color::LightBlue,
     }
 }
@@ -1195,5 +1198,20 @@ mod tests {
             Color::Blue,
             "plain Blue is the classic hard-to-read-on-dark terminal colour"
         );
+
+        // The doc above claims these stay clear of the activity dot's own
+        // palette so the two coloured things in a row don't compete. Pin it:
+        // the claim is the reason the colours were chosen, and nothing else
+        // would notice if a later edit collided with the dot.
+        for dot in [
+            Color::Green,
+            Color::Cyan,
+            Color::Yellow,
+            Color::Gray,
+            Color::DarkGray,
+        ] {
+            assert_ne!(claude, dot, "agent label collides with an activity dot");
+            assert_ne!(codex, dot, "agent label collides with an activity dot");
+        }
     }
 }
