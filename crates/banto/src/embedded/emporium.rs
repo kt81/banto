@@ -409,8 +409,8 @@ fn shutdown_handles(
 }
 
 /// Execute one `Cmd`, returning any follow-up `Event`(s) — the only place
-/// that writes to a hosted session's stdin, spawns a process, or touches the
-/// store.
+/// that writes to a hosted session's stdin, spawns a process, touches the
+/// store, or toggles the host terminal's own mouse capture.
 fn execute_cmd(
     cmd: Cmd,
     deps: &Deps,
@@ -422,6 +422,14 @@ fn execute_cmd(
             if let Some(handle) = handles.get_mut(&key) {
                 handle.send_bytes(&bytes);
             }
+            Vec::new()
+        }
+        Cmd::SetMouseCapture(enabled) => {
+            // Best-effort: a failed terminal write here isn't worth
+            // aborting the whole event loop over (matches this module's
+            // other terminal-control calls — `setup_terminal`/
+            // `restore_terminal` are the only ones that propagate `Result`).
+            let _ = set_mouse_capture(enabled);
             Vec::new()
         }
         Cmd::ResizePty { key, rows, cols } => {
@@ -1313,6 +1321,25 @@ fn restore_terminal() -> Result<()> {
         DisableMouseCapture,
         DisableBracketedPaste
     )?;
+    Ok(())
+}
+
+/// The shell-side half of `Cmd::SetMouseCapture` (see
+/// `engine::update_mouse_capture`'s doc for when the core asks for this):
+/// released so the host terminal's own native text selection works over a
+/// pane whose child never enabled mouse reporting, re-acquired once focus
+/// moves somewhere that does (including the sidebar itself, which always
+/// wants it for its own click/scroll handling). Capture is the host
+/// terminal's own state, not any one pane's, so — unlike every other `Cmd`
+/// here — this never touches `handles`/a `SessionKey` at all; a fresh
+/// `io::stdout()` handle is all `execute!` needs, same as `setup_terminal`/
+/// `restore_terminal` already use.
+fn set_mouse_capture(enabled: bool) -> Result<()> {
+    if enabled {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)?;
+    }
     Ok(())
 }
 
