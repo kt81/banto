@@ -221,8 +221,23 @@ pub struct Areas {
 /// Consecutive relay ticks a member must be observed idle before it's
 /// eligible for a nudge.
 const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
-/// How long a focused pane's own recently-forwarded input suppresses a nudge.
-const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(3);
+/// How long a focused pane's own recently-forwarded input suppresses a
+/// nudge. Was 3s, which is a *typing-gap* threshold (how long between two
+/// keystrokes before you'd call the operator "done typing"), not a
+/// *composing* one — a human writing even one sentence routinely pauses
+/// longer than that to think, re-read, or pick a word, so the old value let
+/// a nudge land mid-sentence: confirmed in the field, where it did exactly
+/// that, corrupting a message the operator was composing to a Worker (the
+/// nudge text landed inside it, then [`RELAY_SUBMIT_DELAY`] later submitted
+/// the mixed result before he could stop it — see [`update_key`]'s
+/// `cancel_pending_submit_on_input` call for the other half of that fix).
+/// 30s is chosen for the cost asymmetry, not a measured pause length: a
+/// nudge arriving late only delays how soon the Worker notices unread mail
+/// (and the operator can still see the unread marker in the sidebar in the
+/// meantime), while a nudge arriving mid-composition can destroy what the
+/// operator was actually typing — a much more expensive failure to guard a
+/// few extra seconds against.
+const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(30);
 /// Minimum gap between nudges to the same member.
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Give up nudging a member after this many attempts on one unseen batch.
@@ -327,6 +342,28 @@ struct PendingSubmit {
     nudged_at: Instant,
 }
 
+/// Drop `key`'s pending submitting `\r`, if one is waiting, because real
+/// operator input for that same pane just arrived. Widening
+/// [`RELAY_INPUT_QUIET_PERIOD`] narrows the window a nudge can start in
+/// while the operator is composing, but it cannot close it — the operator
+/// can still start typing in the [`RELAY_SUBMIT_DELAY`] gap between a
+/// nudge's text landing and its `\r` following. Left unguarded, that `\r`
+/// submits banto's nudge text spliced with whatever the operator has typed
+/// on top of it since, not what either of them meant to send. Called at
+/// every site that forwards real keystrokes to a pane (not the mouse path —
+/// an SGR report to the child isn't the operator composing text into it).
+///
+/// The nudge text already written to the pane is left alone: banto cannot
+/// un-type it without writing more bytes into the same line the operator is
+/// mid-edit on, and a guessed-at erase (backspaces sized to the nudge
+/// line's length) risks deleting the operator's own text instead if the
+/// child already reflowed or echoed something in between. Leaving a stray
+/// line the operator can see and clear themselves is the honest outcome
+/// here — silently submitting it early is the actual bug.
+fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key: &SessionKey) {
+    pending_submits.retain(|pending| &pending.key != key);
+}
+
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
 /// `SpawnFailed` know what to do with the result.
 enum PendingOpen {
@@ -397,6 +434,13 @@ pub struct EmporiumState {
     /// reused discriminator could attach a stale mapping (an old screen, a
     /// stale PTY handle) to a new pane that happens to mint the same key.
     next_plain_id: u64,
+    /// What [`update_mouse_capture`] last decided the host terminal's mouse
+    /// capture should be — starts `true` to match what `setup_terminal`
+    /// already did before the first event ever reaches `update` (the
+    /// sidebar, [`Focus::Sidebar`]'s own initial value, wants it on
+    /// anyway), so nothing re-sends a redundant `Cmd::SetMouseCapture` on
+    /// the very first frame.
+    mouse_capture_enabled: bool,
 }
 
 impl EmporiumState {
@@ -417,6 +461,7 @@ impl EmporiumState {
             prefix,
             prefix_armed: None,
             next_plain_id: 0,
+            mouse_capture_enabled: true,
         }
     }
 
@@ -432,6 +477,28 @@ impl EmporiumState {
         let discriminator = self.next_plain_id;
         self.next_plain_id += 1;
         SessionKey::new_plain(cwd, discriminator)
+    }
+
+    /// Drop `key` from the stage, keeping [`Self::focus`] pointing at
+    /// something that exists.
+    ///
+    /// Removing the last pane leaves [`Stage::Empty`], and a `Focus::Pane`
+    /// outliving it strands every keypress: the pane branch forwards to a
+    /// focused key that is now `None`, and the sidebar branch never runs
+    /// because focus is not on the sidebar. Nothing blocks and nothing
+    /// spins — the loop keeps drawing a correct screen while answering
+    /// nothing, which reads as a freeze rather than as a bug. `prefix x` on
+    /// a solo pane did exactly that, and F2 was the only way out, for
+    /// someone who already knew.
+    ///
+    /// Unstaging goes through here rather than calling `Stage::remove`
+    /// directly so that a third caller cannot reintroduce it by omitting a
+    /// step it has no reason to know about.
+    fn unstage(&mut self, key: &SessionKey) {
+        self.stage.remove(key);
+        if !self.stage.is_active() {
+            self.focus = Focus::Sidebar;
+        }
     }
 }
 
@@ -792,6 +859,13 @@ pub enum Cmd {
     },
     Store(StoreIntent),
     Reload,
+    /// Enable or disable the *host* terminal's own mouse capture — see
+    /// [`update_mouse_capture`]'s doc for when the core asks for this.
+    /// Capture is a property of banto's own terminal, not of any one pane
+    /// (`docs/DISCIPLINE.md` §2's I/O-at-the-edges split), so unlike every
+    /// other `Cmd` here this has no `SessionKey`: the shell just calls
+    /// crossterm's `Enable`/`DisableMouseCapture` on its own stdout.
+    SetMouseCapture(bool),
 }
 
 /// A fact about the outside world, fed into [`update`]. Derives
@@ -1008,7 +1082,51 @@ pub fn update(
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
     };
     cmds.extend(resize_staged_tiles(state));
+    cmds.extend(update_mouse_capture(state));
     cmds
+}
+
+/// Whether the host terminal's mouse capture should be on right now: always
+/// for the sidebar (its own click/scroll handling needs crossterm to
+/// actually deliver `Event::Mouse` at all), otherwise exactly when the
+/// focused pane's child wants SGR mouse reports (see
+/// [`crate::screen::Screen::wants_sgr_mouse`]) — a pane with no `Screen` yet
+/// (nothing spawned, or nothing heard from it yet) defaults to `false`,
+/// same as a child that has said nothing about mouse mode at all.
+fn wants_mouse_capture(state: &EmporiumState) -> bool {
+    match state.focus {
+        Focus::Sidebar => true,
+        Focus::Pane => state
+            .stage
+            .focused_key()
+            .and_then(|key| state.screens.get(key))
+            .is_some_and(crate::screen::Screen::wants_sgr_mouse),
+    }
+}
+
+/// Reconcile the host terminal's mouse capture with what the currently
+/// focused pane's child actually wants, emitting `Cmd::SetMouseCapture` only
+/// on a change (see [`EmporiumState::mouse_capture_enabled`]'s doc for the
+/// baseline this compares against). Called once at the end of every
+/// `update` regardless of event kind — same shape as
+/// [`resize_staged_tiles`] and for the same reason: the desired state can
+/// change from focus moving (a key or a mouse click) *or* from the focused
+/// pane's own output enabling/disabling mouse reporting after the fact
+/// (`Event::PtyOutput`), and checking centrally here is cheaper and more
+/// robust than remembering to call this from every branch that could cause
+/// either.
+///
+/// This only decides *whether* the child should receive mouse events —
+/// actually enabling/disabling capture is the host terminal's own state,
+/// which only the shell can touch (`docs/DISCIPLINE.md` §2); see
+/// `embedded::emporium::set_mouse_capture` for that half.
+fn update_mouse_capture(state: &mut EmporiumState) -> Vec<Cmd> {
+    let wants = wants_mouse_capture(state);
+    if wants == state.mouse_capture_enabled {
+        return Vec::new();
+    }
+    state.mouse_capture_enabled = wants;
+    vec![Cmd::SetMouseCapture(wants)]
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
@@ -1119,6 +1237,7 @@ fn update_key(
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
+                    cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                     vec![Cmd::WritePty { key: target, bytes }]
                 }
             } else {
@@ -1221,6 +1340,7 @@ fn resolve_armed_prefix(
             if bytes.is_empty() {
                 Vec::new()
             } else {
+                cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                 vec![Cmd::WritePty { key: target, bytes }]
             }
         }
@@ -1319,6 +1439,13 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
         }
         KeyCode::Tab => {
             app.modal_complete_candidate();
+            Vec::new()
+        }
+        // New-session modal only (see `App::modal_toggle_new_session_agent`'s
+        // doc for why the chōba has no equivalent binding); a no-op for
+        // every other modal kind, same as `modal_complete_candidate` above.
+        KeyCode::BackTab => {
+            app.modal_toggle_new_session_agent();
             Vec::new()
         }
         KeyCode::Backspace => {
@@ -1438,6 +1565,8 @@ fn update_new_session_cwd_checked(
         app.modal_set_error(format!("{} is not a directory", cwd.display()));
         return Vec::new();
     }
+    // Read before `close_modal` drops the `NewSessionState` this came from.
+    let agent = app.modal_new_session_agent();
     app.close_modal();
     let key = state.mint_plain_key(&cwd);
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
@@ -1445,7 +1574,7 @@ fn update_new_session_cwd_checked(
         key,
         target: SessionToOpen {
             id: String::new(),
-            agent: AgentKind::ClaudeCode,
+            agent,
             title: cwd.display().to_string(),
             cwd,
         },
@@ -1739,6 +1868,16 @@ fn add_worker(state: &mut EmporiumState, app: &App, _brigade: &BrigadeConfig) ->
     vec![Cmd::Store(StoreIntent::AddWorker { brigade_id, cwd })]
 }
 
+/// Dispatch one mouse event: sidebar click/scroll, or — over a pane — focus
+/// it (`Down(Left)` always moves focus, regardless of whether it wants
+/// mouse) and forward the event as an SGR report, but only when the focused
+/// pane's own child asked for mouse reporting in that encoding (see
+/// [`crate::screen::Screen::wants_sgr_mouse`]) — forwarding unconditionally,
+/// as this used to, sent bytes to children that never asked for them and
+/// would otherwise have gotten native terminal text selection instead. See
+/// [`update_mouse_capture`] for the other half: releasing banto's own
+/// terminal capture so that native selection actually becomes available
+/// once forwarding is refused.
 fn update_mouse(
     state: &mut EmporiumState,
     app: &mut App,
@@ -1767,6 +1906,10 @@ fn update_mouse(
         }
         if state.focus == Focus::Pane
             && let Some((key, rect)) = hit
+            && state
+                .screens
+                .get(&key)
+                .is_some_and(crate::screen::Screen::wants_sgr_mouse)
             && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect))
         {
             state.last_forwarded_input = Some(now);
@@ -1877,6 +2020,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
             normalized.into_bytes()
         };
         state.last_forwarded_input = Some(now);
+        cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
     }
     Vec::new()
@@ -1969,7 +2113,7 @@ fn update_pty_exited(
     now: Instant,
 ) -> Vec<Cmd> {
     state.screens.remove(&key);
-    state.stage.remove(&key);
+    state.unstage(&key);
     let title = app
         .row_for_id(key.as_str())
         .map(|row| row.display_title().to_string())
@@ -2272,7 +2416,7 @@ fn update_worker_dismissed(
                 .unwrap_or_else(|| key.as_str().to_string());
             state.set_status(format!("{title} dismissed from the brigade"), now);
             if staged {
-                state.stage.remove(&key);
+                state.unstage(&key);
                 vec![Cmd::KillPty { key }]
             } else {
                 Vec::new()
@@ -2380,6 +2524,7 @@ mod tests {
             preview: None,
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         }
     }
 
@@ -3452,6 +3597,209 @@ mod tests {
         assert_eq!(screen.screen().cell(0, 1).unwrap().contents(), "i");
     }
 
+    // --- mouse: SGR forwarding gated on the child's own mouse-protocol state
+
+    /// A left-button-down at the top-left corner of `state`'s pane content
+    /// area — assumes a `Solo` (or single-member `Brigade`) stage, whose one
+    /// tile fills the whole pane area, so this always lands inside it.
+    fn click_inside_pane(state: &EmporiumState) -> MouseEvent {
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let content = pane_content(areas.pane);
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: content.x,
+            row: content.y,
+        }
+    }
+
+    /// A `Screen` already sized to match `state`'s own pane content area
+    /// (same `Solo`/single-member `Brigade` assumption as
+    /// [`click_inside_pane`]) — so `update`'s own per-tick `resize_staged_tiles`
+    /// has nothing to correct and doesn't add an incidental `Cmd::ResizePty`
+    /// these tests aren't about.
+    fn screen_sized_for_pane(state: &EmporiumState) -> Screen {
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let content = pane_content(areas.pane);
+        Screen::new(content.height, content.width)
+    }
+
+    #[test]
+    fn mouse_click_over_a_pane_with_no_screen_focuses_it_but_forwards_nothing() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        // No `state.screens` entry at all: nothing spawned yet, or nothing
+        // heard from it — either way, it can't have asked for mouse.
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = click_inside_pane(&state);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert_eq!(state.focus, Focus::Pane);
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::WritePty { .. })),
+            "nothing should be forwarded to a child that never asked: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_click_over_a_pane_that_enabled_sgr_mouse_forwards_the_report() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1003h\x1b[?1006h"); // any-motion mode, SGR encoding
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = click_inside_pane(&state);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert_eq!(state.focus, Focus::Pane);
+        match cmds.as_slice() {
+            [
+                Cmd::WritePty {
+                    key: got_key,
+                    bytes,
+                },
+            ] => {
+                assert_eq!(got_key, &key);
+                assert_eq!(bytes, b"\x1b[<0;1;1M");
+            }
+            other => panic!("expected exactly one WritePty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_click_over_a_pane_with_a_non_sgr_encoding_forwards_nothing() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        let mut screen = screen_sized_for_pane(&state);
+        // Mouse mode is on, but in the UTF-8 encoding, not SGR — banto has
+        // no encoder for this, so it must refuse rather than send SGR bytes
+        // this child never asked for.
+        screen.process(b"\x1b[?1000h\x1b[?1005h");
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = click_inside_pane(&state);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Cmd::WritePty { .. })),
+            "a non-SGR encoding must not be sent SGR bytes: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_stays_on_when_focus_moves_to_a_pane_that_wants_sgr_mouse() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1003h\x1b[?1006h");
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = click_inside_pane(&state);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::SetMouseCapture(false))),
+            "capture must stay on for a pane that wants mouse: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_releases_when_focus_moves_to_a_pane_with_no_screen() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = click_inside_pane(&state);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        assert!(!state.mouse_capture_enabled);
+    }
+
+    #[test]
+    fn mouse_capture_releases_when_the_already_focused_panes_own_output_disables_mouse_mode() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1003h\x1b[?1006h");
+        state.screens.insert(key.clone(), screen);
+        // Already focused on a pane that wants mouse: pre-sync to how a
+        // real sequence of events would have left this (see
+        // `armed_o_cycles_the_focused_pane`'s comment on the same line).
+        state.mouse_capture_enabled = wants_mouse_capture(&state);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        // No focus change here at all — the child's own output is what
+        // turns mouse reporting back off.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key,
+                chunk: b"\x1b[?1003l".to_vec(),
+            },
+            test_instant(),
+        );
+
+        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+    }
+
     #[test]
     fn pty_exited_on_a_staged_solo_collapses_to_empty_with_status() {
         let mut state = EmporiumState::new(PrefixKey::default());
@@ -3473,6 +3821,58 @@ mod tests {
         assert!(matches!(state.stage, Stage::Empty));
         assert!(!state.screens.contains_key(&key));
         assert!(state.status.unwrap().contains("session ended"));
+        assert_eq!(
+            state.focus,
+            Focus::Sidebar,
+            "focus must not outlive the pane it points at"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_answers_keys_again_after_its_last_pane_exits() {
+        // The assertion above is the state; this is what the operator
+        // experiences. A solo pane's exit used to leave `Focus::Pane`
+        // behind, so every later key was forwarded to a pane that no longer
+        // existed and the sidebar never saw one — a correctly drawn screen
+        // that answered nothing.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![row("sess-1"), row("sess-2")]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key: key.clone() },
+            now,
+        );
+
+        let before = app.selected_row().map(|row| row.id.clone());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert_ne!(
+            app.selected_row().map(|row| row.id.clone()),
+            before,
+            "`j` should have moved the sidebar selection"
+        );
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "nothing should be written to a pane that no longer exists"
+        );
     }
 
     #[test]
@@ -3728,6 +4128,126 @@ mod tests {
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
     }
 
+    /// Shared setup for the two tests below: a solo, focused pane, ticked
+    /// idle twice so it's nudge-eligible, then nudged. `Focus::Pane` and no
+    /// prior `last_forwarded_input` together mean the quiet-period guard
+    /// (`RELAY_INPUT_QUIET_PERIOD`) never blocks the nudge — this models the
+    /// operator sitting on a focused pane they have not yet typed into when
+    /// the nudge fires, exactly the case a keystroke can still land in
+    /// before the delayed `\r`. Returns `(state, app, brigade, worker, now)`
+    /// with `now` positioned right after the nudge text went out.
+    fn nudged_focused_pane_awaiting_submit()
+    -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let worker = SessionKey::from_id("w1");
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(worker.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mut now = test_instant();
+
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: worker.clone(),
+                bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
+            }],
+            "setup error: expected the nudge text to have gone out"
+        );
+
+        (state, app, brigade, worker, now)
+    }
+
+    #[test]
+    fn real_input_in_the_submit_gap_cancels_the_pending_r() {
+        let (mut state, mut app, brigade, worker, mut now) = nudged_focused_pane_awaiting_submit();
+
+        // The operator starts typing into that same focused pane before
+        // RELAY_SUBMIT_DELAY elapses.
+        now += Duration::from_millis(50);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: worker.clone(),
+                bytes: b"h".to_vec(),
+            }],
+            "the operator's own keystroke must still reach the pane"
+        );
+
+        // Once RELAY_SUBMIT_DELAY has fully elapsed, nothing flushes: the
+        // pending `\r` was cancelled the moment real input arrived.
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(
+            cmds.is_empty(),
+            "a cancelled submit must never fire: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_submit_still_flushes_when_nothing_interrupts_it() {
+        let (mut state, mut app, brigade, worker, mut now) = nudged_focused_pane_awaiting_submit();
+
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: worker,
+                bytes: b"\r".to_vec(),
+            }]
+        );
+    }
+
     #[test]
     fn archive_done_sets_status_and_reloads() {
         let mut state = EmporiumState::new(PrefixKey::default());
@@ -3883,6 +4403,11 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
+        // Neither pane has a `Screen` here, so `update`'s own mouse-capture
+        // sync would otherwise emit an incidental `Cmd::SetMouseCapture`
+        // this test isn't about — pre-sync it to match, same as a realistic
+        // sequence of events would have.
+        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -3919,6 +4444,8 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
+        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
+        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -3948,6 +4475,8 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
+        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
+        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4002,6 +4531,8 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
+        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
+        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
@@ -4258,6 +4789,47 @@ mod tests {
                 assert!(key.is_synthetic());
                 assert_eq!(target.id, "");
                 assert_eq!(target.cwd, PathBuf::from("/work/alpha"));
+                assert_eq!(target.agent, AgentKind::ClaudeCode);
+            }
+            other => panic!("expected a single OpenEmbedded cmd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_modal_backtab_toggles_the_agent_and_the_open_reflects_it() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]);
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::BackTab,
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert_eq!(app.modal_new_session_agent(), AgentKind::Codex);
+
+        press_enter(&mut state, &mut app, &brigade, now);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked {
+                cwd: PathBuf::from("/work/alpha"),
+                is_dir: true,
+            },
+            now,
+        );
+
+        match cmds.as_slice() {
+            [Cmd::OpenEmbedded { target, .. }] => {
+                assert_eq!(target.agent, AgentKind::Codex);
             }
             other => panic!("expected a single OpenEmbedded cmd, got {other:?}"),
         }
@@ -4691,8 +5263,11 @@ mod tests {
             ))),
             now,
         );
-        assert!(cmds.is_empty());
         assert_eq!(state.focus, Focus::Pane);
+        // The now-focused pane has no `Screen` at all (nothing spawned),
+        // so it can't want mouse reporting — banto releases its own
+        // capture, per `update_mouse_capture`.
+        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
 
         let cmds = update(
             &mut state,
@@ -4704,8 +5279,10 @@ mod tests {
             ))),
             now,
         );
-        assert!(cmds.is_empty());
         assert_eq!(state.focus, Focus::Sidebar);
+        // Back at the sidebar, which always wants capture for its own
+        // click/scroll handling.
+        assert_eq!(cmds, vec![Cmd::SetMouseCapture(true)]);
     }
 
     #[test]
@@ -4994,12 +5571,14 @@ mod tests {
             now,
         );
 
-        assert!(cmds.is_empty());
         assert_eq!(state.focus, Focus::Pane);
         match &state.stage {
             Stage::Brigade { focused, .. } => assert_eq!(*focused, 0),
             _ => panic!("expected a Brigade stage"),
         }
+        // Neither pane has a `Screen` here, so the newly-focused director
+        // pane can't want mouse reporting — banto releases its own capture.
+        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
     }
 
     #[test]
@@ -5013,6 +5592,8 @@ mod tests {
             focused: 1,
         };
         state.focus = Focus::Pane;
+        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
+        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();

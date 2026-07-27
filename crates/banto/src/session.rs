@@ -6,14 +6,17 @@
 //! here writes to disk. Everything under `claude_home` is treated as
 //! strictly read-only.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
-use banto_core::config::ActivityConfig;
+use banto_core::config::{ActivityConfig, ResolvedAgents};
 pub use banto_core::model::SessionRow;
-use banto_core::model::{Activity, AgeBucket, SessionMeta};
+use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::provider::codex::CodexProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
 use banto_io::status::{self, SysinfoProbe};
 
@@ -43,21 +46,92 @@ pub fn activity_tag(activity: Activity) -> &'static str {
     }
 }
 
-/// Discover sessions under `claude_home`, classify their activity, and return
-/// them sorted by mtime descending (newest first), with session id as a
-/// deterministic tie-breaker. A thin wrapper — discover, then
-/// [`rows_from_metas`] — kept for callers that only want rows and have no
-/// reason to run a second discover() pass of their own.
+/// The startup notice for `Config.agents`, when [`resolve_agents`] had to
+/// ignore part of it — `None` when every name parsed cleanly (including the
+/// ordinary `all`/unset case, which never has anything to ignore). Shared
+/// by both `crate::tui::run` and `crate::embedded::run_emporium`, the two
+/// entry points with a status line to put this in; the `list` subcommand
+/// has no such line and doesn't call this.
 ///
-/// Read-only: this reads `<claude_home>/projects` and `<claude_home>/sessions`
-/// and never writes anywhere.
+/// Fires for a partial drop too, not only the total fallback: even when
+/// some names were recognized and the setting still did something real, a
+/// silently-dropped name is still a typo the operator would want to know
+/// about — `ResolvedAgents::fell_back_to_all` only changes the wording
+/// (naming what's still in effect vs. saying the setting did nothing at
+/// all), not whether the notice appears.
+///
+/// [`resolve_agents`]: banto_core::config::resolve_agents
+pub fn agents_ignored_notice(resolved: &ResolvedAgents) -> Option<String> {
+    if resolved.ignored.is_empty() {
+        return None;
+    }
+    let names = resolved.ignored.join(", ");
+    Some(if resolved.fell_back_to_all {
+        format!("agents: no recognized name in \"{names}\" — showing every product")
+    } else {
+        let kept = resolved
+            .enabled
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("agents: ignored unknown name(s) \"{names}\" — showing {kept}")
+    })
+}
+
+/// Discover sessions under `claude_home` (and `codex_home`, when resolved
+/// and enabled), classify their activity, and return them sorted by mtime
+/// descending (newest first), with session id as a deterministic
+/// tie-breaker. A thin wrapper — [`discover_all`], then [`rows_from_metas`]
+/// — kept for callers that only want rows and have no reason to run a
+/// second discovery pass of their own.
+///
+/// Read-only: this reads `<claude_home>/projects`, `<claude_home>/sessions`,
+/// and `codex_home`'s `threads` database, and never writes anywhere.
 pub fn load_rows(
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
+    enabled: &BTreeSet<AgentKind>,
 ) -> Result<Vec<SessionRow>, ProviderError> {
-    let provider = ClaudeCodeProvider::new(claude_home.clone());
-    let metas = provider.discover()?;
+    let metas = discover_all(claude_home, codex_home, enabled)?;
     Ok(rows_from_metas(metas, claude_home, thresholds))
+}
+
+/// Every session every *enabled* provider knows about, merged (not
+/// deduplicated: the two products never share a session id).
+///
+/// `enabled` (resolved from `Config::agents` by
+/// `banto_core::config::resolve_agents`) gates which provider *runs at
+/// all*, not which of its already-discovered rows get kept — unlike
+/// `App::show_agents`/`crate::tui::exclude_archived`, which both filter
+/// rows banto has already read off disk. That distinction matters here
+/// specifically: `CodexProvider::discover` opens a foreign sqlite database,
+/// under a read-only exception this crate had to earn (see
+/// `crate::codex_home`/`crate::sqlite_ro`'s docs). An operator who has
+/// switched Codex off should have banto never touch that file, not have
+/// banto read it and then discard the result — so a disabled product's
+/// provider is never constructed, let alone called.
+///
+/// Codex is additionally skipped whenever `codex_home` is `None` — an
+/// absent Codex home degrades to "no Codex sessions", not an error, the
+/// same way a missing `threads` database inside [`CodexProvider::discover`]
+/// does — independent of whether Codex is enabled.
+pub fn discover_all(
+    claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+    enabled: &BTreeSet<AgentKind>,
+) -> Result<Vec<SessionMeta>, ProviderError> {
+    let mut metas = Vec::new();
+    if enabled.contains(&AgentKind::ClaudeCode) {
+        metas.extend(ClaudeCodeProvider::new(claude_home.clone()).discover()?);
+    }
+    if enabled.contains(&AgentKind::Codex)
+        && let Some(codex_home) = codex_home
+    {
+        metas.extend(CodexProvider::new(codex_home.clone()).discover()?);
+    }
+    Ok(metas)
 }
 
 /// The conversion half of [`load_rows`] — classify and sort already-
@@ -92,6 +166,7 @@ pub fn rows_from_metas(
                 preview: meta.preview,
                 mtime: meta.mtime,
                 size: meta.size,
+                source_archived: meta.source_archived,
             }
         })
         .collect()
@@ -119,6 +194,7 @@ mod tests {
             is_agent: false,
             preview: None,
             continuation_of_uuid: None,
+            source_archived: false,
         }
     }
 
@@ -134,6 +210,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -150,6 +227,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -166,6 +244,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }
@@ -196,6 +275,42 @@ mod tests {
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Older)), "older");
     }
 
+    // -- agents_ignored_notice -------------------------------------------
+
+    #[test]
+    fn agents_ignored_notice_is_none_when_nothing_was_ignored() {
+        assert_eq!(
+            agents_ignored_notice(&banto_core::config::resolve_agents("")),
+            None
+        );
+        assert_eq!(
+            agents_ignored_notice(&banto_core::config::resolve_agents("all")),
+            None
+        );
+        assert_eq!(
+            agents_ignored_notice(&banto_core::config::resolve_agents("claude,codex")),
+            None
+        );
+    }
+
+    #[test]
+    fn agents_ignored_notice_names_the_dropped_name_and_what_survived() {
+        let resolved = banto_core::config::resolve_agents("claude,made-up-product");
+        let notice = agents_ignored_notice(&resolved).unwrap();
+        assert!(notice.contains("made-up-product"), "{notice}");
+        assert!(notice.contains("Claude"), "{notice}");
+        // A partial drop, not a total one — must not claim the fallback.
+        assert!(!notice.contains("every product"), "{notice}");
+    }
+
+    #[test]
+    fn agents_ignored_notice_says_it_fell_back_when_nothing_was_recognized() {
+        let resolved = banto_core::config::resolve_agents("made-up-product");
+        let notice = agents_ignored_notice(&resolved).unwrap();
+        assert!(notice.contains("made-up-product"), "{notice}");
+        assert!(notice.contains("every product"), "{notice}");
+    }
+
     #[test]
     fn load_rows_sorts_newest_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -220,9 +335,141 @@ mod tests {
         filetime_set(&projects.join("new.jsonl"), newer);
 
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
-        let rows = load_rows(&claude_home, &AgeThresholds::default()).unwrap();
+        let rows = load_rows(&claude_home, None, &AgeThresholds::default(), &all_agents()).unwrap();
         let titles: Vec<_> = rows.iter().map(|r| r.display_title().to_string()).collect();
         assert_eq!(titles, vec!["New".to_string(), "Old".to_string()]);
+    }
+
+    /// Every product this build supports — the "nothing restricted" case
+    /// most discovery tests want, so they read as "the usual set" rather
+    /// than repeating both variants inline.
+    fn all_agents() -> BTreeSet<AgentKind> {
+        AgentKind::ALL.into_iter().collect()
+    }
+
+    /// The synthetic `threads` shape every Codex test here builds — one
+    /// definition rather than a copy per test, because two copies is how
+    /// this went wrong once: a column added to the provider's query reached
+    /// the copy that existed at the time and not the one a parallel branch
+    /// was adding, and the schemas only disagreed after both merged. Never
+    /// real session data; a hand-authored shape only.
+    const CREATE_THREADS: &str = "\
+        CREATE TABLE threads (\
+            id TEXT PRIMARY KEY, \
+            title TEXT, \
+            cwd TEXT, \
+            rollout_path TEXT, \
+            first_user_message TEXT, \
+            updated_at_ms INTEGER, \
+            archived INTEGER DEFAULT 0\
+        )";
+
+    #[test]
+    fn discover_all_merges_claude_and_codex_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let projects = claude_root.join("projects").join("proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("claude-1.jsonl"),
+            "{\"type\":\"custom-title\",\"customTitle\":\"Claude session\"}\n",
+        )
+        .unwrap();
+
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let rollout = codex_root.join("rollout.jsonl");
+        std::fs::write(&rollout, "x").unwrap();
+        let codex_home = banto_io::codex_home::CodexHome::new(codex_root);
+        let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
+        conn.execute_batch(CREATE_THREADS).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, rollout_path, updated_at_ms) \
+             VALUES ('codex-1', 'Codex session', ?1, 0)",
+            rusqlite::params![rollout.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn); // clean close: no -wal left behind for discover() to open around
+
+        let claude_home = ClaudeHome::new(claude_root);
+        let metas = discover_all(&claude_home, Some(&codex_home), &all_agents()).unwrap();
+        let mut ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["claude-1".to_string(), "codex-1".to_string()]);
+        let agents: Vec<_> = metas.iter().map(|m| m.agent).collect();
+        assert!(agents.contains(&AgentKind::ClaudeCode));
+        assert!(agents.contains(&AgentKind::Codex));
+    }
+
+    #[test]
+    fn discover_all_never_calls_the_codex_provider_when_codex_is_disabled() {
+        // `state_5.sqlite` is a directory, not a database: if `CodexProvider`
+        // were constructed and called at all, opening it would fail and
+        // this whole call would return `Err`. Succeeding here is only
+        // possible because a disabled product's provider is never reached
+        // — the actual property this gate exists for (see `discover_all`'s
+        // doc), not just its rows getting dropped afterward.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let projects = claude_root.join("projects").join("proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("claude-1.jsonl"),
+            "{\"type\":\"custom-title\",\"customTitle\":\"Claude session\"}\n",
+        )
+        .unwrap();
+
+        let codex_root = dir.path().join("codex");
+        let codex_home = banto_io::codex_home::CodexHome::new(codex_root.clone());
+        std::fs::create_dir_all(codex_home.threads_db_path()).unwrap();
+
+        let claude_home = ClaudeHome::new(claude_root);
+        let enabled = BTreeSet::from([AgentKind::ClaudeCode]);
+        let metas = discover_all(&claude_home, Some(&codex_home), &enabled).unwrap();
+        let ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
+        assert_eq!(ids, vec!["claude-1".to_string()]);
+    }
+
+    #[test]
+    fn discover_all_never_calls_the_claude_provider_when_claude_is_disabled() {
+        // `<claude_home>/projects` is a plain file, not a directory: if
+        // `ClaudeCodeProvider` were constructed and called at all,
+        // `fs::read_dir` on it would fail and this whole call would return
+        // `Err` — the same "never reached, not just filtered" property as
+        // the Codex-disabled case above, checked from the other side.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::write(claude_root.join("projects"), "not a directory").unwrap();
+
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let rollout = codex_root.join("rollout.jsonl");
+        std::fs::write(&rollout, "x").unwrap();
+        let codex_home = banto_io::codex_home::CodexHome::new(codex_root);
+        let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
+        conn.execute_batch(CREATE_THREADS).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, rollout_path, updated_at_ms) \
+             VALUES ('codex-1', 'Codex session', ?1, 0)",
+            rusqlite::params![rollout.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let claude_home = ClaudeHome::new(claude_root);
+        let enabled = BTreeSet::from([AgentKind::Codex]);
+        let metas = discover_all(&claude_home, Some(&codex_home), &enabled).unwrap();
+        let ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
+        assert_eq!(ids, vec!["codex-1".to_string()]);
+    }
+
+    #[test]
+    fn discover_all_skips_codex_entirely_when_its_home_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let metas = discover_all(&claude_home, None, &all_agents()).unwrap();
+        assert!(metas.is_empty());
     }
 
     #[test]

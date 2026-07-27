@@ -112,9 +112,10 @@ ferrying at all. This repository was largely built through that loop.
 
 ## Read-only guarantee
 
-**banto never writes anything under `~/.claude`.** Session `.jsonl` files,
-live-state files, history — all strictly read-only. banto's own data lives
-under its own directories:
+**banto never writes anything under `~/.claude` or `~/.codex`.** Session
+`.jsonl` files, live-state files, history, Codex's `threads` and `logs`
+sqlite databases (session index and liveness, respectively) — all strictly
+read-only. banto's own data lives under its own directories:
 
 - Config: `dirs::config_dir()/banto/config.toml`
   (Windows: `%APPDATA%\banto\`) by default — see
@@ -126,6 +127,22 @@ under its own directories:
 Even the MCP wiring honors this: member `--mcp-config` files are written
 under banto's data dir and passed by argv, never installed into Claude's own
 configuration.
+
+**One named exception.** Reading a Codex sqlite database (`state_5.sqlite`
+for the session index, `logs_2.sqlite` for liveness — the same strategy was
+independently re-verified against each, not assumed to carry over) while
+Codex itself might be writing it needs SQLite's own read-only machinery,
+chosen by which sidecar files are present: `mode=ro` when a `-wal` file
+exists (a database Codex may be actively writing), `immutable=1` when it
+does not (a cleanly-closed database, where `immutable=1` alone could
+otherwise return a stale snapshot if a writer started between the check and
+the open). The one case this doesn't cover for free is crash residue — a
+`-wal` left behind without its `-shm` sidecar (e.g. Codex was killed
+mid-write) — where the first `mode=ro` open recreates a fresh `-shm`: a
+single ~32KB write, SQLite's own coordination index rather than banto's
+data, and one Codex's own next run would create regardless. Named here
+rather than smoothed over, because "banto never writes" should mean exactly
+what it says everywhere else.
 
 ## Install & run
 
@@ -214,6 +231,11 @@ opener = "in-place"
 
 claude_home = "C:/Users/you/.claude"   # optional override
 db_path = "..."                        # optional override
+
+# "all" (default) | "claude" | "codex" | "claude,codex" — which agent
+# products banto discovers sessions for. A disabled product's own files
+# (Codex's sqlite database, in particular) are never even opened.
+agents = "all"
 
 [activity]
 today_hours = 24   # activity-dot bucketing

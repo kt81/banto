@@ -142,6 +142,118 @@ Note: the format is undocumented and subject to change. Defend with **lenient
 parsing** (ignore unknown records/fields, skip broken lines) plus tests against
 synthetic fixtures. **Never bring real session data into the repository.**
 
+## Codex data sources (observed 2026-07-26, this machine's installed Codex CLI)
+
+Nothing like Claude Code's layout: no `projects/`, no per-session `.jsonl`
+directory tree banto walks itself. One sqlite database, one table.
+
+| Source | Content |
+|---|---|
+| `$CODEX_HOME` (else `~/.codex`)`/state_5.sqlite`, `threads` table | One row per session. Columns banto reads: `id`, `title`, `cwd`, `rollout_path`, `first_user_message`, `updated_at_ms`. The filename (`state_5.sqlite`) is what this machine's installed version uses; a future Codex CLI could rename it |
+| `threads.rollout_path` | The session transcript file itself, under a `sessions/` tree whose internal (date-partitioned) layout banto does not rely on — the path comes from the column directly, never from walking the tree |
+| `threads.cwd` | Carries a Windows extended-length path prefix (`\\?\`) that a rollout file's own recorded cwd does not — normalized once, in `provider::codex`, at the point this becomes `SessionMeta.cwd` |
+| `threads.updated_at_ms` | Milliseconds since the Unix epoch, application-reported by Codex — not a filesystem mtime the way Claude Code's is. `SessionMeta.mtime` says so |
+| `$CODEX_HOME/logs_2.sqlite`, `logs` table | Process liveness (not read by discovery — the Codex-side double-resume guard, `codex_liveness::is_thread_alive`). Real schema, read from a real, live `~/.codex/logs_2.sqlite` on this machine (2026-07-27): `id, ts, ts_nanos, level, target, thread_id, process_uuid, ...`, with `CREATE INDEX idx_logs_thread_id_ts ON logs(thread_id, ts DESC, ts_nanos DESC, id DESC)` — the newest row per `thread_id` is exactly what that index is for |
+| `logs.process_uuid` | `pid:<PID>:<suffix>`. Confirmed against that same real database: the newest row's pid for the session actually running matched a real, live process (cross-checked via `Win32_Process`); three finished sessions' newest rows named three dead pids |
+| `logs.ts` | Unix **seconds** (confirmed by comparing a real row's value against the current clock — not milliseconds, unlike `threads.updated_at_ms`). Compared against `sysinfo::Process::start_time()` (also unix seconds, and available on every platform `sysinfo` supports — unlike Claude's Linux/WSL-only `/proc` ticks comparison) for the pid-recycling guard: a process that started strictly after this log row was written cannot be the one that wrote it |
+
+**Reading a database Codex itself may be writing (measured directly against
+both `state_5.sqlite` and, independently, `logs_2.sqlite` — including a read
+against the real, live `logs_2.sqlite` on this machine while it was warm —
+rather than assuming one database's answer transferred to the other;
+rusqlite 0.40.1 bundled, the version this workspace pins).** Two open forms,
+both able to read correctly, neither always safe alone:
+- `mode=ro` is always correct — it sees every committed row, including a
+  writer's in-flight commits — and on its own writes nothing, but opening it
+  against a **cold** database (no `-wal`/`-shm` sidecars yet) creates those
+  sidecars on first touch: a write into a directory banto promises never to
+  write to.
+- `immutable=1` never creates a sidecar, but read against an **actively
+  written** database it can silently return a stale or incomplete snapshot —
+  wrong, not just old.
+
+The resolution: stat for the `-wal` sidecar first. Present -> `mode=ro`
+(warm, correct, no new sidecar since one already exists). Absent ->
+`immutable=1` (cold, correct, no sidecar created). This is correct in every
+case and zero-write in every case but one: **crash residue** — `-wal`
+present, its `-shm` sidecar absent (e.g. Codex was killed mid-write) — where
+`mode=ro` recreates a fresh `-shm` on that first read, a single ~32KB write.
+It is SQLite's own coordination index, not banto's data, and Codex's own
+next run would create it regardless, but it is a write, so the README's
+read-only section names it rather than smoothing it over.
+
+One more edge, benign: a **TOCTOU** gap between the stat and the open — a
+database that was cold a moment ago gets a writer between the two, and this
+approach opens it `immutable=1` anyway, returning the pre-write snapshot
+rather than an error. Stale for one poll cycle, not wrong, and
+self-correcting the next time discovery stats and finds `-wal` now present.
+
+Note: like Claude Code's format, this is undocumented and can change between
+Codex CLI versions. Same defense: **lenient parsing** (a malformed row is
+skipped, not fatal) plus synthetic-fixture tests. **Never bring a real
+`~/.codex` database into the repository.**
+
+**Live-reload watch:** `crate::watch` watches `CodexHome::rollout_dir`
+(`<codex_home>/sessions/`, recursively) so a new session's rollout file
+appearing triggers the same debounced reload a Claude Code change does. It
+does not watch any of Codex's sqlite files. Measured against a synthetic
+WAL-mode database shaped like `state_5.sqlite`: a write never touches the
+main file's own mtime (everything lands in its `-wal`/`-shm` sidecars), and a
+running session writes somewhere in `$CODEX_HOME` on every turn —
+`logs_2.sqlite` on every log line — so a directory watch there would fire far
+more often than the rollout tree's one event per turn, across databases
+discovery doesn't even read.
+
+## The `agents` setting
+
+`Config.agents` (a plain string, default `""`) selects which agent products
+banto discovers sessions for: `"all"` — also what an absent or empty string
+means — or a comma-separated list of product names (`claude`, `codex`).
+`banto_core::config::resolve_agents` resolves it into a `ResolvedAgents`
+(`enabled: BTreeSet<AgentKind>`, plus `ignored`/`fell_back_to_all` — see
+below); `"all"` means every product this build currently supports
+(`AgentKind::ALL`), not a wildcard reserved for products that don't exist
+yet. An unrecognized name is dropped, not rejected — this crate's config
+layer is lenient by design (a broken setting must never prevent startup) —
+but if *every* name in a non-empty setting goes unrecognized, `enabled`
+falls back to `all` rather than an empty set that would silently discover
+nothing with no visible cause.
+
+**The ignored-name notice.** A dropped name still needs to be discoverable
+by the operator, or a typo is indistinguishable from `all` with no way to
+find out short of reading the source. `ResolvedAgents.ignored` records every
+unrecognized name (deduplicated, first-seen order); `session::agents_ignored_notice`
+turns that into one line, posted once via `App::set_status` right after
+`App::new` in both `tui::run` and `embedded::run_emporium` — the two
+entry points with a status line to put it in (the `list` subcommand has
+none, and doesn't call this). Fires for a partial drop too, not only the
+total fallback: an operator who kept a real, working filter is still owed
+the fact that part of what they wrote silently did nothing.
+`ResolvedAgents.fell_back_to_all` only changes the wording (naming what's
+still enabled vs. saying the setting had no effect at all) — both cases
+show the notice.
+
+**Applies at discovery, not display — deliberately breaking precedent.**
+Every other row filter in this codebase (`App::show_agents`,
+`crate::tui::exclude_archived`) filters rows already read off disk.
+`enabled_agents` instead gates which `SessionProvider` runs at all, inside
+`session::discover_all` — the one place both providers' `discover()` calls
+live. A disabled product's provider is never constructed, let alone called:
+an operator who has switched Codex off gets banto never touching
+`state_5.sqlite`, not banto reading it and discarding the result — the same
+read-only discipline this file's Codex section had to earn a documented
+exception for in the first place.
+
+**The empty-list case:** a valid, non-restricting-looking setting (e.g.
+`agents = "codex"` on a machine with no Codex sessions yet) can legitimately
+discover zero rows, which looks identical to a genuinely empty machine.
+`App::restricted_agents_label` (set once at startup via
+`App::with_enabled_agents`, never re-filtered) lets
+`banto_tui::view::render_list`'s existing empty-list placeholder say why —
+`"No sessions found (agents = Codex)."` instead of the bare default — only
+when `total_len() == 0`; a search query narrowing an otherwise-populated
+list to nothing keeps its own unrelated "No matching sessions." message.
+
 ## Module layout
 
 Four crates, split along the TEA / sans-IO boundary
@@ -153,12 +265,13 @@ provider/status/store/opener/config modules once sketched here as
 crates/
 ├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/search/replay
 ├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
-│  ├─ provider/         # SessionProvider trait + claude_code impl (discovery/parsing)
-│  ├─ status/           # live state (sessions/<pid>.json + PID liveness)
+│  ├─ provider/         # SessionProvider trait + claude_code impl (JSONL) + codex impl (sqlite)
+│  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
 │  ├─ store/            # rusqlite: groups/pins/archived, brigades, session<->pane map
 │  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
 │  ├─ watch/            # filesystem watching (notify) for live TUI updates
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
+│  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
 │  ├─ process.rs        # resumed-session process spawning
@@ -432,7 +545,9 @@ themselves.
 3. Otherwise bucket by jsonl mtime: today / this week / older
    (thresholds and colors configurable)
 
-Watch `projects/` and `sessions/` with `notify` for realtime updates.
+Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
+when a Codex home resolves, its rollout tree (see "Codex data sources" above
+for why not its sqlite files too).
 
 ## Stack
 

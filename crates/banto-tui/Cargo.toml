@@ -20,5 +20,21 @@ ratatui = { version = "0.30.2", default-features = false, features = [
     "macros",
     "underline-color",
 ] }
+# `ratatui-core`'s optional `critical-section` dependency (pulled in by our
+# own `layout-cache` above) is a bare `dep:critical-section` with no backend:
+# without a std/no-std implementation feature, `critical_section::Impl` is
+# never defined anywhere in the graph and linking a real binary fails with
+# unresolved `_critical_section_1_0_acquire`/`_release`. `ratatui-core`
+# itself only pulls `std` for its own dev-dependencies (its own test suite),
+# never for a downstream consumer, so this crate has to ask for it directly.
+#
+# Only bites `cargo test -p banto-tui` (or any other build of this crate in
+# isolation): building the full workspace already resolves a `std` backend
+# via feature unification with some other crate elsewhere in the graph, so
+# `cargo build --workspace` / `cargo test --workspace` link fine without
+# this line — don't "prove" it unneeded by running those. Remove it and the
+# isolated case breaks again with no clue why, since nothing else in this
+# crate's own source ever names `critical-section`.
+critical-section = { version = "1.2", features = ["std"] }
 unicode-width = "0.2.2"
 vt100 = "0.16.2"

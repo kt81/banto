@@ -5,11 +5,11 @@
 //! in `banto::tui` (the chōba list) is a thin shell over this state; the
 //! emporium's `crate::engine` uses it too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::model::{Activity, SessionRow};
+use crate::model::{Activity, AgentKind, SessionRow};
 
 /// A group id, mirroring `banto_io::store::GroupId` (`i64`) without
 /// coupling `App` to the store crate's types.
@@ -352,6 +352,11 @@ pub struct NewSessionState {
     /// a second Enter from firing a second round trip before the first
     /// answers.
     checking: bool,
+    /// Which agent product confirming would launch, defaulting to
+    /// [`AgentKind::ClaudeCode`] — toggled by [`Self::toggle_agent`], the
+    /// emporium's own binding (the chōba has none: its new-session path is
+    /// feature-frozen, see `banto::opener::new_session_wrap_argv`'s doc).
+    agent: AgentKind,
 }
 
 impl NewSessionState {
@@ -365,6 +370,7 @@ impl NewSessionState {
             error: None,
             placement,
             checking: false,
+            agent: AgentKind::ClaudeCode,
         };
         state.refilter();
         state
@@ -477,6 +483,15 @@ impl NewSessionState {
         self.placement
     }
 
+    /// Which agent product confirming would launch.
+    pub fn agent(&self) -> AgentKind {
+        self.agent
+    }
+
+    fn toggle_agent(&mut self) {
+        self.agent = self.agent.toggle();
+    }
+
     /// The cwd that would be launched if confirmed right now: the
     /// highlighted candidate if any match, otherwise the raw typed input
     /// (`None` if that's empty too — nothing to launch).
@@ -538,6 +553,16 @@ pub struct App {
     /// loaded from the store at startup and on every reload; see
     /// [`Self::with_superseded`]/[`Self::set_superseded`].
     superseded: HashSet<String>,
+    /// `Config.agents`, resolved — display-only here, not a name-doubling
+    /// coincidence with [`Self::show_agents`]: that one hides/reveals
+    /// already-loaded *rows* (spawned-agent sessions), this one only
+    /// explains why [`Self::rows`] can be short to begin with — the actual
+    /// filtering happened before discovery ever produced a row (see
+    /// `crate::config::resolve_agents`'s doc). Never affects `filtered`.
+    /// Defaults to every product ([`AgentKind::ALL`]) so a caller that never
+    /// calls [`Self::with_enabled_agents`] (most tests) behaves as
+    /// unrestricted, matching `Config.agents`'s own empty-string default.
+    enabled_agents: BTreeSet<AgentKind>,
     /// Whether agent-run sessions (`SessionRow::is_agent`) and non-live
     /// superseded sessions are included in `filtered`. Off by default: a
     /// human browsing their own sessions doesn't usually want every
@@ -573,8 +598,18 @@ pub struct App {
     /// view, section headers occupy lines of their own, so the two spaces
     /// diverge whenever any header is above the current scroll position.
     offset: usize,
-    /// Number of list rows currently visible.
+    /// Number of physical lines currently visible.
     viewport_height: usize,
+    /// Physical lines one row's [`ListLine::Row`] renders as — 1 for the
+    /// chōba list, 2 for the emporium sidebar (see [`Self::with_lines_per_row`]
+    /// and `banto_tui::view`'s module doc's "Row layout" section). A section
+    /// header is always exactly one line regardless — only a row's height
+    /// varies — so [`Self::offset`]/[`Self::viewport_height`] stay in *item*
+    /// units (a position in [`Self::display_sequence`]) while every method
+    /// that compares against physical space (`ensure_visible`/`click`/
+    /// `visible`/`selected_in_viewport`) converts through this weight
+    /// instead of assuming 1:1, via [`Self::line_weight`].
+    lines_per_row: usize,
     /// Last click (filtered index + time) for double-click detection.
     last_click: Option<(usize, Instant)>,
     /// Transient status-bar message (e.g. the phase-2 open notice).
@@ -600,15 +635,19 @@ pub struct VisibleRow<'a> {
     pub superseded: bool,
 }
 
-/// One physical line in the rendered list, in display order: either a real
-/// session row, or (grouped view only) a section header — its own line, not
-/// bundled into the row after it, so it occupies exactly one slot in the
-/// same index space [`App::click`]/[`App::scroll`]/[`App::ensure_visible`]
-/// use. That's what lets a click below a header land on the right row and
-/// keeps "how many rows fit in the viewport" accurate even when headers are
-/// present — seeded in the previous pass, headers were bundled into the
-/// following row's item instead, which under-counted physical rows and
-/// misaligned every click below a header. See [`App::display_sequence`].
+/// One item in the rendered list, in display order: either a real session
+/// row, or (grouped view only) a section header — its own item, not bundled
+/// into the row after it, so it occupies exactly one slot in the same index
+/// space [`App::click`]/[`App::scroll`]/[`App::ensure_visible`] use. That's
+/// what lets a click below a header land on the right row and keeps "how
+/// many rows fit in the viewport" accurate even when headers are present —
+/// seeded in the previous pass, headers were bundled into the following
+/// row's item instead, which under-counted physical rows and misaligned
+/// every click below a header. A header is always exactly one physical
+/// line; a row is [`App::lines_per_row`] (1 for the chōba list, 2 for the
+/// emporium sidebar) — see that field's doc for how the index space above
+/// converts between item position and physical line. See
+/// [`App::display_sequence`].
 pub enum ListLine<'a> {
     /// `count` is how many rows fall under this section under the current
     /// filter — varies as the filter changes, so a consumer comparing
@@ -643,6 +682,7 @@ impl App {
             hidden: HashSet::new(),
             directors: HashSet::new(),
             superseded: HashSet::new(),
+            enabled_agents: AgentKind::ALL.into_iter().collect(),
             show_agents: false,
             groups: Vec::new(),
             session_group: HashMap::new(),
@@ -655,6 +695,7 @@ impl App {
             selected: 0,
             offset: 0,
             viewport_height: 0,
+            lines_per_row: 1,
             last_click: None,
             status: None,
             status_set_at: None,
@@ -902,6 +943,26 @@ impl App {
         match &self.modal {
             Some(Modal::NewSession(state)) => state.target(),
             _ => None,
+        }
+    }
+
+    /// Which agent the open new-session modal would launch, defaulting to
+    /// [`AgentKind::ClaudeCode`] when no such modal is open — callers only
+    /// ever read this while one is (see `engine::update_new_session_cwd_checked`),
+    /// so the default is never observed in production.
+    pub fn modal_new_session_agent(&self) -> AgentKind {
+        match &self.modal {
+            Some(Modal::NewSession(state)) => state.agent(),
+            _ => AgentKind::ClaudeCode,
+        }
+    }
+
+    /// Toggle the open new-session modal's agent choice (the emporium's own
+    /// binding — see [`NewSessionState::agent`]'s doc for why the chōba has
+    /// none). No-op when no such modal is open.
+    pub fn modal_toggle_new_session_agent(&mut self) {
+        if let Some(Modal::NewSession(state)) = &mut self.modal {
+            state.toggle_agent();
         }
     }
 
@@ -1193,6 +1254,35 @@ impl App {
         self.refilter_keeping_selected(selected_id);
     }
 
+    /// Seed the `Config.agents` setting, resolved (loaded once at startup —
+    /// config never hot-reloads, so unlike [`Self::with_directors`] there is
+    /// no corresponding `set_*`). Display-only, like `directors`: the actual
+    /// filtering already happened in `discover_all`, before any of these
+    /// rows existed, so this never re-filters — it only lets
+    /// [`Self::restricted_agents_label`] explain a short (or empty) list
+    /// that a genuinely-empty machine would otherwise look identical to.
+    pub fn with_enabled_agents(mut self, enabled: BTreeSet<AgentKind>) -> Self {
+        self.enabled_agents = enabled;
+        self
+    }
+
+    /// A short, comma-joined label of the currently enabled agent products
+    /// (e.g. `"Codex"`), or `None` when every product this build supports is
+    /// enabled — the common case, and the one where no explanation is
+    /// needed. See [`Self::with_enabled_agents`].
+    pub fn restricted_agents_label(&self) -> Option<String> {
+        if self.enabled_agents.len() >= AgentKind::ALL.len() {
+            return None;
+        }
+        Some(
+            self.enabled_agents
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
     /// Seed the initial brigade-director-id set (loaded from the store at
     /// startup — see [`Self::set_directors`] for reloads). Unlike
     /// [`Self::with_hidden_worker_ids`], this never affects filtering
@@ -1227,6 +1317,26 @@ impl App {
         self.superseded = superseded;
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
+    }
+
+    /// Set how many physical lines one row renders as (see
+    /// [`Self::lines_per_row`]'s field doc) — a one-time bootstrap choice
+    /// like [`Self::with_directors`], not a repeating decision, so this is a
+    /// builder rather than a `set_*` — `banto::embedded::emporium::run` calls
+    /// it once with `2`; the chōba never calls it, keeping the default of
+    /// `1`. Clamped to at least `1` (a zero-line row would never be visible
+    /// at all, unrepresentable in `App`'s own weighted viewport math).
+    pub fn with_lines_per_row(mut self, lines: usize) -> Self {
+        self.lines_per_row = lines.max(1);
+        self
+    }
+
+    /// Physical lines one row renders as — see [`Self::lines_per_row`]'s
+    /// field doc. Read by `banto_tui::view` to decide whether a row needs a
+    /// second physical line for cwd/agent, kept in lockstep with the same
+    /// value this struct's own scroll/click math already uses internally.
+    pub fn lines_per_row(&self) -> usize {
+        self.lines_per_row
     }
 
     /// Open the emporium's disband confirm dialog for the given brigade
@@ -1429,9 +1539,14 @@ impl App {
         self.ensure_visible();
     }
 
-    /// Page size for PgUp/PgDn (at least one row).
+    /// Page size for PgUp/PgDn (at least one row): the viewport's physical
+    /// height in rows, ignoring headers entirely — an approximation the
+    /// grouped view already lived with before [`Self::lines_per_row`]
+    /// existed (a page near a section header moves by roughly, not
+    /// exactly, one viewport height), now just also scaled down for a
+    /// multi-line row so it doesn't overshoot by that same factor.
     fn page_step(&self) -> isize {
-        self.viewport_height.max(1) as isize
+        (self.viewport_height / self.lines_per_row).max(1) as isize
     }
 
     /// Move the selection by `delta`, clamped to the filtered range, then
@@ -1466,28 +1581,99 @@ impl App {
         self.offset = target as usize;
     }
 
-    /// Largest offset that still fills the viewport, in display-line space.
+    /// Physical lines one display item occupies: a header is always one; a
+    /// row is [`Self::lines_per_row`] (see that field's doc) — the seam
+    /// every physical-space computation below converts through instead of
+    /// assuming every item is one line.
+    fn line_weight(&self, line: &DisplayLine) -> usize {
+        match line {
+            DisplayLine::Header { .. } => 1,
+            DisplayLine::Row(_) => self.lines_per_row,
+        }
+    }
+
+    /// How many of `display[start..]`'s items fit within `budget` physical
+    /// lines. `budget == 0` (no viewport set yet) fits none; otherwise
+    /// always at least 1, even if that one item's own weight exceeds
+    /// `budget` — mirrors `row_line`'s own "never let it vanish entirely"
+    /// width-degradation philosophy, applied here to height instead of
+    /// width.
+    fn items_fitting(&self, display: &[DisplayLine], start: usize, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        let mut used = 0;
+        let mut count = 0;
+        for item in display.get(start..).unwrap_or(&[]) {
+            let w = self.line_weight(item);
+            if count > 0 && used + w > budget {
+                break;
+            }
+            used += w;
+            count += 1;
+        }
+        count
+    }
+
+    /// Largest `start <= end_excl` such that `display[start..end_excl]`
+    /// fits within `budget` physical lines — i.e. the offset that puts item
+    /// `end_excl - 1` at the very bottom of a full viewport. `budget == 0`
+    /// yields `end_excl` itself (nothing fits); otherwise always includes
+    /// at least the one item right before `end_excl` (the bottom-anchored
+    /// mirror of [`Self::items_fitting`]'s own guarantee).
+    fn bottom_anchored_start(
+        &self,
+        display: &[DisplayLine],
+        end_excl: usize,
+        budget: usize,
+    ) -> usize {
+        let end_excl = end_excl.min(display.len());
+        if budget == 0 {
+            return end_excl;
+        }
+        let mut used = 0;
+        let mut start = end_excl;
+        for item in display[..end_excl].iter().rev() {
+            let w = self.line_weight(item);
+            if start < end_excl && used + w > budget {
+                break;
+            }
+            used += w;
+            start -= 1;
+        }
+        start
+    }
+
+    /// Largest offset that still fills the viewport, in item-index space
+    /// (see [`Self::bottom_anchored_start`], applied to the whole sequence).
     fn max_offset(&self, display: &[DisplayLine]) -> usize {
-        display.len().saturating_sub(self.viewport_height)
+        self.bottom_anchored_start(display, display.len(), self.viewport_height)
     }
 
     /// Scroll the minimum amount so the selection is inside the viewport,
-    /// then clamp the offset so we never scroll past the end. Works in
-    /// display-line space (see [`Self::display_sequence`]) so a section
-    /// header above the selection is correctly counted as occupying a line
-    /// of its own, rather than being invisible to this accounting.
+    /// then clamp the offset so we never scroll past the end. `self.offset`/
+    /// `self.selected` stay in item-index space throughout (positions in
+    /// [`Self::display_sequence`]) — only the "is it inside the viewport"
+    /// and "where would the bottom-anchored offset be" questions convert
+    /// through [`Self::items_fitting`]/[`Self::bottom_anchored_start`] into
+    /// physical-line space, so a section header above the selection (one
+    /// line) and a multi-line row (`lines_per_row` lines) are both counted
+    /// correctly rather than assumed uniform.
     fn ensure_visible(&mut self) {
         if self.viewport_height == 0 {
             return;
         }
         let display = self.display_sequence();
-        let Some(selected_line) = Self::display_line_of(&display, self.selected) else {
+        let Some(selected_idx) = Self::display_line_of(&display, self.selected) else {
             return; // nothing selected (e.g. filtered is empty)
         };
-        if selected_line < self.offset {
-            self.offset = selected_line;
-        } else if selected_line >= self.offset + self.viewport_height {
-            self.offset = selected_line + 1 - self.viewport_height;
+        if selected_idx < self.offset {
+            self.offset = selected_idx;
+        } else if selected_idx
+            >= self.offset + self.items_fitting(&display, self.offset, self.viewport_height)
+        {
+            self.offset =
+                self.bottom_anchored_start(&display, selected_idx + 1, self.viewport_height);
         }
         let max_offset = self.max_offset(&display);
         if self.offset > max_offset {
@@ -1496,7 +1682,10 @@ impl App {
     }
 
     /// The display-line index of the `filtered` position `k`, if it's
-    /// present in `display` (it always is, unless `filtered` is empty).
+    /// present in `display` (it always is, unless `filtered` is empty). An
+    /// item-index (position in `display`), not a physical-line position —
+    /// see [`Self::line_weight`] for why those differ once `lines_per_row`
+    /// is more than 1.
     fn display_line_of(display: &[DisplayLine], k: usize) -> Option<usize> {
         display
             .iter()
@@ -1506,13 +1695,25 @@ impl App {
     // --- mouse ----------------------------------------------------------
 
     /// Handle a left click on viewport row `viewport_row` (0 = top visible
-    /// display line). Returns `None` when the click lands past the last
+    /// physical line). Returns `None` when the click lands past the last
     /// line, or on a section header (grouped view only) — headers aren't
-    /// selectable.
+    /// selectable. Walks forward from `self.offset` (an item index) summing
+    /// each item's physical-line weight, rather than a direct index add, so
+    /// a click landing on either physical line of a multi-line row (see
+    /// [`Self::lines_per_row`]) still resolves to that same row.
     pub fn click(&mut self, viewport_row: usize, now: Instant) -> Option<ClickOutcome> {
         let display = self.display_sequence();
-        let display_index = self.offset.checked_add(viewport_row)?;
-        let filtered_index = match display.get(display_index)? {
+        let mut remaining = viewport_row;
+        let mut idx = self.offset;
+        loop {
+            let item = display.get(idx)?;
+            if remaining < self.line_weight(item) {
+                break;
+            }
+            remaining -= self.line_weight(item);
+            idx += 1;
+        }
+        let filtered_index = match display.get(idx)? {
             DisplayLine::Row(k) => *k,
             DisplayLine::Header { .. } => return None,
         };
@@ -1681,29 +1882,35 @@ impl App {
             .is_some_and(|row| self.directors.contains(&row.id))
     }
 
-    /// Selection index relative to the viewport (in display-line space —
-    /// see [`Self::display_sequence`]), or `None` when the selection is
-    /// scrolled out of view (or the list is empty).
+    /// Selection index relative to the viewport — an item position within
+    /// what [`Self::visible`] returns (for `ListState::select`), or `None`
+    /// when the selection is scrolled out of view (or the list is empty).
     pub fn selected_in_viewport(&self) -> Option<usize> {
         if self.filtered.is_empty() {
             return None;
         }
-        let selected_line = Self::display_line_of(&self.display_sequence(), self.selected)?;
-        if selected_line < self.offset {
+        let display = self.display_sequence();
+        let selected_idx = Self::display_line_of(&display, self.selected)?;
+        if selected_idx < self.offset {
             return None;
         }
-        let local = selected_line - self.offset;
-        (local < self.viewport_height).then_some(local)
+        let local = selected_idx - self.offset;
+        let visible_items = self.items_fitting(&display, self.offset, self.viewport_height);
+        (local < visible_items).then_some(local)
     }
 
-    /// The display lines currently visible in the viewport, top to bottom —
-    /// real rows and (grouped view only) section headers, each occupying
-    /// exactly one line (see [`ListLine`]/[`Self::display_sequence`]). Which
+    /// The display items currently visible in the viewport, top to bottom —
+    /// real rows and (grouped view only) section headers (see [`ListLine`]/
+    /// [`Self::display_sequence`]). A header is always one physical line; a
+    /// row is [`Self::lines_per_row`] — the returned count already accounts
+    /// for that (see [`Self::items_fitting`]), so the caller can render
+    /// every item in order without doing its own height arithmetic. Which
     /// one (if any) is selected is reported separately by
     /// [`Self::selected_in_viewport`].
     pub fn visible(&self) -> Vec<ListLine<'_>> {
         let display = self.display_sequence();
-        let end = (self.offset + self.viewport_height).min(display.len());
+        let count = self.items_fitting(&display, self.offset, self.viewport_height);
+        let end = (self.offset + count).min(display.len());
         display[self.offset..end]
             .iter()
             .map(|line| match line {
@@ -1766,6 +1973,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         }
     }
 
@@ -2070,6 +2278,104 @@ mod tests {
         assert_eq!(app.selected_row().unwrap().id, "b");
         assert_eq!(ids(&app), vec!["a", "b"]);
         // The last row is on-screen, in the viewport's bottom slot.
+        assert_eq!(app.selected_in_viewport(), Some(1));
+    }
+
+    // --- lines_per_row (emporium sidebar's two-line rows) ----------------
+
+    #[test]
+    fn two_line_rows_fit_half_as_many_per_viewport_as_one_line_rows() {
+        let mut app = App::new(numbered(10)).with_lines_per_row(2);
+        app.toggle_grouped_view(); // flat: no headers to complicate the count
+        app.set_viewport_height(6);
+        assert_eq!(ids(&app), vec!["id0", "id1", "id2"]);
+    }
+
+    #[test]
+    fn two_line_rows_scroll_to_keep_the_selection_fully_visible() {
+        let mut app = App::new(numbered(10)).with_lines_per_row(2);
+        app.toggle_grouped_view();
+        app.set_viewport_height(6); // 3 rows fit
+
+        app.select_last();
+        assert_eq!(app.selected_row().unwrap().id, "id9");
+        assert_eq!(app.selected_in_viewport(), Some(2)); // bottom slot
+
+        app.select_first();
+        assert_eq!(app.selected_in_viewport(), Some(0));
+    }
+
+    #[test]
+    fn two_line_rows_click_on_either_physical_line_selects_the_same_row() {
+        let mut app = App::new(numbered(5)).with_lines_per_row(2);
+        app.toggle_grouped_view();
+        app.set_viewport_height(10); // all 5 rows (10 physical lines) fit
+
+        // Spaced beyond DOUBLE_CLICK_INTERVAL: each click here is its own
+        // pointer-down on a different physical line, not a double-click.
+        let mut t = test_instant();
+        let mut click_at = |app: &mut App, row: usize| {
+            t += Duration::from_millis(500);
+            app.click(row, t)
+        };
+
+        assert_eq!(click_at(&mut app, 0), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "id0");
+        assert_eq!(click_at(&mut app, 1), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "id0"); // row 0's 2nd line
+
+        assert_eq!(click_at(&mut app, 2), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "id1");
+        assert_eq!(click_at(&mut app, 3), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "id1"); // row 1's 2nd line
+    }
+
+    /// Same 3-row, 2-section layout as
+    /// `bottom_row_stays_reachable_with_two_sections_in_a_short_viewport`
+    /// (display sequence `[Header(Pinned), Row(pinned), Header(Ungrouped),
+    /// Row(a), Row(b)]`), but with 2-line rows: physical weights
+    /// `[1, 2, 1, 2, 2]`, 8 total. A viewport of 4 physical lines exactly
+    /// fits `Header(Pinned) + Row(pinned) + Header(Ungrouped)` (1+2+1) —
+    /// proof that a header (weight 1) and a row (weight 2) are counted by
+    /// their own weight, not both assumed uniform.
+    #[test]
+    fn two_line_rows_account_for_header_weight_in_a_mixed_viewport() {
+        let mut app = App::new(vec![
+            row("a", "A", ""),
+            row("b", "B", ""),
+            row("pinned", "P", ""),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect())
+        .with_lines_per_row(2);
+        app.set_viewport_height(4);
+
+        assert_eq!(ids(&app), vec!["pinned"]);
+        assert_eq!(headers(&app), vec!["Pinned", "Ungrouped"]);
+
+        // A click on either of "pinned"'s two physical lines selects it; the
+        // headers immediately above/below stay non-selectable. Spaced beyond
+        // DOUBLE_CLICK_INTERVAL so consecutive clicks on the same row don't
+        // register as a double-click.
+        let mut t = test_instant();
+        let mut click_at = |app: &mut App, row: usize| {
+            t += Duration::from_millis(500);
+            app.click(row, t)
+        };
+        assert_eq!(click_at(&mut app, 0), None); // "Pinned" header
+        assert_eq!(click_at(&mut app, 1), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "pinned");
+        assert_eq!(click_at(&mut app, 2), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().unwrap().id, "pinned"); // 2nd line
+        assert_eq!(click_at(&mut app, 3), None); // "Ungrouped" header
+
+        // Selecting the last row scrolls so it's fully visible: "a" and "b"
+        // (weight 2 each) exactly fill the 4-line budget bottom-anchored at
+        // "b", so even the "Ungrouped" header above them scrolls off rather
+        // than clipping "b"'s own second line off the bottom.
+        app.select_last();
+        assert_eq!(app.selected_row().unwrap().id, "b");
+        assert_eq!(ids(&app), vec!["a", "b"]);
+        assert_eq!(headers(&app), Vec::<String>::new());
         assert_eq!(app.selected_in_viewport(), Some(1));
     }
 
@@ -2498,6 +2804,46 @@ mod tests {
     }
 
     #[test]
+    fn restricted_agents_label_is_none_when_unset_or_explicitly_all() {
+        assert_eq!(App::new(vec![]).restricted_agents_label(), None);
+        assert_eq!(
+            App::new(vec![])
+                .with_enabled_agents(AgentKind::ALL.into_iter().collect())
+                .restricted_agents_label(),
+            None
+        );
+    }
+
+    #[test]
+    fn restricted_agents_label_names_a_narrower_set() {
+        let app = App::new(vec![]).with_enabled_agents(BTreeSet::from([AgentKind::Codex]));
+        assert_eq!(app.restricted_agents_label().as_deref(), Some("Codex"));
+    }
+
+    #[test]
+    fn restricted_agents_label_is_none_when_every_kind_is_named_explicitly() {
+        // Same outcome as the `all`/unset case, reached a different way
+        // (naming both products individually rather than relying on the
+        // `all` shorthand) — the check is "is every product enabled",
+        // never "was the literal string `all` used".
+        let app = App::new(vec![])
+            .with_enabled_agents(BTreeSet::from([AgentKind::Codex, AgentKind::ClaudeCode]));
+        assert_eq!(app.restricted_agents_label(), None);
+    }
+
+    #[test]
+    fn with_enabled_agents_never_filters_rows() {
+        let mut app = App::new(vec![row("h1", "Claude session", "")])
+            .with_enabled_agents(BTreeSet::from([AgentKind::Codex]));
+        app.set_viewport_height(10);
+        // The row is already a Claude session (loaded before this setting
+        // is even applied, in `discover_all`) — `with_enabled_agents` must
+        // not re-filter it away a second time here.
+        assert_eq!(app.total_len(), 1);
+        assert_eq!(ids(&app), vec!["h1"]);
+    }
+
+    #[test]
     fn toggle_agent_filter_keeps_the_current_selection() {
         let mut app = App::new(vec![
             row("h1", "Human one", ""),
@@ -2548,6 +2894,37 @@ mod tests {
         };
         assert_eq!(state.candidates(), vec!["/a", "/b"]);
         assert_eq!(state.input(), "");
+    }
+
+    #[test]
+    fn new_session_modal_agent_defaults_to_claude_and_toggles_to_codex_and_back() {
+        let mut app = App::new(vec![row("1", "one", "/a")]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
+
+        app.modal_toggle_new_session_agent();
+        assert_eq!(app.modal_new_session_agent(), AgentKind::Codex);
+
+        app.modal_toggle_new_session_agent();
+        assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn modal_new_session_agent_defaults_to_claude_with_no_modal_open() {
+        let app = App::new(vec![row("1", "one", "/a")]);
+        assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn modal_toggle_new_session_agent_is_a_noop_for_a_different_modal() {
+        let mut app = App::new(vec![row("1", "one", "/a")]);
+        app.set_viewport_height(10);
+        app.open_confirm_archive_modal();
+
+        app.modal_toggle_new_session_agent(); // no new-session modal open
+        assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
     }
 
     #[test]

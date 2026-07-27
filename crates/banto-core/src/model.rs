@@ -17,14 +17,43 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// Which agent product a session belongs to. One variant today; a second
-/// agent product is planned, and this is the axis it lands on — which is
-/// why it is an enum rather than the bare string it replaced.
-/// `SessionProvider` (`banto-io`) keeps its own name: a provider *provides*
-/// sessions, this says *whose*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Which agent product a session belongs to — the axis this exists to
+/// distinguish, which is why it is an enum rather than the bare string it
+/// replaced. `SessionProvider` (`banto-io`) keeps its own name: a provider
+/// *provides* sessions, this says *whose*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     ClaudeCode,
+    Codex,
+}
+
+impl AgentKind {
+    /// Every agent product banto currently discovers, in display order —
+    /// what an absent, empty, or `"all"` `agents` config setting resolves to
+    /// (see `config::resolve_agents`). [`Self::toggle`] already hardcodes
+    /// "exactly two"; update both the day a third provider lands.
+    pub const ALL: [AgentKind; 2] = [AgentKind::ClaudeCode, AgentKind::Codex];
+
+    /// Short product name for display (the row list's agent column, the
+    /// new-session modal) — never abbreviated or iconified: no single emoji
+    /// names an agent product (see `banto_tui::view`'s module doc's "Emoji
+    /// markers" section for why the row markers stay icons while this stays
+    /// text).
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "Claude",
+            AgentKind::Codex => "Codex",
+        }
+    }
+
+    /// The other product — the new-session modal's only choice, since there
+    /// are exactly two.
+    pub fn toggle(self) -> Self {
+        match self {
+            AgentKind::ClaudeCode => AgentKind::Codex,
+            AgentKind::Codex => AgentKind::ClaudeCode,
+        }
+    }
 }
 
 /// Metadata for one discovered session, provider-agnostic.
@@ -37,16 +66,25 @@ pub struct SessionMeta {
     pub title: Option<String>,
     /// Working directory the session ran in, if it could be determined.
     pub cwd: Option<PathBuf>,
-    /// Path to the session's source file (.jsonl for Claude Code).
+    /// Path to the session's source file: the `.jsonl` for Claude Code, the
+    /// rollout file for Codex.
     pub source_path: PathBuf,
-    /// Last modification time of the source file.
+    /// When this session was last touched — not the same *kind* of fact for
+    /// every product: a filesystem mtime for Claude Code (the source file's
+    /// own), an application-reported timestamp for Codex
+    /// (`threads.updated_at_ms`, whatever Codex itself considers last
+    /// activity). Not reconciled to a common meaning here.
     pub mtime: SystemTime,
     /// Source file size in bytes.
     pub size: u64,
-    /// True when this session was run by a spawned agent (subagent /
-    /// Agent-Teams teammate) rather than started interactively by the user.
-    /// Detected from a `{"type":"agent-setting"}` record in the file head
-    /// (observed 2026-07-19); interactive sessions start with `mode` records.
+    /// Whether this session was run by a spawned agent (Claude Code's
+    /// subagent / Agent-Teams teammate) rather than a human at the
+    /// keyboard — narrower than the field's own name suggests: "no signal
+    /// either way" must default to `false` (assume a human was there, keep
+    /// the session visible), never to `true`. Claude Code sets this from a
+    /// `{"type":"agent-setting"}` record in the file head (observed
+    /// 2026-07-19; interactive sessions start with `mode` records instead).
+    /// Codex always reports `false` — it has no equivalent signal yet.
     pub is_agent: bool,
     /// Short single-line excerpt of the first user message, for the summary
     /// panel. Independent of `title` (which may come from custom/ai titles).
@@ -56,6 +94,15 @@ pub struct SessionMeta {
     /// of another one. `None` for an ordinary session (including a manually
     /// `/compact`-ed one, which keeps its original id rather than forking).
     pub continuation_of_uuid: Option<String>,
+    /// Whether the session's own product considers it archived — Codex's
+    /// `threads.archived` column (set by `codex archive`); Claude Code has
+    /// no equivalent yet and always reports `false`. Distinct from banto's
+    /// own archive (`Store::archive_session`, bound to `d`): that one is
+    /// banto's per-session-id fact, product-neutral and always reversible
+    /// from within banto; this one banto can only ever read, never clear —
+    /// `~/.codex` stays read-only (see `banto::tui::exclude_archived` for
+    /// how the two combine into what the list actually hides).
+    pub source_archived: bool,
 }
 
 /// Activity state rendered as the colored dot in the session list.
@@ -109,6 +156,11 @@ pub struct SessionRow {
     pub mtime: SystemTime,
     /// Source file size in bytes, for the summary panel ([`humanize_size`]).
     pub size: u64,
+    /// See [`SessionMeta::source_archived`]. `#[serde(default)]` so a
+    /// record/replay stream captured before this field existed still
+    /// deserializes (same reasoning as `Event::RowsLoaded::superseded`).
+    #[serde(default)]
+    pub source_archived: bool,
 }
 
 impl SessionRow {
@@ -305,6 +357,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -321,6 +374,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -337,6 +391,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }

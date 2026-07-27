@@ -8,11 +8,12 @@
 //! it needs filesystem access and the `dirs` crate for the default path,
 //! both forbidden here (`docs/DISCIPLINE.md` §2).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::model::BrigadeRole;
+use crate::model::{AgentKind, BrigadeRole};
 
 /// Which backend resumes sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -188,6 +189,19 @@ impl BrigadeConfig {
     }
 }
 
+/// Per-agent binary overrides. `None` for a given field means "look it up
+/// on `$PATH`" — today's behavior, and still the default. Codex is not
+/// reliably on `PATH` in practice (observed: present in two install
+/// locations, absent from `PATH` until the shell that installed it was
+/// reopened), which is the whole reason this exists; Claude gets the same
+/// treatment for symmetry rather than a special case.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentBinaries {
+    pub claude: Option<PathBuf>,
+    pub codex: Option<PathBuf>,
+}
+
 /// Emporium keybinding settings. Just the tmux-style prefix chord this
 /// round — full user-remappable keymaps are out of scope (a scoped decision,
 /// not an oversight: see `crate::engine`'s `PrefixKey`).
@@ -221,10 +235,107 @@ pub struct Config {
     pub activity: ActivityConfig,
     pub brigade: BrigadeConfig,
     pub keys: KeysConfig,
+    pub agent_binaries: AgentBinaries,
+    /// Which agent products banto discovers sessions for: `"all"` (also
+    /// what an absent or empty string means, and the default), or a
+    /// comma-separated list of product names (`claude`, `codex`). Kept as
+    /// the raw string here and resolved by [`resolve_agents`] rather than
+    /// parsed into a set at deserialize time, so a name this build doesn't
+    /// recognize degrades leniently (see that function's doc) instead of
+    /// failing the whole document the way `OpenerMode`'s strict enum would.
+    pub agents: String,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
+    /// Overrides the provider's default `~/.codex` location (read-only!).
+    pub codex_home: Option<PathBuf>,
     /// Overrides `banto_io::config::default_db_path`.
     pub db_path: Option<PathBuf>,
+}
+
+/// The result of resolving [`Config::agents`]: the working set, plus enough
+/// of what [`resolve_agents`] discarded along the way for a caller to tell
+/// the operator about it (see that function's doc for why dropped names are
+/// tracked at all rather than simply vanishing).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedAgents {
+    /// The agent products banto should actually discover sessions for.
+    pub enabled: BTreeSet<AgentKind>,
+    /// Names from a non-empty setting that matched no known product, in the
+    /// order they first appeared, each listed once even if repeated. Empty
+    /// for `""`/`"all"`, or when every name in the list was recognized.
+    pub ignored: Vec<String>,
+    /// Whether every name in a non-empty setting went unrecognized, so
+    /// `enabled` fell back to [`AgentKind::ALL`] rather than reflecting
+    /// anything the operator actually wrote — worse than [`Self::ignored`]
+    /// being merely non-empty: there, the setting still did *something*;
+    /// here, it silently did nothing at all.
+    pub fell_back_to_all: bool,
+}
+
+/// Resolve [`Config::agents`] into the set of agent products banto should
+/// discover sessions for. Empty (including an absent field, which
+/// deserializes to the empty string) or `"all"` (case-insensitive) resolves
+/// to [`AgentKind::ALL`] — "all" means every product this build supports,
+/// not a wildcard for products that don't exist yet. Otherwise each
+/// comma-separated entry is looked up independently, matched
+/// case-insensitively with surrounding whitespace trimmed.
+///
+/// An unrecognized name is dropped, not rejected: this crate's config layer
+/// is lenient by design (`banto_io::config`'s module doc — a broken setting
+/// must never prevent startup), and every other lenient fallback in this
+/// file decays toward *less filtering*, never toward *less discovery*
+/// (`RelayMode`'s unknown value falls back to the working default, a
+/// malformed file falls back to the full default `Config`). So if every
+/// name in a non-empty setting goes unrecognized — a typo, or a product this
+/// build has never heard of — [`ResolvedAgents::enabled`] is
+/// [`AgentKind::ALL`] too, the same as leaving `agents` unset, rather than
+/// an empty set that would silently discover nothing with no visible cause.
+///
+/// Dropping a name silently would still leave the operator with no way to
+/// find a typo short of reading this function's source, so every
+/// unrecognized name is recorded in [`ResolvedAgents::ignored`] — this
+/// function only collects the fact; deciding whether and how to tell the
+/// operator (a status line, today) is `banto`'s job, not this crate's (see
+/// this module's doc: no I/O, no UI, here).
+pub fn resolve_agents(raw: &str) -> ResolvedAgents {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+        return ResolvedAgents {
+            enabled: AgentKind::ALL.into_iter().collect(),
+            ignored: Vec::new(),
+            fell_back_to_all: false,
+        };
+    }
+    let mut ignored = Vec::new();
+    let recognized: BTreeSet<AgentKind> = trimmed
+        .split(',')
+        .filter_map(|name| {
+            let name = name.trim();
+            match name.to_ascii_lowercase().as_str() {
+                "claude" => Some(AgentKind::ClaudeCode),
+                "codex" => Some(AgentKind::Codex),
+                _ => {
+                    if !ignored.iter().any(|seen: &String| seen == name) {
+                        ignored.push(name.to_string());
+                    }
+                    None
+                }
+            }
+        })
+        .collect();
+    if recognized.is_empty() {
+        ResolvedAgents {
+            enabled: AgentKind::ALL.into_iter().collect(),
+            ignored,
+            fell_back_to_all: true,
+        }
+    } else {
+        ResolvedAgents {
+            enabled: recognized,
+            ignored,
+            fell_back_to_all: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +360,9 @@ mod tests {
         assert_eq!(config.brigade.worker_model, "sonnet");
         assert_eq!(config.brigade.relay, RelayMode::Auto);
         assert_eq!(config.keys.prefix, "C-b");
+        assert_eq!(config.agents, "");
         assert_eq!(config.claude_home, None);
+        assert_eq!(config.codex_home, None);
         assert_eq!(config.db_path, None);
     }
 
@@ -368,13 +481,36 @@ mod tests {
     }
 
     #[test]
+    fn agent_binaries_default_to_none() {
+        let config = Config::default();
+        assert_eq!(config.agent_binaries.claude, None);
+        assert_eq!(config.agent_binaries.codex, None);
+    }
+
+    #[test]
+    fn agent_binaries_parse_independently() {
+        let config = parse("[agent_binaries]\ncodex = \"C:/tools/codex.exe\"\n");
+        assert_eq!(config.agent_binaries.claude, None);
+        assert_eq!(
+            config.agent_binaries.codex,
+            Some(PathBuf::from("C:/tools/codex.exe"))
+        );
+    }
+
+    #[test]
     fn path_overrides_parse() {
         let config = parse(
-            "claude_home = \"C:/synthetic/claude-home\"\ndb_path = \"C:/synthetic/banto.db\"\n",
+            "claude_home = \"C:/synthetic/claude-home\"\n\
+             codex_home = \"C:/synthetic/codex-home\"\n\
+             db_path = \"C:/synthetic/banto.db\"\n",
         );
         assert_eq!(
             config.claude_home,
             Some(PathBuf::from("C:/synthetic/claude-home"))
+        );
+        assert_eq!(
+            config.codex_home,
+            Some(PathBuf::from("C:/synthetic/codex-home"))
         );
         assert_eq!(config.db_path, Some(PathBuf::from("C:/synthetic/banto.db")));
     }
@@ -383,5 +519,96 @@ mod tests {
     fn wrong_field_type_is_a_parse_error() {
         let result: Result<Config, _> = toml::from_str("opener = \"no-such-backend\"\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn agents_setting_parses_as_a_plain_string() {
+        let config = parse("agents = \"codex\"\n");
+        assert_eq!(config.agents, "codex");
+    }
+
+    // -- resolve_agents ------------------------------------------------
+
+    fn all_agents() -> BTreeSet<AgentKind> {
+        AgentKind::ALL.into_iter().collect()
+    }
+
+    #[test]
+    fn resolve_agents_empty_means_all() {
+        let resolved = resolve_agents("");
+        assert_eq!(resolved.enabled, all_agents());
+        assert!(resolved.ignored.is_empty());
+        assert!(!resolved.fell_back_to_all);
+    }
+
+    #[test]
+    fn resolve_agents_all_is_case_insensitive_and_trims_whitespace() {
+        for text in ["all", "ALL", "All", "  all  "] {
+            let resolved = resolve_agents(text);
+            assert_eq!(resolved.enabled, all_agents());
+            assert!(resolved.ignored.is_empty());
+            assert!(!resolved.fell_back_to_all);
+        }
+    }
+
+    #[test]
+    fn resolve_agents_single_name() {
+        assert_eq!(
+            resolve_agents("codex").enabled,
+            BTreeSet::from([AgentKind::Codex])
+        );
+        assert_eq!(
+            resolve_agents("claude").enabled,
+            BTreeSet::from([AgentKind::ClaudeCode])
+        );
+    }
+
+    #[test]
+    fn resolve_agents_comma_separated_list_is_case_insensitive_and_trims_whitespace() {
+        assert_eq!(
+            resolve_agents(" Claude ,CODEX ").enabled,
+            BTreeSet::from([AgentKind::ClaudeCode, AgentKind::Codex])
+        );
+    }
+
+    #[test]
+    fn resolve_agents_drops_an_unrecognized_name_alongside_a_recognized_one() {
+        let resolved = resolve_agents("claude,made-up-product");
+        assert_eq!(resolved.enabled, BTreeSet::from([AgentKind::ClaudeCode]));
+        assert_eq!(resolved.ignored, vec!["made-up-product".to_string()]);
+        assert!(
+            !resolved.fell_back_to_all,
+            "a partial drop still used a real name, not the fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_agents_falls_back_to_all_when_nothing_is_recognized() {
+        let single = resolve_agents("made-up-product");
+        assert_eq!(single.enabled, all_agents());
+        assert_eq!(single.ignored, vec!["made-up-product".to_string()]);
+        assert!(single.fell_back_to_all);
+
+        let list = resolve_agents("nonsense,also-nonsense");
+        assert_eq!(list.enabled, all_agents());
+        assert_eq!(
+            list.ignored,
+            vec!["nonsense".to_string(), "also-nonsense".to_string()]
+        );
+        assert!(list.fell_back_to_all);
+    }
+
+    #[test]
+    fn resolve_agents_a_repeated_name_still_yields_one_entry() {
+        assert_eq!(
+            resolve_agents("codex,codex").enabled,
+            BTreeSet::from([AgentKind::Codex])
+        );
+    }
+
+    #[test]
+    fn resolve_agents_a_repeated_unrecognized_name_is_listed_once() {
+        let resolved = resolve_agents("claude,made-up,made-up");
+        assert_eq!(resolved.ignored, vec!["made-up".to_string()]);
     }
 }

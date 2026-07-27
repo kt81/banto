@@ -21,11 +21,22 @@
 //! emoji, which would lose the theme colors and this codebase's
 //! production-proven narrow (1-column) rendering.
 //!
+//! # Colour
+//!
+//! Truecolor is assumed; the 16- and 256-colour palettes are not a
+//! constraint on what may be chosen here (operator's call — the terminals
+//! this is used from are all rich, and the agents it hosts paint freely
+//! themselves). Named colours are still the right default for *status*,
+//! where following the reader's theme is the point — the activity dot
+//! keeps them. Identity is the exception: an agent's accent names an
+//! absolute colour, because the point of it is that a product looks like
+//! itself rather than like the reader's palette.
+//!
 //! # Row layout
 //!
 //! One algorithm, driven by the render area's width and whether grouped
 //! view is actually in effect (`App::grouped_view_in_effect`), for both
-//! modes: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`.
+//! modes: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label][gap>=2][age]`.
 //! The pin slot exists (3 columns) only in flat view — in grouped view
 //! every pinned row's section is "Pinned" (`App::section_name` gives it
 //! top priority), so a pin marker could never render there anyway; the
@@ -37,6 +48,12 @@
 //! flush at the right edge, saturating throughout with an explicit
 //! narrow-width degradation that drops the age column entirely rather than
 //! ever let it collide into the prefix).
+//!
+//! A row is one line (`App::lines_per_row` 1, the chōba — the label sits on
+//! that same line, per the formula above) or two (more than 1, the emporium
+//! sidebar): line one is the formula above minus the label, line two is cwd
+//! plus the label, indented to align under the title rather than starting
+//! at column zero — see [`cwd_agent_line`].
 
 use std::time::SystemTime;
 
@@ -48,7 +65,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use banto_core::app::{App, ListLine, VisibleRow};
-use banto_core::model::{self, Activity, AgeBucket, SessionRow};
+use banto_core::model::{self, Activity, AgeBucket, AgentKind, SessionRow};
 
 use crate::text::{truncate_to_width, truncate_to_width_leading};
 
@@ -70,6 +87,11 @@ fn fixed_prefix_width(show_pin_slot: bool) -> usize {
 }
 const MIN_GAP_BEFORE_AGE: usize = 2;
 const TITLE_CWD_GAP: usize = 2;
+/// Gap between the title/cwd content and the agent label, when both share
+/// one physical line (the chōba — see [`App::lines_per_row`]; the emporium
+/// sidebar puts the label on its own second line instead, via
+/// [`cwd_agent_line`]).
+const LABEL_GAP: usize = 2;
 /// cwd is only shown if at least this many columns remain for it once the
 /// title (at its natural, untruncated width) and the title-cwd gap are
 /// accounted for.
@@ -86,10 +108,21 @@ const MIN_WIDTH_FOR_CWD: usize = 60;
 /// the caller at the draw call's boundary, same as [`render_summary`].
 pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
     if app.filtered_len() == 0 {
+        // A restricted `agents` setting narrowing discovery down to zero
+        // rows looks identical, at this point, to a machine that genuinely
+        // has none — distinguished only by `App::restricted_agents_label`,
+        // set from `Config.agents` at startup, never by anything filtered
+        // here. Checked only in the `total_len() == 0` arm: a search query
+        // narrowing an otherwise-populated list to nothing is a completely
+        // different, already-self-explanatory situation ("No matching
+        // sessions."), not this one.
         let message = if app.total_len() == 0 {
-            "No sessions found."
+            match app.restricted_agents_label() {
+                Some(label) => format!("No sessions found (agents = {label})."),
+                None => "No sessions found.".to_string(),
+            }
         } else {
-            "No matching sessions."
+            "No matching sessions.".to_string()
         };
         let placeholder = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(placeholder, area);
@@ -99,10 +132,11 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
     // See the module doc's "Row layout" section for why the pin slot is
     // conditional on this.
     let show_pin_slot = !app.grouped_view_in_effect();
+    let lines_per_row = app.lines_per_row();
     let items: Vec<ListItem> = app
         .visible()
         .into_iter()
-        .map(|line| list_item(line, area.width, now, show_pin_slot))
+        .map(|line| list_item(line, area.width, now, show_pin_slot, lines_per_row))
         .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
@@ -111,19 +145,39 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
 }
 
 /// Build one list line: a bold, icon-prefixed section-header line (grouped
-/// view only), or a row. Each is its own `ListItem`/physical line rather
-/// than a header bundled into its row, matching the index space
+/// view only), or a row. Each is its own `ListItem`/physical-line-group
+/// rather than a header bundled into its row, matching the index space
 /// `App::click`/`App::scroll`/`App::ensure_visible` all use — see
-/// [`ListLine`] for why that matters for mouse clicks.
+/// [`ListLine`] for why that matters for mouse clicks. A row is one line
+/// when `lines_per_row` is 1 (the chōba, with the agent label sharing that
+/// line — see [`row_line`]), or two when it's more (the emporium sidebar:
+/// title/age, then cwd/agent — see [`cwd_agent_line`]); a header is always
+/// one line regardless, matching `App::lines_per_row`'s own accounting.
 fn list_item(
     line: ListLine<'_>,
     area_width: u16,
     now: SystemTime,
     show_pin_slot: bool,
+    lines_per_row: usize,
 ) -> ListItem<'static> {
     match line {
         ListLine::Header { name, count } => header_line(&name, count),
-        ListLine::Row(visible) => ListItem::new(row_line(visible, area_width, now, show_pin_slot)),
+        ListLine::Row(visible) => {
+            if lines_per_row > 1 {
+                let top = row_line(&visible, area_width, now, show_pin_slot, None);
+                let bottom = cwd_agent_line(visible.row, area_width, show_pin_slot);
+                ListItem::new(vec![top, bottom])
+            } else {
+                let label = agent_label(visible.row);
+                ListItem::new(row_line(
+                    &visible,
+                    area_width,
+                    now,
+                    show_pin_slot,
+                    Some(&label),
+                ))
+            }
+        }
     }
 }
 
@@ -156,9 +210,12 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
     )))
 }
 
-/// Build one row: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`
+/// Build one row's first (and, at `lines_per_row` 1, only) physical line:
+/// `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label?][gap>=2][age]`
 /// — see the module doc's "Row layout" section for why the pin slot is
-/// conditional on `show_pin_slot`.
+/// conditional on `show_pin_slot`. `label` is `None` when the emporium
+/// sidebar's second line ([`cwd_agent_line`]) carries it instead; `Some` for
+/// the chōba, where the row stays one line.
 ///
 /// `title` and `cwd` are mutually exclusive truncation targets: cwd is only
 /// shown when the title's *natural* (untruncated) width already leaves at
@@ -170,16 +227,19 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
 /// placement, not separately computed/padded.
 ///
 /// All arithmetic is saturating. If the area is too narrow to fit the fixed
-/// prefix, the minimum gap, and the age column at all, age is dropped
-/// entirely (never left to collide into the prefix) and the title gets
-/// whatever width remains after the prefix — degrading further to an empty
-/// title, then (ratatui's own area-boundary clipping) to just the prefix,
-/// in a pathologically narrow area. Never panics, never underflows.
+/// prefix, the minimum gap, `label` (if present), and age all at once, both
+/// `label` and age are dropped together — not one before the other, so this
+/// stays the same single narrow/normal split the row always had rather than
+/// a new three-tier cascade — and the title gets whatever width remains
+/// after the prefix, degrading further to an empty title, then (ratatui's
+/// own area-boundary clipping) to just the prefix, in a pathologically
+/// narrow area. Never panics, never underflows.
 fn row_line(
-    visible: VisibleRow<'_>,
+    visible: &VisibleRow<'_>,
     area_width: u16,
     now: SystemTime,
     show_pin_slot: bool,
+    label: Option<&str>,
 ) -> Line<'static> {
     let dot = Span::styled(
         "\u{25cf} ",
@@ -204,17 +264,20 @@ fn row_line(
     let area_width = area_width as usize;
     let age_str = model::humanize_age_compact(visible.row.mtime, now);
     let age_width = age_str.width();
+    let label_reserved = label.map_or(0, |label| LABEL_GAP + label.width());
 
     let title_full = visible.row.display_title().to_string();
     let title_width = title_full.width();
     let cwd_full = visible.row.cwd_display();
 
-    let max_left_content = area_width.saturating_sub(prefix_width + MIN_GAP_BEFORE_AGE + age_width);
+    let max_left_content =
+        area_width.saturating_sub(prefix_width + label_reserved + MIN_GAP_BEFORE_AGE + age_width);
 
     if max_left_content == 0 {
-        // Narrow-width degradation: no room for prefix + min gap + age at
-        // all — drop age entirely rather than let it collide into the
-        // prefix, and give the title whatever's left after the prefix.
+        // Narrow-width degradation: no room for prefix + label (if any) +
+        // min gap + age all at once — drop label and age together rather
+        // than let anything collide into the prefix, and give the title
+        // whatever's left after the prefix.
         let title_budget = area_width.saturating_sub(prefix_width);
         let title = truncate_to_width(&title_full, title_budget as u16);
         prefix.push(Span::raw(title));
@@ -245,6 +308,16 @@ fn row_line(
         spans.push(Span::raw(title));
     }
 
+    if let Some(label) = label {
+        spans.push(Span::raw(" ".repeat(LABEL_GAP)));
+        used_width += LABEL_GAP;
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(agent_label_color(visible.row.agent)),
+        ));
+        used_width += label.width();
+    }
+
     // Age, right-flush at the row's literal right edge. `used_width` is
     // bounded (by construction of `max_left_content` and the truncation
     // helpers' own <= max_width guarantee) so this gap is always >=
@@ -254,6 +327,68 @@ fn row_line(
     spans.push(Span::styled(age_str, Style::default().fg(Color::DarkGray)));
 
     Line::from(spans)
+}
+
+/// Bracketed agent product label — "no single emoji names an agent
+/// product" (the operator's own call), so this is the one row-list marker
+/// that stays text instead of joining the module doc's "Emoji markers"
+/// section.
+fn agent_label(row: &SessionRow) -> String {
+    format!("[{}]", row.agent.label())
+}
+
+/// Each product's own accent, absolute rather than themed — see the module
+/// doc's "Colour" section for why identity is the one thing here that does
+/// not follow the reader's palette. Claude's orange and Codex's teal are
+/// each that product's own; they also happen to sit on opposite sides of
+/// the wheel, which is what keeps them apart at a glance in a mixed list.
+///
+/// Both stay off the activity dot's hues so the two coloured things in one
+/// row don't read as related.
+fn agent_label_color(agent: AgentKind) -> Color {
+    match agent {
+        AgentKind::ClaudeCode => Color::Rgb(217, 119, 87),
+        AgentKind::Codex => Color::Rgb(16, 163, 127),
+    }
+}
+
+/// The emporium sidebar's second physical line per row (only when
+/// `App::lines_per_row` is more than 1, see [`list_item`]): indented by
+/// [`fixed_prefix_width`] so its content aligns under line one's *title*
+/// rather than starting at column zero — without this a stray path would
+/// appear to hang between every row instead of reading as that row's own
+/// second line (dogfooding report). cwd is leading-truncated on the left;
+/// the agent label sits right-aligned at the row's literal right edge — the
+/// same right-flush-trailing-element and saturating-arithmetic conventions
+/// [`row_line`]'s own age column uses, applied here since age itself has no
+/// place on this line. Below room for the label plus its minimum gap, the
+/// gap guarantee is the first thing dropped (matching [`row_line`]'s own
+/// "drop the gap, not the content" order); the label itself is truncated,
+/// never panicking, only once even that alone doesn't fit.
+fn cwd_agent_line(row: &SessionRow, area_width: u16, show_pin_slot: bool) -> Line<'static> {
+    let indent = fixed_prefix_width(show_pin_slot);
+    let content_width = (area_width as usize).saturating_sub(indent);
+    let indent_span = Span::raw(" ".repeat(indent));
+
+    let label = agent_label(row);
+    let label_width = label.width();
+    let label_style = Style::default().fg(agent_label_color(row.agent));
+    let cwd_full = row.cwd_display();
+
+    let max_cwd = content_width.saturating_sub(MIN_GAP_BEFORE_AGE + label_width);
+    if max_cwd == 0 {
+        let label = truncate_to_width(&label, content_width as u16);
+        return Line::from(vec![indent_span, Span::styled(label, label_style)]);
+    }
+
+    let cwd_truncated = truncate_to_width_leading(&cwd_full, max_cwd as u16);
+    let gap = content_width.saturating_sub(cwd_truncated.width() + label_width);
+    Line::from(vec![
+        indent_span,
+        Span::styled(cwd_truncated, Style::default().fg(Color::DarkGray)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(label, label_style),
+    ])
 }
 
 /// Render the always-visible summary panel: the selected session's activity
@@ -390,12 +525,20 @@ mod tests {
             preview: None,
             mtime,
             size: 0,
+            source_archived: false,
         }
     }
 
     fn agent_row(id: &str, title: &str, cwd: &str, mtime: SystemTime) -> SessionRow {
         SessionRow {
             is_agent: true,
+            ..row(id, title, cwd, mtime)
+        }
+    }
+
+    fn codex_row(id: &str, title: &str, cwd: &str, mtime: SystemTime) -> SessionRow {
+        SessionRow {
+            agent: AgentKind::Codex,
             ..row(id, title, cwd, mtime)
         }
     }
@@ -445,6 +588,45 @@ mod tests {
         line.chars()
             .position(|c| c == first_char)
             .unwrap_or_else(|| panic!("{first_char:?} not found in line {line:?}"))
+    }
+
+    // --- empty-list placeholder --------------------------------------------
+
+    #[test]
+    fn empty_list_with_no_agents_restriction_shows_the_plain_message() {
+        let now = SystemTime::UNIX_EPOCH;
+        let app = App::new(vec![]);
+        let text = draw_list(&app, 60, 10, now);
+        assert!(text.contains("No sessions found."));
+        assert!(!text.contains("agents ="));
+    }
+
+    #[test]
+    fn empty_list_under_a_restricted_agents_setting_names_it() {
+        let now = SystemTime::UNIX_EPOCH;
+        let app = App::new(vec![]).with_enabled_agents([AgentKind::Codex].into_iter().collect());
+        let text = draw_list(&app, 60, 10, now);
+        assert!(
+            text.contains("No sessions found (agents = Codex)."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_search_query_that_matches_nothing_ignores_the_agents_restriction() {
+        // Narrowing an otherwise-populated list to nothing via search is a
+        // different, already self-explanatory situation — the `agents`
+        // hint belongs only to the "nothing was ever discovered" case.
+        let now = SystemTime::UNIX_EPOCH;
+        let mut app = App::new(vec![row("h1", "Claude session", "", now)])
+            .with_enabled_agents([AgentKind::Codex].into_iter().collect());
+        app.enter_search();
+        for c in "no-such-title".chars() {
+            app.push_char(c);
+        }
+        let text = draw_list(&app, 60, 10, now);
+        assert!(text.contains("No matching sessions."));
+        assert!(!text.contains("agents ="));
     }
 
     // --- marker slots ------------------------------------------------------
@@ -853,10 +1035,11 @@ mod tests {
         app.set_viewport_height(10);
 
         // Wide enough that "This Is" (the title's start) survives
-        // truncation and can anchor the line lookup, but still well under
+        // truncation and can anchor the line lookup even with the agent
+        // label's own width reserved alongside it, but still well under
         // MIN_WIDTH_FOR_CWD and short of the full title's length, so cwd
         // stays dropped and the title still gets truncated.
-        let text = draw_list(&app, 30, 10, now);
+        let text = draw_list(&app, 40, 10, now);
         let line = text.lines().find(|l| l.contains("This Is")).unwrap();
         assert!(
             !line.contains("/some/path"),
@@ -882,5 +1065,200 @@ mod tests {
             !text.contains("now"),
             "age should have been dropped entirely, not collided into the prefix:\n{text}"
         );
+    }
+
+    // --- agent label (chōba: same line; sidebar: second line) -----------
+
+    #[test]
+    fn choba_row_shows_the_agent_label_after_cwd_and_before_age_for_both_products() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("c", "Claude Row", "", now),
+            codex_row("x", "Codex Row", "", now),
+        ]);
+        app.set_viewport_height(10);
+
+        let text = draw_list(&app, 60, 10, now);
+
+        let claude_line = text.lines().find(|l| l.contains("Claude Row")).unwrap();
+        assert!(claude_line.contains("[Claude]"), "{claude_line}");
+        let label_at = claude_line.find("[Claude]").unwrap();
+        let age_at = claude_line.find("now").unwrap();
+        assert!(
+            label_at < age_at,
+            "label should sit before age, not after:\n{claude_line}"
+        );
+
+        let codex_line = text.lines().find(|l| l.contains("Codex Row")).unwrap();
+        assert!(codex_line.contains("[Codex]"), "{codex_line}");
+    }
+
+    #[test]
+    fn choba_narrow_width_drops_the_label_and_age_together() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![row("r", "A Reasonably Long Title", "", now)]);
+        app.set_viewport_height(10);
+
+        // Too narrow for prefix(8) + label_gap(2) + "[Claude]"(8) +
+        // min_gap(2) + age(3) all at once — both the label and age are
+        // dropped together (the module's single narrow/normal split, not a
+        // new three-tier cascade), leaving just the truncated title.
+        let text = draw_list(&app, 15, 10, now);
+        assert!(
+            !text.contains("[Claude]"),
+            "label should have been dropped:\n{text}"
+        );
+        assert!(
+            !text.contains("now"),
+            "age should have been dropped together with the label:\n{text}"
+        );
+        assert!(
+            text.contains('\u{2026}'),
+            "expected a truncated title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn sidebar_row_carries_cwd_and_agent_label_on_a_second_line_for_both_products() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("c", "Claude Row", "/work/claude", now),
+            codex_row("x", "Codex Row", "/work/codex", now),
+        ])
+        .with_lines_per_row(2);
+        app.set_viewport_height(10);
+
+        // 34 columns: the emporium sidebar's own inner width (36-column
+        // SIDEBAR_WIDTH minus its 2-column border).
+        let text = draw_list(&app, 34, 10, now);
+        let lines: Vec<&str> = text.lines().collect();
+
+        let claude_title = lines.iter().position(|l| l.contains("Claude Row")).unwrap();
+        assert!(
+            !lines[claude_title].contains("[Claude]"),
+            "the label belongs on line two, not the title line:\n{}",
+            lines[claude_title]
+        );
+        let claude_cwd_line = lines[claude_title + 1];
+        assert!(claude_cwd_line.contains("claude"), "{claude_cwd_line}");
+        assert!(claude_cwd_line.contains("[Claude]"), "{claude_cwd_line}");
+
+        let codex_title = lines.iter().position(|l| l.contains("Codex Row")).unwrap();
+        let codex_cwd_line = lines[codex_title + 1];
+        assert!(codex_cwd_line.contains("codex"), "{codex_cwd_line}");
+        assert!(codex_cwd_line.contains("[Codex]"), "{codex_cwd_line}");
+    }
+
+    #[test]
+    fn sidebar_line_two_leading_truncates_cwd_and_keeps_the_label_flush_right() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let cwd = format!("/head_marker/{}/tail_marker", "x".repeat(40));
+        let mut app = App::new(vec![row("r", "Short", &cwd, now)]).with_lines_per_row(2);
+        app.set_viewport_height(10);
+
+        let text = draw_list(&app, 34, 10, now);
+        let lines: Vec<&str> = text.lines().collect();
+        let title_line = lines.iter().position(|l| l.contains("Short")).unwrap();
+        let cwd_line = lines[title_line + 1];
+
+        assert!(!cwd_line.contains("head_marker"), "{cwd_line}");
+        assert!(cwd_line.contains("tail_marker"), "{cwd_line}");
+        assert!(
+            cwd_line.contains('\u{2026}'),
+            "expected a leading ellipsis:\n{cwd_line}"
+        );
+        assert!(
+            cwd_line.trim_end().ends_with("[Claude]"),
+            "label should be flush right:\n{cwd_line}"
+        );
+    }
+
+    #[test]
+    fn sidebar_line_two_truncates_the_label_itself_in_a_pathologically_narrow_sidebar() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![row("r", "Short", "/some/path", now)]).with_lines_per_row(2);
+        app.set_viewport_height(10);
+
+        // 6 columns is less than min_gap(2) + "[Claude]"(8) even before cwd
+        // is considered — cwd is dropped entirely and even the label itself
+        // is truncated, never panicking.
+        let text = draw_list(&app, 6, 10, now);
+        assert!(
+            !text.contains('/'),
+            "cwd should have been dropped entirely:\n{text}"
+        );
+    }
+
+    #[test]
+    fn sidebar_line_two_aligns_under_line_ones_title_in_both_flat_and_grouped_view() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "/work/a", now),
+            row("b", "Beta", "/work/b", now),
+        ])
+        .with_pinned(["a".to_string()].into_iter().collect())
+        .with_lines_per_row(2);
+        app.set_viewport_height(10);
+
+        let title_and_cwd_cols = |text: &str| -> (usize, usize) {
+            let lines: Vec<&str> = text.lines().collect();
+            let title_idx = lines
+                .iter()
+                .position(|l| l.contains("Alpha"))
+                .unwrap_or_else(|| panic!("no row contains \"Alpha\":\n{text}"));
+            let title_col = lines[title_idx].chars().position(|c| c == 'A').unwrap();
+            let cwd_col = lines[title_idx + 1].chars().position(|c| c == '/').unwrap();
+            (title_col, cwd_col)
+        };
+
+        // Grouped view (default): the pin slot is dropped (see
+        // `grouped_view_drops_the_pin_column_so_titles_start_three_columns_earlier`),
+        // so line two's indent must shrink by the same 3 columns as line
+        // one's title — not stay at whatever flat view used.
+        let (grouped_title_col, grouped_cwd_col) =
+            title_and_cwd_cols(&draw_list(&app, 34, 10, now));
+        assert_eq!(
+            grouped_cwd_col, grouped_title_col,
+            "line two should align under line one's title in grouped view"
+        );
+
+        app.toggle_grouped_view(); // flat: pin slot present
+        let (flat_title_col, flat_cwd_col) = title_and_cwd_cols(&draw_list(&app, 34, 10, now));
+        assert_eq!(
+            flat_cwd_col, flat_title_col,
+            "line two should align under line one's title in flat view"
+        );
+
+        assert_eq!(
+            flat_title_col - grouped_title_col,
+            3,
+            "the two views should actually use different indents here, or this \
+             test isn't exercising the thing it claims to"
+        );
+    }
+
+    #[test]
+    fn agent_label_color_differs_by_product_and_avoids_the_activity_dot() {
+        let claude = agent_label_color(AgentKind::ClaudeCode);
+        let codex = agent_label_color(AgentKind::Codex);
+        assert_ne!(
+            claude, codex,
+            "the two products should be visually distinguishable"
+        );
+
+        // The doc above claims these stay clear of the activity dot's own
+        // palette so the two coloured things in a row don't read as related.
+        // Pin it: nothing else would notice a later edit colliding with the
+        // dot until someone looked at a row and wondered why.
+        for dot in [
+            Color::Green,
+            Color::Cyan,
+            Color::Yellow,
+            Color::Gray,
+            Color::DarkGray,
+        ] {
+            assert_ne!(claude, dot, "agent label collides with an activity dot");
+            assert_ne!(codex, dot, "agent label collides with an activity dot");
+        }
     }
 }

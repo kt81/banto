@@ -1,17 +1,37 @@
 //! banto binary: a clap CLI whose default action launches the TUI.
 //!
-//! Claude-home resolution order (highest priority first):
-//! 1. the `--claude-home` flag,
-//! 2. `Config.claude_home` from banto's own `config.toml`,
-//! 3. the provider default (`~/.claude`).
+//! Both products' homes resolve in the same shape and priority order
+//! (highest first), so that a flag and a `config.toml` entry always beat
+//! the product's own environment variable rather than one product
+//! honouring it unconditionally and the other ignoring it:
+//! 1. the `--claude-home` / `--codex-home` flag,
+//! 2. `Config.claude_home` / `Config.codex_home` from banto's own
+//!    `config.toml` — banto-specific and deliberately set, so it outranks
+//!    an ambient environment variable meant for the provider CLI itself,
+//! 3. the provider's own override variable (`$CLAUDE_CONFIG_DIR` /
+//!    `$CODEX_HOME`),
+//! 4. the provider default (`~/.claude` / `~/.codex`).
 //!
-//! Everything under the resolved Claude home is treated as strictly
-//! read-only.
+//! See [`resolve_claude_home`] and [`resolve_codex_home`]. They differ only
+//! in failure mode: no Claude home is a startup error (`--claude-home` is
+//! the escape hatch), while no Codex home just means no Codex sessions —
+//! Codex support is optional, Claude's is not.
+//!
+//! Everything under the resolved Claude home, and under the resolved Codex
+//! home, is treated as strictly read-only.
 //! banto's own database (session <-> pane map, groups, pins) lives under
 //! `Config.db_path`, falling back to [`config::default_db_path`].
 //!
 //! `config.toml` itself is located by [`config::resolve_config_path`]'s
 //! resolution order (see [`load_config`]).
+//!
+//! `Config.agents` gates which products get discovered at all — resolved
+//! once here via `banto_core::config::resolve_agents` into `resolved_agents`
+//! and passed down to every entry point, since `session::discover_all` (not
+//! any of these) is what actually decides which provider runs.
+//! `ResolvedAgents::ignored` is where a name banto didn't recognize ends up;
+//! `tui::run`/`embedded::run_emporium` are the ones that tell the operator
+//! about it, once, at startup — see `session::agents_ignored_notice`.
 
 mod embedded;
 mod mcp;
@@ -21,14 +41,17 @@ mod sgr;
 mod tui;
 mod wrap;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use banto_core::config::Config;
+use banto_core::model::AgentKind;
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
 use banto_io::config;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::SystemProcessRunner;
@@ -41,10 +64,17 @@ use session::{activity_tag, load_rows, thresholds_from};
 #[derive(Parser)]
 #[command(name = "banto", version, about, long_about = None)]
 struct Cli {
-    /// Override the Claude home directory (default: config, else ~/.claude).
-    /// Read-only: banto never writes under this path.
+    /// Override the Claude home directory (default: config, else
+    /// $CLAUDE_CONFIG_DIR, else ~/.claude). Read-only: banto never writes
+    /// under this path.
     #[arg(long, global = true, value_name = "PATH")]
     claude_home: Option<PathBuf>,
+
+    /// Override the Codex home directory (default: config, else
+    /// $CODEX_HOME, else ~/.codex). Read-only: banto never writes under
+    /// this path.
+    #[arg(long, global = true, value_name = "PATH")]
+    codex_home: Option<PathBuf>,
 
     /// Explicit path to banto's own config.toml. Takes priority over
     /// $BANTO_CONFIG and the XDG/~/.config/platform-default search — and
@@ -143,11 +173,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config(cli.config.as_deref())?;
 
+    let resolved_agents = banto_core::config::resolve_agents(&config.agents);
+
     match cli.command {
         Some(Command::List) => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let codex_home = resolve_codex_home(cli.codex_home, &config);
             let thresholds = thresholds_from(&config.activity);
-            run_list(&claude_home, &thresholds)
+            run_list(
+                &claude_home,
+                codex_home.as_ref(),
+                &thresholds,
+                &resolved_agents.enabled,
+            )
         }
         Some(Command::Wrap {
             session,
@@ -203,6 +241,7 @@ fn main() -> Result<()> {
         }
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let codex_home = resolve_codex_home(cli.codex_home, &config);
             let thresholds = thresholds_from(&config.activity);
             // `Store::set_session_group` (the `g` modal) takes `&mut self`
             // (it wraps a transaction), and the store is shared by both the
@@ -212,13 +251,26 @@ fn main() -> Result<()> {
             if cli.emporium {
                 embedded::run_emporium(
                     &claude_home,
+                    codex_home.as_ref(),
                     &thresholds,
                     &store,
-                    &config.brigade,
-                    &config.keys,
+                    &embedded::EmporiumSettings {
+                        brigade: &config.brigade,
+                        keys: &config.keys,
+                        agent_binaries: &config.agent_binaries,
+                        resolved_agents: &resolved_agents,
+                    },
                 )
             } else {
-                tui::run(&claude_home, &thresholds, config.opener, &store)
+                tui::run(
+                    &claude_home,
+                    codex_home,
+                    config.agent_binaries.clone(),
+                    &thresholds,
+                    config.opener,
+                    &store,
+                    resolved_agents,
+                )
             }
         }
     }
@@ -258,6 +310,16 @@ fn resolve_claude_home(flag: Option<PathBuf>, config: &Config) -> Result<ClaudeH
         .context("could not determine the Claude home directory; pass --claude-home <PATH>")
 }
 
+/// Resolve the Codex home directory per the same priority order as
+/// [`resolve_claude_home`], except that failing to resolve one is not a
+/// startup error: Codex support is optional, so no Codex home just means no
+/// Codex sessions to show.
+fn resolve_codex_home(flag: Option<PathBuf>, config: &Config) -> Option<CodexHome> {
+    flag.or_else(|| config.codex_home.clone())
+        .map(CodexHome::new)
+        .or_else(CodexHome::default_home)
+}
+
 /// Open (creating if needed) banto's own sqlite database at
 /// `Config.db_path`, falling back to [`config::default_db_path`].
 fn open_store(config: &Config) -> Result<Store> {
@@ -270,8 +332,14 @@ fn open_store(config: &Config) -> Result<Store> {
 }
 
 /// `banto list`: one line per session — activity tag, id, title, cwd.
-fn run_list(claude_home: &ClaudeHome, thresholds: &AgeThresholds) -> Result<()> {
-    let rows = load_rows(claude_home, thresholds).context("failed to read sessions")?;
+fn run_list(
+    claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+    thresholds: &AgeThresholds,
+    enabled_agents: &BTreeSet<AgentKind>,
+) -> Result<()> {
+    let rows = load_rows(claude_home, codex_home, thresholds, enabled_agents)
+        .context("failed to read sessions")?;
     for row in &rows {
         let title = row.title.as_deref().unwrap_or("(no title)");
         let cwd = row

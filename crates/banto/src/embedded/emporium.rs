@@ -19,7 +19,7 @@
 //! into [`engine::update`] as a `docs/DISCIPLINE.md` §8 replay stream.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -40,16 +40,18 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
-use banto_core::config::{BrigadeConfig, KeysConfig};
+use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
     self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
     SessionKey, Stage, StoreIntent, layout, stage_tiles,
 };
 use banto_core::input::InputEvent;
-use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
+use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
@@ -70,25 +72,45 @@ use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// The `config.toml`-derived settings [`run`] needs, bundled into one
+/// parameter once a fourth one (`enabled_agents`) pushed the plain arg list
+/// past clippy's `too_many_arguments` limit — mirrors `crate::opener::OpenContext`'s
+/// role for the same problem there.
+pub struct EmporiumSettings<'a> {
+    /// `[brigade]`: how many fresh Workers `B` auto-spawns when forming a
+    /// new brigade, the `--model` an auto-spawned Worker launches with, and
+    /// whether the relay engine is enabled.
+    pub brigade: &'a BrigadeConfig,
+    /// `[keys]`: the tmux-style prefix chord for pane operations.
+    pub keys: &'a KeysConfig,
+    /// `[agent_binaries]` — see `crate::opener::agent_binary`.
+    pub agent_binaries: &'a AgentBinaries,
+    /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
+    /// The whole [`ResolvedAgents`], not just its `enabled` set, so [`run`]
+    /// can also post the startup notice for a name it had to ignore (see
+    /// `session::agents_ignored_notice`).
+    pub resolved_agents: &'a ResolvedAgents,
+}
+
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
-/// `brigade` is `[brigade]` from config.toml: how many fresh Workers `B`
-/// auto-spawns when forming a new brigade, the `--model` an auto-spawned
-/// Worker launches with, and whether the relay engine is enabled. `keys` is
-/// `[keys]`: the tmux-style prefix chord for pane operations.
 pub fn run(
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
-    brigade: &BrigadeConfig,
-    keys: &KeysConfig,
+    settings: &EmporiumSettings,
 ) -> Result<()> {
+    let brigade = settings.brigade;
+    let keys = settings.keys;
+    let agent_binaries = settings.agent_binaries;
+    let enabled_agents = &settings.resolved_agents.enabled;
     // Janitor: purge brigades with no members left (legacy pre-v7 data, or
     // residue from a crash mid-formation) before the sidebar's brigade-
     // derived caches (hidden Workers, Directors) load. Silent by design — an
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    let metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
+    let metas = session::discover_all(claude_home, codex_home, enabled_agents)?;
     // In-memory only, for this process's lifetime — see
     // `crate::tui::superseded_from_metas`'s doc. Created once here and
     // threaded through every reload (the bootstrap below and every later
@@ -124,14 +146,26 @@ pub fn run(
         .with_groups(groups, session_groups)
         .with_hidden_worker_ids(hidden)
         .with_directors(directors)
-        .with_superseded(superseded);
+        .with_superseded(superseded)
+        // Two lines per row (title/age, then cwd/agent) — the sidebar has
+        // the width for markers and a title but not a cwd too (see
+        // `banto_tui::view`'s module doc's "Row layout" section); the chōba
+        // stays the default of 1.
+        .with_lines_per_row(2)
+        .with_enabled_agents(enabled_agents.clone());
+    if let Some(notice) = session::agents_ignored_notice(settings.resolved_agents) {
+        app.set_status(notice, Instant::now());
+    }
 
     let deps = Deps {
         claude_home,
+        codex_home,
         thresholds,
         store,
         superseded_failed: &superseded_failed,
         brigade,
+        agent_binaries,
+        enabled_agents,
     };
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut app, &deps, keys);
@@ -166,6 +200,9 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// [`Self::superseded_failed`]) gets threaded through.
 struct Deps<'a> {
     claude_home: &'a ClaudeHome,
+    /// `None` degrades to no Codex sessions in the sidebar, not an error —
+    /// same contract as `crate::tui::Context::codex_home`.
+    codex_home: Option<&'a CodexHome>,
     thresholds: &'a AgeThresholds,
     store: &'a RefCell<Store>,
     /// See [`crate::tui::superseded_from_metas`]'s doc: in-memory only, for
@@ -176,6 +213,10 @@ struct Deps<'a> {
     /// member's launch argv carries its role briefing — see
     /// [`render_briefing`]).
     brigade: &'a BrigadeConfig,
+    /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
+    agent_binaries: &'a AgentBinaries,
+    /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
+    enabled_agents: &'a BTreeSet<AgentKind>,
 }
 
 fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig) -> Result<()> {
@@ -183,7 +224,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
-    let mut watch = LiveWatch::new(deps.claude_home);
+    let mut watch = LiveWatch::new(deps.claude_home, deps.codex_home);
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
     let mut input_log = open_input_log();
@@ -331,12 +372,28 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         }
 
         // A `PtyExited` handler drops the session's `Screen`; the handle
-        // itself (now pointing at a dead reader thread) is dropped here.
+        // itself (now pointing at a dead reader thread) is reaped here.
         // This is also why every core-side `screens` rekey must reach the
         // handle map (`Cmd::RekeyPty`): a handle left under a stale key
         // reads as "screen gone" and is reaped here, which on Unix closes
         // the PTY master and SIGHUPs a perfectly live child.
-        handles.retain(|key, _| state.screens.contains_key(key));
+        //
+        // The reaped handles are dropped on a thread of their own, and that
+        // is not tidiness. Closing a pseudoconsole can block until its
+        // output has been drained and its client has exited, and by the time
+        // a handle is dropped its reader thread is already gone — so the
+        // close waits for a drain that will never happen. Dropping inline
+        // froze the whole UI after `prefix x`: rendering had completed, the
+        // process sat at zero CPU, and no further input was ever read.
+        // Whatever the exact contract turns out to be, a teardown that can
+        // block must not run on the thread that serves the operator.
+        let reaped: Vec<PtyHandle> = handles
+            .extract_if(|key, _| !state.screens.contains_key(key))
+            .map(|(_, handle)| handle)
+            .collect();
+        if !reaped.is_empty() {
+            std::thread::spawn(move || drop(reaped));
+        }
 
         terminal.draw(|frame| draw(frame, app, &state, SystemTime::now()))?;
 
@@ -393,8 +450,8 @@ fn shutdown_handles(
 }
 
 /// Execute one `Cmd`, returning any follow-up `Event`(s) — the only place
-/// that writes to a hosted session's stdin, spawns a process, or touches the
-/// store.
+/// that writes to a hosted session's stdin, spawns a process, touches the
+/// store, or toggles the host terminal's own mouse capture.
 fn execute_cmd(
     cmd: Cmd,
     deps: &Deps,
@@ -406,6 +463,14 @@ fn execute_cmd(
             if let Some(handle) = handles.get_mut(&key) {
                 handle.send_bytes(&bytes);
             }
+            Vec::new()
+        }
+        Cmd::SetMouseCapture(enabled) => {
+            // Best-effort: a failed terminal write here isn't worth
+            // aborting the whole event loop over (matches this module's
+            // other terminal-control calls — `setup_terminal`/
+            // `restore_terminal` are the only ones that propagate `Result`).
+            let _ = set_mouse_capture(enabled);
             Vec::new()
         }
         Cmd::ResizePty { key, rows, cols } => {
@@ -445,10 +510,14 @@ fn execute_cmd(
 /// [`opener::decide_inplace_resume`] when a real id is already known (`None`
 /// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
 /// otherwise — either way with `model`/`briefing` carried on the result.
-/// `--model` applies the same way to a resume as to a fresh spawn: a Worker
-/// resumed without it falls back to the operator's own default model
-/// instead of the brigade's configured one (`engine::stage_brigade` never
-/// sets it for the Director, so this is never reached for one).
+/// `target.agent` picks the variant; `briefing` only ever reaches the
+/// `Claude` one (see [`opener::AgentLaunch`]'s doc — brigades are Claude-only,
+/// and the `Codex` variant has no field to put it in even if this is called
+/// with one anyway). `--model` applies the same way to a resume as to a
+/// fresh spawn: a Worker resumed without it falls back to the operator's
+/// own default model instead of the brigade's configured one
+/// (`engine::stage_brigade` never sets it for the Director, so this is
+/// never reached for one).
 ///
 /// `briefing` is the member's already-rendered role briefing
 /// (`--append-system-prompt`, see [`render_briefing`]) — rendered by the
@@ -464,8 +533,7 @@ fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
     briefing: Option<&str>,
-    probe: &dyn ProcessProbe,
-    live: &[LiveSession],
+    ctx: &opener::OpenContext,
 ) -> Option<opener::AgentLaunch> {
     let resume = if target.id.is_empty() {
         None
@@ -474,15 +542,26 @@ fn build_open_launch(
         // guard (CLAUDE.md invariant 4), and `?` is what turns a session that
         // is already live somewhere else into `None`. The `InPlaceLaunch` it
         // hands back is dropped because its argv is by construction
-        // `inplace_argv(Some(&target.id))` — the same id we resume below.
-        opener::decide_inplace_resume(target, probe, live)?;
+        // `inplace_argv(target.agent, Some(&target.id), ...)` — the same id
+        // we resume below.
+        opener::decide_inplace_resume(target, ctx)?;
         Some(target.id.clone())
     };
-    Some(opener::AgentLaunch {
-        resume,
-        model: model.map(str::to_string),
-        append_system_prompt: briefing.map(str::to_string),
-        mcp_config: None,
+    Some(match target.agent {
+        AgentKind::ClaudeCode => opener::AgentLaunch::Claude {
+            resume,
+            model: model.map(str::to_string),
+            append_system_prompt: briefing.map(str::to_string),
+            mcp_config: None,
+        },
+        // `briefing` is silently unused here: brigades are Claude-only for
+        // now, and this variant has no field to carry it even if a caller
+        // mistakenly passed one — see `opener::AgentLaunch`'s doc.
+        AgentKind::Codex => opener::AgentLaunch::Codex {
+            resume,
+            model: model.map(str::to_string),
+            cwd: target.cwd.clone(),
+        },
     })
 }
 
@@ -513,25 +592,32 @@ fn execute_open_embedded(
     let briefing = brigade
         .as_ref()
         .and_then(|(brigade_id, token, role)| member_briefing(deps, *brigade_id, token, *role));
-    let Some(mut launch) = build_open_launch(
-        &target,
-        model.as_deref(),
-        briefing.as_deref(),
-        &SysinfoProbe,
-        &live,
-    ) else {
+    let open_ctx = opener::OpenContext {
+        probe: &SysinfoProbe,
+        live: &live,
+        binaries: deps.agent_binaries,
+        codex_home: deps.codex_home,
+        start_time: &SysinfoStartTime,
+    };
+    let Some(mut launch) =
+        build_open_launch(&target, model.as_deref(), briefing.as_deref(), &open_ctx)
+    else {
         return vec![Event::SpawnFailed {
             key,
             error: "already running elsewhere".to_string(),
         }];
     };
-    if let Some((brigade_id, token, role)) = &brigade {
+    // Only the `Claude` variant has an `mcp_config` slot to fill — a Codex
+    // launch structurally can't carry one (brigades are Claude-only).
+    if let (Some((brigade_id, token, role)), opener::AgentLaunch::Claude { mcp_config, .. }) =
+        (&brigade, &mut launch)
+    {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
         if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
-            launch.mcp_config = Some(path);
+            *mcp_config = Some(path);
         }
     }
-    let argv = launch.argv();
+    let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), 24, 80) {
         Ok(handle) => {
@@ -774,7 +860,8 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 /// lineage-resolution budget against the same discover() pass (see
 /// [`crate::tui::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(metas) = ClaudeCodeProvider::new(deps.claude_home.clone()).discover() else {
+    let Ok(metas) = session::discover_all(deps.claude_home, deps.codex_home, deps.enabled_agents)
+    else {
         return Vec::new();
     };
     let store = deps.store.borrow();
@@ -1175,7 +1262,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
     );
 
     if let Some(modal) = app.modal() {
-        banto_tui::render_modal::render_modal(frame, modal, full_area);
+        // `true`: the emporium binds Shift-Tab to
+        // `App::modal_toggle_new_session_agent` (see
+        // `engine::update_modal_key`) — see `render_modal`'s doc.
+        banto_tui::render_modal::render_modal(frame, modal, full_area, true);
     }
 }
 
@@ -1273,6 +1363,25 @@ fn restore_terminal() -> Result<()> {
         DisableMouseCapture,
         DisableBracketedPaste
     )?;
+    Ok(())
+}
+
+/// The shell-side half of `Cmd::SetMouseCapture` (see
+/// `engine::update_mouse_capture`'s doc for when the core asks for this):
+/// released so the host terminal's own native text selection works over a
+/// pane whose child never enabled mouse reporting, re-acquired once focus
+/// moves somewhere that does (including the sidebar itself, which always
+/// wants it for its own click/scroll handling). Capture is the host
+/// terminal's own state, not any one pane's, so — unlike every other `Cmd`
+/// here — this never touches `handles`/a `SessionKey` at all; a fresh
+/// `io::stdout()` handle is all `execute!` needs, same as `setup_terminal`/
+/// `restore_terminal` already use.
+fn set_mouse_capture(enabled: bool) -> Result<()> {
+    if enabled {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    } else {
+        execute!(io::stdout(), DisableMouseCapture)?;
+    }
     Ok(())
 }
 
@@ -1474,6 +1583,12 @@ mod tests {
 
     fn open(host: &MockPtyHost) -> PtyHandle {
         PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
+    }
+
+    /// Every product this build supports — the "nothing restricted" `Deps`
+    /// field most tests here want, mirroring `session::tests::all_agents`.
+    fn all_agents() -> BTreeSet<AgentKind> {
+        AgentKind::ALL.into_iter().collect()
     }
 
     #[test]
@@ -1795,12 +1910,17 @@ mod tests {
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
         let deps = Deps {
             claude_home: &claude_home,
+            codex_home: None,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
             brigade: &brigade,
+            agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
         };
         let mut handles = HashMap::new();
 
@@ -1851,12 +1971,17 @@ mod tests {
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
         let deps = Deps {
             claude_home: &claude_home,
+            codex_home: None,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
             brigade: &brigade,
+            agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
         };
 
         let events = execute_cmd(
@@ -2164,15 +2289,38 @@ mod tests {
         }
     }
 
+    /// An [`opener::OpenContext`] for tests that don't care about Codex
+    /// liveness (`codex_home: None` degrades every Codex check to "not
+    /// live" — see `codex_liveness::is_thread_alive`'s doc).
+    fn test_ctx<'a>(
+        probe: &'a dyn ProcessProbe,
+        live: &'a [LiveSession],
+        binaries: &'a AgentBinaries,
+    ) -> opener::OpenContext<'a> {
+        opener::OpenContext {
+            probe,
+            live,
+            binaries,
+            codex_home: None,
+            start_time: &SysinfoStartTime,
+        }
+    }
+
     #[test]
     fn build_open_launch_appends_model_to_a_resumed_sessions_argv() {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch =
-            build_open_launch(&open_target("sess-1"), Some("opus"), None, &probe, &[]).unwrap();
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target("sess-1"),
+            Some("opus"),
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
         );
     }
@@ -2182,9 +2330,16 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(&open_target(""), Some("opus"), None, &probe, &[]).unwrap();
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target(""),
+            Some("opus"),
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             ["claude", "--model", "opus"].map(str::to_string)
         );
     }
@@ -2194,9 +2349,16 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target("sess-1"),
+            None,
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
     }
@@ -2215,8 +2377,48 @@ mod tests {
             name: None,
             proc_start: None,
         }];
+        let binaries = AgentBinaries::default();
         assert!(
-            build_open_launch(&open_target("sess-1"), Some("opus"), None, &probe, &live).is_none()
+            build_open_launch(
+                &open_target("sess-1"),
+                Some("opus"),
+                None,
+                &test_ctx(&probe, &live, &binaries),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn build_open_launch_codex_target_resumes_via_codex_with_cwd() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let mut target = open_target("codex-uuid-1");
+        target.agent = AgentKind::Codex;
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &target,
+            Some("o3"),
+            // A briefing passed anyway (shouldn't happen — brigades are
+            // Claude-only — but the Codex variant has nowhere to put it
+            // even so).
+            Some("you are the Director"),
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.argv("codex"),
+            [
+                "codex",
+                "resume",
+                "codex-uuid-1",
+                "-m",
+                "o3",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
         );
     }
 
@@ -2227,16 +2429,16 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
             Some("you are the Director"),
-            &probe,
-            &[],
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             [
                 "claude",
                 "--resume",
@@ -2255,8 +2457,18 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
-        assert_eq!(launch.mcp_config, None);
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target("sess-1"),
+            None,
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        match launch {
+            opener::AgentLaunch::Claude { mcp_config, .. } => assert_eq!(mcp_config, None),
+            opener::AgentLaunch::Codex { .. } => panic!("expected a Claude launch"),
+        }
     }
 
     #[test]
@@ -2315,12 +2527,17 @@ mod tests {
             ..config.clone()
         };
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
         let deps = |brigade| Deps {
             claude_home: &claude_home,
+            codex_home: None,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
             brigade,
+            agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
         };
 
         assert_eq!(

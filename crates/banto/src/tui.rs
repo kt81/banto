@@ -7,7 +7,7 @@
 //! is cross-platform — crossterm handles the Windows specifics.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,15 +33,15 @@ use unicode_width::UnicodeWidthStr;
 use banto_core::app::{
     App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessionPlacement, OpenAction,
 };
-use banto_core::config::OpenerMode;
-use banto_core::model::{SessionId, SessionMeta, SessionToOpen};
+use banto_core::config::{AgentBinaries, OpenerMode, ResolvedAgents};
+use banto_core::model::{AgentKind, SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::{ProcessRunner, SystemProcessRunner};
-use banto_io::provider::SessionProvider;
-use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::status::{SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
 use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource};
@@ -124,6 +124,17 @@ struct Context<'a> {
     /// sites below don't each need a place of their own to hold one just to
     /// satisfy a borrow.
     claude_home: ClaudeHome,
+    /// `None` when Codex home resolution failed entirely (no home
+    /// directory) or `$CODEX_HOME`/`~/.codex` simply doesn't exist yet —
+    /// either way, no Codex sessions, not an error.
+    codex_home: Option<CodexHome>,
+    /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
+    agent_binaries: AgentBinaries,
+    /// `Config.agents`, resolved — which providers [`session::discover_all`]
+    /// is allowed to run at all. Also threaded into `App::with_enabled_agents`
+    /// so the empty-list placeholder can say why, when it's this and not a
+    /// genuinely empty machine.
+    enabled_agents: BTreeSet<AgentKind>,
     thresholds: &'a AgeThresholds,
     /// `RefCell`-wrapped — see `main`'s construction site for why.
     store: &'a RefCell<Store>,
@@ -205,9 +216,9 @@ pub(crate) struct LiveWatch {
 }
 
 impl LiveWatch {
-    pub(crate) fn new(claude_home: &ClaudeHome) -> Self {
+    pub(crate) fn new(claude_home: &ClaudeHome, codex_home: Option<&CodexHome>) -> Self {
         Self {
-            source: NotifyChangeSource::new(claude_home).ok(),
+            source: NotifyChangeSource::new(claude_home, codex_home).ok(),
             debouncer: Debouncer::new(DEBOUNCE_QUIET),
         }
     }
@@ -227,11 +238,17 @@ impl LiveWatch {
 
 pub fn run(
     claude_home: &ClaudeHome,
+    codex_home: Option<CodexHome>,
+    agent_binaries: AgentBinaries,
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
+    resolved_agents: ResolvedAgents,
 ) -> Result<()> {
-    let metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
+    // Computed before `resolved_agents.enabled` moves below.
+    let agents_notice = session::agents_ignored_notice(&resolved_agents);
+    let enabled_agents = resolved_agents.enabled;
+    let metas = session::discover_all(claude_home, codex_home.as_ref(), &enabled_agents)?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
@@ -258,9 +275,18 @@ pub fn run(
         .with_groups(groups, session_groups)
         .with_hidden_worker_ids(hidden)
         .with_directors(directors)
-        .with_superseded(superseded);
+        .with_superseded(superseded)
+        .with_enabled_agents(enabled_agents.clone());
+    // A one-time startup notice, not part of `Context`/reload — see
+    // `session::agents_ignored_notice`'s doc.
+    if let Some(notice) = agents_notice {
+        app.set_status(notice, Instant::now());
+    }
     let ctx = Context {
         claude_home: claude_home.clone(),
+        codex_home,
+        agent_binaries,
+        enabled_agents,
         thresholds,
         store,
         opener_mode,
@@ -283,9 +309,22 @@ pub fn run(
     result.and(restored)
 }
 
-/// Drop archived sessions from `rows` (soft-hide via `d` — see
-/// `App::open_confirm_archive_modal`/`confirm_modal`). A read failure is
-/// tolerated: nothing gets excluded rather than blocking the TUI.
+/// Drop archived sessions from `rows` — the union of two independent facts:
+/// banto's own archive (soft-hide via `d` — see
+/// `App::open_confirm_archive_modal`/`confirm_modal`), and, for Codex,
+/// `SessionRow::source_archived` (`threads.archived`, set by `codex
+/// archive`). Two facts, not one: banto's archive is per-session-id and
+/// product-neutral, entirely independent of whatever the session's own
+/// product thinks; `source_archived` is the reverse — a fact banto can only
+/// ever read, since `~/.codex` stays read-only to it (never a write, so
+/// never an unarchive from banto's side either). Either one hides the row;
+/// neither is cleared by the other disagreeing. Concretely: unarchiving in
+/// Codex (`codex unarchive`) clears `source_archived` on the next reload,
+/// and the row reappears *unless* the operator separately archived that
+/// same session in banto too, in which case it stays hidden until banto's
+/// own archive is lifted — a real store write, unaffected by anything
+/// Codex reports. A store read failure is tolerated: nothing gets excluded
+/// rather than blocking the TUI.
 pub(crate) fn exclude_archived(
     rows: Vec<session::SessionRow>,
     store: &Store,
@@ -297,7 +336,7 @@ pub(crate) fn exclude_archived(
         .map(|id| id.0)
         .collect();
     rows.into_iter()
-        .filter(|row| !archived.contains(&row.id))
+        .filter(|row| !row.source_archived && !archived.contains(&row.id))
         .collect()
 }
 
@@ -584,7 +623,7 @@ fn layout_areas(area: Rect) -> [Rect; 4] {
 /// `event::read()`) is what lets live updates land without waiting for the
 /// next keypress.
 fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
-    let mut watch = LiveWatch::new(&ctx.claude_home);
+    let mut watch = LiveWatch::new(&ctx.claude_home, ctx.codex_home.as_ref());
 
     loop {
         // Compute the layout up front so the viewport height and mouse
@@ -827,7 +866,14 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 cwd.display()
             ));
             *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
-                argv: opener::inplace_argv(None),
+                // Always Claude, deliberately ignoring `state`'s own agent
+                // choice: the chōba is feature-frozen (out of scope, not an
+                // oversight — see `opener::new_session_wrap_argv`'s doc for
+                // the split placement's identical reasoning), and its key
+                // dispatch never binds anything to
+                // `App::modal_toggle_new_session_agent`, so `state.agent()`
+                // can never actually be anything but the default here.
+                argv: opener::inplace_argv(AgentKind::ClaudeCode, None, &cwd, &ctx.agent_binaries),
                 startup_message: opener::new_session_startup_message(&cwd),
                 cwd,
             });
@@ -852,6 +898,7 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 SystemCommandRunner,
                 anchor.as_deref(),
                 wrap_log.as_deref(),
+                &ctx.agent_binaries,
             );
             ctx.log(&format!(
                 "confirm_new_session_modal (split) cwd={} outcome={outcome:?}",
@@ -1520,7 +1567,14 @@ fn activate(app: &mut App, ctx: &Context) {
     // Only consulted here — in-place mode has no pane map, so this is the
     // *only* double-resume guard, not a fallback for an untracked case.
     let live = read_live_sessions(&ctx.claude_home.sessions_dir());
-    match opener::decide_inplace_resume(&session, &SysinfoProbe, &live) {
+    let open_ctx = opener::OpenContext {
+        probe: &SysinfoProbe,
+        live: &live,
+        binaries: &ctx.agent_binaries,
+        codex_home: ctx.codex_home.as_ref(),
+        start_time: &SysinfoStartTime,
+    };
+    match opener::decide_inplace_resume(&session, &open_ctx) {
         Some(launch) => {
             ctx.log(&format!(
                 "activate (in-place) session={id} argv={:?} cwd={}",
@@ -1589,12 +1643,17 @@ fn activate_split(app: &mut App, ctx: &Context) {
     let live = read_live_sessions(&ctx.claude_home.sessions_dir());
     let outcome = opener::open_session(
         &ctx.store.borrow(),
-        &SysinfoProbe,
         backend,
         &session,
         SystemCommandRunner,
         anchor.as_deref(),
-        &live,
+        &opener::OpenContext {
+            probe: &SysinfoProbe,
+            live: &live,
+            binaries: &ctx.agent_binaries,
+            codex_home: ctx.codex_home.as_ref(),
+            start_time: &SysinfoStartTime,
+        },
     );
     ctx.log(&format!("activate_split open_session outcome={outcome:?}"));
     if let Ok(record) = ctx.store.borrow().get_pane(&SessionId(id.clone())) {
@@ -1672,7 +1731,11 @@ fn toggle_agent_filter(app: &mut App) {
 /// are kept rather than the TUI erroring out over a transient filesystem
 /// hiccup.
 fn reload(app: &mut App, ctx: &Context) {
-    if let Ok(metas) = ClaudeCodeProvider::new(ctx.claude_home.clone()).discover() {
+    if let Ok(metas) = session::discover_all(
+        &ctx.claude_home,
+        ctx.codex_home.as_ref(),
+        &ctx.enabled_agents,
+    ) {
         let store = ctx.store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);
         let rows = session::rows_from_metas(metas, &ctx.claude_home, ctx.thresholds);
@@ -1697,7 +1760,9 @@ fn render(frame: &mut Frame, app: &App, now: SystemTime) {
     view::render_summary(frame, app, summary_area, now);
     render_status(frame, app, status_area);
     if let Some(modal) = app.modal() {
-        render_modal(frame, modal, frame.area());
+        // `false`: the chōba binds no key to `App::modal_toggle_new_session_agent`
+        // (its new-session path is feature-frozen) — see `render_modal`'s doc.
+        render_modal(frame, modal, frame.area(), false);
     }
 }
 
@@ -1792,6 +1857,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         }
     }
 
@@ -1815,6 +1881,7 @@ mod tests {
             is_agent: false,
             preview: None,
             continuation_of_uuid: None,
+            source_archived: false,
         }
     }
 
@@ -1886,6 +1953,57 @@ mod tests {
         assert!(failed.borrow().contains(&SessionId("child".to_string())));
     }
 
+    // --- exclude_archived: banto's archive and Codex's own flag, unioned --
+
+    #[test]
+    fn exclude_archived_hides_a_row_banto_itself_archived() {
+        let store = Store::open_in_memory().unwrap();
+        store.archive_session(&SessionId("a".to_string())).unwrap();
+        let rows = vec![row("a", "A", "", Activity::Alive)];
+
+        assert!(exclude_archived(rows, &store).is_empty());
+    }
+
+    #[test]
+    fn exclude_archived_hides_a_row_only_codex_marked_archived() {
+        let store = Store::open_in_memory().unwrap();
+        // banto's own archive table has nothing for "a" at all — this row's
+        // only reason to be hidden is `source_archived`, set by discovery
+        // from Codex's own `threads.archived` (see `provider::codex`).
+        let rows = vec![SessionRow {
+            source_archived: true,
+            ..row("a", "A", "", Activity::Alive)
+        }];
+
+        assert!(exclude_archived(rows, &store).is_empty());
+    }
+
+    #[test]
+    fn exclude_archived_leaves_an_unarchived_row_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let rows = vec![row("a", "A", "", Activity::Alive)];
+
+        assert_eq!(exclude_archived(rows, &store).len(), 1);
+    }
+
+    #[test]
+    fn exclude_archived_stays_hidden_via_bantos_own_archive_even_after_codex_unarchives() {
+        // The disagreement case: the operator archived "a" in banto (`d`)
+        // independently of Codex; Codex's own `archived` flag has since
+        // gone back to false (`codex unarchive`, reflected on the next
+        // discovery as `source_archived: false`). The row stays hidden —
+        // banto's own archive is a separate fact banto never clears just
+        // because the source disagrees; only banto's own unarchive would.
+        let store = Store::open_in_memory().unwrap();
+        store.archive_session(&SessionId("a".to_string())).unwrap();
+        let rows = vec![SessionRow {
+            source_archived: false,
+            ..row("a", "A", "", Activity::Alive)
+        }];
+
+        assert!(exclude_archived(rows, &store).is_empty());
+    }
+
     /// A `Context` for tests exercising `handle_key`/`handle_normal_key`/
     /// `handle_search_key` directly — these are ordinary functions with no
     /// terminal dependency (only `resolve_escape` touches `event::poll`/
@@ -1910,6 +2028,9 @@ mod tests {
     ) -> Context<'a> {
         Context {
             claude_home: ClaudeHome::new(PathBuf::from(".")),
+            codex_home: None,
+            agent_binaries: AgentBinaries::default(),
+            enabled_agents: AgentKind::ALL.into_iter().collect(),
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,

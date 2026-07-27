@@ -1,7 +1,9 @@
 //! Filesystem watching for live TUI updates (phase 3).
 //!
-//! Watches `<claude_home>/projects/` and `<claude_home>/sessions/` with
-//! `notify`, debouncing bursts into coarse per-root change events:
+//! Watches `<claude_home>/projects/`, `<claude_home>/sessions/`, and —
+//! when a Codex home resolves — `<codex_home>/sessions/` (its rollout
+//! tree, see `CodexHome::rollout_dir`) with `notify`, debouncing bursts
+//! into coarse per-root change events:
 //! - [`debounce`] holds the debounce/merge logic as a pure function of
 //!   recorded timestamps and an injected `now`; fully unit-tested without a
 //!   real clock or filesystem.
@@ -28,6 +30,11 @@ pub enum WatchRoot {
     Projects,
     /// `<claude_home>/sessions/`: live-state `<pid>.json` files (activity).
     Sessions,
+    /// `<codex_home>/sessions/`: rollout transcript files (provider
+    /// discovery) — see `CodexHome::rollout_dir`. Never fires when no Codex
+    /// home was resolved; deliberately excludes Codex's sqlite files, see
+    /// `NotifyChangeSource::new`'s doc for why.
+    CodexSessions,
 }
 
 /// One raw, un-debounced change observed under a [`WatchRoot`].
