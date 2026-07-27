@@ -347,12 +347,28 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         }
 
         // A `PtyExited` handler drops the session's `Screen`; the handle
-        // itself (now pointing at a dead reader thread) is dropped here.
+        // itself (now pointing at a dead reader thread) is reaped here.
         // This is also why every core-side `screens` rekey must reach the
         // handle map (`Cmd::RekeyPty`): a handle left under a stale key
         // reads as "screen gone" and is reaped here, which on Unix closes
         // the PTY master and SIGHUPs a perfectly live child.
-        handles.retain(|key, _| state.screens.contains_key(key));
+        //
+        // The reaped handles are dropped on a thread of their own, and that
+        // is not tidiness. Closing a pseudoconsole can block until its
+        // output has been drained and its client has exited, and by the time
+        // a handle is dropped its reader thread is already gone — so the
+        // close waits for a drain that will never happen. Dropping inline
+        // froze the whole UI after `prefix x`: rendering had completed, the
+        // process sat at zero CPU, and no further input was ever read.
+        // Whatever the exact contract turns out to be, a teardown that can
+        // block must not run on the thread that serves the operator.
+        let reaped: Vec<PtyHandle> = handles
+            .extract_if(|key, _| !state.screens.contains_key(key))
+            .map(|(_, handle)| handle)
+            .collect();
+        if !reaped.is_empty() {
+            std::thread::spawn(move || drop(reaped));
+        }
 
         terminal.draw(|frame| draw(frame, app, &state, SystemTime::now()))?;
 
