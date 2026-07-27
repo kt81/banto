@@ -205,6 +205,7 @@ mod tests {
             preview: None,
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         }
     }
 

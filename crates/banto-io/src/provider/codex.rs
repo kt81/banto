@@ -50,7 +50,7 @@ impl SessionProvider for CodexProvider {
         }
         let conn = open_read_only(&db_path)?;
         let mut stmt = conn.prepare(
-            "SELECT id, title, cwd, rollout_path, first_user_message, updated_at_ms \
+            "SELECT id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived \
              FROM threads",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -61,6 +61,7 @@ impl SessionProvider for CodexProvider {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<bool>>(6)?,
             ))
         })?;
 
@@ -69,10 +70,13 @@ impl SessionProvider for CodexProvider {
             // unexpectedly-shaped) is skipped, not fatal to the whole scan.
             .flatten()
             .filter_map(
-                |(id, title, cwd, rollout_path, first_user_message, updated_at_ms)| {
+                |(id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived)| {
                     // `id` and `rollout_path` are what banto cannot function
                     // without; everything else degrades gracefully instead of
                     // dropping the row (see session_meta_from_row for size).
+                    // `archived` unset (a row from before `codex archive`
+                    // existed) reads as not archived, not "unknown" — the
+                    // same "no signal means visible" default `is_agent` uses.
                     Some(session_meta_from_row(
                         id?,
                         title,
@@ -80,6 +84,7 @@ impl SessionProvider for CodexProvider {
                         rollout_path?,
                         first_user_message,
                         updated_at_ms.unwrap_or_default(),
+                        archived.unwrap_or(false),
                     ))
                 },
             )
@@ -136,6 +141,7 @@ fn session_meta_from_row(
     rollout_path: String,
     first_user_message: Option<String>,
     updated_at_ms: i64,
+    archived: bool,
 ) -> SessionMeta {
     let rollout_path = PathBuf::from(rollout_path);
     // The one place this isn't just a SELECT: a missing rollout file (the
@@ -157,6 +163,7 @@ fn session_meta_from_row(
         // Codex has no auto-compaction-continuation concept banto tracks —
         // not "unknown", genuinely nothing to substitute.
         continuation_of_uuid: None,
+        source_archived: archived,
     }
 }
 
@@ -233,6 +240,7 @@ mod tests {
         rollout_path: &'a Path,
         first_user_message: Option<&'a str>,
         updated_at_ms: i64,
+        archived: bool,
     }
 
     impl<'a> ThreadRow<'a> {
@@ -244,6 +252,7 @@ mod tests {
                 rollout_path,
                 first_user_message: None,
                 updated_at_ms: 0,
+                archived: false,
             }
         }
     }
@@ -257,15 +266,16 @@ mod tests {
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         conn.execute_batch(CREATE_THREADS).unwrap();
         conn.execute(
-            "INSERT INTO threads (id, title, cwd, rollout_path, first_user_message, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO threads (id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 row.id,
                 row.title,
                 row.cwd,
                 row.rollout_path.to_string_lossy(),
                 row.first_user_message,
-                row.updated_at_ms
+                row.updated_at_ms,
+                row.archived
             ],
         )
         .unwrap();
@@ -324,10 +334,56 @@ mod tests {
         assert_eq!(meta.size, 5);
         assert!(!meta.is_agent);
         assert_eq!(meta.continuation_of_uuid, None);
+        assert!(!meta.source_archived);
         assert_eq!(
             meta.mtime,
             UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
         );
+    }
+
+    #[test]
+    fn discover_treats_a_null_archived_column_as_not_archived() {
+        // A row from before `codex archive` existed would have never
+        // written this column at all; SQLite reports that as NULL, not the
+        // schema's own `DEFAULT 0` (which only applies when an INSERT omits
+        // the column, not when it's explicitly NULL) — both must degrade to
+        // "not archived", not an error or a dropped row.
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        fs::create_dir_all(home.root()).unwrap();
+        let conn = Connection::open(home.threads_db_path()).unwrap();
+        conn.execute_batch(CREATE_THREADS).unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, archived) VALUES ('thread-1', ?1, NULL)",
+            rusqlite::params![rollout.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let sessions = provider(&dir).discover().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].source_archived);
+    }
+
+    #[test]
+    fn discover_reads_an_archived_thread() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        write_thread(
+            &home,
+            ThreadRow {
+                archived: true,
+                ..ThreadRow::new("thread-1", &rollout)
+            },
+            true,
+        );
+
+        let sessions = provider(&dir).discover().unwrap();
+        assert!(sessions[0].source_archived);
     }
 
     #[test]

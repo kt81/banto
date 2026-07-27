@@ -301,9 +301,22 @@ pub fn run(
     result.and(restored)
 }
 
-/// Drop archived sessions from `rows` (soft-hide via `d` — see
-/// `App::open_confirm_archive_modal`/`confirm_modal`). A read failure is
-/// tolerated: nothing gets excluded rather than blocking the TUI.
+/// Drop archived sessions from `rows` — the union of two independent facts:
+/// banto's own archive (soft-hide via `d` — see
+/// `App::open_confirm_archive_modal`/`confirm_modal`), and, for Codex,
+/// `SessionRow::source_archived` (`threads.archived`, set by `codex
+/// archive`). Two facts, not one: banto's archive is per-session-id and
+/// product-neutral, entirely independent of whatever the session's own
+/// product thinks; `source_archived` is the reverse — a fact banto can only
+/// ever read, since `~/.codex` stays read-only to it (never a write, so
+/// never an unarchive from banto's side either). Either one hides the row;
+/// neither is cleared by the other disagreeing. Concretely: unarchiving in
+/// Codex (`codex unarchive`) clears `source_archived` on the next reload,
+/// and the row reappears *unless* the operator separately archived that
+/// same session in banto too, in which case it stays hidden until banto's
+/// own archive is lifted — a real store write, unaffected by anything
+/// Codex reports. A store read failure is tolerated: nothing gets excluded
+/// rather than blocking the TUI.
 pub(crate) fn exclude_archived(
     rows: Vec<session::SessionRow>,
     store: &Store,
@@ -315,7 +328,7 @@ pub(crate) fn exclude_archived(
         .map(|id| id.0)
         .collect();
     rows.into_iter()
-        .filter(|row| !archived.contains(&row.id))
+        .filter(|row| !row.source_archived && !archived.contains(&row.id))
         .collect()
 }
 
@@ -1836,6 +1849,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         }
     }
 
@@ -1859,6 +1873,7 @@ mod tests {
             is_agent: false,
             preview: None,
             continuation_of_uuid: None,
+            source_archived: false,
         }
     }
 
@@ -1928,6 +1943,57 @@ mod tests {
 
         assert!(superseded.is_empty());
         assert!(failed.borrow().contains(&SessionId("child".to_string())));
+    }
+
+    // --- exclude_archived: banto's archive and Codex's own flag, unioned --
+
+    #[test]
+    fn exclude_archived_hides_a_row_banto_itself_archived() {
+        let store = Store::open_in_memory().unwrap();
+        store.archive_session(&SessionId("a".to_string())).unwrap();
+        let rows = vec![row("a", "A", "", Activity::Alive)];
+
+        assert!(exclude_archived(rows, &store).is_empty());
+    }
+
+    #[test]
+    fn exclude_archived_hides_a_row_only_codex_marked_archived() {
+        let store = Store::open_in_memory().unwrap();
+        // banto's own archive table has nothing for "a" at all — this row's
+        // only reason to be hidden is `source_archived`, set by discovery
+        // from Codex's own `threads.archived` (see `provider::codex`).
+        let rows = vec![SessionRow {
+            source_archived: true,
+            ..row("a", "A", "", Activity::Alive)
+        }];
+
+        assert!(exclude_archived(rows, &store).is_empty());
+    }
+
+    #[test]
+    fn exclude_archived_leaves_an_unarchived_row_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let rows = vec![row("a", "A", "", Activity::Alive)];
+
+        assert_eq!(exclude_archived(rows, &store).len(), 1);
+    }
+
+    #[test]
+    fn exclude_archived_stays_hidden_via_bantos_own_archive_even_after_codex_unarchives() {
+        // The disagreement case: the operator archived "a" in banto (`d`)
+        // independently of Codex; Codex's own `archived` flag has since
+        // gone back to false (`codex unarchive`, reflected on the next
+        // discovery as `source_archived: false`). The row stays hidden —
+        // banto's own archive is a separate fact banto never clears just
+        // because the source disagrees; only banto's own unarchive would.
+        let store = Store::open_in_memory().unwrap();
+        store.archive_session(&SessionId("a".to_string())).unwrap();
+        let rows = vec![SessionRow {
+            source_archived: false,
+            ..row("a", "A", "", Activity::Alive)
+        }];
+
+        assert!(exclude_archived(rows, &store).is_empty());
     }
 
     /// A `Context` for tests exercising `handle_key`/`handle_normal_key`/

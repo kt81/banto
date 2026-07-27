@@ -525,6 +525,7 @@ mod tests {
             preview: None,
             mtime,
             size: 0,
+            source_archived: false,
         }
     }
 

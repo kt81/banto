@@ -178,6 +178,9 @@ fn read_session(path: &Path) -> Option<SessionMeta> {
         is_agent: fields.is_agent,
         preview,
         continuation_of_uuid: fields.continuation_of_uuid,
+        // No equivalent signal exists yet — see SessionMeta::source_archived's
+        // doc for why false, not a guess, is the correct value here.
+        source_archived: false,
     })
 }
 
