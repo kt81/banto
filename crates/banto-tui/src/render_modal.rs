@@ -159,11 +159,17 @@ pub fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 /// there is nothing to blank behind it — the one-column widen is solely to
 /// neutralize a background full-width character straddling the border
 /// itself (see [`modal_clear_area`]).
-pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
+/// `agent_choice`: whether the host binds a key to
+/// `App::modal_toggle_new_session_agent` (the emporium does; the chōba
+/// doesn't — its new-session path is feature-frozen, see
+/// `banto::opener::new_session_wrap_argv`'s doc). Only
+/// [`render_new_session_modal`] reads it, to decide whether to advertise a
+/// key the host wouldn't actually honor.
+pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_choice: bool) {
     let area = modal_area(full_area);
     frame.render_widget(Clear, modal_clear_area(full_area));
     match modal {
-        Modal::NewSession(state) => render_new_session_modal(frame, state, area),
+        Modal::NewSession(state) => render_new_session_modal(frame, state, area, agent_choice),
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
         Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
         Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
@@ -180,16 +186,35 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
 /// when the last confirm attempt failed (see `App::modal_set_error`), and
 /// a substring-filtered list of previously seen cwds to pick from instead of
 /// typing a full path (Tab completes the highlighted one into the input).
-fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Rect) {
+/// The title always names the agent it would launch (`NewSessionState::agent`
+/// defaults to Claude and only the emporium can change it — see
+/// `render_modal`'s doc), matching how it already names the placement
+/// regardless of which key opened the modal; the bottom hint only
+/// advertises the toggle key when `agent_choice` says the host actually
+/// binds it, so the chōba never shows a key that would do nothing.
+fn render_new_session_modal(
+    frame: &mut Frame,
+    state: &NewSessionState,
+    area: Rect,
+    agent_choice: bool,
+) {
     let placement_label = match state.placement() {
         NewSessionPlacement::InPlace => "in-place",
         NewSessionPlacement::Split => "split",
     };
+    let hint = if agent_choice {
+        " Enter launch  Tab complete  Shift-Tab agent  Esc cancel "
+    } else {
+        " Enter launch  Tab complete  Esc cancel "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(" New Session ({placement_label}) \u{2014} cwd "))
-        .title_bottom(" Enter launch  Tab complete  Esc cancel ");
+        .title(format!(
+            " New Session ({placement_label}) \u{2014} cwd \u{2014} {} ",
+            state.agent().label()
+        ))
+        .title_bottom(hint);
     let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
@@ -429,6 +454,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use banto_core::app::App;
+
     use super::*;
 
     #[test]
@@ -582,7 +609,7 @@ mod tests {
                 // leave a dangling half-glyph once the border overwrote
                 // only the continuation cell.
                 frame.render_widget(Span::raw("あ"), Rect::new(1, 5, 2, 1));
-                render_modal(frame, &modal, area);
+                render_modal(frame, &modal, area, false);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -609,7 +636,7 @@ mod tests {
                 // `modal_area_shrinks_margin_in_a_narrow_pane_...`:
                 // width 36 starting at x=2 ends at column 37).
                 frame.render_widget(Span::raw("あ"), Rect::new(38, 5, 2, 1));
-                render_modal(frame, &modal, area);
+                render_modal(frame, &modal, area, false);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -619,6 +646,57 @@ mod tests {
         // ...and the adjacent glyph was neutralized rather than left
         // dangling at the very edge of the frame.
         assert_eq!(buf.cell((38, 5)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn new_session_modal_title_names_the_current_agent() {
+        let mut app = App::new(Vec::new());
+        app.open_new_session_modal();
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+
+        let area = Rect::new(2, 2, 50, 10);
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render_new_session_modal(frame, state, area, false))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            text.contains("Claude"),
+            "expected the default agent named in the title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn new_session_modal_hint_only_advertises_the_agent_toggle_when_available() {
+        let mut app = App::new(Vec::new());
+        app.open_new_session_modal();
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected an open new-session modal");
+        };
+
+        let area = Rect::new(2, 2, 60, 10);
+        let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
+
+        terminal
+            .draw(|frame| render_new_session_modal(frame, state, area, false))
+            .unwrap();
+        let without_toggle = buffer_text(terminal.backend().buffer());
+        assert!(
+            !without_toggle.contains("Shift-Tab"),
+            "the chōba never binds the toggle, so its hint must not advertise it:\n{without_toggle}"
+        );
+
+        terminal
+            .draw(|frame| render_new_session_modal(frame, state, area, true))
+            .unwrap();
+        let with_toggle = buffer_text(terminal.backend().buffer());
+        assert!(
+            with_toggle.contains("Shift-Tab"),
+            "the emporium binds the toggle, so its hint should advertise it:\n{with_toggle}"
+        );
     }
 
     #[test]

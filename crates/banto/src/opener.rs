@@ -595,11 +595,13 @@ fn wrap_argv(
 /// `BANTO_WRAP_LOG` from its own environment would silently produce no
 /// diagnostic log at all — see `crate::wrap::WrapLog::new`'s doc comment.
 ///
-/// Always launches Claude: the new-session modal this feeds has no agent
-/// axis of its own, and the chōba (`crate::tui`) is feature-frozen — adding
-/// one is out of scope, not an oversight. `binaries` still resolves which
-/// `claude` binary, for the same configurability every other launch site
-/// gets.
+/// Always launches Claude: only the chōba's own split placement (`crate::tui`)
+/// reaches this — the emporium's new-session path never opens a real
+/// terminal-multiplexer split (see `engine::update_new_session_cwd_checked`) —
+/// and the chōba is feature-frozen, so the modal's own agent choice (which
+/// only the emporium's key dispatch can ever move off the default) is out of
+/// scope here, not an oversight. `binaries` still resolves which `claude`
+/// binary, for the same configurability every other launch site gets.
 fn new_session_wrap_argv(
     exe: Option<&str>,
     cwd: &Path,

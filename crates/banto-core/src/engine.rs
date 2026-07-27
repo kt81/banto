@@ -1321,6 +1321,13 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
             app.modal_complete_candidate();
             Vec::new()
         }
+        // New-session modal only (see `App::modal_toggle_new_session_agent`'s
+        // doc for why the chōba has no equivalent binding); a no-op for
+        // every other modal kind, same as `modal_complete_candidate` above.
+        KeyCode::BackTab => {
+            app.modal_toggle_new_session_agent();
+            Vec::new()
+        }
         KeyCode::Backspace => {
             app.modal_backspace();
             Vec::new()
@@ -1438,6 +1445,8 @@ fn update_new_session_cwd_checked(
         app.modal_set_error(format!("{} is not a directory", cwd.display()));
         return Vec::new();
     }
+    // Read before `close_modal` drops the `NewSessionState` this came from.
+    let agent = app.modal_new_session_agent();
     app.close_modal();
     let key = state.mint_plain_key(&cwd);
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
@@ -1445,7 +1454,7 @@ fn update_new_session_cwd_checked(
         key,
         target: SessionToOpen {
             id: String::new(),
-            agent: AgentKind::ClaudeCode,
+            agent,
             title: cwd.display().to_string(),
             cwd,
         },
@@ -4258,6 +4267,47 @@ mod tests {
                 assert!(key.is_synthetic());
                 assert_eq!(target.id, "");
                 assert_eq!(target.cwd, PathBuf::from("/work/alpha"));
+                assert_eq!(target.agent, AgentKind::ClaudeCode);
+            }
+            other => panic!("expected a single OpenEmbedded cmd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_session_modal_backtab_toggles_the_agent_and_the_open_reflects_it() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("s1")]);
+        app.open_new_session_modal();
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::BackTab,
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert_eq!(app.modal_new_session_agent(), AgentKind::Codex);
+
+        press_enter(&mut state, &mut app, &brigade, now);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked {
+                cwd: PathBuf::from("/work/alpha"),
+                is_dir: true,
+            },
+            now,
+        );
+
+        match cmds.as_slice() {
+            [Cmd::OpenEmbedded { target, .. }] => {
+                assert_eq!(target.agent, AgentKind::Codex);
             }
             other => panic!("expected a single OpenEmbedded cmd, got {other:?}"),
         }

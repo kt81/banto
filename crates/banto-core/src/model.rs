@@ -27,6 +27,29 @@ pub enum AgentKind {
     Codex,
 }
 
+impl AgentKind {
+    /// Short product name for display (the row list's agent column, the
+    /// new-session modal) — never abbreviated or iconified: no single emoji
+    /// names an agent product (see `banto_tui::view`'s module doc's "Emoji
+    /// markers" section for why the row markers stay icons while this stays
+    /// text).
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "Claude",
+            AgentKind::Codex => "Codex",
+        }
+    }
+
+    /// The other product — the new-session modal's only choice, since there
+    /// are exactly two.
+    pub fn toggle(self) -> Self {
+        match self {
+            AgentKind::ClaudeCode => AgentKind::Codex,
+            AgentKind::Codex => AgentKind::ClaudeCode,
+        }
+    }
+}
+
 /// Metadata for one discovered session, provider-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMeta {
