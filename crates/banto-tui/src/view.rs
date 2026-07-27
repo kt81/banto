@@ -21,6 +21,17 @@
 //! emoji, which would lose the theme colors and this codebase's
 //! production-proven narrow (1-column) rendering.
 //!
+//! # Colour
+//!
+//! Truecolor is assumed; the 16- and 256-colour palettes are not a
+//! constraint on what may be chosen here (operator's call — the terminals
+//! this is used from are all rich, and the agents it hosts paint freely
+//! themselves). Named colours are still the right default for *status*,
+//! where following the reader's theme is the point — the activity dot
+//! keeps them. Identity is the exception: an agent's accent names an
+//! absolute colour, because the point of it is that a product looks like
+//! itself rather than like the reader's palette.
+//!
 //! # Row layout
 //!
 //! One algorithm, driven by the render area's width and whether grouped
@@ -315,23 +326,18 @@ fn agent_label(row: &SessionRow) -> String {
     format!("[{}]", row.agent.label())
 }
 
-/// Per-product accent for the agent label — clear of every colour the
-/// activity dot already uses (Green/Cyan/Yellow/Gray/DarkGray) so the two
-/// colours sharing a row don't compete. Plain `Blue` is avoided on purpose:
-/// many default 16-colour schemes render it close to black, the same
-/// unreadable-on-dark failure that got an emoji rejected here once.
+/// Each product's own accent, absolute rather than themed — see the module
+/// doc's "Colour" section for why identity is the one thing here that does
+/// not follow the reader's palette. Claude's orange and Codex's teal are
+/// each that product's own; they also happen to sit on opposite sides of
+/// the wheel, which is what keeps them apart at a glance in a mixed list.
 ///
-/// Claude's is the one place this file names an absolute colour rather than
-/// a themed one. The operator asked for orange, and orange has no ANSI
-/// name — the nearest candidates are a dark olive `Yellow` (already the
-/// dot's) and a pink-red `LightRed`. An identity marker is also the case
-/// where following the reader's theme is least useful: the point is that
-/// Claude looks like Claude. Codex keeps a themed colour because nothing
-/// about it needs a specific hue, only contrast with the other one.
+/// Both stay off the activity dot's hues so the two coloured things in one
+/// row don't read as related.
 fn agent_label_color(agent: AgentKind) -> Color {
     match agent {
         AgentKind::ClaudeCode => Color::Rgb(217, 119, 87),
-        AgentKind::Codex => Color::LightBlue,
+        AgentKind::Codex => Color::Rgb(16, 163, 127),
     }
 }
 
@@ -1181,28 +1187,18 @@ mod tests {
     }
 
     #[test]
-    fn agent_label_color_differs_by_product_and_avoids_plain_blue() {
+    fn agent_label_color_differs_by_product_and_avoids_the_activity_dot() {
         let claude = agent_label_color(AgentKind::ClaudeCode);
         let codex = agent_label_color(AgentKind::Codex);
         assert_ne!(
             claude, codex,
             "the two products should be visually distinguishable"
         );
-        assert_ne!(
-            claude,
-            Color::Blue,
-            "plain Blue is the classic hard-to-read-on-dark terminal colour"
-        );
-        assert_ne!(
-            codex,
-            Color::Blue,
-            "plain Blue is the classic hard-to-read-on-dark terminal colour"
-        );
 
         // The doc above claims these stay clear of the activity dot's own
-        // palette so the two coloured things in a row don't compete. Pin it:
-        // the claim is the reason the colours were chosen, and nothing else
-        // would notice if a later edit collided with the dot.
+        // palette so the two coloured things in a row don't read as related.
+        // Pin it: nothing else would notice a later edit colliding with the
+        // dot until someone looked at a row and wondered why.
         for dot in [
             Color::Green,
             Color::Cyan,
