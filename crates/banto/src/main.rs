@@ -26,9 +26,12 @@
 //! resolution order (see [`load_config`]).
 //!
 //! `Config.agents` gates which products get discovered at all — resolved
-//! once here via `banto_core::config::resolve_agents` into `enabled_agents`
+//! once here via `banto_core::config::resolve_agents` into `resolved_agents`
 //! and passed down to every entry point, since `session::discover_all` (not
 //! any of these) is what actually decides which provider runs.
+//! `ResolvedAgents::ignored` is where a name banto didn't recognize ends up;
+//! `tui::run`/`embedded::run_emporium` are the ones that tell the operator
+//! about it, once, at startup — see `session::agents_ignored_notice`.
 
 mod embedded;
 mod mcp;
@@ -170,7 +173,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config(cli.config.as_deref())?;
 
-    let enabled_agents = banto_core::config::resolve_agents(&config.agents);
+    let resolved_agents = banto_core::config::resolve_agents(&config.agents);
 
     match cli.command {
         Some(Command::List) => {
@@ -181,7 +184,7 @@ fn main() -> Result<()> {
                 &claude_home,
                 codex_home.as_ref(),
                 &thresholds,
-                &enabled_agents,
+                &resolved_agents.enabled,
             )
         }
         Some(Command::Wrap {
@@ -255,7 +258,7 @@ fn main() -> Result<()> {
                         brigade: &config.brigade,
                         keys: &config.keys,
                         agent_binaries: &config.agent_binaries,
-                        enabled_agents: &enabled_agents,
+                        resolved_agents: &resolved_agents,
                     },
                 )
             } else {
@@ -266,7 +269,7 @@ fn main() -> Result<()> {
                     &thresholds,
                     config.opener,
                     &store,
-                    enabled_agents,
+                    resolved_agents,
                 )
             }
         }

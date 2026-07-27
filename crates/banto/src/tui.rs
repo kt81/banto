@@ -33,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 use banto_core::app::{
     App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessionPlacement, OpenAction,
 };
-use banto_core::config::{AgentBinaries, OpenerMode};
+use banto_core::config::{AgentBinaries, OpenerMode, ResolvedAgents};
 use banto_core::model::{AgentKind, SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
@@ -243,8 +243,11 @@ pub fn run(
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
-    enabled_agents: BTreeSet<AgentKind>,
+    resolved_agents: ResolvedAgents,
 ) -> Result<()> {
+    // Computed before `resolved_agents.enabled` moves below.
+    let agents_notice = session::agents_ignored_notice(&resolved_agents);
+    let enabled_agents = resolved_agents.enabled;
     let metas = session::discover_all(claude_home, codex_home.as_ref(), &enabled_agents)?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
@@ -274,6 +277,11 @@ pub fn run(
         .with_directors(directors)
         .with_superseded(superseded)
         .with_enabled_agents(enabled_agents.clone());
+    // A one-time startup notice, not part of `Context`/reload — see
+    // `session::agents_ignored_notice`'s doc.
+    if let Some(notice) = agents_notice {
+        app.set_status(notice, Instant::now());
+    }
     let ctx = Context {
         claude_home: claude_home.clone(),
         codex_home,

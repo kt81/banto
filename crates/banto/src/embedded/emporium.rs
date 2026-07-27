@@ -40,7 +40,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
-use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig};
+use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
     self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
     SessionKey, Stage, StoreIntent, layout, stage_tiles,
@@ -86,7 +86,10 @@ pub struct EmporiumSettings<'a> {
     /// `[agent_binaries]` — see `crate::opener::agent_binary`.
     pub agent_binaries: &'a AgentBinaries,
     /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
-    pub enabled_agents: &'a BTreeSet<AgentKind>,
+    /// The whole [`ResolvedAgents`], not just its `enabled` set, so [`run`]
+    /// can also post the startup notice for a name it had to ignore (see
+    /// `session::agents_ignored_notice`).
+    pub resolved_agents: &'a ResolvedAgents,
 }
 
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
@@ -100,7 +103,7 @@ pub fn run(
     let brigade = settings.brigade;
     let keys = settings.keys;
     let agent_binaries = settings.agent_binaries;
-    let enabled_agents = settings.enabled_agents;
+    let enabled_agents = &settings.resolved_agents.enabled;
     // Janitor: purge brigades with no members left (legacy pre-v7 data, or
     // residue from a crash mid-formation) before the sidebar's brigade-
     // derived caches (hidden Workers, Directors) load. Silent by design — an
@@ -150,6 +153,9 @@ pub fn run(
         // stays the default of 1.
         .with_lines_per_row(2)
         .with_enabled_agents(enabled_agents.clone());
+    if let Some(notice) = session::agents_ignored_notice(settings.resolved_agents) {
+        app.set_status(notice, Instant::now());
+    }
 
     let deps = Deps {
         claude_home,

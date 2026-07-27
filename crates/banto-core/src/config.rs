@@ -252,6 +252,26 @@ pub struct Config {
     pub db_path: Option<PathBuf>,
 }
 
+/// The result of resolving [`Config::agents`]: the working set, plus enough
+/// of what [`resolve_agents`] discarded along the way for a caller to tell
+/// the operator about it (see that function's doc for why dropped names are
+/// tracked at all rather than simply vanishing).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedAgents {
+    /// The agent products banto should actually discover sessions for.
+    pub enabled: BTreeSet<AgentKind>,
+    /// Names from a non-empty setting that matched no known product, in the
+    /// order they first appeared, each listed once even if repeated. Empty
+    /// for `""`/`"all"`, or when every name in the list was recognized.
+    pub ignored: Vec<String>,
+    /// Whether every name in a non-empty setting went unrecognized, so
+    /// `enabled` fell back to [`AgentKind::ALL`] rather than reflecting
+    /// anything the operator actually wrote — worse than [`Self::ignored`]
+    /// being merely non-empty: there, the setting still did *something*;
+    /// here, it silently did nothing at all.
+    pub fell_back_to_all: bool,
+}
+
 /// Resolve [`Config::agents`] into the set of agent products banto should
 /// discover sessions for. Empty (including an absent field, which
 /// deserializes to the empty string) or `"all"` (case-insensitive) resolves
@@ -267,26 +287,54 @@ pub struct Config {
 /// (`RelayMode`'s unknown value falls back to the working default, a
 /// malformed file falls back to the full default `Config`). So if every
 /// name in a non-empty setting goes unrecognized — a typo, or a product this
-/// build has never heard of — the result is [`AgentKind::ALL`] too, the same
-/// as leaving `agents` unset, rather than an empty set that would silently
-/// discover nothing with no visible cause.
-pub fn resolve_agents(raw: &str) -> BTreeSet<AgentKind> {
+/// build has never heard of — [`ResolvedAgents::enabled`] is
+/// [`AgentKind::ALL`] too, the same as leaving `agents` unset, rather than
+/// an empty set that would silently discover nothing with no visible cause.
+///
+/// Dropping a name silently would still leave the operator with no way to
+/// find a typo short of reading this function's source, so every
+/// unrecognized name is recorded in [`ResolvedAgents::ignored`] — this
+/// function only collects the fact; deciding whether and how to tell the
+/// operator (a status line, today) is `banto`'s job, not this crate's (see
+/// this module's doc: no I/O, no UI, here).
+pub fn resolve_agents(raw: &str) -> ResolvedAgents {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
-        return AgentKind::ALL.into_iter().collect();
+        return ResolvedAgents {
+            enabled: AgentKind::ALL.into_iter().collect(),
+            ignored: Vec::new(),
+            fell_back_to_all: false,
+        };
     }
+    let mut ignored = Vec::new();
     let recognized: BTreeSet<AgentKind> = trimmed
         .split(',')
-        .filter_map(|name| match name.trim().to_ascii_lowercase().as_str() {
-            "claude" => Some(AgentKind::ClaudeCode),
-            "codex" => Some(AgentKind::Codex),
-            _ => None,
+        .filter_map(|name| {
+            let name = name.trim();
+            match name.to_ascii_lowercase().as_str() {
+                "claude" => Some(AgentKind::ClaudeCode),
+                "codex" => Some(AgentKind::Codex),
+                _ => {
+                    if !ignored.iter().any(|seen: &String| seen == name) {
+                        ignored.push(name.to_string());
+                    }
+                    None
+                }
+            }
         })
         .collect();
     if recognized.is_empty() {
-        AgentKind::ALL.into_iter().collect()
+        ResolvedAgents {
+            enabled: AgentKind::ALL.into_iter().collect(),
+            ignored,
+            fell_back_to_all: true,
+        }
     } else {
-        recognized
+        ResolvedAgents {
+            enabled: recognized,
+            ignored,
+            fell_back_to_all: false,
+        }
     }
 }
 
@@ -481,29 +529,36 @@ mod tests {
 
     // -- resolve_agents ------------------------------------------------
 
+    fn all_agents() -> BTreeSet<AgentKind> {
+        AgentKind::ALL.into_iter().collect()
+    }
+
     #[test]
     fn resolve_agents_empty_means_all() {
-        assert_eq!(
-            resolve_agents(""),
-            AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
-        );
+        let resolved = resolve_agents("");
+        assert_eq!(resolved.enabled, all_agents());
+        assert!(resolved.ignored.is_empty());
+        assert!(!resolved.fell_back_to_all);
     }
 
     #[test]
     fn resolve_agents_all_is_case_insensitive_and_trims_whitespace() {
         for text in ["all", "ALL", "All", "  all  "] {
-            assert_eq!(
-                resolve_agents(text),
-                AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
-            );
+            let resolved = resolve_agents(text);
+            assert_eq!(resolved.enabled, all_agents());
+            assert!(resolved.ignored.is_empty());
+            assert!(!resolved.fell_back_to_all);
         }
     }
 
     #[test]
     fn resolve_agents_single_name() {
-        assert_eq!(resolve_agents("codex"), BTreeSet::from([AgentKind::Codex]));
         assert_eq!(
-            resolve_agents("claude"),
+            resolve_agents("codex").enabled,
+            BTreeSet::from([AgentKind::Codex])
+        );
+        assert_eq!(
+            resolve_agents("claude").enabled,
             BTreeSet::from([AgentKind::ClaudeCode])
         );
     }
@@ -511,36 +566,49 @@ mod tests {
     #[test]
     fn resolve_agents_comma_separated_list_is_case_insensitive_and_trims_whitespace() {
         assert_eq!(
-            resolve_agents(" Claude ,CODEX "),
+            resolve_agents(" Claude ,CODEX ").enabled,
             BTreeSet::from([AgentKind::ClaudeCode, AgentKind::Codex])
         );
     }
 
     #[test]
     fn resolve_agents_drops_an_unrecognized_name_alongside_a_recognized_one() {
-        assert_eq!(
-            resolve_agents("claude,made-up-product"),
-            BTreeSet::from([AgentKind::ClaudeCode])
+        let resolved = resolve_agents("claude,made-up-product");
+        assert_eq!(resolved.enabled, BTreeSet::from([AgentKind::ClaudeCode]));
+        assert_eq!(resolved.ignored, vec!["made-up-product".to_string()]);
+        assert!(
+            !resolved.fell_back_to_all,
+            "a partial drop still used a real name, not the fallback"
         );
     }
 
     #[test]
     fn resolve_agents_falls_back_to_all_when_nothing_is_recognized() {
+        let single = resolve_agents("made-up-product");
+        assert_eq!(single.enabled, all_agents());
+        assert_eq!(single.ignored, vec!["made-up-product".to_string()]);
+        assert!(single.fell_back_to_all);
+
+        let list = resolve_agents("nonsense,also-nonsense");
+        assert_eq!(list.enabled, all_agents());
         assert_eq!(
-            resolve_agents("made-up-product"),
-            AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
+            list.ignored,
+            vec!["nonsense".to_string(), "also-nonsense".to_string()]
         );
-        assert_eq!(
-            resolve_agents("nonsense,also-nonsense"),
-            AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
-        );
+        assert!(list.fell_back_to_all);
     }
 
     #[test]
     fn resolve_agents_a_repeated_name_still_yields_one_entry() {
         assert_eq!(
-            resolve_agents("codex,codex"),
+            resolve_agents("codex,codex").enabled,
             BTreeSet::from([AgentKind::Codex])
         );
+    }
+
+    #[test]
+    fn resolve_agents_a_repeated_unrecognized_name_is_listed_once() {
+        let resolved = resolve_agents("claude,made-up,made-up");
+        assert_eq!(resolved.ignored, vec!["made-up".to_string()]);
     }
 }

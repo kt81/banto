@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
-use banto_core::config::ActivityConfig;
+use banto_core::config::{ActivityConfig, ResolvedAgents};
 pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::AgeThresholds;
@@ -44,6 +44,39 @@ pub fn activity_tag(activity: Activity) -> &'static str {
         Activity::Idle(AgeBucket::ThisWeek) => "week",
         Activity::Idle(AgeBucket::Older) => "older",
     }
+}
+
+/// The startup notice for `Config.agents`, when [`resolve_agents`] had to
+/// ignore part of it — `None` when every name parsed cleanly (including the
+/// ordinary `all`/unset case, which never has anything to ignore). Shared
+/// by both `crate::tui::run` and `crate::embedded::run_emporium`, the two
+/// entry points with a status line to put this in; the `list` subcommand
+/// has no such line and doesn't call this.
+///
+/// Fires for a partial drop too, not only the total fallback: even when
+/// some names were recognized and the setting still did something real, a
+/// silently-dropped name is still a typo the operator would want to know
+/// about — `ResolvedAgents::fell_back_to_all` only changes the wording
+/// (naming what's still in effect vs. saying the setting did nothing at
+/// all), not whether the notice appears.
+///
+/// [`resolve_agents`]: banto_core::config::resolve_agents
+pub fn agents_ignored_notice(resolved: &ResolvedAgents) -> Option<String> {
+    if resolved.ignored.is_empty() {
+        return None;
+    }
+    let names = resolved.ignored.join(", ");
+    Some(if resolved.fell_back_to_all {
+        format!("agents: no recognized name in \"{names}\" — showing every product")
+    } else {
+        let kept = resolved
+            .enabled
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("agents: ignored unknown name(s) \"{names}\" — showing {kept}")
+    })
 }
 
 /// Discover sessions under `claude_home` (and `codex_home`, when resolved
@@ -240,6 +273,42 @@ mod tests {
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Today)), "today");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::ThisWeek)), "week");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Older)), "older");
+    }
+
+    // -- agents_ignored_notice -------------------------------------------
+
+    #[test]
+    fn agents_ignored_notice_is_none_when_nothing_was_ignored() {
+        assert_eq!(
+            agents_ignored_notice(&banto_core::config::resolve_agents("")),
+            None
+        );
+        assert_eq!(
+            agents_ignored_notice(&banto_core::config::resolve_agents("all")),
+            None
+        );
+        assert_eq!(
+            agents_ignored_notice(&banto_core::config::resolve_agents("claude,codex")),
+            None
+        );
+    }
+
+    #[test]
+    fn agents_ignored_notice_names_the_dropped_name_and_what_survived() {
+        let resolved = banto_core::config::resolve_agents("claude,made-up-product");
+        let notice = agents_ignored_notice(&resolved).unwrap();
+        assert!(notice.contains("made-up-product"), "{notice}");
+        assert!(notice.contains("Claude"), "{notice}");
+        // A partial drop, not a total one — must not claim the fallback.
+        assert!(!notice.contains("every product"), "{notice}");
+    }
+
+    #[test]
+    fn agents_ignored_notice_says_it_fell_back_when_nothing_was_recognized() {
+        let resolved = banto_core::config::resolve_agents("made-up-product");
+        let notice = agents_ignored_notice(&resolved).unwrap();
+        assert!(notice.contains("made-up-product"), "{notice}");
+        assert!(notice.contains("every product"), "{notice}");
     }
 
     #[test]

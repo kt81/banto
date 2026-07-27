@@ -209,14 +209,29 @@ discovery doesn't even read.
 `Config.agents` (a plain string, default `""`) selects which agent products
 banto discovers sessions for: `"all"` — also what an absent or empty string
 means — or a comma-separated list of product names (`claude`, `codex`).
-`banto_core::config::resolve_agents` resolves it into a `BTreeSet<AgentKind>`;
-`"all"` means every product this build currently supports
+`banto_core::config::resolve_agents` resolves it into a `ResolvedAgents`
+(`enabled: BTreeSet<AgentKind>`, plus `ignored`/`fell_back_to_all` — see
+below); `"all"` means every product this build currently supports
 (`AgentKind::ALL`), not a wildcard reserved for products that don't exist
 yet. An unrecognized name is dropped, not rejected — this crate's config
 layer is lenient by design (a broken setting must never prevent startup) —
-but if *every* name in a non-empty setting goes unrecognized, the whole
-thing falls back to `all` rather than an empty set that would silently
-discover nothing with no visible cause.
+but if *every* name in a non-empty setting goes unrecognized, `enabled`
+falls back to `all` rather than an empty set that would silently discover
+nothing with no visible cause.
+
+**The ignored-name notice.** A dropped name still needs to be discoverable
+by the operator, or a typo is indistinguishable from `all` with no way to
+find out short of reading the source. `ResolvedAgents.ignored` records every
+unrecognized name (deduplicated, first-seen order); `session::agents_ignored_notice`
+turns that into one line, posted once via `App::set_status` right after
+`App::new` in both `tui::run` and `embedded::run_emporium` — the two
+entry points with a status line to put it in (the `list` subcommand has
+none, and doesn't call this). Fires for a partial drop too, not only the
+total fallback: an operator who kept a real, working filter is still owed
+the fact that part of what they wrote silently did nothing.
+`ResolvedAgents.fell_back_to_all` only changes the wording (naming what's
+still enabled vs. saying the setting had no effect at all) — both cases
+show the notice.
 
 **Applies at discovery, not display — deliberately breaking precedent.**
 Every other row filter in this codebase (`App::show_agents`,
