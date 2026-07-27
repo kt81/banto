@@ -6,11 +6,12 @@
 //! here writes to disk. Everything under `claude_home` is treated as
 //! strictly read-only.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::ActivityConfig;
 pub use banto_core::model::SessionRow;
-use banto_core::model::{Activity, AgeBucket, SessionMeta};
+use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
@@ -45,12 +46,12 @@ pub fn activity_tag(activity: Activity) -> &'static str {
     }
 }
 
-/// Discover sessions under `claude_home` (and `codex_home`, when resolved),
-/// classify their activity, and return them sorted by mtime descending
-/// (newest first), with session id as a deterministic tie-breaker. A thin
-/// wrapper — [`discover_all`], then [`rows_from_metas`] — kept for callers
-/// that only want rows and have no reason to run a second discovery pass of
-/// their own.
+/// Discover sessions under `claude_home` (and `codex_home`, when resolved
+/// and enabled), classify their activity, and return them sorted by mtime
+/// descending (newest first), with session id as a deterministic
+/// tie-breaker. A thin wrapper — [`discover_all`], then [`rows_from_metas`]
+/// — kept for callers that only want rows and have no reason to run a
+/// second discovery pass of their own.
 ///
 /// Read-only: this reads `<claude_home>/projects`, `<claude_home>/sessions`,
 /// and `codex_home`'s `threads` database, and never writes anywhere.
@@ -58,22 +59,43 @@ pub fn load_rows(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
+    enabled: &BTreeSet<AgentKind>,
 ) -> Result<Vec<SessionRow>, ProviderError> {
-    let metas = discover_all(claude_home, codex_home)?;
+    let metas = discover_all(claude_home, codex_home, enabled)?;
     Ok(rows_from_metas(metas, claude_home, thresholds))
 }
 
-/// Every session both providers know about, merged (not deduplicated: the
-/// two products never share a session id). Codex is skipped entirely when
-/// `codex_home` is `None` — an absent Codex home degrades to "no Codex
-/// sessions", not an error, the same way a missing `threads` database
-/// inside [`CodexProvider::discover`] does.
+/// Every session every *enabled* provider knows about, merged (not
+/// deduplicated: the two products never share a session id).
+///
+/// `enabled` (resolved from `Config::agents` by
+/// `banto_core::config::resolve_agents`) gates which provider *runs at
+/// all*, not which of its already-discovered rows get kept — unlike
+/// `App::show_agents`/`crate::tui::exclude_archived`, which both filter
+/// rows banto has already read off disk. That distinction matters here
+/// specifically: `CodexProvider::discover` opens a foreign sqlite database,
+/// under a read-only exception this crate had to earn (see
+/// `crate::codex_home`/`crate::sqlite_ro`'s docs). An operator who has
+/// switched Codex off should have banto never touch that file, not have
+/// banto read it and then discard the result — so a disabled product's
+/// provider is never constructed, let alone called.
+///
+/// Codex is additionally skipped whenever `codex_home` is `None` — an
+/// absent Codex home degrades to "no Codex sessions", not an error, the
+/// same way a missing `threads` database inside [`CodexProvider::discover`]
+/// does — independent of whether Codex is enabled.
 pub fn discover_all(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
+    enabled: &BTreeSet<AgentKind>,
 ) -> Result<Vec<SessionMeta>, ProviderError> {
-    let mut metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
-    if let Some(codex_home) = codex_home {
+    let mut metas = Vec::new();
+    if enabled.contains(&AgentKind::ClaudeCode) {
+        metas.extend(ClaudeCodeProvider::new(claude_home.clone()).discover()?);
+    }
+    if enabled.contains(&AgentKind::Codex)
+        && let Some(codex_home) = codex_home
+    {
         metas.extend(CodexProvider::new(codex_home.clone()).discover()?);
     }
     Ok(metas)
@@ -239,9 +261,16 @@ mod tests {
         filetime_set(&projects.join("new.jsonl"), newer);
 
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
-        let rows = load_rows(&claude_home, None, &AgeThresholds::default()).unwrap();
+        let rows = load_rows(&claude_home, None, &AgeThresholds::default(), &all_agents()).unwrap();
         let titles: Vec<_> = rows.iter().map(|r| r.display_title().to_string()).collect();
         assert_eq!(titles, vec!["New".to_string(), "Old".to_string()]);
+    }
+
+    /// Every product this build supports — the "nothing restricted" case
+    /// most discovery tests want, so they read as "the usual set" rather
+    /// than repeating both variants inline.
+    fn all_agents() -> BTreeSet<AgentKind> {
+        AgentKind::ALL.into_iter().collect()
     }
 
     #[test]
@@ -276,7 +305,7 @@ mod tests {
         drop(conn); // clean close: no -wal left behind for discover() to open around
 
         let claude_home = ClaudeHome::new(claude_root);
-        let metas = discover_all(&claude_home, Some(&codex_home)).unwrap();
+        let metas = discover_all(&claude_home, Some(&codex_home), &all_agents()).unwrap();
         let mut ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["claude-1".to_string(), "codex-1".to_string()]);
@@ -286,10 +315,77 @@ mod tests {
     }
 
     #[test]
+    fn discover_all_never_calls_the_codex_provider_when_codex_is_disabled() {
+        // `state_5.sqlite` is a directory, not a database: if `CodexProvider`
+        // were constructed and called at all, opening it would fail and
+        // this whole call would return `Err`. Succeeding here is only
+        // possible because a disabled product's provider is never reached
+        // — the actual property this gate exists for (see `discover_all`'s
+        // doc), not just its rows getting dropped afterward.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let projects = claude_root.join("projects").join("proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("claude-1.jsonl"),
+            "{\"type\":\"custom-title\",\"customTitle\":\"Claude session\"}\n",
+        )
+        .unwrap();
+
+        let codex_root = dir.path().join("codex");
+        let codex_home = banto_io::codex_home::CodexHome::new(codex_root.clone());
+        std::fs::create_dir_all(codex_home.threads_db_path()).unwrap();
+
+        let claude_home = ClaudeHome::new(claude_root);
+        let enabled = BTreeSet::from([AgentKind::ClaudeCode]);
+        let metas = discover_all(&claude_home, Some(&codex_home), &enabled).unwrap();
+        let ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
+        assert_eq!(ids, vec!["claude-1".to_string()]);
+    }
+
+    #[test]
+    fn discover_all_never_calls_the_claude_provider_when_claude_is_disabled() {
+        // `<claude_home>/projects` is a plain file, not a directory: if
+        // `ClaudeCodeProvider` were constructed and called at all,
+        // `fs::read_dir` on it would fail and this whole call would return
+        // `Err` — the same "never reached, not just filtered" property as
+        // the Codex-disabled case above, checked from the other side.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::write(claude_root.join("projects"), "not a directory").unwrap();
+
+        let codex_root = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let rollout = codex_root.join("rollout.jsonl");
+        std::fs::write(&rollout, "x").unwrap();
+        let codex_home = banto_io::codex_home::CodexHome::new(codex_root);
+        let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, \
+             rollout_path TEXT, first_user_message TEXT, updated_at_ms INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, rollout_path, updated_at_ms) \
+             VALUES ('codex-1', 'Codex session', ?1, 0)",
+            rusqlite::params![rollout.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let claude_home = ClaudeHome::new(claude_root);
+        let enabled = BTreeSet::from([AgentKind::Codex]);
+        let metas = discover_all(&claude_home, Some(&codex_home), &enabled).unwrap();
+        let ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
+        assert_eq!(ids, vec!["codex-1".to_string()]);
+    }
+
+    #[test]
     fn discover_all_skips_codex_entirely_when_its_home_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
-        let metas = discover_all(&claude_home, None).unwrap();
+        let metas = discover_all(&claude_home, None, &all_agents()).unwrap();
         assert!(metas.is_empty());
     }
 

@@ -108,10 +108,21 @@ const MIN_WIDTH_FOR_CWD: usize = 60;
 /// the caller at the draw call's boundary, same as [`render_summary`].
 pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
     if app.filtered_len() == 0 {
+        // A restricted `agents` setting narrowing discovery down to zero
+        // rows looks identical, at this point, to a machine that genuinely
+        // has none — distinguished only by `App::restricted_agents_label`,
+        // set from `Config.agents` at startup, never by anything filtered
+        // here. Checked only in the `total_len() == 0` arm: a search query
+        // narrowing an otherwise-populated list to nothing is a completely
+        // different, already-self-explanatory situation ("No matching
+        // sessions."), not this one.
         let message = if app.total_len() == 0 {
-            "No sessions found."
+            match app.restricted_agents_label() {
+                Some(label) => format!("No sessions found (agents = {label})."),
+                None => "No sessions found.".to_string(),
+            }
         } else {
-            "No matching sessions."
+            "No matching sessions.".to_string()
         };
         let placeholder = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(placeholder, area);
@@ -576,6 +587,45 @@ mod tests {
         line.chars()
             .position(|c| c == first_char)
             .unwrap_or_else(|| panic!("{first_char:?} not found in line {line:?}"))
+    }
+
+    // --- empty-list placeholder --------------------------------------------
+
+    #[test]
+    fn empty_list_with_no_agents_restriction_shows_the_plain_message() {
+        let now = SystemTime::UNIX_EPOCH;
+        let app = App::new(vec![]);
+        let text = draw_list(&app, 60, 10, now);
+        assert!(text.contains("No sessions found."));
+        assert!(!text.contains("agents ="));
+    }
+
+    #[test]
+    fn empty_list_under_a_restricted_agents_setting_names_it() {
+        let now = SystemTime::UNIX_EPOCH;
+        let app = App::new(vec![]).with_enabled_agents([AgentKind::Codex].into_iter().collect());
+        let text = draw_list(&app, 60, 10, now);
+        assert!(
+            text.contains("No sessions found (agents = Codex)."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_search_query_that_matches_nothing_ignores_the_agents_restriction() {
+        // Narrowing an otherwise-populated list to nothing via search is a
+        // different, already self-explanatory situation — the `agents`
+        // hint belongs only to the "nothing was ever discovered" case.
+        let now = SystemTime::UNIX_EPOCH;
+        let mut app = App::new(vec![row("h1", "Claude session", "", now)])
+            .with_enabled_agents([AgentKind::Codex].into_iter().collect());
+        app.enter_search();
+        for c in "no-such-title".chars() {
+            app.push_char(c);
+        }
+        let text = draw_list(&app, 60, 10, now);
+        assert!(text.contains("No matching sessions."));
+        assert!(!text.contains("agents ="));
     }
 
     // --- marker slots ------------------------------------------------------

@@ -21,13 +21,19 @@ impl fmt::Display for SessionId {
 /// distinguish, which is why it is an enum rather than the bare string it
 /// replaced. `SessionProvider` (`banto-io`) keeps its own name: a provider
 /// *provides* sessions, this says *whose*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     ClaudeCode,
     Codex,
 }
 
 impl AgentKind {
+    /// Every agent product banto currently discovers, in display order —
+    /// what an absent, empty, or `"all"` `agents` config setting resolves to
+    /// (see `config::resolve_agents`). [`Self::toggle`] already hardcodes
+    /// "exactly two"; update both the day a third provider lands.
+    pub const ALL: [AgentKind; 2] = [AgentKind::ClaudeCode, AgentKind::Codex];
+
     /// Short product name for display (the row list's agent column, the
     /// new-session modal) — never abbreviated or iconified: no single emoji
     /// names an agent product (see `banto_tui::view`'s module doc's "Emoji

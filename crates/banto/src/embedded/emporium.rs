@@ -19,7 +19,7 @@
 //! into [`engine::update`] as a `docs/DISCIPLINE.md` §8 replay stream.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -72,27 +72,42 @@ use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// The `config.toml`-derived settings [`run`] needs, bundled into one
+/// parameter once a fourth one (`enabled_agents`) pushed the plain arg list
+/// past clippy's `too_many_arguments` limit — mirrors `crate::opener::OpenContext`'s
+/// role for the same problem there.
+pub struct EmporiumSettings<'a> {
+    /// `[brigade]`: how many fresh Workers `B` auto-spawns when forming a
+    /// new brigade, the `--model` an auto-spawned Worker launches with, and
+    /// whether the relay engine is enabled.
+    pub brigade: &'a BrigadeConfig,
+    /// `[keys]`: the tmux-style prefix chord for pane operations.
+    pub keys: &'a KeysConfig,
+    /// `[agent_binaries]` — see `crate::opener::agent_binary`.
+    pub agent_binaries: &'a AgentBinaries,
+    /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
+    pub enabled_agents: &'a BTreeSet<AgentKind>,
+}
+
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
-/// `brigade` is `[brigade]` from config.toml: how many fresh Workers `B`
-/// auto-spawns when forming a new brigade, the `--model` an auto-spawned
-/// Worker launches with, and whether the relay engine is enabled. `keys` is
-/// `[keys]`: the tmux-style prefix chord for pane operations.
 pub fn run(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
-    brigade: &BrigadeConfig,
-    keys: &KeysConfig,
-    agent_binaries: &AgentBinaries,
+    settings: &EmporiumSettings,
 ) -> Result<()> {
+    let brigade = settings.brigade;
+    let keys = settings.keys;
+    let agent_binaries = settings.agent_binaries;
+    let enabled_agents = settings.enabled_agents;
     // Janitor: purge brigades with no members left (legacy pre-v7 data, or
     // residue from a crash mid-formation) before the sidebar's brigade-
     // derived caches (hidden Workers, Directors) load. Silent by design — an
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    let metas = session::discover_all(claude_home, codex_home)?;
+    let metas = session::discover_all(claude_home, codex_home, enabled_agents)?;
     // In-memory only, for this process's lifetime — see
     // `crate::tui::superseded_from_metas`'s doc. Created once here and
     // threaded through every reload (the bootstrap below and every later
@@ -133,7 +148,8 @@ pub fn run(
         // the width for markers and a title but not a cwd too (see
         // `banto_tui::view`'s module doc's "Row layout" section); the chōba
         // stays the default of 1.
-        .with_lines_per_row(2);
+        .with_lines_per_row(2)
+        .with_enabled_agents(enabled_agents.clone());
 
     let deps = Deps {
         claude_home,
@@ -143,6 +159,7 @@ pub fn run(
         superseded_failed: &superseded_failed,
         brigade,
         agent_binaries,
+        enabled_agents,
     };
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut app, &deps, keys);
@@ -192,6 +209,8 @@ struct Deps<'a> {
     brigade: &'a BrigadeConfig,
     /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
     agent_binaries: &'a AgentBinaries,
+    /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
+    enabled_agents: &'a BTreeSet<AgentKind>,
 }
 
 fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig) -> Result<()> {
@@ -835,7 +854,8 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 /// lineage-resolution budget against the same discover() pass (see
 /// [`crate::tui::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(metas) = session::discover_all(deps.claude_home, deps.codex_home) else {
+    let Ok(metas) = session::discover_all(deps.claude_home, deps.codex_home, deps.enabled_agents)
+    else {
         return Vec::new();
     };
     let store = deps.store.borrow();
@@ -1559,6 +1579,12 @@ mod tests {
         PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
     }
 
+    /// Every product this build supports — the "nothing restricted" `Deps`
+    /// field most tests here want, mirroring `session::tests::all_agents`.
+    fn all_agents() -> BTreeSet<AgentKind> {
+        AgentKind::ALL.into_iter().collect()
+    }
+
     #[test]
     fn shutdown_sweep_lets_a_promptly_exiting_child_go_without_a_force_kill() {
         let kills = Arc::new(Mutex::new(0));
@@ -1879,6 +1905,7 @@ mod tests {
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
         let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
         let deps = Deps {
             claude_home: &claude_home,
             codex_home: None,
@@ -1887,6 +1914,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
         };
         let mut handles = HashMap::new();
 
@@ -1938,6 +1966,7 @@ mod tests {
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
         let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
         let deps = Deps {
             claude_home: &claude_home,
             codex_home: None,
@@ -1946,6 +1975,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
         };
 
         let events = execute_cmd(
@@ -2492,6 +2522,7 @@ mod tests {
         };
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
         let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
         let deps = |brigade| Deps {
             claude_home: &claude_home,
             codex_home: None,
@@ -2500,6 +2531,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             brigade,
             agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
         };
 
         assert_eq!(

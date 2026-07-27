@@ -232,6 +232,11 @@ opener = "in-place"
 claude_home = "C:/Users/you/.claude"   # optional override
 db_path = "..."                        # optional override
 
+# "all" (default) | "claude" | "codex" | "claude,codex" — which agent
+# products banto discovers sessions for. A disabled product's own files
+# (Codex's sqlite database, in particular) are never even opened.
+agents = "all"
+
 [activity]
 today_hours = 24   # activity-dot bucketing
 week_days = 7

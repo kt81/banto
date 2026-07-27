@@ -17,6 +17,11 @@
 //!
 //! `config.toml` itself is located by [`config::resolve_config_path`]'s
 //! resolution order (see [`load_config`]).
+//!
+//! `Config.agents` gates which products get discovered at all — resolved
+//! once here via `banto_core::config::resolve_agents` into `enabled_agents`
+//! and passed down to every entry point, since `session::discover_all` (not
+//! any of these) is what actually decides which provider runs.
 
 mod embedded;
 mod mcp;
@@ -26,12 +31,14 @@ mod sgr;
 mod tui;
 mod wrap;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use banto_core::config::Config;
+use banto_core::model::AgentKind;
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
@@ -149,12 +156,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config(cli.config.as_deref())?;
 
+    let enabled_agents = banto_core::config::resolve_agents(&config.agents);
+
     match cli.command {
         Some(Command::List) => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let codex_home = CodexHome::default_home();
             let thresholds = thresholds_from(&config.activity);
-            run_list(&claude_home, codex_home.as_ref(), &thresholds)
+            run_list(
+                &claude_home,
+                codex_home.as_ref(),
+                &thresholds,
+                &enabled_agents,
+            )
         }
         Some(Command::Wrap {
             session,
@@ -223,9 +237,12 @@ fn main() -> Result<()> {
                     codex_home.as_ref(),
                     &thresholds,
                     &store,
-                    &config.brigade,
-                    &config.keys,
-                    &config.agent_binaries,
+                    &embedded::EmporiumSettings {
+                        brigade: &config.brigade,
+                        keys: &config.keys,
+                        agent_binaries: &config.agent_binaries,
+                        enabled_agents: &enabled_agents,
+                    },
                 )
             } else {
                 tui::run(
@@ -235,6 +252,7 @@ fn main() -> Result<()> {
                     &thresholds,
                     config.opener,
                     &store,
+                    enabled_agents,
                 )
             }
         }
@@ -291,8 +309,10 @@ fn run_list(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
+    enabled_agents: &BTreeSet<AgentKind>,
 ) -> Result<()> {
-    let rows = load_rows(claude_home, codex_home, thresholds).context("failed to read sessions")?;
+    let rows = load_rows(claude_home, codex_home, thresholds, enabled_agents)
+        .context("failed to read sessions")?;
     for row in &rows {
         let title = row.title.as_deref().unwrap_or("(no title)");
         let cwd = row

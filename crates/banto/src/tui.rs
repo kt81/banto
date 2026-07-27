@@ -7,7 +7,7 @@
 //! is cross-platform — crossterm handles the Windows specifics.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -130,6 +130,11 @@ struct Context<'a> {
     codex_home: Option<CodexHome>,
     /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
     agent_binaries: AgentBinaries,
+    /// `Config.agents`, resolved — which providers [`session::discover_all`]
+    /// is allowed to run at all. Also threaded into `App::with_enabled_agents`
+    /// so the empty-list placeholder can say why, when it's this and not a
+    /// genuinely empty machine.
+    enabled_agents: BTreeSet<AgentKind>,
     thresholds: &'a AgeThresholds,
     /// `RefCell`-wrapped — see `main`'s construction site for why.
     store: &'a RefCell<Store>,
@@ -238,8 +243,9 @@ pub fn run(
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
+    enabled_agents: BTreeSet<AgentKind>,
 ) -> Result<()> {
-    let metas = session::discover_all(claude_home, codex_home.as_ref())?;
+    let metas = session::discover_all(claude_home, codex_home.as_ref(), &enabled_agents)?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
@@ -266,11 +272,13 @@ pub fn run(
         .with_groups(groups, session_groups)
         .with_hidden_worker_ids(hidden)
         .with_directors(directors)
-        .with_superseded(superseded);
+        .with_superseded(superseded)
+        .with_enabled_agents(enabled_agents.clone());
     let ctx = Context {
         claude_home: claude_home.clone(),
         codex_home,
         agent_binaries,
+        enabled_agents,
         thresholds,
         store,
         opener_mode,
@@ -1702,7 +1710,11 @@ fn toggle_agent_filter(app: &mut App) {
 /// are kept rather than the TUI erroring out over a transient filesystem
 /// hiccup.
 fn reload(app: &mut App, ctx: &Context) {
-    if let Ok(metas) = session::discover_all(&ctx.claude_home, ctx.codex_home.as_ref()) {
+    if let Ok(metas) = session::discover_all(
+        &ctx.claude_home,
+        ctx.codex_home.as_ref(),
+        &ctx.enabled_agents,
+    ) {
         let store = ctx.store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);
         let rows = session::rows_from_metas(metas, &ctx.claude_home, ctx.thresholds);
@@ -1944,6 +1956,7 @@ mod tests {
             claude_home: ClaudeHome::new(PathBuf::from(".")),
             codex_home: None,
             agent_binaries: AgentBinaries::default(),
+            enabled_agents: AgentKind::ALL.into_iter().collect(),
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,

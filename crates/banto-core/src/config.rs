@@ -8,11 +8,12 @@
 //! it needs filesystem access and the `dirs` crate for the default path,
 //! both forbidden here (`docs/DISCIPLINE.md` §2).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::model::BrigadeRole;
+use crate::model::{AgentKind, BrigadeRole};
 
 /// Which backend resumes sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -235,10 +236,56 @@ pub struct Config {
     pub brigade: BrigadeConfig,
     pub keys: KeysConfig,
     pub agent_binaries: AgentBinaries,
+    /// Which agent products banto discovers sessions for: `"all"` (also
+    /// what an absent or empty string means, and the default), or a
+    /// comma-separated list of product names (`claude`, `codex`). Kept as
+    /// the raw string here and resolved by [`resolve_agents`] rather than
+    /// parsed into a set at deserialize time, so a name this build doesn't
+    /// recognize degrades leniently (see that function's doc) instead of
+    /// failing the whole document the way `OpenerMode`'s strict enum would.
+    pub agents: String,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
     /// Overrides `banto_io::config::default_db_path`.
     pub db_path: Option<PathBuf>,
+}
+
+/// Resolve [`Config::agents`] into the set of agent products banto should
+/// discover sessions for. Empty (including an absent field, which
+/// deserializes to the empty string) or `"all"` (case-insensitive) resolves
+/// to [`AgentKind::ALL`] — "all" means every product this build supports,
+/// not a wildcard for products that don't exist yet. Otherwise each
+/// comma-separated entry is looked up independently, matched
+/// case-insensitively with surrounding whitespace trimmed.
+///
+/// An unrecognized name is dropped, not rejected: this crate's config layer
+/// is lenient by design (`banto_io::config`'s module doc — a broken setting
+/// must never prevent startup), and every other lenient fallback in this
+/// file decays toward *less filtering*, never toward *less discovery*
+/// (`RelayMode`'s unknown value falls back to the working default, a
+/// malformed file falls back to the full default `Config`). So if every
+/// name in a non-empty setting goes unrecognized — a typo, or a product this
+/// build has never heard of — the result is [`AgentKind::ALL`] too, the same
+/// as leaving `agents` unset, rather than an empty set that would silently
+/// discover nothing with no visible cause.
+pub fn resolve_agents(raw: &str) -> BTreeSet<AgentKind> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+        return AgentKind::ALL.into_iter().collect();
+    }
+    let recognized: BTreeSet<AgentKind> = trimmed
+        .split(',')
+        .filter_map(|name| match name.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(AgentKind::ClaudeCode),
+            "codex" => Some(AgentKind::Codex),
+            _ => None,
+        })
+        .collect();
+    if recognized.is_empty() {
+        AgentKind::ALL.into_iter().collect()
+    } else {
+        recognized
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +310,7 @@ mod tests {
         assert_eq!(config.brigade.worker_model, "sonnet");
         assert_eq!(config.brigade.relay, RelayMode::Auto);
         assert_eq!(config.keys.prefix, "C-b");
+        assert_eq!(config.agents, "");
         assert_eq!(config.claude_home, None);
         assert_eq!(config.db_path, None);
     }
@@ -414,5 +462,76 @@ mod tests {
     fn wrong_field_type_is_a_parse_error() {
         let result: Result<Config, _> = toml::from_str("opener = \"no-such-backend\"\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn agents_setting_parses_as_a_plain_string() {
+        let config = parse("agents = \"codex\"\n");
+        assert_eq!(config.agents, "codex");
+    }
+
+    // -- resolve_agents ------------------------------------------------
+
+    #[test]
+    fn resolve_agents_empty_means_all() {
+        assert_eq!(
+            resolve_agents(""),
+            AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn resolve_agents_all_is_case_insensitive_and_trims_whitespace() {
+        for text in ["all", "ALL", "All", "  all  "] {
+            assert_eq!(
+                resolve_agents(text),
+                AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_agents_single_name() {
+        assert_eq!(resolve_agents("codex"), BTreeSet::from([AgentKind::Codex]));
+        assert_eq!(
+            resolve_agents("claude"),
+            BTreeSet::from([AgentKind::ClaudeCode])
+        );
+    }
+
+    #[test]
+    fn resolve_agents_comma_separated_list_is_case_insensitive_and_trims_whitespace() {
+        assert_eq!(
+            resolve_agents(" Claude ,CODEX "),
+            BTreeSet::from([AgentKind::ClaudeCode, AgentKind::Codex])
+        );
+    }
+
+    #[test]
+    fn resolve_agents_drops_an_unrecognized_name_alongside_a_recognized_one() {
+        assert_eq!(
+            resolve_agents("claude,made-up-product"),
+            BTreeSet::from([AgentKind::ClaudeCode])
+        );
+    }
+
+    #[test]
+    fn resolve_agents_falls_back_to_all_when_nothing_is_recognized() {
+        assert_eq!(
+            resolve_agents("made-up-product"),
+            AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            resolve_agents("nonsense,also-nonsense"),
+            AgentKind::ALL.into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn resolve_agents_a_repeated_name_still_yields_one_entry() {
+        assert_eq!(
+            resolve_agents("codex,codex"),
+            BTreeSet::from([AgentKind::Codex])
+        );
     }
 }

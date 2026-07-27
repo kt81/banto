@@ -16,6 +16,7 @@ mod session;
 
 pub use banto_io::pty::PortablePtyHost;
 pub use banto_tui::render::screen_to_text;
+pub use emporium::EmporiumSettings;
 pub use emporium::run as run_emporium;
 pub use session::EmbeddedSession;
 

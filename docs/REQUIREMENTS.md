@@ -204,6 +204,41 @@ running session writes somewhere in `$CODEX_HOME` on every turn —
 more often than the rollout tree's one event per turn, across databases
 discovery doesn't even read.
 
+## The `agents` setting
+
+`Config.agents` (a plain string, default `""`) selects which agent products
+banto discovers sessions for: `"all"` — also what an absent or empty string
+means — or a comma-separated list of product names (`claude`, `codex`).
+`banto_core::config::resolve_agents` resolves it into a `BTreeSet<AgentKind>`;
+`"all"` means every product this build currently supports
+(`AgentKind::ALL`), not a wildcard reserved for products that don't exist
+yet. An unrecognized name is dropped, not rejected — this crate's config
+layer is lenient by design (a broken setting must never prevent startup) —
+but if *every* name in a non-empty setting goes unrecognized, the whole
+thing falls back to `all` rather than an empty set that would silently
+discover nothing with no visible cause.
+
+**Applies at discovery, not display — deliberately breaking precedent.**
+Every other row filter in this codebase (`App::show_agents`,
+`crate::tui::exclude_archived`) filters rows already read off disk.
+`enabled_agents` instead gates which `SessionProvider` runs at all, inside
+`session::discover_all` — the one place both providers' `discover()` calls
+live. A disabled product's provider is never constructed, let alone called:
+an operator who has switched Codex off gets banto never touching
+`state_5.sqlite`, not banto reading it and discarding the result — the same
+read-only discipline this file's Codex section had to earn a documented
+exception for in the first place.
+
+**The empty-list case:** a valid, non-restricting-looking setting (e.g.
+`agents = "codex"` on a machine with no Codex sessions yet) can legitimately
+discover zero rows, which looks identical to a genuinely empty machine.
+`App::restricted_agents_label` (set once at startup via
+`App::with_enabled_agents`, never re-filtered) lets
+`banto_tui::view::render_list`'s existing empty-list placeholder say why —
+`"No sessions found (agents = Codex)."` instead of the bare default — only
+when `total_len() == 0`; a search query narrowing an otherwise-populated
+list to nothing keeps its own unrelated "No matching sessions." message.
+
 ## Module layout
 
 Four crates, split along the TEA / sans-IO boundary

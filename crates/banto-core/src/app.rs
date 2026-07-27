@@ -5,7 +5,7 @@
 //! in `banto::tui` (the chōba list) is a thin shell over this state; the
 //! emporium's `crate::engine` uses it too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -553,6 +553,16 @@ pub struct App {
     /// loaded from the store at startup and on every reload; see
     /// [`Self::with_superseded`]/[`Self::set_superseded`].
     superseded: HashSet<String>,
+    /// `Config.agents`, resolved — display-only here, not a name-doubling
+    /// coincidence with [`Self::show_agents`]: that one hides/reveals
+    /// already-loaded *rows* (spawned-agent sessions), this one only
+    /// explains why [`Self::rows`] can be short to begin with — the actual
+    /// filtering happened before discovery ever produced a row (see
+    /// `crate::config::resolve_agents`'s doc). Never affects `filtered`.
+    /// Defaults to every product ([`AgentKind::ALL`]) so a caller that never
+    /// calls [`Self::with_enabled_agents`] (most tests) behaves as
+    /// unrestricted, matching `Config.agents`'s own empty-string default.
+    enabled_agents: BTreeSet<AgentKind>,
     /// Whether agent-run sessions (`SessionRow::is_agent`) and non-live
     /// superseded sessions are included in `filtered`. Off by default: a
     /// human browsing their own sessions doesn't usually want every
@@ -672,6 +682,7 @@ impl App {
             hidden: HashSet::new(),
             directors: HashSet::new(),
             superseded: HashSet::new(),
+            enabled_agents: AgentKind::ALL.into_iter().collect(),
             show_agents: false,
             groups: Vec::new(),
             session_group: HashMap::new(),
@@ -1241,6 +1252,35 @@ impl App {
         self.hidden = hidden;
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
+    }
+
+    /// Seed the `Config.agents` setting, resolved (loaded once at startup —
+    /// config never hot-reloads, so unlike [`Self::with_directors`] there is
+    /// no corresponding `set_*`). Display-only, like `directors`: the actual
+    /// filtering already happened in `discover_all`, before any of these
+    /// rows existed, so this never re-filters — it only lets
+    /// [`Self::restricted_agents_label`] explain a short (or empty) list
+    /// that a genuinely-empty machine would otherwise look identical to.
+    pub fn with_enabled_agents(mut self, enabled: BTreeSet<AgentKind>) -> Self {
+        self.enabled_agents = enabled;
+        self
+    }
+
+    /// A short, comma-joined label of the currently enabled agent products
+    /// (e.g. `"Codex"`), or `None` when every product this build supports is
+    /// enabled — the common case, and the one where no explanation is
+    /// needed. See [`Self::with_enabled_agents`].
+    pub fn restricted_agents_label(&self) -> Option<String> {
+        if self.enabled_agents.len() >= AgentKind::ALL.len() {
+            return None;
+        }
+        Some(
+            self.enabled_agents
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 
     /// Seed the initial brigade-director-id set (loaded from the store at
@@ -2759,6 +2799,46 @@ mod tests {
 
         let hiding = app.toggle_agent_filter();
         assert!(!hiding);
+        assert_eq!(ids(&app), vec!["h1"]);
+    }
+
+    #[test]
+    fn restricted_agents_label_is_none_when_unset_or_explicitly_all() {
+        assert_eq!(App::new(vec![]).restricted_agents_label(), None);
+        assert_eq!(
+            App::new(vec![])
+                .with_enabled_agents(AgentKind::ALL.into_iter().collect())
+                .restricted_agents_label(),
+            None
+        );
+    }
+
+    #[test]
+    fn restricted_agents_label_names_a_narrower_set() {
+        let app = App::new(vec![]).with_enabled_agents(BTreeSet::from([AgentKind::Codex]));
+        assert_eq!(app.restricted_agents_label().as_deref(), Some("Codex"));
+    }
+
+    #[test]
+    fn restricted_agents_label_is_none_when_every_kind_is_named_explicitly() {
+        // Same outcome as the `all`/unset case, reached a different way
+        // (naming both products individually rather than relying on the
+        // `all` shorthand) — the check is "is every product enabled",
+        // never "was the literal string `all` used".
+        let app = App::new(vec![])
+            .with_enabled_agents(BTreeSet::from([AgentKind::Codex, AgentKind::ClaudeCode]));
+        assert_eq!(app.restricted_agents_label(), None);
+    }
+
+    #[test]
+    fn with_enabled_agents_never_filters_rows() {
+        let mut app = App::new(vec![row("h1", "Claude session", "")])
+            .with_enabled_agents(BTreeSet::from([AgentKind::Codex]));
+        app.set_viewport_height(10);
+        // The row is already a Claude session (loaded before this setting
+        // is even applied, in `discover_all`) — `with_enabled_agents` must
+        // not re-filter it away a second time here.
+        assert_eq!(app.total_len(), 1);
         assert_eq!(ids(&app), vec!["h1"]);
     }
 
