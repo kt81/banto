@@ -127,7 +127,12 @@ pub fn run(
         .with_groups(groups, session_groups)
         .with_hidden_worker_ids(hidden)
         .with_directors(directors)
-        .with_superseded(superseded);
+        .with_superseded(superseded)
+        // Two lines per row (title/age, then cwd/agent) — the sidebar has
+        // the width for markers and a title but not a cwd too (see
+        // `banto_tui::view`'s module doc's "Row layout" section); the chōba
+        // stays the default of 1.
+        .with_lines_per_row(2);
 
     let deps = Deps {
         claude_home,
@@ -1206,7 +1211,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
     );
 
     if let Some(modal) = app.modal() {
-        banto_tui::render_modal::render_modal(frame, modal, full_area);
+        // `true`: the emporium binds Shift-Tab to
+        // `App::modal_toggle_new_session_agent` (see
+        // `engine::update_modal_key`) — see `render_modal`'s doc.
+        banto_tui::render_modal::render_modal(frame, modal, full_area, true);
     }
 }
 

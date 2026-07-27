@@ -836,10 +836,13 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 cwd.display()
             ));
             *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
-                // Always Claude: the new-session modal has no agent axis of
-                // its own, and the chōba is feature-frozen — see
-                // `opener::new_session_wrap_argv`'s doc for the split
-                // placement's identical reasoning.
+                // Always Claude, deliberately ignoring `state`'s own agent
+                // choice: the chōba is feature-frozen (out of scope, not an
+                // oversight — see `opener::new_session_wrap_argv`'s doc for
+                // the split placement's identical reasoning), and its key
+                // dispatch never binds anything to
+                // `App::modal_toggle_new_session_agent`, so `state.agent()`
+                // can never actually be anything but the default here.
                 argv: opener::inplace_argv(AgentKind::ClaudeCode, None, &cwd, &ctx.agent_binaries),
                 startup_message: opener::new_session_startup_message(&cwd),
                 cwd,
@@ -1714,7 +1717,9 @@ fn render(frame: &mut Frame, app: &App, now: SystemTime) {
     view::render_summary(frame, app, summary_area, now);
     render_status(frame, app, status_area);
     if let Some(modal) = app.modal() {
-        render_modal(frame, modal, frame.area());
+        // `false`: the chōba binds no key to `App::modal_toggle_new_session_agent`
+        // (its new-session path is feature-frozen) — see `render_modal`'s doc.
+        render_modal(frame, modal, frame.area(), false);
     }
 }
 
