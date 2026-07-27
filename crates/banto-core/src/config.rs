@@ -237,6 +237,8 @@ pub struct Config {
     pub agent_binaries: AgentBinaries,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
+    /// Overrides the provider's default `~/.codex` location (read-only!).
+    pub codex_home: Option<PathBuf>,
     /// Overrides `banto_io::config::default_db_path`.
     pub db_path: Option<PathBuf>,
 }
@@ -264,6 +266,7 @@ mod tests {
         assert_eq!(config.brigade.relay, RelayMode::Auto);
         assert_eq!(config.keys.prefix, "C-b");
         assert_eq!(config.claude_home, None);
+        assert_eq!(config.codex_home, None);
         assert_eq!(config.db_path, None);
     }
 
@@ -401,11 +404,17 @@ mod tests {
     #[test]
     fn path_overrides_parse() {
         let config = parse(
-            "claude_home = \"C:/synthetic/claude-home\"\ndb_path = \"C:/synthetic/banto.db\"\n",
+            "claude_home = \"C:/synthetic/claude-home\"\n\
+             codex_home = \"C:/synthetic/codex-home\"\n\
+             db_path = \"C:/synthetic/banto.db\"\n",
         );
         assert_eq!(
             config.claude_home,
             Some(PathBuf::from("C:/synthetic/claude-home"))
+        );
+        assert_eq!(
+            config.codex_home,
+            Some(PathBuf::from("C:/synthetic/codex-home"))
         );
         assert_eq!(config.db_path, Some(PathBuf::from("C:/synthetic/banto.db")));
     }
