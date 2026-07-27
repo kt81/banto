@@ -221,8 +221,23 @@ pub struct Areas {
 /// Consecutive relay ticks a member must be observed idle before it's
 /// eligible for a nudge.
 const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
-/// How long a focused pane's own recently-forwarded input suppresses a nudge.
-const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(3);
+/// How long a focused pane's own recently-forwarded input suppresses a
+/// nudge. Was 3s, which is a *typing-gap* threshold (how long between two
+/// keystrokes before you'd call the operator "done typing"), not a
+/// *composing* one — a human writing even one sentence routinely pauses
+/// longer than that to think, re-read, or pick a word, so the old value let
+/// a nudge land mid-sentence: confirmed in the field, where it did exactly
+/// that, corrupting a message the operator was composing to a Worker (the
+/// nudge text landed inside it, then [`RELAY_SUBMIT_DELAY`] later submitted
+/// the mixed result before he could stop it — see [`update_key`]'s
+/// `cancel_pending_submit_on_input` call for the other half of that fix).
+/// 30s is chosen for the cost asymmetry, not a measured pause length: a
+/// nudge arriving late only delays how soon the Worker notices unread mail
+/// (and the operator can still see the unread marker in the sidebar in the
+/// meantime), while a nudge arriving mid-composition can destroy what the
+/// operator was actually typing — a much more expensive failure to guard a
+/// few extra seconds against.
+const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(30);
 /// Minimum gap between nudges to the same member.
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Give up nudging a member after this many attempts on one unseen batch.
@@ -325,6 +340,28 @@ pub struct RelayObservation {
 struct PendingSubmit {
     key: SessionKey,
     nudged_at: Instant,
+}
+
+/// Drop `key`'s pending submitting `\r`, if one is waiting, because real
+/// operator input for that same pane just arrived. Widening
+/// [`RELAY_INPUT_QUIET_PERIOD`] narrows the window a nudge can start in
+/// while the operator is composing, but it cannot close it — the operator
+/// can still start typing in the [`RELAY_SUBMIT_DELAY`] gap between a
+/// nudge's text landing and its `\r` following. Left unguarded, that `\r`
+/// submits banto's nudge text spliced with whatever the operator has typed
+/// on top of it since, not what either of them meant to send. Called at
+/// every site that forwards real keystrokes to a pane (not the mouse path —
+/// an SGR report to the child isn't the operator composing text into it).
+///
+/// The nudge text already written to the pane is left alone: banto cannot
+/// un-type it without writing more bytes into the same line the operator is
+/// mid-edit on, and a guessed-at erase (backspaces sized to the nudge
+/// line's length) risks deleting the operator's own text instead if the
+/// child already reflowed or echoed something in between. Leaving a stray
+/// line the operator can see and clear themselves is the honest outcome
+/// here — silently submitting it early is the actual bug.
+fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key: &SessionKey) {
+    pending_submits.retain(|pending| &pending.key != key);
 }
 
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
@@ -1178,6 +1215,7 @@ fn update_key(
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
+                    cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                     vec![Cmd::WritePty { key: target, bytes }]
                 }
             } else {
@@ -1280,6 +1318,7 @@ fn resolve_armed_prefix(
             if bytes.is_empty() {
                 Vec::new()
             } else {
+                cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                 vec![Cmd::WritePty { key: target, bytes }]
             }
         }
@@ -1959,6 +1998,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
             normalized.into_bytes()
         };
         state.last_forwarded_input = Some(now);
+        cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
     }
     Vec::new()
@@ -4011,6 +4051,126 @@ mod tests {
             now,
         );
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+    }
+
+    /// Shared setup for the two tests below: a solo, focused pane, ticked
+    /// idle twice so it's nudge-eligible, then nudged. `Focus::Pane` and no
+    /// prior `last_forwarded_input` together mean the quiet-period guard
+    /// (`RELAY_INPUT_QUIET_PERIOD`) never blocks the nudge — this models the
+    /// operator sitting on a focused pane they have not yet typed into when
+    /// the nudge fires, exactly the case a keystroke can still land in
+    /// before the delayed `\r`. Returns `(state, app, brigade, worker, now)`
+    /// with `now` positioned right after the nudge text went out.
+    fn nudged_focused_pane_awaiting_submit()
+    -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let worker = SessionKey::from_id("w1");
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(worker.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mut now = test_instant();
+
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: worker.clone(),
+                bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
+            }],
+            "setup error: expected the nudge text to have gone out"
+        );
+
+        (state, app, brigade, worker, now)
+    }
+
+    #[test]
+    fn real_input_in_the_submit_gap_cancels_the_pending_r() {
+        let (mut state, mut app, brigade, worker, mut now) = nudged_focused_pane_awaiting_submit();
+
+        // The operator starts typing into that same focused pane before
+        // RELAY_SUBMIT_DELAY elapses.
+        now += Duration::from_millis(50);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: worker.clone(),
+                bytes: b"h".to_vec(),
+            }],
+            "the operator's own keystroke must still reach the pane"
+        );
+
+        // Once RELAY_SUBMIT_DELAY has fully elapsed, nothing flushes: the
+        // pending `\r` was cancelled the moment real input arrived.
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(
+            cmds.is_empty(),
+            "a cancelled submit must never fire: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_submit_still_flushes_when_nothing_interrupts_it() {
+        let (mut state, mut app, brigade, worker, mut now) = nudged_focused_pane_awaiting_submit();
+
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: worker,
+                bytes: b"\r".to_vec(),
+            }]
+        );
     }
 
     #[test]
