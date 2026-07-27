@@ -51,6 +51,7 @@ use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
@@ -478,9 +479,7 @@ fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
     briefing: Option<&str>,
-    probe: &dyn ProcessProbe,
-    live: &[LiveSession],
-    binaries: &AgentBinaries,
+    ctx: &opener::OpenContext,
 ) -> Option<opener::AgentLaunch> {
     let resume = if target.id.is_empty() {
         None
@@ -491,7 +490,7 @@ fn build_open_launch(
         // hands back is dropped because its argv is by construction
         // `inplace_argv(target.agent, Some(&target.id), ...)` — the same id
         // we resume below.
-        opener::decide_inplace_resume(target, probe, live, binaries)?;
+        opener::decide_inplace_resume(target, ctx)?;
         Some(target.id.clone())
     };
     Some(match target.agent {
@@ -539,14 +538,16 @@ fn execute_open_embedded(
     let briefing = brigade
         .as_ref()
         .and_then(|(brigade_id, token, role)| member_briefing(deps, *brigade_id, token, *role));
-    let Some(mut launch) = build_open_launch(
-        &target,
-        model.as_deref(),
-        briefing.as_deref(),
-        &SysinfoProbe,
-        &live,
-        deps.agent_binaries,
-    ) else {
+    let open_ctx = opener::OpenContext {
+        probe: &SysinfoProbe,
+        live: &live,
+        binaries: deps.agent_binaries,
+        codex_home: deps.codex_home,
+        start_time: &SysinfoStartTime,
+    };
+    let Some(mut launch) =
+        build_open_launch(&target, model.as_deref(), briefing.as_deref(), &open_ctx)
+    else {
         return vec![Event::SpawnFailed {
             key,
             error: "already running elsewhere".to_string(),
@@ -2201,18 +2202,34 @@ mod tests {
         }
     }
 
+    /// An [`opener::OpenContext`] for tests that don't care about Codex
+    /// liveness (`codex_home: None` degrades every Codex check to "not
+    /// live" — see `codex_liveness::is_thread_alive`'s doc).
+    fn test_ctx<'a>(
+        probe: &'a dyn ProcessProbe,
+        live: &'a [LiveSession],
+        binaries: &'a AgentBinaries,
+    ) -> opener::OpenContext<'a> {
+        opener::OpenContext {
+            probe,
+            live,
+            binaries,
+            codex_home: None,
+            start_time: &SysinfoStartTime,
+        }
+    }
+
     #[test]
     fn build_open_launch_appends_model_to_a_resumed_sessions_argv() {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
             None,
-            &probe,
-            &[],
-            &AgentBinaries::default(),
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
@@ -2226,13 +2243,12 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target(""),
             Some("opus"),
             None,
-            &probe,
-            &[],
-            &AgentBinaries::default(),
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
@@ -2246,13 +2262,12 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             None,
             None,
-            &probe,
-            &[],
-            &AgentBinaries::default(),
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
@@ -2275,14 +2290,13 @@ mod tests {
             name: None,
             proc_start: None,
         }];
+        let binaries = AgentBinaries::default();
         assert!(
             build_open_launch(
                 &open_target("sess-1"),
                 Some("opus"),
                 None,
-                &probe,
-                &live,
-                &AgentBinaries::default(),
+                &test_ctx(&probe, &live, &binaries),
             )
             .is_none()
         );
@@ -2295,6 +2309,7 @@ mod tests {
         };
         let mut target = open_target("codex-uuid-1");
         target.agent = AgentKind::Codex;
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &target,
             Some("o3"),
@@ -2302,9 +2317,7 @@ mod tests {
             // Claude-only — but the Codex variant has nowhere to put it
             // even so).
             Some("you are the Director"),
-            &probe,
-            &[],
-            &AgentBinaries::default(),
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
@@ -2329,13 +2342,12 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
             Some("you are the Director"),
-            &probe,
-            &[],
-            &AgentBinaries::default(),
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
@@ -2358,13 +2370,12 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
+        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             None,
             None,
-            &probe,
-            &[],
-            &AgentBinaries::default(),
+            &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         match launch {

@@ -153,11 +153,16 @@ directory tree banto walks itself. One sqlite database, one table.
 | `threads.rollout_path` | The session transcript file itself, under a `sessions/` tree whose internal (date-partitioned) layout banto does not rely on — the path comes from the column directly, never from walking the tree |
 | `threads.cwd` | Carries a Windows extended-length path prefix (`\\?\`) that a rollout file's own recorded cwd does not — normalized once, in `provider::codex`, at the point this becomes `SessionMeta.cwd` |
 | `threads.updated_at_ms` | Milliseconds since the Unix epoch, application-reported by Codex — not a filesystem mtime the way Claude Code's is. `SessionMeta.mtime` says so |
-| `$CODEX_HOME/logs_2.sqlite`, `logs.process_uuid` (`pid:<PID>:<suffix>`) | Process liveness — not read by discovery; for the liveness round that follows this one, which must re-verify its own version of the read-only-access question below rather than assume `state_5.sqlite`'s answer transfers to a different database file |
+| `$CODEX_HOME/logs_2.sqlite`, `logs` table | Process liveness (not read by discovery — the Codex-side double-resume guard, `codex_liveness::is_thread_alive`). Real schema, read from a real, live `~/.codex/logs_2.sqlite` on this machine (2026-07-27): `id, ts, ts_nanos, level, target, thread_id, process_uuid, ...`, with `CREATE INDEX idx_logs_thread_id_ts ON logs(thread_id, ts DESC, ts_nanos DESC, id DESC)` — the newest row per `thread_id` is exactly what that index is for |
+| `logs.process_uuid` | `pid:<PID>:<suffix>`. Confirmed against that same real database: the newest row's pid for the session actually running matched a real, live process (cross-checked via `Win32_Process`); three finished sessions' newest rows named three dead pids |
+| `logs.ts` | Unix **seconds** (confirmed by comparing a real row's value against the current clock — not milliseconds, unlike `threads.updated_at_ms`). Compared against `sysinfo::Process::start_time()` (also unix seconds, and available on every platform `sysinfo` supports — unlike Claude's Linux/WSL-only `/proc` ticks comparison) for the pid-recycling guard: a process that started strictly after this log row was written cannot be the one that wrote it |
 
-**Reading a database Codex itself may be writing (measured directly, this
-session, rusqlite 0.40.1 bundled — the version this workspace pins).** Two
-open forms, both able to read correctly, neither always safe alone:
+**Reading a database Codex itself may be writing (measured directly against
+both `state_5.sqlite` and, independently, `logs_2.sqlite` — including a read
+against the real, live `logs_2.sqlite` on this machine while it was warm —
+rather than assuming one database's answer transferred to the other;
+rusqlite 0.40.1 bundled, the version this workspace pins).** Two open forms,
+both able to read correctly, neither always safe alone:
 - `mode=ro` is always correct — it sees every committed row, including a
   writer's in-flight commits — and on its own writes nothing, but opening it
   against a **cold** database (no `-wal`/`-shm` sidecars yet) creates those

@@ -38,6 +38,7 @@ use banto_core::model::{AgentKind, SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::{ProcessRunner, SystemProcessRunner};
@@ -1534,7 +1535,14 @@ fn activate(app: &mut App, ctx: &Context) {
     // Only consulted here — in-place mode has no pane map, so this is the
     // *only* double-resume guard, not a fallback for an untracked case.
     let live = read_live_sessions(&ctx.claude_home.sessions_dir());
-    match opener::decide_inplace_resume(&session, &SysinfoProbe, &live, &ctx.agent_binaries) {
+    let open_ctx = opener::OpenContext {
+        probe: &SysinfoProbe,
+        live: &live,
+        binaries: &ctx.agent_binaries,
+        codex_home: ctx.codex_home.as_ref(),
+        start_time: &SysinfoStartTime,
+    };
+    match opener::decide_inplace_resume(&session, &open_ctx) {
         Some(launch) => {
             ctx.log(&format!(
                 "activate (in-place) session={id} argv={:?} cwd={}",
@@ -1611,6 +1619,8 @@ fn activate_split(app: &mut App, ctx: &Context) {
             probe: &SysinfoProbe,
             live: &live,
             binaries: &ctx.agent_binaries,
+            codex_home: ctx.codex_home.as_ref(),
+            start_time: &SysinfoStartTime,
         },
     );
     ctx.log(&format!("activate_split open_session outcome={outcome:?}"));

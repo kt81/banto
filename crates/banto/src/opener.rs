@@ -15,6 +15,8 @@ use std::time::SystemTime;
 use banto_core::config::{AgentBinaries, OpenerMode};
 pub use banto_core::model::SessionToOpen;
 use banto_core::model::{AgentKind, SessionId};
+use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::{self, ProcessStartTime};
 use banto_io::opener::{
     self, Backend, CommandRunner, CommandSpec, OpenError, Opener, ResumeCommand, SessionHandle,
     TmuxFlavor, TmuxOpener, WindowsTerminalOpener,
@@ -160,9 +162,14 @@ pub fn open_new_session<R: CommandRunner + 'static>(
 pub struct OpenContext<'a> {
     pub probe: &'a dyn ProcessProbe,
     /// The current `<claude_home>/sessions/*.json` snapshot (see
-    /// `banto_io::status::read_live_sessions`).
+    /// `banto_io::status::read_live_sessions`). Claude sessions only —
+    /// Codex liveness goes through `codex_home`/`start_time` instead (see
+    /// [`is_live`]).
     pub live: &'a [LiveSession],
     pub binaries: &'a AgentBinaries,
+    /// `None` degrades a Codex session to "not live" — see [`is_live`].
+    pub codex_home: Option<&'a CodexHome>,
+    pub start_time: &'a dyn ProcessStartTime,
 }
 
 /// Open or focus `session`, enforcing the no-double-resume invariant.
@@ -204,7 +211,7 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
         // modal, which has no pre-existing session id to key a pane record
         // against). Opening fresh here would `--resume` an already-running
         // session, forking its history.
-        None if is_live(&session.id, ctx.live, ctx.probe) => {
+        None if is_live(session, ctx) => {
             return Ok(OpenOutcome::AlreadyRunningUntracked);
         }
         None => {}
@@ -213,31 +220,42 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
     open_fresh(store, backend, session, runner, anchor_pane, ctx.binaries)
 }
 
-/// Whether any live-state entry names `session_id` with a currently-alive
-/// pid, regardless of busy/idle status — used to guard against
-/// `--resume`-ing (and thereby history-forking) a session that's live but
-/// untracked (see [`open_session`]), and reused by [`decide_inplace_resume`]
-/// for the same reason: in-place mode has no pane map of its own, so this is
-/// its *only* double-resume guard, not just a fallback for the untracked
-/// case. Unlike `banto_io::status::classify` (which is about which
-/// activity dot to show, so a busy entry outranks a merely-alive one), this
-/// only answers "is this session actually running right now".
+/// Whether `session` is currently running somewhere banto can't already see
+/// via a pane record — used to guard against `--resume`-ing (and thereby
+/// history-forking) a session that's live but untracked (see
+/// [`open_session`]), and reused by [`decide_inplace_resume`] for the same
+/// reason: in-place mode has no pane map of its own, so this is its *only*
+/// double-resume guard, not just a fallback for the untracked case.
 ///
-/// When `entry` carries a `proc_start` (Claude Code's own record of its
-/// process's kernel start time), liveness is checked via
+/// `session.agent` picks the source: Claude Code checks `ctx.live` (any
+/// entry naming `session.id` with a currently-alive pid, regardless of
+/// busy/idle status — unlike `banto_io::status::classify`, which is about
+/// which activity dot to show, this only answers "is this actually running
+/// right now"); Codex checks `ctx.codex_home` via
+/// `codex_liveness::is_thread_alive`, which degrades to `false` — not live
+/// — whenever it can't be determined (see that function's doc for why
+/// under-reporting is the safe direction here too).
+///
+/// For Claude, when `entry` carries a `proc_start` (Claude Code's own
+/// record of its process's kernel start time), liveness is checked via
 /// [`ProcessProbe::is_alive_matching`] instead of a bare
 /// [`ProcessProbe::is_alive`] — so a pid recycled by an unrelated process
 /// since the live-state file was written is not mistaken for the original
 /// session still running, which would otherwise block a resume forever with
 /// no self-heal (see that method's doc comment).
-pub(crate) fn is_live(session_id: &str, live: &[LiveSession], probe: &dyn ProcessProbe) -> bool {
-    live.iter().any(|entry| {
-        entry.session_id.as_deref() == Some(session_id)
-            && match &entry.proc_start {
-                Some(proc_start) => probe.is_alive_matching(entry.pid, proc_start),
-                None => probe.is_alive(entry.pid),
-            }
-    })
+pub(crate) fn is_live(session: &SessionToOpen, ctx: &OpenContext) -> bool {
+    match session.agent {
+        AgentKind::ClaudeCode => ctx.live.iter().any(|entry| {
+            entry.session_id.as_deref() == Some(session.id.as_str())
+                && match &entry.proc_start {
+                    Some(proc_start) => ctx.probe.is_alive_matching(entry.pid, proc_start),
+                    None => ctx.probe.is_alive(entry.pid),
+                }
+        }),
+        AgentKind::Codex => ctx.codex_home.is_some_and(|codex_home| {
+            codex_liveness::is_thread_alive(codex_home, &session.id, ctx.start_time)
+        }),
+    }
 }
 
 /// A terminal hand-off ready to run in-place: the argv to execute with
@@ -408,23 +426,21 @@ pub(crate) fn inplace_argv(
 
 /// Decide whether to resume `session` in place, or `None` to refuse: taking
 /// over the terminal for a session that's already running somewhere else (a
-/// split pane, another banto instance, or a directly-launched `claude`)
-/// would `--resume` it a second time and fork its history (CLAUDE.md
-/// invariant 4). `live`/`probe` are the same live-state snapshot and
-/// liveness probe [`open_session`]'s untracked-but-live guard uses (see
-/// [`is_live`]) — the only guard available here, since in-place mode has no
-/// pane map of its own to consult first.
+/// split pane, another banto instance, or a directly-launched agent
+/// process) would `--resume`/`resume` it a second time and fork its history
+/// (CLAUDE.md invariant 4). `ctx` is the same context [`open_session`]'s
+/// untracked-but-live guard uses (see [`is_live`]) — the only guard
+/// available here, since in-place mode has no pane map of its own to
+/// consult first.
 pub(crate) fn decide_inplace_resume(
     session: &SessionToOpen,
-    probe: &dyn ProcessProbe,
-    live: &[LiveSession],
-    binaries: &AgentBinaries,
+    ctx: &OpenContext,
 ) -> Option<InPlaceLaunch> {
-    if is_live(&session.id, live, probe) {
+    if is_live(session, ctx) {
         None
     } else {
         Some(InPlaceLaunch {
-            argv: inplace_argv(session.agent, Some(&session.id), &session.cwd, binaries),
+            argv: inplace_argv(session.agent, Some(&session.id), &session.cwd, ctx.binaries),
             cwd: session.cwd.clone(),
             startup_message: resume_startup_message(&session.title),
         })
@@ -858,6 +874,22 @@ mod tests {
         }
     }
 
+    /// An [`OpenContext`] for tests that don't care about Codex liveness
+    /// (`codex_home: None` degrades every Codex check to "not live").
+    fn test_ctx<'a>(
+        probe: &'a dyn ProcessProbe,
+        live: &'a [LiveSession],
+        binaries: &'a AgentBinaries,
+    ) -> OpenContext<'a> {
+        OpenContext {
+            probe,
+            live,
+            binaries,
+            codex_home: None,
+            start_time: &codex_liveness::SysinfoStartTime,
+        }
+    }
+
     #[test]
     fn opens_fresh_and_records_the_pane_when_nothing_is_tracked() {
         let store = Store::open_in_memory().unwrap();
@@ -870,11 +902,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -915,22 +943,33 @@ mod tests {
     #[test]
     fn is_live_matches_only_a_live_entry_with_the_right_session_id_and_a_live_pid() {
         let probe = MockProbe::with_alive(&[100]);
+        let binaries = AgentBinaries::default();
 
-        assert!(is_live("sess-1", &[live_entry("sess-1", 100)], &probe));
+        assert!(is_live(
+            &session(),
+            &test_ctx(&probe, &[live_entry("sess-1", 100)], &binaries)
+        ));
         // Wrong session id.
-        assert!(!is_live("sess-1", &[live_entry("sess-2", 100)], &probe));
+        assert!(!is_live(
+            &session(),
+            &test_ctx(&probe, &[live_entry("sess-2", 100)], &binaries)
+        ));
         // Right session id, dead pid.
-        assert!(!is_live("sess-1", &[live_entry("sess-1", 999)], &probe));
+        assert!(!is_live(
+            &session(),
+            &test_ctx(&probe, &[live_entry("sess-1", 999)], &binaries)
+        ));
         // No live entries at all.
-        assert!(!is_live("sess-1", &[], &probe));
+        assert!(!is_live(&session(), &test_ctx(&probe, &[], &binaries)));
     }
 
     #[test]
     fn is_live_confirms_a_proc_start_carrying_entry_via_is_alive_matching() {
         let probe = MockProbe::with_alive(&[100]);
         let entry = live_entry_with_proc_start("sess-1", 100, "1105463");
+        let binaries = AgentBinaries::default();
 
-        assert!(is_live("sess-1", &[entry], &probe));
+        assert!(is_live(&session(), &test_ctx(&probe, &[entry], &binaries)));
     }
 
     #[test]
@@ -941,8 +980,22 @@ mod tests {
         // reused) — is_live must not treat this as still running.
         let probe = MockProbe::with_alive_but_identity_mismatch(&[100]);
         let entry = live_entry_with_proc_start("sess-1", 100, "1105463");
+        let binaries = AgentBinaries::default();
 
-        assert!(!is_live("sess-1", &[entry], &probe));
+        assert!(!is_live(&session(), &test_ctx(&probe, &[entry], &binaries)));
+    }
+
+    #[test]
+    fn is_live_codex_session_with_no_codex_home_is_not_live() {
+        // codex_home: None degrades every Codex liveness check to "not
+        // live" — see `codex_liveness::is_thread_alive`'s doc for why that
+        // is the safe direction to fail in.
+        let probe = MockProbe::with_alive(&[]);
+        let mut codex_session = session();
+        codex_session.agent = AgentKind::Codex;
+        let binaries = AgentBinaries::default();
+
+        assert!(!is_live(&codex_session, &test_ctx(&probe, &[], &binaries)));
     }
 
     // --- AgentLaunch::argv --------------------------------------------------
@@ -1125,9 +1178,9 @@ mod tests {
     #[test]
     fn decide_inplace_resume_proceeds_when_the_session_is_not_live() {
         let probe = MockProbe::with_alive(&[]);
+        let binaries = AgentBinaries::default();
 
-        let launch =
-            decide_inplace_resume(&session(), &probe, &[], &AgentBinaries::default()).unwrap();
+        let launch = decide_inplace_resume(&session(), &test_ctx(&probe, &[], &binaries)).unwrap();
 
         assert_eq!(
             launch.argv,
@@ -1142,9 +1195,10 @@ mod tests {
         let probe = MockProbe::with_alive(&[]);
         let mut codex_session = session();
         codex_session.agent = AgentKind::Codex;
+        let binaries = AgentBinaries::default();
 
         let launch =
-            decide_inplace_resume(&codex_session, &probe, &[], &AgentBinaries::default()).unwrap();
+            decide_inplace_resume(&codex_session, &test_ctx(&probe, &[], &binaries)).unwrap();
 
         assert_eq!(
             launch.argv,
@@ -1156,9 +1210,10 @@ mod tests {
     fn decide_inplace_resume_refuses_when_the_session_is_already_live() {
         let probe = MockProbe::with_alive(&[4242]);
         let live = [live_entry("sess-1", 4242)];
+        let binaries = AgentBinaries::default();
 
         assert_eq!(
-            decide_inplace_resume(&session(), &probe, &live, &AgentBinaries::default()),
+            decide_inplace_resume(&session(), &test_ctx(&probe, &live, &binaries)),
             None
         );
     }
@@ -1167,10 +1222,9 @@ mod tests {
     fn decide_inplace_resume_ignores_a_live_entry_for_a_different_session() {
         let probe = MockProbe::with_alive(&[4242]);
         let live = [live_entry("some-other-session", 4242)];
+        let binaries = AgentBinaries::default();
 
-        assert!(
-            decide_inplace_resume(&session(), &probe, &live, &AgentBinaries::default()).is_some()
-        );
+        assert!(decide_inplace_resume(&session(), &test_ctx(&probe, &live, &binaries)).is_some());
     }
 
     #[test]
@@ -1186,11 +1240,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &live,
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &live, &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1222,11 +1272,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &live,
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &live, &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1245,11 +1291,7 @@ mod tests {
             &session(),
             runner.clone(),
             Some("%7"),
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1273,11 +1315,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1310,11 +1348,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1348,11 +1382,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1380,11 +1410,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1419,11 +1445,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
@@ -1457,11 +1479,7 @@ mod tests {
             &session(),
             runner.clone(),
             None,
-            &OpenContext {
-                probe: &probe,
-                live: &[],
-                binaries: &AgentBinaries::default(),
-            },
+            &test_ctx(&probe, &[], &AgentBinaries::default()),
         )
         .unwrap();
 
