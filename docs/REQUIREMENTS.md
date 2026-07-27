@@ -193,6 +193,17 @@ Codex CLI versions. Same defense: **lenient parsing** (a malformed row is
 skipped, not fatal) plus synthetic-fixture tests. **Never bring a real
 `~/.codex` database into the repository.**
 
+**Live-reload watch:** `crate::watch` watches `CodexHome::rollout_dir`
+(`<codex_home>/sessions/`, recursively) so a new session's rollout file
+appearing triggers the same debounced reload a Claude Code change does. It
+does not watch any of Codex's sqlite files. Measured against a synthetic
+WAL-mode database shaped like `state_5.sqlite`: a write never touches the
+main file's own mtime (everything lands in its `-wal`/`-shm` sidecars), and a
+running session writes somewhere in `$CODEX_HOME` on every turn —
+`logs_2.sqlite` on every log line — so a directory watch there would fire far
+more often than the rollout tree's one event per turn, across databases
+discovery doesn't even read.
+
 ## Module layout
 
 Four crates, split along the TEA / sans-IO boundary
@@ -484,7 +495,9 @@ themselves.
 3. Otherwise bucket by jsonl mtime: today / this week / older
    (thresholds and colors configurable)
 
-Watch `projects/` and `sessions/` with `notify` for realtime updates.
+Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
+when a Codex home resolves, its rollout tree (see "Codex data sources" above
+for why not its sqlite files too).
 
 ## Stack
 

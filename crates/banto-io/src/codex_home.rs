@@ -7,9 +7,11 @@
 //! `sessions/<pid>.json`. A sqlite database (`state_5.sqlite`, observed on
 //! this machine's installed Codex CLI version — the filename may change
 //! across versions) holds a `threads` table indexing every session, each row
-//! naming a `rollout_path` — the actual per-session transcript file. Its
-//! `sessions/` tree has no accessor here because nothing joins paths onto
-//! it: discovery reads each row's `rollout_path` from the table directly.
+//! naming a `rollout_path` — the actual per-session transcript file.
+//! Discovery reads each row's `rollout_path` straight from the table rather
+//! than joining onto [`Self::rollout_dir`]; that accessor exists only for
+//! [`crate::watch`], which has to name a directory to watch before any row
+//! exists.
 //!
 //! Pure paths only: no I/O, no existence checks, no failure mode of its own
 //! — same contract as [`ClaudeHome`](crate::claude_home::ClaudeHome).
@@ -63,6 +65,15 @@ impl CodexHome {
     pub fn logs_db_path(&self) -> PathBuf {
         self.0.join("logs_2.sqlite")
     }
+
+    /// `<root>/sessions`: the rollout-transcript tree
+    /// (`YYYY/MM/DD/rollout-*.jsonl`, confirmed against a real installed
+    /// Codex CLI's `~/.codex/sessions`), watched (not read) by
+    /// [`crate::watch`] to notice a new session the moment its rollout file
+    /// appears.
+    pub fn rollout_dir(&self) -> PathBuf {
+        self.0.join("sessions")
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +91,10 @@ mod tests {
         assert_eq!(
             home.logs_db_path(),
             PathBuf::from("/synthetic/codex-home/logs_2.sqlite")
+        );
+        assert_eq!(
+            home.rollout_dir(),
+            PathBuf::from("/synthetic/codex-home/sessions")
         );
     }
 

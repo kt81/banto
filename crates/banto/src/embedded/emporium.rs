@@ -199,7 +199,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
-    let mut watch = LiveWatch::new(deps.claude_home);
+    let mut watch = LiveWatch::new(deps.claude_home, deps.codex_home);
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
     let mut input_log = open_input_log();

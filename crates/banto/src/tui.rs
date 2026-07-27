@@ -211,9 +211,9 @@ pub(crate) struct LiveWatch {
 }
 
 impl LiveWatch {
-    pub(crate) fn new(claude_home: &ClaudeHome) -> Self {
+    pub(crate) fn new(claude_home: &ClaudeHome, codex_home: Option<&CodexHome>) -> Self {
         Self {
-            source: NotifyChangeSource::new(claude_home).ok(),
+            source: NotifyChangeSource::new(claude_home, codex_home).ok(),
             debouncer: Debouncer::new(DEBOUNCE_QUIET),
         }
     }
@@ -594,7 +594,7 @@ fn layout_areas(area: Rect) -> [Rect; 4] {
 /// `event::read()`) is what lets live updates land without waiting for the
 /// next keypress.
 fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
-    let mut watch = LiveWatch::new(&ctx.claude_home);
+    let mut watch = LiveWatch::new(&ctx.claude_home, ctx.codex_home.as_ref());
 
     loop {
         // Compute the layout up front so the viewport height and mouse
