@@ -278,6 +278,23 @@ mod tests {
         AgentKind::ALL.into_iter().collect()
     }
 
+    /// The synthetic `threads` shape every Codex test here builds — one
+    /// definition rather than a copy per test, because two copies is how
+    /// this went wrong once: a column added to the provider's query reached
+    /// the copy that existed at the time and not the one a parallel branch
+    /// was adding, and the schemas only disagreed after both merged. Never
+    /// real session data; a hand-authored shape only.
+    const CREATE_THREADS: &str = "\
+        CREATE TABLE threads (\
+            id TEXT PRIMARY KEY, \
+            title TEXT, \
+            cwd TEXT, \
+            rollout_path TEXT, \
+            first_user_message TEXT, \
+            updated_at_ms INTEGER, \
+            archived INTEGER DEFAULT 0\
+        )";
+
     #[test]
     fn discover_all_merges_claude_and_codex_sessions() {
         let dir = tempfile::tempdir().unwrap();
@@ -296,12 +313,7 @@ mod tests {
         std::fs::write(&rollout, "x").unwrap();
         let codex_home = banto_io::codex_home::CodexHome::new(codex_root);
         let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, \
-             rollout_path TEXT, first_user_message TEXT, updated_at_ms INTEGER, \
-             archived INTEGER DEFAULT 0);",
-        )
-        .unwrap();
+        conn.execute_batch(CREATE_THREADS).unwrap();
         conn.execute(
             "INSERT INTO threads (id, title, rollout_path, updated_at_ms) \
              VALUES ('codex-1', 'Codex session', ?1, 0)",
@@ -367,11 +379,7 @@ mod tests {
         std::fs::write(&rollout, "x").unwrap();
         let codex_home = banto_io::codex_home::CodexHome::new(codex_root);
         let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, \
-             rollout_path TEXT, first_user_message TEXT, updated_at_ms INTEGER);",
-        )
-        .unwrap();
+        conn.execute_batch(CREATE_THREADS).unwrap();
         conn.execute(
             "INSERT INTO threads (id, title, rollout_path, updated_at_ms) \
              VALUES ('codex-1', 'Codex session', ?1, 0)",
