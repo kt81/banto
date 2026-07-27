@@ -1,7 +1,7 @@
 //! The root directory the Codex CLI stores its own state under (`~/.codex`
 //! by default, or `$CODEX_HOME` when set — Codex's own override variable;
-//! Claude Code has none, so [`ClaudeHome`](crate::claude_home::ClaudeHome)
-//! only ever takes an explicit root).
+//! see [`ClaudeHome`](crate::claude_home::ClaudeHome) for the equivalent
+//! `$CLAUDE_CONFIG_DIR` on the Claude side).
 //!
 //! Codex's layout is nothing like Claude's: no `projects/`, no
 //! `sessions/<pid>.json`. A sqlite database (`state_5.sqlite`, observed on

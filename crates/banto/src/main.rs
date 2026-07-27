@@ -1,14 +1,21 @@
 //! banto binary: a clap CLI whose default action launches the TUI.
 //!
-//! Claude-home resolution order (highest priority first):
-//! 1. the `--claude-home` flag,
-//! 2. `Config.claude_home` from banto's own `config.toml`,
-//! 3. the provider default (`~/.claude`).
+//! Both products' homes resolve in the same shape and priority order
+//! (highest first), so that a flag and a `config.toml` entry always beat
+//! the product's own environment variable rather than one product
+//! honouring it unconditionally and the other ignoring it:
+//! 1. the `--claude-home` / `--codex-home` flag,
+//! 2. `Config.claude_home` / `Config.codex_home` from banto's own
+//!    `config.toml` — banto-specific and deliberately set, so it outranks
+//!    an ambient environment variable meant for the provider CLI itself,
+//! 3. the provider's own override variable (`$CLAUDE_CONFIG_DIR` /
+//!    `$CODEX_HOME`),
+//! 4. the provider default (`~/.claude` / `~/.codex`).
 //!
-//! Codex home resolution has no flag or config field yet: `$CODEX_HOME` if
-//! set, else the provider default (`~/.codex`) — see
-//! [`CodexHome::default_home`]. A Codex home that fails to resolve at all
-//! simply means no Codex sessions, not a startup error.
+//! See [`resolve_claude_home`] and [`resolve_codex_home`]. They differ only
+//! in failure mode: no Claude home is a startup error (`--claude-home` is
+//! the escape hatch), while no Codex home just means no Codex sessions —
+//! Codex support is optional, Claude's is not.
 //!
 //! Everything under the resolved Claude home, and under the resolved Codex
 //! home, is treated as strictly read-only.
@@ -54,10 +61,17 @@ use session::{activity_tag, load_rows, thresholds_from};
 #[derive(Parser)]
 #[command(name = "banto", version, about, long_about = None)]
 struct Cli {
-    /// Override the Claude home directory (default: config, else ~/.claude).
-    /// Read-only: banto never writes under this path.
+    /// Override the Claude home directory (default: config, else
+    /// $CLAUDE_CONFIG_DIR, else ~/.claude). Read-only: banto never writes
+    /// under this path.
     #[arg(long, global = true, value_name = "PATH")]
     claude_home: Option<PathBuf>,
+
+    /// Override the Codex home directory (default: config, else
+    /// $CODEX_HOME, else ~/.codex). Read-only: banto never writes under
+    /// this path.
+    #[arg(long, global = true, value_name = "PATH")]
+    codex_home: Option<PathBuf>,
 
     /// Explicit path to banto's own config.toml. Takes priority over
     /// $BANTO_CONFIG and the XDG/~/.config/platform-default search — and
@@ -161,7 +175,7 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::List) => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-            let codex_home = CodexHome::default_home();
+            let codex_home = resolve_codex_home(cli.codex_home, &config);
             let thresholds = thresholds_from(&config.activity);
             run_list(
                 &claude_home,
@@ -224,7 +238,7 @@ fn main() -> Result<()> {
         }
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-            let codex_home = CodexHome::default_home();
+            let codex_home = resolve_codex_home(cli.codex_home, &config);
             let thresholds = thresholds_from(&config.activity);
             // `Store::set_session_group` (the `g` modal) takes `&mut self`
             // (it wraps a transaction), and the store is shared by both the
@@ -291,6 +305,16 @@ fn resolve_claude_home(flag: Option<PathBuf>, config: &Config) -> Result<ClaudeH
         .map(ClaudeHome::new)
         .or_else(ClaudeHome::default_home)
         .context("could not determine the Claude home directory; pass --claude-home <PATH>")
+}
+
+/// Resolve the Codex home directory per the same priority order as
+/// [`resolve_claude_home`], except that failing to resolve one is not a
+/// startup error: Codex support is optional, so no Codex home just means no
+/// Codex sessions to show.
+fn resolve_codex_home(flag: Option<PathBuf>, config: &Config) -> Option<CodexHome> {
+    flag.or_else(|| config.codex_home.clone())
+        .map(CodexHome::new)
+        .or_else(CodexHome::default_home)
 }
 
 /// Open (creating if needed) banto's own sqlite database at
