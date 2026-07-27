@@ -478,6 +478,28 @@ impl EmporiumState {
         self.next_plain_id += 1;
         SessionKey::new_plain(cwd, discriminator)
     }
+
+    /// Drop `key` from the stage, keeping [`Self::focus`] pointing at
+    /// something that exists.
+    ///
+    /// Removing the last pane leaves [`Stage::Empty`], and a `Focus::Pane`
+    /// outliving it strands every keypress: the pane branch forwards to a
+    /// focused key that is now `None`, and the sidebar branch never runs
+    /// because focus is not on the sidebar. Nothing blocks and nothing
+    /// spins — the loop keeps drawing a correct screen while answering
+    /// nothing, which reads as a freeze rather than as a bug. `prefix x` on
+    /// a solo pane did exactly that, and F2 was the only way out, for
+    /// someone who already knew.
+    ///
+    /// Unstaging goes through here rather than calling `Stage::remove`
+    /// directly so that a third caller cannot reintroduce it by omitting a
+    /// step it has no reason to know about.
+    fn unstage(&mut self, key: &SessionKey) {
+        self.stage.remove(key);
+        if !self.stage.is_active() {
+            self.focus = Focus::Sidebar;
+        }
+    }
 }
 
 /// How long the prefix stays armed with no follow-up key before
@@ -2091,7 +2113,7 @@ fn update_pty_exited(
     now: Instant,
 ) -> Vec<Cmd> {
     state.screens.remove(&key);
-    state.stage.remove(&key);
+    state.unstage(&key);
     let title = app
         .row_for_id(key.as_str())
         .map(|row| row.display_title().to_string())
@@ -2394,7 +2416,7 @@ fn update_worker_dismissed(
                 .unwrap_or_else(|| key.as_str().to_string());
             state.set_status(format!("{title} dismissed from the brigade"), now);
             if staged {
-                state.stage.remove(&key);
+                state.unstage(&key);
                 vec![Cmd::KillPty { key }]
             } else {
                 Vec::new()
@@ -3798,6 +3820,58 @@ mod tests {
         assert!(matches!(state.stage, Stage::Empty));
         assert!(!state.screens.contains_key(&key));
         assert!(state.status.unwrap().contains("session ended"));
+        assert_eq!(
+            state.focus,
+            Focus::Sidebar,
+            "focus must not outlive the pane it points at"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_answers_keys_again_after_its_last_pane_exits() {
+        // The assertion above is the state; this is what the operator
+        // experiences. A solo pane's exit used to leave `Focus::Pane`
+        // behind, so every later key was forwarded to a pane that no longer
+        // existed and the sidebar never saw one — a correctly drawn screen
+        // that answered nothing.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![row("sess-1"), row("sess-2")]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key: key.clone() },
+            now,
+        );
+
+        let before = app.selected_row().map(|row| row.id.clone());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert_ne!(
+            app.selected_row().map(|row| row.id.clone()),
+            before,
+            "`j` should have moved the sidebar selection"
+        );
+        assert!(
+            !cmds.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "nothing should be written to a pane that no longer exists"
+        );
     }
 
     #[test]
