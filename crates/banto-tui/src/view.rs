@@ -25,7 +25,7 @@
 //!
 //! One algorithm, driven by the render area's width and whether grouped
 //! view is actually in effect (`App::grouped_view_in_effect`), for both
-//! modes: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`.
+//! modes: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label][gap>=2][age]`.
 //! The pin slot exists (3 columns) only in flat view — in grouped view
 //! every pinned row's section is "Pinned" (`App::section_name` gives it
 //! top priority), so a pin marker could never render there anyway; the
@@ -37,6 +37,12 @@
 //! flush at the right edge, saturating throughout with an explicit
 //! narrow-width degradation that drops the age column entirely rather than
 //! ever let it collide into the prefix).
+//!
+//! A row is one line (`App::lines_per_row` 1, the chōba — the label sits on
+//! that same line, per the formula above) or two (more than 1, the emporium
+//! sidebar): line one is the formula above minus the label, line two is cwd
+//! plus the label, indented to align under the title rather than starting
+//! at column zero — see [`cwd_agent_line`].
 
 use std::time::SystemTime;
 
@@ -48,7 +54,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use banto_core::app::{App, ListLine, VisibleRow};
-use banto_core::model::{self, Activity, AgeBucket, SessionRow};
+use banto_core::model::{self, Activity, AgeBucket, AgentKind, SessionRow};
 
 use crate::text::{truncate_to_width, truncate_to_width_leading};
 
@@ -137,7 +143,7 @@ fn list_item(
         ListLine::Row(visible) => {
             if lines_per_row > 1 {
                 let top = row_line(&visible, area_width, now, show_pin_slot, None);
-                let bottom = cwd_agent_line(visible.row, area_width);
+                let bottom = cwd_agent_line(visible.row, area_width, show_pin_slot);
                 ListItem::new(vec![top, bottom])
             } else {
                 let label = agent_label(visible.row);
@@ -285,7 +291,7 @@ fn row_line(
         used_width += LABEL_GAP;
         spans.push(Span::styled(
             label.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(agent_label_color(visible.row.agent)),
         ));
         used_width += label.width();
     }
@@ -309,34 +315,59 @@ fn agent_label(row: &SessionRow) -> String {
     format!("[{}]", row.agent.label())
 }
 
+/// Per-product accent for the agent label — muted, not vivid, and
+/// deliberately clear of every colour the activity dot already uses
+/// (Green/Cyan/Yellow/Gray/DarkGray, see the module doc's "Emoji markers"
+/// section) so the two colours sharing a row don't compete for attention.
+/// Plain `Blue` is skipped for either variant on purpose: it's the classic
+/// hard-to-read-on-a-dark-terminal colour (many default 16-colour schemes
+/// render it close to black) — exactly the kind of failure that got an
+/// emoji rejected outright once already (see the module doc); `LightBlue`
+/// is the brighter variant terminal themes generally exist to fix that
+/// with.
+fn agent_label_color(agent: AgentKind) -> Color {
+    match agent {
+        AgentKind::ClaudeCode => Color::Magenta,
+        AgentKind::Codex => Color::LightBlue,
+    }
+}
+
 /// The emporium sidebar's second physical line per row (only when
-/// `App::lines_per_row` is more than 1, see [`list_item`]): cwd,
-/// leading-truncated, on the left; the agent label right-aligned at the
-/// row's literal right edge — the same right-flush-trailing-element and
-/// saturating-arithmetic conventions [`row_line`]'s own age column uses,
-/// applied here since age itself has no place on this line. Below room for
-/// the label plus its minimum gap, the gap guarantee is the first thing
-/// dropped (matching [`row_line`]'s own "drop the gap, not the content"
-/// order); the label itself is truncated, never panicking, only once even
-/// that alone doesn't fit.
-fn cwd_agent_line(row: &SessionRow, area_width: u16) -> Line<'static> {
-    let area_width = area_width as usize;
+/// `App::lines_per_row` is more than 1, see [`list_item`]): indented by
+/// [`fixed_prefix_width`] so its content aligns under line one's *title*
+/// rather than starting at column zero — without this a stray path would
+/// appear to hang between every row instead of reading as that row's own
+/// second line (dogfooding report). cwd is leading-truncated on the left;
+/// the agent label sits right-aligned at the row's literal right edge — the
+/// same right-flush-trailing-element and saturating-arithmetic conventions
+/// [`row_line`]'s own age column uses, applied here since age itself has no
+/// place on this line. Below room for the label plus its minimum gap, the
+/// gap guarantee is the first thing dropped (matching [`row_line`]'s own
+/// "drop the gap, not the content" order); the label itself is truncated,
+/// never panicking, only once even that alone doesn't fit.
+fn cwd_agent_line(row: &SessionRow, area_width: u16, show_pin_slot: bool) -> Line<'static> {
+    let indent = fixed_prefix_width(show_pin_slot);
+    let content_width = (area_width as usize).saturating_sub(indent);
+    let indent_span = Span::raw(" ".repeat(indent));
+
     let label = agent_label(row);
     let label_width = label.width();
+    let label_style = Style::default().fg(agent_label_color(row.agent));
     let cwd_full = row.cwd_display();
 
-    let max_cwd = area_width.saturating_sub(MIN_GAP_BEFORE_AGE + label_width);
+    let max_cwd = content_width.saturating_sub(MIN_GAP_BEFORE_AGE + label_width);
     if max_cwd == 0 {
-        let label = truncate_to_width(&label, area_width as u16);
-        return Line::from(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        let label = truncate_to_width(&label, content_width as u16);
+        return Line::from(vec![indent_span, Span::styled(label, label_style)]);
     }
 
     let cwd_truncated = truncate_to_width_leading(&cwd_full, max_cwd as u16);
-    let gap = area_width.saturating_sub(cwd_truncated.width() + label_width);
+    let gap = content_width.saturating_sub(cwd_truncated.width() + label_width);
     Line::from(vec![
+        indent_span,
         Span::styled(cwd_truncated, Style::default().fg(Color::DarkGray)),
         Span::raw(" ".repeat(gap)),
-        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::styled(label, label_style),
     ])
 }
 
@@ -1095,6 +1126,74 @@ mod tests {
         assert!(
             !text.contains('/'),
             "cwd should have been dropped entirely:\n{text}"
+        );
+    }
+
+    #[test]
+    fn sidebar_line_two_aligns_under_line_ones_title_in_both_flat_and_grouped_view() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut app = App::new(vec![
+            row("a", "Alpha", "/work/a", now),
+            row("b", "Beta", "/work/b", now),
+        ])
+        .with_pinned(["a".to_string()].into_iter().collect())
+        .with_lines_per_row(2);
+        app.set_viewport_height(10);
+
+        let title_and_cwd_cols = |text: &str| -> (usize, usize) {
+            let lines: Vec<&str> = text.lines().collect();
+            let title_idx = lines
+                .iter()
+                .position(|l| l.contains("Alpha"))
+                .unwrap_or_else(|| panic!("no row contains \"Alpha\":\n{text}"));
+            let title_col = lines[title_idx].chars().position(|c| c == 'A').unwrap();
+            let cwd_col = lines[title_idx + 1].chars().position(|c| c == '/').unwrap();
+            (title_col, cwd_col)
+        };
+
+        // Grouped view (default): the pin slot is dropped (see
+        // `grouped_view_drops_the_pin_column_so_titles_start_three_columns_earlier`),
+        // so line two's indent must shrink by the same 3 columns as line
+        // one's title — not stay at whatever flat view used.
+        let (grouped_title_col, grouped_cwd_col) =
+            title_and_cwd_cols(&draw_list(&app, 34, 10, now));
+        assert_eq!(
+            grouped_cwd_col, grouped_title_col,
+            "line two should align under line one's title in grouped view"
+        );
+
+        app.toggle_grouped_view(); // flat: pin slot present
+        let (flat_title_col, flat_cwd_col) = title_and_cwd_cols(&draw_list(&app, 34, 10, now));
+        assert_eq!(
+            flat_cwd_col, flat_title_col,
+            "line two should align under line one's title in flat view"
+        );
+
+        assert_eq!(
+            flat_title_col - grouped_title_col,
+            3,
+            "the two views should actually use different indents here, or this \
+             test isn't exercising the thing it claims to"
+        );
+    }
+
+    #[test]
+    fn agent_label_color_differs_by_product_and_avoids_plain_blue() {
+        let claude = agent_label_color(AgentKind::ClaudeCode);
+        let codex = agent_label_color(AgentKind::Codex);
+        assert_ne!(
+            claude, codex,
+            "the two products should be visually distinguishable"
+        );
+        assert_ne!(
+            claude,
+            Color::Blue,
+            "plain Blue is the classic hard-to-read-on-dark terminal colour"
+        );
+        assert_ne!(
+            codex,
+            Color::Blue,
+            "plain Blue is the classic hard-to-read-on-dark terminal colour"
         );
     }
 }
