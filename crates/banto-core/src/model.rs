@@ -88,6 +88,15 @@ pub struct SessionMeta {
     /// of another one. `None` for an ordinary session (including a manually
     /// `/compact`-ed one, which keeps its original id rather than forking).
     pub continuation_of_uuid: Option<String>,
+    /// Whether the session's own product considers it archived — Codex's
+    /// `threads.archived` column (set by `codex archive`); Claude Code has
+    /// no equivalent yet and always reports `false`. Distinct from banto's
+    /// own archive (`Store::archive_session`, bound to `d`): that one is
+    /// banto's per-session-id fact, product-neutral and always reversible
+    /// from within banto; this one banto can only ever read, never clear —
+    /// `~/.codex` stays read-only (see `banto::tui::exclude_archived` for
+    /// how the two combine into what the list actually hides).
+    pub source_archived: bool,
 }
 
 /// Activity state rendered as the colored dot in the session list.
@@ -141,6 +150,11 @@ pub struct SessionRow {
     pub mtime: SystemTime,
     /// Source file size in bytes, for the summary panel ([`humanize_size`]).
     pub size: u64,
+    /// See [`SessionMeta::source_archived`]. `#[serde(default)]` so a
+    /// record/replay stream captured before this field existed still
+    /// deserializes (same reasoning as `Event::RowsLoaded::superseded`).
+    #[serde(default)]
+    pub source_archived: bool,
 }
 
 impl SessionRow {
@@ -337,6 +351,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -353,6 +368,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -369,6 +385,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }

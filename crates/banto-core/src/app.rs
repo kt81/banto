@@ -1933,6 +1933,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         }
     }
 

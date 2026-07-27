@@ -111,6 +111,7 @@ pub fn rows_from_metas(
                 preview: meta.preview,
                 mtime: meta.mtime,
                 size: meta.size,
+                source_archived: meta.source_archived,
             }
         })
         .collect()
@@ -138,6 +139,7 @@ mod tests {
             is_agent: false,
             preview: None,
             continuation_of_uuid: None,
+            source_archived: false,
         }
     }
 
@@ -153,6 +155,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -169,6 +172,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -185,6 +189,7 @@ mod tests {
             preview: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
+            source_archived: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }
@@ -264,7 +269,8 @@ mod tests {
         let conn = rusqlite::Connection::open(codex_home.threads_db_path()).unwrap();
         conn.execute_batch(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, \
-             rollout_path TEXT, first_user_message TEXT, updated_at_ms INTEGER);",
+             rollout_path TEXT, first_user_message TEXT, updated_at_ms INTEGER, \
+             archived INTEGER DEFAULT 0);",
         )
         .unwrap();
         conn.execute(
