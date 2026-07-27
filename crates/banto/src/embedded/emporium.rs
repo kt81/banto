@@ -40,16 +40,17 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
-use banto_core::config::{BrigadeConfig, KeysConfig};
+use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig};
 use banto_core::engine::{
     self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
     SessionKey, Stage, StoreIntent, layout, stage_tiles,
 };
 use banto_core::input::InputEvent;
-use banto_core::model::{BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
+use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::PortablePtyHost;
@@ -77,10 +78,12 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// `[keys]`: the tmux-style prefix chord for pane operations.
 pub fn run(
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
     store: &RefCell<Store>,
     brigade: &BrigadeConfig,
     keys: &KeysConfig,
+    agent_binaries: &AgentBinaries,
 ) -> Result<()> {
     // Janitor: purge brigades with no members left (legacy pre-v7 data, or
     // residue from a crash mid-formation) before the sidebar's brigade-
@@ -88,7 +91,7 @@ pub fn run(
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    let metas = ClaudeCodeProvider::new(claude_home.clone()).discover()?;
+    let metas = session::discover_all(claude_home, codex_home)?;
     // In-memory only, for this process's lifetime — see
     // `crate::tui::superseded_from_metas`'s doc. Created once here and
     // threaded through every reload (the bootstrap below and every later
@@ -128,10 +131,12 @@ pub fn run(
 
     let deps = Deps {
         claude_home,
+        codex_home,
         thresholds,
         store,
         superseded_failed: &superseded_failed,
         brigade,
+        agent_binaries,
     };
     let mut terminal = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut app, &deps, keys);
@@ -166,6 +171,9 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// [`Self::superseded_failed`]) gets threaded through.
 struct Deps<'a> {
     claude_home: &'a ClaudeHome,
+    /// `None` degrades to no Codex sessions in the sidebar, not an error —
+    /// same contract as `crate::tui::Context::codex_home`.
+    codex_home: Option<&'a CodexHome>,
     thresholds: &'a AgeThresholds,
     store: &'a RefCell<Store>,
     /// See [`crate::tui::superseded_from_metas`]'s doc: in-memory only, for
@@ -176,6 +184,8 @@ struct Deps<'a> {
     /// member's launch argv carries its role briefing — see
     /// [`render_briefing`]).
     brigade: &'a BrigadeConfig,
+    /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
+    agent_binaries: &'a AgentBinaries,
 }
 
 fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig) -> Result<()> {
@@ -445,10 +455,14 @@ fn execute_cmd(
 /// [`opener::decide_inplace_resume`] when a real id is already known (`None`
 /// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
 /// otherwise — either way with `model`/`briefing` carried on the result.
-/// `--model` applies the same way to a resume as to a fresh spawn: a Worker
-/// resumed without it falls back to the operator's own default model
-/// instead of the brigade's configured one (`engine::stage_brigade` never
-/// sets it for the Director, so this is never reached for one).
+/// `target.agent` picks the variant; `briefing` only ever reaches the
+/// `Claude` one (see [`opener::AgentLaunch`]'s doc — brigades are Claude-only,
+/// and the `Codex` variant has no field to put it in even if this is called
+/// with one anyway). `--model` applies the same way to a resume as to a
+/// fresh spawn: a Worker resumed without it falls back to the operator's
+/// own default model instead of the brigade's configured one
+/// (`engine::stage_brigade` never sets it for the Director, so this is
+/// never reached for one).
 ///
 /// `briefing` is the member's already-rendered role briefing
 /// (`--append-system-prompt`, see [`render_briefing`]) — rendered by the
@@ -466,6 +480,7 @@ fn build_open_launch(
     briefing: Option<&str>,
     probe: &dyn ProcessProbe,
     live: &[LiveSession],
+    binaries: &AgentBinaries,
 ) -> Option<opener::AgentLaunch> {
     let resume = if target.id.is_empty() {
         None
@@ -474,15 +489,26 @@ fn build_open_launch(
         // guard (CLAUDE.md invariant 4), and `?` is what turns a session that
         // is already live somewhere else into `None`. The `InPlaceLaunch` it
         // hands back is dropped because its argv is by construction
-        // `inplace_argv(Some(&target.id))` — the same id we resume below.
-        opener::decide_inplace_resume(target, probe, live)?;
+        // `inplace_argv(target.agent, Some(&target.id), ...)` — the same id
+        // we resume below.
+        opener::decide_inplace_resume(target, probe, live, binaries)?;
         Some(target.id.clone())
     };
-    Some(opener::AgentLaunch {
-        resume,
-        model: model.map(str::to_string),
-        append_system_prompt: briefing.map(str::to_string),
-        mcp_config: None,
+    Some(match target.agent {
+        AgentKind::ClaudeCode => opener::AgentLaunch::Claude {
+            resume,
+            model: model.map(str::to_string),
+            append_system_prompt: briefing.map(str::to_string),
+            mcp_config: None,
+        },
+        // `briefing` is silently unused here: brigades are Claude-only for
+        // now, and this variant has no field to carry it even if a caller
+        // mistakenly passed one — see `opener::AgentLaunch`'s doc.
+        AgentKind::Codex => opener::AgentLaunch::Codex {
+            resume,
+            model: model.map(str::to_string),
+            cwd: target.cwd.clone(),
+        },
     })
 }
 
@@ -519,19 +545,24 @@ fn execute_open_embedded(
         briefing.as_deref(),
         &SysinfoProbe,
         &live,
+        deps.agent_binaries,
     ) else {
         return vec![Event::SpawnFailed {
             key,
             error: "already running elsewhere".to_string(),
         }];
     };
-    if let Some((brigade_id, token, role)) = &brigade {
+    // Only the `Claude` variant has an `mcp_config` slot to fill — a Codex
+    // launch structurally can't carry one (brigades are Claude-only).
+    if let (Some((brigade_id, token, role)), opener::AgentLaunch::Claude { mcp_config, .. }) =
+        (&brigade, &mut launch)
+    {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
         if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
-            launch.mcp_config = Some(path);
+            *mcp_config = Some(path);
         }
     }
-    let argv = launch.argv();
+    let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), 24, 80) {
         Ok(handle) => {
@@ -774,7 +805,7 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 /// lineage-resolution budget against the same discover() pass (see
 /// [`crate::tui::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(metas) = ClaudeCodeProvider::new(deps.claude_home.clone()).discover() else {
+    let Ok(metas) = session::discover_all(deps.claude_home, deps.codex_home) else {
         return Vec::new();
     };
     let store = deps.store.borrow();
@@ -1795,12 +1826,15 @@ mod tests {
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
         let deps = Deps {
             claude_home: &claude_home,
+            codex_home: None,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
             brigade: &brigade,
+            agent_binaries: &agent_binaries,
         };
         let mut handles = HashMap::new();
 
@@ -1851,12 +1885,15 @@ mod tests {
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
         let deps = Deps {
             claude_home: &claude_home,
+            codex_home: None,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
             brigade: &brigade,
+            agent_binaries: &agent_binaries,
         };
 
         let events = execute_cmd(
@@ -2169,10 +2206,17 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch =
-            build_open_launch(&open_target("sess-1"), Some("opus"), None, &probe, &[]).unwrap();
+        let launch = build_open_launch(
+            &open_target("sess-1"),
+            Some("opus"),
+            None,
+            &probe,
+            &[],
+            &AgentBinaries::default(),
+        )
+        .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
         );
     }
@@ -2182,9 +2226,17 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(&open_target(""), Some("opus"), None, &probe, &[]).unwrap();
+        let launch = build_open_launch(
+            &open_target(""),
+            Some("opus"),
+            None,
+            &probe,
+            &[],
+            &AgentBinaries::default(),
+        )
+        .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             ["claude", "--model", "opus"].map(str::to_string)
         );
     }
@@ -2194,9 +2246,17 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
+        let launch = build_open_launch(
+            &open_target("sess-1"),
+            None,
+            None,
+            &probe,
+            &[],
+            &AgentBinaries::default(),
+        )
+        .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
     }
@@ -2216,7 +2276,49 @@ mod tests {
             proc_start: None,
         }];
         assert!(
-            build_open_launch(&open_target("sess-1"), Some("opus"), None, &probe, &live).is_none()
+            build_open_launch(
+                &open_target("sess-1"),
+                Some("opus"),
+                None,
+                &probe,
+                &live,
+                &AgentBinaries::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn build_open_launch_codex_target_resumes_via_codex_with_cwd() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let mut target = open_target("codex-uuid-1");
+        target.agent = AgentKind::Codex;
+        let launch = build_open_launch(
+            &target,
+            Some("o3"),
+            // A briefing passed anyway (shouldn't happen — brigades are
+            // Claude-only — but the Codex variant has nowhere to put it
+            // even so).
+            Some("you are the Director"),
+            &probe,
+            &[],
+            &AgentBinaries::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.argv("codex"),
+            [
+                "codex",
+                "resume",
+                "codex-uuid-1",
+                "-m",
+                "o3",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
         );
     }
 
@@ -2233,10 +2335,11 @@ mod tests {
             Some("you are the Director"),
             &probe,
             &[],
+            &AgentBinaries::default(),
         )
         .unwrap();
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             [
                 "claude",
                 "--resume",
@@ -2255,8 +2358,19 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(&open_target("sess-1"), None, None, &probe, &[]).unwrap();
-        assert_eq!(launch.mcp_config, None);
+        let launch = build_open_launch(
+            &open_target("sess-1"),
+            None,
+            None,
+            &probe,
+            &[],
+            &AgentBinaries::default(),
+        )
+        .unwrap();
+        match launch {
+            opener::AgentLaunch::Claude { mcp_config, .. } => assert_eq!(mcp_config, None),
+            opener::AgentLaunch::Codex { .. } => panic!("expected a Claude launch"),
+        }
     }
 
     #[test]
@@ -2315,12 +2429,15 @@ mod tests {
             ..config.clone()
         };
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
         let deps = |brigade| Deps {
             claude_home: &claude_home,
+            codex_home: None,
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
             brigade,
+            agent_binaries: &agent_binaries,
         };
 
         assert_eq!(

@@ -210,6 +210,7 @@ fn main() -> Result<()> {
         }
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let codex_home = CodexHome::default_home();
             let thresholds = thresholds_from(&config.activity);
             // `Store::set_session_group` (the `g` modal) takes `&mut self`
             // (it wraps a transaction), and the store is shared by both the
@@ -219,14 +220,22 @@ fn main() -> Result<()> {
             if cli.emporium {
                 embedded::run_emporium(
                     &claude_home,
+                    codex_home.as_ref(),
                     &thresholds,
                     &store,
                     &config.brigade,
                     &config.keys,
+                    &config.agent_binaries,
                 )
             } else {
-                let codex_home = CodexHome::default_home();
-                tui::run(&claude_home, codex_home, &thresholds, config.opener, &store)
+                tui::run(
+                    &claude_home,
+                    codex_home,
+                    config.agent_binaries.clone(),
+                    &thresholds,
+                    config.opener,
+                    &store,
+                )
             }
         }
     }

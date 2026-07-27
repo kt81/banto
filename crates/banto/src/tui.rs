@@ -33,8 +33,8 @@ use unicode_width::UnicodeWidthStr;
 use banto_core::app::{
     App, ClickOutcome, GroupJoinTarget, Modal, Mode, NewSessionPlacement, OpenAction,
 };
-use banto_core::config::OpenerMode;
-use banto_core::model::{SessionId, SessionMeta, SessionToOpen};
+use banto_core::config::{AgentBinaries, OpenerMode};
+use banto_core::model::{AgentKind, SessionId, SessionMeta, SessionToOpen};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
@@ -127,6 +127,8 @@ struct Context<'a> {
     /// directory) or `$CODEX_HOME`/`~/.codex` simply doesn't exist yet —
     /// either way, no Codex sessions, not an error.
     codex_home: Option<CodexHome>,
+    /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
+    agent_binaries: AgentBinaries,
     thresholds: &'a AgeThresholds,
     /// `RefCell`-wrapped — see `main`'s construction site for why.
     store: &'a RefCell<Store>,
@@ -231,6 +233,7 @@ impl LiveWatch {
 pub fn run(
     claude_home: &ClaudeHome,
     codex_home: Option<CodexHome>,
+    agent_binaries: AgentBinaries,
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
@@ -266,6 +269,7 @@ pub fn run(
     let ctx = Context {
         claude_home: claude_home.clone(),
         codex_home,
+        agent_binaries,
         thresholds,
         store,
         opener_mode,
@@ -832,7 +836,11 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 cwd.display()
             ));
             *ctx.pending_inplace.borrow_mut() = Some(opener::InPlaceLaunch {
-                argv: opener::inplace_argv(None),
+                // Always Claude: the new-session modal has no agent axis of
+                // its own, and the chōba is feature-frozen — see
+                // `opener::new_session_wrap_argv`'s doc for the split
+                // placement's identical reasoning.
+                argv: opener::inplace_argv(AgentKind::ClaudeCode, None, &cwd, &ctx.agent_binaries),
                 startup_message: opener::new_session_startup_message(&cwd),
                 cwd,
             });
@@ -857,6 +865,7 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 SystemCommandRunner,
                 anchor.as_deref(),
                 wrap_log.as_deref(),
+                &ctx.agent_binaries,
             );
             ctx.log(&format!(
                 "confirm_new_session_modal (split) cwd={} outcome={outcome:?}",
@@ -1525,7 +1534,7 @@ fn activate(app: &mut App, ctx: &Context) {
     // Only consulted here — in-place mode has no pane map, so this is the
     // *only* double-resume guard, not a fallback for an untracked case.
     let live = read_live_sessions(&ctx.claude_home.sessions_dir());
-    match opener::decide_inplace_resume(&session, &SysinfoProbe, &live) {
+    match opener::decide_inplace_resume(&session, &SysinfoProbe, &live, &ctx.agent_binaries) {
         Some(launch) => {
             ctx.log(&format!(
                 "activate (in-place) session={id} argv={:?} cwd={}",
@@ -1594,12 +1603,15 @@ fn activate_split(app: &mut App, ctx: &Context) {
     let live = read_live_sessions(&ctx.claude_home.sessions_dir());
     let outcome = opener::open_session(
         &ctx.store.borrow(),
-        &SysinfoProbe,
         backend,
         &session,
         SystemCommandRunner,
         anchor.as_deref(),
-        &live,
+        &opener::OpenContext {
+            probe: &SysinfoProbe,
+            live: &live,
+            binaries: &ctx.agent_binaries,
+        },
     );
     ctx.log(&format!("activate_split open_session outcome={outcome:?}"));
     if let Ok(record) = ctx.store.borrow().get_pane(&SessionId(id.clone())) {
@@ -1916,6 +1928,7 @@ mod tests {
         Context {
             claude_home: ClaudeHome::new(PathBuf::from(".")),
             codex_home: None,
+            agent_binaries: AgentBinaries::default(),
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,

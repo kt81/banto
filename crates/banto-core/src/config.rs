@@ -188,6 +188,19 @@ impl BrigadeConfig {
     }
 }
 
+/// Per-agent binary overrides. `None` for a given field means "look it up
+/// on `$PATH`" — today's behavior, and still the default. Codex is not
+/// reliably on `PATH` in practice (observed: present in two install
+/// locations, absent from `PATH` until the shell that installed it was
+/// reopened), which is the whole reason this exists; Claude gets the same
+/// treatment for symmetry rather than a special case.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentBinaries {
+    pub claude: Option<PathBuf>,
+    pub codex: Option<PathBuf>,
+}
+
 /// Emporium keybinding settings. Just the tmux-style prefix chord this
 /// round — full user-remappable keymaps are out of scope (a scoped decision,
 /// not an oversight: see `crate::engine`'s `PrefixKey`).
@@ -221,6 +234,7 @@ pub struct Config {
     pub activity: ActivityConfig,
     pub brigade: BrigadeConfig,
     pub keys: KeysConfig,
+    pub agent_binaries: AgentBinaries,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
     /// Overrides `banto_io::config::default_db_path`.
@@ -365,6 +379,23 @@ mod tests {
     fn unknown_keys_are_ignored() {
         let config = parse("opener = \"psmux\"\nfuture_option = true\n[some_new_section]\nx = 1\n");
         assert_eq!(config.opener, OpenerMode::Psmux);
+    }
+
+    #[test]
+    fn agent_binaries_default_to_none() {
+        let config = Config::default();
+        assert_eq!(config.agent_binaries.claude, None);
+        assert_eq!(config.agent_binaries.codex, None);
+    }
+
+    #[test]
+    fn agent_binaries_parse_independently() {
+        let config = parse("[agent_binaries]\ncodex = \"C:/tools/codex.exe\"\n");
+        assert_eq!(config.agent_binaries.claude, None);
+        assert_eq!(
+            config.agent_binaries.codex,
+            Some(PathBuf::from("C:/tools/codex.exe"))
+        );
     }
 
     #[test]

@@ -12,9 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use banto_core::config::OpenerMode;
-use banto_core::model::SessionId;
+use banto_core::config::{AgentBinaries, OpenerMode};
 pub use banto_core::model::SessionToOpen;
+use banto_core::model::{AgentKind, SessionId};
 use banto_io::opener::{
     self, Backend, CommandRunner, CommandSpec, OpenError, Opener, ResumeCommand, SessionHandle,
     TmuxFlavor, TmuxOpener, WindowsTerminalOpener,
@@ -123,6 +123,7 @@ pub fn open_new_session<R: CommandRunner + 'static>(
     runner: R,
     anchor_pane: Option<&str>,
     wrap_log: Option<&str>,
+    binaries: &AgentBinaries,
 ) -> Result<OpenOutcome, OpenError> {
     let Some(backend) = backend else {
         return Ok(OpenOutcome::NoBackendDetected);
@@ -137,7 +138,7 @@ pub fn open_new_session<R: CommandRunner + 'static>(
     let cmd = ResumeCommand {
         // Unused: there is no pane-map record for this launch to key.
         session_id: String::new(),
-        argv: new_session_wrap_argv(exe.as_deref(), cwd, backend, wrap_log),
+        argv: new_session_wrap_argv(exe.as_deref(), cwd, backend, wrap_log, binaries),
         cwd: cwd.to_path_buf(),
         title,
     };
@@ -152,22 +153,31 @@ pub fn open_new_session<R: CommandRunner + 'static>(
     Ok(OpenOutcome::Opened)
 }
 
+/// Read-only inputs an open/resume decision needs beyond the session itself
+/// — bundled once `open_session`'s own argument list hit clippy's
+/// too-many-arguments limit, rather than letting it keep growing one field
+/// at a time.
+pub struct OpenContext<'a> {
+    pub probe: &'a dyn ProcessProbe,
+    /// The current `<claude_home>/sessions/*.json` snapshot (see
+    /// `banto_io::status::read_live_sessions`).
+    pub live: &'a [LiveSession],
+    pub binaries: &'a AgentBinaries,
+}
+
 /// Open or focus `session`, enforcing the no-double-resume invariant.
 ///
 /// `backend` is the resolved opener backend for *new* opens (see
 /// [`resolve_backend`]); an existing pane is always focused through whichever
 /// backend it was originally opened with, regardless of the current default.
-/// `live` is the current `<claude_home>/sessions/*.json` snapshot (see
-/// `banto_io::status::read_live_sessions`), used only for the untracked
-/// case below.
+/// `ctx.live` is used only for the untracked case below.
 pub fn open_session<R: CommandRunner + Clone + 'static>(
     store: &Store,
-    probe: &dyn ProcessProbe,
     backend: Option<Backend>,
     session: &SessionToOpen,
     runner: R,
     anchor_pane: Option<&str>,
-    live: &[LiveSession],
+    ctx: &OpenContext,
 ) -> Result<OpenOutcome, SessionOpenError> {
     let id = SessionId(session.id.clone());
 
@@ -175,7 +185,7 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
         Some(record) => {
             // No PID yet means the wrapper is still starting up; assume alive
             // rather than risk a double resume.
-            let alive = record.pid.is_none_or(|pid| probe.is_alive(pid));
+            let alive = record.pid.is_none_or(|pid| ctx.probe.is_alive(pid));
             if alive {
                 match focus_existing(store, &record, runner.clone())? {
                     FocusResult::Outcome(outcome) => return Ok(outcome),
@@ -194,13 +204,13 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
         // modal, which has no pre-existing session id to key a pane record
         // against). Opening fresh here would `--resume` an already-running
         // session, forking its history.
-        None if is_live(&session.id, live, probe) => {
+        None if is_live(&session.id, ctx.live, ctx.probe) => {
             return Ok(OpenOutcome::AlreadyRunningUntracked);
         }
         None => {}
     }
 
-    open_fresh(store, backend, session, runner, anchor_pane)
+    open_fresh(store, backend, session, runner, anchor_pane, ctx.binaries)
 }
 
 /// Whether any live-state entry names `session_id` with a currently-alive
@@ -267,49 +277,102 @@ pub(crate) fn new_session_startup_message(cwd: &Path) -> String {
     format!("banto: starting a new session in {} ...", cwd.display())
 }
 
-/// A pending `claude` invocation, independent of *how* it will be run
+/// A pending agent invocation, independent of *how* it will be run —
 /// in-place, wrapped via `_wrap --session`, or wrapped via `_wrap
 /// --new-session` (see [`inplace_argv`]/[`wrap_argv`]/[`new_session_wrap_argv`],
-/// the three sites that build one of these and turn it into argv). This is
-/// the single place in the workspace that knows which flags `claude` itself
-/// takes and in what order; everything else either sets fields on this or
-/// prepends a `banto _wrap ... --` prefix in front of its rendered argv.
-/// Fields are independent — set the ones that apply and leave the rest
-/// `None`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct AgentLaunch {
-    pub resume: Option<String>,
-    pub model: Option<String>,
-    pub append_system_prompt: Option<String>,
-    pub mcp_config: Option<PathBuf>,
+/// the sites that build one of these and turn it into argv via [`Self::argv`]).
+/// This is the single place in the workspace that knows which flags each
+/// agent product takes and in what order.
+///
+/// One variant per [`AgentKind`], not one struct with optional fields
+/// spanning every product: `append_system_prompt`/`mcp_config` are Claude
+/// Code concepts with no Codex equivalent (Codex 0.145's own `--help` has
+/// no `--append-system-prompt`; its MCP config goes through
+/// `-c mcp_servers.…` instead), and brigades — the only callers of either
+/// field — are Claude-only for now. A struct with both fields left `None`
+/// for Codex would rely on every caller remembering to leave them unset; an
+/// enum makes a Codex launch physically unable to carry them, whether or
+/// not a caller remembers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentLaunch {
+    Claude {
+        resume: Option<String>,
+        model: Option<String>,
+        append_system_prompt: Option<String>,
+        mcp_config: Option<PathBuf>,
+    },
+    /// Codex takes its working directory as `-C <dir>` in argv itself
+    /// (measured against Codex 0.145: unlike Claude, which only ever gets a
+    /// cwd via the spawner's own `current_dir`/`Command::current_dir`) — so
+    /// `cwd` lives on the launch here, even though [`Self::Claude`]'s own
+    /// rendering keeps ignoring it in favor of the spawner.
+    Codex {
+        resume: Option<String>,
+        model: Option<String>,
+        cwd: PathBuf,
+    },
 }
 
-/// The `claude` binary name. The only occurrence of this literal left in the
-/// workspace outside tests and user-facing help/flag text (`main.rs`'s
-/// `--claude-home` and about string) — see [`AgentLaunch`].
-const AGENT_BINARY: &str = "claude";
+/// Resolve the binary to invoke for `agent`: the operator's own
+/// `[agent_binaries]` override from config.toml, or the product's own bare
+/// name (found via `$PATH`) when unset — today's behavior, preserved as the
+/// default for both products.
+pub(crate) fn agent_binary(agent: AgentKind, binaries: &AgentBinaries) -> String {
+    let (override_path, default_name) = match agent {
+        AgentKind::ClaudeCode => (&binaries.claude, "claude"),
+        AgentKind::Codex => (&binaries.codex, "codex"),
+    };
+    match override_path {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => default_name.to_string(),
+    }
+}
 
 impl AgentLaunch {
-    /// Render as `claude`'s own argv, in the fixed order every existing call
-    /// site already agreed on before this type existed: `--resume`, then
-    /// `--model`, then `--append-system-prompt`, then `--mcp-config`.
-    pub(crate) fn argv(&self) -> Vec<String> {
-        let mut argv = vec![AGENT_BINARY.to_string()];
-        if let Some(id) = &self.resume {
-            argv.push("--resume".to_string());
-            argv.push(id.clone());
-        }
-        if let Some(model) = &self.model {
-            argv.push("--model".to_string());
-            argv.push(model.clone());
-        }
-        if let Some(prompt) = &self.append_system_prompt {
-            argv.push("--append-system-prompt".to_string());
-            argv.push(prompt.clone());
-        }
-        if let Some(path) = &self.mcp_config {
-            argv.push("--mcp-config".to_string());
-            argv.push(path.to_string_lossy().into_owned());
+    /// Render as `binary`'s own argv (see [`agent_binary`] for resolving
+    /// it). Claude's fixed order is the one every existing call site already
+    /// agreed on before this type existed: `--resume`, then `--model`, then
+    /// `--append-system-prompt`, then `--mcp-config`. Codex's: the `resume
+    /// <uuid>` subcommand (or nothing, for a fresh launch), then `-m`, then
+    /// `-C <cwd>` last, always present.
+    pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
+        let mut argv = vec![binary.to_string()];
+        match self {
+            AgentLaunch::Claude {
+                resume,
+                model,
+                append_system_prompt,
+                mcp_config,
+            } => {
+                if let Some(id) = resume {
+                    argv.push("--resume".to_string());
+                    argv.push(id.clone());
+                }
+                if let Some(model) = model {
+                    argv.push("--model".to_string());
+                    argv.push(model.clone());
+                }
+                if let Some(prompt) = append_system_prompt {
+                    argv.push("--append-system-prompt".to_string());
+                    argv.push(prompt.clone());
+                }
+                if let Some(path) = mcp_config {
+                    argv.push("--mcp-config".to_string());
+                    argv.push(path.to_string_lossy().into_owned());
+                }
+            }
+            AgentLaunch::Codex { resume, model, cwd } => {
+                if let Some(id) = resume {
+                    argv.push("resume".to_string());
+                    argv.push(id.clone());
+                }
+                if let Some(model) = model {
+                    argv.push("-m".to_string());
+                    argv.push(model.clone());
+                }
+                argv.push("-C".to_string());
+                argv.push(cwd.to_string_lossy().into_owned());
+            }
         }
         argv
     }
@@ -321,12 +384,26 @@ impl AgentLaunch {
 /// `crate::tui`'s teardown/run/re-init loop), so there is no separate
 /// long-lived process for a wrapper to attach a pane record to in the first
 /// place.
-pub(crate) fn inplace_argv(session_id: Option<&str>) -> Vec<String> {
-    AgentLaunch {
-        resume: session_id.map(str::to_string),
-        ..Default::default()
-    }
-    .argv()
+pub(crate) fn inplace_argv(
+    agent: AgentKind,
+    session_id: Option<&str>,
+    cwd: &Path,
+    binaries: &AgentBinaries,
+) -> Vec<String> {
+    let launch = match agent {
+        AgentKind::ClaudeCode => AgentLaunch::Claude {
+            resume: session_id.map(str::to_string),
+            model: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        },
+        AgentKind::Codex => AgentLaunch::Codex {
+            resume: session_id.map(str::to_string),
+            model: None,
+            cwd: cwd.to_path_buf(),
+        },
+    };
+    launch.argv(&agent_binary(agent, binaries))
 }
 
 /// Decide whether to resume `session` in place, or `None` to refuse: taking
@@ -341,12 +418,13 @@ pub(crate) fn decide_inplace_resume(
     session: &SessionToOpen,
     probe: &dyn ProcessProbe,
     live: &[LiveSession],
+    binaries: &AgentBinaries,
 ) -> Option<InPlaceLaunch> {
     if is_live(&session.id, live, probe) {
         None
     } else {
         Some(InPlaceLaunch {
-            argv: inplace_argv(Some(&session.id)),
+            argv: inplace_argv(session.agent, Some(&session.id), &session.cwd, binaries),
             cwd: session.cwd.clone(),
             startup_message: resume_startup_message(&session.title),
         })
@@ -398,6 +476,7 @@ fn open_fresh<R: CommandRunner + 'static>(
     session: &SessionToOpen,
     runner: R,
     anchor_pane: Option<&str>,
+    binaries: &AgentBinaries,
 ) -> Result<OpenOutcome, SessionOpenError> {
     let Some(backend) = backend else {
         return Ok(OpenOutcome::NoBackendDetected);
@@ -408,7 +487,13 @@ fn open_fresh<R: CommandRunner + 'static>(
         .and_then(|path| path.to_str().map(str::to_string));
     let cmd = ResumeCommand {
         session_id: session.id.clone(),
-        argv: wrap_argv(exe.as_deref(), &session.id),
+        argv: wrap_argv(
+            exe.as_deref(),
+            &session.id,
+            session.agent,
+            &session.cwd,
+            binaries,
+        ),
         cwd: session.cwd.clone(),
         title: session.title.clone(),
     };
@@ -444,7 +529,13 @@ fn open_fresh<R: CommandRunner + 'static>(
 /// deterministic in tests) so the spawned pane/tab can find it even when it
 /// isn't on `$PATH` (e.g. a dev build); `None` falls back to the bare name
 /// `banto` (relies on `$PATH`).
-fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
+fn wrap_argv(
+    exe: Option<&str>,
+    session_id: &str,
+    agent: AgentKind,
+    cwd: &Path,
+    binaries: &AgentBinaries,
+) -> Vec<String> {
     let banto_exe = exe.unwrap_or("banto").to_string();
     let mut argv = vec![
         banto_exe,
@@ -453,13 +544,20 @@ fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
         session_id.to_string(),
         "--".to_string(),
     ];
-    argv.extend(
-        AgentLaunch {
+    let launch = match agent {
+        AgentKind::ClaudeCode => AgentLaunch::Claude {
             resume: Some(session_id.to_string()),
-            ..Default::default()
-        }
-        .argv(),
-    );
+            model: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        },
+        AgentKind::Codex => AgentLaunch::Codex {
+            resume: Some(session_id.to_string()),
+            model: None,
+            cwd: cwd.to_path_buf(),
+        },
+    };
+    argv.extend(launch.argv(&agent_binary(agent, binaries)));
     argv
 }
 
@@ -480,11 +578,18 @@ fn wrap_argv(exe: Option<&str>, session_id: &str) -> Vec<String> {
 /// (docs/notes/psmux-spike.md), so relying on `_wrap` to read
 /// `BANTO_WRAP_LOG` from its own environment would silently produce no
 /// diagnostic log at all — see `crate::wrap::WrapLog::new`'s doc comment.
+///
+/// Always launches Claude: the new-session modal this feeds has no agent
+/// axis of its own, and the chōba (`crate::tui`) is feature-frozen — adding
+/// one is out of scope, not an oversight. `binaries` still resolves which
+/// `claude` binary, for the same configurability every other launch site
+/// gets.
 fn new_session_wrap_argv(
     exe: Option<&str>,
     cwd: &Path,
     backend: Backend,
     wrap_log: Option<&str>,
+    binaries: &AgentBinaries,
 ) -> Vec<String> {
     let banto_exe = exe.unwrap_or("banto").to_string();
     let mut argv = vec![
@@ -501,7 +606,13 @@ fn new_session_wrap_argv(
         argv.push(path.to_string());
     }
     argv.push("--".to_string());
-    argv.extend(AgentLaunch::default().argv());
+    let launch = AgentLaunch::Claude {
+        resume: None,
+        model: None,
+        append_system_prompt: None,
+        mcp_config: None,
+    };
+    argv.extend(launch.argv(&agent_binary(AgentKind::ClaudeCode, binaries)));
     argv
 }
 
@@ -755,12 +866,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -833,22 +947,33 @@ mod tests {
 
     // --- AgentLaunch::argv --------------------------------------------------
 
+    fn blank_claude() -> AgentLaunch {
+        AgentLaunch::Claude {
+            resume: None,
+            model: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        }
+    }
+
     #[test]
-    fn agent_launch_with_no_fields_is_bare_claude() {
+    fn agent_launch_claude_with_no_fields_is_bare_claude() {
         assert_eq!(
-            AgentLaunch::default().argv(),
+            blank_claude().argv("claude"),
             ["claude"].map(str::to_string)
         );
     }
 
     #[test]
     fn agent_launch_appends_mcp_config_last_on_its_own() {
-        let launch = AgentLaunch {
+        let launch = AgentLaunch::Claude {
+            resume: None,
+            model: None,
+            append_system_prompt: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
-            ..Default::default()
         };
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             [
                 "claude",
                 "--mcp-config",
@@ -860,14 +985,14 @@ mod tests {
 
     #[test]
     fn agent_launch_combines_every_flag_in_the_fixed_order() {
-        let launch = AgentLaunch {
+        let launch = AgentLaunch::Claude {
             resume: Some("sess-1".to_string()),
             model: Some("opus".to_string()),
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
         };
         assert_eq!(
-            launch.argv(),
+            launch.argv("claude"),
             [
                 "claude",
                 "--resume",
@@ -883,19 +1008,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_launch_codex_fresh_launch_is_bare_codex_plus_cwd() {
+        let launch = AgentLaunch::Codex {
+            resume: None,
+            model: None,
+            cwd: PathBuf::from("/work/alpha"),
+        };
+        assert_eq!(
+            launch.argv("codex"),
+            ["codex", "-C", "/work/alpha"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_codex_resume_renders_the_subcommand_then_model_then_cwd() {
+        let launch = AgentLaunch::Codex {
+            resume: Some("codex-uuid-1".to_string()),
+            model: Some("o3".to_string()),
+            cwd: PathBuf::from("/work/alpha"),
+        };
+        assert_eq!(
+            launch.argv("codex"),
+            [
+                "codex",
+                "resume",
+                "codex-uuid-1",
+                "-m",
+                "o3",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_binary_falls_back_to_the_bare_name_when_unset() {
+        let binaries = AgentBinaries::default();
+        assert_eq!(agent_binary(AgentKind::ClaudeCode, &binaries), "claude");
+        assert_eq!(agent_binary(AgentKind::Codex, &binaries), "codex");
+    }
+
+    #[test]
+    fn agent_binary_uses_the_configured_override_when_set() {
+        let binaries = AgentBinaries {
+            claude: None,
+            codex: Some(PathBuf::from("C:/tools/codex.exe")),
+        };
+        assert_eq!(agent_binary(AgentKind::ClaudeCode, &binaries), "claude");
+        assert_eq!(
+            agent_binary(AgentKind::Codex, &binaries),
+            "C:/tools/codex.exe"
+        );
+    }
+
     // --- inplace_argv / decide_inplace_resume -----------------------------
 
     #[test]
     fn inplace_argv_resumes_a_given_session_id() {
         assert_eq!(
-            inplace_argv(Some("sess-1")),
+            inplace_argv(
+                AgentKind::ClaudeCode,
+                Some("sess-1"),
+                Path::new("/work/alpha"),
+                &AgentBinaries::default(),
+            ),
             ["claude", "--resume", "sess-1"].map(str::to_string)
         );
     }
 
     #[test]
     fn inplace_argv_launches_plain_claude_for_a_new_session() {
-        assert_eq!(inplace_argv(None), ["claude"].map(str::to_string));
+        assert_eq!(
+            inplace_argv(
+                AgentKind::ClaudeCode,
+                None,
+                Path::new("/work/alpha"),
+                &AgentBinaries::default(),
+            ),
+            ["claude"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn inplace_argv_codex_resume_includes_the_cwd_flag() {
+        assert_eq!(
+            inplace_argv(
+                AgentKind::Codex,
+                Some("codex-uuid-1"),
+                Path::new("/work/alpha"),
+                &AgentBinaries::default(),
+            ),
+            ["codex", "resume", "codex-uuid-1", "-C", "/work/alpha"].map(str::to_string)
+        );
     }
 
     #[test]
@@ -920,7 +1126,8 @@ mod tests {
     fn decide_inplace_resume_proceeds_when_the_session_is_not_live() {
         let probe = MockProbe::with_alive(&[]);
 
-        let launch = decide_inplace_resume(&session(), &probe, &[]).unwrap();
+        let launch =
+            decide_inplace_resume(&session(), &probe, &[], &AgentBinaries::default()).unwrap();
 
         assert_eq!(
             launch.argv,
@@ -931,11 +1138,29 @@ mod tests {
     }
 
     #[test]
+    fn decide_inplace_resume_codex_session_resumes_via_codex() {
+        let probe = MockProbe::with_alive(&[]);
+        let mut codex_session = session();
+        codex_session.agent = AgentKind::Codex;
+
+        let launch =
+            decide_inplace_resume(&codex_session, &probe, &[], &AgentBinaries::default()).unwrap();
+
+        assert_eq!(
+            launch.argv,
+            ["codex", "resume", "sess-1", "-C", "/work/alpha"].map(str::to_string)
+        );
+    }
+
+    #[test]
     fn decide_inplace_resume_refuses_when_the_session_is_already_live() {
         let probe = MockProbe::with_alive(&[4242]);
         let live = [live_entry("sess-1", 4242)];
 
-        assert_eq!(decide_inplace_resume(&session(), &probe, &live), None);
+        assert_eq!(
+            decide_inplace_resume(&session(), &probe, &live, &AgentBinaries::default()),
+            None
+        );
     }
 
     #[test]
@@ -943,7 +1168,9 @@ mod tests {
         let probe = MockProbe::with_alive(&[4242]);
         let live = [live_entry("some-other-session", 4242)];
 
-        assert!(decide_inplace_resume(&session(), &probe, &live).is_some());
+        assert!(
+            decide_inplace_resume(&session(), &probe, &live, &AgentBinaries::default()).is_some()
+        );
     }
 
     #[test]
@@ -955,12 +1182,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &live,
+            &OpenContext {
+                probe: &probe,
+                live: &live,
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -988,12 +1218,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &live,
+            &OpenContext {
+                probe: &probe,
+                live: &live,
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1008,12 +1241,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             Some("%7"),
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1031,8 +1267,19 @@ mod tests {
         let probe = MockProbe::with_alive(&[]);
         let runner = MockRunner::default();
 
-        let outcome =
-            open_session(&store, &probe, None, &session(), runner.clone(), None, &[]).unwrap();
+        let outcome = open_session(
+            &store,
+            None,
+            &session(),
+            runner.clone(),
+            None,
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
+        )
+        .unwrap();
 
         assert_eq!(outcome, OpenOutcome::NoBackendDetected);
         assert!(runner.calls().is_empty());
@@ -1059,12 +1306,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1094,12 +1344,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1123,12 +1376,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1159,12 +1415,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::Psmux),
             &session(),
             runner.clone(),
             None,
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1194,12 +1453,15 @@ mod tests {
 
         let outcome = open_session(
             &store,
-            &probe,
             Some(Backend::WindowsTerminal),
             &session(),
             runner.clone(),
             None,
-            &[],
+            &OpenContext {
+                probe: &probe,
+                live: &[],
+                binaries: &AgentBinaries::default(),
+            },
         )
         .unwrap();
 
@@ -1218,6 +1480,7 @@ mod tests {
             runner.clone(),
             None,
             None,
+            &AgentBinaries::default(),
         )
         .unwrap();
 
@@ -1260,6 +1523,7 @@ mod tests {
             runner.clone(),
             Some("%7"),
             None,
+            &AgentBinaries::default(),
         )
         .unwrap();
 
@@ -1282,6 +1546,7 @@ mod tests {
             runner.clone(),
             None,
             None,
+            &AgentBinaries::default(),
         )
         .unwrap();
 
@@ -1302,6 +1567,7 @@ mod tests {
             runner.clone(),
             None,
             None,
+            &AgentBinaries::default(),
         )
         .unwrap();
 
@@ -1319,6 +1585,7 @@ mod tests {
             runner.clone(),
             None,
             Some("C:/logs/wrap.log"),
+            &AgentBinaries::default(),
         )
         .unwrap();
 
@@ -1427,7 +1694,13 @@ mod tests {
     #[test]
     fn wrap_argv_uses_the_given_exe_path_when_available() {
         assert_eq!(
-            wrap_argv(Some("C:/dev/banto.exe"), "sess-1"),
+            wrap_argv(
+                Some("C:/dev/banto.exe"),
+                "sess-1",
+                AgentKind::ClaudeCode,
+                Path::new("/work/alpha"),
+                &AgentBinaries::default(),
+            ),
             [
                 "C:/dev/banto.exe",
                 "_wrap",
@@ -1444,7 +1717,42 @@ mod tests {
 
     #[test]
     fn wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
-        assert_eq!(wrap_argv(None, "sess-1")[0], "banto");
+        assert_eq!(
+            wrap_argv(
+                None,
+                "sess-1",
+                AgentKind::ClaudeCode,
+                Path::new("/work/alpha"),
+                &AgentBinaries::default(),
+            )[0],
+            "banto"
+        );
+    }
+
+    #[test]
+    fn wrap_argv_codex_session_resumes_via_codex_with_the_cwd_flag() {
+        assert_eq!(
+            wrap_argv(
+                None,
+                "codex-uuid-1",
+                AgentKind::Codex,
+                Path::new("/work/alpha"),
+                &AgentBinaries::default(),
+            ),
+            [
+                "banto",
+                "_wrap",
+                "--session",
+                "codex-uuid-1",
+                "--",
+                "codex",
+                "resume",
+                "codex-uuid-1",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
+        );
     }
 
     #[test]
@@ -1454,7 +1762,8 @@ mod tests {
                 Some("C:/dev/banto.exe"),
                 Path::new("/work/alpha"),
                 Backend::Psmux,
-                None
+                None,
+                &AgentBinaries::default(),
             ),
             [
                 "C:/dev/banto.exe",
@@ -1474,7 +1783,13 @@ mod tests {
     #[test]
     fn new_session_wrap_argv_falls_back_to_the_bare_name_without_an_exe_path() {
         assert_eq!(
-            new_session_wrap_argv(None, Path::new("/work/alpha"), Backend::Psmux, None)[0],
+            new_session_wrap_argv(
+                None,
+                Path::new("/work/alpha"),
+                Backend::Psmux,
+                None,
+                &AgentBinaries::default(),
+            )[0],
             "banto"
         );
     }
@@ -1486,6 +1801,7 @@ mod tests {
             Path::new("/work/alpha"),
             Backend::WindowsTerminal,
             None,
+            &AgentBinaries::default(),
         );
         let pos = argv
             .iter()
@@ -1501,6 +1817,7 @@ mod tests {
             Path::new("/work/alpha"),
             Backend::Psmux,
             Some("C:/logs/wrap.log"),
+            &AgentBinaries::default(),
         );
         let pos = argv
             .iter()
@@ -1513,8 +1830,34 @@ mod tests {
 
     #[test]
     fn new_session_wrap_argv_omits_wrap_log_when_not_given() {
-        let argv = new_session_wrap_argv(None, Path::new("/work/alpha"), Backend::Psmux, None);
+        let argv = new_session_wrap_argv(
+            None,
+            Path::new("/work/alpha"),
+            Backend::Psmux,
+            None,
+            &AgentBinaries::default(),
+        );
         assert!(!argv.iter().any(|a| a == "--wrap-log"));
+    }
+
+    #[test]
+    fn agent_binary_is_used_as_argv0_when_configured() {
+        let binaries = AgentBinaries {
+            claude: None,
+            codex: Some(PathBuf::from("C:/tools/codex.exe")),
+        };
+        let argv = wrap_argv(
+            None,
+            "codex-uuid-1",
+            AgentKind::Codex,
+            Path::new("/work/alpha"),
+            &binaries,
+        );
+        assert_eq!(argv.last(), Some(&"/work/alpha".to_string()));
+        // The wrapped command's own argv[0] (after the `--` separator) is
+        // the configured Codex binary, not the bare "codex" default.
+        let sep = argv.iter().position(|a| a == "--").expect("-- missing");
+        assert_eq!(argv[sep + 1], "C:/tools/codex.exe");
     }
 
     #[test]
