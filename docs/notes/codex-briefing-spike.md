@@ -220,18 +220,45 @@ warning, no error, and nothing in the output naming trust — the same command
 simply produces no hook. An untrusted hook is dropped from the run list, not
 reported.
 
-Trust is keyed by a hash of the hook's normalized identity plus a *positional*
-key (`<source>:<event>:<group>:<handler>`), which upstream's own comment flags
-as something to replace with a durable id. It is written only from the
-interactive TUI's startup review prompt ("Trust all and continue"), into the
-user layer. Two consequences for banto: the operator would have to establish
-that trust once, by hand, in an interactive Codex; and the hook command banto
-injects has to stay byte-stable across launches, so anything embedding a
-worktree-varying absolute path would drift out of trust.
+**One approval holds — measured end to end.** The operator granted trust once
+from the interactive TUI's startup review ("Trust all and continue"). After
+that, with the bypass flag gone, the same hook fired from `codex exec`, and
+from `codex exec resume` with `source: "resume"` — a different subcommand, a
+different process, a different session. Not per pane, not per resume. The
+record it wrote:
 
-`--dangerously-bypass-hook-trust` is not the way out. It is scoped to hook
-trust and touches neither the sandbox nor MCP approval, but it applies to
-*every* hook in the merged config for that invocation — including a hook whose
-command changed since a human last reviewed it. Passing it on every launch would
-mean banto silently running whatever else the operator's or the project's config
-happens to contain.
+```toml
+[hooks.state.'C:\<session-flags>\config.toml:session_start:0:0']
+trusted_hash = "sha256:…"
+enabled = true
+```
+
+That key is the whole story. Its first component is a **synthetic literal** for
+the `-c` layer, with no session id, pid or timestamp in it, and distinct from
+the real path a user-config hook would key under — so an operator adding their
+own hooks cannot shift banto's indices, which are scoped per layer per event.
+The hash is the *value*, not part of the key, and covers only the hook's
+declared config text plus a compile-time platform flag; `cwd` is not a field
+that can reach it at all. Same config text, same binary, same hash — every
+launch, every member, every worktree.
+
+Two things follow for banto, and they are constraints, not observations:
+
+- **The injected `-c hooks.…` TOML must not vary by one byte between
+  launches**, and there must be exactly one of them. Set `timeout_sec` and
+  `matcher` explicitly rather than letting them default — a future Codex
+  changing the default would silently move the hash, and a hash that no longer
+  matches produces no error, just a hook that stops running.
+- **Per-member identity cannot ride in the command string**, since that is
+  hashed. It rides in the environment instead: a hook inherits the environment
+  of the session banto launched (measured — `BANTO_*` variables set on the
+  Codex child arrived intact in the hook, and varied per launch while the hook
+  config, and so the trust record, stayed fixed). `session_id` and `cwd` also
+  arrive on the hook's stdin.
+
+`--dangerously-bypass-hook-trust` is not the way out, and is not needed. It is
+scoped to hook trust and touches neither the sandbox nor MCP approval, but it
+applies to *every* hook in the merged config for that invocation — including a
+hook whose command changed since a human last reviewed it. Passing it on every
+launch would mean banto silently running whatever else the operator's or the
+project's config happens to contain.
