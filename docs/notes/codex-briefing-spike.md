@@ -109,9 +109,9 @@ Surveyed and rejected before the above, so nobody re-derives them:
 
 - **`AGENTS.md`** — read from the session's cwd, i.e. the operator's own
   repository. Invariant 1's spirit: banto writes only to its own directories.
-- **Hooks (`SessionStart` + `additionalContext`)** — fires on resume, which is
-  attractive, but every discovery location is `~/.codex` or `<repo>/.codex`, and
-  it needs hook trust the CLI's own help calls dangerous.
+- **Hooks (`SessionStart` + `additionalContext`)** — ruled out here on the
+  belief that every discovery location is `~/.codex` or `<repo>/.codex`. That
+  belief was wrong; see the follow-up at the end of this note.
 - **Profiles (`-p`)** — the profile file lives under `$CODEX_HOME`.
 - **`model_instructions_file`** — writable to a compliant location, but it
   *replaces* the built-in instructions rather than adding to them, so it would
@@ -182,3 +182,56 @@ None of this reopens the decision to defer Codex brigades. It replaces one
 unknown with a cost: fresh-launch-only briefing, tool names carried by hand, an
 approval gate whose fix is only source-deep, and a startup that was not reliably
 reproducible on the machine that measured it.
+
+## Follow-up: a `SessionStart` hook does reach a resumed session
+
+The list above rules hooks out for needing a file under `~/.codex` or the
+operator's repository. That is wrong, and the correction is the most useful
+thing in this note.
+
+`-c` overrides are loaded as an ordinary config layer (`SessionFlags`), and hook
+discovery walks every layer asking each one for its `hooks` table without caring
+which layer it is. So a hook can be supplied entirely on the command line. The
+syntax is an inline array of inline tables:
+
+```
+-c 'hooks.SessionStart=[{hooks=[{type="command",command="<cmd>"}]}]'
+```
+
+Measured, with the same request capture used above:
+
+- **It fires on a fresh launch** — the hook is handed
+  `{"hook_event_name":"SessionStart","source":"startup",…}` on stdin — and its
+  `additionalContext` arrives as a **developer-role message with no wrapping
+  markers**, placed *after* Codex's built-in developer blocks and immediately
+  before the user turn. That is a better position than `developer_instructions`,
+  which is prepended to the `<permissions instructions>` block far earlier.
+- **It fires on `codex exec resume` too**, with `source: "resume"` and the
+  resumed session's own id, and the context lands in the same place —
+  immediately before the new user turn. This is the gap `developer_instructions`
+  leaves open, closed: the hook runs live on the first turn after the session is
+  constructed, whereas the resumed prefix is replayed from the rollout, so a
+  fresh `developer_instructions` at resume time has nothing to attach to.
+
+**The gate is trust, and it fails silently.** Both runs above passed
+`--dangerously-bypass-hook-trust`, to separate "does the mechanism work" from
+"is this hook allowed". Re-run without it and the hook does not execute, with no
+warning, no error, and nothing in the output naming trust — the same command
+simply produces no hook. An untrusted hook is dropped from the run list, not
+reported.
+
+Trust is keyed by a hash of the hook's normalized identity plus a *positional*
+key (`<source>:<event>:<group>:<handler>`), which upstream's own comment flags
+as something to replace with a durable id. It is written only from the
+interactive TUI's startup review prompt ("Trust all and continue"), into the
+user layer. Two consequences for banto: the operator would have to establish
+that trust once, by hand, in an interactive Codex; and the hook command banto
+injects has to stay byte-stable across launches, so anything embedding a
+worktree-varying absolute path would drift out of trust.
+
+`--dangerously-bypass-hook-trust` is not the way out. It is scoped to hook
+trust and touches neither the sandbox nor MCP approval, but it applies to
+*every* hook in the merged config for that invocation — including a hook whose
+command changed since a human last reviewed it. Passing it on every launch would
+mean banto silently running whatever else the operator's or the project's config
+happens to contain.
