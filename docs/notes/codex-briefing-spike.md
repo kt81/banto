@@ -122,7 +122,7 @@ The positional prompt argument (`codex resume <id> "<text>"`) does reach a
 running session, but as a **user turn**: it reads as though the operator typed
 it, and the model answers it. That is a different instrument, not a substitute.
 
-## Open: MCP tool calls need an approval, and the fix is unverified
+## MCP tool calls need an approval, and one flag settles it
 
 Told to call the spike tool, Codex logged
 `mcp: spike/spike_probe started` → `(failed)` → `user cancelled MCP tool call`,
@@ -142,30 +142,38 @@ same router-registered MCP handler, which is the only call site of the approval
 check in the repo, so the recipe is the same whether the model calls the tool
 natively or finds it through `ALL_TOOLS`.
 
-**None of this was confirmed on a live call**: every attempt to exercise it ran
-into the startup problem below, so the tool was never reachable to approve.
-Treat it as the likely fix, not a measured one.
+Confirmed on a live call, in an interactive session: with
+`default_tools_approval_mode="approve"` passed on the command line, no prompt
+appeared and `tools/call` arrived at the server, which had never happened
+before. The flag is read fresh from the merged config on every call and never
+consults the persistence path, so it does not matter that a `-c`-registered
+server cannot persist an approval at all — and it cannot: the "remember my
+choice" write is gated on the server being present in the *user* config layer,
+and silently degrades to session-only when it is not. banto should pass the
+flag every launch and never rely on the remembered choice.
 
-## Open: the MCP server stopped being started at all
+## A `codex exec` trap that cost this spike an afternoon
 
-Partway through the spike, and from then on for every subsequent run, Codex
-stopped spawning the MCP server — the server's log file, which is written on
-the very first inbound line, was never created. It is not the server (it still
-answers a hand-piped handshake), not PATH (an absolute `node.exe` behaves the
-same), not the config (`codex mcp list` still reports the server `enabled`, and
-`--strict-config` accepts every key used), and not `startup_timeout_sec`.
+Partway through, `codex exec` stopped spawning the MCP server at all — the
+server's log, written on its very first inbound line, was never created. Not
+the server (it still answers a hand-piped handshake), not PATH (an absolute
+`node.exe` behaves the same), not the config (`codex mcp list` still reports it
+`enabled`, `--strict-config` accepts every key), not `startup_timeout_sec`. No
+error, and nothing to read: **`codex exec` writes nothing to `logs_2.sqlite`**,
+so the only log entries visible during the hunt belonged to an unrelated
+interactive session — which is how a wrong conclusion got drawn from them
+before that was noticed.
 
-The runs that did work were all slow ones — a prompt that made the model go
-looking for the tool list, or a turn that spent ~30s retrying against the
-capture endpoint. The runs that failed were all trivial turns answered in a
-second or two. That points at startup being asynchronous and a short turn
-simply finishing first, but it was not pinned down, and the machine was running
-three other agent sessions throughout, so load is a confound rather than a
-conclusion.
+The same configuration in an **interactive** session starts the server, lists
+its tools, and completes a `tools/call`. banto launches Codex interactively in
+a PTY, so this never touches banto; it only ever broke the measuring
+instrument. Whatever it is stayed undiagnosed and is left that way
+deliberately.
 
-If it is a race, it matters for brigades directly: a Codex member could begin
-its first turn before banto's tools exist, which is precisely the turn the
-briefing is trying to shape.
+The lesson worth keeping is the shape, not the cause: three separate gates in
+this spike — a deferred tool, an unapproved MCP call, an untrusted hook — all
+fail by producing *nothing*. A harness that reads success from the absence of
+an error will read all three as working.
 
 ## Consequence for brigades on Codex
 
@@ -178,10 +186,10 @@ toolset at all. A deferred tool *is* callable once named (the spike called one
 by name), so the briefing would have to carry the tool names itself, and the
 relay's forcing function would have to survive the approval gate above.
 
-None of this reopens the decision to defer Codex brigades. It replaces one
-unknown with a cost: fresh-launch-only briefing, tool names carried by hand, an
-approval gate whose fix is only source-deep, and a startup that was not reliably
-reproducible on the machine that measured it.
+None of this reopens the decision to defer Codex brigades by itself, but it
+removes the technical reason for it. What is left is a cost: the briefing has
+to name banto's tools by hand, because a Codex member cannot discover them; and
+every member launch has to carry a fixed hook plus an approval flag, exactly.
 
 ## Follow-up: a `SessionStart` hook does reach a resumed session
 
