@@ -511,24 +511,26 @@ fn execute_cmd(
 /// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
 /// otherwise — either way with `model`/`briefing` carried on the result.
 /// `target.agent` picks the variant; `briefing` only ever reaches the
-/// `Claude` one (see [`opener::AgentLaunch`]'s doc — brigades are Claude-only,
-/// and the `Codex` variant has no field to put it in even if this is called
-/// with one anyway). `--model` applies the same way to a resume as to a
+/// `Claude` one, because only Claude takes a briefing as launch argv; a
+/// Codex member gets the same text from the `banto _hook` process the
+/// injected `SessionStart` hook spawns
+/// (docs/notes/codex-briefing-spike.md). `--model` applies the same way to a resume as to a
 /// fresh spawn: a Worker resumed without it falls back to the operator's
 /// own default model instead of the brigade's configured one
 /// (`engine::stage_brigade` never sets it for the Director, so this is
 /// never reached for one).
 ///
 /// `briefing` is the member's already-rendered role briefing
-/// (`--append-system-prompt`, see [`render_briefing`]) — rendered by the
-/// caller because it needs a store read for the roster, verified against
+/// (`--append-system-prompt`, see [`crate::briefing::render`]) — rendered by
+/// the caller because it needs a store read for the roster, verified against
 /// `claude` 2.1.219 to apply to a `--resume` exactly as it does to a fresh
 /// launch, which is what makes it reach a resumed Director at all.
 ///
 /// Pulled out of [`execute_open_embedded`] so this decision logic is
 /// unit-testable without spawning a real PTY; the returned launch's
-/// `mcp_config` is left `None` here and filled in by the caller, since
-/// writing that file needs real I/O this doesn't.
+/// `mcp_config` (Claude) and `brigade` (Codex) are left `None` here and
+/// filled in by the caller, since both need real I/O this doesn't — a config
+/// file write and the running executable's own path.
 fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
@@ -554,13 +556,17 @@ fn build_open_launch(
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
         },
-        // `briefing` is silently unused here: brigades are Claude-only for
-        // now, and this variant has no field to carry it even if a caller
-        // mistakenly passed one — see `opener::AgentLaunch`'s doc.
+        // `briefing` is deliberately unused here: Codex has no
+        // `--append-system-prompt`, so a Codex member's briefing is rendered
+        // by the `banto _hook` process the injected SessionStart hook spawns,
+        // not passed on the argv. `brigade` is left `None` for the caller to
+        // fill for the same reason `mcp_config` is — it needs the running
+        // executable's own path, which is I/O this stays free of.
         AgentKind::Codex => opener::AgentLaunch::Codex {
             resume,
             model: model.map(str::to_string),
             cwd: target.cwd.clone(),
+            brigade: None,
         },
     })
 }
@@ -607,19 +613,37 @@ fn execute_open_embedded(
             error: "already running elsewhere".to_string(),
         }];
     };
-    // Only the `Claude` variant has an `mcp_config` slot to fill — a Codex
-    // launch structurally can't carry one (brigades are Claude-only).
-    if let (Some((brigade_id, token, role)), opener::AgentLaunch::Claude { mcp_config, .. }) =
-        (&brigade, &mut launch)
-    {
+    // Each product reaches banto's own MCP server a different way: Claude via
+    // a config file named on the argv, Codex via `-c` overrides built from
+    // banto's executable path. Claude's file write degrades gracefully (spawn
+    // without the flag rather than lose the pane over a write error); Codex's
+    // side writes nothing, so the only way it can fail is not knowing its own
+    // executable.
+    if let Some((brigade_id, token, role)) = &brigade {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
-        if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
-            *mcp_config = Some(path);
+        match &mut launch {
+            opener::AgentLaunch::Claude { mcp_config, .. } => {
+                if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
+                    *mcp_config = Some(path);
+                }
+            }
+            opener::AgentLaunch::Codex { brigade: slot, .. } => {
+                if let Ok(exe) = std::env::current_exe() {
+                    *slot = Some(opener::CodexBrigade {
+                        exe,
+                        brigade_id: *brigade_id,
+                        token: token.clone(),
+                        role: *role,
+                        session: known_id.map(str::to_string),
+                    });
+                }
+            }
         }
     }
     let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
+    let env = brigade_env(brigade.as_ref());
     // Size is corrected on this same tick's resize pass, once staged.
-    match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), 24, 80) {
+    match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), &env, 24, 80) {
         Ok(handle) => {
             let pid = handle.pid();
             handles.insert(key.clone(), handle);
@@ -1088,14 +1112,10 @@ fn gather_fork_observations(
     events
 }
 
-/// This member's role briefing, ready for `--append-system-prompt`, or
-/// `None` when the configured template for its role is empty.
-///
-/// The store read is what keeps the roster honest: `{peers}` has to name
-/// the members that exist *at launch*, which is later than any of the
-/// core's own decisions about the cell (a Worker added with `b` changes it,
-/// and a Director resumed into an existing brigade never went through
-/// formation at all).
+/// This member's role briefing, or `None` when the configured template for
+/// its role is empty. Only the Claude path uses the returned string as launch
+/// argv; a Codex member's briefing is rendered from the same template in the
+/// `banto _hook` process instead (see [`crate::briefing`]).
 fn member_briefing(
     deps: &Deps,
     brigade_id: BrigadeId,
@@ -1103,36 +1123,42 @@ fn member_briefing(
     role: BrigadeRole,
 ) -> Option<String> {
     let template = deps.brigade.prompt_for(role)?;
-    let peers: Vec<String> = deps
-        .store
-        .borrow()
-        .brigade_members(brigade_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|member| member.role != role)
-        .map(|member| member.token)
-        .collect();
-    Some(render_briefing(template, brigade_id, token, &peers))
+    let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
+    Some(crate::briefing::render(template, brigade_id, token, &peers))
 }
 
-/// Substitute `{brigade}` / `{token}` / `{peers}` into a briefing template.
+/// The `BANTO_*` variables a brigade member's child is launched with.
 ///
-/// Plain string replacement, deliberately: this is banto's own config text
-/// being filled in for banto's own launch, not a templating language, and
-/// an unrecognized `{...}` is left alone rather than treated as an error —
-/// the same leniency the rest of the config layer promises. A member with
-/// no addressable peers yet renders as "none yet" rather than an empty gap,
-/// so the sentence still reads as a sentence.
-fn render_briefing(template: &str, brigade_id: BrigadeId, token: &str, peers: &[String]) -> String {
-    let peers = if peers.is_empty() {
-        "none yet".to_string()
-    } else {
-        peers.join(", ")
+/// Member identity travels in the environment rather than on the argv because
+/// a Codex member's `SessionStart` hook is trusted by a hash of its *command
+/// string*: putting the token in that command would make every member a
+/// different hook needing its own approval, and worse, they would fight over
+/// one trust slot. An untrusted hook is then dropped in silence — no error,
+/// no briefing (docs/notes/codex-briefing-spike.md). The environment is
+/// outside that hash, so one command serves the whole cell.
+///
+/// Set for Claude members too, though nothing reads it there yet: one launch
+/// path is easier to reason about than two, and a member knowing its own
+/// token is useful regardless of product.
+fn brigade_env(brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>) -> Vec<(String, String)> {
+    let Some((brigade_id, token, role)) = brigade else {
+        return Vec::new();
     };
-    template
-        .replace("{brigade}", &brigade_id.to_string())
-        .replace("{token}", token)
-        .replace("{peers}", &peers)
+    vec![
+        ("BANTO_BRIGADE".to_string(), brigade_id.to_string()),
+        ("BANTO_MEMBER".to_string(), token.clone()),
+        ("BANTO_ROLE".to_string(), role_token(*role).to_string()),
+    ]
+}
+
+/// This role's wire spelling, shared by everything banto hands a child
+/// process so the `_mcp` argv, the `_hook` environment and the store all
+/// agree on one word.
+fn role_token(role: BrigadeRole) -> &'static str {
+    match role {
+        BrigadeRole::Director => "director",
+        BrigadeRole::Worker => "worker",
+    }
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
@@ -1148,10 +1174,6 @@ fn write_mcp_config(
     session_id: Option<&str>,
 ) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let role_token = match role {
-        BrigadeRole::Director => "director",
-        BrigadeRole::Worker => "worker",
-    };
     let mut args = vec![
         "_mcp".to_string(),
         "--brigade".to_string(),
@@ -1159,7 +1181,7 @@ fn write_mcp_config(
         "--member".to_string(),
         token.to_string(),
         "--role".to_string(),
-        role_token.to_string(),
+        role_token(role).to_string(),
     ];
     if let Some(session_id) = session_id {
         args.push("--session".to_string());
@@ -1581,7 +1603,7 @@ mod tests {
     use super::*;
 
     fn open(host: &MockPtyHost) -> PtyHandle {
-        PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
+        PtyHandle::open(host, &["child".to_string()], None, &[], 24, 80).unwrap()
     }
 
     /// Every product this build supports — the "nothing restricted" `Deps`
@@ -2471,30 +2493,20 @@ mod tests {
     }
 
     #[test]
-    fn render_briefing_substitutes_the_brigade_the_token_and_the_peer_roster() {
-        let peers = ["worker-1".to_string(), "worker-2".to_string()];
+    fn brigade_env_carries_the_identity_the_hook_command_must_not() {
         assert_eq!(
-            render_briefing("{token} of {brigade} leads {peers}", 7, "director", &peers),
-            "director of 7 leads worker-1, worker-2"
+            brigade_env(Some(&(7, "worker-1".to_string(), BrigadeRole::Worker))),
+            vec![
+                ("BANTO_BRIGADE".to_string(), "7".to_string()),
+                ("BANTO_MEMBER".to_string(), "worker-1".to_string()),
+                ("BANTO_ROLE".to_string(), "worker".to_string()),
+            ]
         );
     }
 
     #[test]
-    fn render_briefing_says_none_yet_rather_than_leaving_a_gap() {
-        assert_eq!(
-            render_briefing("your peers: {peers}.", 1, "director", &[]),
-            "your peers: none yet."
-        );
-    }
-
-    #[test]
-    fn render_briefing_leaves_an_unknown_placeholder_alone() {
-        // Lenient like the rest of the config layer: a typo in the operator's
-        // own template is not worth failing a launch over.
-        assert_eq!(
-            render_briefing("{brigade}/{nope}", 3, "director", &[]),
-            "3/{nope}"
-        );
+    fn brigade_env_is_empty_outside_a_brigade() {
+        assert!(brigade_env(None).is_empty());
     }
 
     #[test]

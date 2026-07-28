@@ -48,11 +48,12 @@ impl PtyHandle {
         host: &dyn PtyHost,
         argv: &[String],
         cwd: Option<&Path>,
+        env: &[(String, String)],
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
         Ok(Self {
-            io: host.open(argv, cwd, rows, cols)?,
+            io: host.open(argv, cwd, env, rows, cols)?,
             exit_observed: false,
         })
     }
@@ -220,7 +221,9 @@ impl EmbeddedSession {
     ) -> Result<Self> {
         Ok(Self {
             screen: Screen::new(rows, cols),
-            handle: PtyHandle::open(host, argv, cwd, rows, cols)?,
+            // No added environment: this is the `_embed` path, which hosts a
+            // bare command rather than a brigade member.
+            handle: PtyHandle::open(host, argv, cwd, &[], rows, cols)?,
         })
     }
 
@@ -268,7 +271,7 @@ mod tests {
     }
 
     fn open_handle(host: &MockPtyHost) -> PtyHandle {
-        PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
+        PtyHandle::open(host, &["child".to_string()], None, &[], 24, 80).unwrap()
     }
 
     #[test]

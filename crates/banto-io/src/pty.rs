@@ -78,8 +78,19 @@ pub trait Hangup: Send {
 }
 
 /// Spawns a child inside a PTY.
+///
+/// `env` is *added* to the environment banto itself is running under, not a
+/// replacement for it — a child agent needs the operator's own `PATH`, home
+/// and terminal settings to behave like one they started themselves.
 pub trait PtyHost {
-    fn open(&self, argv: &[String], cwd: Option<&Path>, rows: u16, cols: u16) -> Result<PtyIo>;
+    fn open(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtyIo>;
 }
 
 /// [`PtyHost`] backed by `portable-pty` (ConPTY on Windows, a Unix pty
@@ -88,7 +99,14 @@ pub trait PtyHost {
 pub struct PortablePtyHost;
 
 impl PtyHost for PortablePtyHost {
-    fn open(&self, argv: &[String], cwd: Option<&Path>, rows: u16, cols: u16) -> Result<PtyIo> {
+    fn open(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtyIo> {
         let pair = native_pty_system().openpty(PtySize {
             rows,
             cols,
@@ -102,6 +120,9 @@ impl PtyHost for PortablePtyHost {
         }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -298,6 +319,7 @@ pub mod mock {
             &self,
             _argv: &[String],
             _cwd: Option<&Path>,
+            _env: &[(String, String)],
             _rows: u16,
             _cols: u16,
         ) -> Result<PtyIo> {

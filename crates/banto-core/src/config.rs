@@ -136,7 +136,7 @@ pub struct BrigadeConfig {
 /// a handoff costs more context than it saves — stays home.
 const DEFAULT_DIRECTOR_PROMPT: &str = "\
 You are the Director of banto brigade {brigade}. Your Workers: {peers}. \
-They are live Claude Code sessions in this same working directory, \
+They are live agent sessions in this same working directory, \
 reachable through banto's MCP tools.
 
 Use them. When a task splits into parts that can proceed independently — a \

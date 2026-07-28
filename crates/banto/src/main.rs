@@ -33,7 +33,9 @@
 //! `tui::run`/`embedded::run_emporium` are the ones that tell the operator
 //! about it, once, at startup — see `session::agents_ignored_notice`.
 
+mod briefing;
 mod embedded;
+mod hook;
 mod mcp;
 mod opener;
 mod session;
@@ -167,10 +169,29 @@ enum Command {
         #[arg(long)]
         role: Option<String>,
     },
+    /// Internal: the Codex `SessionStart` hook process (see `crate::hook`'s
+    /// module doc). Takes no arguments, deliberately, forever: Codex trusts
+    /// a hook by hashing its literal command string, and adding so much as a
+    /// flag here would silently break that trust for every brigade launch
+    /// site already approved. Member identity travels through
+    /// `BANTO_BRIGADE`/`BANTO_MEMBER`/`BANTO_ROLE` in the environment
+    /// instead.
+    #[command(name = "_hook", hide = true)]
+    Hook,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `Command::Hook` is dispatched before `load_config(...)?` runs at all
+    // (and before it can fail): this process is spawned mid-startup of the
+    // *operator's own* unrelated Codex session, so a broken --config/
+    // BANTO_CONFIG the operator set for some other reason must never take
+    // the hook down with it. `hook::run` resolves and loads its own config
+    // independently, always leniently.
+    if matches!(cli.command, Some(Command::Hook)) {
+        hook::run();
+        return Ok(());
+    }
     let config = load_config(cli.config.as_deref())?;
 
     let resolved_agents = banto_core::config::resolve_agents(&config.agents);
@@ -239,6 +260,7 @@ fn main() -> Result<()> {
             };
             mcp::run_stdio_server(store, identity, claude_home)
         }
+        Some(Command::Hook) => unreachable!("Command::Hook returns before load_config runs"),
         None => {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let codex_home = resolve_codex_home(cli.codex_home, &config);
