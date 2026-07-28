@@ -7,16 +7,16 @@
 //! user.
 //!
 //! `brigade_members` is keyed by a banto-owned `member_token` ('director',
-//! 'worker-1', 'worker-2', ...) rather than the Claude session id itself: a
-//! Worker is formed *before* Claude assigns it a session id (banto
+//! 'worker-1', 'worker-2', ...) rather than the session id itself: a
+//! Worker is formed *before* its agent product assigns it a session id (banto
 //! auto-spawns a fresh `claude` process and only later discovers its id —
 //! see `crate::embedded::emporium`'s `PendingNew` flow), so the id has to be
-//! a nullable column (`claude_session_id`) filled in after the fact, not the
+//! a nullable column (`session_id`) filled in after the fact, not the
 //! primary identity. Two policies are layered here in code rather than
 //! enforced by the schema:
 //! - a brigade has exactly one Director — that rule lives in the formation
 //!   layer (the emporium), not this table;
-//! - a Claude session belongs to at most one brigade at a time — also the
+//! - a session belongs to at most one brigade at a time — also the
 //!   formation layer's job (it only ever forms a brigade from a session with
 //!   no existing membership, and Workers are always freshly spawned).
 
@@ -69,9 +69,9 @@ impl Store {
     }
 
     /// Adds `token` to `brigade_id` with `role`, optionally already knowing
-    /// its Claude session id (the Director always does, at formation time;
+    /// its session id (the Director always does, at formation time;
     /// a freshly-spawned Worker starts with `None`, filled in later via
-    /// [`Self::set_member_claude_session`] once Claude assigns one). Also
+    /// [`Self::set_member_session`] once its agent product assigns one). Also
     /// seeds the member's cursor to "now" (the current max message id), so
     /// it sees only messages enqueued *after* joining.
     pub fn add_brigade_member(
@@ -79,17 +79,17 @@ impl Store {
         brigade_id: BrigadeId,
         token: &str,
         role: BrigadeRole,
-        claude_session_id: Option<&SessionId>,
+        session_id: Option<&SessionId>,
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO brigade_members (brigade_id, member_token, role, claude_session_id)
+            "INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 brigade_id,
                 token,
                 role.as_token(),
-                claude_session_id.map(|s| s.0.as_str())
+                session_id.map(|s| s.0.as_str())
             ],
         )?;
         tx.execute(
@@ -101,34 +101,34 @@ impl Store {
         Ok(())
     }
 
-    /// Records the Claude session id Claude assigned to a member banto
-    /// spawned ahead of time (a Worker's `claude_session_id`, initially
+    /// Records the session id a member's agent product assigned to a member
+    /// banto spawned ahead of time (a Worker's `session_id`, initially
     /// `None`). A no-op if `(brigade_id, token)` doesn't exist.
     ///
-    /// One Claude session belongs to at most one member: any other row
+    /// One session belongs to at most one member: any other row
     /// holding this id is cleared back to "awaiting discovery" in the same
-    /// transaction. A duplicate would make `brigade_of_claude_session`
+    /// transaction. A duplicate would make `brigade_of_session`
     /// answer with whichever row sorted first, so an `_mcp` connection
     /// could speak as the wrong member — worth spending a transaction to
     /// make unrepresentable, and it repairs a row a past duplicate left
     /// behind.
-    pub fn set_member_claude_session(
+    pub fn set_member_session(
         &mut self,
         brigade_id: BrigadeId,
         token: &str,
-        claude_session_id: &SessionId,
+        session_id: &SessionId,
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE brigade_members SET claude_session_id = NULL
-             WHERE claude_session_id = ?1
+            "UPDATE brigade_members SET session_id = NULL
+             WHERE session_id = ?1
                AND NOT (brigade_id = ?2 AND member_token = ?3)",
-            params![claude_session_id.0, brigade_id, token],
+            params![session_id.0, brigade_id, token],
         )?;
         tx.execute(
-            "UPDATE brigade_members SET claude_session_id = ?1
+            "UPDATE brigade_members SET session_id = ?1
              WHERE brigade_id = ?2 AND member_token = ?3",
-            params![claude_session_id.0, brigade_id, token],
+            params![session_id.0, brigade_id, token],
         )?;
         tx.commit()?;
         Ok(())
@@ -191,18 +191,18 @@ impl Store {
     /// worker-count clamp of 1..=8 guarantees).
     pub fn brigade_members(&self, brigade_id: BrigadeId) -> Result<Vec<BrigadeMember>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT member_token, role, claude_session_id FROM brigade_members
+            "SELECT member_token, role, session_id FROM brigade_members
              WHERE brigade_id = ?1
              ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, member_token",
         )?;
         let rows = stmt.query_map([brigade_id], |row| {
             let token: String = row.get(0)?;
             let role: String = row.get(1)?;
-            let claude_session_id: Option<String> = row.get(2)?;
+            let session_id: Option<String> = row.get(2)?;
             Ok(BrigadeMember {
                 token,
                 role: BrigadeRole::from_token(&role),
-                claude_session_id: claude_session_id.map(SessionId),
+                session_id: session_id.map(SessionId),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -216,37 +216,37 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT member_token, role, claude_session_id FROM brigade_members
+                "SELECT member_token, role, session_id FROM brigade_members
                  WHERE brigade_id = ?1 AND member_token = ?2",
                 params![brigade_id, token],
                 |row| {
                     let token: String = row.get(0)?;
                     let role: String = row.get(1)?;
-                    let claude_session_id: Option<String> = row.get(2)?;
+                    let session_id: Option<String> = row.get(2)?;
                     Ok(BrigadeMember {
                         token,
                         role: BrigadeRole::from_token(&role),
-                        claude_session_id: claude_session_id.map(SessionId),
+                        session_id: session_id.map(SessionId),
                     })
                 },
             )
             .optional()?)
     }
 
-    /// Returns the brigade a Claude session belongs to, its token, and its
+    /// Returns the brigade a session belongs to, its token, and its
     /// role there, if any. If the session is (unusually) linked from more
     /// than one member, returns the lowest brigade id, deterministically.
-    pub fn brigade_of_claude_session(
+    pub fn brigade_of_session(
         &self,
-        claude_session_id: &SessionId,
+        session_id: &SessionId,
     ) -> Result<Option<(BrigadeId, MemberToken, BrigadeRole)>, StoreError> {
         Ok(self
             .conn
             .query_row(
                 "SELECT brigade_id, member_token, role FROM brigade_members
-                 WHERE claude_session_id = ?1
+                 WHERE session_id = ?1
                  ORDER BY brigade_id LIMIT 1",
-                [&claude_session_id.0],
+                [&session_id.0],
                 |row| {
                     let id: BrigadeId = row.get(0)?;
                     let token: String = row.get(1)?;
@@ -257,24 +257,25 @@ impl Store {
             .optional()?)
     }
 
-    /// Every known Worker's Claude session id, across every brigade, that has
-    /// been assigned one so far (a Worker banto is still waiting on Claude to
-    /// assign one has no entry). Used to hide Workers from the session list.
+    /// Every known Worker's session id, across every brigade, that has
+    /// been assigned one so far (a Worker banto is still waiting on its
+    /// agent product to assign one has no entry). Used to hide Workers from
+    /// the session list.
     pub fn brigade_worker_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT claude_session_id FROM brigade_members
-             WHERE role = 'worker' AND claude_session_id IS NOT NULL",
+            "SELECT session_id FROM brigade_members
+             WHERE role = 'worker' AND session_id IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |row| Ok(SessionId(row.get(0)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Every known Director's Claude session id, across every brigade. Used
+    /// Every known Director's session id, across every brigade. Used
     /// to mark Directors in the session list.
     pub fn brigade_director_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT claude_session_id FROM brigade_members
-             WHERE role = 'director' AND claude_session_id IS NOT NULL",
+            "SELECT session_id FROM brigade_members
+             WHERE role = 'director' AND session_id IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |row| Ok(SessionId(row.get(0)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -315,7 +316,7 @@ impl Store {
     /// seen yet (id past its cursor), oldest first, and advance that
     /// member's cursor past them — so a later call returns only what has
     /// arrived since. The cursor is scoped to `(brigade_id, member_token)`,
-    /// so it doesn't carry over if the token's underlying Claude session
+    /// so it doesn't carry over if the token's underlying session
     /// later changes, and per-member cursors mean each recipient of a
     /// broadcast sees it independently.
     pub fn fetch_brigade_messages(
@@ -483,24 +484,24 @@ mod tests {
                 BrigadeMember {
                     token: "director".to_string(),
                     role: BrigadeRole::Director,
-                    claude_session_id: Some(sid("dir")),
+                    session_id: Some(sid("dir")),
                 },
                 BrigadeMember {
                     token: "worker-1".to_string(),
                     role: BrigadeRole::Worker,
-                    claude_session_id: Some(sid("w1")),
+                    session_id: Some(sid("w1")),
                 },
                 BrigadeMember {
                     token: "worker-2".to_string(),
                     role: BrigadeRole::Worker,
-                    claude_session_id: Some(sid("w2")),
+                    session_id: Some(sid("w2")),
                 },
             ]
         );
     }
 
     #[test]
-    fn worker_can_be_added_with_no_claude_session_yet() {
+    fn worker_can_be_added_with_no_session_yet() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
@@ -508,20 +509,20 @@ mod tests {
             .unwrap();
 
         let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
-        assert_eq!(member.claude_session_id, None);
+        assert_eq!(member.session_id, None);
 
         store
-            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .set_member_session(br, "worker-1", &sid("w1"))
             .unwrap();
         let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
-        assert_eq!(member.claude_session_id, Some(sid("w1")));
+        assert_eq!(member.session_id, Some(sid("w1")));
     }
 
     #[test]
-    fn one_claude_session_belongs_to_one_member_the_older_row_is_cleared() {
+    fn one_session_belongs_to_one_member_the_older_row_is_cleared() {
         // Two Workers spawned into one cwd once resolved to a single
         // discovered id, leaving both rows claiming it — after which
-        // `brigade_of_claude_session` answered with whichever sorted first
+        // `brigade_of_session` answered with whichever sorted first
         // and an `_mcp` connection could speak as the wrong member. The
         // second assignment now clears the first row back to "awaiting
         // discovery" instead, which also repairs data a past duplicate left.
@@ -535,18 +536,18 @@ mod tests {
             .unwrap();
 
         store
-            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .set_member_session(br, "worker-1", &sid("w1"))
             .unwrap();
         store
-            .set_member_claude_session(br, "worker-2", &sid("w1"))
+            .set_member_session(br, "worker-2", &sid("w1"))
             .unwrap();
 
         let first = store.brigade_member(br, "worker-1").unwrap().unwrap();
         let second = store.brigade_member(br, "worker-2").unwrap().unwrap();
-        assert_eq!(first.claude_session_id, None);
-        assert_eq!(second.claude_session_id, Some(sid("w1")));
+        assert_eq!(first.session_id, None);
+        assert_eq!(second.session_id, Some(sid("w1")));
         assert_eq!(
-            store.brigade_of_claude_session(&sid("w1")).unwrap(),
+            store.brigade_of_session(&sid("w1")).unwrap(),
             Some((br, "worker-2".to_string(), BrigadeRole::Worker))
         );
     }
@@ -561,41 +562,41 @@ mod tests {
             .unwrap();
 
         store
-            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .set_member_session(br, "worker-1", &sid("w1"))
             .unwrap();
         store
-            .set_member_claude_session(br, "worker-1", &sid("w1"))
+            .set_member_session(br, "worker-1", &sid("w1"))
             .unwrap();
 
         let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
-        assert_eq!(member.claude_session_id, Some(sid("w1")));
+        assert_eq!(member.session_id, Some(sid("w1")));
     }
 
     #[test]
-    fn brigade_of_claude_session_reports_membership_token_and_role() {
+    fn brigade_of_session_reports_membership_token_and_role() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
 
-        assert_eq!(store.brigade_of_claude_session(&sid("dir")).unwrap(), None);
+        assert_eq!(store.brigade_of_session(&sid("dir")).unwrap(), None);
 
         store
             .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
             .unwrap();
         assert_eq!(
-            store.brigade_of_claude_session(&sid("dir")).unwrap(),
+            store.brigade_of_session(&sid("dir")).unwrap(),
             Some((br, "director".to_string(), BrigadeRole::Director))
         );
     }
 
     #[test]
-    fn brigade_of_claude_session_is_none_for_a_worker_awaiting_discovery() {
+    fn brigade_of_session_is_none_for_a_worker_awaiting_discovery() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
             .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
             .unwrap();
 
-        assert_eq!(store.brigade_of_claude_session(&sid("w1")).unwrap(), None);
+        assert_eq!(store.brigade_of_session(&sid("w1")).unwrap(), None);
     }
 
     #[test]
@@ -811,7 +812,7 @@ mod tests {
             [BrigadeMember {
                 token: "director".to_string(),
                 role: BrigadeRole::Director,
-                claude_session_id: Some(sid("dir")),
+                session_id: Some(sid("dir")),
             }]
         );
         // See remove_brigade_member's doc: a non-member is a no-op.
@@ -819,7 +820,7 @@ mod tests {
 
         store.delete_brigade(br).unwrap();
         assert!(store.brigade_members(br).unwrap().is_empty());
-        assert_eq!(store.brigade_of_claude_session(&sid("dir")).unwrap(), None);
+        assert_eq!(store.brigade_of_session(&sid("dir")).unwrap(), None);
     }
 
     #[test]

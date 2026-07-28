@@ -270,8 +270,8 @@ pub type BrigadeId = i64;
 
 /// A banto-owned member identity within a brigade: `"director"` or
 /// `"worker-1"`, `"worker-2"`, etc. Stable for the member's lifetime in the
-/// brigade, unlike its Claude session id (unknown for a Worker until
-/// discovered, and never reused across brigades).
+/// brigade, unlike its session id (unknown for a Worker until discovered,
+/// and never reused across brigades).
 pub type MemberToken = String;
 
 /// A member's role within a brigade.
@@ -311,14 +311,14 @@ pub struct Brigade {
     pub name: String,
 }
 
-/// One member of a brigade: its banto-owned token, role, and Claude session
-/// id once known (`None` for a Worker banto has spawned but Claude hasn't
+/// One member of a brigade: its banto-owned token, role, and session id once
+/// known (`None` for a Worker banto has spawned but its agent product hasn't
 /// assigned an id to yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrigadeMember {
     pub token: MemberToken,
     pub role: BrigadeRole,
-    pub claude_session_id: Option<SessionId>,
+    pub session_id: Option<SessionId>,
 }
 
 /// A queued message from one brigade member to the peer role, or to one

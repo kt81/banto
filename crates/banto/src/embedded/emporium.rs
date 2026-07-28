@@ -679,11 +679,10 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
         }
         StoreIntent::ResolveMembership { session_id } => {
             // `&mut` (not `&`): healing a member below persists a moved
-            // claude_session_id (`set_member_claude_session`), not just
-            // reads one.
+            // session_id (`set_member_session`), not just reads one.
             let mut store = store.borrow_mut();
             let membership = store
-                .brigade_of_claude_session(&SessionId(session_id.clone()))
+                .brigade_of_session(&SessionId(session_id.clone()))
                 .ok()
                 .flatten();
             let members = membership.as_ref().map(|(brigade_id, _, _)| {
@@ -696,7 +695,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                             &mut store,
                             *brigade_id,
                             &member.token,
-                            member.claude_session_id,
+                            member.session_id,
                         );
                         (member.token, member.role, healed_id)
                     })
@@ -762,7 +761,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             session_id,
         } => {
             let mut store = store.borrow_mut();
-            let _ = store.set_member_claude_session(brigade_id, &token, &SessionId(session_id));
+            let _ = store.set_member_session(brigade_id, &token, &SessionId(session_id));
             vec![Event::MemberSessionRecorded {
                 hidden: crate::tui::load_hidden_worker_ids(&store),
                 directors: crate::tui::load_directors(&store),
@@ -771,9 +770,9 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
     }
 }
 
-/// Follow `claude_session_id` to its newest known auto-compaction
-/// continuation (`Store::lineage_leaf`) and, if it moved, persist the move
-/// (`Store::set_member_claude_session`, v9 move semantics: any other row
+/// Follow `session_id` to its newest known auto-compaction continuation
+/// (`Store::lineage_leaf`) and, if it moved, persist the move
+/// (`Store::set_member_session`, v9 move semantics: any other row
 /// holding the healed id is cleared) — closing the zombie loop for forks the
 /// live watcher missed (banto wasn't running when they happened), so
 /// re-staging resumes the true continuation instead of a stale ancestor.
@@ -784,14 +783,14 @@ fn heal_member_session(
     store: &mut Store,
     brigade_id: BrigadeId,
     token: &str,
-    claude_session_id: Option<SessionId>,
+    session_id: Option<SessionId>,
 ) -> Option<String> {
-    let recorded = claude_session_id?;
+    let recorded = session_id?;
     let leaf = store
         .lineage_leaf(&recorded)
         .unwrap_or_else(|_| recorded.clone());
     if leaf != recorded {
-        let _ = store.set_member_claude_session(brigade_id, token, &leaf);
+        let _ = store.set_member_session(brigade_id, token, &leaf);
     }
     Some(leaf.0)
 }
@@ -965,7 +964,7 @@ fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String>
 /// Gather this tick's relay observations for the staged brigade's members
 /// (unseen messages, live idle/busy status) — the store + live-session reads
 /// `engine::update_tick`'s decision logic needs, per member with a known
-/// Claude session id and an open pane among the currently-staged ones.
+/// session id and an open pane among the currently-staged ones.
 fn gather_relay_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
@@ -982,10 +981,10 @@ fn gather_relay_observations(
     let live = read_live_sessions(&claude_home.sessions_dir());
     let mut observations = Vec::new();
     for member in &members {
-        let Some(claude_session_id) = member.claude_session_id.as_ref() else {
+        let Some(session_id) = member.session_id.as_ref() else {
             continue;
         };
-        let key = SessionKey::from_id(&claude_session_id.0);
+        let key = SessionKey::from_id(&session_id.0);
         if !panes.contains(&key) {
             continue;
         }
@@ -995,7 +994,7 @@ fn gather_relay_observations(
             .unwrap_or(false);
         let is_idle_this_tick = live
             .iter()
-            .find(|entry| entry.session_id.as_deref() == Some(claude_session_id.0.as_str()))
+            .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
             .map(|entry| {
                 SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
             });
@@ -1046,10 +1045,10 @@ fn gather_fork_observations(
     let probe = SysinfoProbe;
     let mut events = Vec::new();
     for member in &members {
-        let Some(claude_session_id) = member.claude_session_id.as_ref() else {
+        let Some(session_id) = member.session_id.as_ref() else {
             continue;
         };
-        let old_key = SessionKey::from_id(&claude_session_id.0);
+        let old_key = SessionKey::from_id(&session_id.0);
         if !panes.contains(&old_key) {
             continue;
         }
@@ -1066,7 +1065,7 @@ fn gather_fork_observations(
         // changed.
         if live
             .iter()
-            .any(|entry| entry.session_id.as_deref() == Some(claude_session_id.0.as_str()))
+            .any(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
         {
             continue;
         }
@@ -1074,14 +1073,14 @@ fn gather_fork_observations(
             entry
                 .session_id
                 .as_deref()
-                .is_some_and(|id| !id.is_empty() && id != claude_session_id.0)
+                .is_some_and(|id| !id.is_empty() && id != session_id.0)
                 && ancestry_reaches(entry.pid, pid, &probe, FORK_ANCESTRY_DEPTH)
         });
         if let Some(new_id) = forked.and_then(|entry| entry.session_id.clone()) {
             events.push(Event::MemberSessionForked {
                 brigade_id,
                 token: member.token.clone(),
-                old_id: claude_session_id.0.clone(),
+                old_id: session_id.0.clone(),
                 new_id,
             });
         }
@@ -1139,14 +1138,14 @@ fn render_briefing(template: &str, brigade_id: BrigadeId, token: &str, peers: &[
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
 /// banto's own MCP server (`banto _mcp`) with this member's brigade
 /// identity, and return its path. Named by `(brigade_id, token)` rather than
-/// the Claude session id, since that's the only identity known upfront for a
+/// the session id, since that's the only identity known upfront for a
 /// freshly-spawned Worker. Lives under banto's own data dir, never under
 /// `~/.claude`.
 fn write_mcp_config(
     brigade_id: BrigadeId,
     token: &str,
     role: BrigadeRole,
-    claude_session_id: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let role_token = match role {
@@ -1162,7 +1161,7 @@ fn write_mcp_config(
         "--role".to_string(),
         role_token.to_string(),
     ];
-    if let Some(session_id) = claude_session_id {
+    if let Some(session_id) = session_id {
         args.push("--session".to_string());
         args.push(session_id.to_string());
     }
@@ -1723,7 +1722,7 @@ mod tests {
                 .brigade_member(brigade_id, "worker-1")
                 .unwrap()
                 .unwrap()
-                .claude_session_id,
+                .session_id,
             Some(SessionId("w1-new".to_string()))
         );
     }

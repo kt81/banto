@@ -221,6 +221,19 @@ const MIGRATIONS: &[&str] = &[
     // disappears.
     "DROP TABLE sessions_fts;
     DROP TABLE sessions;",
+    // v12: `claude_session_id` renamed back to `session_id` — its v4 name,
+    // before v7 attached "claude". Codex became a second product this
+    // column has to hold (banto now forms brigades around Codex sessions
+    // too), so a name naming only one of them was no longer a fact, just a
+    // leftover. `RENAME COLUMN` rewrites the index definition below to
+    // reference the new column name automatically, but SQLite has no
+    // `ALTER INDEX RENAME`, so the index keeps its now-equally-stale old
+    // name until dropped and recreated by hand.
+    "ALTER TABLE brigade_members RENAME COLUMN claude_session_id TO session_id;
+    DROP INDEX brigade_members_claude_session;
+    CREATE UNIQUE INDEX brigade_members_session
+        ON brigade_members (session_id)
+        WHERE session_id IS NOT NULL;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -449,7 +462,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("dir".to_string()))
+                .brigade_of_session(&SessionId("dir".to_string()))
                 .unwrap(),
             Some((br, "director".to_string(), BrigadeRole::Director))
         );
@@ -489,7 +502,7 @@ mod tests {
         let mut store = Store::open(&db).unwrap();
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("dir".to_string()))
+                .brigade_of_session(&SessionId("dir".to_string()))
                 .unwrap(),
             Some((1, "director".to_string(), BrigadeRole::Director))
         );
@@ -552,7 +565,7 @@ mod tests {
         let mut store = Store::open(&db).unwrap();
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("w1".to_string()))
+                .brigade_of_session(&SessionId("w1".to_string()))
                 .unwrap(),
             Some((1, "worker-1".to_string(), BrigadeRole::Worker))
         );
@@ -638,19 +651,19 @@ mod tests {
         let store = Store::open(&db).unwrap();
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("dir".to_string()))
+                .brigade_of_session(&SessionId("dir".to_string()))
                 .unwrap(),
             Some((1, "director".to_string(), BrigadeRole::Director))
         );
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("alice".to_string()))
+                .brigade_of_session(&SessionId("alice".to_string()))
                 .unwrap(),
             Some((1, "worker-1".to_string(), BrigadeRole::Worker))
         );
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("bob".to_string()))
+                .brigade_of_session(&SessionId("bob".to_string()))
                 .unwrap(),
             Some((1, "worker-2".to_string(), BrigadeRole::Worker))
         );
@@ -766,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_to_v9_upgrade_clears_a_duplicated_claude_session_id_and_locks_it_out() {
+    fn v8_to_v9_upgrade_clears_a_duplicated_session_id_and_locks_it_out() {
         use super::super::BrigadeRole;
 
         let dir = tempfile::tempdir().unwrap();
@@ -801,11 +814,7 @@ mod tests {
         // The later row keeps the id; the earlier one goes back to
         // "awaiting discovery" and respawns fresh next time it's staged.
         let id_of = |store: &Store, token: &str| {
-            store
-                .brigade_member(1, token)
-                .unwrap()
-                .unwrap()
-                .claude_session_id
+            store.brigade_member(1, token).unwrap().unwrap().session_id
         };
         assert_eq!(id_of(&store, "worker-1"), None);
         assert_eq!(
@@ -820,7 +829,7 @@ mod tests {
         // row happened to sort first.
         assert_eq!(
             store
-                .brigade_of_claude_session(&SessionId("dup".to_string()))
+                .brigade_of_session(&SessionId("dup".to_string()))
                 .unwrap(),
             Some((1, "worker-2".to_string(), BrigadeRole::Worker))
         );
@@ -828,7 +837,7 @@ mod tests {
         // And a fresh duplicate can no longer be written at all: the
         // reassignment moves the id, it never lands in two rows.
         store
-            .set_member_claude_session(1, "worker-1", &SessionId("dup".to_string()))
+            .set_member_session(1, "worker-1", &SessionId("dup".to_string()))
             .unwrap();
         assert_eq!(id_of(&store, "worker-2"), None);
         assert_eq!(
@@ -875,6 +884,87 @@ mod tests {
         let parent = SessionId("parent".to_string());
         store.record_lineage(&child, &parent).unwrap();
         assert_eq!(store.lineage_leaf(&parent).unwrap(), child);
+
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v11_to_v12_upgrade_renames_the_session_column_and_its_index() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v11 code would have left it: a brigade with a
+        // Director already assigned an id and a Worker still awaiting one.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..11] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, member_token, role, claude_session_id) VALUES
+                 (1, 'director', 'director', 'dir'),
+                 (1, 'worker-1', 'worker',   NULL)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 11).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+
+        // The pre-migration row reads back under the new column name.
+        assert_eq!(
+            store
+                .brigade_member(1, "director")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            Some(SessionId("dir".to_string()))
+        );
+
+        // The partial unique index, recreated under its new name, still lets
+        // any number of NULLs coexist...
+        store
+            .add_brigade_member(1, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+        assert_eq!(
+            store
+                .brigade_member(1, "worker-1")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            None
+        );
+        assert_eq!(
+            store
+                .brigade_member(1, "worker-2")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            None
+        );
+        // ...but still rejects a non-NULL duplicate.
+        assert!(
+            store
+                .add_brigade_member(
+                    1,
+                    "worker-3",
+                    BrigadeRole::Worker,
+                    Some(&SessionId("dir".to_string())),
+                )
+                .is_err()
+        );
 
         let version: i64 = store
             .conn

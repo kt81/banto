@@ -74,7 +74,7 @@ impl SessionKey {
     }
 
     /// Whether this key is a placeholder awaiting id discovery, rather than
-    /// a real Claude session id.
+    /// a real session id.
     pub fn is_synthetic(&self) -> bool {
         self.0.starts_with("new::") || self.0.starts_with("new-worker::")
     }
@@ -845,7 +845,7 @@ pub enum Cmd {
     },
     /// The child hosted under `from` is now known by `to`: id discovery
     /// resolved a freshly-launched session's synthetic placeholder key into
-    /// the real Claude session id (`Event::DiscoveryResult`). The core
+    /// the real session id (`Event::DiscoveryResult`). The core
     /// renames its own `screens`/`Stage` entries itself; this Cmd is how the
     /// shell's PTY handle — which the core cannot touch — follows along.
     /// Without it the handle is orphaned under a key nothing references
@@ -1746,7 +1746,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
 }
 
 /// Stage brigade `brigade_id`: `members` is its full roster (token, role,
-/// Claude session id if known), already fetched by the shell alongside the
+/// session id if known), already fetched by the shell alongside the
 /// membership resolution that led here. A member whose row is already
 /// embedded is added immediately; one that resolves to a row but isn't
 /// embedded yet gets an `OpenEmbedded` request; a Worker with no resolved
@@ -1772,10 +1772,8 @@ fn stage_brigade(
     let mut panes = Vec::new();
     let mut cmds = Vec::new();
     let mut missing = 0;
-    for (token, role, claude_session_id) in members {
-        let resolved_row = claude_session_id
-            .as_deref()
-            .and_then(|sid| app.row_for_id(sid));
+    for (token, role, session_id) in members {
+        let resolved_row = session_id.as_deref().and_then(|sid| app.row_for_id(sid));
         match resolved_row {
             Some(row) => {
                 let key = SessionKey::from_id(&row.id);

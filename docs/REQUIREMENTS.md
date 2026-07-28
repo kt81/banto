@@ -434,12 +434,14 @@ directly).
 
 **Member identity.** Each member gets a banto-owned `member_token`
 (`"director"`, `"worker-1"`, `"worker-2"`, ...) rather than being keyed by its
-Claude session id — a Worker is formed by banto *before* Claude assigns it a
-session id (it's auto-spawned), so the id has to be a nullable, filled-in-later
-column rather than the primary identity
-(`crates/banto-io/src/store/migrations.rs` v7 migration comment). The token is
-stable for the member's lifetime in the brigade; its Claude session id is not
-(unknown until discovered, never reused across brigades).
+session id — a Worker is formed by banto *before* its agent product assigns it
+a session id (it's auto-spawned), so the id has to be a nullable, filled-in-later
+column (`brigade_members.session_id`) rather than the primary identity
+(`crates/banto-io/src/store/migrations.rs` v7/v12 migration comments — v7
+named the column `claude_session_id`; v12 renamed it back to `session_id` once
+Codex became a second product it has to hold). The token is stable for the
+member's lifetime in the brigade; its session id is not (unknown until
+discovered, never reused across brigades).
 
 **Lifecycle.** Killing a Worker's pane (prefix-`x`) lets it respawn fresh under
 the same token next time its brigade is staged; *dismissing* one (a separate

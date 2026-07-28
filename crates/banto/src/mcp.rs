@@ -47,7 +47,7 @@ use banto_io::store::{Store, StoreError};
 /// alone, so a removal takes effect on the very next call, with no relaunch.
 /// `session` is a fallback for `--mcp-config` files written before `--member`
 /// existed: with no `member`, membership is instead resolved by matching
-/// `session` against a member's `claude_session_id`.
+/// `session` against a member's `session_id`.
 pub struct Identity {
     pub session: Option<String>,
     pub brigade: Option<BrigadeId>,
@@ -287,9 +287,9 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
 
 /// What a peer is doing, as far as banto can tell: its live-state entry's
 /// status when one exists, otherwise the honest "banto has spawned it but
-/// Claude hasn't named it yet" / "no live session" — never a guess.
+/// its agent product hasn't named it yet" / "no live session" — never a guess.
 fn peer_activity(peer: &BrigadeMember, live: &[LiveSession]) -> String {
-    let Some(session_id) = peer.claude_session_id.as_ref() else {
+    let Some(session_id) = peer.session_id.as_ref() else {
         return "starting up (no session id yet)".to_string();
     };
     let entry = live
@@ -421,11 +421,11 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
 /// and `--member` and that `(brigade, member)` row still exists, it wins, and
 /// the role always comes from the row, never from argv. When the row is gone
 /// — the brigade was disbanded or the member removed — the `--session`
-/// fallback still runs: a claude session that was since enrolled in a *new*
+/// fallback still runs: a session that was since enrolled in a *new*
 /// brigade (disband, then re-form around a still-running session) resolves to
-/// its current membership by `claude_session_id` instead of staying chained
+/// its current membership by `session_id` instead of staying chained
 /// to its launch-time identity forever. A member that was truly removed
-/// matches nothing either way (its `claude_session_id` is on no row), so
+/// matches nothing either way (its `session_id` is on no row), so
 /// revocation still takes effect on the very next call, with no relaunch.
 /// The same fallback serves `--mcp-config` files predating `--member`.
 /// `Ok(None)` when nothing resolves; `Err` only on a genuine store failure.
@@ -440,7 +440,7 @@ fn live_membership(
     let Some(session) = ctx.identity.session.clone() else {
         return Ok(None);
     };
-    ctx.store.brigade_of_claude_session(&SessionId(session))
+    ctx.store.brigade_of_session(&SessionId(session))
 }
 
 fn peer_role(role: BrigadeRole) -> BrigadeRole {
@@ -518,7 +518,7 @@ mod tests {
     /// Builds a `ServerContext` from `(session, brigade, member, role)`
     /// launch-argv fields. When `brigade`/`member`/`role` are all given, also
     /// registers that as the member's *real* store row (with
-    /// `claude_session_id` set from `session`), matching the normal case
+    /// `session_id` set from `session`), matching the normal case
     /// where launch argv reflects membership at spawn time; tests that need
     /// the two to diverge (a later removal or reassignment) mutate the store
     /// afterwards.
@@ -974,7 +974,7 @@ mod tests {
         // (brigade, member) is a Worker — the live row must win for role.
         let mut ctx = ctx("s", Some(1), Some("worker-1"), Some(BrigadeRole::Director));
         ctx.store
-            .set_member_claude_session(1, "worker-1", &SessionId("s".to_string()))
+            .set_member_session(1, "worker-1", &SessionId("s".to_string()))
             .unwrap();
         ctx.store.remove_brigade_member(1, "worker-1").unwrap();
         ctx.store
@@ -1004,10 +1004,10 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_matching_session_against_claude_session_id_when_member_is_absent() {
+    fn falls_back_to_matching_session_against_session_id_when_member_is_absent() {
         // An old `--mcp-config` written before `--member` existed: no
         // `member` in argv, so membership is resolved by matching `session`
-        // against a member's claude_session_id instead.
+        // against a member's session_id instead.
         let mut ctx = ctx("s", None, None, None);
         ctx.store
             .add_brigade_member(
