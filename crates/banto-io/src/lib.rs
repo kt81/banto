@@ -6,6 +6,7 @@
 //! - [`claude_home`] the root Claude Code stores its state under, plus its subdirs
 //! - [`codex_home`] the root the Codex CLI stores its state under: threads/logs db, rollout tree
 //! - [`codex_liveness`] Codex session liveness via `logs_2.sqlite` (the Codex-side double-resume guard)
+//! - [`codex_trust`] advisory-only read of whether Codex has trusted banto's own SessionStart hook
 //! - [`config`]  loading `banto_core::config`'s types from disk
 //! - [`lineage`] resolving auto-compaction parent links (beside the provider)
 //! - [`opener`]  opening/focusing sessions in a real terminal (psmux, WT)
@@ -20,6 +21,7 @@
 pub mod claude_home;
 pub mod codex_home;
 pub mod codex_liveness;
+pub mod codex_trust;
 pub mod config;
 pub mod lineage;
 pub mod opener;

@@ -400,7 +400,7 @@ fn toml_basic_string(s: &str) -> String {
 /// happened to still work only because Windows itself tolerates the extra
 /// pair — a mistake structurally impossible once there's nothing left to
 /// double-escape).
-fn forward_slash_path(path: &Path) -> String {
+pub(crate) fn forward_slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -425,7 +425,15 @@ fn forward_slash_path(path: &Path) -> String {
 /// trust hash — changes shape the day an operator's install path happens
 /// to contain one; quoting always keeps the shape fixed regardless. `_hook`
 /// is a fixed literal, not a path, so it stays outside the quotes.
-fn session_start_hook_override(exe: &str) -> String {
+///
+/// `pub(crate)` specifically so [`crate::codex_trust`] can call this same
+/// function rather than reconstruct its own copy of the string: the whole
+/// point of `codex-trust` is to show the operator, in a standalone `codex`
+/// session with nothing else running, the *exact* hook they're about to
+/// trust everywhere else. A hand-copied second implementation would drift
+/// the moment either one changed, and the two need not even land in the
+/// same commit for that to happen quietly.
+pub(crate) fn session_start_hook_override(exe: &str) -> String {
     let command = toml_basic_string(&format!("\"{exe}\" _hook"));
     format!(
         "hooks.SessionStart=[{{matcher=\"\",hooks=[{{type=\"command\",timeout_sec=600,command=\"{command}\"}}]}}]"

@@ -153,7 +153,26 @@ pub fn run(
         // stays the default of 1.
         .with_lines_per_row(2)
         .with_enabled_agents(enabled_agents.clone());
-    if let Some(notice) = session::agents_ignored_notice(settings.resolved_agents) {
+    // The trust notice wins the status line when both apply: an unknown agent
+    // name is a typo in a setting, while an untrusted hook is a cell about to
+    // form with members nothing will ever brief.
+    let trust_notice = codex_home
+        .filter(|_| enabled_agents.contains(&AgentKind::Codex))
+        .and_then(|home| {
+            let has_brigade = !store
+                .borrow()
+                .list_brigades()
+                .unwrap_or_default()
+                .is_empty();
+            session::codex_trust_notice(
+                banto_io::codex_trust::hook_trust_state(home),
+                true,
+                has_brigade,
+            )
+        });
+    if let Some(notice) =
+        trust_notice.or_else(|| session::agents_ignored_notice(settings.resolved_agents))
+    {
         app.set_status(notice, Instant::now());
     }
 

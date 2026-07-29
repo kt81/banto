@@ -15,6 +15,7 @@ use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
+use banto_io::codex_trust::HookTrustState;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
@@ -77,6 +78,38 @@ pub fn agents_ignored_notice(resolved: &ResolvedAgents) -> Option<String> {
             .join(", ");
         format!("agents: ignored unknown name(s) \"{names}\" — showing {kept}")
     })
+}
+
+/// Status-line notice telling the operator that Codex has not been asked to
+/// trust banto's brigade hook yet, or `None` when the question doesn't apply.
+///
+/// Deliberately raised *before* a brigade is staged rather than after it goes
+/// wrong. An untrusted hook is not refused loudly — Codex drops it in silence
+/// (docs/notes/codex-briefing-spike.md), so the first sign of trouble would
+/// otherwise be members behaving as though nobody had told them they were in
+/// a cell. And the approval prompt cannot be answered once for a whole
+/// brigade: trust is read as each member starts, so members launched together
+/// each raise their own dialog, and dismissing any of them leaves that member
+/// briefed by nothing.
+///
+/// [`HookTrustState::Unknown`] is treated exactly like `NotPrimed` — banto
+/// could not tell, and offering a one-time step the operator may not need
+/// costs less than staying silent about one they do. `Primed` stays quiet
+/// while being only a hint; see [`banto_io::codex_trust`] for why it cannot
+/// be more than that, and `BrigadeMember::briefed_at` for the fact that can.
+pub fn codex_trust_notice(
+    state: HookTrustState,
+    codex_enabled: bool,
+    has_brigade: bool,
+) -> Option<String> {
+    if !codex_enabled || !has_brigade || state == HookTrustState::Primed {
+        return None;
+    }
+    Some(
+        "codex: brigade briefings need a one-time approval — run `banto codex-trust` \
+         (until then a Codex member starts unbriefed, without saying so)"
+            .to_string(),
+    )
 }
 
 /// Discover sessions under `claude_home` (and `codex_home`, when resolved
@@ -273,6 +306,39 @@ mod tests {
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Today)), "today");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::ThisWeek)), "week");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Older)), "older");
+    }
+
+    // -- codex_trust_notice ----------------------------------------------
+
+    #[test]
+    fn codex_trust_notice_offers_the_one_time_step_when_nothing_looks_trusted() {
+        let notice = codex_trust_notice(HookTrustState::NotPrimed, true, true)
+            .expect("an unprimed cell must be warned");
+        assert!(notice.contains("banto codex-trust"), "must name the fix");
+    }
+
+    #[test]
+    fn codex_trust_notice_treats_an_unreadable_config_as_unprimed() {
+        // Silence here would trade a needless prompt for a cell that forms
+        // with members nothing ever briefs.
+        assert!(codex_trust_notice(HookTrustState::Unknown, true, true).is_some());
+    }
+
+    #[test]
+    fn codex_trust_notice_is_silent_once_something_looks_trusted() {
+        assert_eq!(codex_trust_notice(HookTrustState::Primed, true, true), None);
+    }
+
+    #[test]
+    fn codex_trust_notice_is_silent_for_an_operator_with_no_brigade_or_no_codex() {
+        assert_eq!(
+            codex_trust_notice(HookTrustState::NotPrimed, true, false),
+            None
+        );
+        assert_eq!(
+            codex_trust_notice(HookTrustState::NotPrimed, false, true),
+            None
+        );
     }
 
     // -- agents_ignored_notice -------------------------------------------
