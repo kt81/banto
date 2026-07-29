@@ -34,13 +34,24 @@ pub(crate) fn run(
     binaries: &AgentBinaries,
     runner: &dyn ProcessRunner,
 ) -> io::Result<Option<i32>> {
+    // The path is named because trust is granted to a command string that
+    // contains it: run from a build directory, and the approval covers that
+    // copy rather than the installed one that will actually host brigades —
+    // a mismatch nothing later reports, since an untrusted hook simply
+    // doesn't run.
     println!(
         "banto: starting Codex so you can review and trust its SessionStart hook.\n\
+         Trust is granted to this executable specifically:\n  {}\n\
+         Run this from the same copy you launch banto with, or brigades \
+         started from a different copy stay unbriefed.\n\
          Choose \"Trust all and continue\", then run /quit once Codex is ready \
-         — nothing else to do here."
+         — nothing else to do here.",
+        exe.display()
     );
     let code = runner.run(&trust_argv(exe, binaries))?;
-    println!("banto: done — Codex brigade members can be started normally now.");
+    println!(
+        "banto: done — Codex brigade members started from this executable can be briefed now."
+    );
     Ok(code)
 }
 
