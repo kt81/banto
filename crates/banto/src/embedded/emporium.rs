@@ -164,10 +164,18 @@ pub fn run(
                 .list_brigades()
                 .unwrap_or_default()
                 .is_empty();
+            // An unknowable executable path counts as launchable: blaming a
+            // space nothing has established is there would be worse than
+            // leaving the trust question to speak for itself.
+            let hook_launchable = match std::env::current_exe() {
+                Ok(exe) => opener::hook_command_is_launchable(&opener::forward_slash_path(&exe)),
+                Err(_) => true,
+            };
             session::codex_trust_notice(
                 banto_io::codex_trust::hook_trust_state(home),
                 true,
                 has_brigade,
+                hook_launchable,
             )
         });
     if let Some(notice) =

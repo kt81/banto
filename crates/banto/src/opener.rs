@@ -380,13 +380,13 @@ pub(crate) fn agent_binary(agent: AgentKind, binaries: &AgentBinaries) -> String
 /// escape a `"` would itself get escaped a second time by a later pass.
 ///
 /// [`forward_slash_path`] already eliminates backslashes from the one value
-/// here that would otherwise be full of them (a Windows path), so the
-/// backslash pass below is defense, not the load-bearing half anymore. The
-/// quote pass is: [`session_start_hook_override`] deliberately wraps the
-/// executable path in *literal* `"` characters (see its own doc for why),
-/// and those have to survive as `\"` once this whole string becomes the
-/// body of the outer TOML `command="..."` value, or the string would
-/// terminate early and produce broken TOML.
+/// here that would otherwise be full of them (a Windows path), so both
+/// passes below are defense against a byte class none of banto's own
+/// current inputs (a forward-slash path, an `_mcp` argument) are known to
+/// contain, not a load-bearing part of any of them. Letting a stray `\` or
+/// `"` through unescaped would silently corrupt the outer TOML
+/// `command="..."`/`args=[...]` value it sits inside rather than error, so
+/// it stays in as cheap insurance.
 fn toml_basic_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -404,6 +404,21 @@ pub(crate) fn forward_slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Whether `exe` (already forward-slash-normalized) can be embedded bare as
+/// the hook command's first token. Codex splits `command` on whitespace
+/// itself before spawning it, and a space anywhere in that first token
+/// breaks the split — quoting was tried as the fix (worker-3, measured
+/// 2026-07-29, `docs/notes/codex-briefing-spike.md`) and made the hook fail
+/// *unconditionally*, quoted or not, space or no space: there is no working
+/// quoting scheme for token 0. Every caller of
+/// [`session_start_hook_override`] must check this first and, when it
+/// returns `false`, skip the hook `-c` entirely — emitting a command that
+/// can never fire trades a working briefing for a bare "SessionStart
+/// Failed" in the pane and nothing more useful than that.
+pub(crate) fn hook_command_is_launchable(exe: &str) -> bool {
+    !exe.contains(' ')
+}
+
 /// The `-c hooks.SessionStart=...` override that makes banto's own
 /// briefing hook fire. Depends on nothing but `exe` — no brigade id, member
 /// token, role, or session id — because Codex keys hook trust off a hash of
@@ -415,16 +430,13 @@ pub(crate) fn forward_slash_path(path: &Path) -> String {
 /// the same reason: a future default change would shift the hash under us
 /// with no visible cause either.
 ///
-/// `exe` is wrapped in literal `"` characters unconditionally, even though
-/// nothing about today's install paths needs it: Codex's hook `command` is
-/// one string it splits on whitespace itself, so an *unquoted* path
-/// containing a space (measured: `C:/Program Files/...`) silently fails to
-/// split and the hook never fires — no error, no log line, nothing but a
-/// bare "SessionStart Failed" with zero other trace. Quoting only once a
-/// space actually shows up would mean this string — and therefore the
-/// trust hash — changes shape the day an operator's install path happens
-/// to contain one; quoting always keeps the shape fixed regardless. `_hook`
-/// is a fixed literal, not a path, so it stays outside the quotes.
+/// `exe` is embedded bare, with no quoting at all, unlike an earlier
+/// version of this function that wrapped it in literal `"` characters to
+/// protect a path containing a space: that was measured (worker-3,
+/// 2026-07-29) to break the hook regardless of the space, quoted or not —
+/// there is no working fix here, only [`hook_command_is_launchable`]
+/// deciding up front whether to call this function at all. `_hook` is a
+/// fixed literal with no spaces, so it was never the problem.
 ///
 /// `pub(crate)` specifically so [`crate::codex_trust`] can call this same
 /// function rather than reconstruct its own copy of the string: the whole
@@ -434,7 +446,7 @@ pub(crate) fn forward_slash_path(path: &Path) -> String {
 /// the moment either one changed, and the two need not even land in the
 /// same commit for that to happen quietly.
 pub(crate) fn session_start_hook_override(exe: &str) -> String {
-    let command = toml_basic_string(&format!("\"{exe}\" _hook"));
+    let command = toml_basic_string(&format!("{exe} _hook"));
     format!(
         "hooks.SessionStart=[{{matcher=\"\",hooks=[{{type=\"command\",timeout_sec=600,command=\"{command}\"}}]}}]"
     )
@@ -495,17 +507,25 @@ const MCP_SERVER_APPROVAL_OVERRIDE: &str =
     "mcp_servers.banto.default_tools_approval_mode=\"approve\"";
 
 impl CodexBrigade {
-    /// The four `-c` overrides this member's launch adds, in the order
+    /// The `-c` overrides this member's launch adds, in the order
     /// [`AgentLaunch::argv`] must emit them — see each override function's
-    /// own doc for why this specific one and not a different shape.
+    /// own doc for why this specific one and not a different shape. Normally
+    /// four; three when [`hook_command_is_launchable`] rejects `exe` — the
+    /// hook override is left out entirely rather than emitted broken (see
+    /// that function's own doc). The MCP overrides are unaffected either
+    /// way: Codex hands `mcp_servers.banto.*` to its own process spawner
+    /// directly rather than splitting them on whitespace itself, so a space
+    /// in `exe` is no obstacle for those.
     fn overrides(&self) -> Vec<String> {
         let exe = forward_slash_path(&self.exe);
-        vec![
-            session_start_hook_override(&exe),
-            mcp_server_command_override(&exe),
-            mcp_server_args_override(self),
-            MCP_SERVER_APPROVAL_OVERRIDE.to_string(),
-        ]
+        let mut overrides = Vec::with_capacity(4);
+        if hook_command_is_launchable(&exe) {
+            overrides.push(session_start_hook_override(&exe));
+        }
+        overrides.push(mcp_server_command_override(&exe));
+        overrides.push(mcp_server_args_override(self));
+        overrides.push(MCP_SERVER_APPROVAL_OVERRIDE.to_string());
+        overrides
     }
 }
 
@@ -1296,7 +1316,7 @@ mod tests {
             [
                 "codex",
                 "-c",
-                "hooks.SessionStart=[{matcher=\"\",hooks=[{type=\"command\",timeout_sec=600,command=\"\\\"/opt/banto/banto\\\" _hook\"}]}]",
+                "hooks.SessionStart=[{matcher=\"\",hooks=[{type=\"command\",timeout_sec=600,command=\"/opt/banto/banto _hook\"}]}]",
                 "-c",
                 "mcp_servers.banto.command=\"/opt/banto/banto\"",
                 "-c",
@@ -1339,7 +1359,7 @@ mod tests {
         let overrides = brigade.overrides();
         assert_eq!(
             overrides[0],
-            r#"hooks.SessionStart=[{matcher="",hooks=[{type="command",timeout_sec=600,command="\"C:/Users/kt81/banto-dogfood/banto.exe\" _hook"}]}]"#
+            r#"hooks.SessionStart=[{matcher="",hooks=[{type="command",timeout_sec=600,command="C:/Users/kt81/banto-dogfood/banto.exe _hook"}]}]"#
         );
         assert_eq!(
             overrides[1],
@@ -1348,12 +1368,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_brigade_hook_override_quotes_a_path_containing_spaces() {
-        // The measured failure mode this quoting exists to prevent: an
-        // unquoted path with a space silently fails to fire the hook at
-        // all (see `session_start_hook_override`'s doc) — quoting is
-        // unconditional specifically so this case never has to be
-        // special-cased or noticed.
+    fn codex_brigade_omits_the_hook_override_when_the_exe_path_contains_a_space() {
+        // The measured failure mode this guards: quoting doesn't save a
+        // spaced path either (see `hook_command_is_launchable`'s doc) — the
+        // only fix left is to never emit a hook `-c` that can never fire.
+        // The MCP overrides still go out: those aren't split on whitespace
+        // by Codex, so the space is no obstacle for them.
         let brigade = CodexBrigade {
             exe: PathBuf::from(r#"C:\Program Files\banto\banto.exe"#),
             brigade_id: 1,
@@ -1361,9 +1381,12 @@ mod tests {
             role: BrigadeRole::Director,
             session: None,
         };
+        let overrides = brigade.overrides();
+        assert_eq!(overrides.len(), 3);
+        assert!(!overrides.iter().any(|o| o.contains("SessionStart")));
         assert_eq!(
-            brigade.overrides()[0],
-            r#"hooks.SessionStart=[{matcher="",hooks=[{type="command",timeout_sec=600,command="\"C:/Program Files/banto/banto.exe\" _hook"}]}]"#
+            overrides[0],
+            r#"mcp_servers.banto.command="C:/Program Files/banto/banto.exe""#
         );
     }
 

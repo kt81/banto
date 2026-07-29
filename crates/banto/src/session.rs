@@ -101,8 +101,23 @@ pub fn codex_trust_notice(
     state: HookTrustState,
     codex_enabled: bool,
     has_brigade: bool,
+    hook_launchable: bool,
 ) -> Option<String> {
-    if !codex_enabled || !has_brigade || state == HookTrustState::Primed {
+    if !codex_enabled || !has_brigade {
+        return None;
+    }
+    // Outranks the trust question, and outranks `Primed` too: from a path
+    // Codex cannot launch, an existing trust record is a leftover for a hook
+    // that will never run, so pointing at `codex-trust` would send the
+    // operator to a command that only declines.
+    if !hook_launchable {
+        return Some(
+            "codex: banto's own path contains a space, which Codex cannot launch a hook \
+             from — brigade members stay unbriefed until banto is moved somewhere without one"
+                .to_string(),
+        );
+    }
+    if state == HookTrustState::Primed {
         return None;
     }
     Some(
@@ -312,7 +327,7 @@ mod tests {
 
     #[test]
     fn codex_trust_notice_offers_the_one_time_step_when_nothing_looks_trusted() {
-        let notice = codex_trust_notice(HookTrustState::NotPrimed, true, true)
+        let notice = codex_trust_notice(HookTrustState::NotPrimed, true, true, true)
             .expect("an unprimed cell must be warned");
         assert!(notice.contains("banto codex-trust"), "must name the fix");
     }
@@ -321,24 +336,46 @@ mod tests {
     fn codex_trust_notice_treats_an_unreadable_config_as_unprimed() {
         // Silence here would trade a needless prompt for a cell that forms
         // with members nothing ever briefs.
-        assert!(codex_trust_notice(HookTrustState::Unknown, true, true).is_some());
+        assert!(codex_trust_notice(HookTrustState::Unknown, true, true, true).is_some());
     }
 
     #[test]
     fn codex_trust_notice_is_silent_once_something_looks_trusted() {
-        assert_eq!(codex_trust_notice(HookTrustState::Primed, true, true), None);
+        assert_eq!(
+            codex_trust_notice(HookTrustState::Primed, true, true, true),
+            None
+        );
     }
 
     #[test]
     fn codex_trust_notice_is_silent_for_an_operator_with_no_brigade_or_no_codex() {
         assert_eq!(
-            codex_trust_notice(HookTrustState::NotPrimed, true, false),
+            codex_trust_notice(HookTrustState::NotPrimed, true, false, true),
             None
         );
         assert_eq!(
-            codex_trust_notice(HookTrustState::NotPrimed, false, true),
+            codex_trust_notice(HookTrustState::NotPrimed, false, true, true),
             None
         );
+    }
+
+    #[test]
+    fn codex_trust_notice_blames_the_space_rather_than_sending_them_to_a_command_that_declines() {
+        // Even `Primed`: a trust record earned from a path Codex cannot
+        // launch is a leftover for a hook that will never run.
+        for state in [
+            HookTrustState::Primed,
+            HookTrustState::NotPrimed,
+            HookTrustState::Unknown,
+        ] {
+            let notice = codex_trust_notice(state, true, true, false)
+                .expect("an unlaunchable path must be reported whatever the trust state");
+            assert!(notice.contains("space"), "must name the cause");
+            assert!(
+                !notice.contains("codex-trust"),
+                "must not send them to a command that only declines"
+            );
+        }
     }
 
     // -- agents_ignored_notice -------------------------------------------

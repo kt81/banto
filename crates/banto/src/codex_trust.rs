@@ -21,7 +21,9 @@ use banto_core::config::AgentBinaries;
 use banto_core::model::AgentKind;
 use banto_io::process::ProcessRunner;
 
-use crate::opener::{agent_binary, forward_slash_path, session_start_hook_override};
+use crate::opener::{
+    agent_binary, forward_slash_path, hook_command_is_launchable, session_start_hook_override,
+};
 
 /// Run `codex -c <hook override>` interactively (inherited stdio, blocking
 /// until it exits — see `runner`'s own trait doc), after a short
@@ -29,11 +31,33 @@ use crate::opener::{agent_binary, forward_slash_path, session_start_hook_overrid
 /// path (production callers pass `std::env::current_exe()`, injected here
 /// so this stays deterministic in tests — the same convention
 /// `opener::wrap_argv`'s own `exe` parameter already uses).
+///
+/// Declines to launch Codex at all when `exe` fails
+/// [`hook_command_is_launchable`]: no quoting scheme lets the hook fire from
+/// a path with a space in it (see that function's own doc), so trusting the
+/// hook here would only earn an approval that can never do anything —
+/// worse than no approval, since nothing later would explain why the
+/// briefing never arrives.
 pub(crate) fn run(
     exe: &Path,
     binaries: &AgentBinaries,
     runner: &dyn ProcessRunner,
 ) -> io::Result<Option<i32>> {
+    if !hook_command_is_launchable(&forward_slash_path(exe)) {
+        println!(
+            "banto: this executable's path contains a space, and Codex cannot launch a \
+             SessionStart hook command from one — measured, not assumed (see \
+             docs/notes/codex-briefing-spike.md):\n  {}\n\
+             Trusting the hook from here would not help: it could still never fire, so a \
+             Codex brigade member launched from this copy would never receive its briefing.\n\
+             Move this executable to a path with no spaces and run `banto codex-trust` again \
+             from there. Note %LOCALAPPDATA% is not automatically safe for this — it contains \
+             a space whenever the Windows username itself does, e.g. \
+             C:\\Users\\John Smith\\AppData\\Local\\...",
+            exe.display()
+        );
+        return Ok(Some(1));
+    }
     // The path is named because trust is granted to a command string that
     // contains it: run from a build directory, and the approval covers that
     // copy rather than the installed one that will actually host brigades —
@@ -154,5 +178,20 @@ mod tests {
 
         assert_eq!(code, Some(0));
         assert_eq!(runner.calls(), vec![trust_argv(&exe, &binaries)]);
+    }
+
+    #[test]
+    fn run_declines_to_launch_codex_when_the_exe_path_contains_a_space() {
+        // Approving a hook that can never fire (see `hook_command_is_launchable`'s
+        // doc) would be worse than no approval at all: the runner must never
+        // be invoked here.
+        let exe = PathBuf::from(r"C:\Program Files\banto\banto.exe");
+        let binaries = AgentBinaries::default();
+        let runner = MockProcessRunner::new(Some(0));
+
+        let code = run(&exe, &binaries, &runner).unwrap();
+
+        assert_eq!(code, Some(1));
+        assert!(runner.calls().is_empty());
     }
 }
