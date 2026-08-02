@@ -13,7 +13,7 @@
 //! - [`opener`]  opening/focusing sessions in a real terminal (psmux, WT)
 //! - [`process`] spawning the resumed session's process
 //! - [`provider`] session discovery + tolerant JSONL parsing (Claude Code) / sqlite (Codex)
-//! - [`pty`]     PTY host abstraction (portable-pty)
+//! - [`pty`]     PTY host abstraction (portable-pty-psmux)
 //! - [`sqlite_ro`] read-only access to a Codex sqlite database Codex may be actively writing
 //! - [`status`]  live-session state (the I/O half; bucketing is core's) — Claude Code only, deliberately
 //! - [`store`]   sqlite: groups/pins/archived, brigades, session<->pane map

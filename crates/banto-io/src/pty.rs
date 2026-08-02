@@ -93,8 +93,17 @@ pub trait PtyHost {
     ) -> Result<PtyIo>;
 }
 
-/// [`PtyHost`] backed by `portable-pty` (ConPTY on Windows, a Unix pty
-/// elsewhere).
+/// [`PtyHost`] backed by `portable-pty-psmux` (ConPTY on Windows, a Unix pty
+/// elsewhere) — a fork of `portable-pty`, not the crates.io original: it
+/// requests `PSEUDOCONSOLE_PASSTHROUGH_MODE` on Windows 11 22H2+ (build
+/// ≥22621), which makes ConPTY relay a child's VT bytes verbatim instead of
+/// reinterpreting them through its own legacy Win32 console buffer and
+/// re-serializing its own reconstruction. Without it, a child that reserves
+/// a footer via DECSTBM (Codex does) never gets a single line into
+/// `vt100`'s scrollback, because ConPTY's own re-serialization uses a
+/// narrow scroll region unconditionally — measured 2026-08-02 with a
+/// controlled A/B (same Codex binary, same prompt, only the PTY crate
+/// swapped): scrollback stayed 0 without this flag, reached 191 with it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PortablePtyHost;
 
