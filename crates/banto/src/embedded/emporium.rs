@@ -1041,7 +1041,6 @@ fn gather_relay_observations(
         Err(_) => return Vec::new(),
     };
     let live = read_live_sessions(&claude_home.sessions_dir());
-    let now = SystemTime::now();
     let mut observations = Vec::new();
     for member in &members {
         let Some(session_id) = member.session_id.as_ref() else {
@@ -1063,7 +1062,7 @@ fn gather_relay_observations(
                     SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
                 }),
             Some(AgentKind::Codex) => {
-                codex_home.and_then(|home| codex_activity::is_thread_idle(home, &session_id.0, now))
+                codex_home.and_then(|home| codex_activity::is_thread_idle(home, &session_id.0))
             }
             None => None,
         };
@@ -2377,37 +2376,39 @@ mod tests {
         (RefCell::new(store), state, app)
     }
 
-    fn unix_now() -> i64 {
-        SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-    }
-
-    fn write_codex_log_row(codex_home: &Path, ts: i64, thread_id: &str) {
+    /// Writes a synthetic `threads` row (`state_5.sqlite`) pointing
+    /// `thread_id` at a rollout file under `codex_home`, and writes that
+    /// rollout file with `event_msg` lines built from `markers` (each
+    /// `"task_started"` or `"task_complete"`) — the shape
+    /// `codex_activity::is_thread_idle` reads.
+    fn write_codex_rollout(codex_home: &Path, thread_id: &str, markers: &[&str]) {
         std::fs::create_dir_all(codex_home).unwrap();
-        let conn = rusqlite::Connection::open(codex_home.join("logs_2.sqlite")).unwrap();
+        let rollout_path = codex_home.join(format!("{thread_id}.jsonl"));
+        let body: String = markers
+            .iter()
+            .map(|marker| {
+                format!(r#"{{"type":"event_msg","payload":{{"type":"{marker}"}}}}"#) + "\n"
+            })
+            .collect();
+        std::fs::write(&rollout_path, body).unwrap();
+
+        let conn = rusqlite::Connection::open(codex_home.join("state_5.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE logs (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
-                ts_nanos INTEGER NOT NULL, level TEXT NOT NULL, target TEXT NOT NULL, \
-                thread_id TEXT, process_uuid TEXT\
-            )",
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
         )
         .ok(); // no-op once the table exists
         conn.execute(
-            "INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) \
-             VALUES (?1, 0, 'INFO', 'codex_core', ?2, NULL)",
-            rusqlite::params![ts, thread_id],
+            "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+            rusqlite::params![thread_id, rollout_path.to_string_lossy().to_string()],
         )
         .unwrap();
     }
 
     #[test]
-    fn a_codex_member_with_recent_log_activity_is_not_idle() {
+    fn a_codex_member_mid_turn_is_not_idle() {
         let codex_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::Codex));
-        write_codex_log_row(codex_home.path(), unix_now() - 5, "w1");
+        write_codex_rollout(codex_home.path(), "w1", &["task_started"]);
 
         let claude_home = tempfile::tempdir().unwrap();
         let observations = gather_relay_observations(
@@ -2426,14 +2427,10 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_member_quiet_past_the_threshold_is_idle() {
+    fn a_codex_member_past_task_complete_is_idle() {
         let codex_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::Codex));
-        write_codex_log_row(
-            codex_home.path(),
-            unix_now() - codex_activity::CODEX_IDLE_QUIET_PERIOD.as_secs() as i64 - 5,
-            "w1",
-        );
+        write_codex_rollout(codex_home.path(), "w1", &["task_started", "task_complete"]);
 
         let claude_home = tempfile::tempdir().unwrap();
         let observations = gather_relay_observations(
@@ -2496,10 +2493,11 @@ mod tests {
 
     #[test]
     fn a_member_whose_product_cannot_be_resolved_is_unknown_never_idle() {
-        // The Worker has a live Claude-shaped session file AND a fresh Codex
-        // log row under the same id — an adversarial case showing that
-        // without a matching `App` row, neither signal is trusted; product
-        // must come from discovery, never be inferred from what data exists.
+        // The Worker has a live Claude-shaped session file AND a Codex
+        // rollout mid-turn under the same id — an adversarial case showing
+        // that without a matching `App` row, neither signal is trusted;
+        // product must come from discovery, never be inferred from what
+        // data exists.
         let claude_home = tempfile::tempdir().unwrap();
         let codex_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", None); // no row for "w1" at all
@@ -2509,7 +2507,7 @@ mod tests {
             "w1",
             Path::new("/work"),
         );
-        write_codex_log_row(codex_home.path(), unix_now() - 1, "w1");
+        write_codex_rollout(codex_home.path(), "w1", &["task_started"]);
 
         let observations = gather_relay_observations(
             &state,
