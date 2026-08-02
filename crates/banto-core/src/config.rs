@@ -89,6 +89,61 @@ impl<'de> Deserialize<'de> for RelayMode {
     }
 }
 
+/// Which product an auto-spawned Worker runs as, relative to the Director
+/// forming the brigade — `[brigade] worker_agent` in config.toml.
+///
+/// Not yet consumed anywhere: `crate::engine::spawn_worker` still always
+/// spawns a Claude Worker (`AgentKind::ClaudeCode` is hardcoded there). This
+/// type is the config-layer half of letting a brigade's Worker be Codex too;
+/// the formation logic that reads it, and the new-session-modal-style picker
+/// [`Self::Select`] needs, land separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkerAgentSetting {
+    /// Same product as the Director. The default: an operator who never
+    /// heard of this setting keeps getting exactly what banto has always
+    /// spawned for a Claude Director, and a Codex Director's Workers follow
+    /// it symmetrically rather than silently defaulting to Claude anyway.
+    #[default]
+    Inherit,
+    /// Ask at formation time (a picker, the same axis the new-session modal
+    /// already offers for a plain session — decided in the UI layer, not
+    /// here).
+    Select,
+    /// Always Claude Code, regardless of the Director's own product.
+    Claude,
+    /// Always Codex, regardless of the Director's own product.
+    Codex,
+}
+
+impl WorkerAgentSetting {
+    /// Parses `[brigade] worker_agent`'s raw string. Case-insensitive and
+    /// whitespace-trimmed — the same leniency [`resolve_agents`] already
+    /// applies to the neighboring `agents` setting, since both name the
+    /// same product vocabulary an operator might type inconsistently — and
+    /// an unrecognized value (including a typo, or empty) falls back to
+    /// [`Self::Inherit`] rather than a parse error: this crate's config
+    /// layer never fails a load over one bad setting (`banto_io::config`'s
+    /// module doc).
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "select" => Self::Select,
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            _ => Self::Inherit,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerAgentSetting {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
+    }
+}
+
 /// Brigade formation settings (emporium mode only).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -97,12 +152,28 @@ pub struct BrigadeConfig {
     /// Clamped to 1..=8 wherever it's consumed — a raw, unclamped value here
     /// lets a config round-trip losslessly even if it's out of range.
     pub workers: u32,
-    /// `--model` passed to an auto-spawned Worker's `claude` invocation. An
-    /// empty string is the escape hatch: no `--model` flag is passed, so the
-    /// Worker inherits the operator's default model. Not validated here —
-    /// an invalid model name is `claude`'s problem, surfaced in the Worker's
-    /// own pane.
+    /// `--model` passed to an auto-spawned Claude Worker's `claude`
+    /// invocation. An empty string is the escape hatch: no `--model` flag is
+    /// passed, so the Worker inherits the operator's default model. Not
+    /// validated here — an invalid model name is `claude`'s problem,
+    /// surfaced in the Worker's own pane.
+    ///
+    /// Named without a product suffix because it predates
+    /// [`Self::worker_model_codex`] and every config.toml that already sets
+    /// it means exactly this — a Claude Worker's model — so it keeps that
+    /// name and that meaning unconditionally rather than being renamed or
+    /// repurposed into a product-agnostic default. See
+    /// [`Self::worker_model_for`] for how the two fields combine once a
+    /// brigade can have either product as Worker.
     pub worker_model: String,
+    /// `--model` an auto-spawned Codex Worker launches with — the Codex
+    /// sibling of [`Self::worker_model`], same empty-string escape hatch,
+    /// independent default (Codex and Claude Code do not share a model
+    /// namespace, so one shared field could never default sensibly for
+    /// both at once).
+    pub worker_model_codex: String,
+    /// See [`WorkerAgentSetting`].
+    pub worker_agent: WorkerAgentSetting,
     /// See [`RelayMode`].
     pub relay: RelayMode,
     /// Role briefing appended to a Director's system prompt at launch
@@ -165,6 +236,8 @@ impl Default for BrigadeConfig {
         Self {
             workers: 1,
             worker_model: "sonnet".to_string(),
+            worker_model_codex: "gpt-5.6-terra".to_string(),
+            worker_agent: WorkerAgentSetting::default(),
             relay: RelayMode::Auto,
             director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
             worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
@@ -186,6 +259,22 @@ impl BrigadeConfig {
             BrigadeRole::Worker => &self.worker_prompt,
         };
         (!template.is_empty()).then_some(template.as_str())
+    }
+
+    /// The `--model` value an auto-spawned Worker running `agent` should
+    /// launch with, or `None` for "pass no `--model` flag at all" (either
+    /// product's own empty-string escape hatch). Not called anywhere yet —
+    /// `crate::engine`'s `spawn_worker` still reads [`Self::worker_model`]
+    /// directly, unconditionally, until the Worker-agent-selection feature
+    /// lands there; this exists so that wiring has one obvious, already-
+    /// tested place for the per-product choice instead of reinventing it
+    /// inline.
+    pub fn worker_model_for(&self, agent: AgentKind) -> Option<&str> {
+        let raw = match agent {
+            AgentKind::ClaudeCode => &self.worker_model,
+            AgentKind::Codex => &self.worker_model_codex,
+        };
+        (!raw.is_empty()).then_some(raw.as_str())
     }
 }
 
@@ -358,6 +447,8 @@ mod tests {
         assert_eq!(config.activity.week_days, 7);
         assert_eq!(config.brigade.workers, 1);
         assert_eq!(config.brigade.worker_model, "sonnet");
+        assert_eq!(config.brigade.worker_model_codex, "gpt-5.6-terra");
+        assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
         assert_eq!(config.brigade.relay, RelayMode::Auto);
         assert_eq!(config.keys.prefix, "C-b");
         assert_eq!(config.agents, "");
@@ -384,6 +475,8 @@ mod tests {
         assert_eq!(config.brigade.workers, 3);
         assert_eq!(config.brigade.worker_count(), 3);
         assert_eq!(config.brigade.worker_model, "sonnet");
+        assert_eq!(config.brigade.worker_model_codex, "gpt-5.6-terra");
+        assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
         assert_eq!(config.brigade.relay, RelayMode::Auto);
     }
 
@@ -412,6 +505,104 @@ mod tests {
     fn brigade_worker_model_empty_string_is_the_inherit_default_escape_hatch() {
         let config = parse("[brigade]\nworker_model = \"\"\n");
         assert_eq!(config.brigade.worker_model, "");
+    }
+
+    #[test]
+    fn an_existing_config_toml_setting_only_worker_model_is_unaffected_by_the_codex_split() {
+        // A file written before `worker_model_codex`/`worker_agent` existed
+        // must keep meaning exactly what it always meant: this Worker's
+        // model, full stop, with the Codex field and the new-setting field
+        // both silently taking their own defaults.
+        let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
+        assert_eq!(config.brigade.worker_model, "sonnet");
+        assert_eq!(config.brigade.worker_model_codex, "gpt-5.6-terra");
+        assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
+    }
+
+    #[test]
+    fn worker_model_codex_defaults_independently_of_worker_model() {
+        let config = parse("[brigade]\nworker_model = \"opus\"\n");
+        assert_eq!(config.brigade.worker_model, "opus");
+        assert_eq!(
+            config.brigade.worker_model_codex, "gpt-5.6-terra",
+            "an override for the Claude field must not leak into the Codex one"
+        );
+    }
+
+    #[test]
+    fn brigade_worker_model_codex_parses_and_has_its_own_empty_escape_hatch() {
+        let overridden = parse("[brigade]\nworker_model_codex = \"gpt-5-mini\"\n");
+        assert_eq!(overridden.brigade.worker_model_codex, "gpt-5-mini");
+
+        let cleared = parse("[brigade]\nworker_model_codex = \"\"\n");
+        assert_eq!(cleared.brigade.worker_model_codex, "");
+    }
+
+    #[test]
+    fn worker_model_for_reads_the_matching_products_field_and_honors_both_escape_hatches() {
+        let brigade = BrigadeConfig {
+            worker_model: "opus".to_string(),
+            worker_model_codex: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            brigade.worker_model_for(AgentKind::ClaudeCode),
+            Some("opus")
+        );
+        assert_eq!(
+            brigade.worker_model_for(AgentKind::Codex),
+            None,
+            "an empty worker_model_codex means no --model flag, same escape \
+             hatch as worker_model"
+        );
+    }
+
+    #[test]
+    fn worker_model_for_uses_each_products_own_default_when_unset() {
+        let brigade = BrigadeConfig::default();
+        assert_eq!(
+            brigade.worker_model_for(AgentKind::ClaudeCode),
+            Some("sonnet")
+        );
+        assert_eq!(
+            brigade.worker_model_for(AgentKind::Codex),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    // -- WorkerAgentSetting ----------------------------------------------
+
+    #[test]
+    fn worker_agent_defaults_to_inherit() {
+        assert_eq!(WorkerAgentSetting::default(), WorkerAgentSetting::Inherit);
+        assert_eq!(WorkerAgentSetting::parse(""), WorkerAgentSetting::Inherit);
+    }
+
+    #[test]
+    fn worker_agent_every_known_value_parses() {
+        for (text, expected) in [
+            ("inherit", WorkerAgentSetting::Inherit),
+            ("select", WorkerAgentSetting::Select),
+            ("claude", WorkerAgentSetting::Claude),
+            ("codex", WorkerAgentSetting::Codex),
+        ] {
+            assert_eq!(WorkerAgentSetting::parse(text), expected);
+            let config = parse(&format!("[brigade]\nworker_agent = \"{text}\"\n"));
+            assert_eq!(config.brigade.worker_agent, expected);
+        }
+    }
+
+    #[test]
+    fn worker_agent_is_case_insensitive_and_trims_whitespace() {
+        for text in ["Codex", "CODEX", "  codex  "] {
+            assert_eq!(WorkerAgentSetting::parse(text), WorkerAgentSetting::Codex);
+        }
+    }
+
+    #[test]
+    fn worker_agent_unknown_value_falls_back_to_inherit() {
+        let config = parse("[brigade]\nworker_agent = \"made-up-product\"\n");
+        assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
     }
 
     #[test]
