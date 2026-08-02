@@ -1807,14 +1807,26 @@ fn add_worker(state: &mut EmporiumState, app: &App, _brigade: &BrigadeConfig) ->
     vec![Cmd::Store(StoreIntent::AddWorker { brigade_id, cwd })]
 }
 
+/// Lines [`update_mouse`] scrolls a pane's own scrollback per wheel notch —
+/// tmux's own long-standing convention, chosen so a habit already
+/// muscle-memorized elsewhere carries over here.
+const SCROLL_NOTCH_LINES: isize = 3;
+
 /// Dispatch one mouse event: sidebar click/scroll, or — over a pane — focus
 /// it (`Down(Left)` always moves focus, regardless of whether it wants
-/// mouse) and forward the event as an SGR report, but only when the focused
-/// pane's own child asked for mouse reporting in that encoding (see
+/// mouse), then either forward the event as an SGR report or, for the
+/// wheel specifically, consume it into that pane's own scrollback — the
+/// choice in both cases keyed on whether the focused pane's child asked
+/// for mouse reporting in the one encoding banto speaks (see
 /// [`crate::screen::Screen::wants_sgr_mouse`]): a child that never enabled
 /// mouse reporting has no idea what to do with an SGR sequence arriving on
 /// its stdin, so forwarding unconditionally would just leak noise into
-/// whatever it's actually reading.
+/// whatever it's actually reading — and it has no scrollback of its own to
+/// receive the wheel as input either. A child that *does* want mouse gets
+/// every event forwarded exactly as before, wheel included: it can already
+/// implement its own scrollback (Claude Code does), and forwarding both
+/// keeps that working and never fights it over whose scroll position is
+/// authoritative.
 ///
 /// The host terminal's own mouse capture used to track this same
 /// wants-mouse check, releasing itself over a pane that didn't want
@@ -1857,14 +1869,28 @@ fn update_mouse(
         }
         if state.focus == Focus::Pane
             && let Some((key, rect)) = hit
-            && state
+        {
+            if state
                 .screens
                 .get(&key)
                 .is_some_and(crate::screen::Screen::wants_sgr_mouse)
-            && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect))
-        {
-            state.last_forwarded_input = Some(now);
-            return vec![Cmd::WritePty { key, bytes }];
+            {
+                if let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect)) {
+                    state.last_forwarded_input = Some(now);
+                    return vec![Cmd::WritePty { key, bytes }];
+                }
+            } else {
+                let notch_delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => Some(SCROLL_NOTCH_LINES),
+                    MouseEventKind::ScrollDown => Some(-SCROLL_NOTCH_LINES),
+                    _ => None,
+                };
+                if let Some(delta) = notch_delta
+                    && let Some(screen) = state.screens.get_mut(&key)
+                {
+                    screen.scroll(delta);
+                }
+            }
         }
         return Vec::new();
     }
@@ -3664,6 +3690,87 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| matches!(c, Cmd::WritePty { .. })),
             "a non-SGR encoding must not be sent SGR bytes: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn wheel_over_a_pane_that_does_not_want_sgr_mouse_scrolls_its_own_scrollback() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        // No mouse mode enabled at all, so this pane never asked for SGR —
+        // enough output written first that there's real scrollback to move
+        // into.
+        for i in 0..50 {
+            screen.process(format!("line{i}\r\n").as_bytes());
+        }
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..click_inside_pane(&state)
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "scrolling a pane's own scrollback is pure state, no Cmd needed: {cmds:?}"
+        );
+        assert_eq!(state.screens.get(&key).unwrap().scrollback(), 3);
+    }
+
+    #[test]
+    fn wheel_over_a_pane_that_wants_sgr_mouse_is_forwarded_not_consumed() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1003h\x1b[?1006h"); // any-motion mode, SGR encoding
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..click_inside_pane(&state)
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        match cmds.as_slice() {
+            [
+                Cmd::WritePty {
+                    key: got_key,
+                    bytes,
+                },
+            ] => {
+                assert_eq!(got_key, &key);
+                assert_eq!(bytes, b"\x1b[<64;1;1M");
+            }
+            other => panic!("expected exactly one WritePty, got {other:?}"),
+        }
+        assert_eq!(
+            state.screens.get(&key).unwrap().scrollback(),
+            0,
+            "a child that wants mouse handles its own scrollback; banto must not also consume the wheel"
         );
     }
 

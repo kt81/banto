@@ -1308,7 +1308,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
             frame.render_widget(Paragraph::new(screen_to_text(screen.screen())), content);
-            if focused_tile && !screen.screen().hide_cursor() {
+            // `cursor_position()` is always the *live* cursor, never
+            // adjusted for scrollback (`Screen::scroll`'s own doc) — drawn
+            // while scrolled back, it would sit on top of whatever
+            // historical text happens to be at that row, implying "you can
+            // type here" over content that isn't live at all.
+            if focused_tile && screen.scrollback() == 0 && !screen.screen().hide_cursor() {
                 let (cursor_row, cursor_col) = screen.screen().cursor_position();
                 let (x, y) = (content.x + cursor_col, content.y + cursor_row);
                 if x < content.x + content.width && y < content.y + content.height {
