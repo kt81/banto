@@ -136,6 +136,13 @@ pub enum Modal {
         /// (`B`), and a solo pane has no brigade to dismiss from at all.
         worker_choice: Option<KillChoice>,
     },
+    /// The emporium's formation-time picker for `[brigade] worker_agent =
+    /// "select"`: choose which product this brigade's *Workers* (not the
+    /// Director — that's already whatever session was promoted) will run
+    /// as, and their `--model`, before any of them spawn. The chōba never
+    /// opens this either, for the same reason as `ConfirmDisband`/
+    /// `ConfirmKill` — it has no brigade-formation path of its own.
+    WorkerAgentPicker(WorkerAgentPickerState),
 }
 
 /// The two choices in a Worker's prefix-`x` kill confirm dialog (see
@@ -503,6 +510,110 @@ impl NewSessionState {
     }
 }
 
+/// State for [`Modal::WorkerAgentPicker`]: an [`AgentKind`] toggle (same
+/// binding and vocabulary as [`NewSessionState::agent`]) plus a free-text
+/// `--model` input for whichever product is currently selected.
+///
+/// Unlike [`NewSessionState`], there's no candidate list to pick from — a
+/// model name isn't drawn from a set of previously seen values the way a
+/// cwd is — so this only ever has the one text field, always in scope
+/// (no [`Modal::ConfirmArchive`]-style "no text input" case to gate on).
+pub struct WorkerAgentPickerState {
+    agent: AgentKind,
+    model_input: String,
+    /// Char-index position of the text cursor within `model_input`
+    /// (0..=its char length); see [`Self::push_char`]/[`Self::move_cursor_left`]
+    /// etc. — same convention as every other modal's text field.
+    cursor: usize,
+    /// This brigade's own configured `--model` default for each product
+    /// (`worker_model`/`worker_model_codex`), captured once at construction
+    /// so [`Self::toggle_agent`] can re-seed `model_input` without needing
+    /// the config again.
+    claude_default_model: String,
+    codex_default_model: String,
+}
+
+impl WorkerAgentPickerState {
+    fn new(agent: AgentKind, claude_default_model: String, codex_default_model: String) -> Self {
+        let model_input = match agent {
+            AgentKind::ClaudeCode => claude_default_model.clone(),
+            AgentKind::Codex => codex_default_model.clone(),
+        };
+        let cursor = char_len(&model_input);
+        Self {
+            agent,
+            model_input,
+            cursor,
+            claude_default_model,
+            codex_default_model,
+        }
+    }
+
+    /// Which product confirming would spawn every fresh Worker as.
+    pub fn agent(&self) -> AgentKind {
+        self.agent
+    }
+
+    /// The `--model` value confirming would use (empty means "pass no
+    /// `--model` flag at all", the same escape hatch `worker_model`/
+    /// `worker_model_codex` already have in config.toml).
+    pub fn model_input(&self) -> &str {
+        &self.model_input
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Switch product and re-seed [`Self::model_input`] from *that*
+    /// product's own configured default, discarding whatever was typed for
+    /// the one just left: Claude and Codex share no model namespace, so
+    /// carrying an edit across the toggle would show a stale, wrong-shaped
+    /// string for the newly selected product rather than a clean default to
+    /// start editing from again.
+    fn toggle_agent(&mut self) {
+        self.agent = self.agent.toggle();
+        self.model_input = match self.agent {
+            AgentKind::ClaudeCode => self.claude_default_model.clone(),
+            AgentKind::Codex => self.codex_default_model.clone(),
+        };
+        self.cursor = char_len(&self.model_input);
+    }
+
+    fn push_char(&mut self, c: char) {
+        insert_at_cursor(&mut self.model_input, self.cursor, c);
+        self.cursor += 1;
+    }
+
+    // Same as GroupJoinState::backspace/delete_forward, minus the refilter
+    // (nothing to filter here).
+    fn backspace(&mut self) {
+        if remove_before_cursor(&mut self.model_input, self.cursor) {
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        remove_at_cursor(&mut self.model_input, self.cursor);
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(char_len(&self.model_input));
+    }
+
+    fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_cursor_end(&mut self) {
+        self.cursor = char_len(&self.model_input);
+    }
+}
+
 /// Distinct cwd strings across `rows`, most-recently-used first (rows are
 /// already mtime-descending, so keeping the first occurrence of each
 /// preserves that order). Rows with no known cwd are skipped.
@@ -748,21 +859,23 @@ impl App {
 
     /// Whether typed characters are currently being accepted as text:
     /// [`Mode::Search`], or a modal with a text field ([`Modal::NewSession`]/
-    /// [`Modal::GroupJoin`]). `false` for a confirm-only modal
-    /// (`ConfirmArchive`/`ConfirmDisband`/`ConfirmKill`) — those ignore
-    /// [`Self::push_char`]/[`Self::modal_push_char`] entirely. Named for its
-    /// one consumer so far, the emporium's paste accumulator
-    /// (`paste_accum::is_in_scope`, see its doc for why a confirm-only
-    /// modal's y/n/Enter keys must stay out of scope), which widens paste
-    /// synthesis to exactly this set of contexts on top of a focused pane,
-    /// without teaching the shell about modal variants.
+    /// [`Modal::GroupJoin`]/[`Modal::WorkerAgentPicker`]). `false` for a
+    /// confirm-only modal (`ConfirmArchive`/`ConfirmDisband`/`ConfirmKill`)
+    /// — those ignore [`Self::push_char`]/[`Self::modal_push_char`]
+    /// entirely. Named for its one consumer so far, the emporium's paste
+    /// accumulator (`paste_accum::is_in_scope`, see its doc for why a
+    /// confirm-only modal's y/n/Enter keys must stay out of scope), which
+    /// widens paste synthesis to exactly this set of contexts on top of a
+    /// focused pane, without teaching the shell about modal variants.
     pub fn accepts_text_input(&self) -> bool {
         if self.mode == Mode::Search {
             return true;
         }
         matches!(
             self.modal,
-            Some(Modal::NewSession(_)) | Some(Modal::GroupJoin(_))
+            Some(Modal::NewSession(_))
+                | Some(Modal::GroupJoin(_))
+                | Some(Modal::WorkerAgentPicker(_))
         )
     }
 
@@ -827,6 +940,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.push_char(c),
             Some(Modal::GroupJoin(state)) => state.push_char(c),
+            Some(Modal::WorkerAgentPicker(state)) => state.push_char(c),
             Some(Modal::ConfirmArchive { .. })
             | Some(Modal::ConfirmDisband { .. })
             | Some(Modal::ConfirmKill { .. })
@@ -841,6 +955,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.backspace(),
             Some(Modal::GroupJoin(state)) => state.backspace(),
+            Some(Modal::WorkerAgentPicker(state)) => state.backspace(),
             _ => {}
         }
     }
@@ -852,6 +967,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.delete_forward(),
             Some(Modal::GroupJoin(state)) => state.delete_forward(),
+            Some(Modal::WorkerAgentPicker(state)) => state.delete_forward(),
             _ => {}
         }
     }
@@ -862,6 +978,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_left(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_left(),
+            Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_left(),
             _ => {}
         }
     }
@@ -872,6 +989,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_right(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_right(),
+            Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_right(),
             _ => {}
         }
     }
@@ -882,6 +1000,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_home(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_home(),
+            Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_home(),
             _ => {}
         }
     }
@@ -892,6 +1011,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_end(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_end(),
+            Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_end(),
             _ => {}
         }
     }
@@ -957,12 +1077,15 @@ impl App {
         }
     }
 
-    /// Toggle the open new-session modal's agent choice (the emporium's own
-    /// binding — see [`NewSessionState::agent`]'s doc for why the chōba has
-    /// none). No-op when no such modal is open.
-    pub fn modal_toggle_new_session_agent(&mut self) {
-        if let Some(Modal::NewSession(state)) = &mut self.modal {
-            state.toggle_agent();
+    /// Toggle the open modal's agent choice ([`Modal::NewSession`] or
+    /// [`Modal::WorkerAgentPicker`] — the emporium's own binding on both,
+    /// see [`NewSessionState::agent`]'s doc for why the chōba has neither).
+    /// No-op for every other modal kind.
+    pub fn modal_toggle_agent(&mut self) {
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.toggle_agent(),
+            Some(Modal::WorkerAgentPicker(state)) => state.toggle_agent(),
+            _ => {}
         }
     }
 
@@ -1355,6 +1478,26 @@ impl App {
             title,
             worker_choice: is_worker.then_some(KillChoice::ClosePane),
         });
+    }
+
+    /// Open the emporium's formation-time Worker-agent picker (bound where
+    /// brigade formation would otherwise proceed directly, when `[brigade]
+    /// worker_agent = "select"`). `initial_agent` seeds the toggle — the
+    /// Director's own product, the same starting point `Inherit` would
+    /// resolve to; `claude_default_model`/`codex_default_model` seed the
+    /// editable model text for whichever product ends up selected
+    /// (`worker_model`/`worker_model_codex` from config.toml).
+    pub fn open_worker_agent_modal(
+        &mut self,
+        initial_agent: AgentKind,
+        claude_default_model: String,
+        codex_default_model: String,
+    ) {
+        self.modal = Some(Modal::WorkerAgentPicker(WorkerAgentPickerState::new(
+            initial_agent,
+            claude_default_model,
+            codex_default_model,
+        )));
     }
 
     /// Toggle the pinned state of the selected session (no-op when nothing
@@ -2904,10 +3047,10 @@ mod tests {
 
         assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
 
-        app.modal_toggle_new_session_agent();
+        app.modal_toggle_agent();
         assert_eq!(app.modal_new_session_agent(), AgentKind::Codex);
 
-        app.modal_toggle_new_session_agent();
+        app.modal_toggle_agent();
         assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
     }
 
@@ -2918,13 +3061,81 @@ mod tests {
     }
 
     #[test]
-    fn modal_toggle_new_session_agent_is_a_noop_for_a_different_modal() {
+    fn modal_toggle_agent_is_a_noop_for_a_confirm_only_modal() {
         let mut app = App::new(vec![row("1", "one", "/a")]);
         app.set_viewport_height(10);
         app.open_confirm_archive_modal();
 
-        app.modal_toggle_new_session_agent(); // no new-session modal open
+        app.modal_toggle_agent(); // no text-input modal open
         assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
+    }
+
+    #[test]
+    fn worker_agent_picker_seeds_and_toggle_reseeds_the_model_from_each_products_own_default() {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected the worker-agent picker to be open");
+        };
+        assert_eq!(state.agent(), AgentKind::ClaudeCode);
+        assert_eq!(state.model_input(), "sonnet");
+
+        app.modal_toggle_agent();
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected the worker-agent picker to still be open");
+        };
+        assert_eq!(state.agent(), AgentKind::Codex);
+        assert_eq!(state.model_input(), "gpt-5.6-terra");
+
+        app.modal_toggle_agent();
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected the worker-agent picker to still be open");
+        };
+        assert_eq!(state.agent(), AgentKind::ClaudeCode);
+        assert_eq!(state.model_input(), "sonnet");
+    }
+
+    #[test]
+    fn worker_agent_picker_toggle_discards_an_edit_made_under_the_previous_product() {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_push_char('!'); // edit while Claude is selected
+
+        app.modal_toggle_agent(); // switch to Codex
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected the worker-agent picker to be open");
+        };
+        assert_eq!(
+            state.model_input(),
+            "gpt-5.6-terra",
+            "the Claude-side edit must not leak into Codex's own default"
+        );
+    }
+
+    #[test]
+    fn worker_agent_picker_text_editing_moves_the_cursor_and_edits_in_place() {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(AgentKind::Codex, String::new(), "gpt".to_string());
+        let cursor = |app: &App| match app.modal() {
+            Some(Modal::WorkerAgentPicker(state)) => state.cursor(),
+            _ => panic!("expected the worker-agent picker to be open"),
+        };
+        assert_eq!(cursor(&app), 3); // cursor starts at the end of the seeded "gpt"
+
+        app.modal_cursor_left();
+        app.modal_push_char('X');
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected the worker-agent picker to be open");
+        };
+        assert_eq!(state.model_input(), "gpXt");
     }
 
     #[test]

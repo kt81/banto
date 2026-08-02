@@ -14,7 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use banto_core::app::{GroupJoinState, KillChoice, Modal, NewSessionPlacement, NewSessionState};
+use banto_core::app::{
+    GroupJoinState, KillChoice, Modal, NewSessionPlacement, NewSessionState, WorkerAgentPickerState,
+};
 
 use crate::text::truncate_to_width;
 
@@ -159,12 +161,14 @@ pub fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 /// there is nothing to blank behind it — the one-column widen is solely to
 /// neutralize a background full-width character straddling the border
 /// itself (see [`modal_clear_area`]).
-/// `agent_choice`: whether the host binds a key to
-/// `App::modal_toggle_new_session_agent` (the emporium does; the chōba
-/// doesn't — its new-session path is feature-frozen, see
-/// `banto::opener::new_session_wrap_argv`'s doc). Only
+/// `agent_choice`: whether the host binds a key to `App::modal_toggle_agent`
+/// (the emporium does; the chōba doesn't — its new-session path is
+/// feature-frozen, see `banto::opener::new_session_wrap_argv`'s doc). Only
 /// [`render_new_session_modal`] reads it, to decide whether to advertise a
-/// key the host wouldn't actually honor.
+/// key the host wouldn't actually honor — `Modal::WorkerAgentPicker` has no
+/// equivalent parameter because it's never opened anywhere the toggle
+/// wouldn't work in the first place (the chōba has no brigade-formation
+/// path to open it from at all).
 pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_choice: bool) {
     let area = modal_area(full_area);
     frame.render_widget(Clear, modal_clear_area(full_area));
@@ -178,6 +182,7 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_cho
             worker_choice,
             ..
         } => render_confirm_kill_modal(frame, title, *worker_choice, area),
+        Modal::WorkerAgentPicker(state) => render_worker_agent_picker_modal(frame, state, area),
     }
 }
 
@@ -259,6 +264,45 @@ fn render_new_session_modal(
     let mut list_state = ListState::default();
     list_state.select(state.selected());
     frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+/// Render the emporium's formation-time Worker-agent picker
+/// (`[brigade] worker_agent = "select"`): a title naming the currently
+/// selected product (same convention as the new-session modal's own title),
+/// and a one-line, editable `--model` input below it, seeded from that
+/// product's own configured default. No candidate list — a model name isn't
+/// drawn from a set of previously seen values the way a cwd is — and no
+/// `agent_choice` parameter either: unlike the new-session modal, this one
+/// is never opened anywhere Shift-Tab wouldn't actually work (the chōba has
+/// no brigade-formation path to open it from at all).
+fn render_worker_agent_picker_modal(frame: &mut Frame, state: &WorkerAgentPickerState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            " Brigade Workers \u{2014} {} ",
+            state.agent().label()
+        ))
+        .title_bottom(" Enter form  Shift-Tab agent  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let [label_area, input_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+
+    frame.render_widget(
+        Paragraph::new("Model (blank passes no --model flag):")
+            .style(Style::default().fg(Color::DarkGray)),
+        label_area,
+    );
+
+    let (visible_input, cursor_col) =
+        windowed_view(state.model_input(), state.cursor(), input_area.width);
+    frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
+    if input_area.width > 0 {
+        let cursor_x = (input_area.x + cursor_col).min(input_area.x + input_area.width - 1);
+        frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    }
 }
 
 /// Render the `d` archive confirm dialog: a one-line yes/no prompt naming
@@ -455,6 +499,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use banto_core::app::App;
+    use banto_core::model::AgentKind;
 
     use super::*;
 
@@ -666,6 +711,35 @@ mod tests {
         assert!(
             text.contains("Claude"),
             "expected the default agent named in the title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn worker_agent_picker_modal_names_the_agent_and_shows_its_seeded_model() {
+        let mut app = App::new(Vec::new());
+        app.open_worker_agent_modal(
+            AgentKind::Codex,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected an open worker-agent picker modal");
+        };
+
+        let area = Rect::new(2, 2, 50, 10);
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render_worker_agent_picker_modal(frame, state, area))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            text.contains("Codex"),
+            "expected the selected agent named in the title:\n{text}"
+        );
+        assert!(
+            text.contains("gpt-5.6-terra"),
+            "expected Codex's own seeded model in the input:\n{text}"
         );
     }
 

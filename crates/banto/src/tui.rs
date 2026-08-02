@@ -818,15 +818,19 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 }
 
 /// Confirm whichever modal is open, dispatching to its kind-specific logic.
-/// `ConfirmDisband`/`ConfirmKill` are the emporium's own modals — the chōba
-/// never opens either, so confirming them here is a no-op (Esc still
-/// closes it, via the shared `close_modal` in [`handle_modal_key`]).
+/// `ConfirmDisband`/`ConfirmKill`/`WorkerAgentPicker` are the emporium's own
+/// modals — the chōba never opens any of them (it has no brigade-formation
+/// path of its own), so confirming them here is a no-op (Esc still closes
+/// it, via the shared `close_modal` in [`handle_modal_key`]).
 fn confirm_modal(app: &mut App, ctx: &Context) {
     match app.modal() {
         Some(Modal::NewSession(_)) => confirm_new_session_modal(app, ctx),
         Some(Modal::ConfirmArchive { .. }) => confirm_archive_modal(app, ctx),
         Some(Modal::GroupJoin(_)) => confirm_group_join_modal(app, ctx),
-        Some(Modal::ConfirmDisband { .. }) | Some(Modal::ConfirmKill { .. }) | None => {}
+        Some(Modal::ConfirmDisband { .. })
+        | Some(Modal::ConfirmKill { .. })
+        | Some(Modal::WorkerAgentPicker(_))
+        | None => {}
     }
 }
 
@@ -870,9 +874,9 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 // choice: the chōba is feature-frozen (out of scope, not an
                 // oversight — see `opener::new_session_wrap_argv`'s doc for
                 // the split placement's identical reasoning), and its key
-                // dispatch never binds anything to
-                // `App::modal_toggle_new_session_agent`, so `state.agent()`
-                // can never actually be anything but the default here.
+                // dispatch never binds anything to `App::modal_toggle_agent`,
+                // so `state.agent()` can never actually be anything but the
+                // default here.
                 argv: opener::inplace_argv(AgentKind::ClaudeCode, None, &cwd, &ctx.agent_binaries),
                 startup_message: opener::new_session_startup_message(&cwd),
                 cwd,
@@ -1760,8 +1764,8 @@ fn render(frame: &mut Frame, app: &App, now: SystemTime) {
     view::render_summary(frame, app, summary_area, now);
     render_status(frame, app, status_area);
     if let Some(modal) = app.modal() {
-        // `false`: the chōba binds no key to `App::modal_toggle_new_session_agent`
-        // (its new-session path is feature-frozen) — see `render_modal`'s doc.
+        // `false`: the chōba binds no key to `App::modal_toggle_agent` (its
+        // new-session path is feature-frozen) — see `render_modal`'s doc.
         render_modal(frame, modal, frame.area(), false);
     }
 }

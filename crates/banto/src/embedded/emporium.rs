@@ -774,20 +774,31 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             name,
             cwd,
             worker_count,
+            worker_agent,
+            worker_model,
         } => {
             let result = form_brigade_store(store, &director_row_id, &name, worker_count);
             vec![Event::BrigadeFormed {
                 director_row_id,
                 name,
                 cwd,
+                worker_agent,
+                worker_model,
                 result,
             }]
         }
-        StoreIntent::AddWorker { brigade_id, cwd } => {
+        StoreIntent::AddWorker {
+            brigade_id,
+            cwd,
+            worker_agent,
+            worker_model,
+        } => {
             let result = add_worker_store(store, brigade_id);
             vec![Event::WorkerAdded {
                 brigade_id,
                 cwd,
+                worker_agent,
+                worker_model,
                 result,
             }]
         }
@@ -1416,9 +1427,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
     );
 
     if let Some(modal) = app.modal() {
-        // `true`: the emporium binds Shift-Tab to
-        // `App::modal_toggle_new_session_agent` (see
-        // `engine::update_modal_key`) — see `render_modal`'s doc.
+        // `true`: the emporium binds Shift-Tab to `App::modal_toggle_agent`
+        // (see `engine::update_modal_key`) — see `render_modal`'s doc.
         banto_tui::render_modal::render_modal(frame, modal, full_area, true);
     }
 }

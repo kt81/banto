@@ -26,7 +26,7 @@ use ratatui_core::layout::{Constraint, Layout, Position, Rect};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, KillChoice, Modal, Mode};
-use crate::config::{BrigadeConfig, RelayMode};
+use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -434,6 +434,15 @@ enum PendingOpen {
         brigade_id: BrigadeId,
         worker_tokens: Vec<MemberToken>,
         cwd: PathBuf,
+        /// Resolved once at `StoreIntent::FormBrigade`'s own press-time
+        /// moment (see its doc) and carried this whole way so opening each
+        /// Worker, once the Director's own spawn succeeds, never has to
+        /// re-derive it from `app`.
+        worker_agent: AgentKind,
+        /// Same reasoning as `worker_agent` — carried through so
+        /// `update_spawned` never needs `&BrigadeConfig` just to look this
+        /// up again.
+        worker_model: String,
     },
     /// One member (Director or Worker) of a brigade whose `Stage` already
     /// exists (or is being built alongside this open): on success, append
@@ -468,6 +477,21 @@ enum PendingMembership {
     DismissWorker,
 }
 
+/// A brigade formation waiting on `Modal::WorkerAgentPicker` to say which
+/// product (and model) its Workers will run as — everything `FormBrigade`
+/// needs *except* that, stashed here the moment the modal opens (see
+/// `update_membership_resolved`'s `Select` branch) and consumed by
+/// [`confirm_worker_agent_modal`] once the operator confirms. Cleared on
+/// Esc too (`update_modal_key`), so a cancelled picker can never leave a
+/// stale formation for some later, unrelated confirm to pick up by
+/// accident.
+struct PendingBrigadeFormation {
+    director_row_id: String,
+    name: String,
+    cwd: PathBuf,
+    worker_count: usize,
+}
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -499,6 +523,7 @@ pub struct EmporiumState {
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
+    pending_brigade_formation: Option<PendingBrigadeFormation>,
     /// The Worker pane a confirmed prefix-`x` dismiss is about to remove,
     /// stashed at confirm time (`confirm_kill_modal`) — regardless of
     /// whether `StoreIntent::DismissWorker` was built immediately (a
@@ -539,6 +564,7 @@ impl EmporiumState {
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
             pending_membership: None,
+            pending_brigade_formation: None,
             pending_dismiss: None,
             size: (0, 0),
             prefix,
@@ -848,10 +874,34 @@ pub enum StoreIntent {
         name: String,
         cwd: PathBuf,
         worker_count: usize,
+        /// Resolved once, at the press-time moment the Director's own row
+        /// (and therefore its product) is known — see [`resolve_worker_agent`]
+        /// — and carried through this whole round trip the same way `cwd`
+        /// already is, rather than re-resolved later from a `[brigade]`
+        /// setting that could theoretically have changed mid-flight.
+        /// `[brigade] worker_agent = "select"` resolves here to whatever the
+        /// operator chose in `Modal::WorkerAgentPicker`, not `Inherit`'s
+        /// value — see `confirm_worker_agent_modal`.
+        worker_agent: AgentKind,
+        /// The `--model` every fresh Worker this formation spawns launches
+        /// with, empty meaning "no `--model` flag at all" — resolved
+        /// alongside `worker_agent`, from `BrigadeConfig::worker_model_for`
+        /// or (the `Select` picker) the operator's own edited text, so
+        /// nothing downstream needs `&BrigadeConfig` just to look this up
+        /// again.
+        worker_model: String,
     },
     AddWorker {
         brigade_id: BrigadeId,
         cwd: PathBuf,
+        /// Same reasoning as `FormBrigade`'s own `worker_agent`: resolved
+        /// once, at the `B`-press moment, in [`add_worker`]. `add_worker`
+        /// has no `Select`-modal path of its own (out of this round's
+        /// scope — see its own doc), so this is always
+        /// `BrigadeConfig::worker_model_for`'s answer.
+        worker_agent: AgentKind,
+        /// Same reasoning as `FormBrigade`'s own `worker_model`.
+        worker_model: String,
     },
     Disband {
         brigade_id: BrigadeId,
@@ -1028,11 +1078,23 @@ pub enum Event {
         director_row_id: String,
         name: String,
         cwd: PathBuf,
+        /// Echoed straight through from `StoreIntent::FormBrigade` — see
+        /// its own doc.
+        worker_agent: AgentKind,
+        /// Echoed straight through from `StoreIntent::FormBrigade` — see
+        /// its own doc.
+        worker_model: String,
         result: Result<(BrigadeId, Vec<MemberToken>), String>,
     },
     WorkerAdded {
         brigade_id: BrigadeId,
         cwd: PathBuf,
+        /// Echoed straight through from `StoreIntent::AddWorker` — see its
+        /// own doc.
+        worker_agent: AgentKind,
+        /// Echoed straight through from `StoreIntent::AddWorker` — see its
+        /// own doc.
+        worker_model: String,
         result: Result<MemberToken, String>,
     },
     Disbanded {
@@ -1099,7 +1161,7 @@ pub fn update(
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
-        Event::Spawned { key } => update_spawned(state, brigade, key, now),
+        Event::Spawned { key } => update_spawned(state, key, now),
         Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
             rows,
@@ -1152,13 +1214,37 @@ pub fn update(
             director_row_id,
             name,
             cwd,
+            worker_agent,
+            worker_model,
             result,
-        } => update_brigade_formed(state, app, director_row_id, name, cwd, result, now),
+        } => update_brigade_formed(
+            state,
+            app,
+            FormedBrigade {
+                director_row_id,
+                name,
+                cwd,
+                worker_agent,
+                worker_model,
+            },
+            result,
+            now,
+        ),
         Event::WorkerAdded {
             brigade_id,
             cwd,
+            worker_agent,
+            worker_model,
             result,
-        } => update_worker_added(state, brigade_id, cwd, result, now),
+        } => update_worker_added(
+            state,
+            brigade_id,
+            cwd,
+            worker_agent,
+            worker_model,
+            result,
+            now,
+        ),
         Event::Disbanded { brigade_id, result } => {
             update_disbanded(state, app, brigade_id, result, now)
         }
@@ -1464,6 +1550,13 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
     match code {
         KeyCode::Esc => {
             app.close_modal();
+            // Unconditional, not gated on which modal was open: cancelling
+            // the Worker-agent picker must cancel the formation it was
+            // interrupting too — a brigade forming anyway with whatever
+            // product happened to be selected is a far worse outcome than
+            // clearing a stash that was already `None` for every other
+            // modal kind.
+            state.pending_brigade_formation = None;
             Vec::new()
         }
         KeyCode::Up => {
@@ -1494,11 +1587,12 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
             app.modal_complete_candidate();
             Vec::new()
         }
-        // New-session modal only (see `App::modal_toggle_new_session_agent`'s
-        // doc for why the chōba has no equivalent binding); a no-op for
-        // every other modal kind, same as `modal_complete_candidate` above.
+        // New-session and Worker-agent-picker modals only (see
+        // `App::modal_toggle_agent`'s doc for why the chōba binds neither);
+        // a no-op for every other modal kind, same as
+        // `modal_complete_candidate` above.
         KeyCode::BackTab => {
-            app.modal_toggle_new_session_agent();
+            app.modal_toggle_agent();
             Vec::new()
         }
         KeyCode::Backspace => {
@@ -1525,6 +1619,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         New,
         Disband,
         Kill,
+        WorkerAgent,
     }
     let kind = match app.modal() {
         Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
@@ -1532,6 +1627,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Modal::NewSession(_)) => Some(Kind::New),
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
+        Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
         None => None,
     };
     match kind {
@@ -1540,8 +1636,38 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::New) => confirm_new_session_modal(app),
         Some(Kind::Disband) => confirm_disband_modal(app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
+        Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
         None => Vec::new(),
     }
+}
+
+/// Confirm the Worker-agent picker: read its chosen agent and (already
+/// trimmed-by-nothing — an empty model is meaningful, "no `--model` flag")
+/// model text, combine with the formation this modal interrupted
+/// ([`EmporiumState::pending_brigade_formation`], stashed when it opened —
+/// see `update_membership_resolved`'s `Select` branch), and issue the same
+/// `StoreIntent::FormBrigade` a non-`Select` setting would have issued
+/// directly. A no-op (closes the modal, nothing forms) if either half is
+/// missing — shouldn't happen structurally, but "form nothing" is the only
+/// safe fallback if it ever does, not guessing at a product.
+fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::WorkerAgentPicker(picker)) = app.modal() else {
+        return Vec::new();
+    };
+    let worker_agent = picker.agent();
+    let worker_model = picker.model_input().to_string();
+    app.close_modal();
+    let Some(formation) = state.pending_brigade_formation.take() else {
+        return Vec::new();
+    };
+    vec![Cmd::Store(StoreIntent::FormBrigade {
+        director_row_id: formation.director_row_id,
+        name: formation.name,
+        cwd: formation.cwd,
+        worker_count: formation.worker_count,
+        worker_agent,
+        worker_model,
+    })]
 }
 
 fn confirm_archive_modal(app: &mut App) -> Vec<Cmd> {
@@ -1751,7 +1877,7 @@ fn update_membership_resolved(
                 app,
                 brigade_id,
                 &members.unwrap_or_default(),
-                &brigade.worker_model,
+                brigade,
             ),
             _ => open_solo(state, &row),
         },
@@ -1764,12 +1890,40 @@ fn update_membership_resolved(
                 state.status = Some("workers can't be promoted to Director directly".to_string());
                 Vec::new()
             }
-            None => vec![Cmd::Store(StoreIntent::FormBrigade {
-                director_row_id: row.id.clone(),
-                name: row.display_title().to_string(),
-                cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                worker_count: brigade.worker_count(),
-            })],
+            // `Select` interrupts formation with a modal instead of issuing
+            // `FormBrigade` right away: the operator has to pick a product
+            // (and, given the product, a model) *before* there's anything
+            // to form — see `confirm_worker_agent_modal` for the other half
+            // of this round trip. Every other setting resolves immediately,
+            // unchanged from before this existed.
+            None if brigade.worker_agent == WorkerAgentSetting::Select => {
+                state.pending_brigade_formation = Some(PendingBrigadeFormation {
+                    director_row_id: row.id.clone(),
+                    name: row.display_title().to_string(),
+                    cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                    worker_count: brigade.worker_count(),
+                });
+                app.open_worker_agent_modal(
+                    row.agent,
+                    brigade.worker_model.clone(),
+                    brigade.worker_model_codex.clone(),
+                );
+                Vec::new()
+            }
+            None => {
+                let worker_agent = resolve_worker_agent(brigade.worker_agent, row.agent);
+                vec![Cmd::Store(StoreIntent::FormBrigade {
+                    director_row_id: row.id.clone(),
+                    name: row.display_title().to_string(),
+                    cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                    worker_count: brigade.worker_count(),
+                    worker_agent,
+                    worker_model: brigade
+                        .worker_model_for(worker_agent)
+                        .unwrap_or("")
+                        .to_string(),
+                })]
+            }
         },
         // Handled above, before the `row_for_id` guard.
         PendingMembership::DismissWorker => Vec::new(),
@@ -1812,15 +1966,21 @@ fn stage_brigade(
     app: &App,
     brigade_id: BrigadeId,
     members: &[(MemberToken, BrigadeRole, Option<String>)],
-    worker_model: &str,
+    brigade: &BrigadeConfig,
 ) -> Vec<Cmd> {
-    let cwd = members
+    let director_row = members
         .iter()
         .find(|(_, role, _)| *role == BrigadeRole::Director)
         .and_then(|(_, _, sid)| sid.as_deref())
-        .and_then(|sid| app.row_for_id(sid))
+        .and_then(|sid| app.row_for_id(sid));
+    let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
+    // A Director not yet resolved to a row can't say what product it is
+    // either — the safe default rather than blocking staging on it, same
+    // fallback `add_worker`/`update_brigade_formed` use.
+    let director_agent = director_row.map_or(AgentKind::ClaudeCode, |row| row.agent);
+    let fresh_worker_agent = resolve_worker_agent(brigade.worker_agent, director_agent);
 
     let mut panes = Vec::new();
     let mut cmds = Vec::new();
@@ -1849,9 +2009,14 @@ fn stage_brigade(
                     // model rather than the brigade's configured one. Never
                     // for the Director — that's the operator's own session,
                     // launched (and re-launched) entirely outside banto's
-                    // control.
-                    let model = (*role == BrigadeRole::Worker && !worker_model.is_empty())
-                        .then(|| worker_model.to_string());
+                    // control. Resolved from *this row's own* `agent`, not
+                    // `fresh_worker_agent`: a resumed member already has a
+                    // fixed product, unrelated to what a brand-new spawn
+                    // would pick.
+                    let model = (*role == BrigadeRole::Worker)
+                        .then(|| brigade.worker_model_for(row.agent))
+                        .flatten()
+                        .map(str::to_string);
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -1880,13 +2045,14 @@ fn stage_brigade(
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
+                    let model = brigade.worker_model_for(fresh_worker_agent).unwrap_or("");
                     cmds.extend(open_worker(
                         state,
                         brigade_id,
                         token,
                         &cwd,
-                        worker_model,
-                        AgentKind::ClaudeCode,
+                        model,
+                        fresh_worker_agent,
                     ));
                 }
             }
@@ -1919,18 +2085,31 @@ fn toggle_pin(app: &mut App) -> Vec<Cmd> {
 /// `b`: spawn one more fresh Worker into the staged brigade. `cwd` is the
 /// Director's own row cwd, resolved from `app` via the Director's key
 /// (always `panes[0]`, always a known real id) — no extra round trip needed.
-fn add_worker(state: &mut EmporiumState, app: &App, _brigade: &BrigadeConfig) -> Vec<Cmd> {
+fn add_worker(state: &mut EmporiumState, app: &App, brigade: &BrigadeConfig) -> Vec<Cmd> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         state.status = Some("no brigade staged — press B to start one".to_string());
         return Vec::new();
     };
     let brigade_id = *id;
-    let cwd = panes
-        .first()
-        .and_then(|key| app.row_for_id(key.as_str()))
+    let director_row = panes.first().and_then(|key| app.row_for_id(key.as_str()));
+    let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
-    vec![Cmd::Store(StoreIntent::AddWorker { brigade_id, cwd })]
+    // A Director not yet resolved to a row can't say what product it is
+    // either — the safe default rather than blocking on it, same fallback
+    // `stage_brigade`/`update_brigade_formed` use.
+    let director_agent = director_row.map_or(AgentKind::ClaudeCode, |row| row.agent);
+    let worker_agent = resolve_worker_agent(brigade.worker_agent, director_agent);
+    let worker_model = brigade
+        .worker_model_for(worker_agent)
+        .unwrap_or("")
+        .to_string();
+    vec![Cmd::Store(StoreIntent::AddWorker {
+        brigade_id,
+        cwd,
+        worker_agent,
+        worker_model,
+    })]
 }
 
 /// Lines [`update_mouse`] scrolls a pane's own scrollback per wheel notch —
@@ -2129,12 +2308,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
     Vec::new()
 }
 
-fn update_spawned(
-    state: &mut EmporiumState,
-    brigade: &BrigadeConfig,
-    key: SessionKey,
-    now: Instant,
-) -> Vec<Cmd> {
+fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> Vec<Cmd> {
     state
         .screens
         .insert(key.clone(), crate::screen::Screen::new(24, 80));
@@ -2151,6 +2325,8 @@ fn update_spawned(
             brigade_id,
             worker_tokens,
             cwd,
+            worker_agent,
+            worker_model,
         } => {
             state.stage = Stage::Brigade {
                 id: brigade_id,
@@ -2161,14 +2337,7 @@ fn update_spawned(
             worker_tokens
                 .into_iter()
                 .flat_map(|token| {
-                    open_worker(
-                        state,
-                        brigade_id,
-                        &token,
-                        &cwd,
-                        &brigade.worker_model,
-                        AgentKind::ClaudeCode,
-                    )
+                    open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
                 })
                 .collect()
         }
@@ -2193,17 +2362,37 @@ fn update_spawned(
     }
 }
 
+/// Which product a fresh Worker spawn should use, given `[brigade]
+/// worker_agent` and the brigade's own Director's product.
+///
+/// `Select` is a stand-in for `Inherit` here, not a considered choice of its
+/// own: every call site that reaches this function runs well after
+/// formation already started — a re-stage, a later `B` add-worker, or the
+/// moment right after the Director itself finished spawning — with no
+/// synchronous UI moment left to interrupt with a picker. The formation
+/// modal that actually asks the operator up front (so every one of these
+/// call sites gets an already-decided `AgentKind` before this function ever
+/// runs) is separate, not-yet-landed work; until it does, falling back to
+/// `Inherit`'s behavior is the least-surprising default.
+fn resolve_worker_agent(setting: WorkerAgentSetting, director_agent: AgentKind) -> AgentKind {
+    match setting {
+        WorkerAgentSetting::Inherit | WorkerAgentSetting::Select => director_agent,
+        WorkerAgentSetting::Claude => AgentKind::ClaudeCode,
+        WorkerAgentSetting::Codex => AgentKind::Codex,
+    }
+}
+
 /// Emit the `Cmd::OpenEmbedded` for one auto-spawned Worker, wired to the
 /// brigade's MCP channel, tracked as a `BrigadeMember` open.
 ///
-/// `agent` is every current call site's own choice, always
-/// `AgentKind::ClaudeCode` today — resolving it from config.toml is a
-/// separate, ongoing piece of work. Once a caller does pass
-/// `AgentKind::Codex`, [`PendingOpen::BrigadeMember::needs_codex_kickoff`]
-/// picks that up automatically: this function is the *only* place that
-/// ever sets it `true`, since every call here is a fresh, id-less spawn — a
-/// resumed member with a known id (`stage_brigade`'s own `Some(row)`
-/// branch) never calls this at all.
+/// `agent` is always the caller's own, already-resolved choice (see
+/// [`resolve_worker_agent`]) — this function never re-derives it. Whenever
+/// that choice is `AgentKind::Codex`,
+/// [`PendingOpen::BrigadeMember::needs_codex_kickoff`] picks it up
+/// automatically: this function is the *only* place that ever sets it
+/// `true`, since every call here is a fresh, id-less spawn — a resumed
+/// member with a known id (`stage_brigade`'s own `Some(row)` branch) never
+/// calls this at all.
 fn open_worker(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
@@ -2397,15 +2586,32 @@ fn update_member_session_forked(
     cmds
 }
 
-fn update_brigade_formed(
-    state: &mut EmporiumState,
-    app: &mut App,
+/// `Event::BrigadeFormed`'s successful-formation payload, bundled so
+/// [`update_brigade_formed`] doesn't tip into clippy's too-many-arguments —
+/// these five always travel together anyway, all the way from
+/// `StoreIntent::FormBrigade`.
+struct FormedBrigade {
     director_row_id: String,
     name: String,
     cwd: PathBuf,
+    worker_agent: AgentKind,
+    worker_model: String,
+}
+
+fn update_brigade_formed(
+    state: &mut EmporiumState,
+    app: &mut App,
+    formed: FormedBrigade,
     result: Result<(BrigadeId, Vec<MemberToken>), String>,
     now: Instant,
 ) -> Vec<Cmd> {
+    let FormedBrigade {
+        director_row_id,
+        name,
+        cwd,
+        worker_agent,
+        worker_model,
+    } = formed;
     let (brigade_id, worker_tokens) = match result {
         Ok(pair) => pair,
         Err(err) => {
@@ -2425,7 +2631,7 @@ fn update_brigade_formed(
         worker_tokens
             .into_iter()
             .flat_map(|token| {
-                open_worker(state, brigade_id, &token, &cwd, "", AgentKind::ClaudeCode)
+                open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
             })
             .collect()
     } else {
@@ -2435,6 +2641,8 @@ fn update_brigade_formed(
                 brigade_id,
                 worker_tokens,
                 cwd: cwd.clone(),
+                worker_agent,
+                worker_model,
             },
         );
         let Some(row) = app.row_for_id(&director_row_id) else {
@@ -2463,13 +2671,15 @@ fn update_worker_added(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
     cwd: PathBuf,
+    worker_agent: AgentKind,
+    worker_model: String,
     result: Result<MemberToken, String>,
     now: Instant,
 ) -> Vec<Cmd> {
     match result {
         Ok(token) => {
             state.set_status(format!("{token} added"), now);
-            open_worker(state, brigade_id, &token, &cwd, "", AgentKind::ClaudeCode)
+            open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
         }
         Err(err) => {
             state.set_status(format!("failed to add worker: {err}"), now);
@@ -3737,6 +3947,398 @@ mod tests {
                 .any(|(id, model)| id == "w1" && model.as_deref() == Some("sonnet")),
             "a resumed Worker must carry the configured worker_model: {models:?}"
         );
+    }
+
+    // --- worker_agent: config wired into every open_worker call site -------
+
+    #[test]
+    fn resolve_worker_agent_follows_the_configured_setting() {
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Inherit, AgentKind::Codex),
+            AgentKind::Codex,
+            "Inherit copies the Director's own product"
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Inherit, AgentKind::ClaudeCode),
+            AgentKind::ClaudeCode
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Select, AgentKind::Codex),
+            AgentKind::Codex,
+            "stage-1 stand-in: Select behaves like Inherit until the formation modal lands"
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Claude, AgentKind::Codex),
+            AgentKind::ClaudeCode,
+            "Claude pins regardless of the Director's own product"
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Codex, AgentKind::ClaudeCode),
+            AgentKind::Codex,
+            "Codex pins regardless of the Director's own product"
+        );
+    }
+
+    #[test]
+    fn stage_brigade_fresh_worker_spawn_inherits_a_claude_directors_product_unchanged() {
+        // The explicit regression this round asked for: with the default
+        // `[brigade] worker_agent = "inherit"`, a Claude Director's cell
+        // must not change by a single byte.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config(); // worker_agent defaults to Inherit
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            ("worker-1".to_string(), BrigadeRole::Worker, None), // fresh, no id yet
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            test_instant(),
+        );
+
+        let worker_target = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, .. } if target.id.is_empty() => Some(target),
+            _ => None,
+        });
+        assert_eq!(worker_target.map(|t| t.agent), Some(AgentKind::ClaudeCode));
+    }
+
+    #[test]
+    fn stage_brigade_fresh_worker_spawn_uses_an_explicitly_configured_codex_setting() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]); // dir's own row is Claude...
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex, // ...but pinned regardless
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            ("worker-1".to_string(), BrigadeRole::Worker, None),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            test_instant(),
+        );
+
+        let worker_target = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, .. } if target.id.is_empty() => Some(target),
+            _ => None,
+        });
+        assert_eq!(worker_target.map(|t| t.agent), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn brigade_formed_worker_spawn_respects_the_configured_worker_agent_when_the_director_already_has_a_screen()
+     {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                // Resolved at press-time in the real flow (`update_membership_resolved`);
+                // supplied directly here since this test is about what
+                // `update_brigade_formed` does with it, not how it got resolved.
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
+
+        let worker = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, model, .. } if target.id.is_empty() => {
+                Some((target.agent, model.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            worker,
+            Some((AgentKind::Codex, Some("gpt-5.6-terra".to_string())))
+        );
+    }
+
+    #[test]
+    fn brigade_formed_then_spawned_worker_uses_the_configured_worker_agent_when_director_spawns_after()
+     {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+
+        // Director's own screen doesn't exist yet: `PendingOpen::BrigadeDirector`
+        // must carry `worker_agent`/`worker_model` through to the later
+        // `Event::Spawned`.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+
+        let worker = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, model, .. } if target.id.is_empty() => {
+                Some((target.agent, model.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            worker,
+            Some((AgentKind::Codex, Some("gpt-5.6-terra".to_string())))
+        );
+    }
+
+    #[test]
+    fn add_worker_resolves_the_configured_agent_from_the_staged_directors_row() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director],
+            focused: 0,
+        };
+        let mut codex_director_row = row("dir");
+        codex_director_row.agent = AgentKind::Codex;
+        let app = app_with(vec![codex_director_row]);
+        let brigade = brigade_config(); // Inherit — must follow the staged Director's own product
+
+        let cmds = add_worker(&mut state, &app, &brigade);
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::AddWorker {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn worker_added_passes_the_carried_agent_and_model_straight_to_open_worker() {
+        // `worker_agent`/`worker_model` are already fully resolved by the
+        // time this event exists (`add_worker`, at `B`-press) — this only
+        // pins that `update_worker_added` passes them through unchanged
+        // rather than re-deriving anything from `brigade`.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerAdded {
+                brigade_id: 1,
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok("worker-2".to_string()),
+            },
+            test_instant(),
+        );
+
+        match cmds.as_slice() {
+            [Cmd::OpenEmbedded { target, model, .. }] => {
+                assert_eq!(target.agent, AgentKind::Codex);
+                assert_eq!(model.as_deref(), Some("gpt-5.6-terra"));
+            }
+            other => panic!("expected exactly one OpenEmbedded: {other:?}"),
+        }
+    }
+
+    // --- worker_agent = "select": the formation-time picker modal ----------
+
+    #[test]
+    fn brigade_key_forms_immediately_when_worker_agent_is_not_select() {
+        // The explicit regression for this half too: the default `[brigade]
+        // worker_agent = "inherit"` must keep forming a brigade the instant
+        // `B` resolves, exactly as before this modal existed.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::ClaudeCode,
+                ..
+            })]
+        ));
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn brigade_key_opens_the_worker_agent_modal_when_select_is_configured() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert!(cmds.is_empty(), "nothing forms until the picker confirms");
+        assert!(matches!(app.modal(), Some(Modal::WorkerAgentPicker(_))));
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_forms_the_brigade_with_the_chosen_agent_and_model() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+        });
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_toggle_agent(); // Claude -> Codex, re-seeds the model input
+        app.modal_push_char('!'); // then the operator edits it further
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Store(StoreIntent::FormBrigade {
+                    director_row_id,
+                    name,
+                    cwd,
+                    worker_count: 2,
+                    worker_agent: AgentKind::Codex,
+                    worker_model,
+                })] if director_row_id == "dir"
+                    && name == "cell"
+                    && cwd == &PathBuf::from("/work")
+                    && worker_model == "gpt-5.6-terra!"
+            ),
+            "expected a FormBrigade carrying the picker's own final state: {cmds:?}"
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_brigade_formation.is_none());
+    }
+
+    #[test]
+    fn esc_on_worker_agent_modal_cancels_the_formation_entirely() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 1,
+        });
+        app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
+
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+        assert!(
+            state.pending_brigade_formation.is_none(),
+            "a cancelled picker must never leave a formation for a later confirm to pick up"
+        );
+    }
+
+    #[test]
+    fn backtab_toggles_the_worker_agent_modals_agent() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
+
+        update_modal_key(&mut state, &mut app, KeyCode::BackTab);
+
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::WorkerAgentPicker(picker)) if picker.agent() == AgentKind::Codex
+        ));
     }
 
     #[test]
