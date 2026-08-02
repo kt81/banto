@@ -251,6 +251,49 @@ const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a freshly-spawned Codex Worker pane's own output must have been
+/// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
+/// — see that constant's doc for why this exists at all. Measured
+/// 2026-08-02: Codex's own boot sequence (terminal-mode escapes, the
+/// hook-bypass warning banner, an MCP server booting, the composer frame
+/// settling) ran for ~2s after spawn in the captured run, every gap
+/// *inside* that burst under 400ms; 700ms clears the noisiest observed
+/// mid-boot gap with real margin, without piling much more wait on top.
+/// Confirmed end to end, not just inferred from the gap sizes: typed at the
+/// 700ms-quiet mark, the kickoff line was not dropped or garbled — the
+/// resulting turn ran, the hook fired, and the discovered session id
+/// resolved to a real Codex `threads` row within a few seconds.
+const CODEX_KICKOFF_QUIET_PERIOD: Duration = Duration::from_millis(700);
+
+/// The fixed, ASCII-only line banto types into a freshly-spawned Codex
+/// Worker's stdin once its boot output goes quiet (see
+/// [`CODEX_KICKOFF_QUIET_PERIOD`]) — the turn this starts is what makes
+/// Codex's own `SessionStart` hook fire at all. Measured (2026-08-02
+/// investigation): an idle Codex TUI with nothing ever typed into it never
+/// runs the hook, never creates a session `threads` row, never writes a
+/// rollout file — a freshly spawned Worker is otherwise permanently
+/// undiscoverable, since every path banto has for learning a Codex session's
+/// id depends on that same first turn having happened.
+///
+/// This is deliberately *not* [`RELAY_NUDGE_LINE`] reused: that line
+/// asserts a peer sent a message, which would be false here — nobody has,
+/// this pane just started, and the member reading it would call
+/// `check_messages` to find an empty inbox. Typing a false "you have mail"
+/// purely to make a hook fire trades a working mechanism for a member's
+/// trust in what banto tells it, which is a worse trade than the one it's
+/// avoiding; this line only states what's actually true at the moment it's
+/// sent. It also doesn't restate the member's role or peers — the hook's
+/// own `additionalContext` delivers that on this very same turn
+/// (`crate::hook`'s module doc, in the `banto` crate), so repeating it here
+/// would just be noise on top of noise.
+///
+/// ASCII-only for the same reason [`RELAY_NUDGE_LINE`] is: this is typed as
+/// literal bytes into whatever the child's own input widget does with them,
+/// and nothing here has verified how a raw multi-byte UTF-8 sequence
+/// arriving as one written chunk behaves in Codex's own input handling — no
+/// reason to be the one to find out.
+const CODEX_WORKER_KICKOFF_LINE: &str = "[banto] This pane just started as a brigade member.";
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NudgeState {
     last_nudge: Option<Instant>,
@@ -364,6 +407,21 @@ fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key:
     pending_submits.retain(|pending| &pending.key != key);
 }
 
+/// A freshly-spawned Codex Worker pane awaiting its own boot output going
+/// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
+/// — see that constant's doc for why this exists at all. Queued by
+/// [`update_spawned`] the moment such a pane's `PendingOpen::BrigadeMember`
+/// resolves; removed once the kickoff is sent (its `\r` becomes an ordinary
+/// [`PendingSubmit`], the same two-phase shape as a relay nudge) or the pane
+/// unstages first.
+struct PendingKickoff {
+    key: SessionKey,
+    /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
+    /// has no entry yet for this pane (nothing has arrived at all) — the
+    /// moment this tracker was created, i.e. spawn time.
+    spawned_at: Instant,
+}
+
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
 /// `SpawnFailed` know what to do with the result.
 enum PendingOpen {
@@ -380,7 +438,17 @@ enum PendingOpen {
     /// One member (Director or Worker) of a brigade whose `Stage` already
     /// exists (or is being built alongside this open): on success, append
     /// to `panes`.
-    BrigadeMember { brigade_id: BrigadeId },
+    BrigadeMember {
+        brigade_id: BrigadeId,
+        /// `true` only for a Worker [`open_worker`] just spawned fresh (no
+        /// id yet) as a Codex agent — the one case that needs a
+        /// [`PendingKickoff`] queued once it's actually spawned. Always
+        /// `false` for a *resumed* member ([`stage_brigade`]'s own
+        /// `Some(row)` branch inserts this same variant, for a session
+        /// whose id is already known): it has nothing left to discover and
+        /// no reason to spend a turn kicking it off.
+        needs_codex_kickoff: bool,
+    },
 }
 
 /// Why a `Cmd::Store(StoreIntent::ResolveMembership)` was requested.
@@ -418,6 +486,16 @@ pub struct EmporiumState {
     /// else's keystrokes. An entry is dropped when its pane unstages (see
     /// [`Self::unstage`]) so a closed pane's key never accumulates here.
     pub last_forwarded_input: HashMap<SessionKey, Instant>,
+    /// When a pane's child last produced *any* output, keyed by its own
+    /// [`SessionKey`] — the baseline [`update_tick`]'s kickoff-readiness
+    /// check measures quiet time against (see
+    /// [`CODEX_KICKOFF_QUIET_PERIOD`]). Only meaningful for a pane with an
+    /// entry in [`Self::pending_kickoffs`], but kept for every pane
+    /// regardless: a `HashMap` write on every `Event::PtyOutput` is cheaper
+    /// than checking membership first. Dropped when its pane unstages, same
+    /// as [`Self::last_forwarded_input`].
+    last_output_at: HashMap<SessionKey, Instant>,
+    pending_kickoffs: Vec<PendingKickoff>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
@@ -456,6 +534,8 @@ impl EmporiumState {
             status_set_at: None,
             relay_states: HashMap::new(),
             last_forwarded_input: HashMap::new(),
+            last_output_at: HashMap::new(),
+            pending_kickoffs: Vec::new(),
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
             pending_membership: None,
@@ -499,6 +579,8 @@ impl EmporiumState {
     fn unstage(&mut self, key: &SessionKey) {
         self.stage.remove(key);
         self.last_forwarded_input.remove(key);
+        self.last_output_at.remove(key);
+        self.pending_kickoffs.retain(|pending| &pending.key != key);
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
         }
@@ -911,6 +993,19 @@ pub enum Event {
         session_id: String,
         member: Option<(BrigadeId, MemberToken)>,
     },
+    /// The shell's Codex-sourced discovery tracker for `key` gave up: too
+    /// long since spawn with `BrigadeMember::briefed_session_id` still
+    /// `None` (see `docs/notes/codex-briefing-spike.md`'s silent-failure
+    /// list — an untrusted hook, a kickoff line that never got typed, and
+    /// others all look identical from here: nothing ever arrives). Unlike a
+    /// resolved [`Self::DiscoveryResult`], this never rekeys anything — the
+    /// pane stays parked under its synthetic key, same degraded-but-visible
+    /// outcome as an unresolved Claude discovery today, just with a status
+    /// line explaining why instead of silence.
+    CodexWorkerDiscoveryTimedOut {
+        key: SessionKey,
+        token: MemberToken,
+    },
     ArchiveDone {
         title: String,
         result: Result<(), String>,
@@ -994,6 +1089,7 @@ pub fn update(
         Event::Input(input) => update_input(state, app, brigade, input, now),
         Event::Resized { width, height } => update_resized(state, app, width, height),
         Event::PtyOutput { key, chunk } => {
+            state.last_output_at.insert(key.clone(), now);
             if let Some(screen) = state.screens.get_mut(&key) {
                 screen.process(&chunk);
             }
@@ -1003,7 +1099,7 @@ pub fn update(
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
-        Event::Spawned { key } => update_spawned(state, brigade, key),
+        Event::Spawned { key } => update_spawned(state, brigade, key, now),
         Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
             rows,
@@ -1022,6 +1118,11 @@ pub fn update(
             session_id,
             member,
         } => update_discovery_result(state, key, session_id, member, now),
+        Event::CodexWorkerDiscoveryTimedOut { key, token } => {
+            state.pending_kickoffs.retain(|pending| pending.key != key);
+            state.set_status(format!("{token}: Codex briefing wasn't confirmed"), now);
+            Vec::new()
+        }
         Event::ArchiveDone { title, result } => {
             state.set_status(
                 match &result {
@@ -1732,9 +1833,16 @@ fn stage_brigade(
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
-                    state
-                        .pending_opens
-                        .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+                    state.pending_opens.insert(
+                        key.clone(),
+                        // Resuming a known id: nothing to discover, so
+                        // never a kickoff candidate (see `open_worker`'s
+                        // own doc on why only *it* ever sets this `true`).
+                        PendingOpen::BrigadeMember {
+                            brigade_id,
+                            needs_codex_kickoff: false,
+                        },
+                    );
                     // A resume's `--model` matters exactly like a fresh
                     // spawn's (see `open_worker`): a Worker resumed without
                     // it silently falls back to the operator's own default
@@ -1772,7 +1880,14 @@ fn stage_brigade(
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
-                    cmds.extend(open_worker(state, brigade_id, token, &cwd, worker_model));
+                    cmds.extend(open_worker(
+                        state,
+                        brigade_id,
+                        token,
+                        &cwd,
+                        worker_model,
+                        AgentKind::ClaudeCode,
+                    ));
                 }
             }
             None => missing += 1,
@@ -2014,7 +2129,12 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
     Vec::new()
 }
 
-fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: SessionKey) -> Vec<Cmd> {
+fn update_spawned(
+    state: &mut EmporiumState,
+    brigade: &BrigadeConfig,
+    key: SessionKey,
+    now: Instant,
+) -> Vec<Cmd> {
     state
         .screens
         .insert(key.clone(), crate::screen::Screen::new(24, 80));
@@ -2041,16 +2161,32 @@ fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: Sessi
             worker_tokens
                 .into_iter()
                 .flat_map(|token| {
-                    open_worker(state, brigade_id, &token, &cwd, &brigade.worker_model)
+                    open_worker(
+                        state,
+                        brigade_id,
+                        &token,
+                        &cwd,
+                        &brigade.worker_model,
+                        AgentKind::ClaudeCode,
+                    )
                 })
                 .collect()
         }
-        PendingOpen::BrigadeMember { brigade_id } => {
+        PendingOpen::BrigadeMember {
+            brigade_id,
+            needs_codex_kickoff,
+        } => {
             if let Stage::Brigade { id, panes, .. } = &mut state.stage
                 && *id == brigade_id
                 && !panes.contains(&key)
             {
-                panes.push(key);
+                panes.push(key.clone());
+            }
+            if needs_codex_kickoff {
+                state.pending_kickoffs.push(PendingKickoff {
+                    key,
+                    spawned_at: now,
+                });
             }
             Vec::new()
         }
@@ -2059,22 +2195,36 @@ fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: Sessi
 
 /// Emit the `Cmd::OpenEmbedded` for one auto-spawned Worker, wired to the
 /// brigade's MCP channel, tracked as a `BrigadeMember` open.
+///
+/// `agent` is every current call site's own choice, always
+/// `AgentKind::ClaudeCode` today — resolving it from config.toml is a
+/// separate, ongoing piece of work. Once a caller does pass
+/// `AgentKind::Codex`, [`PendingOpen::BrigadeMember::needs_codex_kickoff`]
+/// picks that up automatically: this function is the *only* place that
+/// ever sets it `true`, since every call here is a fresh, id-less spawn — a
+/// resumed member with a known id (`stage_brigade`'s own `Some(row)`
+/// branch) never calls this at all.
 fn open_worker(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
     token: &str,
     cwd: &std::path::Path,
     worker_model: &str,
+    agent: AgentKind,
 ) -> Vec<Cmd> {
     let key = SessionKey::new_worker(brigade_id, token);
-    state
-        .pending_opens
-        .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+    state.pending_opens.insert(
+        key.clone(),
+        PendingOpen::BrigadeMember {
+            brigade_id,
+            needs_codex_kickoff: agent == AgentKind::Codex,
+        },
+    );
     vec![Cmd::OpenEmbedded {
         key,
         target: SessionToOpen {
             id: String::new(),
-            agent: AgentKind::ClaudeCode,
+            agent,
             title: format!("worker {token}"),
             cwd: cwd.to_path_buf(),
         },
@@ -2274,7 +2424,9 @@ fn update_brigade_formed(
         state.focus = Focus::Pane;
         worker_tokens
             .into_iter()
-            .flat_map(|token| open_worker(state, brigade_id, &token, &cwd, ""))
+            .flat_map(|token| {
+                open_worker(state, brigade_id, &token, &cwd, "", AgentKind::ClaudeCode)
+            })
             .collect()
     } else {
         state.pending_opens.insert(
@@ -2317,7 +2469,7 @@ fn update_worker_added(
     match result {
         Ok(token) => {
             state.set_status(format!("{token} added"), now);
-            open_worker(state, brigade_id, &token, &cwd, "")
+            open_worker(state, brigade_id, &token, &cwd, "", AgentKind::ClaudeCode)
         }
         Err(err) => {
             state.set_status(format!("failed to add worker: {err}"), now);
@@ -2436,6 +2588,32 @@ fn update_tick(
             cmds.push(Cmd::WritePty {
                 key: entry.key,
                 bytes: b"\r".to_vec(),
+            });
+        } else {
+            i += 1;
+        }
+    }
+
+    // Codex Worker kickoff: once a pending pane's own output has been quiet
+    // for CODEX_KICKOFF_QUIET_PERIOD, type the fixed line and hand its `\r`
+    // to the exact same phase-two mechanism as a relay nudge above — the
+    // trigger and text differ, the two-write shape doesn't need to.
+    let mut i = 0;
+    while i < state.pending_kickoffs.len() {
+        let quiet_since = state
+            .last_output_at
+            .get(&state.pending_kickoffs[i].key)
+            .copied()
+            .unwrap_or(state.pending_kickoffs[i].spawned_at);
+        if now.saturating_duration_since(quiet_since) >= CODEX_KICKOFF_QUIET_PERIOD {
+            let entry = state.pending_kickoffs.swap_remove(i);
+            cmds.push(Cmd::WritePty {
+                key: entry.key.clone(),
+                bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+            });
+            state.pending_submits.push(PendingSubmit {
+                key: entry.key,
+                nudged_at: now,
             });
         } else {
             i += 1;
@@ -4221,6 +4399,247 @@ mod tests {
             now,
         );
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+    }
+
+    // --- Codex Worker kickoff: open_worker / update_spawned / update_tick --
+
+    #[test]
+    fn open_worker_for_codex_marks_the_pending_open_for_a_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        open_worker(
+            &mut state,
+            1,
+            "worker-1",
+            std::path::Path::new("/work"),
+            "",
+            AgentKind::Codex,
+        );
+        let key = SessionKey::new_worker(1, "worker-1");
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::BrigadeMember {
+                needs_codex_kickoff: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn open_worker_for_claude_never_needs_a_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        open_worker(
+            &mut state,
+            1,
+            "worker-1",
+            std::path::Path::new("/work"),
+            "",
+            AgentKind::ClaudeCode,
+        );
+        let key = SessionKey::new_worker(1, "worker-1");
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::BrigadeMember {
+                needs_codex_kickoff: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn spawning_a_kickoff_eligible_worker_queues_a_pending_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_opens.insert(
+            key.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: true,
+            },
+        );
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key: key.clone() },
+            test_instant(),
+        );
+
+        assert_eq!(state.pending_kickoffs.len(), 1);
+        assert_eq!(state.pending_kickoffs[0].key, key);
+    }
+
+    #[test]
+    fn spawning_a_non_kickoff_worker_queues_nothing() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_opens.insert(
+            key.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false,
+            },
+        );
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key },
+            test_instant(),
+        );
+
+        assert!(state.pending_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn tick_sends_the_kickoff_once_quiet_long_enough_but_not_before() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        let spawned_at = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
+        );
+        assert!(cmds.is_empty(), "not quiet long enough yet");
+        assert_eq!(state.pending_kickoffs.len(), 1);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: key.clone(),
+                bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+            }]
+        );
+        assert!(state.pending_kickoffs.is_empty());
+        assert_eq!(state.pending_submits.len(), 1);
+        assert_eq!(state.pending_submits[0].key, key);
+    }
+
+    #[test]
+    fn pty_output_pushes_the_kickoff_quiet_deadline_back() {
+        // A pane that's still noisy at the original deadline must not get
+        // typed into — see CODEX_KICKOFF_QUIET_PERIOD's own doc for why an
+        // early write risks the input being dropped.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        let spawned_at = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at,
+        });
+
+        let output_at = spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(50);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"boot noise".to_vec(),
+            },
+            output_at,
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert!(
+            cmds.is_empty(),
+            "quiet since the LATEST output, not the original spawn"
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            output_at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert!(!cmds.is_empty(), "quiet long enough since the last output");
+    }
+
+    #[test]
+    fn codex_worker_discovery_timed_out_sets_status_and_drops_any_pending_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::CodexWorkerDiscoveryTimedOut {
+                key,
+                token: "worker-1".to_string(),
+            },
+            test_instant(),
+        );
+
+        assert!(cmds.is_empty());
+        assert!(state.pending_kickoffs.is_empty());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("worker-1: Codex briefing wasn't confirmed")
+        );
+    }
+
+    #[test]
+    fn pty_exited_clears_pending_kickoff_and_last_output_for_that_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+        });
+        state.last_output_at.insert(key.clone(), test_instant());
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key: key.clone() },
+            test_instant(),
+        );
+
+        assert!(state.pending_kickoffs.is_empty());
+        assert!(!state.last_output_at.contains_key(&key));
     }
 
     /// Two-pane brigade (Director + Worker), both `Screen`s registered, `now`

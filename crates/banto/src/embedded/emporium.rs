@@ -215,6 +215,11 @@ struct DiscoveryTracker {
     /// match against `sessions/<pid>.json` that [`poll_discovery`] tries
     /// before falling back to scanning session files by cwd.
     pid: Option<u32>,
+    /// Which product this is — Claude's own two sources above don't apply
+    /// to a Codex child at all (see [`poll_discovery`]'s doc for the
+    /// store-based fallback this gates), and only a Codex tracker ever
+    /// gives up on a [`CODEX_WORKER_DISCOVERY_TIMEOUT`].
+    agent: AgentKind,
 }
 
 /// How often the relay engine (and the pending-submit flush / status expiry
@@ -361,7 +366,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
             let live = read_live_sessions(&deps.claude_home.sessions_dir());
-            events.extend(poll_discovery(&mut discovery, &provider, &claimed, &live));
+            events.extend(poll_discovery(
+                &mut discovery,
+                &provider,
+                &claimed,
+                &live,
+                deps.store,
+            ));
         }
 
         if watch.poll_ready(SystemTime::now()) {
@@ -676,6 +687,7 @@ fn execute_open_embedded(
             if key.is_synthetic() {
                 discovery.push(DiscoveryTracker {
                     key: key.clone(),
+                    agent: target.agent,
                     cwd: target.cwd,
                     since: SystemTime::now(),
                     member: brigade.map(|(brigade_id, token, _)| (brigade_id, token)),
@@ -927,9 +939,44 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     }]
 }
 
-/// Poll every pending discovery tracker for the id Claude assigned it.
+/// How long a Codex-sourced discovery tracker waits for
+/// `BrigadeMember::briefed_session_id` before giving up — a judgment call,
+/// not a measured minimum: the happy path (2026-08-02 investigation)
+/// resolved within a few seconds of the kickoff's submitting `\r`, so this
+/// is generous headroom for slower model latency or a heavier real briefing
+/// prompt, not a tuned floor. Only ever applies to a tracker whose
+/// `DiscoveryTracker::agent` is `AgentKind::Codex` — Claude's own trackers
+/// keep waiting forever, unchanged from before this existed.
+const CODEX_WORKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// This member's `briefed_session_id`, if the store has one — the id
+/// `banto _hook` recorded on stdin the last time it ran for this member
+/// (`BrigadeMember::briefed_session_id`'s own doc, in `banto-core`). The
+/// only discovery source that exists at all for a Codex Worker: unlike
+/// Claude, nothing Codex writes to disk names a session before its first
+/// turn (measured 2026-08-02 — no live-state file, no session file, no
+/// `threads` row, nothing), so this is that same fact reaching the store
+/// instead, once `crate::engine`'s kickoff mechanism has forced that first
+/// turn to happen.
+fn codex_briefed_session_id(
+    store: &RefCell<Store>,
+    brigade_id: BrigadeId,
+    token: &str,
+) -> Option<String> {
+    store
+        .borrow()
+        .brigade_members(brigade_id)
+        .ok()?
+        .into_iter()
+        .find(|member| member.token == token)?
+        .briefed_session_id
+        .map(|session_id| session_id.0)
+}
+
+/// Poll every pending discovery tracker for the id its child was assigned.
 ///
-/// Two sources, tried in that order:
+/// Three sources, tried in that order — the first two Claude-only, mirrored
+/// from the pre-migration code:
 ///
 /// 1. **The live-state file** `sessions/<pid>.json`, matched on the child's
 ///    own pid. `claude` writes it at startup, and banto knows the pid it
@@ -946,17 +993,29 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
 ///    batch spawned into one cwd at once — mirrors the pre-migration
 ///    `discover_new_ids`. The fallback whenever the direct child isn't the
 ///    `claude` process itself (see `PtyIo::pid`).
+/// 3. **The store's `briefed_session_id`** ([`codex_briefed_session_id`]),
+///    tried only for a tracker whose `agent` is `AgentKind::Codex`: sources
+///    1 and 2 don't apply to it at all — see that function's own doc.
 ///
-/// Both skip ids already claimed by an open session or taken earlier in
-/// this same pass.
+/// A Codex tracker still unresolved past [`CODEX_WORKER_DISCOVERY_TIMEOUT`]
+/// gives up: removed the same as a resolved one, but reported as
+/// [`Event::CodexWorkerDiscoveryTimedOut`] instead of
+/// [`Event::DiscoveryResult`], so the operator sees why rather than the
+/// pane just silently never identifying itself. A Claude tracker never
+/// times out — unchanged from before this existed.
+///
+/// All three sources skip ids already claimed by an open session or taken
+/// earlier in this same pass.
 fn poll_discovery(
     trackers: &mut Vec<DiscoveryTracker>,
     provider: &dyn SessionProvider,
     claimed: &HashSet<String>,
     live: &[LiveSession],
+    store: &RefCell<Store>,
 ) -> Vec<Event> {
     let mut used_this_pass: HashSet<String> = HashSet::new();
     let mut resolved: Vec<(usize, String)> = Vec::new();
+    let mut timed_out: Vec<usize> = Vec::new();
     for (i, tracker) in trackers.iter().enumerate() {
         let by_pid = tracker
             .pid
@@ -969,16 +1028,31 @@ fn poll_discovery(
                     .into_iter()
                     .map(|id| id.0)
                     .find(|id| !claimed.contains(id) && !used_this_pass.contains(id))
+            })
+            .or_else(|| {
+                (tracker.agent == AgentKind::Codex)
+                    .then_some(tracker.member.as_ref())
+                    .flatten()
+                    .and_then(|(brigade_id, token)| {
+                        codex_briefed_session_id(store, *brigade_id, token)
+                    })
+                    .filter(|id| !claimed.contains(id) && !used_this_pass.contains(id))
             });
         if let Some(id) = id {
             used_this_pass.insert(id.clone());
             resolved.push((i, id));
+        } else if tracker.agent == AgentKind::Codex
+            && SystemTime::now()
+                .duration_since(tracker.since)
+                .is_ok_and(|elapsed| elapsed >= CODEX_WORKER_DISCOVERY_TIMEOUT)
+        {
+            timed_out.push(i);
         }
     }
-    if resolved.is_empty() {
+    if resolved.is_empty() && timed_out.is_empty() {
         return Vec::new();
     }
-    let events = resolved
+    let mut events: Vec<Event> = resolved
         .iter()
         .map(|(i, id)| Event::DiscoveryResult {
             key: trackers[*i].key.clone(),
@@ -986,10 +1060,20 @@ fn poll_discovery(
             member: trackers[*i].member.clone(),
         })
         .collect();
-    let resolved_indices: HashSet<usize> = resolved.into_iter().map(|(i, _)| i).collect();
+    events.extend(timed_out.iter().filter_map(|&i| {
+        trackers[i]
+            .member
+            .as_ref()
+            .map(|(_, token)| Event::CodexWorkerDiscoveryTimedOut {
+                key: trackers[i].key.clone(),
+                token: token.clone(),
+            })
+    }));
+    let mut removed_indices: HashSet<usize> = resolved.into_iter().map(|(i, _)| i).collect();
+    removed_indices.extend(timed_out);
     let mut i = 0;
     trackers.retain(|_| {
-        let keep = !resolved_indices.contains(&i);
+        let keep = !removed_indices.contains(&i);
         i += 1;
         keep
     });
@@ -2094,13 +2178,15 @@ mod tests {
 
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
             cwd: cwd.clone(),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: Some(4242),
         }];
+        let store = RefCell::new(Store::open_in_memory().unwrap());
 
-        let events = poll_discovery(&mut trackers, &provider, &HashSet::new(), &live);
+        let events = poll_discovery(&mut trackers, &provider, &HashSet::new(), &live, &store);
 
         assert!(
             matches!(
@@ -2131,14 +2217,16 @@ mod tests {
 
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
             cwd: PathBuf::from("/work/alpha"),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: Some(4242),
         }];
+        let store = RefCell::new(Store::open_in_memory().unwrap());
 
         assert!(
-            poll_discovery(&mut trackers, &provider, &HashSet::new(), &live).is_empty(),
+            poll_discovery(&mut trackers, &provider, &HashSet::new(), &live, &store).is_empty(),
             "a different cwd means a different session"
         );
         assert_eq!(trackers.len(), 1, "still pending, not resolved wrongly");
@@ -2163,12 +2251,14 @@ mod tests {
         // child pid, so only the session-file scan can answer.
         let tracker = |token: &str| DiscoveryTracker {
             key: pending_key(token),
+            agent: AgentKind::ClaudeCode,
             cwd: cwd.clone(),
             since,
             member: Some((1, token.to_string())),
             pid: None,
         };
         let mut trackers = vec![tracker("worker-1"), tracker("worker-2")];
+        let store = RefCell::new(Store::open_in_memory().unwrap());
 
         // Pass 1: only the first Worker's session file exists yet.
         write_session_at(claude_home.path(), "w1", &cwd);
@@ -2176,7 +2266,7 @@ mod tests {
             .iter()
             .map(|tracker| tracker.key.as_str().to_string())
             .collect();
-        let events = poll_discovery(&mut trackers, &provider, &claimed, &[]);
+        let events = poll_discovery(&mut trackers, &provider, &claimed, &[], &store);
         assert!(matches!(
             events.as_slice(),
             [Event::DiscoveryResult { session_id, .. }] if session_id == "w1"
@@ -2190,7 +2280,7 @@ mod tests {
 
         // Pass 2: the second Worker's file appears.
         write_session_at(claude_home.path(), "w2", &cwd);
-        let events = poll_discovery(&mut trackers, &provider, &claimed, &[]);
+        let events = poll_discovery(&mut trackers, &provider, &claimed, &[], &store);
         assert!(
             matches!(
                 events.as_slice(),
@@ -2199,6 +2289,131 @@ mod tests {
             "worker-2 must take the unclaimed id, not re-take worker-1's: {events:?}"
         );
         assert!(trackers.is_empty());
+    }
+
+    // --- Codex Worker discovery: the store-based source, and giving up -----
+
+    fn codex_tracker(brigade_id: BrigadeId, token: &str, since: SystemTime) -> DiscoveryTracker {
+        DiscoveryTracker {
+            key: pending_key(token),
+            agent: AgentKind::Codex,
+            cwd: PathBuf::from("/work/alpha"),
+            since,
+            member: Some((brigade_id, token.to_string())),
+            pid: None,
+        }
+    }
+
+    #[test]
+    fn a_codex_worker_resolves_via_the_stores_briefed_session_id() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("w1".to_string()),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+
+        let mut trackers = vec![codex_tracker(brigade_id, "worker-1", SystemTime::now())];
+
+        let events = poll_discovery(&mut trackers, &provider, &HashSet::new(), &[], &store);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::DiscoveryResult { session_id, member, .. }]
+                    if session_id == "w1" && member.as_ref().unwrap().1 == "worker-1"
+            ),
+            "no live-state file or session file exists for Codex; the store is the only source: {events:?}"
+        );
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn a_claude_tracker_never_consults_the_stores_briefed_session_id() {
+        // Defends the `agent == AgentKind::Codex` gate itself: even with a
+        // matching (and misleading, in practice never-set-for-Claude)
+        // briefed_session_id sitting in the store, a Claude tracker must
+        // never resolve from it.
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("w1".to_string()),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
+            cwd: PathBuf::from("/work/alpha"),
+            since: SystemTime::now(),
+            member: Some((brigade_id, "worker-1".to_string())),
+            pid: None,
+        }];
+
+        assert!(poll_discovery(&mut trackers, &provider, &HashSet::new(), &[], &store).is_empty());
+        assert_eq!(
+            trackers.len(),
+            1,
+            "still pending — no Claude source resolved it"
+        );
+    }
+
+    #[test]
+    fn a_codex_worker_past_the_timeout_gives_up_and_is_removed() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let long_ago = SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1);
+        let mut trackers = vec![codex_tracker(1, "worker-1", long_ago)];
+
+        let events = poll_discovery(&mut trackers, &provider, &HashSet::new(), &[], &store);
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::CodexWorkerDiscoveryTimedOut { token, .. }] if token == "worker-1"
+        ));
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn a_claude_worker_never_times_out() {
+        // Regression: the give-up timeout is Codex-only. Unresolved Claude
+        // discovery keeps waiting forever, same as before this existed.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let long_ago = SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1);
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
+            cwd: PathBuf::from("/work/alpha"),
+            since: long_ago,
+            member: Some((1, "worker-1".to_string())),
+            pid: None,
+        }];
+
+        assert!(poll_discovery(&mut trackers, &provider, &HashSet::new(), &[], &store).is_empty());
+        assert_eq!(trackers.len(), 1, "still pending, not timed out");
     }
 
     // --- compact-fork tracking: gather_fork_observations ------------------
