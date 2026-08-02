@@ -434,13 +434,6 @@ pub struct EmporiumState {
     /// reused discriminator could attach a stale mapping (an old screen, a
     /// stale PTY handle) to a new pane that happens to mint the same key.
     next_plain_id: u64,
-    /// What [`update_mouse_capture`] last decided the host terminal's mouse
-    /// capture should be — starts `true` to match what `setup_terminal`
-    /// already did before the first event ever reaches `update` (the
-    /// sidebar, [`Focus::Sidebar`]'s own initial value, wants it on
-    /// anyway), so nothing re-sends a redundant `Cmd::SetMouseCapture` on
-    /// the very first frame.
-    mouse_capture_enabled: bool,
 }
 
 impl EmporiumState {
@@ -461,7 +454,6 @@ impl EmporiumState {
             prefix,
             prefix_armed: None,
             next_plain_id: 0,
-            mouse_capture_enabled: true,
         }
     }
 
@@ -859,13 +851,6 @@ pub enum Cmd {
     },
     Store(StoreIntent),
     Reload,
-    /// Enable or disable the *host* terminal's own mouse capture — see
-    /// [`update_mouse_capture`]'s doc for when the core asks for this.
-    /// Capture is a property of banto's own terminal, not of any one pane
-    /// (`docs/DISCIPLINE.md` §2's I/O-at-the-edges split), so unlike every
-    /// other `Cmd` here this has no `SessionKey`: the shell just calls
-    /// crossterm's `Enable`/`DisableMouseCapture` on its own stdout.
-    SetMouseCapture(bool),
 }
 
 /// A fact about the outside world, fed into [`update`]. Derives
@@ -1082,51 +1067,7 @@ pub fn update(
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
     };
     cmds.extend(resize_staged_tiles(state));
-    cmds.extend(update_mouse_capture(state));
     cmds
-}
-
-/// Whether the host terminal's mouse capture should be on right now: always
-/// for the sidebar (its own click/scroll handling needs crossterm to
-/// actually deliver `Event::Mouse` at all), otherwise exactly when the
-/// focused pane's child wants SGR mouse reports (see
-/// [`crate::screen::Screen::wants_sgr_mouse`]) — a pane with no `Screen` yet
-/// (nothing spawned, or nothing heard from it yet) defaults to `false`,
-/// same as a child that has said nothing about mouse mode at all.
-fn wants_mouse_capture(state: &EmporiumState) -> bool {
-    match state.focus {
-        Focus::Sidebar => true,
-        Focus::Pane => state
-            .stage
-            .focused_key()
-            .and_then(|key| state.screens.get(key))
-            .is_some_and(crate::screen::Screen::wants_sgr_mouse),
-    }
-}
-
-/// Reconcile the host terminal's mouse capture with what the currently
-/// focused pane's child actually wants, emitting `Cmd::SetMouseCapture` only
-/// on a change (see [`EmporiumState::mouse_capture_enabled`]'s doc for the
-/// baseline this compares against). Called once at the end of every
-/// `update` regardless of event kind — same shape as
-/// [`resize_staged_tiles`] and for the same reason: the desired state can
-/// change from focus moving (a key or a mouse click) *or* from the focused
-/// pane's own output enabling/disabling mouse reporting after the fact
-/// (`Event::PtyOutput`), and checking centrally here is cheaper and more
-/// robust than remembering to call this from every branch that could cause
-/// either.
-///
-/// This only decides *whether* the child should receive mouse events —
-/// actually enabling/disabling capture is the host terminal's own state,
-/// which only the shell can touch (`docs/DISCIPLINE.md` §2); see
-/// `embedded::emporium::set_mouse_capture` for that half.
-fn update_mouse_capture(state: &mut EmporiumState) -> Vec<Cmd> {
-    let wants = wants_mouse_capture(state);
-    if wants == state.mouse_capture_enabled {
-        return Vec::new();
-    }
-    state.mouse_capture_enabled = wants;
-    vec![Cmd::SetMouseCapture(wants)]
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
@@ -1870,12 +1811,24 @@ fn add_worker(state: &mut EmporiumState, app: &App, _brigade: &BrigadeConfig) ->
 /// it (`Down(Left)` always moves focus, regardless of whether it wants
 /// mouse) and forward the event as an SGR report, but only when the focused
 /// pane's own child asked for mouse reporting in that encoding (see
-/// [`crate::screen::Screen::wants_sgr_mouse`]) — forwarding unconditionally,
-/// as this used to, sent bytes to children that never asked for them and
-/// would otherwise have gotten native terminal text selection instead. See
-/// [`update_mouse_capture`] for the other half: releasing banto's own
-/// terminal capture so that native selection actually becomes available
-/// once forwarding is refused.
+/// [`crate::screen::Screen::wants_sgr_mouse`]): a child that never enabled
+/// mouse reporting has no idea what to do with an SGR sequence arriving on
+/// its stdin, so forwarding unconditionally would just leak noise into
+/// whatever it's actually reading.
+///
+/// The host terminal's own mouse capture used to track this same
+/// wants-mouse check, releasing itself over a pane that didn't want
+/// reports so the terminal's native text selection could take over. That
+/// mechanism is gone: capture is unconditional now (`setup_terminal`)
+/// because releasing it had a worse cost than the native selection it
+/// bought — a `BANTO_INPUT_LOG` capture showed that once the host terminal
+/// itself stops delivering mouse events, banto cannot get them back short
+/// of the operator manually re-enabling capture out-of-band, which trapped
+/// focus on any pane whose child didn't request mouse reporting (Codex,
+/// measured; any other non-mouse child equally). This function's own
+/// SGR-forwarding gate above is unaffected by that removal — it was always
+/// about what bytes a child understands, never about whether banto's
+/// terminal receives the event in the first place.
 fn update_mouse(
     state: &mut EmporiumState,
     app: &mut App,
@@ -3715,19 +3668,37 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_stays_on_when_focus_moves_to_a_pane_that_wants_sgr_mouse() {
+    fn left_click_on_another_pane_moves_focus_even_when_the_focused_pane_does_not_want_sgr_mouse() {
+        // The regression this guards: a child that never asks for SGR mouse
+        // (Codex, measured) must not be able to trap focus on its own pane.
+        // Host mouse capture is unconditional now (see `update_mouse`'s own
+        // doc), so the click always reaches here regardless of what the
+        // currently-focused child wants; hit-testing the target pane must
+        // not depend on `wants_sgr_mouse` either. Neither pane has a
+        // `Screen` here, so neither could want SGR even if asked.
         let mut state = EmporiumState::new(PrefixKey::default());
         state.size = (120, 40);
-        let key = SessionKey::from_id("sess-1");
-        state.stage = Stage::Solo(key.clone());
-        let mut screen = screen_sized_for_pane(&state);
-        screen.process(b"\x1b[?1003h\x1b[?1006h");
-        state.screens.insert(key.clone(), screen);
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker.clone()],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let mouse = click_inside_pane(&state);
 
-        let cmds = update(
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let tiles = stage_tiles(areas.pane, &state.stage);
+        let (_, worker_rect) = tiles.iter().find(|(key, _)| *key == worker).unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: worker_rect.x,
+            row: worker_rect.y,
+        };
+
+        update(
             &mut state,
             &mut app,
             &brigade,
@@ -3735,25 +3706,35 @@ mod tests {
             test_instant(),
         );
 
-        assert!(
-            !cmds
-                .iter()
-                .any(|c| matches!(c, Cmd::SetMouseCapture(false))),
-            "capture must stay on for a pane that wants mouse: {cmds:?}"
-        );
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 1),
+            _ => panic!("expected a Brigade stage"),
+        }
     }
 
     #[test]
-    fn mouse_capture_releases_when_focus_moves_to_a_pane_with_no_screen() {
+    fn sidebar_click_works_while_focus_is_on_a_pane_that_does_not_want_sgr_mouse() {
+        // Same regression, the sidebar side: a click there must reach
+        // `update_mouse`'s sidebar branch regardless of what the
+        // currently-focused pane wants — that branch itself never checked
+        // `state.focus` to begin with, but this pins the case that used to
+        // fail at the I/O boundary (capture released, event never arriving).
         let mut state = EmporiumState::new(PrefixKey::default());
         state.size = (120, 40);
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
-        let mut app = app_with(vec![]);
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
-        let mouse = click_inside_pane(&state);
 
-        let cmds = update(
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: areas.sidebar.x + 1,
+            row: areas.sidebar.y + 1,
+        };
+
+        update(
             &mut state,
             &mut app,
             &brigade,
@@ -3761,41 +3742,39 @@ mod tests {
             test_instant(),
         );
 
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
-        assert!(!state.mouse_capture_enabled);
+        assert_eq!(state.focus, Focus::Sidebar);
     }
 
     #[test]
-    fn mouse_capture_releases_when_the_already_focused_panes_own_output_disables_mouse_mode() {
+    fn sidebar_scroll_works_while_focus_is_on_a_pane_that_does_not_want_sgr_mouse() {
+        // `App::scroll` moves the viewport, not the selection, so a
+        // one-row viewport over several rows is what makes it observable.
         let mut state = EmporiumState::new(PrefixKey::default());
         state.size = (120, 40);
         let key = SessionKey::from_id("sess-1");
-        state.stage = Stage::Solo(key.clone());
+        state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        let mut screen = screen_sized_for_pane(&state);
-        screen.process(b"\x1b[?1003h\x1b[?1006h");
-        state.screens.insert(key.clone(), screen);
-        // Already focused on a pane that wants mouse: pre-sync to how a
-        // real sequence of events would have left this (see
-        // `armed_o_cycles_the_focused_pane`'s comment on the same line).
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
-        let mut app = app_with(vec![]);
+        let mut app = app_with((1..=5).map(|n| row(&format!("sess-{n}"))).collect());
+        app.set_viewport_height(1);
         let brigade = brigade_config();
+        let before = app.selected_in_viewport();
 
-        // No focus change here at all — the child's own output is what
-        // turns mouse reporting back off.
-        let cmds = update(
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: areas.sidebar.x,
+            row: areas.sidebar.y,
+        };
+
+        update(
             &mut state,
             &mut app,
             &brigade,
-            Event::PtyOutput {
-                key,
-                chunk: b"\x1b[?1003l".to_vec(),
-            },
+            Event::Input(InputEvent::Mouse(mouse)),
             test_instant(),
         );
 
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        assert_ne!(app.selected_in_viewport(), before);
     }
 
     #[test]
@@ -4401,11 +4380,6 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        // Neither pane has a `Screen` here, so `update`'s own mouse-capture
-        // sync would otherwise emit an incidental `Cmd::SetMouseCapture`
-        // this test isn't about — pre-sync it to match, same as a realistic
-        // sequence of events would have.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4442,8 +4416,6 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4473,8 +4445,6 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4529,8 +4499,6 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
@@ -5262,10 +5230,7 @@ mod tests {
             now,
         );
         assert_eq!(state.focus, Focus::Pane);
-        // The now-focused pane has no `Screen` at all (nothing spawned),
-        // so it can't want mouse reporting — banto releases its own
-        // capture, per `update_mouse_capture`.
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        assert!(cmds.is_empty());
 
         let cmds = update(
             &mut state,
@@ -5278,9 +5243,7 @@ mod tests {
             now,
         );
         assert_eq!(state.focus, Focus::Sidebar);
-        // Back at the sidebar, which always wants capture for its own
-        // click/scroll handling.
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(true)]);
+        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -5574,9 +5537,7 @@ mod tests {
             Stage::Brigade { focused, .. } => assert_eq!(*focused, 0),
             _ => panic!("expected a Brigade stage"),
         }
-        // Neither pane has a `Screen` here, so the newly-focused director
-        // pane can't want mouse reporting — banto releases its own capture.
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -5590,8 +5551,6 @@ mod tests {
             focused: 1,
         };
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();

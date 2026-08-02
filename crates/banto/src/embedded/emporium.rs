@@ -50,6 +50,7 @@ use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionI
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_activity;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
@@ -379,7 +380,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 deps.claude_home,
                 &handles,
             ));
-            let relay = gather_relay_observations(&state, deps.store, deps.claude_home);
+            let relay = gather_relay_observations(
+                &state,
+                deps.store,
+                deps.claude_home,
+                deps.codex_home,
+                app,
+            );
             events.push_back(Event::Tick { relay });
         }
 
@@ -477,8 +484,8 @@ fn shutdown_handles(
 }
 
 /// Execute one `Cmd`, returning any follow-up `Event`(s) — the only place
-/// that writes to a hosted session's stdin, spawns a process, touches the
-/// store, or toggles the host terminal's own mouse capture.
+/// that writes to a hosted session's stdin, spawns a process, or touches
+/// the store.
 fn execute_cmd(
     cmd: Cmd,
     deps: &Deps,
@@ -490,14 +497,6 @@ fn execute_cmd(
             if let Some(handle) = handles.get_mut(&key) {
                 handle.send_bytes(&bytes);
             }
-            Vec::new()
-        }
-        Cmd::SetMouseCapture(enabled) => {
-            // Best-effort: a failed terminal write here isn't worth
-            // aborting the whole event loop over (matches this module's
-            // other terminal-control calls — `setup_terminal`/
-            // `restore_terminal` are the only ones that propagate `Result`).
-            let _ = set_mouse_capture(enabled);
             Vec::new()
         }
         Cmd::ResizePty { key, rows, cols } => {
@@ -1016,10 +1015,22 @@ fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String>
 /// (unseen messages, live idle/busy status) — the store + live-session reads
 /// `engine::update_tick`'s decision logic needs, per member with a known
 /// session id and an open pane among the currently-staged ones.
+///
+/// Idle/busy detection is per-product, resolved via `app.row_for_id` — never
+/// guessed from the session id's own shape (a Claude Code id and a Codex
+/// thread id are both UUID strings with no reliable, future-proof way to
+/// tell them apart by form alone). A member whose product can't be resolved
+/// this way (not yet in the loaded row list) reports `None`, same as a
+/// Codex member when `codex_home` is absent: "unknown" is always the safe
+/// default here, never "idle" — see [`codex_activity::is_thread_idle`]'s doc
+/// for why manufacturing a false idle signal is the one outcome this must
+/// never produce.
 fn gather_relay_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+    app: &App,
 ) -> Vec<RelayObservation> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         return Vec::new();
@@ -1030,6 +1041,7 @@ fn gather_relay_observations(
         Err(_) => return Vec::new(),
     };
     let live = read_live_sessions(&claude_home.sessions_dir());
+    let now = SystemTime::now();
     let mut observations = Vec::new();
     for member in &members {
         let Some(session_id) = member.session_id.as_ref() else {
@@ -1043,12 +1055,18 @@ fn gather_relay_observations(
             .borrow()
             .has_unseen_brigade_messages(brigade_id, &member.token, member.role)
             .unwrap_or(false);
-        let is_idle_this_tick = live
-            .iter()
-            .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
-            .map(|entry| {
-                SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
-            });
+        let is_idle_this_tick = match app.row_for_id(&session_id.0).map(|row| row.agent) {
+            Some(AgentKind::ClaudeCode) => live
+                .iter()
+                .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+                .map(|entry| {
+                    SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
+                }),
+            Some(AgentKind::Codex) => {
+                codex_home.and_then(|home| codex_activity::is_thread_idle(home, &session_id.0, now))
+            }
+            None => None,
+        };
         observations.push(RelayObservation {
             token: member.token.clone(),
             key,
@@ -1414,25 +1432,6 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-/// The shell-side half of `Cmd::SetMouseCapture` (see
-/// `engine::update_mouse_capture`'s doc for when the core asks for this):
-/// released so the host terminal's own native text selection works over a
-/// pane whose child never enabled mouse reporting, re-acquired once focus
-/// moves somewhere that does (including the sidebar itself, which always
-/// wants it for its own click/scroll handling). Capture is the host
-/// terminal's own state, not any one pane's, so — unlike every other `Cmd`
-/// here — this never touches `handles`/a `SessionKey` at all; a fresh
-/// `io::stdout()` handle is all `execute!` needs, same as `setup_terminal`/
-/// `restore_terminal` already use.
-fn set_mouse_capture(enabled: bool) -> Result<()> {
-    if enabled {
-        execute!(io::stdout(), EnableMouseCapture)?;
-    } else {
-        execute!(io::stdout(), DisableMouseCapture)?;
-    }
-    Ok(())
-}
-
 /// Open the diagnostic input-event log when `BANTO_INPUT_LOG` is set —
 /// mirrors `crate::tui`'s own instrumentation (same env var, same
 /// `{ms} <prefix>: <message>` line format) line-for-line except for the
@@ -1624,7 +1623,7 @@ fn install_panic_hook() {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use banto_core::model::AgentKind;
+    use banto_core::model::{Activity, AgentKind, SessionRow};
     use banto_io::pty::mock::MockPtyHost;
 
     use super::*;
@@ -2306,6 +2305,221 @@ mod tests {
         );
 
         assert!(events.is_empty());
+    }
+
+    // --- relay observations: gather_relay_observations ---------------------
+
+    /// A minimal, correctly-attributed [`SessionRow`] for `id` — the "already
+    /// discovered" fact `gather_relay_observations` resolves a member's
+    /// product from, mirroring how `session::rows_from_metas` would have
+    /// built it.
+    fn test_row(id: &str, agent: AgentKind) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            agent,
+            title: None,
+            cwd: None,
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+            source_archived: false,
+        }
+    }
+
+    /// A staged Director ("dir", Claude) plus one Worker at
+    /// `worker_session_id`, whose product is `worker_agent` in both the
+    /// store's membership and the `App`'s row list — the shape
+    /// `gather_relay_observations` reads. `rows` are appended beyond the two
+    /// default ones for the "unresolved product" case, where the Worker's id
+    /// deliberately has no row at all.
+    fn staged_worker(
+        worker_session_id: &str,
+        worker_agent: Option<AgentKind>,
+    ) -> (RefCell<Store>, EmporiumState, App) {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId(worker_session_id.to_string())),
+            )
+            .unwrap();
+        store
+            .enqueue_brigade_message(brigade_id, "worker-1", BrigadeRole::Director, None, "hi")
+            .unwrap();
+
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: brigade_id,
+            panes: vec![
+                SessionKey::from_id("dir"),
+                SessionKey::from_id(worker_session_id),
+            ],
+            focused: 0,
+        };
+        let mut rows = vec![test_row("dir", AgentKind::ClaudeCode)];
+        if let Some(agent) = worker_agent {
+            rows.push(test_row(worker_session_id, agent));
+        }
+        let app = App::new(rows);
+        (RefCell::new(store), state, app)
+    }
+
+    fn unix_now() -> i64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn write_codex_log_row(codex_home: &Path, ts: i64, thread_id: &str) {
+        std::fs::create_dir_all(codex_home).unwrap();
+        let conn = rusqlite::Connection::open(codex_home.join("logs_2.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE logs (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
+                ts_nanos INTEGER NOT NULL, level TEXT NOT NULL, target TEXT NOT NULL, \
+                thread_id TEXT, process_uuid TEXT\
+            )",
+        )
+        .ok(); // no-op once the table exists
+        conn.execute(
+            "INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) \
+             VALUES (?1, 0, 'INFO', 'codex_core', ?2, NULL)",
+            rusqlite::params![ts, thread_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_codex_member_with_recent_log_activity_is_not_idle() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::Codex));
+        write_codex_log_row(codex_home.path(), unix_now() - 5, "w1");
+
+        let claude_home = tempfile::tempdir().unwrap();
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            Some(&CodexHome::new(codex_home.path().to_path_buf())),
+            &app,
+        );
+
+        let worker = observations
+            .iter()
+            .find(|o| o.token == "worker-1")
+            .expect("worker-1 has an open pane and a known session id");
+        assert_eq!(worker.is_idle_this_tick, Some(false));
+    }
+
+    #[test]
+    fn a_codex_member_quiet_past_the_threshold_is_idle() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::Codex));
+        write_codex_log_row(
+            codex_home.path(),
+            unix_now() - codex_activity::CODEX_IDLE_QUIET_PERIOD.as_secs() as i64 - 5,
+            "w1",
+        );
+
+        let claude_home = tempfile::tempdir().unwrap();
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            Some(&CodexHome::new(codex_home.path().to_path_buf())),
+            &app,
+        );
+
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, Some(true));
+    }
+
+    #[test]
+    fn a_claude_members_idle_detection_is_unchanged_by_the_codex_split() {
+        // Same live-file-based check as before this round, now reached via
+        // the AgentKind::ClaudeCode arm instead of being the only arm —
+        // covers both the alive-and-idle and the alive-and-busy cases.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        write_live_state(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+        );
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(
+            worker.is_idle_this_tick,
+            Some(true),
+            "this process's own pid is alive and the live file reports no busy status"
+        );
+    }
+
+    #[test]
+    fn a_claude_member_with_no_live_file_is_unknown_not_idle() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        // No sessions/<pid>.json written at all for "w1".
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, None);
+    }
+
+    #[test]
+    fn a_member_whose_product_cannot_be_resolved_is_unknown_never_idle() {
+        // The Worker has a live Claude-shaped session file AND a fresh Codex
+        // log row under the same id — an adversarial case showing that
+        // without a matching `App` row, neither signal is trusted; product
+        // must come from discovery, never be inferred from what data exists.
+        let claude_home = tempfile::tempdir().unwrap();
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", None); // no row for "w1" at all
+        write_live_state(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+        );
+        write_codex_log_row(codex_home.path(), unix_now() - 1, "w1");
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            Some(&CodexHome::new(codex_home.path().to_path_buf())),
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, None);
     }
 
     // --- worker model on resume: build_open_launch -------------------------

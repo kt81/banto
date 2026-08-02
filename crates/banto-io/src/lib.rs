@@ -4,6 +4,7 @@
 //!
 //! Module map:
 //! - [`claude_home`] the root Claude Code stores its state under, plus its subdirs
+//! - [`codex_activity`] whether a Codex session is busy or idle right now (the relay engine's Codex-side signal)
 //! - [`codex_home`] the root the Codex CLI stores its state under: threads/logs db, rollout tree
 //! - [`codex_liveness`] Codex session liveness via `logs_2.sqlite` (the Codex-side double-resume guard)
 //! - [`codex_trust`] advisory-only read of whether Codex has trusted banto's own SessionStart hook
@@ -19,6 +20,7 @@
 //! - [`watch`]   filesystem watching (notify) for live TUI updates
 
 pub mod claude_home;
+pub mod codex_activity;
 pub mod codex_home;
 pub mod codex_liveness;
 pub mod codex_trust;
