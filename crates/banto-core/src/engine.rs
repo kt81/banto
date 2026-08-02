@@ -407,7 +407,17 @@ pub struct EmporiumState {
     pub status: Option<String>,
     status_set_at: Option<Instant>,
     pub relay_states: HashMap<MemberToken, RelayState>,
-    pub last_forwarded_input: Option<Instant>,
+    /// When real operator input was last forwarded to each pane, keyed by
+    /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
+    /// only ever suppresses a nudge for the pane the operator is actually
+    /// typing into (`RELAY_INPUT_QUIET_PERIOD`'s whole point is protecting
+    /// mid-composition text from a spliced-in nudge); a shared field here
+    /// used to mean input to *any* pane silenced nudges to the *focused*
+    /// one, so switching to a different pane, typing there, then tabbing
+    /// back to a focused-but-untouched one kept it suppressed on someone
+    /// else's keystrokes. An entry is dropped when its pane unstages (see
+    /// [`Self::unstage`]) so a closed pane's key never accumulates here.
+    pub last_forwarded_input: HashMap<SessionKey, Instant>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
@@ -445,7 +455,7 @@ impl EmporiumState {
             status: None,
             status_set_at: None,
             relay_states: HashMap::new(),
-            last_forwarded_input: None,
+            last_forwarded_input: HashMap::new(),
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
             pending_membership: None,
@@ -488,6 +498,7 @@ impl EmporiumState {
     /// step it has no reason to know about.
     fn unstage(&mut self, key: &SessionKey) {
         self.stage.remove(key);
+        self.last_forwarded_input.remove(key);
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
         }
@@ -1174,7 +1185,7 @@ fn update_key(
         Focus::Pane => {
             if let Some(target) = state.stage.focused_key().cloned() {
                 let bytes = key_to_bytes(&key);
-                state.last_forwarded_input = Some(now);
+                state.last_forwarded_input.insert(target.clone(), now);
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
@@ -1277,7 +1288,7 @@ fn resolve_armed_prefix(
                 return Vec::new();
             };
             let bytes = key_to_bytes(&state.prefix.as_key_event());
-            state.last_forwarded_input = Some(now);
+            state.last_forwarded_input.insert(target.clone(), now);
             if bytes.is_empty() {
                 Vec::new()
             } else {
@@ -1876,7 +1887,7 @@ fn update_mouse(
                 .is_some_and(crate::screen::Screen::wants_sgr_mouse)
             {
                 if let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect)) {
-                    state.last_forwarded_input = Some(now);
+                    state.last_forwarded_input.insert(key.clone(), now);
                     return vec![Cmd::WritePty { key, bytes }];
                 }
             } else {
@@ -1996,7 +2007,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
         } else {
             normalized.into_bytes()
         };
-        state.last_forwarded_input = Some(now);
+        state.last_forwarded_input.insert(key.clone(), now);
         cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
     }
@@ -2441,7 +2452,7 @@ fn update_tick(
                 now,
                 obs.is_idle_this_tick,
                 is_focused,
-                state.last_forwarded_input,
+                state.last_forwarded_input.get(&obs.key).copied(),
                 obs.has_unseen,
             );
             if nudge {
@@ -4026,7 +4037,7 @@ mod tests {
             cmds.first(),
             Some(Cmd::WritePty { key: k, bytes }) if *k == key && bytes == b"a"
         ));
-        assert_eq!(state.last_forwarded_input, Some(now));
+        assert_eq!(state.last_forwarded_input.get(&key), Some(&now));
     }
 
     #[test]
@@ -4210,6 +4221,242 @@ mod tests {
             now,
         );
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+    }
+
+    /// Two-pane brigade (Director + Worker), both `Screen`s registered, `now`
+    /// and `app`/`brigade` fixtures ready — the shared shape the
+    /// `last_forwarded_input` per-pane tests below build on.
+    fn two_pane_brigade_focused_on(
+        focused: usize,
+    ) -> (
+        EmporiumState,
+        App,
+        BrigadeConfig,
+        SessionKey,
+        SessionKey,
+        Instant,
+    ) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.screens.insert(director.clone(), Screen::new(24, 80));
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), worker.clone()],
+            focused,
+        };
+        state.focus = Focus::Pane;
+        let app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        (state, app, brigade, director, worker, now)
+    }
+
+    fn writes_of(cmds: &[Cmd]) -> Vec<(SessionKey, Vec<u8>)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::WritePty { key, bytes } => Some((key.clone(), bytes.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_nudge_for_one_pane_is_not_suppressed_by_input_forwarded_to_a_different_pane() {
+        // The bug this round fixes: `last_forwarded_input` used to be one
+        // run-wide `Instant`, so typing into the focused Director pane
+        // silenced a nudge to the Worker the moment focus moved there —
+        // even though the Worker itself had never received a keystroke.
+        let (mut state, mut app, brigade, director, worker, mut now) =
+            two_pane_brigade_focused_on(0); // Director focused first
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(state.last_forwarded_input.contains_key(&director));
+        assert!(!state.last_forwarded_input.contains_key(&worker));
+
+        // Operator tabs over to the Worker pane, which has unseen mail and
+        // goes idle for two consecutive ticks.
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        now += Duration::from_millis(10);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(worker.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())],
+            "the Worker pane never received a keystroke; the Director's own \
+             recent input must not suppress its nudge"
+        );
+    }
+
+    #[test]
+    fn a_nudge_for_a_pane_is_still_suppressed_by_recent_input_to_that_same_pane() {
+        // Regression: the per-pane guard must still protect the pane the
+        // operator is actually composing into.
+        let (mut state, mut app, brigade, _director, worker, mut now) =
+            two_pane_brigade_focused_on(1); // Worker focused
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        now += Duration::from_millis(10);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+
+        assert!(
+            writes_of(&cmds).is_empty(),
+            "recent input to the focused pane itself must still suppress its own nudge"
+        );
+    }
+
+    #[test]
+    fn a_pane_no_longer_focused_is_not_suppressed_by_its_own_earlier_input() {
+        // `is_focused` already gates the quiet-period check, but this proves
+        // it holds through the per-pane storage change too: the Director
+        // pane keeps a very recent `last_forwarded_input` entry, yet once
+        // focus has moved off it, its own nudge is not suppressed by it.
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0); // Director focused first
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(state.last_forwarded_input.contains_key(&director));
+
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1; // focus moves to the Worker; Director is no longer focused
+        }
+        let observation = || RelayObservation {
+            token: "director".to_string(),
+            key: director.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        now += Duration::from_millis(10);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(director.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())],
+            "the Director pane is no longer focused, so its own earlier \
+             keystroke must not suppress its nudge"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_pane_drops_its_last_forwarded_input_entry() {
+        let (mut state, mut app, brigade, director, worker, now) = two_pane_brigade_focused_on(0);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(state.last_forwarded_input.contains_key(&director));
+
+        state.unstage(&director);
+
+        assert!(
+            !state.last_forwarded_input.contains_key(&director),
+            "a closed pane's key must not linger in the map forever"
+        );
+        // The still-open Worker pane's own (absent) entry is untouched.
+        assert!(!state.last_forwarded_input.contains_key(&worker));
     }
 
     /// Shared setup for the two tests below: a solo, focused pane, ticked
