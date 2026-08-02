@@ -77,11 +77,18 @@ impl Screen {
     /// (vt100-0.16.2 `src/screen.rs`, `enter_alternate_grid` /
     /// `alternate_grid: Grid::new(size, 0)`), so `set_scrollback` on it
     /// always clamps back to `0` no matter what's asked. That's the right
-    /// behavior on its own, not a case this method needs to special-case: a
-    /// full-screen app's alternate-screen content (Claude Code, Codex) has
-    /// no history behind it worth scrolling into — what would be "back" is
-    /// whatever was on screen before it took over, which is exactly what
-    /// the alternate screen exists to hide.
+    /// behavior on its own, not a case this method needs to special-case:
+    /// alternate-screen content has no history behind it worth scrolling
+    /// into — what would be "back" is whatever was on screen before the app
+    /// took over, which is exactly what the alternate screen exists to hide.
+    ///
+    /// Which children this actually applies to is worth not guessing at.
+    /// Codex was assumed to be one of them and is not: raw PTY captures
+    /// found no `\x1b[?1049h` at cold start or through a full turn, both
+    /// before and after the ConPTY passthrough switch
+    /// (`banto_io::pty::PortablePtyHost`'s doc). It scrolls in the normal
+    /// buffer like a shell does, which is the case this scrollback exists
+    /// to serve.
     pub fn scroll(&mut self, delta: isize) {
         let target = self.screen().scrollback().saturating_add_signed(delta);
         self.parser.screen_mut().set_scrollback(target);
