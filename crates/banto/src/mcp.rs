@@ -36,6 +36,8 @@ use banto_core::model::{
     BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
 };
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
 use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
 use banto_io::store::{Store, StoreError};
 
@@ -70,21 +72,28 @@ pub fn parse_role(token: &str) -> Option<BrigadeRole> {
 }
 
 /// Per-connection state: the caller's identity, the shared store, and
-/// `claude_home` — [`tool_brigade_status`] reports what each peer is *doing*,
-/// which lives in the `sessions/<pid>.json` files under it.
+/// `claude_home` and (when available) `codex_home` — [`tool_brigade_status`]
+/// checks each product's separate live-state source.
 struct ServerContext {
     identity: Identity,
     store: Store,
     claude_home: ClaudeHome,
+    codex_home: Option<CodexHome>,
 }
 
 /// Run the MCP server on stdio until the client closes the connection (EOF on
 /// stdin). Spawned by an embedded `claude` via `--mcp-config`.
-pub fn run_stdio_server(store: Store, identity: Identity, claude_home: ClaudeHome) -> Result<()> {
+pub fn run_stdio_server(
+    store: Store,
+    identity: Identity,
+    claude_home: ClaudeHome,
+    codex_home: Option<CodexHome>,
+) -> Result<()> {
     let mut ctx = ServerContext {
         identity,
         store,
         claude_home,
+        codex_home,
     };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -262,7 +271,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
     }
     out.push_str(&format!("\nYour {}s:\n", role_label(peer_role(role))));
     for peer in peers {
-        let activity = peer_activity(peer, &live);
+        let activity = peer_activity(peer, &live, ctx.codex_home.as_ref());
         let waiting = ctx
             .store
             .has_unseen_brigade_messages(brigade, &peer.token, peer.role)
@@ -285,10 +294,16 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
     tool_text(out, false)
 }
 
-/// What a peer is doing, as far as banto can tell: its live-state entry's
-/// status when one exists, otherwise the honest "banto has spawned it but
-/// its agent product hasn't named it yet" / "no live session" — never a guess.
-fn peer_activity(peer: &BrigadeMember, live: &[LiveSession]) -> String {
+/// What a peer is doing, as far as banto can tell: Claude's live-state entry
+/// reports its status, while Codex's log can establish only liveness, so its
+/// fallback deliberately says `running` rather than claiming idle or busy.
+/// A member without a session id is still starting; otherwise no live source
+/// means not running.
+fn peer_activity(
+    peer: &BrigadeMember,
+    live: &[LiveSession],
+    codex_home: Option<&CodexHome>,
+) -> String {
     let Some(session_id) = peer.session_id.as_ref() else {
         return "starting up (no session id yet)".to_string();
     };
@@ -298,6 +313,11 @@ fn peer_activity(peer: &BrigadeMember, live: &[LiveSession]) -> String {
     match entry {
         Some(entry) if !SysinfoProbe.is_alive(entry.pid) => "not running".to_string(),
         Some(entry) => entry.status.clone().unwrap_or_else(|| "idle".to_string()),
+        None if codex_home
+            .is_some_and(|home| is_thread_alive(home, &session_id.0, &SysinfoStartTime)) =>
+        {
+            "running".to_string()
+        }
         None => "not running".to_string(),
     }
 }
@@ -514,6 +534,37 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn codex_home_with_live_log(thread_id: &str, pid: u32) -> (tempfile::TempDir, CodexHome) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = CodexHome::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(home.root()).unwrap();
+        let conn = rusqlite::Connection::open(home.logs_db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE logs (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                ts INTEGER NOT NULL, \
+                ts_nanos INTEGER NOT NULL, \
+                level TEXT NOT NULL, \
+                target TEXT NOT NULL, \
+                thread_id TEXT, \
+                process_uuid TEXT\
+            )",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) \
+             VALUES (?1, 0, 'INFO', 'codex_core', ?2, ?3)",
+            rusqlite::params![now, thread_id, format!("pid:{pid}:fixture")],
+        )
+        .unwrap();
+        (dir, home)
+    }
 
     /// Builds a `ServerContext` from `(session, brigade, member, role)`
     /// launch-argv fields. When `brigade`/`member`/`role` are all given, also
@@ -547,6 +598,7 @@ mod tests {
             // see. `brigade_status_reports_a_live_peers_activity` writes
             // real live-state files into its own temp home instead.
             claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
+            codex_home: None,
         }
     }
 
@@ -686,6 +738,87 @@ mod tests {
             Some(BrigadeRole::Director),
         );
         ctx.claude_home = ClaudeHome::new(home.path().to_path_buf());
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".into())),
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &status_call());
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worker-1 — busy"), "got {text:?}");
+    }
+
+    #[test]
+    fn brigade_status_reports_a_live_codex_peer_as_running() {
+        let (_dir, codex_home) = codex_home_with_live_log("codex-worker", std::process::id());
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.codex_home = Some(codex_home);
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("codex-worker".into())),
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &status_call());
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worker-1 — running"), "got {text:?}");
+    }
+
+    #[test]
+    fn brigade_status_reports_a_dead_codex_peer_as_not_running() {
+        let (_dir, codex_home) = codex_home_with_live_log("codex-worker", u32::MAX);
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.codex_home = Some(codex_home);
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("codex-worker".into())),
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &status_call());
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worker-1 — not running"), "got {text:?}");
+    }
+
+    #[test]
+    fn brigade_status_keeps_claude_liveness_when_codex_home_is_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let pid = std::process::id();
+        std::fs::write(
+            home.path().join("sessions").join(format!("{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"w1","status":"busy"}}"#),
+        )
+        .unwrap();
+
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.claude_home = ClaudeHome::new(home.path().to_path_buf());
+        assert!(ctx.codex_home.is_none());
         ctx.store
             .add_brigade_member(
                 1,
