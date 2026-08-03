@@ -281,6 +281,11 @@ pub enum BrigadeRole {
     Director,
     /// Carries out the Director's instructions.
     Worker,
+    /// The retired elder called back in to arbitrate a Director/Worker
+    /// disagreement or an impasse — advises, never spawned by this build
+    /// (no summon path exists yet), addressable only by name, never a
+    /// broadcast recipient.
+    Goinkyo,
 }
 
 impl BrigadeRole {
@@ -289,20 +294,61 @@ impl BrigadeRole {
         match self {
             BrigadeRole::Director => "director",
             BrigadeRole::Worker => "worker",
+            BrigadeRole::Goinkyo => "goinkyo",
         }
     }
 
     /// Parse a persisted `role` token. `None` for anything other than
-    /// `"director"`/`"worker"` — every writer of this column goes through
-    /// [`Self::as_token`], which can only ever produce one of those two, so
-    /// an unrecognized value means the row did not come from banto's own
-    /// write path.
+    /// `"director"`/`"worker"`/`"goinkyo"` — every writer of this column
+    /// goes through [`Self::as_token`], which can only ever produce one of
+    /// those, so an unrecognized value means the row did not come from
+    /// banto's own write path.
     pub fn from_token(token: &str) -> Option<BrigadeRole> {
         match token {
             "director" => Some(BrigadeRole::Director),
             "worker" => Some(BrigadeRole::Worker),
+            "goinkyo" => Some(BrigadeRole::Goinkyo),
             _ => None,
         }
+    }
+
+    /// The single source of truth for banto's Director/Worker/Goinkyo
+    /// messaging rules: every role `self` can reach at all, paired with
+    /// whether that role is reached by broadcast (`to` omitted) or only by
+    /// naming a member of it. An exhaustive `match`, not a bare table, on
+    /// purpose — the guardrail a fourth role has to force open lives in
+    /// this one function being a `match`, not in what its arms return; a
+    /// bare constant table could grow a new role's row forgotten and no
+    /// compiler would say so. Everyone who cares which roles a role can
+    /// reach — `banto`'s `mcp::tool_brigade_status` (the roster shown to a
+    /// member), `mcp::validate_target` (what `to` may name), and
+    /// `briefing::peers_of` (`{peers}` in a launch briefing) — derives it
+    /// from here rather than re-deciding it independently, which is what
+    /// let the roster and the routing drift apart the first time a third
+    /// role existed to disagree about.
+    pub fn addressability(self) -> &'static [(BrigadeRole, bool)] {
+        match self {
+            BrigadeRole::Director => &[(BrigadeRole::Worker, true), (BrigadeRole::Goinkyo, false)],
+            BrigadeRole::Worker => &[(BrigadeRole::Director, true)],
+            BrigadeRole::Goinkyo => &[(BrigadeRole::Director, true)],
+        }
+    }
+
+    /// Whether `self` can reach `target` at all — by broadcast, by name, or
+    /// both. See [`Self::addressability`].
+    pub fn can_reach(self, target: BrigadeRole) -> bool {
+        self.addressability()
+            .iter()
+            .any(|(role, _)| *role == target)
+    }
+
+    /// The role `self`'s broadcast (`to` omitted in `send_to_peer`) reaches.
+    /// See [`Self::addressability`].
+    pub fn broadcast_target(self) -> BrigadeRole {
+        self.addressability()
+            .iter()
+            .find_map(|(role, is_broadcast)| is_broadcast.then_some(*role))
+            .expect("every BrigadeRole's addressability table names exactly one broadcast target")
     }
 }
 
@@ -468,5 +514,21 @@ mod tests {
         assert_eq!(humanize_size(512), "512 B");
         assert_eq!(humanize_size(12 * 1024), "12 KB");
         assert_eq!(humanize_size(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    }
+
+    #[test]
+    fn brigade_role_token_roundtrips_every_variant() {
+        for role in [
+            BrigadeRole::Director,
+            BrigadeRole::Worker,
+            BrigadeRole::Goinkyo,
+        ] {
+            assert_eq!(BrigadeRole::from_token(role.as_token()), Some(role));
+        }
+    }
+
+    #[test]
+    fn brigade_role_from_token_rejects_an_unrecognized_string() {
+        assert_eq!(BrigadeRole::from_token("sous-chef"), None);
     }
 }

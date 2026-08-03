@@ -48,7 +48,12 @@ pub(crate) fn with_codex_addendum(briefing: &str) -> String {
     format!("{briefing}\n\n{CODEX_ADDENDUM}")
 }
 
-/// The other members this one can address, newest roster from the store.
+/// The members this one can address, newest roster from the store — the
+/// same [`BrigadeRole::can_reach`] rule [`crate::mcp::validate_target`]
+/// gates actual delivery with and `tool_brigade_status` groups its roster
+/// by, not "every member whose role isn't mine": that would name a member
+/// this one could never actually reach once a third role exists that isn't
+/// mutually addressable with this one's own (e.g. a Worker and a Goinkyo).
 ///
 /// Read at launch rather than taken from the core's own view of the cell:
 /// `{peers}` has to name the members that exist *now*, which is later than
@@ -60,7 +65,7 @@ pub(crate) fn peers_of(store: &Store, brigade_id: BrigadeId, role: BrigadeRole) 
         .brigade_members(brigade_id)
         .unwrap_or_default()
         .into_iter()
-        .filter(|member| member.role != role)
+        .filter(|member| role.can_reach(member.role))
         .map(|member| member.token)
         .collect()
 }
@@ -113,6 +118,39 @@ mod tests {
         assert_eq!(
             render("peers: {peers}.", 1, "director", &[]),
             "peers: none yet."
+        );
+    }
+
+    #[test]
+    fn peers_of_only_names_members_this_role_can_actually_reach() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .add_brigade_member(brigade_id, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+
+        let mut director_peers = peers_of(&store, brigade_id, BrigadeRole::Director);
+        director_peers.sort();
+        assert_eq!(
+            director_peers,
+            vec!["goinkyo".to_string(), "worker-1".to_string()]
+        );
+
+        assert_eq!(
+            peers_of(&store, brigade_id, BrigadeRole::Worker),
+            vec!["director".to_string()],
+            "a Worker must never be told a Goinkyo is one of its peers"
+        );
+        assert_eq!(
+            peers_of(&store, brigade_id, BrigadeRole::Goinkyo),
+            vec!["director".to_string()],
+            "a Goinkyo must never be told a Worker is one of its peers"
         );
     }
 

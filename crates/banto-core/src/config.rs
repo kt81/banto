@@ -198,6 +198,13 @@ pub struct BrigadeConfig {
     /// how the mail works) rather than a work policy, which is the
     /// Director's to give.
     pub worker_prompt: String,
+    /// Role briefing appended to a Goinkyo's system prompt at launch. Same
+    /// substitutions and the same empty-string escape hatch as
+    /// [`Self::director_prompt`]/[`Self::worker_prompt`]. No `goinkyo_model`
+    /// counterpart to [`Self::worker_model`] exists yet — nothing spawns a
+    /// Goinkyo in this build, so a model setting for one would have no
+    /// reader.
+    pub goinkyo_prompt: String,
 }
 
 /// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
@@ -252,6 +259,25 @@ rather than closing the gap with a guess. Reasons travel with \
 conclusions; the Director cannot see what you read. The work is yours \
 to do — do not hand off to sub-agents.";
 
+/// See [`BrigadeConfig::goinkyo_prompt`].
+const DEFAULT_GOINKYO_PROMPT: &str = "\
+You are the Goinkyo of banto brigade {brigade} — the retired elder this \
+shop calls back in. You are here because the Director and a Worker \
+disagree, or because the Director is stuck. You are not running the rest \
+of the time, you hold nothing from before this moment, and you have no \
+stake in what either of them concluded. That is the whole reason you \
+were called.
+
+Read the source yourself. The Director's account of the disagreement is \
+not the evidence — the Worker's own words and the code are. Where the \
+two accounts differ, say which one the code supports; where neither \
+does, say that instead of picking a side.
+
+You advise, you do not take the work over. The moment you start \
+changing things you are a party to the argument rather than the one who \
+can see it. Answer the Director with send_to_peer: say what you would \
+do, why, and what would change your mind.";
+
 impl Default for BrigadeConfig {
     fn default() -> Self {
         Self {
@@ -262,6 +288,7 @@ impl Default for BrigadeConfig {
             relay: RelayMode::Auto,
             director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
             worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
+            goinkyo_prompt: DEFAULT_GOINKYO_PROMPT.to_string(),
         }
     }
 }
@@ -278,6 +305,7 @@ impl BrigadeConfig {
         let template = match role {
             BrigadeRole::Director => &self.director_prompt,
             BrigadeRole::Worker => &self.worker_prompt,
+            BrigadeRole::Goinkyo => &self.goinkyo_prompt,
         };
         (!template.is_empty()).then_some(template.as_str())
     }
@@ -650,6 +678,35 @@ mod tests {
             Some("lead {peers}")
         );
         assert_eq!(config.brigade.prompt_for(BrigadeRole::Worker), None);
+    }
+
+    #[test]
+    fn brigade_goinkyo_prompt_defaults_to_something_that_substitutes_and_names_the_tool() {
+        let config = parse("");
+        let goinkyo = config.brigade.prompt_for(BrigadeRole::Goinkyo).unwrap();
+        assert!(goinkyo.contains("{brigade}"));
+        assert!(goinkyo.contains("send_to_peer"));
+    }
+
+    #[test]
+    fn brigade_goinkyo_prompt_is_overridable_and_an_empty_one_launches_with_no_flag() {
+        let overridden = parse("[brigade]\ngoinkyo_prompt = \"advise on {brigade}\"\n");
+        assert_eq!(
+            overridden.brigade.prompt_for(BrigadeRole::Goinkyo),
+            Some("advise on {brigade}")
+        );
+
+        let cleared = parse("[brigade]\ngoinkyo_prompt = \"\"\n");
+        assert_eq!(cleared.brigade.prompt_for(BrigadeRole::Goinkyo), None);
+    }
+
+    #[test]
+    fn an_existing_config_toml_without_goinkyo_prompt_gets_the_default() {
+        // A file written before `goinkyo_prompt` existed must keep loading:
+        // the new field silently takes its own default rather than erroring
+        // or leaving the Goinkyo briefing empty.
+        let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
+        assert_eq!(config.brigade.goinkyo_prompt, DEFAULT_GOINKYO_PROMPT);
     }
 
     #[test]
