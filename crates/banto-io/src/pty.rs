@@ -78,17 +78,44 @@ pub trait Hangup: Send {
 }
 
 /// Spawns a child inside a PTY.
+///
+/// `env` is *added* to the environment banto itself is running under, not a
+/// replacement for it — a child agent needs the operator's own `PATH`, home
+/// and terminal settings to behave like one they started themselves.
 pub trait PtyHost {
-    fn open(&self, argv: &[String], cwd: Option<&Path>, rows: u16, cols: u16) -> Result<PtyIo>;
+    fn open(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtyIo>;
 }
 
-/// [`PtyHost`] backed by `portable-pty` (ConPTY on Windows, a Unix pty
-/// elsewhere).
+/// [`PtyHost`] backed by `portable-pty-psmux` (ConPTY on Windows, a Unix pty
+/// elsewhere) — a fork of `portable-pty`, not the crates.io original: it
+/// requests `PSEUDOCONSOLE_PASSTHROUGH_MODE` on Windows 11 22H2+ (build
+/// ≥22621), which makes ConPTY relay a child's VT bytes verbatim instead of
+/// reinterpreting them through its own legacy Win32 console buffer and
+/// re-serializing its own reconstruction. Without it, a child that reserves
+/// a footer via DECSTBM (Codex does) never gets a single line into
+/// `vt100`'s scrollback, because ConPTY's own re-serialization uses a
+/// narrow scroll region unconditionally — measured 2026-08-02 with a
+/// controlled A/B (same Codex binary, same prompt, only the PTY crate
+/// swapped): scrollback stayed 0 without this flag, reached 191 with it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PortablePtyHost;
 
 impl PtyHost for PortablePtyHost {
-    fn open(&self, argv: &[String], cwd: Option<&Path>, rows: u16, cols: u16) -> Result<PtyIo> {
+    fn open(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtyIo> {
         let pair = native_pty_system().openpty(PtySize {
             rows,
             cols,
@@ -102,6 +129,9 @@ impl PtyHost for PortablePtyHost {
         }
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -298,6 +328,7 @@ pub mod mock {
             &self,
             _argv: &[String],
             _cwd: Option<&Path>,
+            _env: &[(String, String)],
             _rows: u16,
             _cols: u16,
         ) -> Result<PtyIo> {

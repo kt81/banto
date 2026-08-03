@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 use banto_core::config::{AgentBinaries, OpenerMode};
 pub use banto_core::model::SessionToOpen;
-use banto_core::model::{AgentKind, SessionId};
+use banto_core::model::{AgentKind, BrigadeRole, SessionId};
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{self, ProcessStartTime};
 use banto_io::opener::{
@@ -306,11 +306,12 @@ pub(crate) fn new_session_startup_message(cwd: &Path) -> String {
 /// spanning every product: `append_system_prompt`/`mcp_config` are Claude
 /// Code concepts with no Codex equivalent (Codex 0.145's own `--help` has
 /// no `--append-system-prompt`; its MCP config goes through
-/// `-c mcp_servers.…` instead), and brigades — the only callers of either
-/// field — are Claude-only for now. A struct with both fields left `None`
-/// for Codex would rely on every caller remembering to leave them unset; an
-/// enum makes a Codex launch physically unable to carry them, whether or
-/// not a caller remembers.
+/// `-c mcp_servers.…` instead — see [`CodexBrigade`] for how a Codex launch
+/// carries the same brigade identity by a different mechanism). A struct
+/// with both products' fields left `None` for whichever one doesn't apply
+/// would rely on every caller remembering to leave them unset; an enum
+/// makes a launch physically unable to carry the other product's fields,
+/// whether or not a caller remembers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentLaunch {
     Claude {
@@ -328,7 +329,33 @@ pub(crate) enum AgentLaunch {
         resume: Option<String>,
         model: Option<String>,
         cwd: PathBuf,
+        /// `None` outside brigade context (an ordinary resume/new session);
+        /// `Some` adds the `-c` overrides that make this launch a brigade
+        /// member — see [`CodexBrigade`].
+        brigade: Option<CodexBrigade>,
     },
+}
+
+/// Brigade identity for a Codex launch, carried entirely as `-c` overrides
+/// instead of `~/.codex/config.toml` — measured 2026-07-28
+/// (`docs/notes/codex-briefing-spike.md`): a `-c`-registered MCP server
+/// can't persist trust, and its tool-approval bypass degrades silently
+/// (not an error) the moment a launch omits it, so both are supplied fresh
+/// on every launch rather than written once to disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexBrigade {
+    /// banto's own executable, re-invoked both as the `SessionStart` hook's
+    /// command and as banto's own MCP server — see
+    /// [`session_start_hook_override`]'s doc for why this is the *only*
+    /// field of this struct the hook override may ever depend on.
+    pub(crate) exe: PathBuf,
+    pub(crate) brigade_id: i64,
+    pub(crate) token: String,
+    pub(crate) role: BrigadeRole,
+    /// This member's own session id, once discovered — `None` for a
+    /// freshly-spawned Worker still awaiting one (mirrors
+    /// `embedded::emporium::write_mcp_config`'s `--session` fallback).
+    pub(crate) session: Option<String>,
 }
 
 /// Resolve the binary to invoke for `agent`: the operator's own
@@ -346,13 +373,170 @@ pub(crate) fn agent_binary(agent: AgentKind, binaries: &AgentBinaries) -> String
     }
 }
 
+/// Escapes `\` and `"` for embedding in the body of a TOML basic string —
+/// the content between the quotes, not the quotes themselves, which every
+/// call site below still writes explicitly. Order matters — backslashes
+/// first, then quotes — or a backslash this function just inserted to
+/// escape a `"` would itself get escaped a second time by a later pass.
+///
+/// [`forward_slash_path`] already eliminates backslashes from the one value
+/// here that would otherwise be full of them (a Windows path), so both
+/// passes below are defense against a byte class none of banto's own
+/// current inputs (a forward-slash path, an `_mcp` argument) are known to
+/// contain, not a load-bearing part of any of them. Letting a stray `\` or
+/// `"` through unescaped would silently corrupt the outer TOML
+/// `command="..."`/`args=[...]` value it sits inside rather than error, so
+/// it stays in as cheap insurance.
+fn toml_basic_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Normalizes a path to forward slashes for embedding in a `-c` override.
+/// Codex's own `-c` value parser accepts both separators on Windows
+/// (measured 2026-07-28, docs/notes/codex-briefing-spike.md) — forward
+/// slashes are used unconditionally rather than backslashes-plus-escaping
+/// because the double-escaping trap is easy to get wrong by hand (measured
+/// the same day: a one-off manual test slipped to *four* backslashes and
+/// happened to still work only because Windows itself tolerates the extra
+/// pair — a mistake structurally impossible once there's nothing left to
+/// double-escape).
+pub(crate) fn forward_slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `exe` (already forward-slash-normalized) can be embedded bare as
+/// the hook command's first token. Codex splits `command` on whitespace
+/// itself before spawning it, and a space anywhere in that first token
+/// breaks the split — quoting was tried as the fix (worker-3, measured
+/// 2026-07-29, `docs/notes/codex-briefing-spike.md`) and made the hook fail
+/// *unconditionally*, quoted or not, space or no space: there is no working
+/// quoting scheme for token 0. Every caller of
+/// [`session_start_hook_override`] must check this first and, when it
+/// returns `false`, skip the hook `-c` entirely — emitting a command that
+/// can never fire trades a working briefing for a bare "SessionStart
+/// Failed" in the pane and nothing more useful than that.
+pub(crate) fn hook_command_is_launchable(exe: &str) -> bool {
+    !exe.contains(' ')
+}
+
+/// The `-c hooks.SessionStart=...` override that makes banto's own
+/// briefing hook fire. Depends on nothing but `exe` — no brigade id, member
+/// token, role, or session id — because Codex keys hook trust off a hash of
+/// this exact command string (measured 2026-07-28): one differing byte
+/// between two members, or between two launches of the same member, drops
+/// that member back to untrusted, and an untrusted hook is skipped with no
+/// warning at all — not an error, not a log line. `matcher`/`timeout_sec`
+/// are spelled out explicitly rather than left to Codex's own defaults for
+/// the same reason: a future default change would shift the hash under us
+/// with no visible cause either.
+///
+/// `exe` is embedded bare, with no quoting at all, unlike an earlier
+/// version of this function that wrapped it in literal `"` characters to
+/// protect a path containing a space: that was measured (worker-3,
+/// 2026-07-29) to break the hook regardless of the space, quoted or not —
+/// there is no working fix here, only [`hook_command_is_launchable`]
+/// deciding up front whether to call this function at all. `_hook` is a
+/// fixed literal with no spaces, so it was never the problem.
+///
+/// `pub(crate)` specifically so [`crate::codex_trust`] can call this same
+/// function rather than reconstruct its own copy of the string: the whole
+/// point of `codex-trust` is to show the operator, in a standalone `codex`
+/// session with nothing else running, the *exact* hook they're about to
+/// trust everywhere else. A hand-copied second implementation would drift
+/// the moment either one changed, and the two need not even land in the
+/// same commit for that to happen quietly.
+pub(crate) fn session_start_hook_override(exe: &str) -> String {
+    let command = toml_basic_string(&format!("{exe} _hook"));
+    format!(
+        "hooks.SessionStart=[{{matcher=\"\",hooks=[{{type=\"command\",timeout_sec=600,command=\"{command}\"}}]}}]"
+    )
+}
+
+/// `-c mcp_servers.banto.command=...`: banto re-invoked as its own MCP
+/// server. Same `exe` as [`session_start_hook_override`], but *not*
+/// quote-wrapped: `command`/`args` here are structured TOML fields Codex
+/// hands to its own process spawner directly, never re-split by a shell the
+/// way the hook's packed command string is (measured 2026-07-28) — wrapping
+/// them anyway is unverified and not worth risking on a field this one
+/// isn't hash-gated, so the constraint here stays only "correct", not
+/// "byte-stable".
+fn mcp_server_command_override(exe: &str) -> String {
+    format!("mcp_servers.banto.command=\"{}\"", toml_basic_string(exe))
+}
+
+/// `-c mcp_servers.banto.args=...`: the `_mcp` argv this member's server
+/// runs with — the brigade-identifying half. Unlike the two overrides
+/// above, this one *is* meant to differ by member (`--member`/`--role`) and
+/// by launch (`--session`, once discovered) — matches
+/// `embedded::emporium::write_mcp_config`'s existing `--role` spelling
+/// (`"director"`/`"worker"`) so a Codex member's identity resolves through
+/// [`crate::mcp`] the same way a Claude one's does.
+fn mcp_server_args_override(brigade: &CodexBrigade) -> String {
+    let role = match brigade.role {
+        BrigadeRole::Director => "director",
+        BrigadeRole::Worker => "worker",
+    };
+    let mut args = vec![
+        "_mcp".to_string(),
+        "--brigade".to_string(),
+        brigade.brigade_id.to_string(),
+        "--member".to_string(),
+        brigade.token.clone(),
+        "--role".to_string(),
+        role.to_string(),
+    ];
+    if let Some(session) = &brigade.session {
+        args.push("--session".to_string());
+        args.push(session.clone());
+    }
+    let rendered = args
+        .iter()
+        .map(|arg| format!("\"{}\"", toml_basic_string(arg)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("mcp_servers.banto.args=[{rendered}]")
+}
+
+/// `-c mcp_servers.banto.default_tools_approval_mode="approve"`: bypasses
+/// the tool-approval prompt for every tool this server offers. Repeated on
+/// every launch, deliberately, never written to `~/.codex/config.toml`: a
+/// `-c`-registered MCP server can't persist trust at all, and (measured
+/// 2026-07-28) the bypass itself degrades silently — no error, no
+/// warning — the moment a launch leaves it off.
+const MCP_SERVER_APPROVAL_OVERRIDE: &str =
+    "mcp_servers.banto.default_tools_approval_mode=\"approve\"";
+
+impl CodexBrigade {
+    /// The `-c` overrides this member's launch adds, in the order
+    /// [`AgentLaunch::argv`] must emit them — see each override function's
+    /// own doc for why this specific one and not a different shape. Normally
+    /// four; three when [`hook_command_is_launchable`] rejects `exe` — the
+    /// hook override is left out entirely rather than emitted broken (see
+    /// that function's own doc). The MCP overrides are unaffected either
+    /// way: Codex hands `mcp_servers.banto.*` to its own process spawner
+    /// directly rather than splitting them on whitespace itself, so a space
+    /// in `exe` is no obstacle for those.
+    fn overrides(&self) -> Vec<String> {
+        let exe = forward_slash_path(&self.exe);
+        let mut overrides = Vec::with_capacity(4);
+        if hook_command_is_launchable(&exe) {
+            overrides.push(session_start_hook_override(&exe));
+        }
+        overrides.push(mcp_server_command_override(&exe));
+        overrides.push(mcp_server_args_override(self));
+        overrides.push(MCP_SERVER_APPROVAL_OVERRIDE.to_string());
+        overrides
+    }
+}
+
 impl AgentLaunch {
     /// Render as `binary`'s own argv (see [`agent_binary`] for resolving
     /// it). Claude's fixed order is the one every existing call site already
     /// agreed on before this type existed: `--resume`, then `--model`, then
     /// `--append-system-prompt`, then `--mcp-config`. Codex's: the `resume
     /// <uuid>` subcommand (or nothing, for a fresh launch), then `-m`, then
-    /// `-C <cwd>` last, always present.
+    /// brigade `-c` overrides (if any — see [`CodexBrigade::overrides`]),
+    /// then `-C <cwd>` last, always present.
     pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
         let mut argv = vec![binary.to_string()];
         match self {
@@ -379,7 +563,12 @@ impl AgentLaunch {
                     argv.push(path.to_string_lossy().into_owned());
                 }
             }
-            AgentLaunch::Codex { resume, model, cwd } => {
+            AgentLaunch::Codex {
+                resume,
+                model,
+                cwd,
+                brigade,
+            } => {
                 if let Some(id) = resume {
                     argv.push("resume".to_string());
                     argv.push(id.clone());
@@ -387,6 +576,12 @@ impl AgentLaunch {
                 if let Some(model) = model {
                     argv.push("-m".to_string());
                     argv.push(model.clone());
+                }
+                if let Some(brigade) = brigade {
+                    for value in brigade.overrides() {
+                        argv.push("-c".to_string());
+                        argv.push(value);
+                    }
                 }
                 argv.push("-C".to_string());
                 argv.push(cwd.to_string_lossy().into_owned());
@@ -419,6 +614,7 @@ pub(crate) fn inplace_argv(
             resume: session_id.map(str::to_string),
             model: None,
             cwd: cwd.to_path_buf(),
+            brigade: None,
         },
     };
     launch.argv(&agent_binary(agent, binaries))
@@ -571,6 +767,7 @@ fn wrap_argv(
             resume: Some(session_id.to_string()),
             model: None,
             cwd: cwd.to_path_buf(),
+            brigade: None,
         },
     };
     argv.extend(launch.argv(&agent_binary(agent, binaries)));
@@ -1069,6 +1266,7 @@ mod tests {
             resume: None,
             model: None,
             cwd: PathBuf::from("/work/alpha"),
+            brigade: None,
         };
         assert_eq!(
             launch.argv("codex"),
@@ -1082,6 +1280,7 @@ mod tests {
             resume: Some("codex-uuid-1".to_string()),
             model: Some("o3".to_string()),
             cwd: PathBuf::from("/work/alpha"),
+            brigade: None,
         };
         assert_eq!(
             launch.argv("codex"),
@@ -1095,6 +1294,158 @@ mod tests {
                 "/work/alpha",
             ]
             .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_codex_brigade_inserts_four_overrides_between_model_and_cwd() {
+        let launch = AgentLaunch::Codex {
+            resume: None,
+            model: None,
+            cwd: PathBuf::from("/work/alpha"),
+            brigade: Some(CodexBrigade {
+                exe: PathBuf::from("/opt/banto/banto"),
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                role: BrigadeRole::Worker,
+                session: None,
+            }),
+        };
+        assert_eq!(
+            launch.argv("codex"),
+            [
+                "codex",
+                "-c",
+                "hooks.SessionStart=[{matcher=\"\",hooks=[{type=\"command\",timeout_sec=600,command=\"/opt/banto/banto _hook\"}]}]",
+                "-c",
+                "mcp_servers.banto.command=\"/opt/banto/banto\"",
+                "-c",
+                "mcp_servers.banto.args=[\"_mcp\",\"--brigade\",\"1\",\"--member\",\"worker-1\",\"--role\",\"worker\"]",
+                "-c",
+                "mcp_servers.banto.default_tools_approval_mode=\"approve\"",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_codex_without_a_brigade_never_emits_any_dash_c_override() {
+        // Regression: adding the `brigade` field must not perturb a single
+        // byte of an ordinary (non-brigade) Codex launch.
+        let launch = AgentLaunch::Codex {
+            resume: Some("codex-uuid-1".to_string()),
+            model: Some("o3".to_string()),
+            cwd: PathBuf::from("/work/alpha"),
+            brigade: None,
+        };
+        assert!(!launch.argv("codex").contains(&"-c".to_string()));
+    }
+
+    #[test]
+    fn codex_brigade_overrides_normalize_a_windows_exe_path_to_forward_slashes() {
+        // Pins the exact `-c` text, not just "it round-trips": hook trust
+        // is a hash of overrides()[0], so this string's shape must not
+        // drift by even a byte once it lands (see
+        // `session_start_hook_override`'s doc).
+        let brigade = CodexBrigade {
+            exe: PathBuf::from(r#"C:\Users\kt81\banto-dogfood\banto.exe"#),
+            brigade_id: 1,
+            token: "director".to_string(),
+            role: BrigadeRole::Director,
+            session: None,
+        };
+        let overrides = brigade.overrides();
+        assert_eq!(
+            overrides[0],
+            r#"hooks.SessionStart=[{matcher="",hooks=[{type="command",timeout_sec=600,command="C:/Users/kt81/banto-dogfood/banto.exe _hook"}]}]"#
+        );
+        assert_eq!(
+            overrides[1],
+            r#"mcp_servers.banto.command="C:/Users/kt81/banto-dogfood/banto.exe""#
+        );
+    }
+
+    #[test]
+    fn codex_brigade_omits_the_hook_override_when_the_exe_path_contains_a_space() {
+        // The measured failure mode this guards: quoting doesn't save a
+        // spaced path either (see `hook_command_is_launchable`'s doc) — the
+        // only fix left is to never emit a hook `-c` that can never fire.
+        // The MCP overrides still go out: those aren't split on whitespace
+        // by Codex, so the space is no obstacle for them.
+        let brigade = CodexBrigade {
+            exe: PathBuf::from(r#"C:\Program Files\banto\banto.exe"#),
+            brigade_id: 1,
+            token: "director".to_string(),
+            role: BrigadeRole::Director,
+            session: None,
+        };
+        let overrides = brigade.overrides();
+        assert_eq!(overrides.len(), 3);
+        assert!(!overrides.iter().any(|o| o.contains("SessionStart")));
+        assert_eq!(
+            overrides[0],
+            r#"mcp_servers.banto.command="C:/Program Files/banto/banto.exe""#
+        );
+    }
+
+    #[test]
+    fn toml_basic_string_escapes_backslash_before_quote_not_after() {
+        // A literal `"` must become `\"`, not `\\"` — proves the two
+        // replace passes run in the order the doc promises.
+        assert_eq!(toml_basic_string(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(toml_basic_string(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn codex_brigade_hook_and_mcp_command_overrides_are_identical_across_members() {
+        // Hook trust is a hash of overrides()[0]'s exact text (see its own
+        // doc) — it must not vary with brigade id, token, role, or session,
+        // or every member drops back to untrusted with no warning at all.
+        let director = CodexBrigade {
+            exe: PathBuf::from("/opt/banto/banto"),
+            brigade_id: 1,
+            token: "director".to_string(),
+            role: BrigadeRole::Director,
+            session: Some("dir-session".to_string()),
+        };
+        let worker = CodexBrigade {
+            exe: PathBuf::from("/opt/banto/banto"),
+            brigade_id: 7,
+            token: "worker-1".to_string(),
+            role: BrigadeRole::Worker,
+            session: None,
+        };
+        assert_eq!(director.overrides()[0], worker.overrides()[0]);
+        // The MCP `command` override shares the same reasoning, even though
+        // it isn't hash-gated.
+        assert_eq!(director.overrides()[1], worker.overrides()[1]);
+        // The identity-carrying `args` override, and only that one, differs.
+        assert_ne!(director.overrides()[2], worker.overrides()[2]);
+        assert_eq!(director.overrides()[3], worker.overrides()[3]);
+    }
+
+    #[test]
+    fn codex_brigade_mcp_args_include_session_only_when_known() {
+        let without_session = CodexBrigade {
+            exe: PathBuf::from("/opt/banto/banto"),
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            role: BrigadeRole::Worker,
+            session: None,
+        };
+        let with_session = CodexBrigade {
+            session: Some("w1-session".to_string()),
+            ..without_session.clone()
+        };
+        assert_eq!(
+            without_session.overrides()[2],
+            "mcp_servers.banto.args=[\"_mcp\",\"--brigade\",\"1\",\"--member\",\"worker-1\",\"--role\",\"worker\"]"
+        );
+        assert_eq!(
+            with_session.overrides()[2],
+            "mcp_servers.banto.args=[\"_mcp\",\"--brigade\",\"1\",\"--member\",\"worker-1\",\"--role\",\"worker\",\"--session\",\"w1-session\"]"
         );
     }
 

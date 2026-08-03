@@ -28,7 +28,7 @@ use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
 };
 
-use super::{Store, StoreError, system_time_to_unix_ms};
+use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 
 impl Store {
     pub fn create_brigade(&self, name: &str) -> Result<BrigadeId, StoreError> {
@@ -191,20 +191,12 @@ impl Store {
     /// worker-count clamp of 1..=8 guarantees).
     pub fn brigade_members(&self, brigade_id: BrigadeId) -> Result<Vec<BrigadeMember>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT member_token, role, session_id FROM brigade_members
+            "SELECT member_token, role, session_id, briefed_at_ms, briefed_session_id
+             FROM brigade_members
              WHERE brigade_id = ?1
              ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, member_token",
         )?;
-        let rows = stmt.query_map([brigade_id], |row| {
-            let token: String = row.get(0)?;
-            let role: String = row.get(1)?;
-            let session_id: Option<String> = row.get(2)?;
-            Ok(BrigadeMember {
-                token,
-                role: BrigadeRole::from_token(&role),
-                session_id: session_id.map(SessionId),
-            })
-        })?;
+        let rows = stmt.query_map([brigade_id], brigade_member_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -216,21 +208,39 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT member_token, role, session_id FROM brigade_members
+                "SELECT member_token, role, session_id, briefed_at_ms, briefed_session_id
+                 FROM brigade_members
                  WHERE brigade_id = ?1 AND member_token = ?2",
                 params![brigade_id, token],
-                |row| {
-                    let token: String = row.get(0)?;
-                    let role: String = row.get(1)?;
-                    let session_id: Option<String> = row.get(2)?;
-                    Ok(BrigadeMember {
-                        token,
-                        role: BrigadeRole::from_token(&role),
-                        session_id: session_id.map(SessionId),
-                    })
-                },
+                brigade_member_from_row,
             )
             .optional()?)
+    }
+
+    /// Records that `banto _hook` reached this member during `session_id` —
+    /// the canary `docs/notes/codex-briefing-spike.md` exists for: every
+    /// failure mode the spike measured for a Codex member's briefing
+    /// (deferred tool, unapproved MCP call, untrusted hook) fails *silently*,
+    /// so "the hook fired at all" has to be observable some other way. Not
+    /// tied to a briefing template actually existing — even a role with an
+    /// empty (disabled) prompt still proves the hook reached it, which is
+    /// exactly the fact worth keeping distinguishable from "never fired".
+    /// A `token` this brigade no longer has is a no-op: nothing to record
+    /// against, not an error (the hook that calls this must never fail on
+    /// its account — see `crate::hook`'s module doc).
+    pub fn record_briefing(
+        &self,
+        brigade_id: BrigadeId,
+        token: &str,
+        session_id: &SessionId,
+        at: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE brigade_members SET briefed_at_ms = ?1, briefed_session_id = ?2
+             WHERE brigade_id = ?3 AND member_token = ?4",
+            params![system_time_to_unix_ms(at), session_id.0, brigade_id, token],
+        )?;
+        Ok(())
     }
 
     /// Returns the brigade a session belongs to, its token, and its
@@ -429,6 +439,23 @@ impl Store {
     }
 }
 
+/// Shared row mapping for [`Store::brigade_members`]/[`Store::brigade_member`]
+/// — both `SELECT`s name the same five columns in the same order.
+fn brigade_member_from_row(row: &rusqlite::Row) -> rusqlite::Result<BrigadeMember> {
+    let token: String = row.get(0)?;
+    let role: String = row.get(1)?;
+    let session_id: Option<String> = row.get(2)?;
+    let briefed_at_ms: Option<i64> = row.get(3)?;
+    let briefed_session_id: Option<String> = row.get(4)?;
+    Ok(BrigadeMember {
+        token,
+        role: BrigadeRole::from_token(&role),
+        session_id: session_id.map(SessionId),
+        briefed_at: briefed_at_ms.map(unix_ms_to_system_time),
+        briefed_session_id: briefed_session_id.map(SessionId),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,16 +512,22 @@ mod tests {
                     token: "director".to_string(),
                     role: BrigadeRole::Director,
                     session_id: Some(sid("dir")),
+                    briefed_at: None,
+                    briefed_session_id: None,
                 },
                 BrigadeMember {
                     token: "worker-1".to_string(),
                     role: BrigadeRole::Worker,
                     session_id: Some(sid("w1")),
+                    briefed_at: None,
+                    briefed_session_id: None,
                 },
                 BrigadeMember {
                     token: "worker-2".to_string(),
                     role: BrigadeRole::Worker,
                     session_id: Some(sid("w2")),
+                    briefed_at: None,
+                    briefed_session_id: None,
                 },
             ]
         );
@@ -570,6 +603,31 @@ mod tests {
 
         let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
         assert_eq!(member.session_id, Some(sid("w1")));
+    }
+
+    #[test]
+    fn record_briefing_sets_both_columns_and_is_a_noop_for_an_unknown_token() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+            .unwrap();
+
+        let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        assert_eq!(member.briefed_at, None);
+        assert_eq!(member.briefed_session_id, None);
+
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1000);
+        store
+            .record_briefing(br, "worker-1", &sid("w1"), at)
+            .unwrap();
+
+        let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        assert_eq!(member.briefed_at, Some(at));
+        assert_eq!(member.briefed_session_id, Some(sid("w1")));
+
+        // A token this brigade doesn't have: not an error, nothing to record.
+        store.record_briefing(br, "nobody", &sid("w1"), at).unwrap();
     }
 
     #[test]
@@ -813,6 +871,8 @@ mod tests {
                 token: "director".to_string(),
                 role: BrigadeRole::Director,
                 session_id: Some(sid("dir")),
+                briefed_at: None,
+                briefed_session_id: None,
             }]
         );
         // See remove_brigade_member's doc: a non-member is a no-op.

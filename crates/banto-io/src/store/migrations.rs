@@ -234,6 +234,18 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX brigade_members_session
         ON brigade_members (session_id)
         WHERE session_id IS NOT NULL;",
+    // v13: two nullable columns recording whether/when `banto _hook` (the
+    // Codex SessionStart hook process, docs/notes/codex-briefing-spike.md)
+    // delivered this member its briefing. Deliberately separate from
+    // `session_id` above: that column is identity, unique-indexed; these are
+    // an observation banto made about a delivery attempt, and can disagree
+    // with `session_id` momentarily without meaning anything is wrong (see
+    // `BrigadeMember::briefed_session_id`'s doc). Every gate the spike
+    // measured that can eat a briefing (deferred tool, unapproved MCP call,
+    // untrusted hook) fails silently, so `briefed_at_ms` staying NULL after a
+    // session clearly started is the only signal that happened.
+    "ALTER TABLE brigade_members ADD COLUMN briefed_at_ms INTEGER;
+    ALTER TABLE brigade_members ADD COLUMN briefed_session_id TEXT;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -964,6 +976,63 @@ mod tests {
                     Some(&SessionId("dir".to_string())),
                 )
                 .is_err()
+        );
+
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v12_to_v13_upgrade_adds_briefed_columns_and_preserves_existing_rows() {
+        use super::super::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // Build a database as v12 code would have left it: a brigade with a
+        // Director already assigned a session id, `user_version` left at 12.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..12] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, member_token, role, session_id) VALUES
+                 (1, 'director', 'director', 'dir')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 12).unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+
+        // The pre-migration row survives, with both new columns defaulting
+        // to NULL ("never briefed").
+        let director = store.brigade_member(1, "director").unwrap().unwrap();
+        assert_eq!(director.role, BrigadeRole::Director);
+        assert_eq!(director.session_id, Some(SessionId("dir".to_string())));
+        assert_eq!(director.briefed_at, None);
+        assert_eq!(director.briefed_session_id, None);
+
+        // A delivery recorded after the upgrade reads back correctly.
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(5000);
+        store
+            .record_briefing(1, "director", &SessionId("dir".to_string()), at)
+            .unwrap();
+        let director = store.brigade_member(1, "director").unwrap().unwrap();
+        assert_eq!(director.briefed_at, Some(at));
+        assert_eq!(
+            director.briefed_session_id,
+            Some(SessionId("dir".to_string()))
         );
 
         let version: i64 = store

@@ -50,6 +50,7 @@ use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionI
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_activity;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
@@ -153,7 +154,34 @@ pub fn run(
         // stays the default of 1.
         .with_lines_per_row(2)
         .with_enabled_agents(enabled_agents.clone());
-    if let Some(notice) = session::agents_ignored_notice(settings.resolved_agents) {
+    // The trust notice wins the status line when both apply: an unknown agent
+    // name is a typo in a setting, while an untrusted hook is a cell about to
+    // form with members nothing will ever brief.
+    let trust_notice = codex_home
+        .filter(|_| enabled_agents.contains(&AgentKind::Codex))
+        .and_then(|home| {
+            let has_brigade = !store
+                .borrow()
+                .list_brigades()
+                .unwrap_or_default()
+                .is_empty();
+            // An unknowable executable path counts as launchable: blaming a
+            // space nothing has established is there would be worse than
+            // leaving the trust question to speak for itself.
+            let hook_launchable = match std::env::current_exe() {
+                Ok(exe) => opener::hook_command_is_launchable(&opener::forward_slash_path(&exe)),
+                Err(_) => true,
+            };
+            session::codex_trust_notice(
+                banto_io::codex_trust::hook_trust_state(home),
+                true,
+                has_brigade,
+                hook_launchable,
+            )
+        });
+    if let Some(notice) =
+        trust_notice.or_else(|| session::agents_ignored_notice(settings.resolved_agents))
+    {
         app.set_status(notice, Instant::now());
     }
 
@@ -187,6 +215,23 @@ struct DiscoveryTracker {
     /// match against `sessions/<pid>.json` that [`poll_discovery`] tries
     /// before falling back to scanning session files by cwd.
     pid: Option<u32>,
+    /// Which product this is — Claude's own two sources above don't apply
+    /// to a Codex child at all (see [`poll_discovery`]'s doc for the
+    /// store-based fallback this gates), and only a Codex tracker ever
+    /// gives up on a [`CODEX_WORKER_DISCOVERY_TIMEOUT`].
+    agent: AgentKind,
+    /// Whether [`poll_discovery`] has already told the operator this Claude
+    /// tracker looks stuck behind an unanswered directory-trust prompt —
+    /// set the first time `claude_directory_trust` reports anything but
+    /// `Trusted`, so the status line states it once instead of restamping
+    /// the same notice every poll (~every loop iteration, not just once a
+    /// second). The Codex-side equivalent (`PendingKickoff::notified_untrusted`)
+    /// lives in `engine.rs` instead, because that one also gates an actual
+    /// keystroke and needs the core's own quiet-period timing; this one only
+    /// ever gates a notice, and this tracker — already the shell's own
+    /// discovery bookkeeping, never seen by the core (see this struct's own
+    /// doc) — is exactly where that one bit belongs.
+    notified_untrusted: bool,
 }
 
 /// How often the relay engine (and the pending-submit flush / status expiry
@@ -333,7 +378,14 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
             let live = read_live_sessions(&deps.claude_home.sessions_dir());
-            events.extend(poll_discovery(&mut discovery, &provider, &claimed, &live));
+            events.extend(poll_discovery(
+                &mut discovery,
+                &provider,
+                &claimed,
+                &live,
+                deps.store,
+                deps.claude_home,
+            ));
         }
 
         if watch.poll_ready(SystemTime::now()) {
@@ -352,7 +404,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 deps.claude_home,
                 &handles,
             ));
-            let relay = gather_relay_observations(&state, deps.store, deps.claude_home);
+            let relay = gather_relay_observations(
+                &state,
+                deps.store,
+                deps.claude_home,
+                deps.codex_home,
+                app,
+            );
             events.push_back(Event::Tick { relay });
         }
 
@@ -450,8 +508,8 @@ fn shutdown_handles(
 }
 
 /// Execute one `Cmd`, returning any follow-up `Event`(s) — the only place
-/// that writes to a hosted session's stdin, spawns a process, touches the
-/// store, or toggles the host terminal's own mouse capture.
+/// that writes to a hosted session's stdin, spawns a process, or touches
+/// the store.
 fn execute_cmd(
     cmd: Cmd,
     deps: &Deps,
@@ -463,14 +521,6 @@ fn execute_cmd(
             if let Some(handle) = handles.get_mut(&key) {
                 handle.send_bytes(&bytes);
             }
-            Vec::new()
-        }
-        Cmd::SetMouseCapture(enabled) => {
-            // Best-effort: a failed terminal write here isn't worth
-            // aborting the whole event loop over (matches this module's
-            // other terminal-control calls — `setup_terminal`/
-            // `restore_terminal` are the only ones that propagate `Result`).
-            let _ = set_mouse_capture(enabled);
             Vec::new()
         }
         Cmd::ResizePty { key, rows, cols } => {
@@ -501,8 +551,89 @@ fn execute_cmd(
             brigade,
             model,
         } => execute_open_embedded(key, target, brigade, model, deps, handles, discovery),
+        Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
+        Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
+        Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
+            execute_check_worker_directory_trust(key, &cwd, deps)
+        }
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
+    }
+}
+
+/// Read whether banto's `SessionStart` hook looks trusted right now —
+/// freshly, not cached, since the operator may have approved it in a pane
+/// since this run started — and whether it could even fire from this
+/// executable's path. `deps.codex_home` absent (Codex unresolved) reads as
+/// unprimed: `Cmd::CheckCodexTrust` is only ever issued once a brigade
+/// formation already resolved to a Codex Worker, so "can't tell" must not
+/// read as "trusted".
+fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
+    let primed = deps.codex_home.is_some_and(|home| {
+        banto_io::codex_trust::hook_trust_state(home)
+            == banto_io::codex_trust::HookTrustState::Primed
+    });
+    let hook_launchable = match std::env::current_exe() {
+        Ok(exe) => opener::hook_command_is_launchable(&opener::forward_slash_path(&exe)),
+        Err(_) => true,
+    };
+    vec![Event::CodexTrustChecked {
+        primed,
+        hook_launchable,
+    }]
+}
+
+/// Read whether Codex has been told to trust `cwd` — freshly, not cached,
+/// since the operator may answer its prompt in the pane at any moment while
+/// `engine::update_tick` keeps re-asking. `deps.codex_home` absent reads as
+/// untrusted (`false`), the same "can't tell must not read as safe" rule
+/// [`execute_check_codex_trust`] follows: this Cmd only exists to gate
+/// typing into a Codex pane, so an unknowable answer must not accidentally
+/// permit it.
+fn execute_check_worker_directory_trust(
+    key: SessionKey,
+    cwd: &std::path::Path,
+    deps: &Deps,
+) -> Vec<Event> {
+    let trusted = deps.codex_home.is_some_and(|home| {
+        banto_io::directory_trust::codex_directory_trust(home, cwd)
+            == banto_io::directory_trust::DirectoryTrust::Trusted
+    });
+    vec![Event::WorkerDirectoryTrustChecked { key, trusted }]
+}
+
+/// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`
+/// — the exact same argv a real brigade launch's hook override would carry,
+/// see that function's own doc) under `key`, staged as a solo pane
+/// (`PendingOpen::Solo`, inserted by `confirm_codex_trust_modal` before this
+/// Cmd was even issued). Deliberately not routed through
+/// `execute_open_embedded`/discovery: this is a throwaway review session,
+/// not one banto should ever track or show in the sidebar.
+fn execute_open_codex_trust_pane(
+    key: SessionKey,
+    deps: &Deps,
+    handles: &mut HashMap<SessionKey, PtyHandle>,
+) -> Vec<Event> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            return vec![Event::SpawnFailed {
+                key,
+                error: err.to_string(),
+            }];
+        }
+    };
+    let argv = crate::codex_trust::trust_argv(&exe, deps.agent_binaries);
+    let cwd = std::env::current_dir().ok();
+    match PtyHandle::open(&PortablePtyHost, &argv, cwd.as_deref(), &[], 24, 80) {
+        Ok(handle) => {
+            handles.insert(key.clone(), handle);
+            vec![Event::Spawned { key }]
+        }
+        Err(err) => vec![Event::SpawnFailed {
+            key,
+            error: err.to_string(),
+        }],
     }
 }
 
@@ -511,24 +642,26 @@ fn execute_cmd(
 /// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
 /// otherwise — either way with `model`/`briefing` carried on the result.
 /// `target.agent` picks the variant; `briefing` only ever reaches the
-/// `Claude` one (see [`opener::AgentLaunch`]'s doc — brigades are Claude-only,
-/// and the `Codex` variant has no field to put it in even if this is called
-/// with one anyway). `--model` applies the same way to a resume as to a
+/// `Claude` one, because only Claude takes a briefing as launch argv; a
+/// Codex member gets the same text from the `banto _hook` process the
+/// injected `SessionStart` hook spawns
+/// (docs/notes/codex-briefing-spike.md). `--model` applies the same way to a resume as to a
 /// fresh spawn: a Worker resumed without it falls back to the operator's
 /// own default model instead of the brigade's configured one
 /// (`engine::stage_brigade` never sets it for the Director, so this is
 /// never reached for one).
 ///
 /// `briefing` is the member's already-rendered role briefing
-/// (`--append-system-prompt`, see [`render_briefing`]) — rendered by the
-/// caller because it needs a store read for the roster, verified against
+/// (`--append-system-prompt`, see [`crate::briefing::render`]) — rendered by
+/// the caller because it needs a store read for the roster, verified against
 /// `claude` 2.1.219 to apply to a `--resume` exactly as it does to a fresh
 /// launch, which is what makes it reach a resumed Director at all.
 ///
 /// Pulled out of [`execute_open_embedded`] so this decision logic is
 /// unit-testable without spawning a real PTY; the returned launch's
-/// `mcp_config` is left `None` here and filled in by the caller, since
-/// writing that file needs real I/O this doesn't.
+/// `mcp_config` (Claude) and `brigade` (Codex) are left `None` here and
+/// filled in by the caller, since both need real I/O this doesn't — a config
+/// file write and the running executable's own path.
 fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
@@ -554,13 +687,17 @@ fn build_open_launch(
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
         },
-        // `briefing` is silently unused here: brigades are Claude-only for
-        // now, and this variant has no field to carry it even if a caller
-        // mistakenly passed one — see `opener::AgentLaunch`'s doc.
+        // `briefing` is deliberately unused here: Codex has no
+        // `--append-system-prompt`, so a Codex member's briefing is rendered
+        // by the `banto _hook` process the injected SessionStart hook spawns,
+        // not passed on the argv. `brigade` is left `None` for the caller to
+        // fill for the same reason `mcp_config` is — it needs the running
+        // executable's own path, which is I/O this stays free of.
         AgentKind::Codex => opener::AgentLaunch::Codex {
             resume,
             model: model.map(str::to_string),
             cwd: target.cwd.clone(),
+            brigade: None,
         },
     })
 }
@@ -607,29 +744,49 @@ fn execute_open_embedded(
             error: "already running elsewhere".to_string(),
         }];
     };
-    // Only the `Claude` variant has an `mcp_config` slot to fill — a Codex
-    // launch structurally can't carry one (brigades are Claude-only).
-    if let (Some((brigade_id, token, role)), opener::AgentLaunch::Claude { mcp_config, .. }) =
-        (&brigade, &mut launch)
-    {
+    // Each product reaches banto's own MCP server a different way: Claude via
+    // a config file named on the argv, Codex via `-c` overrides built from
+    // banto's executable path. Claude's file write degrades gracefully (spawn
+    // without the flag rather than lose the pane over a write error); Codex's
+    // side writes nothing, so the only way it can fail is not knowing its own
+    // executable.
+    if let Some((brigade_id, token, role)) = &brigade {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
-        if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
-            *mcp_config = Some(path);
+        match &mut launch {
+            opener::AgentLaunch::Claude { mcp_config, .. } => {
+                if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
+                    *mcp_config = Some(path);
+                }
+            }
+            opener::AgentLaunch::Codex { brigade: slot, .. } => {
+                if let Ok(exe) = std::env::current_exe() {
+                    *slot = Some(opener::CodexBrigade {
+                        exe,
+                        brigade_id: *brigade_id,
+                        token: token.clone(),
+                        role: *role,
+                        session: known_id.map(str::to_string),
+                    });
+                }
+            }
         }
     }
     let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
+    let env = brigade_env(brigade.as_ref());
     // Size is corrected on this same tick's resize pass, once staged.
-    match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), 24, 80) {
+    match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), &env, 24, 80) {
         Ok(handle) => {
             let pid = handle.pid();
             handles.insert(key.clone(), handle);
             if key.is_synthetic() {
                 discovery.push(DiscoveryTracker {
                     key: key.clone(),
+                    agent: target.agent,
                     cwd: target.cwd,
                     since: SystemTime::now(),
                     member: brigade.map(|(brigade_id, token, _)| (brigade_id, token)),
                     pid,
+                    notified_untrusted: false,
                 });
             }
             vec![Event::Spawned { key }]
@@ -712,20 +869,31 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             name,
             cwd,
             worker_count,
+            worker_agent,
+            worker_model,
         } => {
             let result = form_brigade_store(store, &director_row_id, &name, worker_count);
             vec![Event::BrigadeFormed {
                 director_row_id,
                 name,
                 cwd,
+                worker_agent,
+                worker_model,
                 result,
             }]
         }
-        StoreIntent::AddWorker { brigade_id, cwd } => {
+        StoreIntent::AddWorker {
+            brigade_id,
+            cwd,
+            worker_agent,
+            worker_model,
+        } => {
             let result = add_worker_store(store, brigade_id);
             vec![Event::WorkerAdded {
                 brigade_id,
                 cwd,
+                worker_agent,
+                worker_model,
                 result,
             }]
         }
@@ -877,9 +1045,44 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     }]
 }
 
-/// Poll every pending discovery tracker for the id Claude assigned it.
+/// How long a Codex-sourced discovery tracker waits for
+/// `BrigadeMember::briefed_session_id` before giving up — a judgment call,
+/// not a measured minimum: the happy path (2026-08-02 investigation)
+/// resolved within a few seconds of the kickoff's submitting `\r`, so this
+/// is generous headroom for slower model latency or a heavier real briefing
+/// prompt, not a tuned floor. Only ever applies to a tracker whose
+/// `DiscoveryTracker::agent` is `AgentKind::Codex` — Claude's own trackers
+/// keep waiting forever, unchanged from before this existed.
+const CODEX_WORKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// This member's `briefed_session_id`, if the store has one — the id
+/// `banto _hook` recorded on stdin the last time it ran for this member
+/// (`BrigadeMember::briefed_session_id`'s own doc, in `banto-core`). The
+/// only discovery source that exists at all for a Codex Worker: unlike
+/// Claude, nothing Codex writes to disk names a session before its first
+/// turn (measured 2026-08-02 — no live-state file, no session file, no
+/// `threads` row, nothing), so this is that same fact reaching the store
+/// instead, once `crate::engine`'s kickoff mechanism has forced that first
+/// turn to happen.
+fn codex_briefed_session_id(
+    store: &RefCell<Store>,
+    brigade_id: BrigadeId,
+    token: &str,
+) -> Option<String> {
+    store
+        .borrow()
+        .brigade_members(brigade_id)
+        .ok()?
+        .into_iter()
+        .find(|member| member.token == token)?
+        .briefed_session_id
+        .map(|session_id| session_id.0)
+}
+
+/// Poll every pending discovery tracker for the id its child was assigned.
 ///
-/// Two sources, tried in that order:
+/// Three sources, tried in that order — the first two Claude-only, mirrored
+/// from the pre-migration code:
 ///
 /// 1. **The live-state file** `sessions/<pid>.json`, matched on the child's
 ///    own pid. `claude` writes it at startup, and banto knows the pid it
@@ -896,17 +1099,54 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
 ///    batch spawned into one cwd at once — mirrors the pre-migration
 ///    `discover_new_ids`. The fallback whenever the direct child isn't the
 ///    `claude` process itself (see `PtyIo::pid`).
+/// 3. **The store's `briefed_session_id`** ([`codex_briefed_session_id`]),
+///    tried only for a tracker whose `agent` is `AgentKind::Codex`: sources
+///    1 and 2 don't apply to it at all — see that function's own doc.
 ///
-/// Both skip ids already claimed by an open session or taken earlier in
-/// this same pass.
+/// A Codex tracker still unresolved past [`CODEX_WORKER_DISCOVERY_TIMEOUT`]
+/// gives up: removed the same as a resolved one, but reported as
+/// [`Event::CodexWorkerDiscoveryTimedOut`] instead of
+/// [`Event::DiscoveryResult`], so the operator sees why rather than the
+/// pane just silently never identifying itself. A Claude tracker never
+/// times out — unchanged from before this existed.
+///
+/// A Claude tracker still unresolved (regardless of how long) whose own cwd
+/// reads as definitively [`banto_io::directory_trust::DirectoryTrust::NotTrusted`]
+/// reports [`Event::ClaudeWorkerDirectoryUntrusted`] once — this pane isn't
+/// silent because anything is broken, it's sitting behind an unanswered
+/// trust prompt the same as a fresh Codex Worker would, just with no
+/// kickoff mechanism of its own to gate: Claude never gets typed into by
+/// banto at all, so there's nothing to hold back, only a silence to
+/// explain.
+///
+/// Deliberately narrower than Codex's own gate
+/// ([`execute_check_worker_directory_trust`] collapses `NotTrusted` and
+/// `Unknown` together, since an unknowable answer must not accidentally
+/// permit a keystroke): `Unknown` just means no record exists yet, which is
+/// the ordinary shape of "never opened this directory before" and would
+/// fire on nearly every fresh Worker for the second or so before its first
+/// launch even finishes settling — this only gates a notice, not an action,
+/// so a false positive costs real annoyance with nothing gained. `NotTrusted`
+/// alone is not a guess at "maybe still pending": a real `~/.claude.json`
+/// on this machine has entries recording `hasTrustDialogAccepted: false`
+/// independent of any `true` one, so a directory sitting at an unanswered
+/// prompt is expected to read as `NotTrusted`, not `Unknown`, by the time
+/// this ever fires.
+///
+/// All three discovery sources skip ids already claimed by an open session
+/// or taken earlier in this same pass.
 fn poll_discovery(
     trackers: &mut Vec<DiscoveryTracker>,
     provider: &dyn SessionProvider,
     claimed: &HashSet<String>,
     live: &[LiveSession],
+    store: &RefCell<Store>,
+    claude_home: &ClaudeHome,
 ) -> Vec<Event> {
     let mut used_this_pass: HashSet<String> = HashSet::new();
     let mut resolved: Vec<(usize, String)> = Vec::new();
+    let mut timed_out: Vec<usize> = Vec::new();
+    let mut newly_untrusted: Vec<usize> = Vec::new();
     for (i, tracker) in trackers.iter().enumerate() {
         let by_pid = tracker
             .pid
@@ -919,16 +1159,37 @@ fn poll_discovery(
                     .into_iter()
                     .map(|id| id.0)
                     .find(|id| !claimed.contains(id) && !used_this_pass.contains(id))
+            })
+            .or_else(|| {
+                (tracker.agent == AgentKind::Codex)
+                    .then_some(tracker.member.as_ref())
+                    .flatten()
+                    .and_then(|(brigade_id, token)| {
+                        codex_briefed_session_id(store, *brigade_id, token)
+                    })
+                    .filter(|id| !claimed.contains(id) && !used_this_pass.contains(id))
             });
         if let Some(id) = id {
             used_this_pass.insert(id.clone());
             resolved.push((i, id));
+        } else if tracker.agent == AgentKind::Codex
+            && SystemTime::now()
+                .duration_since(tracker.since)
+                .is_ok_and(|elapsed| elapsed >= CODEX_WORKER_DISCOVERY_TIMEOUT)
+        {
+            timed_out.push(i);
+        } else if tracker.agent == AgentKind::ClaudeCode
+            && !tracker.notified_untrusted
+            && banto_io::directory_trust::claude_directory_trust(claude_home, &tracker.cwd)
+                == banto_io::directory_trust::DirectoryTrust::NotTrusted
+        {
+            newly_untrusted.push(i);
         }
     }
-    if resolved.is_empty() {
+    if resolved.is_empty() && timed_out.is_empty() && newly_untrusted.is_empty() {
         return Vec::new();
     }
-    let events = resolved
+    let mut events: Vec<Event> = resolved
         .iter()
         .map(|(i, id)| Event::DiscoveryResult {
             key: trackers[*i].key.clone(),
@@ -936,10 +1197,31 @@ fn poll_discovery(
             member: trackers[*i].member.clone(),
         })
         .collect();
-    let resolved_indices: HashSet<usize> = resolved.into_iter().map(|(i, _)| i).collect();
+    events.extend(timed_out.iter().filter_map(|&i| {
+        trackers[i]
+            .member
+            .as_ref()
+            .map(|(_, token)| Event::CodexWorkerDiscoveryTimedOut {
+                key: trackers[i].key.clone(),
+                token: token.clone(),
+            })
+    }));
+    events.extend(newly_untrusted.iter().filter_map(|&i| {
+        trackers[i]
+            .member
+            .as_ref()
+            .map(|(_, token)| Event::ClaudeWorkerDirectoryUntrusted {
+                token: token.clone(),
+            })
+    }));
+    for &i in &newly_untrusted {
+        trackers[i].notified_untrusted = true;
+    }
+    let mut removed_indices: HashSet<usize> = resolved.into_iter().map(|(i, _)| i).collect();
+    removed_indices.extend(timed_out);
     let mut i = 0;
     trackers.retain(|_| {
-        let keep = !resolved_indices.contains(&i);
+        let keep = !removed_indices.contains(&i);
         i += 1;
         keep
     });
@@ -965,10 +1247,22 @@ fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String>
 /// (unseen messages, live idle/busy status) — the store + live-session reads
 /// `engine::update_tick`'s decision logic needs, per member with a known
 /// session id and an open pane among the currently-staged ones.
+///
+/// Idle/busy detection is per-product, resolved via `app.row_for_id` — never
+/// guessed from the session id's own shape (a Claude Code id and a Codex
+/// thread id are both UUID strings with no reliable, future-proof way to
+/// tell them apart by form alone). A member whose product can't be resolved
+/// this way (not yet in the loaded row list) reports `None`, same as a
+/// Codex member when `codex_home` is absent: "unknown" is always the safe
+/// default here, never "idle" — see [`codex_activity::is_thread_idle`]'s doc
+/// for why manufacturing a false idle signal is the one outcome this must
+/// never produce.
 fn gather_relay_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+    app: &App,
 ) -> Vec<RelayObservation> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         return Vec::new();
@@ -992,12 +1286,18 @@ fn gather_relay_observations(
             .borrow()
             .has_unseen_brigade_messages(brigade_id, &member.token, member.role)
             .unwrap_or(false);
-        let is_idle_this_tick = live
-            .iter()
-            .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
-            .map(|entry| {
-                SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
-            });
+        let is_idle_this_tick = match app.row_for_id(&session_id.0).map(|row| row.agent) {
+            Some(AgentKind::ClaudeCode) => live
+                .iter()
+                .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+                .map(|entry| {
+                    SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
+                }),
+            Some(AgentKind::Codex) => {
+                codex_home.and_then(|home| codex_activity::is_thread_idle(home, &session_id.0))
+            }
+            None => None,
+        };
         observations.push(RelayObservation {
             token: member.token.clone(),
             key,
@@ -1088,14 +1388,10 @@ fn gather_fork_observations(
     events
 }
 
-/// This member's role briefing, ready for `--append-system-prompt`, or
-/// `None` when the configured template for its role is empty.
-///
-/// The store read is what keeps the roster honest: `{peers}` has to name
-/// the members that exist *at launch*, which is later than any of the
-/// core's own decisions about the cell (a Worker added with `b` changes it,
-/// and a Director resumed into an existing brigade never went through
-/// formation at all).
+/// This member's role briefing, or `None` when the configured template for
+/// its role is empty. Only the Claude path uses the returned string as launch
+/// argv; a Codex member's briefing is rendered from the same template in the
+/// `banto _hook` process instead (see [`crate::briefing`]).
 fn member_briefing(
     deps: &Deps,
     brigade_id: BrigadeId,
@@ -1103,36 +1399,42 @@ fn member_briefing(
     role: BrigadeRole,
 ) -> Option<String> {
     let template = deps.brigade.prompt_for(role)?;
-    let peers: Vec<String> = deps
-        .store
-        .borrow()
-        .brigade_members(brigade_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|member| member.role != role)
-        .map(|member| member.token)
-        .collect();
-    Some(render_briefing(template, brigade_id, token, &peers))
+    let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
+    Some(crate::briefing::render(template, brigade_id, token, &peers))
 }
 
-/// Substitute `{brigade}` / `{token}` / `{peers}` into a briefing template.
+/// The `BANTO_*` variables a brigade member's child is launched with.
 ///
-/// Plain string replacement, deliberately: this is banto's own config text
-/// being filled in for banto's own launch, not a templating language, and
-/// an unrecognized `{...}` is left alone rather than treated as an error —
-/// the same leniency the rest of the config layer promises. A member with
-/// no addressable peers yet renders as "none yet" rather than an empty gap,
-/// so the sentence still reads as a sentence.
-fn render_briefing(template: &str, brigade_id: BrigadeId, token: &str, peers: &[String]) -> String {
-    let peers = if peers.is_empty() {
-        "none yet".to_string()
-    } else {
-        peers.join(", ")
+/// Member identity travels in the environment rather than on the argv because
+/// a Codex member's `SessionStart` hook is trusted by a hash of its *command
+/// string*: putting the token in that command would make every member a
+/// different hook needing its own approval, and worse, they would fight over
+/// one trust slot. An untrusted hook is then dropped in silence — no error,
+/// no briefing (docs/notes/codex-briefing-spike.md). The environment is
+/// outside that hash, so one command serves the whole cell.
+///
+/// Set for Claude members too, though nothing reads it there yet: one launch
+/// path is easier to reason about than two, and a member knowing its own
+/// token is useful regardless of product.
+fn brigade_env(brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>) -> Vec<(String, String)> {
+    let Some((brigade_id, token, role)) = brigade else {
+        return Vec::new();
     };
-    template
-        .replace("{brigade}", &brigade_id.to_string())
-        .replace("{token}", token)
-        .replace("{peers}", &peers)
+    vec![
+        ("BANTO_BRIGADE".to_string(), brigade_id.to_string()),
+        ("BANTO_MEMBER".to_string(), token.clone()),
+        ("BANTO_ROLE".to_string(), role_token(*role).to_string()),
+    ]
+}
+
+/// This role's wire spelling, shared by everything banto hands a child
+/// process so the `_mcp` argv, the `_hook` environment and the store all
+/// agree on one word.
+fn role_token(role: BrigadeRole) -> &'static str {
+    match role {
+        BrigadeRole::Director => "director",
+        BrigadeRole::Worker => "worker",
+    }
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
@@ -1148,10 +1450,6 @@ fn write_mcp_config(
     session_id: Option<&str>,
 ) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let role_token = match role {
-        BrigadeRole::Director => "director",
-        BrigadeRole::Worker => "worker",
-    };
     let mut args = vec![
         "_mcp".to_string(),
         "--brigade".to_string(),
@@ -1159,7 +1457,7 @@ fn write_mcp_config(
         "--member".to_string(),
         token.to_string(),
         "--role".to_string(),
-        role_token.to_string(),
+        role_token(role).to_string(),
     ];
     if let Some(session_id) = session_id {
         args.push("--session".to_string());
@@ -1242,7 +1540,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
             frame.render_widget(Paragraph::new(screen_to_text(screen.screen())), content);
-            if focused_tile && !screen.screen().hide_cursor() {
+            // `cursor_position()` is always the *live* cursor, never
+            // adjusted for scrollback (`Screen::scroll`'s own doc) — drawn
+            // while scrolled back, it would sit on top of whatever
+            // historical text happens to be at that row, implying "you can
+            // type here" over content that isn't live at all.
+            if focused_tile && screen.scrollback() == 0 && !screen.screen().hide_cursor() {
                 let (cursor_row, cursor_col) = screen.screen().cursor_position();
                 let (x, y) = (content.x + cursor_col, content.y + cursor_row);
                 if x < content.x + content.width && y < content.y + content.height {
@@ -1261,9 +1564,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
     );
 
     if let Some(modal) = app.modal() {
-        // `true`: the emporium binds Shift-Tab to
-        // `App::modal_toggle_new_session_agent` (see
-        // `engine::update_modal_key`) — see `render_modal`'s doc.
+        // `true`: the emporium binds Shift-Tab to `App::modal_toggle_agent`
+        // (see `engine::update_modal_key`) — see `render_modal`'s doc.
         banto_tui::render_modal::render_modal(frame, modal, full_area, true);
     }
 }
@@ -1362,25 +1664,6 @@ fn restore_terminal() -> Result<()> {
         DisableMouseCapture,
         DisableBracketedPaste
     )?;
-    Ok(())
-}
-
-/// The shell-side half of `Cmd::SetMouseCapture` (see
-/// `engine::update_mouse_capture`'s doc for when the core asks for this):
-/// released so the host terminal's own native text selection works over a
-/// pane whose child never enabled mouse reporting, re-acquired once focus
-/// moves somewhere that does (including the sidebar itself, which always
-/// wants it for its own click/scroll handling). Capture is the host
-/// terminal's own state, not any one pane's, so — unlike every other `Cmd`
-/// here — this never touches `handles`/a `SessionKey` at all; a fresh
-/// `io::stdout()` handle is all `execute!` needs, same as `setup_terminal`/
-/// `restore_terminal` already use.
-fn set_mouse_capture(enabled: bool) -> Result<()> {
-    if enabled {
-        execute!(io::stdout(), EnableMouseCapture)?;
-    } else {
-        execute!(io::stdout(), DisableMouseCapture)?;
-    }
     Ok(())
 }
 
@@ -1575,13 +1858,13 @@ fn install_panic_hook() {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use banto_core::model::AgentKind;
+    use banto_core::model::{Activity, AgentKind, SessionRow};
     use banto_io::pty::mock::MockPtyHost;
 
     use super::*;
 
     fn open(host: &MockPtyHost) -> PtyHandle {
-        PtyHandle::open(host, &["child".to_string()], None, 24, 80).unwrap()
+        PtyHandle::open(host, &["child".to_string()], None, &[], 24, 80).unwrap()
     }
 
     /// Every product this build supports — the "nothing restricted" `Deps`
@@ -2042,13 +2325,24 @@ mod tests {
 
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
             cwd: cwd.clone(),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: Some(4242),
+            notified_untrusted: false,
         }];
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home = ClaudeHome::new(claude_home.path().to_path_buf());
 
-        let events = poll_discovery(&mut trackers, &provider, &HashSet::new(), &live);
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &live,
+            &store,
+            &claude_home,
+        );
 
         assert!(
             matches!(
@@ -2079,14 +2373,26 @@ mod tests {
 
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
             cwd: PathBuf::from("/work/alpha"),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: Some(4242),
+            notified_untrusted: false,
         }];
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home = ClaudeHome::new(claude_home.path().to_path_buf());
 
         assert!(
-            poll_discovery(&mut trackers, &provider, &HashSet::new(), &live).is_empty(),
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &live,
+                &store,
+                &claude_home
+            )
+            .is_empty(),
             "a different cwd means a different session"
         );
         assert_eq!(trackers.len(), 1, "still pending, not resolved wrongly");
@@ -2111,12 +2417,16 @@ mod tests {
         // child pid, so only the session-file scan can answer.
         let tracker = |token: &str| DiscoveryTracker {
             key: pending_key(token),
+            agent: AgentKind::ClaudeCode,
             cwd: cwd.clone(),
             since,
             member: Some((1, token.to_string())),
             pid: None,
+            notified_untrusted: false,
         };
         let mut trackers = vec![tracker("worker-1"), tracker("worker-2")];
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
 
         // Pass 1: only the first Worker's session file exists yet.
         write_session_at(claude_home.path(), "w1", &cwd);
@@ -2124,7 +2434,14 @@ mod tests {
             .iter()
             .map(|tracker| tracker.key.as_str().to_string())
             .collect();
-        let events = poll_discovery(&mut trackers, &provider, &claimed, &[]);
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &claimed,
+            &[],
+            &store,
+            &claude_home_ref,
+        );
         assert!(matches!(
             events.as_slice(),
             [Event::DiscoveryResult { session_id, .. }] if session_id == "w1"
@@ -2138,7 +2455,14 @@ mod tests {
 
         // Pass 2: the second Worker's file appears.
         write_session_at(claude_home.path(), "w2", &cwd);
-        let events = poll_discovery(&mut trackers, &provider, &claimed, &[]);
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &claimed,
+            &[],
+            &store,
+            &claude_home_ref,
+        );
         assert!(
             matches!(
                 events.as_slice(),
@@ -2147,6 +2471,305 @@ mod tests {
             "worker-2 must take the unclaimed id, not re-take worker-1's: {events:?}"
         );
         assert!(trackers.is_empty());
+    }
+
+    // --- Codex Worker discovery: the store-based source, and giving up -----
+
+    fn codex_tracker(brigade_id: BrigadeId, token: &str, since: SystemTime) -> DiscoveryTracker {
+        DiscoveryTracker {
+            key: pending_key(token),
+            agent: AgentKind::Codex,
+            cwd: PathBuf::from("/work/alpha"),
+            since,
+            member: Some((brigade_id, token.to_string())),
+            pid: None,
+            notified_untrusted: false,
+        }
+    }
+
+    #[test]
+    fn a_codex_worker_resolves_via_the_stores_briefed_session_id() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("w1".to_string()),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
+
+        let mut trackers = vec![codex_tracker(brigade_id, "worker-1", SystemTime::now())];
+
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &[],
+            &store,
+            &claude_home_ref,
+        );
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::DiscoveryResult { session_id, member, .. }]
+                    if session_id == "w1" && member.as_ref().unwrap().1 == "worker-1"
+            ),
+            "no live-state file or session file exists for Codex; the store is the only source: {events:?}"
+        );
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn a_claude_tracker_never_consults_the_stores_briefed_session_id() {
+        // Defends the `agent == AgentKind::Codex` gate itself: even with a
+        // matching (and misleading, in practice never-set-for-Claude)
+        // briefed_session_id sitting in the store, a Claude tracker must
+        // never resolve from it.
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("w1".to_string()),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
+
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
+            cwd: PathBuf::from("/work/alpha"),
+            since: SystemTime::now(),
+            member: Some((brigade_id, "worker-1".to_string())),
+            pid: None,
+            notified_untrusted: false,
+        }];
+
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &[],
+                &store,
+                &claude_home_ref
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            trackers.len(),
+            1,
+            "still pending — no Claude source resolved it"
+        );
+    }
+
+    #[test]
+    fn a_codex_worker_past_the_timeout_gives_up_and_is_removed() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
+        let long_ago = SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1);
+        let mut trackers = vec![codex_tracker(1, "worker-1", long_ago)];
+
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &[],
+            &store,
+            &claude_home_ref,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::CodexWorkerDiscoveryTimedOut { token, .. }] if token == "worker-1"
+        ));
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn a_claude_worker_never_times_out() {
+        // Regression: the give-up timeout is Codex-only. Unresolved Claude
+        // discovery keeps waiting forever, same as before this existed.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
+        let long_ago = SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1);
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
+            cwd: PathBuf::from("/work/alpha"),
+            since: long_ago,
+            member: Some((1, "worker-1".to_string())),
+            pid: None,
+            notified_untrusted: false,
+        }];
+
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &[],
+                &store,
+                &claude_home_ref
+            )
+            .is_empty()
+        );
+        assert_eq!(trackers.len(), 1, "still pending, not timed out");
+    }
+
+    /// Root a [`ClaudeHome`] under `dir` with a `.claude.json` registry
+    /// beside it (`trust_registry_path`'s own layout), matching
+    /// `directory_trust`'s own test fixture.
+    fn claude_home_with_trust_registry(dir: &tempfile::TempDir, registry_text: &str) -> ClaudeHome {
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".claude.json"), registry_text).unwrap();
+        ClaudeHome::new(dir.path().join(".claude"))
+    }
+
+    #[test]
+    fn a_claude_worker_whose_cwd_reads_not_trusted_reports_it_once() {
+        // The deadlock poll_discovery's own doc covers: sitting behind an
+        // unanswered trust prompt, `claude` never writes a session file, so
+        // this is the only way it's ever explained rather than just silent.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = claude_home_with_trust_registry(
+            &dir,
+            r#"{"projects": {"/work/alpha": {"hasTrustDialogAccepted": false}}}"#,
+        );
+        let provider = ClaudeCodeProvider::new(claude_home.clone());
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
+            cwd: PathBuf::from("/work/alpha"),
+            since: SystemTime::now(),
+            member: Some((1, "worker-1".to_string())),
+            pid: None,
+            notified_untrusted: false,
+        }];
+
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &[],
+            &store,
+            &claude_home,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::ClaudeWorkerDirectoryUntrusted { token }] if token == "worker-1"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            trackers.len(),
+            1,
+            "still pending — discovery keeps retrying"
+        );
+
+        // A second poll under the same NotTrusted registry stays silent —
+        // the notice is one-shot, not repeated every tick.
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &[],
+            &store,
+            &claude_home,
+        );
+        assert!(events.is_empty(), "already notified once: {events:?}");
+    }
+
+    #[test]
+    fn a_claude_worker_whose_cwd_has_no_trust_record_never_reports_untrusted() {
+        // The narrowing this gate deliberately keeps over Codex's own
+        // (`NotTrusted` only, not `Unknown` too — see poll_discovery's doc):
+        // a directory nobody has ever opened Claude Code into reads as
+        // `Unknown`, not `NotTrusted`, and must not be mistaken for a stuck
+        // prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = ClaudeHome::new(dir.path().join(".claude"));
+        let provider = ClaudeCodeProvider::new(claude_home.clone());
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut trackers = vec![DiscoveryTracker {
+            key: pending_key("worker-1"),
+            agent: AgentKind::ClaudeCode,
+            cwd: PathBuf::from("/work/alpha"),
+            since: SystemTime::now(),
+            member: Some((1, "worker-1".to_string())),
+            pid: None,
+            notified_untrusted: false,
+        }];
+
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &[],
+                &store,
+                &claude_home
+            )
+            .is_empty()
+        );
+        assert_eq!(trackers.len(), 1);
+    }
+
+    #[test]
+    fn a_codex_worker_in_a_not_trusted_cwd_never_reports_the_claude_specific_event() {
+        // Defends the `agent == AgentKind::ClaudeCode` gate itself: a Codex
+        // tracker has its own, unrelated trust gate
+        // (`execute_check_worker_directory_trust`, core-side, per-Worker
+        // kickoff); this notice exists only to explain Claude's silence.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = claude_home_with_trust_registry(
+            &dir,
+            r#"{"projects": {"/work/alpha": {"hasTrustDialogAccepted": false}}}"#,
+        );
+        let provider = ClaudeCodeProvider::new(claude_home.clone());
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut trackers = vec![codex_tracker(1, "worker-1", SystemTime::now())];
+
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &[],
+                &store,
+                &claude_home
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            trackers.len(),
+            1,
+            "still pending — Codex has its own gate, not this one"
+        );
     }
 
     // --- compact-fork tracking: gather_fork_observations ------------------
@@ -2257,6 +2880,220 @@ mod tests {
         );
 
         assert!(events.is_empty());
+    }
+
+    // --- relay observations: gather_relay_observations ---------------------
+
+    /// A minimal, correctly-attributed [`SessionRow`] for `id` — the "already
+    /// discovered" fact `gather_relay_observations` resolves a member's
+    /// product from, mirroring how `session::rows_from_metas` would have
+    /// built it.
+    fn test_row(id: &str, agent: AgentKind) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            agent,
+            title: None,
+            cwd: None,
+            activity: Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+            source_archived: false,
+        }
+    }
+
+    /// A staged Director ("dir", Claude) plus one Worker at
+    /// `worker_session_id`, whose product is `worker_agent` in both the
+    /// store's membership and the `App`'s row list — the shape
+    /// `gather_relay_observations` reads. `rows` are appended beyond the two
+    /// default ones for the "unresolved product" case, where the Worker's id
+    /// deliberately has no row at all.
+    fn staged_worker(
+        worker_session_id: &str,
+        worker_agent: Option<AgentKind>,
+    ) -> (RefCell<Store>, EmporiumState, App) {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId(worker_session_id.to_string())),
+            )
+            .unwrap();
+        store
+            .enqueue_brigade_message(brigade_id, "worker-1", BrigadeRole::Director, None, "hi")
+            .unwrap();
+
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: brigade_id,
+            panes: vec![
+                SessionKey::from_id("dir"),
+                SessionKey::from_id(worker_session_id),
+            ],
+            focused: 0,
+        };
+        let mut rows = vec![test_row("dir", AgentKind::ClaudeCode)];
+        if let Some(agent) = worker_agent {
+            rows.push(test_row(worker_session_id, agent));
+        }
+        let app = App::new(rows);
+        (RefCell::new(store), state, app)
+    }
+
+    /// Writes a synthetic `threads` row (`state_5.sqlite`) pointing
+    /// `thread_id` at a rollout file under `codex_home`, and writes that
+    /// rollout file with `event_msg` lines built from `markers` (each
+    /// `"task_started"` or `"task_complete"`) — the shape
+    /// `codex_activity::is_thread_idle` reads.
+    fn write_codex_rollout(codex_home: &Path, thread_id: &str, markers: &[&str]) {
+        std::fs::create_dir_all(codex_home).unwrap();
+        let rollout_path = codex_home.join(format!("{thread_id}.jsonl"));
+        let body: String = markers
+            .iter()
+            .map(|marker| {
+                format!(r#"{{"type":"event_msg","payload":{{"type":"{marker}"}}}}"#) + "\n"
+            })
+            .collect();
+        std::fs::write(&rollout_path, body).unwrap();
+
+        let conn = rusqlite::Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+        )
+        .ok(); // no-op once the table exists
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+            rusqlite::params![thread_id, rollout_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_codex_member_mid_turn_is_not_idle() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::Codex));
+        write_codex_rollout(codex_home.path(), "w1", &["task_started"]);
+
+        let claude_home = tempfile::tempdir().unwrap();
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            Some(&CodexHome::new(codex_home.path().to_path_buf())),
+            &app,
+        );
+
+        let worker = observations
+            .iter()
+            .find(|o| o.token == "worker-1")
+            .expect("worker-1 has an open pane and a known session id");
+        assert_eq!(worker.is_idle_this_tick, Some(false));
+    }
+
+    #[test]
+    fn a_codex_member_past_task_complete_is_idle() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::Codex));
+        write_codex_rollout(codex_home.path(), "w1", &["task_started", "task_complete"]);
+
+        let claude_home = tempfile::tempdir().unwrap();
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            Some(&CodexHome::new(codex_home.path().to_path_buf())),
+            &app,
+        );
+
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, Some(true));
+    }
+
+    #[test]
+    fn a_claude_members_idle_detection_is_unchanged_by_the_codex_split() {
+        // Same live-file-based check as before this round, now reached via
+        // the AgentKind::ClaudeCode arm instead of being the only arm —
+        // covers both the alive-and-idle and the alive-and-busy cases.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        write_live_state(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+        );
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(
+            worker.is_idle_this_tick,
+            Some(true),
+            "this process's own pid is alive and the live file reports no busy status"
+        );
+    }
+
+    #[test]
+    fn a_claude_member_with_no_live_file_is_unknown_not_idle() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        // No sessions/<pid>.json written at all for "w1".
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, None);
+    }
+
+    #[test]
+    fn a_member_whose_product_cannot_be_resolved_is_unknown_never_idle() {
+        // The Worker has a live Claude-shaped session file AND a Codex
+        // rollout mid-turn under the same id — an adversarial case showing
+        // that without a matching `App` row, neither signal is trusted;
+        // product must come from discovery, never be inferred from what
+        // data exists.
+        let claude_home = tempfile::tempdir().unwrap();
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", None); // no row for "w1" at all
+        write_live_state(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+        );
+        write_codex_rollout(codex_home.path(), "w1", &["task_started"]);
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            Some(&CodexHome::new(codex_home.path().to_path_buf())),
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, None);
     }
 
     // --- worker model on resume: build_open_launch -------------------------
@@ -2399,9 +3236,15 @@ mod tests {
         let launch = build_open_launch(
             &target,
             Some("o3"),
-            // A briefing passed anyway (shouldn't happen — brigades are
-            // Claude-only — but the Codex variant has nowhere to put it
-            // even so).
+            // The caller resolves a briefing for any brigade member
+            // regardless of product (`member_briefing` takes only
+            // `brigade_id`/`token`/`role`, never `agent` — see
+            // `execute_open_embedded`'s own call) and passes it through
+            // uniformly; Codex has no `--append-system-prompt` equivalent
+            // to put it in, so it's dropped here on purpose. A Codex
+            // member's own briefing arrives a different way entirely — the
+            // `SessionStart` hook's `additionalContext` (`crate::hook`'s
+            // module doc), never through argv at all.
             Some("you are the Director"),
             &test_ctx(&probe, &[], &binaries),
         )
@@ -2471,30 +3314,20 @@ mod tests {
     }
 
     #[test]
-    fn render_briefing_substitutes_the_brigade_the_token_and_the_peer_roster() {
-        let peers = ["worker-1".to_string(), "worker-2".to_string()];
+    fn brigade_env_carries_the_identity_the_hook_command_must_not() {
         assert_eq!(
-            render_briefing("{token} of {brigade} leads {peers}", 7, "director", &peers),
-            "director of 7 leads worker-1, worker-2"
+            brigade_env(Some(&(7, "worker-1".to_string(), BrigadeRole::Worker))),
+            vec![
+                ("BANTO_BRIGADE".to_string(), "7".to_string()),
+                ("BANTO_MEMBER".to_string(), "worker-1".to_string()),
+                ("BANTO_ROLE".to_string(), "worker".to_string()),
+            ]
         );
     }
 
     #[test]
-    fn render_briefing_says_none_yet_rather_than_leaving_a_gap() {
-        assert_eq!(
-            render_briefing("your peers: {peers}.", 1, "director", &[]),
-            "your peers: none yet."
-        );
-    }
-
-    #[test]
-    fn render_briefing_leaves_an_unknown_placeholder_alone() {
-        // Lenient like the rest of the config layer: a typo in the operator's
-        // own template is not worth failing a launch over.
-        assert_eq!(
-            render_briefing("{brigade}/{nope}", 3, "director", &[]),
-            "3/{nope}"
-        );
+    fn brigade_env_is_empty_outside_a_brigade() {
+        assert!(brigade_env(None).is_empty());
     }
 
     #[test]

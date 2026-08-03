@@ -26,7 +26,7 @@ use ratatui_core::layout::{Constraint, Layout, Position, Rect};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, ClickOutcome, GroupJoinTarget, KillChoice, Modal, Mode};
-use crate::config::{BrigadeConfig, RelayMode};
+use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -251,6 +251,49 @@ const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a freshly-spawned Codex Worker pane's own output must have been
+/// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
+/// — see that constant's doc for why this exists at all. Measured
+/// 2026-08-02: Codex's own boot sequence (terminal-mode escapes, the
+/// hook-bypass warning banner, an MCP server booting, the composer frame
+/// settling) ran for ~2s after spawn in the captured run, every gap
+/// *inside* that burst under 400ms; 700ms clears the noisiest observed
+/// mid-boot gap with real margin, without piling much more wait on top.
+/// Confirmed end to end, not just inferred from the gap sizes: typed at the
+/// 700ms-quiet mark, the kickoff line was not dropped or garbled — the
+/// resulting turn ran, the hook fired, and the discovered session id
+/// resolved to a real Codex `threads` row within a few seconds.
+const CODEX_KICKOFF_QUIET_PERIOD: Duration = Duration::from_millis(700);
+
+/// The fixed, ASCII-only line banto types into a freshly-spawned Codex
+/// Worker's stdin once its boot output goes quiet (see
+/// [`CODEX_KICKOFF_QUIET_PERIOD`]) — the turn this starts is what makes
+/// Codex's own `SessionStart` hook fire at all. Measured (2026-08-02
+/// investigation): an idle Codex TUI with nothing ever typed into it never
+/// runs the hook, never creates a session `threads` row, never writes a
+/// rollout file — a freshly spawned Worker is otherwise permanently
+/// undiscoverable, since every path banto has for learning a Codex session's
+/// id depends on that same first turn having happened.
+///
+/// This is deliberately *not* [`RELAY_NUDGE_LINE`] reused: that line
+/// asserts a peer sent a message, which would be false here — nobody has,
+/// this pane just started, and the member reading it would call
+/// `check_messages` to find an empty inbox. Typing a false "you have mail"
+/// purely to make a hook fire trades a working mechanism for a member's
+/// trust in what banto tells it, which is a worse trade than the one it's
+/// avoiding; this line only states what's actually true at the moment it's
+/// sent. It also doesn't restate the member's role or peers — the hook's
+/// own `additionalContext` delivers that on this very same turn
+/// (`crate::hook`'s module doc, in the `banto` crate), so repeating it here
+/// would just be noise on top of noise.
+///
+/// ASCII-only for the same reason [`RELAY_NUDGE_LINE`] is: this is typed as
+/// literal bytes into whatever the child's own input widget does with them,
+/// and nothing here has verified how a raw multi-byte UTF-8 sequence
+/// arriving as one written chunk behaves in Codex's own input handling — no
+/// reason to be the one to find out.
+const CODEX_WORKER_KICKOFF_LINE: &str = "[banto] This pane just started as a brigade member.";
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NudgeState {
     last_nudge: Option<Instant>,
@@ -364,6 +407,34 @@ fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key:
     pending_submits.retain(|pending| &pending.key != key);
 }
 
+/// A freshly-spawned Codex Worker pane awaiting its own boot output going
+/// quiet before [`update_tick`] asks whether it's safe to type
+/// [`CODEX_WORKER_KICKOFF_LINE`] into it — see that constant's doc for why
+/// the kickoff exists at all, and [`Cmd::CheckWorkerDirectoryTrust`]'s for
+/// why quiet alone isn't enough to type it blind. Queued by
+/// [`update_spawned`] the moment such a pane's `PendingOpen::BrigadeMember`
+/// resolves; removed once the kickoff is actually sent (its `\r` becomes an
+/// ordinary [`PendingSubmit`], the same two-phase shape as a relay nudge) or
+/// the pane unstages first.
+struct PendingKickoff {
+    key: SessionKey,
+    /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
+    /// has no entry yet for this pane (nothing has arrived at all) — the
+    /// moment this tracker was created, i.e. spawn time.
+    spawned_at: Instant,
+    /// This Worker's own cwd — echoed on [`Cmd::CheckWorkerDirectoryTrust`]
+    /// once the quiet period elapses, since the pure core has no way to read
+    /// Codex's own trust records itself and the shell has no other way to
+    /// know which directory to check.
+    cwd: PathBuf,
+    /// Whether [`update_worker_directory_trust_checked`] has already told
+    /// the operator this pane is waiting on an unanswered trust prompt —
+    /// set the first time the answer comes back "not trusted", so the
+    /// status line states it once instead of restamping the same notice
+    /// every tick while banto keeps quietly re-checking.
+    notified_untrusted: bool,
+}
+
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
 /// `SpawnFailed` know what to do with the result.
 enum PendingOpen {
@@ -376,11 +447,36 @@ enum PendingOpen {
         brigade_id: BrigadeId,
         worker_tokens: Vec<MemberToken>,
         cwd: PathBuf,
+        /// Resolved once at `StoreIntent::FormBrigade`'s own press-time
+        /// moment (see its doc) and carried this whole way so opening each
+        /// Worker, once the Director's own spawn succeeds, never has to
+        /// re-derive it from `app`.
+        worker_agent: AgentKind,
+        /// Same reasoning as `worker_agent` — carried through so
+        /// `update_spawned` never needs `&BrigadeConfig` just to look this
+        /// up again.
+        worker_model: String,
     },
     /// One member (Director or Worker) of a brigade whose `Stage` already
     /// exists (or is being built alongside this open): on success, append
     /// to `panes`.
-    BrigadeMember { brigade_id: BrigadeId },
+    BrigadeMember {
+        brigade_id: BrigadeId,
+        /// `true` only for a Worker [`open_worker`] just spawned fresh (no
+        /// id yet) as a Codex agent — the one case that needs a
+        /// [`PendingKickoff`] queued once it's actually spawned. Always
+        /// `false` for a *resumed* member ([`stage_brigade`]'s own
+        /// `Some(row)` branch inserts this same variant, for a session
+        /// whose id is already known): it has nothing left to discover and
+        /// no reason to spend a turn kicking it off.
+        needs_codex_kickoff: bool,
+        /// This member's cwd — carried through unconditionally (even when
+        /// `needs_codex_kickoff` is `false`) since it's cheap to plumb and
+        /// only [`PendingKickoff`] ever reads it back out. Needed there to
+        /// ask the shell whether Codex trusts this exact directory before
+        /// typing into it.
+        cwd: PathBuf,
+    },
 }
 
 /// Why a `Cmd::Store(StoreIntent::ResolveMembership)` was requested.
@@ -400,6 +496,70 @@ enum PendingMembership {
     DismissWorker,
 }
 
+/// A brigade formation waiting on `Modal::WorkerAgentPicker` to say which
+/// product (and model) its Workers will run as — everything `FormBrigade`
+/// needs *except* that, stashed here the moment the modal opens (see
+/// `begin_brigade_formation`'s `Select` branch) and consumed by
+/// [`confirm_worker_agent_modal`] once the operator confirms. Cleared on
+/// Esc too (`update_modal_key`), so a cancelled picker can never leave a
+/// stale formation for some later, unrelated confirm to pick up by
+/// accident.
+struct PendingBrigadeFormation {
+    director_row_id: String,
+    name: String,
+    cwd: PathBuf,
+    worker_count: usize,
+}
+
+/// A Worker being added to an *already-formed* brigade (`add_worker`, `b`)
+/// waiting on the same `Modal::WorkerAgentPicker` — everything
+/// `StoreIntent::AddWorker` needs except the product/model, stashed the
+/// moment the modal opens and consumed by [`confirm_worker_agent_modal`]
+/// once the operator confirms. Cleared on Esc too, same as
+/// [`PendingBrigadeFormation`] — but Esc here means something lighter: no
+/// Worker gets added, an already-running brigade is otherwise untouched,
+/// not "the whole cell never forms."
+struct PendingWorkerAddition {
+    brigade_id: BrigadeId,
+    cwd: PathBuf,
+}
+
+/// A brigade formation waiting on a fresh `Cmd::CheckCodexTrust` round trip
+/// before `StoreIntent::FormBrigade` is issued — everything `FormBrigade`
+/// needs, stashed the moment the resolved Worker product turns out to be
+/// [`AgentKind::Codex`] (`update_membership_resolved`'s non-`Select` branch,
+/// or [`confirm_worker_agent_modal`] once `Select`'s own picker resolves).
+/// Unlike [`PendingBrigadeFormation`], `worker_agent`/`worker_model` are
+/// already known by the time this exists — the whole point of this stash is
+/// that they're the fully-resolved values, not a placeholder awaiting them.
+/// Consumed unconditionally by [`update_codex_trust_checked`], whichever way
+/// the check comes out.
+struct PendingCodexTrustFormation {
+    director_row_id: String,
+    name: String,
+    cwd: PathBuf,
+    worker_count: usize,
+    worker_agent: AgentKind,
+    worker_model: String,
+}
+
+/// Everything needed to open a freshly-formed brigade's Director wired
+/// (MCP config / Codex `-c` overrides, plus which Workers to open once it
+/// spawns) — [`PendingOpen::BrigadeDirector`]'s own payload, held here for
+/// the one case that can't build `Cmd::OpenEmbedded` immediately:
+/// `update_brigade_formed` finding the Director's pane still open despite
+/// `begin_brigade_formation`'s own pre-formation gate (see that function's
+/// doc for why this is a residual race, not the common case, and why there
+/// is no aborting once we're here — the brigade record already exists).
+struct PendingDirectorWiring {
+    director_row_id: String,
+    brigade_id: BrigadeId,
+    worker_tokens: Vec<MemberToken>,
+    cwd: PathBuf,
+    worker_agent: AgentKind,
+    worker_model: String,
+}
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -407,10 +567,52 @@ pub struct EmporiumState {
     pub status: Option<String>,
     status_set_at: Option<Instant>,
     pub relay_states: HashMap<MemberToken, RelayState>,
-    pub last_forwarded_input: Option<Instant>,
+    /// When real operator input was last forwarded to each pane, keyed by
+    /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
+    /// only ever suppresses a nudge for the pane the operator is actually
+    /// typing into (`RELAY_INPUT_QUIET_PERIOD`'s whole point is protecting
+    /// mid-composition text from a spliced-in nudge); a shared field here
+    /// used to mean input to *any* pane silenced nudges to the *focused*
+    /// one, so switching to a different pane, typing there, then tabbing
+    /// back to a focused-but-untouched one kept it suppressed on someone
+    /// else's keystrokes. An entry is dropped when its pane unstages (see
+    /// [`Self::unstage`]) so a closed pane's key never accumulates here.
+    pub last_forwarded_input: HashMap<SessionKey, Instant>,
+    /// When a pane's child last produced *any* output, keyed by its own
+    /// [`SessionKey`] — the baseline [`update_tick`]'s kickoff-readiness
+    /// check measures quiet time against (see
+    /// [`CODEX_KICKOFF_QUIET_PERIOD`]). Only meaningful for a pane with an
+    /// entry in [`Self::pending_kickoffs`], but kept for every pane
+    /// regardless: a `HashMap` write on every `Event::PtyOutput` is cheaper
+    /// than checking membership first. Dropped when its pane unstages, same
+    /// as [`Self::last_forwarded_input`].
+    last_output_at: HashMap<SessionKey, Instant>,
+    pending_kickoffs: Vec<PendingKickoff>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
+    pending_brigade_formation: Option<PendingBrigadeFormation>,
+    pending_worker_addition: Option<PendingWorkerAddition>,
+    pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
+    /// The session id of a Director-to-be whose already-open pane was just
+    /// killed (`confirm_director_reopen_modal`), waiting on its
+    /// `Event::PtyExited` before formation can continue — reopening any
+    /// sooner would resume a session `opener::decide_inplace_resume` still
+    /// sees as live and refuse. `update_pty_exited` takes it once the exit
+    /// for this exact key lands. Unlike `pending_brigade_formation`/
+    /// `pending_codex_trust_formation`, not cleared on every Esc: by the
+    /// time this is set, `Modal::ConfirmDirectorReopen` is already closed
+    /// (see that function), so no *other* modal's Esc should touch it.
+    pending_director_reopen: Option<String>,
+    /// The residual-race counterpart to [`Self::pending_director_reopen`] —
+    /// set by `update_brigade_formed` instead of the interactive gate, so it
+    /// carries the full [`PendingDirectorWiring`] rather than just a row id
+    /// to re-derive a formation decision from (there's nothing left to
+    /// decide by that point, only wiring to apply). `update_pty_exited`
+    /// checks both; the two are never set at once in practice, since the
+    /// interactive gate's own stash is always cleared before `FormBrigade`
+    /// is issued.
+    pending_director_wiring: Option<PendingDirectorWiring>,
     /// The Worker pane a confirmed prefix-`x` dismiss is about to remove,
     /// stashed at confirm time (`confirm_kill_modal`) — regardless of
     /// whether `StoreIntent::DismissWorker` was built immediately (a
@@ -434,13 +636,6 @@ pub struct EmporiumState {
     /// reused discriminator could attach a stale mapping (an old screen, a
     /// stale PTY handle) to a new pane that happens to mint the same key.
     next_plain_id: u64,
-    /// What [`update_mouse_capture`] last decided the host terminal's mouse
-    /// capture should be — starts `true` to match what `setup_terminal`
-    /// already did before the first event ever reaches `update` (the
-    /// sidebar, [`Focus::Sidebar`]'s own initial value, wants it on
-    /// anyway), so nothing re-sends a redundant `Cmd::SetMouseCapture` on
-    /// the very first frame.
-    mouse_capture_enabled: bool,
 }
 
 impl EmporiumState {
@@ -452,16 +647,22 @@ impl EmporiumState {
             status: None,
             status_set_at: None,
             relay_states: HashMap::new(),
-            last_forwarded_input: None,
+            last_forwarded_input: HashMap::new(),
+            last_output_at: HashMap::new(),
+            pending_kickoffs: Vec::new(),
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
             pending_membership: None,
+            pending_brigade_formation: None,
+            pending_worker_addition: None,
+            pending_codex_trust_formation: None,
+            pending_director_reopen: None,
+            pending_director_wiring: None,
             pending_dismiss: None,
             size: (0, 0),
             prefix,
             prefix_armed: None,
             next_plain_id: 0,
-            mouse_capture_enabled: true,
         }
     }
 
@@ -496,6 +697,9 @@ impl EmporiumState {
     /// step it has no reason to know about.
     fn unstage(&mut self, key: &SessionKey) {
         self.stage.remove(key);
+        self.last_forwarded_input.remove(key);
+        self.last_output_at.remove(key);
+        self.pending_kickoffs.retain(|pending| &pending.key != key);
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
         }
@@ -763,10 +967,38 @@ pub enum StoreIntent {
         name: String,
         cwd: PathBuf,
         worker_count: usize,
+        /// Resolved once, at the press-time moment the Director's own row
+        /// (and therefore its product) is known — see [`resolve_worker_agent`]
+        /// — and carried through this whole round trip the same way `cwd`
+        /// already is, rather than re-resolved later from a `[brigade]`
+        /// setting that could theoretically have changed mid-flight.
+        /// `[brigade] worker_agent = "select"` resolves here to whatever the
+        /// operator chose in `Modal::WorkerAgentPicker`, not `Inherit`'s
+        /// value — see `confirm_worker_agent_modal`.
+        worker_agent: AgentKind,
+        /// The `--model` every fresh Worker this formation spawns launches
+        /// with, empty meaning "no `--model` flag at all" — resolved
+        /// alongside `worker_agent`, from `BrigadeConfig::worker_model_for`
+        /// or (the `Select` picker) the operator's own edited text, so
+        /// nothing downstream needs `&BrigadeConfig` just to look this up
+        /// again.
+        worker_model: String,
     },
     AddWorker {
         brigade_id: BrigadeId,
         cwd: PathBuf,
+        /// Same reasoning as `FormBrigade`'s own `worker_agent`: resolved
+        /// once, at the `B`-press moment, in [`add_worker`] — either
+        /// directly, or (`[brigade] worker_agent = "select"`) via the same
+        /// `Modal::WorkerAgentPicker` formation uses, see
+        /// [`EmporiumState::pending_worker_addition`]. Unlike formation, a
+        /// `Select`-resolved `AgentKind::Codex` here never routes through
+        /// the codex-trust check — see `confirm_worker_agent_modal`'s own
+        /// doc for why that's an intentional difference, not a gap this
+        /// round left unclosed.
+        worker_agent: AgentKind,
+        /// Same reasoning as `FormBrigade`'s own `worker_model`.
+        worker_model: String,
     },
     Disband {
         brigade_id: BrigadeId,
@@ -857,15 +1089,44 @@ pub enum Cmd {
         from: SessionKey,
         to: SessionKey,
     },
+    /// Read whether banto's own `SessionStart` hook looks trusted right now
+    /// (fresh, not cached — the operator may have approved it in a pane
+    /// since this run started) and whether `std::env::current_exe()` can
+    /// even launch it at all. Issued only when a brigade formation's already-
+    /// resolved Worker product is [`AgentKind::Codex`] — see
+    /// `update_membership_resolved`/`confirm_worker_agent_modal`, which stash
+    /// a [`PendingCodexTrustFormation`] alongside it. The shell answers with
+    /// `Event::CodexTrustChecked`.
+    CheckCodexTrust,
+    /// Open a solo pane running Codex's own trust-review startup (`codex -c
+    /// <hook override>`, via `crate::codex_trust::trust_argv` — no cwd, no
+    /// resume, no MCP overrides, nothing else) under `key`. Confirming
+    /// [`Modal::ConfirmCodexTrust`] issues this; the shell answers with the
+    /// same `Event::Spawned`/`SpawnFailed` any other open does, but this one
+    /// is never handed to `Cmd::OpenEmbedded`/discovery — it's a throwaway
+    /// review session the operator `/quit`s out of, not one banto should
+    /// ever show in the sidebar.
+    OpenCodexTrustPane {
+        key: SessionKey,
+    },
+    /// Read whether Codex has already been told to trust `cwd` — a
+    /// per-directory record, unrelated to `Cmd::CheckCodexTrust`'s
+    /// machine-wide hook-trust one — before typing
+    /// [`CODEX_WORKER_KICKOFF_LINE`] into `key`'s pane blind. Issued by
+    /// [`update_tick`] once a [`PendingKickoff`]'s quiet period has elapsed,
+    /// every tick, until the answer comes back trusted: a directory Codex
+    /// has never seen shows its own first-run trust prompt on stdin/stdout,
+    /// exactly where the kickoff line would otherwise land — measured
+    /// (worker-3's report) to block on that prompt the same way an
+    /// unanswered approval always has, with no flag banto already passes
+    /// dismissing it. The shell answers with
+    /// `Event::WorkerDirectoryTrustChecked`.
+    CheckWorkerDirectoryTrust {
+        key: SessionKey,
+        cwd: PathBuf,
+    },
     Store(StoreIntent),
     Reload,
-    /// Enable or disable the *host* terminal's own mouse capture — see
-    /// [`update_mouse_capture`]'s doc for when the core asks for this.
-    /// Capture is a property of banto's own terminal, not of any one pane
-    /// (`docs/DISCIPLINE.md` §2's I/O-at-the-edges split), so unlike every
-    /// other `Cmd` here this has no `SessionKey`: the shell just calls
-    /// crossterm's `Enable`/`DisableMouseCapture` on its own stdout.
-    SetMouseCapture(bool),
 }
 
 /// A fact about the outside world, fed into [`update`]. Derives
@@ -915,6 +1176,34 @@ pub enum Event {
         session_id: String,
         member: Option<(BrigadeId, MemberToken)>,
     },
+    /// The shell's Codex-sourced discovery tracker for `key` gave up: too
+    /// long since spawn with `BrigadeMember::briefed_session_id` still
+    /// `None` (see `docs/notes/codex-briefing-spike.md`'s silent-failure
+    /// list — an untrusted hook, a kickoff line that never got typed, and
+    /// others all look identical from here: nothing ever arrives). Unlike a
+    /// resolved [`Self::DiscoveryResult`], this never rekeys anything — the
+    /// pane stays parked under its synthetic key, same degraded-but-visible
+    /// outcome as an unresolved Claude discovery today, just with a status
+    /// line explaining why instead of silence.
+    CodexWorkerDiscoveryTimedOut {
+        key: SessionKey,
+        token: MemberToken,
+    },
+    /// The shell's Claude-sourced discovery tracker for `token` still hasn't
+    /// resolved, and its own cwd definitively reads `NotTrusted` (see
+    /// `banto_io::directory_trust::claude_directory_trust` — narrower than
+    /// `Unknown`-also-counts on purpose, `poll_discovery`'s own doc has the
+    /// reasoning) — reported once per tracker (the shell's own dedup,
+    /// `DiscoveryTracker::notified_untrusted`), so this pane's silence gets
+    /// explained instead of looking broken.
+    /// Unlike [`Self::CodexWorkerDiscoveryTimedOut`], there is no keystroke
+    /// to hold back here (Claude is never typed into by banto at all) and no
+    /// give-up timeout either — Claude discovery still waits forever,
+    /// unchanged; this only ever adds a one-time status line on top of that
+    /// wait.
+    ClaudeWorkerDirectoryUntrusted {
+        token: MemberToken,
+    },
     ArchiveDone {
         title: String,
         result: Result<(), String>,
@@ -933,15 +1222,46 @@ pub enum Event {
         /// activating row's own membership).
         members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
     },
+    /// Answers `Cmd::CheckCodexTrust`: whether banto's `SessionStart` hook
+    /// looks trusted right now, and whether it could even fire from this
+    /// executable's path — see [`update_codex_trust_checked`] for how the
+    /// two combine with the [`PendingCodexTrustFormation`] this always
+    /// follows.
+    CodexTrustChecked {
+        primed: bool,
+        hook_launchable: bool,
+    },
+    /// Answers `Cmd::CheckWorkerDirectoryTrust`: whether Codex has been told
+    /// to trust `key`'s pane's own cwd. `trusted` is already collapsed to a
+    /// plain bool by the shell — `banto_io::directory_trust::DirectoryTrust`'s
+    /// `NotTrusted` and `Unknown` both mean "don't type into this pane yet"
+    /// here, so there is nothing a third state would let
+    /// [`update_worker_directory_trust_checked`] do differently.
+    WorkerDirectoryTrustChecked {
+        key: SessionKey,
+        trusted: bool,
+    },
     BrigadeFormed {
         director_row_id: String,
         name: String,
         cwd: PathBuf,
+        /// Echoed straight through from `StoreIntent::FormBrigade` — see
+        /// its own doc.
+        worker_agent: AgentKind,
+        /// Echoed straight through from `StoreIntent::FormBrigade` — see
+        /// its own doc.
+        worker_model: String,
         result: Result<(BrigadeId, Vec<MemberToken>), String>,
     },
     WorkerAdded {
         brigade_id: BrigadeId,
         cwd: PathBuf,
+        /// Echoed straight through from `StoreIntent::AddWorker` — see its
+        /// own doc.
+        worker_agent: AgentKind,
+        /// Echoed straight through from `StoreIntent::AddWorker` — see its
+        /// own doc.
+        worker_model: String,
         result: Result<MemberToken, String>,
     },
     Disbanded {
@@ -998,16 +1318,17 @@ pub fn update(
         Event::Input(input) => update_input(state, app, brigade, input, now),
         Event::Resized { width, height } => update_resized(state, app, width, height),
         Event::PtyOutput { key, chunk } => {
+            state.last_output_at.insert(key.clone(), now);
             if let Some(screen) = state.screens.get_mut(&key) {
                 screen.process(&chunk);
             }
             Vec::new()
         }
-        Event::PtyExited { key } => update_pty_exited(state, app, key, now),
+        Event::PtyExited { key } => update_pty_exited(state, app, brigade, key, now),
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
-        Event::Spawned { key } => update_spawned(state, brigade, key),
+        Event::Spawned { key } => update_spawned(state, key, now),
         Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
             rows,
@@ -1026,6 +1347,21 @@ pub fn update(
             session_id,
             member,
         } => update_discovery_result(state, key, session_id, member, now),
+        Event::CodexWorkerDiscoveryTimedOut { key, token } => {
+            state.pending_kickoffs.retain(|pending| pending.key != key);
+            state.set_status(format!("{token}: Codex briefing wasn't confirmed"), now);
+            Vec::new()
+        }
+        Event::ClaudeWorkerDirectoryUntrusted { token } => {
+            state.set_status(
+                format!(
+                    "{token}: Claude hasn't been told to trust this directory yet — \
+                     answer its prompt in the pane"
+                ),
+                now,
+            );
+            Vec::new()
+        }
         Event::ArchiveDone { title, result } => {
             state.set_status(
                 match &result {
@@ -1051,17 +1387,48 @@ pub fn update(
             membership,
             members,
         } => update_membership_resolved(state, app, brigade, session_id, membership, members),
+        Event::CodexTrustChecked {
+            primed,
+            hook_launchable,
+        } => update_codex_trust_checked(state, app, primed, hook_launchable, now),
+        Event::WorkerDirectoryTrustChecked { key, trusted } => {
+            update_worker_directory_trust_checked(state, key, trusted, now)
+        }
         Event::BrigadeFormed {
             director_row_id,
             name,
             cwd,
+            worker_agent,
+            worker_model,
             result,
-        } => update_brigade_formed(state, app, director_row_id, name, cwd, result, now),
+        } => update_brigade_formed(
+            state,
+            app,
+            FormedBrigade {
+                director_row_id,
+                name,
+                cwd,
+                worker_agent,
+                worker_model,
+            },
+            result,
+            now,
+        ),
         Event::WorkerAdded {
             brigade_id,
             cwd,
+            worker_agent,
+            worker_model,
             result,
-        } => update_worker_added(state, brigade_id, cwd, result, now),
+        } => update_worker_added(
+            state,
+            brigade_id,
+            cwd,
+            worker_agent,
+            worker_model,
+            result,
+            now,
+        ),
         Event::Disbanded { brigade_id, result } => {
             update_disbanded(state, app, brigade_id, result, now)
         }
@@ -1082,51 +1449,7 @@ pub fn update(
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
     };
     cmds.extend(resize_staged_tiles(state));
-    cmds.extend(update_mouse_capture(state));
     cmds
-}
-
-/// Whether the host terminal's mouse capture should be on right now: always
-/// for the sidebar (its own click/scroll handling needs crossterm to
-/// actually deliver `Event::Mouse` at all), otherwise exactly when the
-/// focused pane's child wants SGR mouse reports (see
-/// [`crate::screen::Screen::wants_sgr_mouse`]) — a pane with no `Screen` yet
-/// (nothing spawned, or nothing heard from it yet) defaults to `false`,
-/// same as a child that has said nothing about mouse mode at all.
-fn wants_mouse_capture(state: &EmporiumState) -> bool {
-    match state.focus {
-        Focus::Sidebar => true,
-        Focus::Pane => state
-            .stage
-            .focused_key()
-            .and_then(|key| state.screens.get(key))
-            .is_some_and(crate::screen::Screen::wants_sgr_mouse),
-    }
-}
-
-/// Reconcile the host terminal's mouse capture with what the currently
-/// focused pane's child actually wants, emitting `Cmd::SetMouseCapture` only
-/// on a change (see [`EmporiumState::mouse_capture_enabled`]'s doc for the
-/// baseline this compares against). Called once at the end of every
-/// `update` regardless of event kind — same shape as
-/// [`resize_staged_tiles`] and for the same reason: the desired state can
-/// change from focus moving (a key or a mouse click) *or* from the focused
-/// pane's own output enabling/disabling mouse reporting after the fact
-/// (`Event::PtyOutput`), and checking centrally here is cheaper and more
-/// robust than remembering to call this from every branch that could cause
-/// either.
-///
-/// This only decides *whether* the child should receive mouse events —
-/// actually enabling/disabling capture is the host terminal's own state,
-/// which only the shell can touch (`docs/DISCIPLINE.md` §2); see
-/// `embedded::emporium::set_mouse_capture` for that half.
-fn update_mouse_capture(state: &mut EmporiumState) -> Vec<Cmd> {
-    let wants = wants_mouse_capture(state);
-    if wants == state.mouse_capture_enabled {
-        return Vec::new();
-    }
-    state.mouse_capture_enabled = wants;
-    vec![Cmd::SetMouseCapture(wants)]
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
@@ -1233,7 +1556,7 @@ fn update_key(
         Focus::Pane => {
             if let Some(target) = state.stage.focused_key().cloned() {
                 let bytes = key_to_bytes(&key);
-                state.last_forwarded_input = Some(now);
+                state.last_forwarded_input.insert(target.clone(), now);
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
@@ -1336,7 +1659,7 @@ fn resolve_armed_prefix(
                 return Vec::new();
             };
             let bytes = key_to_bytes(&state.prefix.as_key_event());
-            state.last_forwarded_input = Some(now);
+            state.last_forwarded_input.insert(target.clone(), now);
             if bytes.is_empty() {
                 Vec::new()
             } else {
@@ -1411,6 +1734,18 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
     match code {
         KeyCode::Esc => {
             app.close_modal();
+            // Unconditional, not gated on which modal was open: cancelling
+            // the Worker-agent picker must cancel whatever it was
+            // interrupting too — a brigade forming (or a Worker being
+            // added) anyway with whatever product happened to be selected
+            // is a far worse outcome than clearing a stash that was already
+            // `None` for every other modal kind. `pending_codex_trust_formation`
+            // is already `None` by the time `Modal::ConfirmCodexTrust` can
+            // even be open (see `update_codex_trust_checked`), but cleared
+            // here too, for the same defensive reason.
+            state.pending_brigade_formation = None;
+            state.pending_worker_addition = None;
+            state.pending_codex_trust_formation = None;
             Vec::new()
         }
         KeyCode::Up => {
@@ -1441,11 +1776,12 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
             app.modal_complete_candidate();
             Vec::new()
         }
-        // New-session modal only (see `App::modal_toggle_new_session_agent`'s
-        // doc for why the chōba has no equivalent binding); a no-op for
-        // every other modal kind, same as `modal_complete_candidate` above.
+        // New-session and Worker-agent-picker modals only (see
+        // `App::modal_toggle_agent`'s doc for why the chōba binds neither);
+        // a no-op for every other modal kind, same as
+        // `modal_complete_candidate` above.
         KeyCode::BackTab => {
-            app.modal_toggle_new_session_agent();
+            app.modal_toggle_agent();
             Vec::new()
         }
         KeyCode::Backspace => {
@@ -1472,6 +1808,9 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         New,
         Disband,
         Kill,
+        WorkerAgent,
+        CodexTrust,
+        DirectorReopen,
     }
     let kind = match app.modal() {
         Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
@@ -1479,6 +1818,9 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Modal::NewSession(_)) => Some(Kind::New),
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
+        Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
+        Some(Modal::ConfirmCodexTrust) => Some(Kind::CodexTrust),
+        Some(Modal::ConfirmDirectorReopen { .. }) => Some(Kind::DirectorReopen),
         None => None,
     };
     match kind {
@@ -1487,8 +1829,73 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::New) => confirm_new_session_modal(app),
         Some(Kind::Disband) => confirm_disband_modal(app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
+        Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
+        Some(Kind::CodexTrust) => confirm_codex_trust_modal(state, app),
+        Some(Kind::DirectorReopen) => confirm_director_reopen_modal(state, app),
         None => Vec::new(),
     }
+}
+
+/// Confirm the Worker-agent picker: read its chosen agent and (already
+/// trimmed-by-nothing — an empty model is meaningful, "no `--model` flag")
+/// model text, then combine with whichever interruption opened this modal —
+/// [`EmporiumState::pending_worker_addition`] (`add_worker`'s own `Select`
+/// branch) or [`EmporiumState::pending_brigade_formation`]
+/// (`begin_brigade_formation`'s) — at most one is ever set, since only one
+/// modal is ever open at a time and each is stashed right before opening
+/// it. A no-op (closes the modal, nothing happens) if neither is set —
+/// shouldn't happen structurally, but doing nothing is the only safe
+/// fallback if it ever does, not guessing at a product.
+///
+/// Formation alone routes a Codex choice through a trust check first
+/// (`update_codex_trust_checked`) before `FormBrigade`, same as its own
+/// non-`Select` path. `add_worker`'s non-`Select` path has never done this
+/// (see [`PendingWorkerAddition`]'s own doc for why `Select` doesn't gain
+/// it here either) — adding one more Worker to an already-running brigade
+/// is the lower-stakes case, and by the time one exists to add to, any
+/// Codex member already spawned would already have gone through this same
+/// gate if one was ever needed (the hook's trust key is one fixed string
+/// per install, not per-member — see `opener::session_start_hook_override`'s
+/// doc).
+fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::WorkerAgentPicker(picker)) = app.modal() else {
+        return Vec::new();
+    };
+    let worker_agent = picker.agent();
+    let worker_model = picker.model_input().to_string();
+    app.close_modal();
+
+    if let Some(addition) = state.pending_worker_addition.take() {
+        return vec![Cmd::Store(StoreIntent::AddWorker {
+            brigade_id: addition.brigade_id,
+            cwd: addition.cwd,
+            worker_agent,
+            worker_model,
+        })];
+    }
+
+    let Some(formation) = state.pending_brigade_formation.take() else {
+        return Vec::new();
+    };
+    if worker_agent == AgentKind::Codex {
+        state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
+            director_row_id: formation.director_row_id,
+            name: formation.name,
+            cwd: formation.cwd,
+            worker_count: formation.worker_count,
+            worker_agent,
+            worker_model,
+        });
+        return vec![Cmd::CheckCodexTrust];
+    }
+    vec![Cmd::Store(StoreIntent::FormBrigade {
+        director_row_id: formation.director_row_id,
+        name: formation.name,
+        cwd: formation.cwd,
+        worker_count: formation.worker_count,
+        worker_agent,
+        worker_model,
+    })]
 }
 
 fn confirm_archive_modal(app: &mut App) -> Vec<Cmd> {
@@ -1698,7 +2105,7 @@ fn update_membership_resolved(
                 app,
                 brigade_id,
                 &members.unwrap_or_default(),
-                &brigade.worker_model,
+                brigade,
             ),
             _ => open_solo(state, &row),
         },
@@ -1711,16 +2118,183 @@ fn update_membership_resolved(
                 state.status = Some("workers can't be promoted to Director directly".to_string());
                 Vec::new()
             }
-            None => vec![Cmd::Store(StoreIntent::FormBrigade {
-                director_row_id: row.id.clone(),
-                name: row.display_title().to_string(),
-                cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                worker_count: brigade.worker_count(),
-            })],
+            // Outranks the two gates inside `begin_brigade_formation`
+            // (`Select`'s picker, the codex-trust check): reopening the
+            // Director's own pane is the most disruptive of the three
+            // (running work is lost) and the cheapest to abort (nothing has
+            // been picked or written yet), so it has to be asked about
+            // first — picking a product and a model only to be told the
+            // pane is about to restart anyway would be the wrong order. See
+            // `confirm_director_reopen_modal`/`update_pty_exited` for the
+            // other half of this round trip.
+            None if state.screens.contains_key(&SessionKey::from_id(&row.id)) => {
+                app.open_confirm_director_reopen_modal(
+                    row.id.clone(),
+                    row.display_title().to_string(),
+                );
+                Vec::new()
+            }
+            None => begin_brigade_formation(state, app, brigade, &row),
         },
         // Handled above, before the `row_for_id` guard.
         PendingMembership::DismissWorker => Vec::new(),
     }
+}
+
+/// The formation decision proper, once nothing needs to reopen first (see
+/// `update_membership_resolved`'s `None` branch, and `update_pty_exited` for
+/// the resumed-after-reopen path): `Select` interrupts with a picker instead
+/// of issuing `FormBrigade` right away — the operator has to choose a
+/// product (and, given the product, a model) before there's anything to
+/// form, see `confirm_worker_agent_modal` for the other half of that round
+/// trip. Otherwise the Worker product resolves immediately, and — if it's
+/// Codex — routes through a trust check first, same reasoning, see
+/// `update_codex_trust_checked`.
+fn begin_brigade_formation(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    row: &SessionRow,
+) -> Vec<Cmd> {
+    if brigade.worker_agent == WorkerAgentSetting::Select {
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: row.id.clone(),
+            name: row.display_title().to_string(),
+            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            worker_count: brigade.worker_count(),
+        });
+        app.open_worker_agent_modal(
+            row.agent,
+            brigade.worker_model.clone(),
+            brigade.worker_model_codex.clone(),
+        );
+        return Vec::new();
+    }
+    let worker_agent = resolve_worker_agent(brigade.worker_agent, row.agent);
+    let worker_model = brigade
+        .worker_model_for(worker_agent)
+        .unwrap_or("")
+        .to_string();
+    if worker_agent == AgentKind::Codex {
+        state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
+            director_row_id: row.id.clone(),
+            name: row.display_title().to_string(),
+            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            worker_count: brigade.worker_count(),
+            worker_agent,
+            worker_model,
+        });
+        return vec![Cmd::CheckCodexTrust];
+    }
+    vec![Cmd::Store(StoreIntent::FormBrigade {
+        director_row_id: row.id.clone(),
+        name: row.display_title().to_string(),
+        cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+        worker_count: brigade.worker_count(),
+        worker_agent,
+        worker_model,
+    })]
+}
+
+/// Answers `Cmd::CheckCodexTrust`, always following a
+/// [`PendingCodexTrustFormation`] stash (`update_membership_resolved`'s
+/// non-`Select` branch, or `confirm_worker_agent_modal` once `Select`'s own
+/// picker resolves) — a no-op if it's missing, which shouldn't happen
+/// structurally.
+///
+/// Three outcomes, and only one of them re-issues `FormBrigade`:
+/// - **Not launchable at all** (banto's own path has a space — Codex can
+///   never fire a hook command from one, `hook_command_is_launchable`'s
+///   doc): a trust prompt would only ask the operator to approve a hook
+///   that can never run, so it's skipped — a status line names the cause
+///   (the same wording `codex_trust_notice` already uses for it) and
+///   formation proceeds anyway. Unlike the "not primed" case below, there's
+///   no action a pane could offer that would fix this one before forming.
+/// - **Primed**: proceeds straight to `FormBrigade`, unchanged from before
+///   this check existed.
+/// - **Neither**: opens [`Modal::ConfirmCodexTrust`] and stops — formation
+///   is abandoned for this press, not resumed once the operator approves or
+///   cancels. Resuming it would need to know whether the approval actually
+///   took (Codex hashes its own trust record; banto cannot verify a match
+///   against it — see `banto_io::codex_trust`'s module doc), and treating an
+///   unverifiable "probably fine" as ground truth is exactly the shape of
+///   mistake this project has paid for before. The operator presses `B`
+///   again once they're done.
+fn update_codex_trust_checked(
+    state: &mut EmporiumState,
+    app: &mut App,
+    primed: bool,
+    hook_launchable: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let Some(formation) = state.pending_codex_trust_formation.take() else {
+        return Vec::new();
+    };
+    if !hook_launchable {
+        state.set_status(
+            "codex: banto's own path contains a space, which Codex cannot launch a hook \
+             from — this brigade's Codex member(s) start unbriefed"
+                .to_string(),
+            now,
+        );
+        return vec![Cmd::Store(StoreIntent::FormBrigade {
+            director_row_id: formation.director_row_id,
+            name: formation.name,
+            cwd: formation.cwd,
+            worker_count: formation.worker_count,
+            worker_agent: formation.worker_agent,
+            worker_model: formation.worker_model,
+        })];
+    }
+    if primed {
+        return vec![Cmd::Store(StoreIntent::FormBrigade {
+            director_row_id: formation.director_row_id,
+            name: formation.name,
+            cwd: formation.cwd,
+            worker_count: formation.worker_count,
+            worker_agent: formation.worker_agent,
+            worker_model: formation.worker_model,
+        })];
+    }
+    app.open_confirm_codex_trust_modal();
+    Vec::new()
+}
+
+/// Confirm [`Modal::ConfirmCodexTrust`]: mint a fresh key, stage it as the
+/// (eventual) solo pane the same way any other fresh open does
+/// (`PendingOpen::Solo` — reused as-is, not a new variant, because staging
+/// is all this needs: no session row, no discovery), and ask the shell to
+/// spawn Codex's trust-review startup under it. See `Cmd::OpenCodexTrustPane`
+/// for why this never becomes a tracked session.
+fn confirm_codex_trust_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    if !matches!(app.modal(), Some(Modal::ConfirmCodexTrust)) {
+        return Vec::new();
+    }
+    app.close_modal();
+    let key = state.mint_plain_key(std::path::Path::new(".codex-trust"));
+    state.pending_opens.insert(key.clone(), PendingOpen::Solo);
+    vec![Cmd::OpenCodexTrustPane { key }]
+}
+
+/// Confirm [`Modal::ConfirmDirectorReopen`]: kill the Director-to-be's
+/// already-open pane and stash `pending_director_reopen` so
+/// [`update_pty_exited`] can pick formation back up (via
+/// [`begin_brigade_formation`]) once — not before — that pane's process has
+/// actually exited. Nothing is written to the store here or by that
+/// continuation's first steps; Esc leaves the brigade unformed with no
+/// cleanup needed, same as never having pressed `B` at all.
+fn confirm_director_reopen_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmDirectorReopen {
+        director_row_id, ..
+    }) = app.modal()
+    else {
+        return Vec::new();
+    };
+    let director_row_id = director_row_id.clone();
+    app.close_modal();
+    let director_key = SessionKey::from_id(&director_row_id);
+    state.pending_director_reopen = Some(director_row_id);
+    vec![Cmd::KillPty { key: director_key }]
 }
 
 /// Stage `row` solo: reuse its screen if already open, else request a spawn.
@@ -1759,15 +2333,21 @@ fn stage_brigade(
     app: &App,
     brigade_id: BrigadeId,
     members: &[(MemberToken, BrigadeRole, Option<String>)],
-    worker_model: &str,
+    brigade: &BrigadeConfig,
 ) -> Vec<Cmd> {
-    let cwd = members
+    let director_row = members
         .iter()
         .find(|(_, role, _)| *role == BrigadeRole::Director)
         .and_then(|(_, _, sid)| sid.as_deref())
-        .and_then(|sid| app.row_for_id(sid))
+        .and_then(|sid| app.row_for_id(sid));
+    let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
+    // A Director not yet resolved to a row can't say what product it is
+    // either — the safe default rather than blocking staging on it, same
+    // fallback `add_worker`/`update_brigade_formed` use.
+    let director_agent = director_row.map_or(AgentKind::ClaudeCode, |row| row.agent);
+    let fresh_worker_agent = resolve_worker_agent(brigade.worker_agent, director_agent);
 
     let mut panes = Vec::new();
     let mut cmds = Vec::new();
@@ -1780,18 +2360,31 @@ fn stage_brigade(
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
-                    state
-                        .pending_opens
-                        .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+                    state.pending_opens.insert(
+                        key.clone(),
+                        // Resuming a known id: nothing to discover, so
+                        // never a kickoff candidate (see `open_worker`'s
+                        // own doc on why only *it* ever sets this `true`).
+                        PendingOpen::BrigadeMember {
+                            brigade_id,
+                            needs_codex_kickoff: false,
+                            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                        },
+                    );
                     // A resume's `--model` matters exactly like a fresh
                     // spawn's (see `open_worker`): a Worker resumed without
                     // it silently falls back to the operator's own default
                     // model rather than the brigade's configured one. Never
                     // for the Director — that's the operator's own session,
                     // launched (and re-launched) entirely outside banto's
-                    // control.
-                    let model = (*role == BrigadeRole::Worker && !worker_model.is_empty())
-                        .then(|| worker_model.to_string());
+                    // control. Resolved from *this row's own* `agent`, not
+                    // `fresh_worker_agent`: a resumed member already has a
+                    // fixed product, unrelated to what a brand-new spawn
+                    // would pick.
+                    let model = (*role == BrigadeRole::Worker)
+                        .then(|| brigade.worker_model_for(row.agent))
+                        .flatten()
+                        .map(str::to_string);
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -1820,7 +2413,15 @@ fn stage_brigade(
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
-                    cmds.extend(open_worker(state, brigade_id, token, &cwd, worker_model));
+                    let model = brigade.worker_model_for(fresh_worker_agent).unwrap_or("");
+                    cmds.extend(open_worker(
+                        state,
+                        brigade_id,
+                        token,
+                        &cwd,
+                        model,
+                        fresh_worker_agent,
+                    ));
                 }
             }
             None => missing += 1,
@@ -1852,30 +2453,82 @@ fn toggle_pin(app: &mut App) -> Vec<Cmd> {
 /// `b`: spawn one more fresh Worker into the staged brigade. `cwd` is the
 /// Director's own row cwd, resolved from `app` via the Director's key
 /// (always `panes[0]`, always a known real id) — no extra round trip needed.
-fn add_worker(state: &mut EmporiumState, app: &App, _brigade: &BrigadeConfig) -> Vec<Cmd> {
+fn add_worker(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig) -> Vec<Cmd> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         state.status = Some("no brigade staged — press B to start one".to_string());
         return Vec::new();
     };
     let brigade_id = *id;
-    let cwd = panes
-        .first()
-        .and_then(|key| app.row_for_id(key.as_str()))
+    let director_row = panes.first().and_then(|key| app.row_for_id(key.as_str()));
+    let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
-    vec![Cmd::Store(StoreIntent::AddWorker { brigade_id, cwd })]
+    // A Director not yet resolved to a row can't say what product it is
+    // either — the safe default rather than blocking on it, same fallback
+    // `stage_brigade`/`update_brigade_formed` use.
+    let director_agent = director_row.map_or(AgentKind::ClaudeCode, |row| row.agent);
+
+    // Same interruption `begin_brigade_formation` does for `Select` — see
+    // `PendingWorkerAddition`'s own doc for what Esc means here
+    // specifically (lighter than formation's: this only cancels adding one
+    // more Worker, not an already-running brigade).
+    if brigade.worker_agent == WorkerAgentSetting::Select {
+        state.pending_worker_addition = Some(PendingWorkerAddition { brigade_id, cwd });
+        app.open_worker_agent_modal(
+            director_agent,
+            brigade.worker_model.clone(),
+            brigade.worker_model_codex.clone(),
+        );
+        return Vec::new();
+    }
+
+    let worker_agent = resolve_worker_agent(brigade.worker_agent, director_agent);
+    let worker_model = brigade
+        .worker_model_for(worker_agent)
+        .unwrap_or("")
+        .to_string();
+    vec![Cmd::Store(StoreIntent::AddWorker {
+        brigade_id,
+        cwd,
+        worker_agent,
+        worker_model,
+    })]
 }
+
+/// Lines [`update_mouse`] scrolls a pane's own scrollback per wheel notch —
+/// tmux's own long-standing convention, chosen so a habit already
+/// muscle-memorized elsewhere carries over here.
+const SCROLL_NOTCH_LINES: isize = 3;
 
 /// Dispatch one mouse event: sidebar click/scroll, or — over a pane — focus
 /// it (`Down(Left)` always moves focus, regardless of whether it wants
-/// mouse) and forward the event as an SGR report, but only when the focused
-/// pane's own child asked for mouse reporting in that encoding (see
-/// [`crate::screen::Screen::wants_sgr_mouse`]) — forwarding unconditionally,
-/// as this used to, sent bytes to children that never asked for them and
-/// would otherwise have gotten native terminal text selection instead. See
-/// [`update_mouse_capture`] for the other half: releasing banto's own
-/// terminal capture so that native selection actually becomes available
-/// once forwarding is refused.
+/// mouse), then either forward the event as an SGR report or, for the
+/// wheel specifically, consume it into that pane's own scrollback — the
+/// choice in both cases keyed on whether the focused pane's child asked
+/// for mouse reporting in the one encoding banto speaks (see
+/// [`crate::screen::Screen::wants_sgr_mouse`]): a child that never enabled
+/// mouse reporting has no idea what to do with an SGR sequence arriving on
+/// its stdin, so forwarding unconditionally would just leak noise into
+/// whatever it's actually reading — and it has no scrollback of its own to
+/// receive the wheel as input either. A child that *does* want mouse gets
+/// every event forwarded exactly as before, wheel included: it can already
+/// implement its own scrollback (Claude Code does), and forwarding both
+/// keeps that working and never fights it over whose scroll position is
+/// authoritative.
+///
+/// The host terminal's own mouse capture used to track this same
+/// wants-mouse check, releasing itself over a pane that didn't want
+/// reports so the terminal's native text selection could take over. That
+/// mechanism is gone: capture is unconditional now (`setup_terminal`)
+/// because releasing it had a worse cost than the native selection it
+/// bought — a `BANTO_INPUT_LOG` capture showed that once the host terminal
+/// itself stops delivering mouse events, banto cannot get them back short
+/// of the operator manually re-enabling capture out-of-band, which trapped
+/// focus on any pane whose child didn't request mouse reporting (Codex,
+/// measured; any other non-mouse child equally). This function's own
+/// SGR-forwarding gate above is unaffected by that removal — it was always
+/// about what bytes a child understands, never about whether banto's
+/// terminal receives the event in the first place.
 fn update_mouse(
     state: &mut EmporiumState,
     app: &mut App,
@@ -1904,14 +2557,28 @@ fn update_mouse(
         }
         if state.focus == Focus::Pane
             && let Some((key, rect)) = hit
-            && state
+        {
+            if state
                 .screens
                 .get(&key)
                 .is_some_and(crate::screen::Screen::wants_sgr_mouse)
-            && let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect))
-        {
-            state.last_forwarded_input = Some(now);
-            return vec![Cmd::WritePty { key, bytes }];
+            {
+                if let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect)) {
+                    state.last_forwarded_input.insert(key.clone(), now);
+                    return vec![Cmd::WritePty { key, bytes }];
+                }
+            } else {
+                let notch_delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => Some(SCROLL_NOTCH_LINES),
+                    MouseEventKind::ScrollDown => Some(-SCROLL_NOTCH_LINES),
+                    _ => None,
+                };
+                if let Some(delta) = notch_delta
+                    && let Some(screen) = state.screens.get_mut(&key)
+                {
+                    screen.scroll(delta);
+                }
+            }
         }
         return Vec::new();
     }
@@ -2017,14 +2684,14 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
         } else {
             normalized.into_bytes()
         };
-        state.last_forwarded_input = Some(now);
+        state.last_forwarded_input.insert(key.clone(), now);
         cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
     }
     Vec::new()
 }
 
-fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: SessionKey) -> Vec<Cmd> {
+fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> Vec<Cmd> {
     state
         .screens
         .insert(key.clone(), crate::screen::Screen::new(24, 80));
@@ -2041,6 +2708,8 @@ fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: Sessi
             brigade_id,
             worker_tokens,
             cwd,
+            worker_agent,
+            worker_model,
         } => {
             state.stage = Stage::Brigade {
                 id: brigade_id,
@@ -2051,40 +2720,87 @@ fn update_spawned(state: &mut EmporiumState, brigade: &BrigadeConfig, key: Sessi
             worker_tokens
                 .into_iter()
                 .flat_map(|token| {
-                    open_worker(state, brigade_id, &token, &cwd, &brigade.worker_model)
+                    open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
                 })
                 .collect()
         }
-        PendingOpen::BrigadeMember { brigade_id } => {
+        PendingOpen::BrigadeMember {
+            brigade_id,
+            needs_codex_kickoff,
+            cwd,
+        } => {
             if let Stage::Brigade { id, panes, .. } = &mut state.stage
                 && *id == brigade_id
                 && !panes.contains(&key)
             {
-                panes.push(key);
+                panes.push(key.clone());
+            }
+            if needs_codex_kickoff {
+                state.pending_kickoffs.push(PendingKickoff {
+                    key,
+                    spawned_at: now,
+                    cwd,
+                    notified_untrusted: false,
+                });
             }
             Vec::new()
         }
     }
 }
 
+/// Which product a fresh Worker spawn should use, given `[brigade]
+/// worker_agent` and the brigade's own Director's product.
+///
+/// `Select` is a stand-in for `Inherit` here, not a considered choice of its
+/// own: every call site that reaches this function runs well after
+/// formation already started — a re-stage, a later `B` add-worker, or the
+/// moment right after the Director itself finished spawning — with no
+/// synchronous UI moment left to interrupt with a picker. The formation
+/// modal that actually asks the operator up front (so every one of these
+/// call sites gets an already-decided `AgentKind` before this function ever
+/// runs) is separate, not-yet-landed work; until it does, falling back to
+/// `Inherit`'s behavior is the least-surprising default.
+fn resolve_worker_agent(setting: WorkerAgentSetting, director_agent: AgentKind) -> AgentKind {
+    match setting {
+        WorkerAgentSetting::Inherit | WorkerAgentSetting::Select => director_agent,
+        WorkerAgentSetting::Claude => AgentKind::ClaudeCode,
+        WorkerAgentSetting::Codex => AgentKind::Codex,
+    }
+}
+
 /// Emit the `Cmd::OpenEmbedded` for one auto-spawned Worker, wired to the
 /// brigade's MCP channel, tracked as a `BrigadeMember` open.
+///
+/// `agent` is always the caller's own, already-resolved choice (see
+/// [`resolve_worker_agent`]) — this function never re-derives it. Whenever
+/// that choice is `AgentKind::Codex`,
+/// [`PendingOpen::BrigadeMember::needs_codex_kickoff`] picks it up
+/// automatically: this function is the *only* place that ever sets it
+/// `true`, since every call here is a fresh, id-less spawn — a resumed
+/// member with a known id (`stage_brigade`'s own `Some(row)` branch) never
+/// calls this at all.
 fn open_worker(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
     token: &str,
     cwd: &std::path::Path,
     worker_model: &str,
+    agent: AgentKind,
 ) -> Vec<Cmd> {
     let key = SessionKey::new_worker(brigade_id, token);
-    state
-        .pending_opens
-        .insert(key.clone(), PendingOpen::BrigadeMember { brigade_id });
+    state.pending_opens.insert(
+        key.clone(),
+        PendingOpen::BrigadeMember {
+            brigade_id,
+            needs_codex_kickoff: agent == AgentKind::Codex,
+            cwd: cwd.to_path_buf(),
+        },
+    );
     vec![Cmd::OpenEmbedded {
         key,
         target: SessionToOpen {
             id: String::new(),
-            agent: AgentKind::ClaudeCode,
+            agent,
             title: format!("worker {token}"),
             cwd: cwd.to_path_buf(),
         },
@@ -2106,12 +2822,40 @@ fn update_spawn_failed(
 
 fn update_pty_exited(
     state: &mut EmporiumState,
-    app: &App,
+    app: &mut App,
+    brigade: &BrigadeConfig,
     key: SessionKey,
     now: Instant,
 ) -> Vec<Cmd> {
     state.screens.remove(&key);
     state.unstage(&key);
+    // A Director-reopen confirm killed exactly this pane and is waiting for
+    // it to actually be gone before reopening it wired — see
+    // `confirm_director_reopen_modal`'s doc for why "gone" can't be assumed
+    // any earlier than this event. Takes over from the generic "session
+    // ended" status below: formation continuing *is* what happens next.
+    if state
+        .pending_director_reopen
+        .as_deref()
+        .is_some_and(|id| SessionKey::from_id(id) == key)
+    {
+        let director_row_id = state.pending_director_reopen.take().unwrap();
+        return match app.row_for_id(&director_row_id).cloned() {
+            Some(row) => begin_brigade_formation(state, app, brigade, &row),
+            None => Vec::new(),
+        };
+    }
+    // The residual-race counterpart above (`PendingDirectorWiring`'s own
+    // doc): the brigade already exists in the store, so there is nothing
+    // left to decide, only wiring to apply once this pane is confirmed gone.
+    if state
+        .pending_director_wiring
+        .as_ref()
+        .is_some_and(|wiring| SessionKey::from_id(&wiring.director_row_id) == key)
+    {
+        let wiring = state.pending_director_wiring.take().unwrap();
+        return open_director_with_wiring(state, app, wiring);
+    }
     let title = app
         .row_for_id(key.as_str())
         .map(|row| row.display_title().to_string())
@@ -2257,15 +3001,32 @@ fn update_member_session_forked(
     cmds
 }
 
-fn update_brigade_formed(
-    state: &mut EmporiumState,
-    app: &mut App,
+/// `Event::BrigadeFormed`'s successful-formation payload, bundled so
+/// [`update_brigade_formed`] doesn't tip into clippy's too-many-arguments —
+/// these five always travel together anyway, all the way from
+/// `StoreIntent::FormBrigade`.
+struct FormedBrigade {
     director_row_id: String,
     name: String,
     cwd: PathBuf,
+    worker_agent: AgentKind,
+    worker_model: String,
+}
+
+fn update_brigade_formed(
+    state: &mut EmporiumState,
+    app: &mut App,
+    formed: FormedBrigade,
     result: Result<(BrigadeId, Vec<MemberToken>), String>,
     now: Instant,
 ) -> Vec<Cmd> {
+    let FormedBrigade {
+        director_row_id,
+        name,
+        cwd,
+        worker_agent,
+        worker_model,
+    } = formed;
     let (brigade_id, worker_tokens) = match result {
         Ok(pair) => pair,
         Err(err) => {
@@ -2275,40 +3036,31 @@ fn update_brigade_formed(
     };
     let director_key = SessionKey::from_id(&director_row_id);
     let worker_count = worker_tokens.len();
+    let wiring = PendingDirectorWiring {
+        director_row_id,
+        brigade_id,
+        worker_tokens,
+        cwd,
+        worker_agent,
+        worker_model,
+    };
     let cmds = if state.screens.contains_key(&director_key) {
-        state.stage = Stage::Brigade {
-            id: brigade_id,
-            panes: vec![director_key],
-            focused: 0,
-        };
-        state.focus = Focus::Pane;
-        worker_tokens
-            .into_iter()
-            .flat_map(|token| open_worker(state, brigade_id, &token, &cwd, ""))
-            .collect()
+        // The interactive gate (`begin_brigade_formation`'s caller,
+        // `confirm_director_reopen_modal`) is meant to have already closed
+        // this pane before `StoreIntent::FormBrigade` was even issued —
+        // reaching here with it still open is the residual race worker-3's
+        // card called out: something reopened it in the brief window
+        // between that confirm and this store round trip landing. The
+        // brigade record already exists by this point (this function's own
+        // early return above), so there is no clean way left to abort —
+        // silently staging the existing pane as-is would reproduce the
+        // exact bug this round trip exists to fix (a Director with no
+        // MCP/hook wiring), so it is killed and reopened here too, same as
+        // the interactive gate, just without asking first.
+        state.pending_director_wiring = Some(wiring);
+        vec![Cmd::KillPty { key: director_key }]
     } else {
-        state.pending_opens.insert(
-            director_key.clone(),
-            PendingOpen::BrigadeDirector {
-                brigade_id,
-                worker_tokens,
-                cwd: cwd.clone(),
-            },
-        );
-        let Some(row) = app.row_for_id(&director_row_id) else {
-            return Vec::new();
-        };
-        vec![Cmd::OpenEmbedded {
-            key: director_key,
-            target: SessionToOpen {
-                id: director_row_id,
-                agent: row.agent,
-                title: row.display_title().to_string(),
-                cwd,
-            },
-            brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
-            model: None,
-        }]
+        open_director_with_wiring(state, app, wiring)
     };
     state.set_status(
         format!("brigade formed — director: {name}, {worker_count} worker(s) spawned"),
@@ -2317,17 +3069,67 @@ fn update_brigade_formed(
     cmds
 }
 
+/// Open the Director wired (MCP config / Codex `-c` overrides — see
+/// [`PendingOpen::BrigadeDirector`]'s own doc), for a `director_row_id` whose
+/// pane is confirmed *not* open right now — [`update_brigade_formed`]'s
+/// direct case, or [`update_pty_exited`] once a kill-and-reopen (either
+/// gate) confirms the old pane is actually gone. `Vec::new()` if the row
+/// can no longer be found (the session vanished from `app.rows` in the
+/// interim) — nothing left to open, but the brigade record itself, and
+/// whatever status message the caller already set, stand regardless.
+fn open_director_with_wiring(
+    state: &mut EmporiumState,
+    app: &App,
+    wiring: PendingDirectorWiring,
+) -> Vec<Cmd> {
+    let PendingDirectorWiring {
+        director_row_id,
+        brigade_id,
+        worker_tokens,
+        cwd,
+        worker_agent,
+        worker_model,
+    } = wiring;
+    let director_key = SessionKey::from_id(&director_row_id);
+    state.pending_opens.insert(
+        director_key.clone(),
+        PendingOpen::BrigadeDirector {
+            brigade_id,
+            worker_tokens,
+            cwd: cwd.clone(),
+            worker_agent,
+            worker_model,
+        },
+    );
+    let Some(row) = app.row_for_id(&director_row_id) else {
+        return Vec::new();
+    };
+    vec![Cmd::OpenEmbedded {
+        key: director_key,
+        target: SessionToOpen {
+            id: director_row_id,
+            agent: row.agent,
+            title: row.display_title().to_string(),
+            cwd,
+        },
+        brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
+        model: None,
+    }]
+}
+
 fn update_worker_added(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
     cwd: PathBuf,
+    worker_agent: AgentKind,
+    worker_model: String,
     result: Result<MemberToken, String>,
     now: Instant,
 ) -> Vec<Cmd> {
     match result {
         Ok(token) => {
             state.set_status(format!("{token} added"), now);
-            open_worker(state, brigade_id, &token, &cwd, "")
+            open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
         }
         Err(err) => {
             state.set_status(format!("failed to add worker: {err}"), now);
@@ -2452,6 +3254,28 @@ fn update_tick(
         }
     }
 
+    // Codex Worker kickoff: once a pending pane's own output has been quiet
+    // for CODEX_KICKOFF_QUIET_PERIOD, ask the shell whether Codex has been
+    // told to trust this pane's cwd (`Cmd::CheckWorkerDirectoryTrust`) —
+    // never type the fixed line blind. The entry stays queued, re-asked
+    // every tick, until `update_worker_directory_trust_checked` sees a
+    // trusted answer and does the actual typing; this also means trust
+    // granted later (the operator answers the prompt themselves) is picked
+    // up on its own, with no separate recovery path needed.
+    for pending in &state.pending_kickoffs {
+        let quiet_since = state
+            .last_output_at
+            .get(&pending.key)
+            .copied()
+            .unwrap_or(pending.spawned_at);
+        if now.saturating_duration_since(quiet_since) >= CODEX_KICKOFF_QUIET_PERIOD {
+            cmds.push(Cmd::CheckWorkerDirectoryTrust {
+                key: pending.key.clone(),
+                cwd: pending.cwd.clone(),
+            });
+        }
+    }
+
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
@@ -2462,7 +3286,7 @@ fn update_tick(
                 now,
                 obs.is_idle_this_tick,
                 is_focused,
-                state.last_forwarded_input,
+                state.last_forwarded_input.get(&obs.key).copied(),
                 obs.has_unseen,
             );
             if nudge {
@@ -2492,6 +3316,56 @@ fn update_tick(
         state.prefix_armed = None;
     }
 
+    cmds
+}
+
+/// Answers `Cmd::CheckWorkerDirectoryTrust`, always following a
+/// [`PendingKickoff`] whose quiet period has already elapsed.
+///
+/// `trusted`: types the kickoff line, exactly as [`update_tick`] used to do
+/// unconditionally once quiet — this is that same action, just gated. Not
+/// trusted (or unknown, already collapsed into the same `false` by the
+/// shell): the entry is left in [`EmporiumState::pending_kickoffs`]
+/// untouched, so [`update_tick`] asks again next tick — no separate timeout,
+/// no separate recovery path; trust granted later (the operator answers the
+/// prompt in the pane themselves) is picked up on the very next check. A
+/// missing entry (the pane unstaged between the check being issued and its
+/// answer landing) is a no-op.
+fn update_worker_directory_trust_checked(
+    state: &mut EmporiumState,
+    key: SessionKey,
+    trusted: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let Some(pos) = state.pending_kickoffs.iter().position(|p| p.key == key) else {
+        return Vec::new();
+    };
+    if !trusted {
+        if !state.pending_kickoffs[pos].notified_untrusted {
+            state.pending_kickoffs[pos].notified_untrusted = true;
+            let name = key
+                .worker_identity()
+                .map(|(_, token)| token)
+                .unwrap_or_else(|| key.as_str().to_string());
+            state.set_status(
+                format!(
+                    "{name}: Codex hasn't been told to trust this directory yet — \
+                     answer its prompt in the pane and it will pick up its first turn"
+                ),
+                now,
+            );
+        }
+        return Vec::new();
+    }
+    let entry = state.pending_kickoffs.remove(pos);
+    let cmds = vec![Cmd::WritePty {
+        key: entry.key.clone(),
+        bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+    }];
+    state.pending_submits.push(PendingSubmit {
+        key: entry.key,
+        nudged_at: now,
+    });
     cmds
 }
 
@@ -3571,6 +4445,877 @@ mod tests {
         );
     }
 
+    // --- worker_agent: config wired into every open_worker call site -------
+
+    #[test]
+    fn resolve_worker_agent_follows_the_configured_setting() {
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Inherit, AgentKind::Codex),
+            AgentKind::Codex,
+            "Inherit copies the Director's own product"
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Inherit, AgentKind::ClaudeCode),
+            AgentKind::ClaudeCode
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Select, AgentKind::Codex),
+            AgentKind::Codex,
+            "stage-1 stand-in: Select behaves like Inherit until the formation modal lands"
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Claude, AgentKind::Codex),
+            AgentKind::ClaudeCode,
+            "Claude pins regardless of the Director's own product"
+        );
+        assert_eq!(
+            resolve_worker_agent(WorkerAgentSetting::Codex, AgentKind::ClaudeCode),
+            AgentKind::Codex,
+            "Codex pins regardless of the Director's own product"
+        );
+    }
+
+    #[test]
+    fn stage_brigade_fresh_worker_spawn_inherits_a_claude_directors_product_unchanged() {
+        // The explicit regression this round asked for: with the default
+        // `[brigade] worker_agent = "inherit"`, a Claude Director's cell
+        // must not change by a single byte.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config(); // worker_agent defaults to Inherit
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            ("worker-1".to_string(), BrigadeRole::Worker, None), // fresh, no id yet
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            test_instant(),
+        );
+
+        let worker_target = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, .. } if target.id.is_empty() => Some(target),
+            _ => None,
+        });
+        assert_eq!(worker_target.map(|t| t.agent), Some(AgentKind::ClaudeCode));
+    }
+
+    #[test]
+    fn stage_brigade_fresh_worker_spawn_uses_an_explicitly_configured_codex_setting() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]); // dir's own row is Claude...
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex, // ...but pinned regardless
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            ("worker-1".to_string(), BrigadeRole::Worker, None),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            test_instant(),
+        );
+
+        let worker_target = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, .. } if target.id.is_empty() => Some(target),
+            _ => None,
+        });
+        assert_eq!(worker_target.map(|t| t.agent), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn brigade_formed_kills_and_rewires_the_director_when_its_pane_is_already_open() {
+        // The residual-race case `PendingDirectorWiring` exists for: by the
+        // time `Event::BrigadeFormed` lands, the store record already
+        // exists, so this can no longer ask — it can only kill and reopen
+        // wired, same as the interactive gate, without the confirm step.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                // Resolved at press-time in the real flow (`update_membership_resolved`);
+                // supplied directly here since this test is about what
+                // `update_brigade_formed` does with it, not how it got resolved.
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("dir")
+            }],
+            "must not spawn anything until the existing pane is confirmed gone"
+        );
+        assert!(state.screens.contains_key(&SessionKey::from_id("dir")));
+
+        // The shell answers once the kill actually lands.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+
+        assert!(!state.screens.contains_key(&SessionKey::from_id("dir")));
+        assert!(state.pending_director_wiring.is_none());
+        let director = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded {
+                target, brigade, ..
+            } if target.id == "dir" => Some((target.agent, brigade.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            director,
+            Some((
+                AgentKind::ClaudeCode,
+                Some((1, "director".to_string(), BrigadeRole::Director))
+            )),
+            "must reopen wired to the brigade, not just re-stage: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn brigade_formed_then_spawned_worker_uses_the_configured_worker_agent_when_director_spawns_after()
+     {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+
+        // Director's own screen doesn't exist yet: `PendingOpen::BrigadeDirector`
+        // must carry `worker_agent`/`worker_model` through to the later
+        // `Event::Spawned`.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+
+        let worker = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, model, .. } if target.id.is_empty() => {
+                Some((target.agent, model.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            worker,
+            Some((AgentKind::Codex, Some("gpt-5.6-terra".to_string())))
+        );
+    }
+
+    #[test]
+    fn add_worker_resolves_the_configured_agent_from_the_staged_directors_row() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director],
+            focused: 0,
+        };
+        let mut codex_director_row = row("dir");
+        codex_director_row.agent = AgentKind::Codex;
+        let mut app = app_with(vec![codex_director_row]);
+        let brigade = brigade_config(); // Inherit — must follow the staged Director's own product
+
+        let cmds = add_worker(&mut state, &mut app, &brigade);
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::AddWorker {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn worker_added_passes_the_carried_agent_and_model_straight_to_open_worker() {
+        // `worker_agent`/`worker_model` are already fully resolved by the
+        // time this event exists (`add_worker`, at `B`-press) — this only
+        // pins that `update_worker_added` passes them through unchanged
+        // rather than re-deriving anything from `brigade`.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerAdded {
+                brigade_id: 1,
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok("worker-2".to_string()),
+            },
+            test_instant(),
+        );
+
+        match cmds.as_slice() {
+            [Cmd::OpenEmbedded { target, model, .. }] => {
+                assert_eq!(target.agent, AgentKind::Codex);
+                assert_eq!(model.as_deref(), Some("gpt-5.6-terra"));
+            }
+            other => panic!("expected exactly one OpenEmbedded: {other:?}"),
+        }
+    }
+
+    // --- worker_agent = "select": the formation-time picker modal ----------
+
+    #[test]
+    fn brigade_key_forms_immediately_when_worker_agent_is_not_select() {
+        // The explicit regression for this half too: the default `[brigade]
+        // worker_agent = "inherit"` must keep forming a brigade the instant
+        // `B` resolves, exactly as before this modal existed.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::ClaudeCode,
+                ..
+            })]
+        ));
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn brigade_key_opens_the_director_reopen_modal_when_its_pane_is_already_open() {
+        // Not Codex-specific: a Claude Director's own pane can't carry MCP
+        // config any more than a Codex one can carry `-c` overrides, so this
+        // must fire regardless of product.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "must not form, kill, or check anything until the operator answers"
+        );
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmDirectorReopen { director_row_id, name })
+                if director_row_id == "dir" && name == "dir"
+        ));
+    }
+
+    #[test]
+    fn confirming_director_reopen_kills_the_pane_then_forms_once_it_actually_exits() {
+        // The full interactive round trip, gate to `FormBrigade`: this is
+        // the "confirming reopens wired, not just re-stages" requirement,
+        // exercised through the *interactive* gate rather than the
+        // residual-race path `brigade_formed_kills_and_rewires_...` covers.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
+
+        let cmds = confirm_director_reopen_modal(&mut state, &mut app);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("dir")
+            }]
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_director_reopen.is_some());
+        assert!(
+            state.screens.contains_key(&SessionKey::from_id("dir")),
+            "the pane isn't actually gone until Event::PtyExited says so"
+        );
+
+        let brigade = brigade_config();
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+
+        assert!(!state.screens.contains_key(&SessionKey::from_id("dir")));
+        assert!(state.pending_director_reopen.is_none());
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::ClaudeCode,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn esc_on_director_reopen_modal_cancels_the_formation_entirely() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
+
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+        assert!(
+            state.pending_director_reopen.is_none(),
+            "nothing should be waiting on a kill that was never issued"
+        );
+        assert!(
+            state.screens.contains_key(&SessionKey::from_id("dir")),
+            "Esc must not touch the still-running pane"
+        );
+    }
+
+    #[test]
+    fn director_reopen_gate_runs_before_the_select_picker_and_codex_trust_check() {
+        // All three formation gates in one press: pane already open, AND
+        // `worker_agent = "select"`, AND (once picked) Codex untrusted.
+        // Director-reopen must resolve completely — kill, wait, exit —
+        // before the picker ever opens; the picker's own Codex pick must
+        // then resolve before `FormBrigade` is even considered.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(
+            matches!(app.modal(), Some(Modal::ConfirmDirectorReopen { .. })),
+            "director-reopen must come first, not the picker"
+        );
+
+        let cmds = confirm_director_reopen_modal(&mut state, &mut app);
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("dir")
+            }]
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty(), "nothing forms yet — the picker is next");
+        assert!(matches!(app.modal(), Some(Modal::WorkerAgentPicker(_))));
+
+        app.modal_toggle_agent(); // Claude -> Codex
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckCodexTrust],
+            "the picker's Codex pick must route through the trust check next"
+        );
+        assert!(state.pending_codex_trust_formation.is_some());
+    }
+
+    #[test]
+    fn brigade_key_checks_codex_trust_before_forming_when_worker_agent_resolves_to_codex() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckCodexTrust],
+            "must not form yet — a Codex Worker needs the trust check first"
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_codex_trust_formation.is_some());
+    }
+
+    #[test]
+    fn brigade_key_opens_the_worker_agent_modal_when_select_is_configured() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert!(cmds.is_empty(), "nothing forms until the picker confirms");
+        assert!(matches!(app.modal(), Some(Modal::WorkerAgentPicker(_))));
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_forms_the_brigade_with_the_chosen_agent_and_model() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+        });
+        app.open_worker_agent_modal(
+            AgentKind::Codex,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_toggle_agent(); // Codex -> Claude, re-seeds the model input
+        app.modal_push_char('!'); // then the operator edits it further
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Store(StoreIntent::FormBrigade {
+                    director_row_id,
+                    name,
+                    cwd,
+                    worker_count: 2,
+                    worker_agent: AgentKind::ClaudeCode,
+                    worker_model,
+                })] if director_row_id == "dir"
+                    && name == "cell"
+                    && cwd == &PathBuf::from("/work")
+                    && worker_model == "sonnet!"
+            ),
+            "expected a FormBrigade carrying the picker's own final state: {cmds:?}"
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_brigade_formation.is_none());
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_checks_codex_trust_instead_of_forming_directly_when_codex_is_chosen()
+     {
+        // The whole point of this round trip: a Codex pick must not form the
+        // brigade on the spot, because trust can only be verified by the
+        // shell (`Cmd::CheckCodexTrust`) — see `update_codex_trust_checked`.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+        });
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_toggle_agent(); // Claude -> Codex
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert_eq!(cmds, vec![Cmd::CheckCodexTrust]);
+        assert!(app.modal().is_none());
+        assert!(state.pending_brigade_formation.is_none());
+        assert!(state.pending_codex_trust_formation.is_some());
+    }
+
+    fn pending_codex_trust_formation() -> PendingCodexTrustFormation {
+        PendingCodexTrustFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+            worker_agent: AgentKind::Codex,
+            worker_model: "gpt-5.6-terra".to_string(),
+        }
+    }
+
+    #[test]
+    fn codex_trust_checked_forms_the_brigade_when_primed() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_codex_trust_formation = Some(pending_codex_trust_formation());
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, true, true, test_instant());
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+        assert!(app.modal().is_none());
+        assert!(state.pending_codex_trust_formation.is_none());
+    }
+
+    #[test]
+    fn codex_trust_checked_opens_the_confirm_modal_when_not_primed_but_launchable() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_codex_trust_formation = Some(pending_codex_trust_formation());
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, false, true, test_instant());
+
+        assert!(cmds.is_empty(), "nothing forms until the operator acts");
+        assert!(matches!(app.modal(), Some(Modal::ConfirmCodexTrust)));
+        assert!(
+            state.pending_codex_trust_formation.is_none(),
+            "consumed unconditionally — resuming later would need to verify \
+             the approval actually took, which banto cannot do"
+        );
+    }
+
+    #[test]
+    fn codex_trust_checked_forms_anyway_and_reports_the_space_when_not_launchable() {
+        // Not launchable outranks "not primed": no pane could fix this one,
+        // so there is nothing useful to confirm, unlike the primed-eventually
+        // case above.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_codex_trust_formation = Some(pending_codex_trust_formation());
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, false, false, test_instant());
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+        assert!(app.modal().is_none());
+        let status = state.status.as_deref().unwrap_or_default();
+        assert!(status.contains("space"), "must name the cause: {status}");
+    }
+
+    #[test]
+    fn codex_trust_checked_is_a_no_op_without_a_pending_formation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, true, true, test_instant());
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn confirm_codex_trust_modal_opens_a_solo_pane_and_never_touches_pending_brigade_formation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        app.open_confirm_codex_trust_modal();
+
+        let cmds = confirm_codex_trust_modal(&mut state, &mut app);
+
+        let key = match cmds.as_slice() {
+            [Cmd::OpenCodexTrustPane { key }] => key.clone(),
+            other => panic!("expected exactly one OpenCodexTrustPane: {other:?}"),
+        };
+        assert!(app.modal().is_none());
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::Solo)
+        ));
+    }
+
+    #[test]
+    fn confirm_codex_trust_modal_is_a_no_op_when_a_different_modal_is_open() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        app.open_confirm_archive_modal();
+
+        let cmds = confirm_codex_trust_modal(&mut state, &mut app);
+
+        assert!(cmds.is_empty());
+        assert!(matches!(app.modal(), Some(Modal::ConfirmArchive { .. })));
+    }
+
+    #[test]
+    fn esc_on_worker_agent_modal_cancels_the_formation_entirely() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 1,
+        });
+        app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
+
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+        assert!(
+            state.pending_brigade_formation.is_none(),
+            "a cancelled picker must never leave a formation for a later confirm to pick up"
+        );
+    }
+
+    #[test]
+    fn backtab_toggles_the_worker_agent_modals_agent() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
+
+        update_modal_key(&mut state, &mut app, KeyCode::BackTab);
+
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::WorkerAgentPicker(picker)) if picker.agent() == AgentKind::Codex
+        ));
+    }
+
+    #[test]
+    fn add_worker_opens_the_worker_agent_modal_when_select_is_configured() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        state.stage = Stage::Brigade {
+            id: 7,
+            panes: vec![director],
+            focused: 0,
+        };
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = add_worker(&mut state, &mut app, &brigade);
+
+        assert!(cmds.is_empty(), "nothing added until the picker confirms");
+        assert!(matches!(app.modal(), Some(Modal::WorkerAgentPicker(_))));
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_adds_the_worker_with_the_chosen_agent_and_model() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_worker_addition = Some(PendingWorkerAddition {
+            brigade_id: 7,
+            cwd: PathBuf::from("/work"),
+        });
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_push_char('!'); // edit the seeded Claude default, no toggle
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Store(StoreIntent::AddWorker {
+                    brigade_id: 7,
+                    cwd,
+                    worker_agent: AgentKind::ClaudeCode,
+                    worker_model,
+                })] if cwd == &PathBuf::from("/work") && worker_model == "sonnet!"
+            ),
+            "expected an AddWorker carrying the picker's own final state: {cmds:?}"
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_worker_addition.is_none());
+        assert!(
+            state.pending_brigade_formation.is_none(),
+            "an addition must never leave a formation stash behind either"
+        );
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_never_trust_checks_a_codex_addition() {
+        // Deliberate difference from formation — see `PendingWorkerAddition`'s
+        // own doc and `confirm_worker_agent_modal`'s for why.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_worker_addition = Some(PendingWorkerAddition {
+            brigade_id: 7,
+            cwd: PathBuf::from("/work"),
+        });
+        app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
+        app.modal_toggle_agent(); // Claude -> Codex
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::AddWorker {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+        assert!(state.pending_codex_trust_formation.is_none());
+    }
+
+    #[test]
+    fn esc_on_worker_agent_modal_cancels_the_addition_too() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_worker_addition = Some(PendingWorkerAddition {
+            brigade_id: 7,
+            cwd: PathBuf::from("/work"),
+        });
+        app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
+
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+        assert!(
+            state.pending_worker_addition.is_none(),
+            "a cancelled picker must never leave an addition for a later confirm to pick up"
+        );
+    }
+
     #[test]
     fn pty_output_feeds_the_screen() {
         let mut state = EmporiumState::new(PrefixKey::default());
@@ -3715,17 +5460,26 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_stays_on_when_focus_moves_to_a_pane_that_wants_sgr_mouse() {
+    fn wheel_over_a_pane_that_does_not_want_sgr_mouse_scrolls_its_own_scrollback() {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.size = (120, 40);
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
         let mut screen = screen_sized_for_pane(&state);
-        screen.process(b"\x1b[?1003h\x1b[?1006h");
+        // No mouse mode enabled at all, so this pane never asked for SGR —
+        // enough output written first that there's real scrollback to move
+        // into.
+        for i in 0..50 {
+            screen.process(format!("line{i}\r\n").as_bytes());
+        }
         state.screens.insert(key.clone(), screen);
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let mouse = click_inside_pane(&state);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..click_inside_pane(&state)
+        };
 
         let cmds = update(
             &mut state,
@@ -3736,22 +5490,28 @@ mod tests {
         );
 
         assert!(
-            !cmds
-                .iter()
-                .any(|c| matches!(c, Cmd::SetMouseCapture(false))),
-            "capture must stay on for a pane that wants mouse: {cmds:?}"
+            cmds.is_empty(),
+            "scrolling a pane's own scrollback is pure state, no Cmd needed: {cmds:?}"
         );
+        assert_eq!(state.screens.get(&key).unwrap().scrollback(), 3);
     }
 
     #[test]
-    fn mouse_capture_releases_when_focus_moves_to_a_pane_with_no_screen() {
+    fn wheel_over_a_pane_that_wants_sgr_mouse_is_forwarded_not_consumed() {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.size = (120, 40);
         let key = SessionKey::from_id("sess-1");
-        state.stage = Stage::Solo(key);
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1003h\x1b[?1006h"); // any-motion mode, SGR encoding
+        state.screens.insert(key.clone(), screen);
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
-        let mouse = click_inside_pane(&state);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..click_inside_pane(&state)
+        };
 
         let cmds = update(
             &mut state,
@@ -3761,41 +5521,133 @@ mod tests {
             test_instant(),
         );
 
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
-        assert!(!state.mouse_capture_enabled);
+        match cmds.as_slice() {
+            [
+                Cmd::WritePty {
+                    key: got_key,
+                    bytes,
+                },
+            ] => {
+                assert_eq!(got_key, &key);
+                assert_eq!(bytes, b"\x1b[<64;1;1M");
+            }
+            other => panic!("expected exactly one WritePty, got {other:?}"),
+        }
+        assert_eq!(
+            state.screens.get(&key).unwrap().scrollback(),
+            0,
+            "a child that wants mouse handles its own scrollback; banto must not also consume the wheel"
+        );
     }
 
     #[test]
-    fn mouse_capture_releases_when_the_already_focused_panes_own_output_disables_mouse_mode() {
+    fn left_click_on_another_pane_moves_focus_even_when_the_focused_pane_does_not_want_sgr_mouse() {
+        // The regression this guards: a child that never asks for SGR mouse
+        // (Codex, measured) must not be able to trap focus on its own pane.
+        // Host mouse capture is unconditional now (see `update_mouse`'s own
+        // doc), so the click always reaches here regardless of what the
+        // currently-focused child wants; hit-testing the target pane must
+        // not depend on `wants_sgr_mouse` either. Neither pane has a
+        // `Screen` here, so neither could want SGR even if asked.
         let mut state = EmporiumState::new(PrefixKey::default());
         state.size = (120, 40);
-        let key = SessionKey::from_id("sess-1");
-        state.stage = Stage::Solo(key.clone());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director, worker.clone()],
+            focused: 0,
+        };
         state.focus = Focus::Pane;
-        let mut screen = screen_sized_for_pane(&state);
-        screen.process(b"\x1b[?1003h\x1b[?1006h");
-        state.screens.insert(key.clone(), screen);
-        // Already focused on a pane that wants mouse: pre-sync to how a
-        // real sequence of events would have left this (see
-        // `armed_o_cycles_the_focused_pane`'s comment on the same line).
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
 
-        // No focus change here at all — the child's own output is what
-        // turns mouse reporting back off.
-        let cmds = update(
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let tiles = stage_tiles(areas.pane, &state.stage);
+        let (_, worker_rect) = tiles.iter().find(|(key, _)| *key == worker).unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: worker_rect.x,
+            row: worker_rect.y,
+        };
+
+        update(
             &mut state,
             &mut app,
             &brigade,
-            Event::PtyOutput {
-                key,
-                chunk: b"\x1b[?1003l".to_vec(),
-            },
+            Event::Input(InputEvent::Mouse(mouse)),
             test_instant(),
         );
 
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        match &state.stage {
+            Stage::Brigade { focused, .. } => assert_eq!(*focused, 1),
+            _ => panic!("expected a Brigade stage"),
+        }
+    }
+
+    #[test]
+    fn sidebar_click_works_while_focus_is_on_a_pane_that_does_not_want_sgr_mouse() {
+        // Same regression, the sidebar side: a click there must reach
+        // `update_mouse`'s sidebar branch regardless of what the
+        // currently-focused pane wants — that branch itself never checked
+        // `state.focus` to begin with, but this pins the case that used to
+        // fail at the I/O boundary (capture released, event never arriving).
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: areas.sidebar.x + 1,
+            row: areas.sidebar.y + 1,
+        };
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert_eq!(state.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn sidebar_scroll_works_while_focus_is_on_a_pane_that_does_not_want_sgr_mouse() {
+        // `App::scroll` moves the viewport, not the selection, so a
+        // one-row viewport over several rows is what makes it observable.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        let mut app = app_with((1..=5).map(|n| row(&format!("sess-{n}"))).collect());
+        app.set_viewport_height(1);
+        let brigade = brigade_config();
+        let before = app.selected_in_viewport();
+
+        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: areas.sidebar.x,
+            row: areas.sidebar.y,
+        };
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Mouse(mouse)),
+            test_instant(),
+        );
+
+        assert_ne!(app.selected_in_viewport(), before);
     }
 
     #[test]
@@ -3940,7 +5792,7 @@ mod tests {
             cmds.first(),
             Some(Cmd::WritePty { key: k, bytes }) if *k == key && bytes == b"a"
         ));
-        assert_eq!(state.last_forwarded_input, Some(now));
+        assert_eq!(state.last_forwarded_input.get(&key), Some(&now));
     }
 
     #[test]
@@ -4124,6 +5976,607 @@ mod tests {
             now,
         );
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+    }
+
+    // --- Codex Worker kickoff: open_worker / update_spawned / update_tick --
+
+    #[test]
+    fn open_worker_for_codex_marks_the_pending_open_for_a_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        open_worker(
+            &mut state,
+            1,
+            "worker-1",
+            std::path::Path::new("/work"),
+            "",
+            AgentKind::Codex,
+        );
+        let key = SessionKey::new_worker(1, "worker-1");
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::BrigadeMember {
+                needs_codex_kickoff: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn open_worker_for_claude_never_needs_a_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        open_worker(
+            &mut state,
+            1,
+            "worker-1",
+            std::path::Path::new("/work"),
+            "",
+            AgentKind::ClaudeCode,
+        );
+        let key = SessionKey::new_worker(1, "worker-1");
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::BrigadeMember {
+                needs_codex_kickoff: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn spawning_a_kickoff_eligible_worker_queues_a_pending_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_opens.insert(
+            key.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: true,
+                cwd: PathBuf::from("/work"),
+            },
+        );
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key: key.clone() },
+            test_instant(),
+        );
+
+        assert_eq!(state.pending_kickoffs.len(), 1);
+        assert_eq!(state.pending_kickoffs[0].key, key);
+        assert_eq!(state.pending_kickoffs[0].cwd, PathBuf::from("/work"));
+    }
+
+    #[test]
+    fn spawning_a_non_kickoff_worker_queues_nothing() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_opens.insert(
+            key.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false,
+                cwd: PathBuf::from("/work"),
+            },
+        );
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key },
+            test_instant(),
+        );
+
+        assert!(state.pending_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn tick_checks_directory_trust_once_quiet_long_enough_but_not_before() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        let spawned_at = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
+        );
+        assert!(cmds.is_empty(), "not quiet long enough yet");
+        assert_eq!(state.pending_kickoffs.len(), 1);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckWorkerDirectoryTrust {
+                key: key.clone(),
+                cwd: PathBuf::from("/work"),
+            }]
+        );
+        // Never typed blind: the entry stays queued until the trust check
+        // actually answers.
+        assert_eq!(state.pending_kickoffs.len(), 1);
+        assert!(state.pending_submits.is_empty());
+    }
+
+    #[test]
+    fn a_trusted_directory_answer_types_the_kickoff_line() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: true,
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: key.clone(),
+                bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+            }]
+        );
+        assert!(state.pending_kickoffs.is_empty());
+        assert_eq!(state.pending_submits.len(), 1);
+        assert_eq!(state.pending_submits[0].key, key);
+    }
+
+    #[test]
+    fn an_untrusted_directory_answer_keeps_waiting_and_notifies_once() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: false,
+            },
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "must never type the kickoff line into an untrusted/unknown cwd"
+        );
+        assert_eq!(
+            state.pending_kickoffs.len(),
+            1,
+            "stays queued so the next tick asks again"
+        );
+        let first_status = state.status.clone();
+        assert!(first_status.is_some());
+
+        // A second untrusted answer must not restamp the notice (no new
+        // `status_set_at`, and no duplicate wording).
+        state.status = Some("something else the operator is looking at".to_string());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key,
+                trusted: false,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            state.status,
+            Some("something else the operator is looking at".to_string()),
+            "already notified once; must not clobber an unrelated status"
+        );
+    }
+
+    #[test]
+    fn a_trust_check_answer_for_an_unstaged_pane_is_a_noop() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        // No entry in pending_kickoffs at all — the pane unstaged before the
+        // answer landed.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked { key, trusted: true },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(state.pending_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn pty_output_pushes_the_kickoff_quiet_deadline_back() {
+        // A pane that's still noisy at the original deadline must not get
+        // typed into — see CODEX_KICKOFF_QUIET_PERIOD's own doc for why an
+        // early write risks the input being dropped.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        let spawned_at = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let output_at = spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(50);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"boot noise".to_vec(),
+            },
+            output_at,
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert!(
+            cmds.is_empty(),
+            "quiet since the LATEST output, not the original spawn"
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            output_at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert!(!cmds.is_empty(), "quiet long enough since the last output");
+    }
+
+    #[test]
+    fn codex_worker_discovery_timed_out_sets_status_and_drops_any_pending_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::CodexWorkerDiscoveryTimedOut {
+                key,
+                token: "worker-1".to_string(),
+            },
+            test_instant(),
+        );
+
+        assert!(cmds.is_empty());
+        assert!(state.pending_kickoffs.is_empty());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("worker-1: Codex briefing wasn't confirmed")
+        );
+    }
+
+    #[test]
+    fn pty_exited_clears_pending_kickoff_and_last_output_for_that_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(key.clone());
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+        state.last_output_at.insert(key.clone(), test_instant());
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key: key.clone() },
+            test_instant(),
+        );
+
+        assert!(state.pending_kickoffs.is_empty());
+        assert!(!state.last_output_at.contains_key(&key));
+    }
+
+    /// Two-pane brigade (Director + Worker), both `Screen`s registered, `now`
+    /// and `app`/`brigade` fixtures ready — the shared shape the
+    /// `last_forwarded_input` per-pane tests below build on.
+    fn two_pane_brigade_focused_on(
+        focused: usize,
+    ) -> (
+        EmporiumState,
+        App,
+        BrigadeConfig,
+        SessionKey,
+        SessionKey,
+        Instant,
+    ) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.screens.insert(director.clone(), Screen::new(24, 80));
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), worker.clone()],
+            focused,
+        };
+        state.focus = Focus::Pane;
+        let app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        (state, app, brigade, director, worker, now)
+    }
+
+    fn writes_of(cmds: &[Cmd]) -> Vec<(SessionKey, Vec<u8>)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::WritePty { key, bytes } => Some((key.clone(), bytes.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_nudge_for_one_pane_is_not_suppressed_by_input_forwarded_to_a_different_pane() {
+        // The bug this round fixes: `last_forwarded_input` used to be one
+        // run-wide `Instant`, so typing into the focused Director pane
+        // silenced a nudge to the Worker the moment focus moved there —
+        // even though the Worker itself had never received a keystroke.
+        let (mut state, mut app, brigade, director, worker, mut now) =
+            two_pane_brigade_focused_on(0); // Director focused first
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(state.last_forwarded_input.contains_key(&director));
+        assert!(!state.last_forwarded_input.contains_key(&worker));
+
+        // Operator tabs over to the Worker pane, which has unseen mail and
+        // goes idle for two consecutive ticks.
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        now += Duration::from_millis(10);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(worker.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())],
+            "the Worker pane never received a keystroke; the Director's own \
+             recent input must not suppress its nudge"
+        );
+    }
+
+    #[test]
+    fn a_nudge_for_a_pane_is_still_suppressed_by_recent_input_to_that_same_pane() {
+        // Regression: the per-pane guard must still protect the pane the
+        // operator is actually composing into.
+        let (mut state, mut app, brigade, _director, worker, mut now) =
+            two_pane_brigade_focused_on(1); // Worker focused
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+
+        let observation = || RelayObservation {
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        now += Duration::from_millis(10);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+
+        assert!(
+            writes_of(&cmds).is_empty(),
+            "recent input to the focused pane itself must still suppress its own nudge"
+        );
+    }
+
+    #[test]
+    fn a_pane_no_longer_focused_is_not_suppressed_by_its_own_earlier_input() {
+        // `is_focused` already gates the quiet-period check, but this proves
+        // it holds through the per-pane storage change too: the Director
+        // pane keeps a very recent `last_forwarded_input` entry, yet once
+        // focus has moved off it, its own nudge is not suppressed by it.
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0); // Director focused first
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(state.last_forwarded_input.contains_key(&director));
+
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1; // focus moves to the Worker; Director is no longer focused
+        }
+        let observation = || RelayObservation {
+            token: "director".to_string(),
+            key: director.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        now += Duration::from_millis(10);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        now += Duration::from_secs(1);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(director.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())],
+            "the Director pane is no longer focused, so its own earlier \
+             keystroke must not suppress its nudge"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_pane_drops_its_last_forwarded_input_entry() {
+        let (mut state, mut app, brigade, director, worker, now) = two_pane_brigade_focused_on(0);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert!(state.last_forwarded_input.contains_key(&director));
+
+        state.unstage(&director);
+
+        assert!(
+            !state.last_forwarded_input.contains_key(&director),
+            "a closed pane's key must not linger in the map forever"
+        );
+        // The still-open Worker pane's own (absent) entry is untouched.
+        assert!(!state.last_forwarded_input.contains_key(&worker));
     }
 
     /// Shared setup for the two tests below: a solo, focused pane, ticked
@@ -4401,11 +6854,6 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        // Neither pane has a `Screen` here, so `update`'s own mouse-capture
-        // sync would otherwise emit an incidental `Cmd::SetMouseCapture`
-        // this test isn't about — pre-sync it to match, same as a realistic
-        // sequence of events would have.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4442,8 +6890,6 @@ mod tests {
             focused: 0,
         };
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4473,8 +6919,6 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -4529,8 +6973,6 @@ mod tests {
         let key = SessionKey::from_id("sess-1");
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
@@ -5262,10 +7704,7 @@ mod tests {
             now,
         );
         assert_eq!(state.focus, Focus::Pane);
-        // The now-focused pane has no `Screen` at all (nothing spawned),
-        // so it can't want mouse reporting — banto releases its own
-        // capture, per `update_mouse_capture`.
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        assert!(cmds.is_empty());
 
         let cmds = update(
             &mut state,
@@ -5278,9 +7717,7 @@ mod tests {
             now,
         );
         assert_eq!(state.focus, Focus::Sidebar);
-        // Back at the sidebar, which always wants capture for its own
-        // click/scroll handling.
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(true)]);
+        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -5574,9 +8011,7 @@ mod tests {
             Stage::Brigade { focused, .. } => assert_eq!(*focused, 0),
             _ => panic!("expected a Brigade stage"),
         }
-        // Neither pane has a `Screen` here, so the newly-focused director
-        // pane can't want mouse reporting — banto releases its own capture.
-        assert_eq!(cmds, vec![Cmd::SetMouseCapture(false)]);
+        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -5590,8 +8025,6 @@ mod tests {
             focused: 1,
         };
         state.focus = Focus::Pane;
-        // See `armed_o_cycles_the_focused_pane`'s comment on this line.
-        state.mouse_capture_enabled = wants_mouse_capture(&state);
         state.prefix_armed = Some(test_instant());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();

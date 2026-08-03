@@ -204,6 +204,49 @@ running session writes somewhere in `$CODEX_HOME` on every turn —
 more often than the rollout tree's one event per turn, across databases
 discovery doesn't even read.
 
+**Busy/idle detection** (the relay engine's Codex-side signal —
+`crate::codex_activity`; Claude Code publishes its own `status: busy` in
+`sessions/<pid>.json`, which Codex has no equivalent of): no source above
+records "is this session mid-turn right now" directly, and two timing-based
+readings of `logs_2.sqlite`/the rollout file were tried and measured unsound
+before landing on a third. Rollout mtime stayed pinned at its first-write
+timestamp for an entire generation (file size grew 18KB -> 75KB across about
+a minute of active writing; the reported mtime never moved). A
+`logs_2.sqlite`-write-staleness threshold (120 seconds idle) was checked
+against three real sessions' own `task_started`/`task_complete` markers as
+ground truth and found wrong outright: the largest genuinely-within-a-turn
+gap measured was 135 seconds, the smallest genuinely-between-turns gap was 1
+second — those two distributions overlap completely, so no fixed threshold
+can separate them. What is sound: tailing the rollout `.jsonl` itself for its
+own `task_started`/`task_complete` event markers, a state read rather than a
+clock — paired 1:1 with no exceptions across all 9 turns observed. The tail
+window grows (`tail_turn_marker`/`TAIL_MAX_BYTES`) rather than staying fixed,
+since a `task_complete` record was observed re-embedding the turn's full
+final message on one line north of 11KB — a small fixed tail can land
+entirely inside that one line and misreport idle right when the answer
+matters most.
+
+**Directory trust** (`crate::directory_trust`, advisory-only, read-only):
+before typing anything into a freshly-spawned Codex Worker's pane (see
+"Brigade" below), banto checks whether Codex already trusts that Worker's
+cwd by reading `<codex_home>/config.toml`'s `[projects.'<path>']
+trust_level` — the same record Codex itself writes when an operator answers
+its own directory-trust prompt, keyed by a lowercased, backslash-separated
+path. The module also reads Claude Code's equivalent
+(`~/.claude.json`'s `.projects[<path>].hasTrustDialogAccepted`, keyed by
+whatever exact string a past launch happened to pass as cwd, no
+normalization — the same real directory was found stored under both
+backslash and forward-slash forms disagreeing with each other). That half
+gates nothing — a Claude Worker publishes its session id on its own the
+moment it starts, so banto never types into its pane blind the way Codex's
+kickoff (see "Brigade" below) does. It exists to explain a silence: a Worker
+parked on that prompt starts nothing, is discovered by nothing, and would
+otherwise sit there saying nothing at all, so the emporium's discovery poll
+says so once in the status line. It fires only on a recorded refusal, not on
+the absence of a record, because Claude writes an explicit `false` when an
+operator declines — treating "never seen this directory" as a refusal would
+have meant a warning on every directory opened for the first time.
+
 ## The `agents` setting
 
 `Config.agents` (a plain string, default `""`) selects which agent products
@@ -355,7 +398,7 @@ other CLI, so the flavor is carried explicitly
 Introduced by the 2026-07-22 architecture decision above. `banto --emporium`
 (alias `--oodana`) opens a persistent left sidebar (the same session list) plus
 a right pane hosting the selected session **embedded** — the child's PTY is
-spawned and read by banto itself (`portable-pty`), its output parsed with a VT
+spawned and read by banto itself (`portable-pty-psmux`), its output parsed with a VT
 emulator (`vt100`) into a `Screen` the core owns, and rendered into a ratatui
 pane. This differs from both chōba resume paths, which either hand banto's own
 terminal to the child directly (in-place) or spawn it in a separate
@@ -412,9 +455,24 @@ back-to-back, see "Auto-relay" below); a child's exit produces no EOF on some
 paths, so an active waiter thread is needed rather than relying on read
 returning empty. The spike's own "not yet verified" list, stated plainly
 rather than glossed over: mouse-forwarding into children, resize-under-stress,
-scrollback, and non-Windows behavior beyond one dated Unix teardown follow-up
+and non-Windows behavior beyond one dated Unix teardown follow-up
 (`docs/notes/embedded-pty-spike.md`, 2026-07-25 addendum — a measured
 comparison of graceful vs. force-kill teardown timing on that platform).
+
+**Scrollback** was on that unverified list and turned out to fail outright: a
+child that reserves a footer via DECSTBM (Codex does) never got a single line
+into `vt100`'s scrollback tracking, because vanilla `portable-pty`'s ConPTY
+session reinterprets the child's VT bytes through its own legacy console
+buffer and re-serializes its own reconstruction — which for a DECSTBM footer
+means a narrow scroll region synthesized unconditionally, regardless of what
+the child actually drew. Fixed by requesting `PSEUDOCONSOLE_PASSTHROUGH_MODE`
+(Windows 11 22H2+, build ≥22621) instead, which makes ConPTY relay the
+child's bytes verbatim; banto-io depends on `portable-pty-psmux`, a fork that
+requests this flag, rather than the crates.io `portable-pty`
+(`crates/banto-io/src/pty.rs`'s `PortablePtyHost` doc). Measured 2026-08-02
+with a controlled A/B — same Codex binary, same prompt, same geometry, only
+the PTY crate swapped: scrollback stayed 0 without the flag, reached 191
+lines with it.
 
 ## Brigade (Director/Worker cells)
 
@@ -432,6 +490,48 @@ one more Worker into the currently-staged brigade. `B` on an existing Director
 opens a disband confirmation instead (Workers cannot be promoted to Director
 directly).
 
+Forming (or adding to) a brigade can pass through up to three sequential
+confirm gates before anything is actually formed (`crates/banto-core/src/
+engine.rs`; at most one is ever open at once). Each is independently skipped
+when its own condition doesn't apply, so most presses of `B` show none of
+them:
+
+1. **The Director-to-be's own pane is already open.** Brigade wiring (MCP
+   config for Claude, `-c mcp_servers.banto.*`/hook overrides for Codex — see
+   "MCP mediation server" below) only ever travels through that launch's own
+   argv, so a pane opened before formation can't carry it.
+   `Modal::ConfirmDirectorReopen` — Enter kills that pane and re-issues
+   formation only once `Event::PtyExited` confirms it actually exited (any
+   sooner risks `opener::decide_inplace_resume` seeing the not-yet-dead
+   session as still live and refusing the reopen); Esc cancels the whole
+   attempt. Placed first, ahead of the other two, because it is both the
+   most disruptive of the three (running work in that pane is lost) and the
+   cheapest to abort (nothing has been picked or written yet) — asking the
+   operator to pick a Worker product first, only to then say the pane is
+   about to restart anyway, would be backwards.
+2. **`[brigade] worker_agent = "select"`.** `Modal::WorkerAgentPicker` asks
+   which product (and model) the Workers run as before there is anything to
+   form.
+3. **The resolved Worker product is Codex, and banto's own hook doesn't look
+   trusted.** `Modal::ConfirmCodexTrust` — Enter opens a solo pane running
+   Codex's own trust-review startup and abandons this formation attempt
+   outright, rather than waiting to resume it: Codex records trust as a hash
+   of its own hook command, which banto has no way to reproduce or compare
+   against (`banto_io::codex_trust`'s module doc), so it cannot tell whether
+   an approval in that pane actually took — treating an unverifiable
+   "probably fine" as ground truth is a mistake this project has paid for
+   before. The operator presses `B` again once done. (Skipped, formation
+   proceeding anyway with a status-line notice instead, on the one Codex
+   installation banto cannot brief regardless of trust: its own executable
+   path contains a space, which Codex's own hook launcher can't run a
+   command from.)
+
+A residual race the operator's own choices don't cover — something else
+reopens the Director's pane in the gap between gate 1 confirming and the
+store round trip actually forming the brigade — is handled without asking:
+`update_brigade_formed` kills and rewires that pane unconditionally rather
+than leaving a Director with no wiring at all.
+
 **Member identity.** Each member gets a banto-owned `member_token`
 (`"director"`, `"worker-1"`, `"worker-2"`, ...) rather than being keyed by its
 session id — a Worker is formed by banto *before* its agent product assigns it
@@ -443,6 +543,28 @@ Codex became a second product it has to hold). The token is stable for the
 member's lifetime in the brigade; its session id is not (unknown until
 discovered, never reused across brigades).
 
+**A freshly-spawned Codex Worker has no session id to discover until it runs
+a turn.** Unlike Claude Code, which publishes `sessions/<pid>.json` the
+moment it starts, an idle Codex process with nothing typed into it never
+fires its `SessionStart` hook, never gets a `threads` row, never writes a
+rollout file — there is nothing for discovery to find yet. So banto starts
+the first turn itself: once a fresh Worker's pane output has gone quiet for
+`CODEX_KICKOFF_QUIET_PERIOD` (700ms, a threshold measured against this
+product's own boot sequence) *and* Codex is confirmed to already trust the
+Worker's cwd (the "Directory trust" reading above — typing blind into a pane
+that might instead be showing that product's own directory-trust prompt
+risks answering that prompt by accident), banto types a fixed, ASCII-only
+status line naming itself, then a delayed `\r` in a second PTY write (the
+same two-step "text, then submit" shape the auto-relay nudge uses, and
+deliberately not that same nudge line, since no peer has actually sent mail
+yet). The turn this forces is what fires the hook; the hook's own stdin
+carries the real session id, which `banto _hook` records
+(`store::record_briefing`) for `poll_discovery`'s `codex_briefed_session_id`
+to pick up. If the cwd isn't trusted yet, banto keeps re-checking every tick
+rather than typing blind or giving up — answering the prompt in the pane
+directly lets the kickoff resume on its own next tick, with a status-line
+notice posted once in the meantime.
+
 **Lifecycle.** Killing a Worker's pane (prefix-`x`) lets it respawn fresh under
 the same token next time its brigade is staged; *dismissing* one (a separate
 choice on the same confirm dialog) removes it from the brigade for good —
@@ -453,25 +575,54 @@ gone. Disbanding (`B` on a Director) removes the whole cell.
 
 ```rust
 pub struct BrigadeConfig {
-    pub workers: u32,          // auto-spawned per cell, clamped 1..=8, default 1
-    pub worker_model: String,  // --model for spawned Workers; "" = inherit operator default; default "sonnet"
-    pub relay: RelayMode,      // Auto | Manual, default Auto — see "Auto-relay" below
-    pub director_prompt: String, // --append-system-prompt template for the Director
-    pub worker_prompt: String,   // --append-system-prompt template for each Worker
+    pub workers: u32,               // auto-spawned per cell, clamped 1..=8, default 1
+    pub worker_model: String,       // --model for an auto-spawned Claude Worker; "" = inherit; default "sonnet"
+    pub worker_model_codex: String, // --model for an auto-spawned Codex Worker; independent default and escape hatch
+    pub worker_agent: WorkerAgentSetting, // Inherit (default) | Select | Claude | Codex — see below
+    pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
+    pub director_prompt: String,    // role briefing template for the Director
+    pub worker_prompt: String,      // role briefing template for each Worker
 }
 ```
 
-Each member is launched with a role briefing (`--append-system-prompt`)
-substituting `{brigade}` (the brigade id), `{token}` (this member's own
-token), and `{peers}` (a comma-joined list of its addressable peers); an empty
-template launches with no briefing at all. This is deliberately a *setting*,
-not a hardcoded constant: without one, a cell exists only in banto's data
-model and the operator's own screen — a Director handed three MCP tool names
-and no context about why mostly never uses them (`crates/banto-core/src/config.rs`
-doc comments). The shipped defaults tell a Director to delegate independent,
-parallelizable work to its Workers via `send_to_peer` and keep genuinely
-sequential work itself; that policy is intentionally a setting the operator
-can change, not a fixed behavior.
+`worker_agent` decides which product a brigade's Workers run as, independent
+of the Director's own product: `Inherit` (default) matches the Director's;
+`Claude`/`Codex` fix it regardless; `Select` defers the choice to formation
+gate 2 above. `worker_model`/`worker_model_codex` are two independent
+`--model` overrides, since the two products don't share a model namespace —
+one shared field could never default sensibly for both at once.
+
+**Role briefing delivery differs by product.** Both `director_prompt` and
+`worker_prompt` render the same template, substituting `{brigade}` (the
+brigade id), `{token}` (this member's own token), and `{peers}` (a
+comma-joined list of its addressable peers) — an empty template means no
+briefing at all, deliberately a *setting* and not a constant: without one, a
+cell exists only in banto's data model and the operator's own screen, and a
+Director handed three MCP tool names with no notion that it leads a cell
+mostly never uses them. Only how the rendered text reaches the member differs
+by product:
+- **Claude**: on the launch argv, `--append-system-prompt <rendered>`.
+- **Codex has no equivalent flag.** Its briefing instead rides banto's own
+  `SessionStart` hook: every Codex member's launch adds a `-c
+  hooks.SessionStart=[...]` override naming `<banto executable> _hook` as
+  the hook command — byte-identical across every member and every launch,
+  deliberately, since Codex hashes that literal command string to decide
+  whether to trust it, and a launch carrying member identity in the command
+  itself would make every member's hook need its own separate approval.
+  Identity instead travels through `BANTO_BRIGADE`/`BANTO_MEMBER`/
+  `BANTO_ROLE` in the environment, which the hook process inherits.
+  `banto _hook` (`crates/banto/src/hook.rs`) renders the same template
+  (`crates/banto/src/briefing.rs`) and returns it as the turn's
+  `additionalContext`, appending a fixed Codex-only addendum: banto's own
+  MCP tools are deferred from Codex's own tool list until called by name,
+  and Codex's own developer prompt otherwise casts the model as the primary
+  agent of a different, unrelated multi-agent feature — measured end to end
+  in `docs/notes/codex-briefing-spike.md`.
+
+The shipped defaults tell a Director to delegate independent, parallelizable
+work to its Workers via `send_to_peer` and keep genuinely sequential work
+itself; that policy is intentionally a setting the operator can change, not a
+fixed behavior.
 
 ## MCP mediation server
 
@@ -484,6 +635,23 @@ the launch argv, the config file lives under banto's own data directory
 (`dirs::data_local_dir()/banto/mcp/<brigade_id>-<token>.json`) and is never
 installed into Claude Code's own configuration (`crates/banto/src/mcp.rs`
 module doc; `crates/banto/src/embedded/emporium.rs`'s `write_mcp_config`).
+
+**Codex carries the same server a different way — no config file at all.**
+Codex has no `--mcp-config` equivalent; the launch instead adds `-c
+mcp_servers.banto.command=...` and `-c mcp_servers.banto.args=[...]`
+overrides naming the identical `<banto executable> _mcp --brigade <id>
+--member <token> --role <role> [--session <id>]` invocation (structured TOML
+fields Codex hands its own process spawner directly, not re-split by a
+shell), plus `-c mcp_servers.banto.default_tools_approval_mode="approve"` to
+bypass Codex's own per-tool approval prompt for this server — repeated on
+every single launch rather than written once to `~/.codex/config.toml`, since a
+`-c`-registered server can't persist that trust at all, and (measured
+2026-07-28) the bypass degrades silently, no error and no warning, the
+moment a launch leaves it off (`crates/banto/src/opener.rs`'s
+`CodexBrigade::overrides` and the override functions it calls). This is a
+different Codex prompt from the hook-trust one gated in "Brigade" below —
+tool approval and hook trust are Codex's own two separate mechanisms, solved
+two separate ways here.
 
 The server shares banto's own sqlite store with the TUI process and exposes
 three tools:

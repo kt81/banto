@@ -15,6 +15,7 @@ use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
+use banto_io::codex_trust::HookTrustState;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
@@ -77,6 +78,55 @@ pub fn agents_ignored_notice(resolved: &ResolvedAgents) -> Option<String> {
             .join(", ");
         format!("agents: ignored unknown name(s) \"{names}\" — showing {kept}")
     })
+}
+
+/// Status-line notice telling the operator that Codex has not been asked to
+/// trust banto's brigade hook yet, or `None` when the question doesn't apply.
+///
+/// Deliberately raised *before* a brigade is staged rather than after it goes
+/// wrong. An untrusted hook is not refused loudly — Codex drops it in silence
+/// (docs/notes/codex-briefing-spike.md), so the first sign of trouble would
+/// otherwise be members behaving as though nobody had told them they were in
+/// a cell. And the approval prompt cannot be answered once for a whole
+/// brigade: trust is read as each member starts, so members launched together
+/// each raise their own dialog, and dismissing any of them leaves that member
+/// briefed by nothing.
+///
+/// [`HookTrustState::Unknown`] is treated exactly like `NotPrimed` — banto
+/// could not tell, and offering a one-time step the operator may not need
+/// costs less than staying silent about one they do. `Primed` stays quiet
+/// while being only a hint; see [`banto_io::codex_trust`] for why it cannot
+/// be more than that, and `BrigadeMember::briefed_at` for the fact that can.
+pub fn codex_trust_notice(
+    state: HookTrustState,
+    codex_enabled: bool,
+    has_brigade: bool,
+    hook_launchable: bool,
+) -> Option<String> {
+    if !codex_enabled || !has_brigade {
+        return None;
+    }
+    // Outranks the trust question, and outranks `Primed` too: from a path
+    // Codex cannot launch, an existing trust record is a leftover for a hook
+    // that will never run, so offering a review pane (which the emporium's
+    // own `Modal::ConfirmCodexTrust` skips for the same reason — see
+    // `update_codex_trust_checked`) would only ever decline to open.
+    if !hook_launchable {
+        return Some(
+            "codex: banto's own path contains a space, which Codex cannot launch a hook \
+             from — brigade members stay unbriefed until banto is moved somewhere without one"
+                .to_string(),
+        );
+    }
+    if state == HookTrustState::Primed {
+        return None;
+    }
+    Some(
+        "codex: brigade briefings need a one-time approval — forming a brigade with a \
+         Codex member will offer to open a review pane first (until then a Codex member \
+         starts unbriefed, without saying so)"
+            .to_string(),
+    )
 }
 
 /// Discover sessions under `claude_home` (and `codex_home`, when resolved
@@ -273,6 +323,61 @@ mod tests {
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Today)), "today");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::ThisWeek)), "week");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Older)), "older");
+    }
+
+    // -- codex_trust_notice ----------------------------------------------
+
+    #[test]
+    fn codex_trust_notice_offers_the_one_time_step_when_nothing_looks_trusted() {
+        let notice = codex_trust_notice(HookTrustState::NotPrimed, true, true, true)
+            .expect("an unprimed cell must be warned");
+        assert!(notice.contains("review pane"), "must name the fix");
+    }
+
+    #[test]
+    fn codex_trust_notice_treats_an_unreadable_config_as_unprimed() {
+        // Silence here would trade a needless prompt for a cell that forms
+        // with members nothing ever briefs.
+        assert!(codex_trust_notice(HookTrustState::Unknown, true, true, true).is_some());
+    }
+
+    #[test]
+    fn codex_trust_notice_is_silent_once_something_looks_trusted() {
+        assert_eq!(
+            codex_trust_notice(HookTrustState::Primed, true, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_trust_notice_is_silent_for_an_operator_with_no_brigade_or_no_codex() {
+        assert_eq!(
+            codex_trust_notice(HookTrustState::NotPrimed, true, false, true),
+            None
+        );
+        assert_eq!(
+            codex_trust_notice(HookTrustState::NotPrimed, false, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_trust_notice_blames_the_space_rather_than_offering_a_pane_that_declines() {
+        // Even `Primed`: a trust record earned from a path Codex cannot
+        // launch is a leftover for a hook that will never run.
+        for state in [
+            HookTrustState::Primed,
+            HookTrustState::NotPrimed,
+            HookTrustState::Unknown,
+        ] {
+            let notice = codex_trust_notice(state, true, true, false)
+                .expect("an unlaunchable path must be reported whatever the trust state");
+            assert!(notice.contains("space"), "must name the cause");
+            assert!(
+                !notice.contains("review pane"),
+                "must not offer a pane that can only decline to open"
+            );
+        }
     }
 
     // -- agents_ignored_notice -------------------------------------------

@@ -74,6 +74,13 @@ impl CodexHome {
     pub fn rollout_dir(&self) -> PathBuf {
         self.0.join("sessions")
     }
+
+    /// `<root>/config.toml`: Codex's own settings file, including the
+    /// `[hooks.state]` trust records [`crate::codex_trust`] reads. Read-only,
+    /// like every other accessor here — invariant 1 extends to `~/.codex`.
+    pub fn config_path(&self) -> PathBuf {
+        self.0.join("config.toml")
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +102,10 @@ mod tests {
         assert_eq!(
             home.rollout_dir(),
             PathBuf::from("/synthetic/codex-home/sessions")
+        );
+        assert_eq!(
+            home.config_path(),
+            PathBuf::from("/synthetic/codex-home/config.toml")
         );
     }
 

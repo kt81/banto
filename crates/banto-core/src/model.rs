@@ -319,6 +319,23 @@ pub struct BrigadeMember {
     pub token: MemberToken,
     pub role: BrigadeRole,
     pub session_id: Option<SessionId>,
+    /// When `banto _hook` last delivered this member its role briefing —
+    /// `None` until the first time it fires (Claude never sets this at all,
+    /// it takes its briefing on launch argv instead; see
+    /// `crate::model::AgentKind` — a Codex member with this still `None`
+    /// after its session has clearly started is the signal that one of the
+    /// silent-failure paths `docs/notes/codex-briefing-spike.md` measured
+    /// (deferred tool, unapproved MCP call, untrusted hook) ate the
+    /// briefing, since every one of those fails without an error banto
+    /// could otherwise observe.
+    pub briefed_at: Option<SystemTime>,
+    /// The session id `banto _hook` was actually running under when it last
+    /// recorded [`Self::briefed_at`] — not necessarily [`Self::session_id`]
+    /// (a session-id rekey after discovery, or a hook firing for a session
+    /// this member's row hasn't caught up to yet, can make them disagree
+    /// momentarily). An observation, not an identity: nothing is
+    /// unique-indexed on it the way `session_id` is.
+    pub briefed_session_id: Option<SessionId>,
 }
 
 /// A queued message from one brigade member to the peer role, or to one
