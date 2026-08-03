@@ -292,13 +292,16 @@ impl BrigadeRole {
         }
     }
 
-    /// Parse a persisted `role` token leniently: anything other than
-    /// `"director"` is treated as a Worker.
-    pub fn from_token(token: &str) -> BrigadeRole {
-        if token == "director" {
-            BrigadeRole::Director
-        } else {
-            BrigadeRole::Worker
+    /// Parse a persisted `role` token. `None` for anything other than
+    /// `"director"`/`"worker"` — every writer of this column goes through
+    /// [`Self::as_token`], which can only ever produce one of those two, so
+    /// an unrecognized value means the row did not come from banto's own
+    /// write path.
+    pub fn from_token(token: &str) -> Option<BrigadeRole> {
+        match token {
+            "director" => Some(BrigadeRole::Director),
+            "worker" => Some(BrigadeRole::Worker),
+            _ => None,
         }
     }
 }

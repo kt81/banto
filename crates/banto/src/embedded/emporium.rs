@@ -1004,10 +1004,16 @@ fn heal_member_session(
 }
 
 /// Create the brigade, its Director row, and `worker_count` Worker rows
-/// (schema v7), all-or-nothing rather than continuing past a single worker
-/// row's insert failure — an edge case rare enough (same connection, no
-/// concurrent writers expected) that the extra per-worker partial-failure
-/// bookkeeping isn't worth the complexity.
+/// (schema v7). Not one shared transaction — each `add_brigade_member` call
+/// commits on its own (see that method's own doc) — so a failure partway
+/// through the Worker loop leaves the brigade, Director, and however many
+/// Worker rows already succeeded in place; this only stops issuing the
+/// remaining ones and reports the failure, rather than silently skipping
+/// past it and reporting a partial success as if it were complete. Rare
+/// enough (SQLite serializes writers and `Store::open`'s 5s busy_timeout
+/// absorbs ordinary contention between this store's several writer
+/// processes — a mid-loop failure here means that timeout ran out) that
+/// reconciling the partial state isn't worth the complexity.
 fn form_brigade_store(
     store: &RefCell<Store>,
     director_row_id: &str,
@@ -1463,18 +1469,8 @@ fn brigade_env(brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>) -> Vec<(
     vec![
         ("BANTO_BRIGADE".to_string(), brigade_id.to_string()),
         ("BANTO_MEMBER".to_string(), token.clone()),
-        ("BANTO_ROLE".to_string(), role_token(*role).to_string()),
+        ("BANTO_ROLE".to_string(), role.as_token().to_string()),
     ]
-}
-
-/// This role's wire spelling, shared by everything banto hands a child
-/// process so the `_mcp` argv, the `_hook` environment and the store all
-/// agree on one word.
-fn role_token(role: BrigadeRole) -> &'static str {
-    match role {
-        BrigadeRole::Director => "director",
-        BrigadeRole::Worker => "worker",
-    }
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
@@ -1497,7 +1493,7 @@ fn write_mcp_config(
         "--member".to_string(),
         token.to_string(),
         "--role".to_string(),
-        role_token(role).to_string(),
+        role.as_token().to_string(),
     ];
     if let Some(session_id) = session_id {
         args.push("--session".to_string());

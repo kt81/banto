@@ -472,10 +472,6 @@ fn mcp_server_command_override(exe: &str) -> String {
 /// (`"director"`/`"worker"`) so a Codex member's identity resolves through
 /// [`crate::mcp`] the same way a Claude one's does.
 fn mcp_server_args_override(brigade: &CodexBrigade) -> String {
-    let role = match brigade.role {
-        BrigadeRole::Director => "director",
-        BrigadeRole::Worker => "worker",
-    };
     let mut args = vec![
         "_mcp".to_string(),
         "--brigade".to_string(),
@@ -483,7 +479,7 @@ fn mcp_server_args_override(brigade: &CodexBrigade) -> String {
         "--member".to_string(),
         brigade.token.clone(),
         "--role".to_string(),
-        role.to_string(),
+        brigade.role.as_token().to_string(),
     ];
     if let Some(session) = &brigade.session {
         args.push("--session".to_string());

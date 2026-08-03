@@ -61,16 +61,6 @@ pub struct Identity {
     pub role: Option<BrigadeRole>,
 }
 
-/// Parse the `--role` arg. Unknown values yield `None` (only relevant to the
-/// old-config fallback path — see [`Identity`]).
-pub fn parse_role(token: &str) -> Option<BrigadeRole> {
-    match token {
-        "director" => Some(BrigadeRole::Director),
-        "worker" => Some(BrigadeRole::Worker),
-        _ => None,
-    }
-}
-
 /// Per-connection state: the caller's identity, the shared store, and
 /// `claude_home` and (when available) `codex_home` — [`tool_brigade_status`]
 /// checks each product's separate live-state source.
@@ -339,7 +329,6 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     if text.trim().is_empty() {
         return tool_error("send_to_peer requires a non-empty `text`.");
     }
-    let to_role = peer_role(role);
     let to = msg
         .pointer("/params/arguments/to")
         .and_then(Value::as_str)
@@ -349,14 +338,26 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
         Ok(target) => target,
         Err(message) => return tool_error(&message),
     };
+    // An addressed target's role is the one resolved for it above, not one
+    // computed from the sender's role: the two happen to always agree today
+    // (see `validate_target`'s doc), but this is the one place that has to
+    // keep working the day they don't. Only a broadcast, which names no
+    // member to resolve a role from, falls back to the explicit default.
+    let to_role = target.as_ref().map_or_else(
+        || default_broadcast_role(role),
+        |(_, target_role)| *target_role,
+    );
 
-    match ctx
-        .store
-        .enqueue_brigade_message(brigade, &token, to_role, target.as_deref(), text)
-    {
+    match ctx.store.enqueue_brigade_message(
+        brigade,
+        &token,
+        to_role,
+        target.as_ref().map(|(member, _)| member.as_str()),
+        text,
+    ) {
         Ok(_) => tool_text(
             match &target {
-                Some(member) => format!("Delivered to {member}."),
+                Some((member, _)) => format!("Delivered to {member}."),
                 None => format!("Delivered to your {}.", role_label(to_role)),
             },
             false,
@@ -367,54 +368,72 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
 
 /// Validate an optional `to` argument for the sender's `role`, live against
 /// the brigade's current membership. `Ok(None)` means broadcast (`to` was
-/// omitted); `Ok(Some(token))` names a validated, real target — including a
-/// Worker's `to: "director"`, which names the same sole recipient a
-/// broadcast would but is still tracked as an explicit target so the
-/// confirmation and inbox framing read as addressed rather than broadcast.
-/// `Err` carries the user-facing message for an unknown or wrong-kind
-/// target: a Director may only target an existing Worker token in this
-/// brigade; a Worker may only target `"director"`.
+/// omitted); `Ok(Some((token, role)))` names a validated, real target paired
+/// with its own resolved role, looked up in the live roster rather than
+/// assumed from the sender's — a Director may only target an existing
+/// Worker token in this brigade; a Worker may only target an existing
+/// Director token (in practice always `"director"`, the only token
+/// [`crate::embedded::emporium`]'s `form_brigade_store` ever assigns a
+/// Director). `Err` carries the user-facing message for an unknown or
+/// wrong-kind target.
+///
+/// Resolving the Worker arm against the roster, instead of the bare
+/// `to == "director"` comparison this replaced, is safe only because a
+/// Worker's own row can never exist without its brigade's Director row also
+/// existing at that moment: `form_brigade_store` always inserts the
+/// Director row first in the same call, and the codebase has no path that
+/// removes just a Director row while Worker rows survive (`disband` removes
+/// every row for the brigade together, in one transaction — see
+/// `Store::delete_brigade`). So by the time a Worker's own `live_membership`
+/// resolves at all, its brigade's Director row is already there to resolve
+/// `"director"` against.
 fn validate_target(
     ctx: &ServerContext,
     brigade: BrigadeId,
     role: BrigadeRole,
     to: Option<&str>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, BrigadeRole)>, String> {
     let Some(to) = to else {
         return Ok(None);
     };
+    let members = ctx
+        .store
+        .brigade_members(brigade)
+        .map_err(|err| format!("failed to resolve brigade membership: {err}"))?;
     match role {
         BrigadeRole::Director => {
-            let members = ctx
-                .store
-                .brigade_members(brigade)
-                .map_err(|err| format!("failed to resolve brigade membership: {err}"))?;
-            let worker_tokens: Vec<&str> = members
+            let workers: Vec<&BrigadeMember> = members
                 .iter()
                 .filter(|m| m.role == BrigadeRole::Worker)
-                .map(|m| m.token.as_str())
                 .collect();
-            if worker_tokens.contains(&to) {
-                Ok(Some(to.to_string()))
-            } else {
-                let valid = if worker_tokens.is_empty() {
-                    "(none — no Workers in this brigade)".to_string()
-                } else {
-                    worker_tokens.join(", ")
-                };
-                Err(format!(
-                    "\"{to}\" is not a Worker in this brigade. Valid targets: {valid}."
-                ))
+            match workers.iter().find(|m| m.token == to) {
+                Some(member) => Ok(Some((member.token.clone(), member.role))),
+                None => {
+                    let valid = if workers.is_empty() {
+                        "(none — no Workers in this brigade)".to_string()
+                    } else {
+                        workers
+                            .iter()
+                            .map(|m| m.token.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    Err(format!(
+                        "\"{to}\" is not a Worker in this brigade. Valid targets: {valid}."
+                    ))
+                }
             }
         }
         BrigadeRole::Worker => {
-            if to == "director" {
-                Ok(Some(to.to_string()))
-            } else {
-                Err(format!(
+            match members
+                .iter()
+                .find(|m| m.role == BrigadeRole::Director && m.token == to)
+            {
+                Some(member) => Ok(Some((member.token.clone(), member.role))),
+                None => Err(format!(
                     "\"{to}\" is not a valid target for a Worker — the only addressable \
                      target is \"director\" (or omit `to` for the same effect)."
-                ))
+                )),
             }
         }
     }
@@ -463,7 +482,23 @@ fn live_membership(
     ctx.store.brigade_of_session(&SessionId(session))
 }
 
+/// The role named in display text as "your peers" — [`tool_brigade_status`]'s
+/// roster heading/footer and [`format_inbox`]'s framing sentence. Not used
+/// for routing (see [`default_broadcast_role`]): a label is free to keep
+/// meaning "the other role" even where a routing decision should not.
 fn peer_role(role: BrigadeRole) -> BrigadeRole {
+    match role {
+        BrigadeRole::Director => BrigadeRole::Worker,
+        BrigadeRole::Worker => BrigadeRole::Director,
+    }
+}
+
+/// The audience `send_to_peer` broadcasts to when `to` is omitted. Kept
+/// separate from [`peer_role`] on purpose, even though the two bodies agree
+/// today: this one decides where a message actually goes, so it is the
+/// function a third role has to force open — not something inherited
+/// silently from whatever "the other role" comes to mean by then.
+fn default_broadcast_role(role: BrigadeRole) -> BrigadeRole {
     match role {
         BrigadeRole::Director => BrigadeRole::Worker,
         BrigadeRole::Worker => BrigadeRole::Director,
@@ -857,6 +892,53 @@ mod tests {
         assert_eq!(pulled[0].to_member, None);
     }
 
+    /// Exercises the broadcast default through the real `send_to_peer` call
+    /// (not `store.enqueue_brigade_message` directly) with two registered
+    /// Workers, so `to_role`'s new `default_broadcast_role` path — not just
+    /// its old `peer_role`-derived equivalent — is what this asserts on.
+    #[test]
+    fn send_to_peer_director_broadcast_reaches_every_worker() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-2",
+                BrigadeRole::Worker,
+                Some(&SessionId("w2".to_string())),
+            )
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":25,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"stand up"}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], false);
+
+        for worker in ["worker-1", "worker-2"] {
+            let pulled = ctx
+                .store
+                .fetch_brigade_messages(1, worker, BrigadeRole::Worker)
+                .unwrap();
+            assert_eq!(pulled.len(), 1, "{worker} did not receive the broadcast");
+            assert_eq!(pulled[0].body, "stand up");
+            assert_eq!(pulled[0].to_member, None);
+        }
+    }
+
     #[test]
     fn check_messages_returns_firewall_framed_text_naming_the_sender_token_then_clears() {
         let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
@@ -985,6 +1067,14 @@ mod tests {
     #[test]
     fn send_to_peer_worker_can_only_target_director() {
         let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
+        // `validate_target` resolves "director" against the live roster now,
+        // not a bare string comparison, so a row for it has to actually
+        // exist here — safe to require, since a Worker's own row (already
+        // registered above by `ctx`) can never exist without its brigade's
+        // Director row also existing (see `validate_target`'s own doc).
+        ctx.store
+            .add_brigade_member(1, "director", BrigadeRole::Director, None)
+            .unwrap();
 
         let response = call(
             &mut ctx,

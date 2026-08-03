@@ -2271,11 +2271,14 @@ fn update_membership_resolved(
     // (not a Worker anymore, or not found) matters regardless of whether
     // this session still has a row.
     if matches!(purpose, PendingMembership::DismissWorker) {
+        // `Some((.., Director)) | None` spelled out rather than `_`: a role
+        // added later has to land in one arm or the other explicitly, not
+        // fall silently into whichever one the wildcard used to catch.
         return match membership {
             Some((brigade_id, token, BrigadeRole::Worker)) => {
                 vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
             }
-            _ => {
+            Some((_, _, BrigadeRole::Director)) | None => {
                 state.pending_dismiss = None;
                 Vec::new()
             }
@@ -2293,7 +2296,9 @@ fn update_membership_resolved(
                 &members.unwrap_or_default(),
                 brigade,
             ),
-            _ => open_solo(state, &row),
+            // Spelled out rather than `_`, same reasoning as the
+            // `DismissWorker` branch above.
+            Some((_, _, BrigadeRole::Worker)) | None => open_solo(state, &row),
         },
         PendingMembership::BrigadeKey => match membership {
             Some((brigade_id, _, BrigadeRole::Director)) => {

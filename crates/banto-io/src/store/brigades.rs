@@ -22,6 +22,7 @@
 
 use std::time::SystemTime;
 
+use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, params};
 
 use banto_core::model::{
@@ -260,8 +261,10 @@ impl Store {
                 |row| {
                     let id: BrigadeId = row.get(0)?;
                     let token: String = row.get(1)?;
-                    let role: String = row.get(2)?;
-                    Ok((id, token, BrigadeRole::from_token(&role)))
+                    let role_token: String = row.get(2)?;
+                    let role = BrigadeRole::from_token(&role_token)
+                        .ok_or_else(|| unrecognized_role_error(2, &role_token))?;
+                    Ok((id, token, role))
                 },
             )
             .optional()?)
@@ -439,17 +442,36 @@ impl Store {
     }
 }
 
+/// A `brigade_members.role` column value [`BrigadeRole::from_token`] does
+/// not recognize, surfaced the same way any other malformed row would be
+/// (`rusqlite::Error`, bubbling up through the caller's own `?` into
+/// [`StoreError::Sqlite`]) rather than silently coerced — see
+/// `BrigadeRole::from_token`'s own doc for why this can only mean the row
+/// did not come from banto's own write path. `brigade_messages.to_role`
+/// never goes through this: this crate only ever writes that column
+/// (`to_role.as_token()`) or filters by it in a `WHERE` clause, never reads
+/// it back and parses it into a `BrigadeRole`.
+fn unrecognized_role_error(column: usize, token: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        Type::Text,
+        format!("unrecognized brigade role {token:?}").into(),
+    )
+}
+
 /// Shared row mapping for [`Store::brigade_members`]/[`Store::brigade_member`]
 /// — both `SELECT`s name the same five columns in the same order.
 fn brigade_member_from_row(row: &rusqlite::Row) -> rusqlite::Result<BrigadeMember> {
     let token: String = row.get(0)?;
-    let role: String = row.get(1)?;
+    let role_token: String = row.get(1)?;
     let session_id: Option<String> = row.get(2)?;
     let briefed_at_ms: Option<i64> = row.get(3)?;
     let briefed_session_id: Option<String> = row.get(4)?;
+    let role = BrigadeRole::from_token(&role_token)
+        .ok_or_else(|| unrecognized_role_error(1, &role_token))?;
     Ok(BrigadeMember {
         token,
-        role: BrigadeRole::from_token(&role),
+        role,
         session_id: session_id.map(SessionId),
         briefed_at: briefed_at_ms.map(unix_ms_to_system_time),
         briefed_session_id: briefed_session_id.map(SessionId),
