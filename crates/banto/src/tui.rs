@@ -818,10 +818,11 @@ fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
 }
 
 /// Confirm whichever modal is open, dispatching to its kind-specific logic.
-/// `ConfirmDisband`/`ConfirmKill`/`WorkerAgentPicker` are the emporium's own
-/// modals — the chōba never opens any of them (it has no brigade-formation
-/// path of its own), so confirming them here is a no-op (Esc still closes
-/// it, via the shared `close_modal` in [`handle_modal_key`]).
+/// `ConfirmDisband`/`ConfirmKill`/`WorkerAgentPicker`/`ConfirmCodexTrust` are
+/// the emporium's own modals — the chōba never opens any of them (it has no
+/// brigade-formation path of its own), so confirming them here is a no-op
+/// (Esc still closes it, via the shared `close_modal` in
+/// [`handle_modal_key`]).
 fn confirm_modal(app: &mut App, ctx: &Context) {
     match app.modal() {
         Some(Modal::NewSession(_)) => confirm_new_session_modal(app, ctx),
@@ -830,6 +831,7 @@ fn confirm_modal(app: &mut App, ctx: &Context) {
         Some(Modal::ConfirmDisband { .. })
         | Some(Modal::ConfirmKill { .. })
         | Some(Modal::WorkerAgentPicker(_))
+        | Some(Modal::ConfirmCodexTrust)
         | None => {}
     }
 }

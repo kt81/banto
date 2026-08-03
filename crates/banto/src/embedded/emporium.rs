@@ -538,8 +538,67 @@ fn execute_cmd(
             brigade,
             model,
         } => execute_open_embedded(key, target, brigade, model, deps, handles, discovery),
+        Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
+        Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
+    }
+}
+
+/// Read whether banto's `SessionStart` hook looks trusted right now —
+/// freshly, not cached, since the operator may have approved it in a pane
+/// since this run started — and whether it could even fire from this
+/// executable's path. `deps.codex_home` absent (Codex unresolved) reads as
+/// unprimed: `Cmd::CheckCodexTrust` is only ever issued once a brigade
+/// formation already resolved to a Codex Worker, so "can't tell" must not
+/// read as "trusted".
+fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
+    let primed = deps.codex_home.is_some_and(|home| {
+        banto_io::codex_trust::hook_trust_state(home)
+            == banto_io::codex_trust::HookTrustState::Primed
+    });
+    let hook_launchable = match std::env::current_exe() {
+        Ok(exe) => opener::hook_command_is_launchable(&opener::forward_slash_path(&exe)),
+        Err(_) => true,
+    };
+    vec![Event::CodexTrustChecked {
+        primed,
+        hook_launchable,
+    }]
+}
+
+/// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`
+/// — the exact same argv a real brigade launch's hook override would carry,
+/// see that function's own doc) under `key`, staged as a solo pane
+/// (`PendingOpen::Solo`, inserted by `confirm_codex_trust_modal` before this
+/// Cmd was even issued). Deliberately not routed through
+/// `execute_open_embedded`/discovery: this is a throwaway review session,
+/// not one banto should ever track or show in the sidebar.
+fn execute_open_codex_trust_pane(
+    key: SessionKey,
+    deps: &Deps,
+    handles: &mut HashMap<SessionKey, PtyHandle>,
+) -> Vec<Event> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            return vec![Event::SpawnFailed {
+                key,
+                error: err.to_string(),
+            }];
+        }
+    };
+    let argv = crate::codex_trust::trust_argv(&exe, deps.agent_binaries);
+    let cwd = std::env::current_dir().ok();
+    match PtyHandle::open(&PortablePtyHost, &argv, cwd.as_deref(), &[], 24, 80) {
+        Ok(handle) => {
+            handles.insert(key.clone(), handle);
+            vec![Event::Spawned { key }]
+        }
+        Err(err) => vec![Event::SpawnFailed {
+            key,
+            error: err.to_string(),
+        }],
     }
 }
 

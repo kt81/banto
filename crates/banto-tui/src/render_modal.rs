@@ -183,6 +183,7 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_cho
             ..
         } => render_confirm_kill_modal(frame, title, *worker_choice, area),
         Modal::WorkerAgentPicker(state) => render_worker_agent_picker_modal(frame, state, area),
+        Modal::ConfirmCodexTrust => render_confirm_codex_trust_modal(frame, area),
     }
 }
 
@@ -351,6 +352,33 @@ fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
         Line::from(prompt),
         Line::from(Span::styled(
             "Its Workers keep running and simply reappear in the list.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the emporium's Codex-hook-trust confirm dialog — shown instead of
+/// forming a brigade whose resolved Worker product is Codex, when banto's
+/// `SessionStart` hook doesn't look trusted yet. Static text throughout: the
+/// modal carries no data of its own (see `Modal::ConfirmCodexTrust`'s doc).
+fn render_confirm_codex_trust_modal(frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Codex Hook Trust \u{2014} confirm ")
+        .title_bottom(" Enter open pane  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from("Open a pane to review and trust Codex's SessionStart hook now?"),
+        Line::from(Span::styled(
+            "Without it, a Codex brigade member starts unbriefed, without saying so.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "This brigade won't form yet either way — press B again once you're done.",
             Style::default().fg(Color::DarkGray),
         )),
     ];

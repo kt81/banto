@@ -99,13 +99,6 @@ struct Cli {
 enum Command {
     /// Print all sessions as plain text (newest first), one per line.
     List,
-    /// Approve the SessionStart hook banto uses to brief Codex brigade members.
-    ///
-    /// Run once per machine, before forming a brigade with Codex members.
-    /// Codex reads hook trust at each member's startup, so members launched
-    /// together each raise their own dialog and approving one cannot cover
-    /// the rest.
-    CodexTrust,
     /// Internal: supervises a resumed or brand-new session's process. The
     /// opener spawns this; it is not meant to be invoked directly.
     #[command(name = "_wrap", hide = true)]
@@ -215,13 +208,6 @@ fn main() -> Result<()> {
                 &thresholds,
                 &resolved_agents.enabled,
             )
-        }
-        Some(Command::CodexTrust) => {
-            let exe = std::env::current_exe()
-                .context("could not determine banto's own executable path")?;
-            let code = codex_trust::run(&exe, &config.agent_binaries, &SystemProcessRunner)
-                .context("failed to run codex")?;
-            std::process::exit(code.unwrap_or(1));
         }
         Some(Command::Wrap {
             session,

@@ -108,8 +108,9 @@ pub fn codex_trust_notice(
     }
     // Outranks the trust question, and outranks `Primed` too: from a path
     // Codex cannot launch, an existing trust record is a leftover for a hook
-    // that will never run, so pointing at `codex-trust` would send the
-    // operator to a command that only declines.
+    // that will never run, so offering a review pane (which the emporium's
+    // own `Modal::ConfirmCodexTrust` skips for the same reason — see
+    // `update_codex_trust_checked`) would only ever decline to open.
     if !hook_launchable {
         return Some(
             "codex: banto's own path contains a space, which Codex cannot launch a hook \
@@ -121,8 +122,9 @@ pub fn codex_trust_notice(
         return None;
     }
     Some(
-        "codex: brigade briefings need a one-time approval — run `banto codex-trust` \
-         (until then a Codex member starts unbriefed, without saying so)"
+        "codex: brigade briefings need a one-time approval — forming a brigade with a \
+         Codex member will offer to open a review pane first (until then a Codex member \
+         starts unbriefed, without saying so)"
             .to_string(),
     )
 }
@@ -329,7 +331,7 @@ mod tests {
     fn codex_trust_notice_offers_the_one_time_step_when_nothing_looks_trusted() {
         let notice = codex_trust_notice(HookTrustState::NotPrimed, true, true, true)
             .expect("an unprimed cell must be warned");
-        assert!(notice.contains("banto codex-trust"), "must name the fix");
+        assert!(notice.contains("review pane"), "must name the fix");
     }
 
     #[test]
@@ -360,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_trust_notice_blames_the_space_rather_than_sending_them_to_a_command_that_declines() {
+    fn codex_trust_notice_blames_the_space_rather_than_offering_a_pane_that_declines() {
         // Even `Primed`: a trust record earned from a path Codex cannot
         // launch is a leftover for a hook that will never run.
         for state in [
@@ -372,8 +374,8 @@ mod tests {
                 .expect("an unlaunchable path must be reported whatever the trust state");
             assert!(notice.contains("space"), "must name the cause");
             assert!(
-                !notice.contains("codex-trust"),
-                "must not send them to a command that only declines"
+                !notice.contains("review pane"),
+                "must not offer a pane that can only decline to open"
             );
         }
     }

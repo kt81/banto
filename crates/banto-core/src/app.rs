@@ -143,6 +143,16 @@ pub enum Modal {
     /// opens this either, for the same reason as `ConfirmDisband`/
     /// `ConfirmKill` — it has no brigade-formation path of its own.
     WorkerAgentPicker(WorkerAgentPickerState),
+    /// Shown instead of forming a brigade (or the `Select` picker above)
+    /// when the brigade's resolved Worker product is Codex and banto's
+    /// `SessionStart` hook doesn't look trusted yet — Enter opens a solo
+    /// pane running Codex's own trust-review startup
+    /// (`Cmd::OpenCodexTrustPane`), Esc cancels. Either way, forming the
+    /// brigade itself is abandoned for this press, not resumed afterward —
+    /// see `crate::engine::update_codex_trust_checked`'s doc for why. The
+    /// chōba never opens this either, for the same reason as
+    /// `ConfirmDisband`/`ConfirmKill`/`WorkerAgentPicker`.
+    ConfirmCodexTrust,
 }
 
 /// The two choices in a Worker's prefix-`x` kill confirm dialog (see
@@ -944,6 +954,7 @@ impl App {
             Some(Modal::ConfirmArchive { .. })
             | Some(Modal::ConfirmDisband { .. })
             | Some(Modal::ConfirmKill { .. })
+            | Some(Modal::ConfirmCodexTrust)
             | None => {}
         }
     }
@@ -1466,6 +1477,16 @@ impl App {
     /// (bound to `B` on a session that is that brigade's Director).
     pub fn open_confirm_disband_modal(&mut self, brigade_id: i64, name: String) {
         self.modal = Some(Modal::ConfirmDisband { brigade_id, name });
+    }
+
+    /// Open the emporium's Codex-hook-trust confirm dialog — see
+    /// [`Modal::ConfirmCodexTrust`]. Takes no parameters: unlike
+    /// `open_confirm_disband_modal`/`open_confirm_kill_modal`, the modal
+    /// carries nothing forward for its own confirm to read, since confirming
+    /// it only opens a review pane rather than resuming whatever brigade
+    /// formation this interrupted.
+    pub fn open_confirm_codex_trust_modal(&mut self) {
+        self.modal = Some(Modal::ConfirmCodexTrust);
     }
 
     /// Open the emporium's kill confirm dialog for the given session (bound

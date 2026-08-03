@@ -492,6 +492,25 @@ struct PendingBrigadeFormation {
     worker_count: usize,
 }
 
+/// A brigade formation waiting on a fresh `Cmd::CheckCodexTrust` round trip
+/// before `StoreIntent::FormBrigade` is issued — everything `FormBrigade`
+/// needs, stashed the moment the resolved Worker product turns out to be
+/// [`AgentKind::Codex`] (`update_membership_resolved`'s non-`Select` branch,
+/// or [`confirm_worker_agent_modal`] once `Select`'s own picker resolves).
+/// Unlike [`PendingBrigadeFormation`], `worker_agent`/`worker_model` are
+/// already known by the time this exists — the whole point of this stash is
+/// that they're the fully-resolved values, not a placeholder awaiting them.
+/// Consumed unconditionally by [`update_codex_trust_checked`], whichever way
+/// the check comes out.
+struct PendingCodexTrustFormation {
+    director_row_id: String,
+    name: String,
+    cwd: PathBuf,
+    worker_count: usize,
+    worker_agent: AgentKind,
+    worker_model: String,
+}
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -524,6 +543,7 @@ pub struct EmporiumState {
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
     pending_brigade_formation: Option<PendingBrigadeFormation>,
+    pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
     /// The Worker pane a confirmed prefix-`x` dismiss is about to remove,
     /// stashed at confirm time (`confirm_kill_modal`) — regardless of
     /// whether `StoreIntent::DismissWorker` was built immediately (a
@@ -565,6 +585,7 @@ impl EmporiumState {
             pending_opens: HashMap::new(),
             pending_membership: None,
             pending_brigade_formation: None,
+            pending_codex_trust_formation: None,
             pending_dismiss: None,
             size: (0, 0),
             prefix,
@@ -992,6 +1013,26 @@ pub enum Cmd {
         from: SessionKey,
         to: SessionKey,
     },
+    /// Read whether banto's own `SessionStart` hook looks trusted right now
+    /// (fresh, not cached — the operator may have approved it in a pane
+    /// since this run started) and whether `std::env::current_exe()` can
+    /// even launch it at all. Issued only when a brigade formation's already-
+    /// resolved Worker product is [`AgentKind::Codex`] — see
+    /// `update_membership_resolved`/`confirm_worker_agent_modal`, which stash
+    /// a [`PendingCodexTrustFormation`] alongside it. The shell answers with
+    /// `Event::CodexTrustChecked`.
+    CheckCodexTrust,
+    /// Open a solo pane running Codex's own trust-review startup (`codex -c
+    /// <hook override>`, via `crate::codex_trust::trust_argv` — no cwd, no
+    /// resume, no MCP overrides, nothing else) under `key`. Confirming
+    /// [`Modal::ConfirmCodexTrust`] issues this; the shell answers with the
+    /// same `Event::Spawned`/`SpawnFailed` any other open does, but this one
+    /// is never handed to `Cmd::OpenEmbedded`/discovery — it's a throwaway
+    /// review session the operator `/quit`s out of, not one banto should
+    /// ever show in the sidebar.
+    OpenCodexTrustPane {
+        key: SessionKey,
+    },
     Store(StoreIntent),
     Reload,
 }
@@ -1073,6 +1114,15 @@ pub enum Event {
         /// trip (`stage_brigade` needs the whole roster, not just the
         /// activating row's own membership).
         members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
+    },
+    /// Answers `Cmd::CheckCodexTrust`: whether banto's `SessionStart` hook
+    /// looks trusted right now, and whether it could even fire from this
+    /// executable's path — see [`update_codex_trust_checked`] for how the
+    /// two combine with the [`PendingCodexTrustFormation`] this always
+    /// follows.
+    CodexTrustChecked {
+        primed: bool,
+        hook_launchable: bool,
     },
     BrigadeFormed {
         director_row_id: String,
@@ -1210,6 +1260,10 @@ pub fn update(
             membership,
             members,
         } => update_membership_resolved(state, app, brigade, session_id, membership, members),
+        Event::CodexTrustChecked {
+            primed,
+            hook_launchable,
+        } => update_codex_trust_checked(state, app, primed, hook_launchable, now),
         Event::BrigadeFormed {
             director_row_id,
             name,
@@ -1555,8 +1609,12 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
             // interrupting too — a brigade forming anyway with whatever
             // product happened to be selected is a far worse outcome than
             // clearing a stash that was already `None` for every other
-            // modal kind.
+            // modal kind. `pending_codex_trust_formation` is already `None`
+            // by the time `Modal::ConfirmCodexTrust` can even be open (see
+            // `update_codex_trust_checked`), but cleared here too, for the
+            // same defensive reason.
             state.pending_brigade_formation = None;
+            state.pending_codex_trust_formation = None;
             Vec::new()
         }
         KeyCode::Up => {
@@ -1620,6 +1678,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Disband,
         Kill,
         WorkerAgent,
+        CodexTrust,
     }
     let kind = match app.modal() {
         Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
@@ -1628,6 +1687,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
         Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
+        Some(Modal::ConfirmCodexTrust) => Some(Kind::CodexTrust),
         None => None,
     };
     match kind {
@@ -1637,6 +1697,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::Disband) => confirm_disband_modal(app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
         Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
+        Some(Kind::CodexTrust) => confirm_codex_trust_modal(state, app),
         None => Vec::new(),
     }
 }
@@ -1647,9 +1708,12 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
 /// ([`EmporiumState::pending_brigade_formation`], stashed when it opened —
 /// see `update_membership_resolved`'s `Select` branch), and issue the same
 /// `StoreIntent::FormBrigade` a non-`Select` setting would have issued
-/// directly. A no-op (closes the modal, nothing forms) if either half is
-/// missing — shouldn't happen structurally, but "form nothing" is the only
-/// safe fallback if it ever does, not guessing at a product.
+/// directly — unless the chosen product is [`AgentKind::Codex`], in which
+/// case a codex-trust check comes first, same as the non-`Select` path (see
+/// [`update_codex_trust_checked`]). A no-op (closes the modal, nothing
+/// forms) if the stashed formation is missing — shouldn't happen
+/// structurally, but "form nothing" is the only safe fallback if it ever
+/// does, not guessing at a product.
 fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let Some(Modal::WorkerAgentPicker(picker)) = app.modal() else {
         return Vec::new();
@@ -1660,6 +1724,17 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
     let Some(formation) = state.pending_brigade_formation.take() else {
         return Vec::new();
     };
+    if worker_agent == AgentKind::Codex {
+        state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
+            director_row_id: formation.director_row_id,
+            name: formation.name,
+            cwd: formation.cwd,
+            worker_count: formation.worker_count,
+            worker_agent,
+            worker_model,
+        });
+        return vec![Cmd::CheckCodexTrust];
+    }
     vec![Cmd::Store(StoreIntent::FormBrigade {
         director_row_id: formation.director_row_id,
         name: formation.name,
@@ -1910,24 +1985,121 @@ fn update_membership_resolved(
                 );
                 Vec::new()
             }
+            // `Codex` (whether `[brigade] worker_agent` names it directly,
+            // or `Inherit` resolves to it from a Codex Director) routes
+            // through a codex-trust check before `FormBrigade` — same
+            // reasoning as `confirm_worker_agent_modal`'s own `Select`-
+            // resolved case, see `update_codex_trust_checked`.
             None => {
                 let worker_agent = resolve_worker_agent(brigade.worker_agent, row.agent);
+                let worker_model = brigade
+                    .worker_model_for(worker_agent)
+                    .unwrap_or("")
+                    .to_string();
+                if worker_agent == AgentKind::Codex {
+                    state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
+                        director_row_id: row.id.clone(),
+                        name: row.display_title().to_string(),
+                        cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                        worker_count: brigade.worker_count(),
+                        worker_agent,
+                        worker_model,
+                    });
+                    return vec![Cmd::CheckCodexTrust];
+                }
                 vec![Cmd::Store(StoreIntent::FormBrigade {
                     director_row_id: row.id.clone(),
                     name: row.display_title().to_string(),
                     cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                     worker_count: brigade.worker_count(),
                     worker_agent,
-                    worker_model: brigade
-                        .worker_model_for(worker_agent)
-                        .unwrap_or("")
-                        .to_string(),
+                    worker_model,
                 })]
             }
         },
         // Handled above, before the `row_for_id` guard.
         PendingMembership::DismissWorker => Vec::new(),
     }
+}
+
+/// Answers `Cmd::CheckCodexTrust`, always following a
+/// [`PendingCodexTrustFormation`] stash (`update_membership_resolved`'s
+/// non-`Select` branch, or `confirm_worker_agent_modal` once `Select`'s own
+/// picker resolves) — a no-op if it's missing, which shouldn't happen
+/// structurally.
+///
+/// Three outcomes, and only one of them re-issues `FormBrigade`:
+/// - **Not launchable at all** (banto's own path has a space — Codex can
+///   never fire a hook command from one, `hook_command_is_launchable`'s
+///   doc): a trust prompt would only ask the operator to approve a hook
+///   that can never run, so it's skipped — a status line names the cause
+///   (the same wording `codex_trust_notice` already uses for it) and
+///   formation proceeds anyway. Unlike the "not primed" case below, there's
+///   no action a pane could offer that would fix this one before forming.
+/// - **Primed**: proceeds straight to `FormBrigade`, unchanged from before
+///   this check existed.
+/// - **Neither**: opens [`Modal::ConfirmCodexTrust`] and stops — formation
+///   is abandoned for this press, not resumed once the operator approves or
+///   cancels. Resuming it would need to know whether the approval actually
+///   took (Codex hashes its own trust record; banto cannot verify a match
+///   against it — see `banto_io::codex_trust`'s module doc), and treating an
+///   unverifiable "probably fine" as ground truth is exactly the shape of
+///   mistake this project has paid for before. The operator presses `B`
+///   again once they're done.
+fn update_codex_trust_checked(
+    state: &mut EmporiumState,
+    app: &mut App,
+    primed: bool,
+    hook_launchable: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let Some(formation) = state.pending_codex_trust_formation.take() else {
+        return Vec::new();
+    };
+    if !hook_launchable {
+        state.set_status(
+            "codex: banto's own path contains a space, which Codex cannot launch a hook \
+             from — this brigade's Codex member(s) start unbriefed"
+                .to_string(),
+            now,
+        );
+        return vec![Cmd::Store(StoreIntent::FormBrigade {
+            director_row_id: formation.director_row_id,
+            name: formation.name,
+            cwd: formation.cwd,
+            worker_count: formation.worker_count,
+            worker_agent: formation.worker_agent,
+            worker_model: formation.worker_model,
+        })];
+    }
+    if primed {
+        return vec![Cmd::Store(StoreIntent::FormBrigade {
+            director_row_id: formation.director_row_id,
+            name: formation.name,
+            cwd: formation.cwd,
+            worker_count: formation.worker_count,
+            worker_agent: formation.worker_agent,
+            worker_model: formation.worker_model,
+        })];
+    }
+    app.open_confirm_codex_trust_modal();
+    Vec::new()
+}
+
+/// Confirm [`Modal::ConfirmCodexTrust`]: mint a fresh key, stage it as the
+/// (eventual) solo pane the same way any other fresh open does
+/// (`PendingOpen::Solo` — reused as-is, not a new variant, because staging
+/// is all this needs: no session row, no discovery), and ask the shell to
+/// spawn Codex's trust-review startup under it. See `Cmd::OpenCodexTrustPane`
+/// for why this never becomes a tracked session.
+fn confirm_codex_trust_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    if !matches!(app.modal(), Some(Modal::ConfirmCodexTrust)) {
+        return Vec::new();
+    }
+    app.close_modal();
+    let key = state.mint_plain_key(std::path::Path::new(".codex-trust"));
+    state.pending_opens.insert(key.clone(), PendingOpen::Solo);
+    vec![Cmd::OpenCodexTrustPane { key }]
 }
 
 /// Stage `row` solo: reuse its screen if already open, else request a spawn.
@@ -4239,6 +4411,37 @@ mod tests {
     }
 
     #[test]
+    fn brigade_key_checks_codex_trust_before_forming_when_worker_agent_resolves_to_codex() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckCodexTrust],
+            "must not form yet — a Codex Worker needs the trust check first"
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_codex_trust_formation.is_some());
+    }
+
+    #[test]
     fn brigade_key_opens_the_worker_agent_modal_when_select_is_configured() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
@@ -4275,11 +4478,11 @@ mod tests {
             worker_count: 2,
         });
         app.open_worker_agent_modal(
-            AgentKind::ClaudeCode,
+            AgentKind::Codex,
             "sonnet".to_string(),
             "gpt-5.6-terra".to_string(),
         );
-        app.modal_toggle_agent(); // Claude -> Codex, re-seeds the model input
+        app.modal_toggle_agent(); // Codex -> Claude, re-seeds the model input
         app.modal_push_char('!'); // then the operator edits it further
 
         let cmds = confirm_worker_agent_modal(&mut state, &mut app);
@@ -4292,17 +4495,158 @@ mod tests {
                     name,
                     cwd,
                     worker_count: 2,
-                    worker_agent: AgentKind::Codex,
+                    worker_agent: AgentKind::ClaudeCode,
                     worker_model,
                 })] if director_row_id == "dir"
                     && name == "cell"
                     && cwd == &PathBuf::from("/work")
-                    && worker_model == "gpt-5.6-terra!"
+                    && worker_model == "sonnet!"
             ),
             "expected a FormBrigade carrying the picker's own final state: {cmds:?}"
         );
         assert!(app.modal().is_none());
         assert!(state.pending_brigade_formation.is_none());
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_checks_codex_trust_instead_of_forming_directly_when_codex_is_chosen()
+     {
+        // The whole point of this round trip: a Codex pick must not form the
+        // brigade on the spot, because trust can only be verified by the
+        // shell (`Cmd::CheckCodexTrust`) — see `update_codex_trust_checked`.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+        });
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_toggle_agent(); // Claude -> Codex
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert_eq!(cmds, vec![Cmd::CheckCodexTrust]);
+        assert!(app.modal().is_none());
+        assert!(state.pending_brigade_formation.is_none());
+        assert!(state.pending_codex_trust_formation.is_some());
+    }
+
+    fn pending_codex_trust_formation() -> PendingCodexTrustFormation {
+        PendingCodexTrustFormation {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+            worker_agent: AgentKind::Codex,
+            worker_model: "gpt-5.6-terra".to_string(),
+        }
+    }
+
+    #[test]
+    fn codex_trust_checked_forms_the_brigade_when_primed() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_codex_trust_formation = Some(pending_codex_trust_formation());
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, true, true, test_instant());
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+        assert!(app.modal().is_none());
+        assert!(state.pending_codex_trust_formation.is_none());
+    }
+
+    #[test]
+    fn codex_trust_checked_opens_the_confirm_modal_when_not_primed_but_launchable() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_codex_trust_formation = Some(pending_codex_trust_formation());
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, false, true, test_instant());
+
+        assert!(cmds.is_empty(), "nothing forms until the operator acts");
+        assert!(matches!(app.modal(), Some(Modal::ConfirmCodexTrust)));
+        assert!(
+            state.pending_codex_trust_formation.is_none(),
+            "consumed unconditionally — resuming later would need to verify \
+             the approval actually took, which banto cannot do"
+        );
+    }
+
+    #[test]
+    fn codex_trust_checked_forms_anyway_and_reports_the_space_when_not_launchable() {
+        // Not launchable outranks "not primed": no pane could fix this one,
+        // so there is nothing useful to confirm, unlike the primed-eventually
+        // case above.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_codex_trust_formation = Some(pending_codex_trust_formation());
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, false, false, test_instant());
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+        assert!(app.modal().is_none());
+        let status = state.status.as_deref().unwrap_or_default();
+        assert!(status.contains("space"), "must name the cause: {status}");
+    }
+
+    #[test]
+    fn codex_trust_checked_is_a_no_op_without_a_pending_formation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+
+        let cmds = update_codex_trust_checked(&mut state, &mut app, true, true, test_instant());
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn confirm_codex_trust_modal_opens_a_solo_pane_and_never_touches_pending_brigade_formation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        app.open_confirm_codex_trust_modal();
+
+        let cmds = confirm_codex_trust_modal(&mut state, &mut app);
+
+        let key = match cmds.as_slice() {
+            [Cmd::OpenCodexTrustPane { key }] => key.clone(),
+            other => panic!("expected exactly one OpenCodexTrustPane: {other:?}"),
+        };
+        assert!(app.modal().is_none());
+        assert!(matches!(
+            state.pending_opens.get(&key),
+            Some(PendingOpen::Solo)
+        ));
+    }
+
+    #[test]
+    fn confirm_codex_trust_modal_is_a_no_op_when_a_different_modal_is_open() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        app.open_confirm_archive_modal();
+
+        let cmds = confirm_codex_trust_modal(&mut state, &mut app);
+
+        assert!(cmds.is_empty());
+        assert!(matches!(app.modal(), Some(Modal::ConfirmArchive { .. })));
     }
 
     #[test]
