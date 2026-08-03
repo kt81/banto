@@ -2271,14 +2271,18 @@ fn update_membership_resolved(
     // (not a Worker anymore, or not found) matters regardless of whether
     // this session still has a row.
     if matches!(purpose, PendingMembership::DismissWorker) {
-        // `Some((.., Director)) | None` spelled out rather than `_`: a role
-        // added later has to land in one arm or the other explicitly, not
-        // fall silently into whichever one the wildcard used to catch.
+        // `Some((.., Director | Goinkyo)) | None` spelled out rather than
+        // `_`: a role added later has to land in one arm or the other
+        // explicitly, not fall silently into whichever one the wildcard
+        // used to catch. A Goinkyo is no more a Worker than a Director is,
+        // so it lands here — nothing spawns one yet, but this dismiss flow
+        // is only ever reachable for a pane the operator is looking at, and
+        // an unexpected answer here has always meant "abort", never "guess".
         return match membership {
             Some((brigade_id, token, BrigadeRole::Worker)) => {
                 vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
             }
-            Some((_, _, BrigadeRole::Director)) | None => {
+            Some((_, _, BrigadeRole::Director | BrigadeRole::Goinkyo)) | None => {
                 state.pending_dismiss = None;
                 Vec::new()
             }
@@ -2297,8 +2301,12 @@ fn update_membership_resolved(
                 brigade,
             ),
             // Spelled out rather than `_`, same reasoning as the
-            // `DismissWorker` branch above.
-            Some((_, _, BrigadeRole::Worker)) | None => open_solo(state, &row),
+            // `DismissWorker` branch above: staging the whole brigade is a
+            // Director-only action, so a Goinkyo activated directly opens
+            // solo, same as a Worker does.
+            Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo)) | None => {
+                open_solo(state, &row)
+            }
         },
         PendingMembership::BrigadeKey => match membership {
             Some((brigade_id, _, BrigadeRole::Director)) => {
@@ -2307,6 +2315,13 @@ fn update_membership_resolved(
             }
             Some((_, _, BrigadeRole::Worker)) => {
                 state.status = Some("workers can't be promoted to Director directly".to_string());
+                Vec::new()
+            }
+            // Its own arm rather than folded into the Worker one above: a
+            // Goinkyo is not a Worker, and reusing that exact message would
+            // tell the operator something false about who was refused.
+            Some((_, _, BrigadeRole::Goinkyo)) => {
+                state.status = Some("a goinkyo can't be promoted to Director directly".to_string());
                 Vec::new()
             }
             // Outranks the two gates inside `begin_brigade_formation`

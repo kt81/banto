@@ -484,6 +484,13 @@ is a live operational unit, not a filing category. A session belongs to at
 most one brigade, and a brigade has exactly one Director — both are "layered
 in code, not a schema constraint" (same comment, verbatim).
 
+**A third role, Goinkyo, exists in `BrigadeRole` and the messaging rules
+below** — the retired elder called back in to arbitrate a Director/Worker
+disagreement, addressable by name but never a broadcast recipient (see
+`send_to_peer` below) — but nothing in this build spawns or summons one:
+that, and the MCP tool a Director would use to call one in, is a later
+phase. No Goinkyo member row exists outside a test fixture today.
+
 **Formation.** `B` on a selected session appoints it Director and auto-spawns
 `workers` (config, default 1, clamped 1..=8) fresh Workers beside it. `b` spawns
 one more Worker into the currently-staged brigade. `B` on an existing Director
@@ -582,6 +589,7 @@ pub struct BrigadeConfig {
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub director_prompt: String,    // role briefing template for the Director
     pub worker_prompt: String,      // role briefing template for each Worker
+    pub goinkyo_prompt: String,     // role briefing template for a Goinkyo — no goinkyo_model yet, nothing spawns one
 }
 ```
 
@@ -592,15 +600,15 @@ gate 2 above. `worker_model`/`worker_model_codex` are two independent
 `--model` overrides, since the two products don't share a model namespace —
 one shared field could never default sensibly for both at once.
 
-**Role briefing delivery differs by product.** Both `director_prompt` and
-`worker_prompt` render the same template, substituting `{brigade}` (the
-brigade id), `{token}` (this member's own token), and `{peers}` (a
-comma-joined list of its addressable peers) — an empty template means no
-briefing at all, deliberately a *setting* and not a constant: without one, a
-cell exists only in banto's data model and the operator's own screen, and a
-Director handed three MCP tool names with no notion that it leads a cell
-mostly never uses them. Only how the rendered text reaches the member differs
-by product:
+**Role briefing delivery differs by product.** `director_prompt`,
+`worker_prompt`, and `goinkyo_prompt` all render the same template,
+substituting `{brigade}` (the brigade id), `{token}` (this member's own
+token), and `{peers}` (a comma-joined list of its addressable peers) — an
+empty template means no briefing at all, deliberately a *setting* and not a
+constant: without one, a cell exists only in banto's data model and the
+operator's own screen, and a Director handed three MCP tool names with no
+notion that it leads a cell mostly never uses them. Only how the rendered
+text reaches the member differs by product:
 - **Claude**: on the launch argv, `--append-system-prompt <rendered>`.
 - **Codex has no equivalent flag.** Its briefing instead rides banto's own
   `SessionStart` hook: every Codex member's launch adds a `-c
@@ -655,9 +663,10 @@ two separate ways here.
 
 The server shares banto's own sqlite store with the TUI process and exposes
 three tools:
-- `send_to_peer(text[, to])` — enqueues a message to the opposite role in the
-  brigade (Director → every Worker, or Worker → Director); `to` narrows a
-  broadcast to one specific member token.
+- `send_to_peer(text[, to])` — enqueues a message: a Director broadcasts to
+  every Worker by default, or a Worker/Goinkyo sends to the Director;
+  `to` names one specific member instead — the only way a Director reaches
+  a Goinkyo, since a broadcast never does.
 - `check_messages()` — pulls the messages addressed to this session's role
   that it hasn't seen yet, wrapped in framing that names them as relayed from
   another AI rather than a direct operator instruction.
