@@ -153,6 +153,18 @@ pub enum Modal {
     /// chōba never opens this either, for the same reason as
     /// `ConfirmDisband`/`ConfirmKill`/`WorkerAgentPicker`.
     ConfirmCodexTrust,
+    /// Shown instead of forming a brigade (before either gate above) when
+    /// the session about to become Director already has a pane open:
+    /// brigade wiring (MCP config, Codex's `-c` overrides) only ever travels
+    /// through a launch's own argv, so a pane opened before formation can't
+    /// carry it — Enter kills that pane and reopens it wired once it's
+    /// actually gone (`crate::engine::confirm_director_reopen_modal`/
+    /// `update_pty_exited`), Esc cancels and nothing forms. The chōba never
+    /// opens this either, for the same reason as the others.
+    ConfirmDirectorReopen {
+        director_row_id: String,
+        name: String,
+    },
 }
 
 /// The two choices in a Worker's prefix-`x` kill confirm dialog (see
@@ -955,6 +967,7 @@ impl App {
             | Some(Modal::ConfirmDisband { .. })
             | Some(Modal::ConfirmKill { .. })
             | Some(Modal::ConfirmCodexTrust)
+            | Some(Modal::ConfirmDirectorReopen { .. })
             | None => {}
         }
     }
@@ -1487,6 +1500,18 @@ impl App {
     /// formation this interrupted.
     pub fn open_confirm_codex_trust_modal(&mut self) {
         self.modal = Some(Modal::ConfirmCodexTrust);
+    }
+
+    /// Open the emporium's Director-reopen confirm dialog — see
+    /// [`Modal::ConfirmDirectorReopen`]. `director_row_id`/`name` are the
+    /// session about to be promoted, carried on the modal itself (unlike
+    /// [`Self::open_confirm_codex_trust_modal`]) because confirming it needs
+    /// to know *which* pane to kill.
+    pub fn open_confirm_director_reopen_modal(&mut self, director_row_id: String, name: String) {
+        self.modal = Some(Modal::ConfirmDirectorReopen {
+            director_row_id,
+            name,
+        });
     }
 
     /// Open the emporium's kill confirm dialog for the given session (bound

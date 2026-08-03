@@ -184,6 +184,9 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_cho
         } => render_confirm_kill_modal(frame, title, *worker_choice, area),
         Modal::WorkerAgentPicker(state) => render_worker_agent_picker_modal(frame, state, area),
         Modal::ConfirmCodexTrust => render_confirm_codex_trust_modal(frame, area),
+        Modal::ConfirmDirectorReopen { name, .. } => {
+            render_confirm_director_reopen_modal(frame, name, area)
+        }
     }
 }
 
@@ -379,6 +382,38 @@ fn render_confirm_codex_trust_modal(frame: &mut Frame, area: Rect) {
         )),
         Line::from(Span::styled(
             "This brigade won't form yet either way — press B again once you're done.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the emporium's Director-reopen confirm dialog — shown instead of
+/// forming a brigade when the session about to become Director already has
+/// a pane open (brigade wiring only ever travels through a launch's own
+/// argv, so an already-running pane can't carry it).
+fn render_confirm_director_reopen_modal(frame: &mut Frame, name: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Reopen Director \u{2014} confirm ")
+        .title_bottom(" Enter reopen  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let prompt = truncate_to_width(
+        &format!("\"{name}\" is already open — close and reopen it to form the brigade?"),
+        inner.width,
+    );
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(Span::styled(
+            "Any work in progress in that pane is lost — reopening is the only way to \
+             give it banto's brigade tools.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "Esc cancels — nothing forms and the pane stays as it is.",
             Style::default().fg(Color::DarkGray),
         )),
     ];

@@ -511,6 +511,23 @@ struct PendingCodexTrustFormation {
     worker_model: String,
 }
 
+/// Everything needed to open a freshly-formed brigade's Director wired
+/// (MCP config / Codex `-c` overrides, plus which Workers to open once it
+/// spawns) — [`PendingOpen::BrigadeDirector`]'s own payload, held here for
+/// the one case that can't build `Cmd::OpenEmbedded` immediately:
+/// `update_brigade_formed` finding the Director's pane still open despite
+/// `begin_brigade_formation`'s own pre-formation gate (see that function's
+/// doc for why this is a residual race, not the common case, and why there
+/// is no aborting once we're here — the brigade record already exists).
+struct PendingDirectorWiring {
+    director_row_id: String,
+    brigade_id: BrigadeId,
+    worker_tokens: Vec<MemberToken>,
+    cwd: PathBuf,
+    worker_agent: AgentKind,
+    worker_model: String,
+}
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -544,6 +561,25 @@ pub struct EmporiumState {
     pending_membership: Option<PendingMembership>,
     pending_brigade_formation: Option<PendingBrigadeFormation>,
     pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
+    /// The session id of a Director-to-be whose already-open pane was just
+    /// killed (`confirm_director_reopen_modal`), waiting on its
+    /// `Event::PtyExited` before formation can continue — reopening any
+    /// sooner would resume a session `opener::decide_inplace_resume` still
+    /// sees as live and refuse. `update_pty_exited` takes it once the exit
+    /// for this exact key lands. Unlike `pending_brigade_formation`/
+    /// `pending_codex_trust_formation`, not cleared on every Esc: by the
+    /// time this is set, `Modal::ConfirmDirectorReopen` is already closed
+    /// (see that function), so no *other* modal's Esc should touch it.
+    pending_director_reopen: Option<String>,
+    /// The residual-race counterpart to [`Self::pending_director_reopen`] —
+    /// set by `update_brigade_formed` instead of the interactive gate, so it
+    /// carries the full [`PendingDirectorWiring`] rather than just a row id
+    /// to re-derive a formation decision from (there's nothing left to
+    /// decide by that point, only wiring to apply). `update_pty_exited`
+    /// checks both; the two are never set at once in practice, since the
+    /// interactive gate's own stash is always cleared before `FormBrigade`
+    /// is issued.
+    pending_director_wiring: Option<PendingDirectorWiring>,
     /// The Worker pane a confirmed prefix-`x` dismiss is about to remove,
     /// stashed at confirm time (`confirm_kill_modal`) — regardless of
     /// whether `StoreIntent::DismissWorker` was built immediately (a
@@ -586,6 +622,8 @@ impl EmporiumState {
             pending_membership: None,
             pending_brigade_formation: None,
             pending_codex_trust_formation: None,
+            pending_director_reopen: None,
+            pending_director_wiring: None,
             pending_dismiss: None,
             size: (0, 0),
             prefix,
@@ -1207,7 +1245,7 @@ pub fn update(
             }
             Vec::new()
         }
-        Event::PtyExited { key } => update_pty_exited(state, app, key, now),
+        Event::PtyExited { key } => update_pty_exited(state, app, brigade, key, now),
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
@@ -1679,6 +1717,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Kill,
         WorkerAgent,
         CodexTrust,
+        DirectorReopen,
     }
     let kind = match app.modal() {
         Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
@@ -1688,6 +1727,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
         Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
         Some(Modal::ConfirmCodexTrust) => Some(Kind::CodexTrust),
+        Some(Modal::ConfirmDirectorReopen { .. }) => Some(Kind::DirectorReopen),
         None => None,
     };
     match kind {
@@ -1698,6 +1738,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::Kill) => confirm_kill_modal(state, app),
         Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
         Some(Kind::CodexTrust) => confirm_codex_trust_modal(state, app),
+        Some(Kind::DirectorReopen) => confirm_director_reopen_modal(state, app),
         None => Vec::new(),
     }
 }
@@ -1965,61 +2006,82 @@ fn update_membership_resolved(
                 state.status = Some("workers can't be promoted to Director directly".to_string());
                 Vec::new()
             }
-            // `Select` interrupts formation with a modal instead of issuing
-            // `FormBrigade` right away: the operator has to pick a product
-            // (and, given the product, a model) *before* there's anything
-            // to form — see `confirm_worker_agent_modal` for the other half
-            // of this round trip. Every other setting resolves immediately,
-            // unchanged from before this existed.
-            None if brigade.worker_agent == WorkerAgentSetting::Select => {
-                state.pending_brigade_formation = Some(PendingBrigadeFormation {
-                    director_row_id: row.id.clone(),
-                    name: row.display_title().to_string(),
-                    cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                    worker_count: brigade.worker_count(),
-                });
-                app.open_worker_agent_modal(
-                    row.agent,
-                    brigade.worker_model.clone(),
-                    brigade.worker_model_codex.clone(),
+            // Outranks the two gates inside `begin_brigade_formation`
+            // (`Select`'s picker, the codex-trust check): reopening the
+            // Director's own pane is the most disruptive of the three
+            // (running work is lost) and the cheapest to abort (nothing has
+            // been picked or written yet), so it has to be asked about
+            // first — picking a product and a model only to be told the
+            // pane is about to restart anyway would be the wrong order. See
+            // `confirm_director_reopen_modal`/`update_pty_exited` for the
+            // other half of this round trip.
+            None if state.screens.contains_key(&SessionKey::from_id(&row.id)) => {
+                app.open_confirm_director_reopen_modal(
+                    row.id.clone(),
+                    row.display_title().to_string(),
                 );
                 Vec::new()
             }
-            // `Codex` (whether `[brigade] worker_agent` names it directly,
-            // or `Inherit` resolves to it from a Codex Director) routes
-            // through a codex-trust check before `FormBrigade` — same
-            // reasoning as `confirm_worker_agent_modal`'s own `Select`-
-            // resolved case, see `update_codex_trust_checked`.
-            None => {
-                let worker_agent = resolve_worker_agent(brigade.worker_agent, row.agent);
-                let worker_model = brigade
-                    .worker_model_for(worker_agent)
-                    .unwrap_or("")
-                    .to_string();
-                if worker_agent == AgentKind::Codex {
-                    state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
-                        director_row_id: row.id.clone(),
-                        name: row.display_title().to_string(),
-                        cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                        worker_count: brigade.worker_count(),
-                        worker_agent,
-                        worker_model,
-                    });
-                    return vec![Cmd::CheckCodexTrust];
-                }
-                vec![Cmd::Store(StoreIntent::FormBrigade {
-                    director_row_id: row.id.clone(),
-                    name: row.display_title().to_string(),
-                    cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                    worker_count: brigade.worker_count(),
-                    worker_agent,
-                    worker_model,
-                })]
-            }
+            None => begin_brigade_formation(state, app, brigade, &row),
         },
         // Handled above, before the `row_for_id` guard.
         PendingMembership::DismissWorker => Vec::new(),
     }
+}
+
+/// The formation decision proper, once nothing needs to reopen first (see
+/// `update_membership_resolved`'s `None` branch, and `update_pty_exited` for
+/// the resumed-after-reopen path): `Select` interrupts with a picker instead
+/// of issuing `FormBrigade` right away — the operator has to choose a
+/// product (and, given the product, a model) before there's anything to
+/// form, see `confirm_worker_agent_modal` for the other half of that round
+/// trip. Otherwise the Worker product resolves immediately, and — if it's
+/// Codex — routes through a trust check first, same reasoning, see
+/// `update_codex_trust_checked`.
+fn begin_brigade_formation(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    row: &SessionRow,
+) -> Vec<Cmd> {
+    if brigade.worker_agent == WorkerAgentSetting::Select {
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: row.id.clone(),
+            name: row.display_title().to_string(),
+            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            worker_count: brigade.worker_count(),
+        });
+        app.open_worker_agent_modal(
+            row.agent,
+            brigade.worker_model.clone(),
+            brigade.worker_model_codex.clone(),
+        );
+        return Vec::new();
+    }
+    let worker_agent = resolve_worker_agent(brigade.worker_agent, row.agent);
+    let worker_model = brigade
+        .worker_model_for(worker_agent)
+        .unwrap_or("")
+        .to_string();
+    if worker_agent == AgentKind::Codex {
+        state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
+            director_row_id: row.id.clone(),
+            name: row.display_title().to_string(),
+            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            worker_count: brigade.worker_count(),
+            worker_agent,
+            worker_model,
+        });
+        return vec![Cmd::CheckCodexTrust];
+    }
+    vec![Cmd::Store(StoreIntent::FormBrigade {
+        director_row_id: row.id.clone(),
+        name: row.display_title().to_string(),
+        cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+        worker_count: brigade.worker_count(),
+        worker_agent,
+        worker_model,
+    })]
 }
 
 /// Answers `Cmd::CheckCodexTrust`, always following a
@@ -2100,6 +2162,27 @@ fn confirm_codex_trust_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cm
     let key = state.mint_plain_key(std::path::Path::new(".codex-trust"));
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
     vec![Cmd::OpenCodexTrustPane { key }]
+}
+
+/// Confirm [`Modal::ConfirmDirectorReopen`]: kill the Director-to-be's
+/// already-open pane and stash `pending_director_reopen` so
+/// [`update_pty_exited`] can pick formation back up (via
+/// [`begin_brigade_formation`]) once — not before — that pane's process has
+/// actually exited. Nothing is written to the store here or by that
+/// continuation's first steps; Esc leaves the brigade unformed with no
+/// cleanup needed, same as never having pressed `B` at all.
+fn confirm_director_reopen_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmDirectorReopen {
+        director_row_id, ..
+    }) = app.modal()
+    else {
+        return Vec::new();
+    };
+    let director_row_id = director_row_id.clone();
+    app.close_modal();
+    let director_key = SessionKey::from_id(&director_row_id);
+    state.pending_director_reopen = Some(director_row_id);
+    vec![Cmd::KillPty { key: director_key }]
 }
 
 /// Stage `row` solo: reuse its screen if already open, else request a spawn.
@@ -2607,12 +2690,40 @@ fn update_spawn_failed(
 
 fn update_pty_exited(
     state: &mut EmporiumState,
-    app: &App,
+    app: &mut App,
+    brigade: &BrigadeConfig,
     key: SessionKey,
     now: Instant,
 ) -> Vec<Cmd> {
     state.screens.remove(&key);
     state.unstage(&key);
+    // A Director-reopen confirm killed exactly this pane and is waiting for
+    // it to actually be gone before reopening it wired — see
+    // `confirm_director_reopen_modal`'s doc for why "gone" can't be assumed
+    // any earlier than this event. Takes over from the generic "session
+    // ended" status below: formation continuing *is* what happens next.
+    if state
+        .pending_director_reopen
+        .as_deref()
+        .is_some_and(|id| SessionKey::from_id(id) == key)
+    {
+        let director_row_id = state.pending_director_reopen.take().unwrap();
+        return match app.row_for_id(&director_row_id).cloned() {
+            Some(row) => begin_brigade_formation(state, app, brigade, &row),
+            None => Vec::new(),
+        };
+    }
+    // The residual-race counterpart above (`PendingDirectorWiring`'s own
+    // doc): the brigade already exists in the store, so there is nothing
+    // left to decide, only wiring to apply once this pane is confirmed gone.
+    if state
+        .pending_director_wiring
+        .as_ref()
+        .is_some_and(|wiring| SessionKey::from_id(&wiring.director_row_id) == key)
+    {
+        let wiring = state.pending_director_wiring.take().unwrap();
+        return open_director_with_wiring(state, app, wiring);
+    }
     let title = app
         .row_for_id(key.as_str())
         .map(|row| row.display_title().to_string())
@@ -2793,50 +2904,85 @@ fn update_brigade_formed(
     };
     let director_key = SessionKey::from_id(&director_row_id);
     let worker_count = worker_tokens.len();
+    let wiring = PendingDirectorWiring {
+        director_row_id,
+        brigade_id,
+        worker_tokens,
+        cwd,
+        worker_agent,
+        worker_model,
+    };
     let cmds = if state.screens.contains_key(&director_key) {
-        state.stage = Stage::Brigade {
-            id: brigade_id,
-            panes: vec![director_key],
-            focused: 0,
-        };
-        state.focus = Focus::Pane;
-        worker_tokens
-            .into_iter()
-            .flat_map(|token| {
-                open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
-            })
-            .collect()
+        // The interactive gate (`begin_brigade_formation`'s caller,
+        // `confirm_director_reopen_modal`) is meant to have already closed
+        // this pane before `StoreIntent::FormBrigade` was even issued —
+        // reaching here with it still open is the residual race worker-3's
+        // card called out: something reopened it in the brief window
+        // between that confirm and this store round trip landing. The
+        // brigade record already exists by this point (this function's own
+        // early return above), so there is no clean way left to abort —
+        // silently staging the existing pane as-is would reproduce the
+        // exact bug this round trip exists to fix (a Director with no
+        // MCP/hook wiring), so it is killed and reopened here too, same as
+        // the interactive gate, just without asking first.
+        state.pending_director_wiring = Some(wiring);
+        vec![Cmd::KillPty { key: director_key }]
     } else {
-        state.pending_opens.insert(
-            director_key.clone(),
-            PendingOpen::BrigadeDirector {
-                brigade_id,
-                worker_tokens,
-                cwd: cwd.clone(),
-                worker_agent,
-                worker_model,
-            },
-        );
-        let Some(row) = app.row_for_id(&director_row_id) else {
-            return Vec::new();
-        };
-        vec![Cmd::OpenEmbedded {
-            key: director_key,
-            target: SessionToOpen {
-                id: director_row_id,
-                agent: row.agent,
-                title: row.display_title().to_string(),
-                cwd,
-            },
-            brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
-            model: None,
-        }]
+        open_director_with_wiring(state, app, wiring)
     };
     state.set_status(
         format!("brigade formed — director: {name}, {worker_count} worker(s) spawned"),
         now,
     );
     cmds
+}
+
+/// Open the Director wired (MCP config / Codex `-c` overrides — see
+/// [`PendingOpen::BrigadeDirector`]'s own doc), for a `director_row_id` whose
+/// pane is confirmed *not* open right now — [`update_brigade_formed`]'s
+/// direct case, or [`update_pty_exited`] once a kill-and-reopen (either
+/// gate) confirms the old pane is actually gone. `Vec::new()` if the row
+/// can no longer be found (the session vanished from `app.rows` in the
+/// interim) — nothing left to open, but the brigade record itself, and
+/// whatever status message the caller already set, stand regardless.
+fn open_director_with_wiring(
+    state: &mut EmporiumState,
+    app: &App,
+    wiring: PendingDirectorWiring,
+) -> Vec<Cmd> {
+    let PendingDirectorWiring {
+        director_row_id,
+        brigade_id,
+        worker_tokens,
+        cwd,
+        worker_agent,
+        worker_model,
+    } = wiring;
+    let director_key = SessionKey::from_id(&director_row_id);
+    state.pending_opens.insert(
+        director_key.clone(),
+        PendingOpen::BrigadeDirector {
+            brigade_id,
+            worker_tokens,
+            cwd: cwd.clone(),
+            worker_agent,
+            worker_model,
+        },
+    );
+    let Some(row) = app.row_for_id(&director_row_id) else {
+        return Vec::new();
+    };
+    vec![Cmd::OpenEmbedded {
+        key: director_key,
+        target: SessionToOpen {
+            id: director_row_id,
+            agent: row.agent,
+            title: row.display_title().to_string(),
+            cwd,
+        },
+        brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
+        model: None,
+    }]
 }
 
 fn update_worker_added(
@@ -4226,13 +4372,16 @@ mod tests {
     }
 
     #[test]
-    fn brigade_formed_worker_spawn_respects_the_configured_worker_agent_when_the_director_already_has_a_screen()
-     {
+    fn brigade_formed_kills_and_rewires_the_director_when_its_pane_is_already_open() {
+        // The residual-race case `PendingDirectorWiring` exists for: by the
+        // time `Event::BrigadeFormed` lands, the store record already
+        // exists, so this can no longer ask — it can only kill and reopen
+        // wired, same as the interactive gate, without the confirm step.
         let mut state = EmporiumState::new(PrefixKey::default());
         state
             .screens
             .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
-        let mut app = app_with(vec![]);
+        let mut app = app_with(vec![row("dir")]);
         let brigade = BrigadeConfig {
             worker_agent: WorkerAgentSetting::Codex,
             ..BrigadeConfig::default()
@@ -4256,15 +4405,41 @@ mod tests {
             test_instant(),
         );
 
-        let worker = cmds.iter().find_map(|cmd| match cmd {
-            Cmd::OpenEmbedded { target, model, .. } if target.id.is_empty() => {
-                Some((target.agent, model.clone()))
-            }
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("dir")
+            }],
+            "must not spawn anything until the existing pane is confirmed gone"
+        );
+        assert!(state.screens.contains_key(&SessionKey::from_id("dir")));
+
+        // The shell answers once the kill actually lands.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+
+        assert!(!state.screens.contains_key(&SessionKey::from_id("dir")));
+        assert!(state.pending_director_wiring.is_none());
+        let director = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded {
+                target, brigade, ..
+            } if target.id == "dir" => Some((target.agent, brigade.clone())),
             _ => None,
         });
         assert_eq!(
-            worker,
-            Some((AgentKind::Codex, Some("gpt-5.6-terra".to_string())))
+            director,
+            Some((
+                AgentKind::ClaudeCode,
+                Some((1, "director".to_string(), BrigadeRole::Director))
+            )),
+            "must reopen wired to the brigade, not just re-stage: {cmds:?}"
         );
     }
 
@@ -4408,6 +4583,181 @@ mod tests {
             })]
         ));
         assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn brigade_key_opens_the_director_reopen_modal_when_its_pane_is_already_open() {
+        // Not Codex-specific: a Claude Director's own pane can't carry MCP
+        // config any more than a Codex one can carry `-c` overrides, so this
+        // must fire regardless of product.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "must not form, kill, or check anything until the operator answers"
+        );
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmDirectorReopen { director_row_id, name })
+                if director_row_id == "dir" && name == "dir"
+        ));
+    }
+
+    #[test]
+    fn confirming_director_reopen_kills_the_pane_then_forms_once_it_actually_exits() {
+        // The full interactive round trip, gate to `FormBrigade`: this is
+        // the "confirming reopens wired, not just re-stages" requirement,
+        // exercised through the *interactive* gate rather than the
+        // residual-race path `brigade_formed_kills_and_rewires_...` covers.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
+
+        let cmds = confirm_director_reopen_modal(&mut state, &mut app);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("dir")
+            }]
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_director_reopen.is_some());
+        assert!(
+            state.screens.contains_key(&SessionKey::from_id("dir")),
+            "the pane isn't actually gone until Event::PtyExited says so"
+        );
+
+        let brigade = brigade_config();
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+
+        assert!(!state.screens.contains_key(&SessionKey::from_id("dir")));
+        assert!(state.pending_director_reopen.is_none());
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade {
+                worker_agent: AgentKind::ClaudeCode,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn esc_on_director_reopen_modal_cancels_the_formation_entirely() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
+
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+        assert!(
+            state.pending_director_reopen.is_none(),
+            "nothing should be waiting on a kill that was never issued"
+        );
+        assert!(
+            state.screens.contains_key(&SessionKey::from_id("dir")),
+            "Esc must not touch the still-running pane"
+        );
+    }
+
+    #[test]
+    fn director_reopen_gate_runs_before_the_select_picker_and_codex_trust_check() {
+        // All three formation gates in one press: pane already open, AND
+        // `worker_agent = "select"`, AND (once picked) Codex untrusted.
+        // Director-reopen must resolve completely — kill, wait, exit —
+        // before the picker ever opens; the picker's own Codex pick must
+        // then resolve before `FormBrigade` is even considered.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: None,
+                members: None,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(
+            matches!(app.modal(), Some(Modal::ConfirmDirectorReopen { .. })),
+            "director-reopen must come first, not the picker"
+        );
+
+        let cmds = confirm_director_reopen_modal(&mut state, &mut app);
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("dir")
+            }]
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty(), "nothing forms yet — the picker is next");
+        assert!(matches!(app.modal(), Some(Modal::WorkerAgentPicker(_))));
+
+        app.modal_toggle_agent(); // Claude -> Codex
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckCodexTrust],
+            "the picker's Codex pick must route through the trust check next"
+        );
+        assert!(state.pending_codex_trust_formation.is_some());
     }
 
     #[test]
