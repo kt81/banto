@@ -75,21 +75,32 @@ Workers implement and report over banto's MCP channel. This screenshot is
 itself dogfooding — the session shown is building banto.*
 
 Inside the emporium, `B` appoints the selected session as a **Director** and
-auto-spawns fresh **Worker** sessions beside it (count and model
-configurable). banto mediates a message channel between them over MCP — it
-launches each member with `--mcp-config` pointing back at `banto _mcp`, so
-members get `send_to_peer` / `check_messages` / `brigade_status` tools backed
-by banto's own sqlite queue. Each member is also launched with a role
-briefing (`--append-system-prompt`) naming its brigade, its token, and its
-peers — without one a cell exists only in banto's data model and the
-operator's screen, and a Director handed three tool names and no context
-mostly never uses them; `brigade_status` answers the follow-up question
-(who is on my team, what are they doing, is anyone holding my mail). Delivery is pull-based with per-member cursors and firewall
+auto-spawns fresh **Worker** sessions beside it (count, model, and even
+product all configurable — a brigade's Workers can run Claude Code or Codex
+independently of the Director's own product). banto mediates a message
+channel between them over MCP: it wires every member back to `banto _mcp` on
+its own launch — Claude Code via `--mcp-config`, Codex via `-c
+mcp_servers.banto.*` overrides — so members get `send_to_peer` /
+`check_messages` / `brigade_status` tools backed by banto's own sqlite
+queue. Each member is also handed a role briefing naming its brigade, its
+token, and its peers — appended to the system prompt on launch for Claude
+Code, delivered by banto's own `SessionStart` hook for Codex, which has no
+`--append-system-prompt` of its own — without one a cell exists only in
+banto's data model and the operator's screen, and a Director handed three
+tool names and no context mostly never uses them; `brigade_status` answers
+the follow-up question (who is on my team, what are they doing, is anyone
+holding my mail). Delivery is pull-based with per-member cursors and firewall
 framing (a relayed message is labeled as coming from another AI, never
 mistaken for operator input), and banto's **auto-relay** watches for idle
 members with unread messages and wakes them by typing a short fixed nudge
 into their stdin — so a Director→Worker→Director round trip needs no human
 ferrying at all. This repository was largely built through that loop.
+
+Forming your first Codex brigade needs one thing from you: Codex reviews
+banto's own hook for trust at its own startup, once — not per launch — so
+banto opens a one-time approval pane for you to clear before that first cell
+forms. Approve it once and every brigade launch after that finds it already
+trusted.
 
 ## Status & caveats
 

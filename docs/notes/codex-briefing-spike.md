@@ -191,6 +191,20 @@ removes the technical reason for it. What is left is a cost: the briefing has
 to name banto's tools by hand, because a Codex member cannot discover them; and
 every member launch has to carry a fixed hook plus an approval flag, exactly.
 
+**Addendum, after Codex brigades shipped:** the decision was in fact
+revisited — Codex brigades exist in production
+(`crates/banto/src/hook.rs`, `crates/banto-core/src/config.rs`'s
+`WorkerAgentSetting::Codex`). The first half of the predicted cost landed as
+guessed: the briefing does name banto's tools by hand
+(`crate::briefing::CODEX_ADDENDUM`). The second half didn't — no launch
+carries an approval flag. `--dangerously-bypass-hook-trust` turned out to be
+scoped to hook trust alone but to apply to *every* hook in a launch's merged
+config, not just banto's, so passing it on every launch would silently trust
+whatever else an operator's own config happened to add. What shipped instead
+is a one-time, interactive trust-review pane asked before a brigade's first
+Codex member forms, never repeated afterward — see `docs/REQUIREMENTS.md`'s
+"Brigade" section for the shipped mechanism.
+
 ## Follow-up: a `SessionStart` hook does reach a resumed session
 
 The list above rules hooks out for needing a file under `~/.codex` or the

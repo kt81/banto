@@ -92,11 +92,11 @@ impl<'de> Deserialize<'de> for RelayMode {
 /// Which product an auto-spawned Worker runs as, relative to the Director
 /// forming the brigade — `[brigade] worker_agent` in config.toml.
 ///
-/// Not yet consumed anywhere: `crate::engine::spawn_worker` still always
-/// spawns a Claude Worker (`AgentKind::ClaudeCode` is hardcoded there). This
-/// type is the config-layer half of letting a brigade's Worker be Codex too;
-/// the formation logic that reads it, and the new-session-modal-style picker
-/// [`Self::Select`] needs, land separately.
+/// Read by [`crate::engine::resolve_worker_agent`] at both formation
+/// ([`crate::engine::begin_brigade_formation`]) and single-Worker addition
+/// ([`crate::engine::add_worker`]); [`Self::Select`] opens the same
+/// `Modal::WorkerAgentPicker` in both places, resolved by
+/// [`crate::engine::confirm_worker_agent_modal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkerAgentSetting {
     /// Same product as the Director. The default: an operator who never

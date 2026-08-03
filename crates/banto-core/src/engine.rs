@@ -499,7 +499,7 @@ enum PendingMembership {
 /// A brigade formation waiting on `Modal::WorkerAgentPicker` to say which
 /// product (and model) its Workers will run as — everything `FormBrigade`
 /// needs *except* that, stashed here the moment the modal opens (see
-/// `update_membership_resolved`'s `Select` branch) and consumed by
+/// `begin_brigade_formation`'s `Select` branch) and consumed by
 /// [`confirm_worker_agent_modal`] once the operator confirms. Cleared on
 /// Esc too (`update_modal_key`), so a cancelled picker can never leave a
 /// stale formation for some later, unrelated confirm to pick up by
@@ -509,6 +509,19 @@ struct PendingBrigadeFormation {
     name: String,
     cwd: PathBuf,
     worker_count: usize,
+}
+
+/// A Worker being added to an *already-formed* brigade (`add_worker`, `b`)
+/// waiting on the same `Modal::WorkerAgentPicker` — everything
+/// `StoreIntent::AddWorker` needs except the product/model, stashed the
+/// moment the modal opens and consumed by [`confirm_worker_agent_modal`]
+/// once the operator confirms. Cleared on Esc too, same as
+/// [`PendingBrigadeFormation`] — but Esc here means something lighter: no
+/// Worker gets added, an already-running brigade is otherwise untouched,
+/// not "the whole cell never forms."
+struct PendingWorkerAddition {
+    brigade_id: BrigadeId,
+    cwd: PathBuf,
 }
 
 /// A brigade formation waiting on a fresh `Cmd::CheckCodexTrust` round trip
@@ -579,6 +592,7 @@ pub struct EmporiumState {
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
     pending_brigade_formation: Option<PendingBrigadeFormation>,
+    pending_worker_addition: Option<PendingWorkerAddition>,
     pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
     /// The session id of a Director-to-be whose already-open pane was just
     /// killed (`confirm_director_reopen_modal`), waiting on its
@@ -640,6 +654,7 @@ impl EmporiumState {
             pending_opens: HashMap::new(),
             pending_membership: None,
             pending_brigade_formation: None,
+            pending_worker_addition: None,
             pending_codex_trust_formation: None,
             pending_director_reopen: None,
             pending_director_wiring: None,
@@ -973,10 +988,14 @@ pub enum StoreIntent {
         brigade_id: BrigadeId,
         cwd: PathBuf,
         /// Same reasoning as `FormBrigade`'s own `worker_agent`: resolved
-        /// once, at the `B`-press moment, in [`add_worker`]. `add_worker`
-        /// has no `Select`-modal path of its own (out of this round's
-        /// scope — see its own doc), so this is always
-        /// `BrigadeConfig::worker_model_for`'s answer.
+        /// once, at the `B`-press moment, in [`add_worker`] — either
+        /// directly, or (`[brigade] worker_agent = "select"`) via the same
+        /// `Modal::WorkerAgentPicker` formation uses, see
+        /// [`EmporiumState::pending_worker_addition`]. Unlike formation, a
+        /// `Select`-resolved `AgentKind::Codex` here never routes through
+        /// the codex-trust check — see `confirm_worker_agent_modal`'s own
+        /// doc for why that's an intentional difference, not a gap this
+        /// round left unclosed.
         worker_agent: AgentKind,
         /// Same reasoning as `FormBrigade`'s own `worker_model`.
         worker_model: String,
@@ -1170,6 +1189,21 @@ pub enum Event {
         key: SessionKey,
         token: MemberToken,
     },
+    /// The shell's Claude-sourced discovery tracker for `token` still hasn't
+    /// resolved, and its own cwd definitively reads `NotTrusted` (see
+    /// `banto_io::directory_trust::claude_directory_trust` — narrower than
+    /// `Unknown`-also-counts on purpose, `poll_discovery`'s own doc has the
+    /// reasoning) — reported once per tracker (the shell's own dedup,
+    /// `DiscoveryTracker::notified_untrusted`), so this pane's silence gets
+    /// explained instead of looking broken.
+    /// Unlike [`Self::CodexWorkerDiscoveryTimedOut`], there is no keystroke
+    /// to hold back here (Claude is never typed into by banto at all) and no
+    /// give-up timeout either — Claude discovery still waits forever,
+    /// unchanged; this only ever adds a one-time status line on top of that
+    /// wait.
+    ClaudeWorkerDirectoryUntrusted {
+        token: MemberToken,
+    },
     ArchiveDone {
         title: String,
         result: Result<(), String>,
@@ -1316,6 +1350,16 @@ pub fn update(
         Event::CodexWorkerDiscoveryTimedOut { key, token } => {
             state.pending_kickoffs.retain(|pending| pending.key != key);
             state.set_status(format!("{token}: Codex briefing wasn't confirmed"), now);
+            Vec::new()
+        }
+        Event::ClaudeWorkerDirectoryUntrusted { token } => {
+            state.set_status(
+                format!(
+                    "{token}: Claude hasn't been told to trust this directory yet — \
+                     answer its prompt in the pane"
+                ),
+                now,
+            );
             Vec::new()
         }
         Event::ArchiveDone { title, result } => {
@@ -1691,15 +1735,16 @@ fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> 
         KeyCode::Esc => {
             app.close_modal();
             // Unconditional, not gated on which modal was open: cancelling
-            // the Worker-agent picker must cancel the formation it was
-            // interrupting too — a brigade forming anyway with whatever
-            // product happened to be selected is a far worse outcome than
-            // clearing a stash that was already `None` for every other
-            // modal kind. `pending_codex_trust_formation` is already `None`
-            // by the time `Modal::ConfirmCodexTrust` can even be open (see
-            // `update_codex_trust_checked`), but cleared here too, for the
-            // same defensive reason.
+            // the Worker-agent picker must cancel whatever it was
+            // interrupting too — a brigade forming (or a Worker being
+            // added) anyway with whatever product happened to be selected
+            // is a far worse outcome than clearing a stash that was already
+            // `None` for every other modal kind. `pending_codex_trust_formation`
+            // is already `None` by the time `Modal::ConfirmCodexTrust` can
+            // even be open (see `update_codex_trust_checked`), but cleared
+            // here too, for the same defensive reason.
             state.pending_brigade_formation = None;
+            state.pending_worker_addition = None;
             state.pending_codex_trust_formation = None;
             Vec::new()
         }
@@ -1793,16 +1838,25 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
 
 /// Confirm the Worker-agent picker: read its chosen agent and (already
 /// trimmed-by-nothing — an empty model is meaningful, "no `--model` flag")
-/// model text, combine with the formation this modal interrupted
-/// ([`EmporiumState::pending_brigade_formation`], stashed when it opened —
-/// see `update_membership_resolved`'s `Select` branch), and issue the same
-/// `StoreIntent::FormBrigade` a non-`Select` setting would have issued
-/// directly — unless the chosen product is [`AgentKind::Codex`], in which
-/// case a codex-trust check comes first, same as the non-`Select` path (see
-/// [`update_codex_trust_checked`]). A no-op (closes the modal, nothing
-/// forms) if the stashed formation is missing — shouldn't happen
-/// structurally, but "form nothing" is the only safe fallback if it ever
-/// does, not guessing at a product.
+/// model text, then combine with whichever interruption opened this modal —
+/// [`EmporiumState::pending_worker_addition`] (`add_worker`'s own `Select`
+/// branch) or [`EmporiumState::pending_brigade_formation`]
+/// (`begin_brigade_formation`'s) — at most one is ever set, since only one
+/// modal is ever open at a time and each is stashed right before opening
+/// it. A no-op (closes the modal, nothing happens) if neither is set —
+/// shouldn't happen structurally, but doing nothing is the only safe
+/// fallback if it ever does, not guessing at a product.
+///
+/// Formation alone routes a Codex choice through a trust check first
+/// (`update_codex_trust_checked`) before `FormBrigade`, same as its own
+/// non-`Select` path. `add_worker`'s non-`Select` path has never done this
+/// (see [`PendingWorkerAddition`]'s own doc for why `Select` doesn't gain
+/// it here either) — adding one more Worker to an already-running brigade
+/// is the lower-stakes case, and by the time one exists to add to, any
+/// Codex member already spawned would already have gone through this same
+/// gate if one was ever needed (the hook's trust key is one fixed string
+/// per install, not per-member — see `opener::session_start_hook_override`'s
+/// doc).
 fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let Some(Modal::WorkerAgentPicker(picker)) = app.modal() else {
         return Vec::new();
@@ -1810,6 +1864,16 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
     let worker_agent = picker.agent();
     let worker_model = picker.model_input().to_string();
     app.close_modal();
+
+    if let Some(addition) = state.pending_worker_addition.take() {
+        return vec![Cmd::Store(StoreIntent::AddWorker {
+            brigade_id: addition.brigade_id,
+            cwd: addition.cwd,
+            worker_agent,
+            worker_model,
+        })];
+    }
+
     let Some(formation) = state.pending_brigade_formation.take() else {
         return Vec::new();
     };
@@ -2389,7 +2453,7 @@ fn toggle_pin(app: &mut App) -> Vec<Cmd> {
 /// `b`: spawn one more fresh Worker into the staged brigade. `cwd` is the
 /// Director's own row cwd, resolved from `app` via the Director's key
 /// (always `panes[0]`, always a known real id) — no extra round trip needed.
-fn add_worker(state: &mut EmporiumState, app: &App, brigade: &BrigadeConfig) -> Vec<Cmd> {
+fn add_worker(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig) -> Vec<Cmd> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         state.status = Some("no brigade staged — press B to start one".to_string());
         return Vec::new();
@@ -2403,6 +2467,21 @@ fn add_worker(state: &mut EmporiumState, app: &App, brigade: &BrigadeConfig) -> 
     // either — the safe default rather than blocking on it, same fallback
     // `stage_brigade`/`update_brigade_formed` use.
     let director_agent = director_row.map_or(AgentKind::ClaudeCode, |row| row.agent);
+
+    // Same interruption `begin_brigade_formation` does for `Select` — see
+    // `PendingWorkerAddition`'s own doc for what Esc means here
+    // specifically (lighter than formation's: this only cancels adding one
+    // more Worker, not an already-running brigade).
+    if brigade.worker_agent == WorkerAgentSetting::Select {
+        state.pending_worker_addition = Some(PendingWorkerAddition { brigade_id, cwd });
+        app.open_worker_agent_modal(
+            director_agent,
+            brigade.worker_model.clone(),
+            brigade.worker_model_codex.clone(),
+        );
+        return Vec::new();
+    }
+
     let worker_agent = resolve_worker_agent(brigade.worker_agent, director_agent);
     let worker_model = brigade
         .worker_model_for(worker_agent)
@@ -4603,10 +4682,10 @@ mod tests {
         };
         let mut codex_director_row = row("dir");
         codex_director_row.agent = AgentKind::Codex;
-        let app = app_with(vec![codex_director_row]);
+        let mut app = app_with(vec![codex_director_row]);
         let brigade = brigade_config(); // Inherit — must follow the staged Director's own product
 
-        let cmds = add_worker(&mut state, &app, &brigade);
+        let cmds = add_worker(&mut state, &mut app, &brigade);
 
         assert!(matches!(
             cmds.as_slice(),
@@ -5132,6 +5211,109 @@ mod tests {
             app.modal(),
             Some(Modal::WorkerAgentPicker(picker)) if picker.agent() == AgentKind::Codex
         ));
+    }
+
+    #[test]
+    fn add_worker_opens_the_worker_agent_modal_when_select_is_configured() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        state.stage = Stage::Brigade {
+            id: 7,
+            panes: vec![director],
+            focused: 0,
+        };
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = add_worker(&mut state, &mut app, &brigade);
+
+        assert!(cmds.is_empty(), "nothing added until the picker confirms");
+        assert!(matches!(app.modal(), Some(Modal::WorkerAgentPicker(_))));
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_adds_the_worker_with_the_chosen_agent_and_model() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_worker_addition = Some(PendingWorkerAddition {
+            brigade_id: 7,
+            cwd: PathBuf::from("/work"),
+        });
+        app.open_worker_agent_modal(
+            AgentKind::ClaudeCode,
+            "sonnet".to_string(),
+            "gpt-5.6-terra".to_string(),
+        );
+        app.modal_push_char('!'); // edit the seeded Claude default, no toggle
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Store(StoreIntent::AddWorker {
+                    brigade_id: 7,
+                    cwd,
+                    worker_agent: AgentKind::ClaudeCode,
+                    worker_model,
+                })] if cwd == &PathBuf::from("/work") && worker_model == "sonnet!"
+            ),
+            "expected an AddWorker carrying the picker's own final state: {cmds:?}"
+        );
+        assert!(app.modal().is_none());
+        assert!(state.pending_worker_addition.is_none());
+        assert!(
+            state.pending_brigade_formation.is_none(),
+            "an addition must never leave a formation stash behind either"
+        );
+    }
+
+    #[test]
+    fn confirm_worker_agent_modal_never_trust_checks_a_codex_addition() {
+        // Deliberate difference from formation — see `PendingWorkerAddition`'s
+        // own doc and `confirm_worker_agent_modal`'s for why.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_worker_addition = Some(PendingWorkerAddition {
+            brigade_id: 7,
+            cwd: PathBuf::from("/work"),
+        });
+        app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
+        app.modal_toggle_agent(); // Claude -> Codex
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::AddWorker {
+                worker_agent: AgentKind::Codex,
+                ..
+            })]
+        ));
+        assert!(state.pending_codex_trust_formation.is_none());
+    }
+
+    #[test]
+    fn esc_on_worker_agent_modal_cancels_the_addition_too() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_worker_addition = Some(PendingWorkerAddition {
+            brigade_id: 7,
+            cwd: PathBuf::from("/work"),
+        });
+        app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
+
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+
+        assert!(cmds.is_empty());
+        assert!(app.modal().is_none());
+        assert!(
+            state.pending_worker_addition.is_none(),
+            "a cancelled picker must never leave an addition for a later confirm to pick up"
+        );
     }
 
     #[test]
