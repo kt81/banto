@@ -58,6 +58,22 @@ impl ClaudeHome {
     pub fn sessions_dir(&self) -> PathBuf {
         self.0.join("sessions")
     }
+
+    /// `~/.claude.json`: Claude Code's own project registry (workspace trust
+    /// among other things — see `crate::directory_trust`), a *sibling* of
+    /// `<root>` rather than nested under it (the real file sits beside
+    /// `~/.claude`, not inside it). Derived from `<root>`'s own parent, so it
+    /// only resolves correctly for the common case where `<root>` really is
+    /// `<home>/.claude` — an explicit `--claude-home` override pointed
+    /// somewhere unrelated has no way to also relocate this file, the same
+    /// inherent limitation `CodexHome::config_path` accepts for its own
+    /// single-rooted derivation.
+    pub fn trust_registry_path(&self) -> PathBuf {
+        match self.0.parent() {
+            Some(parent) => parent.join(".claude.json"),
+            None => self.0.join(".claude.json"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +91,10 @@ mod tests {
         assert_eq!(
             home.sessions_dir(),
             PathBuf::from("/synthetic/claude-home/sessions")
+        );
+        assert_eq!(
+            home.trust_registry_path(),
+            PathBuf::from("/synthetic/.claude.json")
         );
     }
 

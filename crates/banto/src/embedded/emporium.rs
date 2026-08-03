@@ -540,6 +540,9 @@ fn execute_cmd(
         } => execute_open_embedded(key, target, brigade, model, deps, handles, discovery),
         Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
+        Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
+            execute_check_worker_directory_trust(key, &cwd, deps)
+        }
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
     }
@@ -565,6 +568,25 @@ fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
         primed,
         hook_launchable,
     }]
+}
+
+/// Read whether Codex has been told to trust `cwd` — freshly, not cached,
+/// since the operator may answer its prompt in the pane at any moment while
+/// `engine::update_tick` keeps re-asking. `deps.codex_home` absent reads as
+/// untrusted (`false`), the same "can't tell must not read as safe" rule
+/// [`execute_check_codex_trust`] follows: this Cmd only exists to gate
+/// typing into a Codex pane, so an unknowable answer must not accidentally
+/// permit it.
+fn execute_check_worker_directory_trust(
+    key: SessionKey,
+    cwd: &std::path::Path,
+    deps: &Deps,
+) -> Vec<Event> {
+    let trusted = deps.codex_home.is_some_and(|home| {
+        banto_io::directory_trust::codex_directory_trust(home, cwd)
+            == banto_io::directory_trust::DirectoryTrust::Trusted
+    });
+    vec![Event::WorkerDirectoryTrustChecked { key, trusted }]
 }
 
 /// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`

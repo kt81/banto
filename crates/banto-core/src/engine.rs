@@ -408,18 +408,31 @@ fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key:
 }
 
 /// A freshly-spawned Codex Worker pane awaiting its own boot output going
-/// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
-/// — see that constant's doc for why this exists at all. Queued by
+/// quiet before [`update_tick`] asks whether it's safe to type
+/// [`CODEX_WORKER_KICKOFF_LINE`] into it — see that constant's doc for why
+/// the kickoff exists at all, and [`Cmd::CheckWorkerDirectoryTrust`]'s for
+/// why quiet alone isn't enough to type it blind. Queued by
 /// [`update_spawned`] the moment such a pane's `PendingOpen::BrigadeMember`
-/// resolves; removed once the kickoff is sent (its `\r` becomes an ordinary
-/// [`PendingSubmit`], the same two-phase shape as a relay nudge) or the pane
-/// unstages first.
+/// resolves; removed once the kickoff is actually sent (its `\r` becomes an
+/// ordinary [`PendingSubmit`], the same two-phase shape as a relay nudge) or
+/// the pane unstages first.
 struct PendingKickoff {
     key: SessionKey,
     /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
     /// has no entry yet for this pane (nothing has arrived at all) — the
     /// moment this tracker was created, i.e. spawn time.
     spawned_at: Instant,
+    /// This Worker's own cwd — echoed on [`Cmd::CheckWorkerDirectoryTrust`]
+    /// once the quiet period elapses, since the pure core has no way to read
+    /// Codex's own trust records itself and the shell has no other way to
+    /// know which directory to check.
+    cwd: PathBuf,
+    /// Whether [`update_worker_directory_trust_checked`] has already told
+    /// the operator this pane is waiting on an unanswered trust prompt —
+    /// set the first time the answer comes back "not trusted", so the
+    /// status line states it once instead of restamping the same notice
+    /// every tick while banto keeps quietly re-checking.
+    notified_untrusted: bool,
 }
 
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
@@ -457,6 +470,12 @@ enum PendingOpen {
         /// whose id is already known): it has nothing left to discover and
         /// no reason to spend a turn kicking it off.
         needs_codex_kickoff: bool,
+        /// This member's cwd — carried through unconditionally (even when
+        /// `needs_codex_kickoff` is `false`) since it's cheap to plumb and
+        /// only [`PendingKickoff`] ever reads it back out. Needed there to
+        /// ask the shell whether Codex trusts this exact directory before
+        /// typing into it.
+        cwd: PathBuf,
     },
 }
 
@@ -1071,6 +1090,22 @@ pub enum Cmd {
     OpenCodexTrustPane {
         key: SessionKey,
     },
+    /// Read whether Codex has already been told to trust `cwd` — a
+    /// per-directory record, unrelated to `Cmd::CheckCodexTrust`'s
+    /// machine-wide hook-trust one — before typing
+    /// [`CODEX_WORKER_KICKOFF_LINE`] into `key`'s pane blind. Issued by
+    /// [`update_tick`] once a [`PendingKickoff`]'s quiet period has elapsed,
+    /// every tick, until the answer comes back trusted: a directory Codex
+    /// has never seen shows its own first-run trust prompt on stdin/stdout,
+    /// exactly where the kickoff line would otherwise land — measured
+    /// (worker-3's report) to block on that prompt the same way an
+    /// unanswered approval always has, with no flag banto already passes
+    /// dismissing it. The shell answers with
+    /// `Event::WorkerDirectoryTrustChecked`.
+    CheckWorkerDirectoryTrust {
+        key: SessionKey,
+        cwd: PathBuf,
+    },
     Store(StoreIntent),
     Reload,
 }
@@ -1161,6 +1196,16 @@ pub enum Event {
     CodexTrustChecked {
         primed: bool,
         hook_launchable: bool,
+    },
+    /// Answers `Cmd::CheckWorkerDirectoryTrust`: whether Codex has been told
+    /// to trust `key`'s pane's own cwd. `trusted` is already collapsed to a
+    /// plain bool by the shell — `banto_io::directory_trust::DirectoryTrust`'s
+    /// `NotTrusted` and `Unknown` both mean "don't type into this pane yet"
+    /// here, so there is nothing a third state would let
+    /// [`update_worker_directory_trust_checked`] do differently.
+    WorkerDirectoryTrustChecked {
+        key: SessionKey,
+        trusted: bool,
     },
     BrigadeFormed {
         director_row_id: String,
@@ -1302,6 +1347,9 @@ pub fn update(
             primed,
             hook_launchable,
         } => update_codex_trust_checked(state, app, primed, hook_launchable, now),
+        Event::WorkerDirectoryTrustChecked { key, trusted } => {
+            update_worker_directory_trust_checked(state, key, trusted, now)
+        }
         Event::BrigadeFormed {
             director_row_id,
             name,
@@ -2256,6 +2304,7 @@ fn stage_brigade(
                         PendingOpen::BrigadeMember {
                             brigade_id,
                             needs_codex_kickoff: false,
+                            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                     );
                     // A resume's `--model` matters exactly like a fresh
@@ -2599,6 +2648,7 @@ fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> V
         PendingOpen::BrigadeMember {
             brigade_id,
             needs_codex_kickoff,
+            cwd,
         } => {
             if let Stage::Brigade { id, panes, .. } = &mut state.stage
                 && *id == brigade_id
@@ -2610,6 +2660,8 @@ fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> V
                 state.pending_kickoffs.push(PendingKickoff {
                     key,
                     spawned_at: now,
+                    cwd,
+                    notified_untrusted: false,
                 });
             }
             Vec::new()
@@ -2662,6 +2714,7 @@ fn open_worker(
         PendingOpen::BrigadeMember {
             brigade_id,
             needs_codex_kickoff: agent == AgentKind::Codex,
+            cwd: cwd.to_path_buf(),
         },
     );
     vec![Cmd::OpenEmbedded {
@@ -3123,28 +3176,24 @@ fn update_tick(
     }
 
     // Codex Worker kickoff: once a pending pane's own output has been quiet
-    // for CODEX_KICKOFF_QUIET_PERIOD, type the fixed line and hand its `\r`
-    // to the exact same phase-two mechanism as a relay nudge above — the
-    // trigger and text differ, the two-write shape doesn't need to.
-    let mut i = 0;
-    while i < state.pending_kickoffs.len() {
+    // for CODEX_KICKOFF_QUIET_PERIOD, ask the shell whether Codex has been
+    // told to trust this pane's cwd (`Cmd::CheckWorkerDirectoryTrust`) —
+    // never type the fixed line blind. The entry stays queued, re-asked
+    // every tick, until `update_worker_directory_trust_checked` sees a
+    // trusted answer and does the actual typing; this also means trust
+    // granted later (the operator answers the prompt themselves) is picked
+    // up on its own, with no separate recovery path needed.
+    for pending in &state.pending_kickoffs {
         let quiet_since = state
             .last_output_at
-            .get(&state.pending_kickoffs[i].key)
+            .get(&pending.key)
             .copied()
-            .unwrap_or(state.pending_kickoffs[i].spawned_at);
+            .unwrap_or(pending.spawned_at);
         if now.saturating_duration_since(quiet_since) >= CODEX_KICKOFF_QUIET_PERIOD {
-            let entry = state.pending_kickoffs.swap_remove(i);
-            cmds.push(Cmd::WritePty {
-                key: entry.key.clone(),
-                bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+            cmds.push(Cmd::CheckWorkerDirectoryTrust {
+                key: pending.key.clone(),
+                cwd: pending.cwd.clone(),
             });
-            state.pending_submits.push(PendingSubmit {
-                key: entry.key,
-                nudged_at: now,
-            });
-        } else {
-            i += 1;
         }
     }
 
@@ -3188,6 +3237,56 @@ fn update_tick(
         state.prefix_armed = None;
     }
 
+    cmds
+}
+
+/// Answers `Cmd::CheckWorkerDirectoryTrust`, always following a
+/// [`PendingKickoff`] whose quiet period has already elapsed.
+///
+/// `trusted`: types the kickoff line, exactly as [`update_tick`] used to do
+/// unconditionally once quiet — this is that same action, just gated. Not
+/// trusted (or unknown, already collapsed into the same `false` by the
+/// shell): the entry is left in [`EmporiumState::pending_kickoffs`]
+/// untouched, so [`update_tick`] asks again next tick — no separate timeout,
+/// no separate recovery path; trust granted later (the operator answers the
+/// prompt in the pane themselves) is picked up on the very next check. A
+/// missing entry (the pane unstaged between the check being issued and its
+/// answer landing) is a no-op.
+fn update_worker_directory_trust_checked(
+    state: &mut EmporiumState,
+    key: SessionKey,
+    trusted: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let Some(pos) = state.pending_kickoffs.iter().position(|p| p.key == key) else {
+        return Vec::new();
+    };
+    if !trusted {
+        if !state.pending_kickoffs[pos].notified_untrusted {
+            state.pending_kickoffs[pos].notified_untrusted = true;
+            let name = key
+                .worker_identity()
+                .map(|(_, token)| token)
+                .unwrap_or_else(|| key.as_str().to_string());
+            state.set_status(
+                format!(
+                    "{name}: Codex hasn't been told to trust this directory yet — \
+                     answer its prompt in the pane and it will pick up its first turn"
+                ),
+                now,
+            );
+        }
+        return Vec::new();
+    }
+    let entry = state.pending_kickoffs.remove(pos);
+    let cmds = vec![Cmd::WritePty {
+        key: entry.key.clone(),
+        bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+    }];
+    state.pending_submits.push(PendingSubmit {
+        key: entry.key,
+        nudged_at: now,
+    });
     cmds
 }
 
@@ -5752,6 +5851,7 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
                 needs_codex_kickoff: true,
+                cwd: PathBuf::from("/work"),
             },
         );
 
@@ -5765,6 +5865,7 @@ mod tests {
 
         assert_eq!(state.pending_kickoffs.len(), 1);
         assert_eq!(state.pending_kickoffs[0].key, key);
+        assert_eq!(state.pending_kickoffs[0].cwd, PathBuf::from("/work"));
     }
 
     #[test]
@@ -5778,6 +5879,7 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
                 needs_codex_kickoff: false,
+                cwd: PathBuf::from("/work"),
             },
         );
 
@@ -5793,7 +5895,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_sends_the_kickoff_once_quiet_long_enough_but_not_before() {
+    fn tick_checks_directory_trust_once_quiet_long_enough_but_not_before() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -5802,6 +5904,8 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: key.clone(),
             spawned_at,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
         });
 
         let cmds = update(
@@ -5823,6 +5927,43 @@ mod tests {
         );
         assert_eq!(
             cmds,
+            vec![Cmd::CheckWorkerDirectoryTrust {
+                key: key.clone(),
+                cwd: PathBuf::from("/work"),
+            }]
+        );
+        // Never typed blind: the entry stays queued until the trust check
+        // actually answers.
+        assert_eq!(state.pending_kickoffs.len(), 1);
+        assert!(state.pending_submits.is_empty());
+    }
+
+    #[test]
+    fn a_trusted_directory_answer_types_the_kickoff_line() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: true,
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
             vec![Cmd::WritePty {
                 key: key.clone(),
                 bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
@@ -5831,6 +5972,82 @@ mod tests {
         assert!(state.pending_kickoffs.is_empty());
         assert_eq!(state.pending_submits.len(), 1);
         assert_eq!(state.pending_submits[0].key, key);
+    }
+
+    #[test]
+    fn an_untrusted_directory_answer_keeps_waiting_and_notifies_once() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: false,
+            },
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "must never type the kickoff line into an untrusted/unknown cwd"
+        );
+        assert_eq!(
+            state.pending_kickoffs.len(),
+            1,
+            "stays queued so the next tick asks again"
+        );
+        let first_status = state.status.clone();
+        assert!(first_status.is_some());
+
+        // A second untrusted answer must not restamp the notice (no new
+        // `status_set_at`, and no duplicate wording).
+        state.status = Some("something else the operator is looking at".to_string());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key,
+                trusted: false,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            state.status,
+            Some("something else the operator is looking at".to_string()),
+            "already notified once; must not clobber an unrelated status"
+        );
+    }
+
+    #[test]
+    fn a_trust_check_answer_for_an_unstaged_pane_is_a_noop() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        // No entry in pending_kickoffs at all — the pane unstaged before the
+        // answer landed.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked { key, trusted: true },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(state.pending_kickoffs.is_empty());
     }
 
     #[test]
@@ -5846,6 +6063,8 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: key.clone(),
             spawned_at,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
         });
 
         let output_at = spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(50);
@@ -5891,6 +6110,8 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: key.clone(),
             spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
         });
 
         let cmds = update(
@@ -5921,6 +6142,8 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: key.clone(),
             spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
         });
         state.last_output_at.insert(key.clone(), test_instant());
         let mut app = app_with(vec![row("sess-1")]);
