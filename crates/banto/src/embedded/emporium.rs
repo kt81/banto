@@ -20,13 +20,14 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -34,6 +35,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -48,6 +50,7 @@ use banto_core::engine::{
 use banto_core::input::InputEvent;
 use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
+use banto_core::screen::Screen;
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity;
@@ -60,7 +63,7 @@ use banto_io::status::{
     LiveSession, ProcessProbe, SysinfoProbe, ancestry_reaches, read_live_sessions,
 };
 use banto_io::store::Store;
-use banto_tui::render::screen_to_text;
+use banto_tui::paint;
 use banto_tui::view;
 
 use crate::opener;
@@ -276,6 +279,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let mut paste_acc = PasteAccumulator::new();
     let run_start = Instant::now();
     let mut event_recorder = open_event_recorder(run_start);
+    let mut pane_render_cache: HashMap<SessionKey, PaneRenderCache> = HashMap::new();
 
     loop {
         let now = Instant::now();
@@ -320,8 +324,8 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         // arriving instead of waiting on the ordinary idle cadence (see
         // `paste_accum`'s module doc).
         // Converted from crossterm at this boundary (`convert::from_crossterm`)
-        // — `None` for an event kind banto ignores (a key release, focus
-        // change, ...), which simply contributes nothing to this tick.
+        // — `None` for an event kind banto ignores (a key release, ...),
+        // which simply contributes nothing to this tick.
         let poll_timeout = if paste_acc.is_pending() {
             Duration::from_millis(10)
         } else {
@@ -335,7 +339,16 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             let event_now = Instant::now();
             let raw = event::read()?;
             log_input(&mut input_log, &describe_raw_event(&raw));
-            if let Some(input) = convert::from_crossterm(raw) {
+            // Intercepted before `convert::from_crossterm`, not routed
+            // through it: banto's own OS focus is not the same thing as
+            // which pane holds focus inside it (`engine::Focus`), but a
+            // child that asked for DECSET 1004 cannot tell those apart —
+            // which is exactly why both have to resolve through one path
+            // (`Event::WindowFocusChanged`'s own doc). Neither is a key, so
+            // neither may reach `is_in_scope`'s paste-accumulation gate.
+            if let Some(ev) = window_focus_event(&raw) {
+                events.push_back(ev);
+            } else if let Some(input) = convert::from_crossterm(raw) {
                 log_input(&mut input_log, &describe_converted_event(&input));
                 if is_in_scope(&state, app, &input) {
                     // A stale buffer (idle past `PASTE_GAP` before this key
@@ -453,7 +466,16 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             std::thread::spawn(move || drop(reaped));
         }
 
-        terminal.draw(|frame| draw(frame, app, &state, SystemTime::now()))?;
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                app,
+                &state,
+                SystemTime::now(),
+                now,
+                &mut pane_render_cache,
+            )
+        })?;
 
         if app.should_quit() {
             break;
@@ -558,6 +580,24 @@ fn execute_cmd(
         }
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
+        Cmd::ForwardClipboardToHost { bytes } => {
+            // Safe to write here, outside `draw`, specifically because OSC
+            // 52 moves neither the cursor nor any cell — it cannot desync
+            // ratatui's model of the screen the way a cursor-positioning
+            // sequence would, which is the property an innocent edit could
+            // break by writing something else this way. `execute_cmd` runs
+            // before this iteration's `terminal.draw`, which flushes its
+            // own output at the end, so there is never a half-written
+            // escape sequence on the wire for this to land inside; `stdout()`
+            // is the same global buffered handle the backend itself writes
+            // through, so the two stay serialized rather than interleaved.
+            // Flushed explicitly rather than left for the next draw's flush
+            // — a copy landing a frame late for no reason defeats a feature
+            // whose whole point is that the operator feels it arrive.
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(&bytes).and_then(|()| stdout.flush());
+            Vec::new()
+        }
     }
 }
 
@@ -1494,7 +1534,135 @@ fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: SystemTime) {
+/// How long a pane's synchronized-update block (DECSET 2026,
+/// [`Screen::in_synchronized_update`]) is honored without its closing
+/// `?2026l` before this draws the pane live anyway — the bound that keeps a
+/// child that hangs or dies mid-frame from freezing its pane forever.
+/// `banto-core` has no clock (`docs/DISCIPLINE.md` §2/§3), so this deadline
+/// lives on the shell side, not on `Screen` itself.
+///
+/// Matches kitty's own default for this exact wire form: `screen_pause_rendering`
+/// (`kitty/screen.c`) is reached from the DECSET/DECRST 2026 handler with no
+/// caller-supplied duration, and falls back to `for_in_ms = 2000`. mintty
+/// implements the feature's older DCS form (`ESC P = 1 s`, `src/termout.c`)
+/// with a much shorter 150ms default (420ms hard cap even on request) — but
+/// that number is tuned for a wire form nothing banto hosts sends; kitty's
+/// is the same DECSET 2026 path both Codex and Claude Code actually use, so
+/// it is the closer precedent.
+const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// The last known-good painted cells for one pane, so a synchronized-update
+/// block (DECSET 2026) can be honored: what the operator last actually saw,
+/// kept ready to blit back in place of a live repaint. Caching the painted
+/// `Buffer` `paint_screen` produces, rather than a `Text`/`Paragraph` recipe
+/// that would need re-rendering, means this outlives whichever widget paints
+/// the live grid.
+struct PaneRenderCache {
+    buffer: Buffer,
+    /// The child's cursor as of `buffer`'s capture (absolute frame
+    /// coordinates), or `None` if it was hidden or off-pane — frozen
+    /// alongside the cells so a held update does not draw *today's* cursor
+    /// over *yesterday's* content, the same tearing this whole cache exists
+    /// to prevent.
+    cursor: Option<(u16, u16)>,
+    /// When this pane's *current* synchronized-update block was first
+    /// observed open, for [`SYNC_UPDATE_TIMEOUT`]. `None` outside of one —
+    /// including the tick the deadline elapses on, since expiring is itself
+    /// what ends the hold, the same as an ordinary `?2026l` would.
+    ///
+    /// The spec (gitlab.com/gnachman/iterm2 wiki, "Synchronized Updates")
+    /// says a Begin-sync received while already inside one should extend
+    /// the timeout. This does not: it measures from the first observed
+    /// open and never revisits that once set. [`Screen::in_synchronized_update`]
+    /// is a bool, not an edge — a repeated `?2026h` while already open is
+    /// genuinely invisible from here, indistinguishable from one long
+    /// block, so there is no re-open event to extend *from*. Reconstructing
+    /// one would mean diffing consecutive polls to infer a transition that
+    /// happened between them, for a case neither child this hosts is known
+    /// to produce; judged not worth the complexity.
+    opened_at: Option<Instant>,
+}
+
+/// Paint one pane's content area into `content` of the live screen straight
+/// from `vt100`, with no caching involved — the one place that actually
+/// builds pane pixels, so [`paint_pane`]'s live and cache-refresh paths stay
+/// identical by construction. The cursor position returned alongside is
+/// already absolute (frame coordinates, not pane-relative) and already
+/// `None` for hidden or out-of-bounds — [`draw`]'s own `focused_tile`/
+/// scrollback gate is the only thing left for the caller to apply.
+fn paint_live(screen: &Screen, content: Rect) -> (Buffer, Option<(u16, u16)>) {
+    let mut buffer = Buffer::empty(content);
+    paint::paint_screen(screen.screen(), content, &mut buffer);
+    let cursor = if screen.screen().hide_cursor() {
+        None
+    } else {
+        let (row, col) = screen.screen().cursor_position();
+        let (x, y) = (content.x + col, content.y + row);
+        (x < content.x + content.width && y < content.y + content.height).then_some((x, y))
+    };
+    (buffer, cursor)
+}
+
+/// Paint one pane into `frame_buffer` at `content`, returning the cursor
+/// position to draw for it (if any) — absolute frame coordinates, for the
+/// caller to gate on focus/scrollback the same as before this cache
+/// existed. While `screen` is inside a synchronized-update block it has not
+/// yet closed — the cached buffer still matches `content`'s size, and that
+/// block is still within [`SYNC_UPDATE_TIMEOUT`] of opening — this blits the
+/// last complete frame and cursor from `cache` instead of a grid the child
+/// explicitly asked not to be shown mid-draw. Otherwise it paints live and
+/// refreshes `cache` for next time — including when the cached size no
+/// longer matches `content` (a resize mid-hold invalidates it; there is
+/// nothing meaningful to blit at the wrong size).
+///
+/// A pane's very first paint seeds `cache` with an empty, correctly-sized
+/// buffer and no cursor, rather than a live one: painting live here and
+/// honoring it below would be self-defeating for the one case that actually
+/// matters — a child that is *already* mid-update by the time its pane is
+/// first drawn — since there is no earlier known-good frame to fall back on
+/// anyway. Blank for up to `SYNC_UPDATE_TIMEOUT` beats leaking a frame the
+/// child asked not to be shown.
+fn paint_pane(
+    frame_buffer: &mut Buffer,
+    cache: &mut HashMap<SessionKey, PaneRenderCache>,
+    key: &SessionKey,
+    screen: &Screen,
+    content: Rect,
+    tick: Instant,
+) -> Option<(u16, u16)> {
+    let entry = cache.entry(key.clone()).or_insert_with(|| PaneRenderCache {
+        buffer: Buffer::empty(content),
+        cursor: None,
+        opened_at: None,
+    });
+
+    if !screen.in_synchronized_update() {
+        entry.opened_at = None;
+    } else if entry.buffer.area == content {
+        let opened_at = *entry.opened_at.get_or_insert(tick);
+        if tick.duration_since(opened_at) < SYNC_UPDATE_TIMEOUT {
+            frame_buffer.merge(&entry.buffer);
+            return entry.cursor;
+        }
+        // Held past the deadline with no closing `?2026l`: stop honoring it
+        // and fall through to painting live, same as a close would.
+    }
+
+    let (live, cursor) = paint_live(screen, content);
+    frame_buffer.merge(&live);
+    entry.buffer = live;
+    entry.cursor = cursor;
+    cursor
+}
+
+fn draw(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    state: &EmporiumState,
+    now: SystemTime,
+    tick: Instant,
+    pane_render_cache: &mut HashMap<SessionKey, PaneRenderCache>,
+) {
     let full_area = frame.area();
     let focus = state.focus;
     let areas = layout(full_area);
@@ -1539,21 +1707,33 @@ fn draw(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, now: Syste
                 .border_style(border_style(focused_tile));
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
-            frame.render_widget(Paragraph::new(screen_to_text(screen.screen())), content);
-            // `cursor_position()` is always the *live* cursor, never
-            // adjusted for scrollback (`Screen::scroll`'s own doc) — drawn
-            // while scrolled back, it would sit on top of whatever
-            // historical text happens to be at that row, implying "you can
-            // type here" over content that isn't live at all.
-            if focused_tile && screen.scrollback() == 0 && !screen.screen().hide_cursor() {
-                let (cursor_row, cursor_col) = screen.screen().cursor_position();
-                let (x, y) = (content.x + cursor_col, content.y + cursor_row);
-                if x < content.x + content.width && y < content.y + content.height {
-                    frame.set_cursor_position(Position::new(x, y));
-                }
+            let cursor = paint_pane(
+                frame.buffer_mut(),
+                pane_render_cache,
+                key,
+                screen,
+                content,
+                tick,
+            );
+            // The position `paint_pane` hands back is always what was
+            // *painted* this frame — the live cursor, or the frozen one
+            // alongside a held update's cells — never adjusted for
+            // scrollback (`Screen::scroll`'s own doc): drawn while scrolled
+            // back, it would sit on top of whatever historical text happens
+            // to be at that row, implying "you can type here" over content
+            // that isn't live at all.
+            if focused_tile
+                && screen.scrollback() == 0
+                && let Some((x, y)) = cursor
+            {
+                frame.set_cursor_position(Position::new(x, y));
             }
         }
     }
+    // Panes that no longer exist (session closed/dismissed) would otherwise
+    // linger in the cache for the life of the process — nothing ever removes
+    // a `SessionKey` entry on its own.
+    pane_render_cache.retain(|key, _| state.screens.contains_key(key));
 
     render_status_bar(
         frame,
@@ -1651,7 +1831,8 @@ fn setup_terminal() -> Result<Tui> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableFocusChange
     )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
@@ -1662,7 +1843,8 @@ fn restore_terminal() -> Result<()> {
         io::stdout(),
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableFocusChange
     )?;
     Ok(())
 }
@@ -1789,6 +1971,20 @@ fn emit_flushed(
     events.push_back(Event::Input(flushed));
 }
 
+/// The `Event` a raw `FocusGained`/`FocusLost` becomes, or `None` for every
+/// other crossterm event kind — the main loop's own translation step,
+/// pulled out as a pure function specifically so this mapping is checkable
+/// without a live terminal: `FocusGained`/`FocusLost` are not keys and never
+/// reach `convert::from_crossterm` at all (see the main loop's own call
+/// site), so nothing else in this file exercises this translation.
+fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
+    match raw {
+        crossterm::event::Event::FocusGained => Some(Event::WindowFocusChanged { focused: true }),
+        crossterm::event::Event::FocusLost => Some(Event::WindowFocusChanged { focused: false }),
+        _ => None,
+    }
+}
+
 /// Compact, payload-free description of one raw crossterm event, logged
 /// before conversion — deliberately a paste's length, never its text (the
 /// diagnostic log is meant to be safe to paste into a bug report).
@@ -1847,7 +2043,8 @@ fn install_panic_hook() {
                 io::stdout(),
                 LeaveAlternateScreen,
                 DisableMouseCapture,
-                DisableBracketedPaste
+                DisableBracketedPaste,
+                DisableFocusChange
             );
             original(info);
         }));
@@ -3398,6 +3595,44 @@ mod tests {
         );
     }
 
+    // --- window_focus_event: the main loop's FocusGained/FocusLost translation --
+
+    #[test]
+    fn a_raw_focus_gained_becomes_window_focus_changed_true() {
+        assert_eq!(
+            window_focus_event(&crossterm::event::Event::FocusGained),
+            Some(Event::WindowFocusChanged { focused: true })
+        );
+    }
+
+    #[test]
+    fn a_raw_focus_lost_becomes_window_focus_changed_false() {
+        assert_eq!(
+            window_focus_event(&crossterm::event::Event::FocusLost),
+            Some(Event::WindowFocusChanged { focused: false })
+        );
+    }
+
+    #[test]
+    fn every_other_raw_event_kind_is_not_a_window_focus_change() {
+        // A key must fall through to `convert::from_crossterm` — if this
+        // ever started matching keys too, they'd stop reaching the paste
+        // accumulator entirely.
+        assert_eq!(
+            window_focus_event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('a'),
+                    crossterm::event::KeyModifiers::NONE,
+                )
+            )),
+            None
+        );
+        assert_eq!(
+            window_focus_event(&crossterm::event::Event::Paste("x".to_string())),
+            None
+        );
+    }
+
     // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------
 
     #[test]
@@ -3483,5 +3718,189 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let events = banto_core::replay::parse_stream(&text).unwrap();
         assert_eq!(events[0].offset_ms, 0);
+    }
+
+    // --- paint_pane: honoring DECSET 2026 without freezing forever --------
+
+    /// `paint_pane` into a fresh `Buffer` sized to `content` and read the
+    /// one row back as a string — the tests below use a single-row screen,
+    /// so this is the whole visible pane.
+    fn paint_row(
+        cache: &mut HashMap<SessionKey, PaneRenderCache>,
+        key: &SessionKey,
+        screen: &Screen,
+        content: Rect,
+        tick: Instant,
+    ) -> String {
+        let mut frame_buffer = Buffer::empty(content);
+        paint_pane(&mut frame_buffer, cache, key, screen, content, tick);
+        (content.x..content.x + content.width)
+            .map(|x| frame_buffer[(x, content.y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_pane_mid_synchronized_update_keeps_showing_its_last_complete_frame() {
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"AAAAAAAAAA");
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let content = Rect::new(0, 0, 10, 1);
+        let tick = Instant::now();
+
+        // Prime the cache with the pre-update frame.
+        let pre = paint_row(&mut cache, &key, &screen, content, tick);
+        assert_eq!(pre, "AAAAAAAAAA");
+
+        // Open a synchronized update and overwrite the whole row mid-update.
+        screen.process(b"\x1b[?2026h\x1b[HBBBBBBBBBB");
+        let mid = paint_row(&mut cache, &key, &screen, content, tick);
+        assert_eq!(
+            mid, "AAAAAAAAAA",
+            "must keep showing the pre-update frame while the block is open"
+        );
+
+        // Close it: the next draw catches up to what actually happened.
+        screen.process(b"\x1b[?2026l");
+        let post = paint_row(&mut cache, &key, &screen, content, tick);
+        assert_eq!(post, "BBBBBBBBBB");
+    }
+
+    #[test]
+    fn a_pane_mid_synchronized_update_keeps_showing_its_last_complete_cursor_too() {
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"AAAAA"); // cursor at column 5 after the pre-update frame
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let content = Rect::new(0, 0, 10, 1);
+        let tick = Instant::now();
+
+        let mut buf = Buffer::empty(content);
+        let pre = paint_pane(&mut buf, &mut cache, &key, &screen, content, tick);
+        assert_eq!(pre, Some((5, 0)));
+
+        // Open a synchronized update and move the cursor mid-update.
+        screen.process(b"\x1b[?2026h\rBB");
+        let mut buf = Buffer::empty(content);
+        let mid = paint_pane(&mut buf, &mut cache, &key, &screen, content, tick);
+        assert_eq!(
+            mid,
+            Some((5, 0)),
+            "must keep the pre-update cursor position while the block is open"
+        );
+
+        // Close it: the next draw catches up to where the cursor actually is.
+        screen.process(b"\x1b[?2026l");
+        let mut buf = Buffer::empty(content);
+        let post = paint_pane(&mut buf, &mut cache, &key, &screen, content, tick);
+        assert_eq!(post, Some((2, 0)));
+    }
+
+    #[test]
+    fn a_pane_mid_synchronized_update_keeps_the_cursor_hidden_if_it_was_hidden_before() {
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"AAAAA\x1b[?25l"); // hide the cursor before the update opens
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let content = Rect::new(0, 0, 10, 1);
+        let tick = Instant::now();
+
+        let mut buf = Buffer::empty(content);
+        let pre = paint_pane(&mut buf, &mut cache, &key, &screen, content, tick);
+        assert_eq!(pre, None, "hidden before the update opened");
+
+        // Mid-update, the child shows the cursor again — must not leak
+        // through while the block is still open.
+        screen.process(b"\x1b[?2026h\x1b[?25h");
+        let mut buf = Buffer::empty(content);
+        let mid = paint_pane(&mut buf, &mut cache, &key, &screen, content, tick);
+        assert_eq!(
+            mid, None,
+            "must not show a cursor the pre-update frame didn't have"
+        );
+    }
+
+    #[test]
+    fn a_synchronized_update_held_past_the_timeout_draws_live_again() {
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"AAAAAAAAAA");
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let content = Rect::new(0, 0, 10, 1);
+        let t0 = Instant::now();
+        paint_row(&mut cache, &key, &screen, content, t0);
+
+        // Opened, mutated, and never closed — a hung or dead child.
+        screen.process(b"\x1b[?2026h\x1b[HBBBBBBBBBB");
+        let still_honored = paint_row(&mut cache, &key, &screen, content, t0);
+        assert_eq!(still_honored, "AAAAAAAAAA");
+
+        let past_deadline = t0 + SYNC_UPDATE_TIMEOUT + Duration::from_millis(1);
+        let recovered = paint_row(&mut cache, &key, &screen, content, past_deadline);
+        assert_eq!(
+            recovered, "BBBBBBBBBB",
+            "a child that never closes its update must not freeze its pane forever"
+        );
+    }
+
+    #[test]
+    fn a_synchronized_update_within_the_deadline_stays_frozen_at_the_next_poll() {
+        // Regression: the deadline must be measured from when the block
+        // *opened*, not reset on every poll that finds it still open.
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"AAAAAAAAAA");
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let content = Rect::new(0, 0, 10, 1);
+        let t0 = Instant::now();
+        paint_row(&mut cache, &key, &screen, content, t0);
+
+        screen.process(b"\x1b[?2026h\x1b[HBBBBBBBBBB");
+        paint_row(&mut cache, &key, &screen, content, t0);
+
+        let still_within = t0 + SYNC_UPDATE_TIMEOUT - Duration::from_millis(1);
+        let text = paint_row(&mut cache, &key, &screen, content, still_within);
+        assert_eq!(text, "AAAAAAAAAA");
+    }
+
+    #[test]
+    fn a_resize_mid_hold_paints_live_instead_of_blitting_the_wrong_size() {
+        // The cached buffer was captured at the old `content` rect; blitting
+        // it into a differently-sized one would misplace or truncate cells,
+        // so a size mismatch must fall back to a live repaint rather than
+        // trust a cache that no longer describes this pane's shape.
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"AAAAAAAAAA");
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let small = Rect::new(0, 0, 10, 1);
+        let t0 = Instant::now();
+        paint_row(&mut cache, &key, &screen, small, t0);
+
+        screen.process(b"\x1b[?2026h");
+        screen.resize(1, 12);
+        screen.process(b"\x1b[HBBBBBBBBBBBB");
+        let wide = Rect::new(0, 0, 12, 1);
+        let mut frame_buffer = Buffer::empty(wide);
+        paint_pane(&mut frame_buffer, &mut cache, &key, &screen, wide, t0);
+        let row: String = (0..12)
+            .map(|x| frame_buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert_eq!(row, "BBBBBBBBBBBB");
+    }
+
+    #[test]
+    fn a_pane_already_mid_update_on_its_very_first_paint_shows_blank_not_the_partial_frame() {
+        // There is no earlier known-good frame for a pane that has never
+        // been painted before, so honoring the hold here means blank, not
+        // whatever happens to be in the grid mid-draw.
+        let mut screen = Screen::new(1, 10);
+        screen.process(b"\x1b[?2026hAAAAAAAAAA"); // mid-update from the very first byte
+        let mut cache = HashMap::new();
+        let key = SessionKey::from_id("s1");
+        let content = Rect::new(0, 0, 10, 1);
+
+        let first = paint_row(&mut cache, &key, &screen, content, Instant::now());
+        assert_eq!(first, "          ", "must not leak the in-progress frame");
     }
 }

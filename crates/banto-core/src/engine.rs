@@ -636,6 +636,19 @@ pub struct EmporiumState {
     /// reused discriminator could attach a stale mapping (an old screen, a
     /// stale PTY handle) to a new pane that happens to mint the same key.
     next_plain_id: u64,
+    /// Whether banto's own process currently holds OS focus — `true` at
+    /// startup (a fresh window is normally the one the operator just
+    /// launched into; the first real `Event::WindowFocusChanged` corrects
+    /// this if it's ever wrong, same as any other "assume it, self-heal on
+    /// the next real fact" default in this module). See
+    /// [`effective_focused_pane`] for how this composes with [`Self::focus`].
+    window_focused: bool,
+    /// The pane [`emit_focus_transitions`] last sent `CSI I` to (`None` for
+    /// "nobody, as far as that diff is concerned") — compared against
+    /// [`effective_focused_pane`] on every call so a change only ever
+    /// produces the one `CSI O`/`CSI I` pair it actually represents, not a
+    /// repeat on every tick.
+    last_focus_notified: Option<SessionKey>,
 }
 
 impl EmporiumState {
@@ -663,6 +676,8 @@ impl EmporiumState {
             prefix,
             prefix_armed: None,
             next_plain_id: 0,
+            window_focused: true,
+            last_focus_notified: None,
         }
     }
 
@@ -1125,6 +1140,16 @@ pub enum Cmd {
         key: SessionKey,
         cwd: PathBuf,
     },
+    /// Re-emit a child's OSC 52 clipboard payload on banto's own stdout, so
+    /// the real terminal banto is running in performs the copy — banto is a
+    /// middleman here, not the clipboard owner (`crate::screen::Screen::
+    /// take_clipboard`'s doc). `bytes` is the complete, already
+    /// selector/alphabet/size-validated OSC 52 escape sequence
+    /// ([`build_clipboard_forward`]), ready to write verbatim; the shell
+    /// must not reinterpret or re-encode it.
+    ForwardClipboardToHost {
+        bytes: Vec<u8>,
+    },
     Store(StoreIntent),
     Reload,
 }
@@ -1303,6 +1328,17 @@ pub enum Event {
     Tick {
         relay: Vec<RelayObservation>,
     },
+    /// banto's own process gained or lost OS focus (crossterm's
+    /// `FocusGained`/`FocusLost`, reported only once `EnableFocusChange` is
+    /// on) — distinct from *which pane* has focus within banto, tracked
+    /// separately by [`Focus`]. A child that asked for DECSET 1004 cannot
+    /// tell its terminal-within-a-terminal apart from a real one, so this
+    /// and an ordinary pane-to-pane switch both resolve through the same
+    /// [`emit_focus_transitions`] diff at the end of [`update`] — see
+    /// [`effective_focused_pane`]'s doc for how the two compose.
+    WindowFocusChanged {
+        focused: bool,
+    },
 }
 
 /// The core: a pure function from one [`Event`] to state mutations and
@@ -1319,10 +1355,26 @@ pub fn update(
         Event::Resized { width, height } => update_resized(state, app, width, height),
         Event::PtyOutput { key, chunk } => {
             state.last_output_at.insert(key.clone(), now);
+            let mut cmds = Vec::new();
             if let Some(screen) = state.screens.get_mut(&key) {
                 screen.process(&chunk);
+                // Drained right after the chunk that staged it is processed
+                // (Screen::take_clipboard's own doc: it's one-shot, so the
+                // same copy must never be forwarded again on a later poll).
+                if let Some((selection, data)) = screen.take_clipboard() {
+                    match build_clipboard_forward(&selection, &data) {
+                        Some(bytes) => cmds.push(Cmd::ForwardClipboardToHost { bytes }),
+                        None => state.set_status(
+                            format!(
+                                "{}: a clipboard copy was too large or malformed to forward",
+                                key.as_str()
+                            ),
+                            now,
+                        ),
+                    }
+                }
             }
-            Vec::new()
+            cmds
         }
         Event::PtyExited { key } => update_pty_exited(state, app, brigade, key, now),
         Event::NewSessionCwdChecked { cwd, is_dir } => {
@@ -1447,8 +1499,13 @@ pub fn update(
             new_id,
         } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
+        Event::WindowFocusChanged { focused } => {
+            state.window_focused = focused;
+            Vec::new()
+        }
     };
     cmds.extend(resize_staged_tiles(state));
+    cmds.extend(emit_focus_transitions(state));
     cmds
 }
 
@@ -1475,6 +1532,135 @@ fn resize_staged_tiles(state: &mut EmporiumState) -> Vec<Cmd> {
         }
     }
     cmds
+}
+
+/// Whether a pane currently reads as focused from a hosted child's own point
+/// of view — both banto's internal [`Focus`] needing to be on the pane
+/// region *and* banto's own process needing OS focus. A child cannot tell
+/// its terminal-within-a-terminal apart from a real one: if the operator
+/// alt-tabs away from banto entirely, the pane they were typing into is, from
+/// that pane's perspective, exactly as unfocused as if the operator had
+/// switched to the sidebar instead. Collapsing both conditions into one
+/// optional key is what lets [`emit_focus_transitions`] answer both halves
+/// of DECSET 1004 with a single diff instead of two.
+fn effective_focused_pane(state: &EmporiumState) -> Option<SessionKey> {
+    if state.focus == Focus::Pane && state.window_focused {
+        state.stage.focused_key().cloned()
+    } else {
+        None
+    }
+}
+
+/// `CSI O` / `CSI I` for whichever pane's effective focus actually changed
+/// since the last call, sent only to a pane that asked for it (DECSET 1004
+/// — [`crate::screen::Screen::wants_focus_events`]). Called unconditionally
+/// at the end of [`update`] (alongside [`resize_staged_tiles`], same
+/// reasoning): cheap, and correct without a pane switch, a pane closing, the
+/// sidebar taking focus, and banto's own window losing OS focus each needing
+/// their own call site to remember this.
+///
+/// Deliberately does *not* short-circuit on "the focused key hasn't
+/// changed": a pane almost always gains focus (on open, or by being clicked)
+/// *before* its own output has had a chance to enable DECSET 1004 — Claude
+/// Code's own 1004 arrives a few bytes into its startup sequence, not before
+/// it. A version of this that recorded the pane as "notified" the first time
+/// it was checked, regardless of whether `wants_focus_events` was true yet,
+/// would compare that stale `true`-if-still-focused key against an unchanged
+/// `now_focused` forever after and never revisit it — the exact shape of a
+/// child that asked for focus events and then waited for a `CSI I` that had
+/// already silently not been sent. So [`EmporiumState::last_focus_notified`]
+/// only ever records a key once a `CSI I` was *actually* sent to it, which
+/// means the pair below re-checks "does the currently-focused pane still
+/// need telling" on every single call — cheap (two `HashMap` lookups), and
+/// what makes a late `wants_focus_events` catch up on the very next `update`
+/// instead of missing its window forever.
+fn emit_focus_transitions(state: &mut EmporiumState) -> Vec<Cmd> {
+    let now_focused = effective_focused_pane(state);
+    let mut cmds = Vec::new();
+
+    if state.last_focus_notified != now_focused
+        && let Some(old) = state.last_focus_notified.take()
+        && state
+            .screens
+            .get(&old)
+            .is_some_and(crate::screen::Screen::wants_focus_events)
+    {
+        cmds.push(Cmd::WritePty {
+            key: old,
+            bytes: b"\x1b[O".to_vec(),
+        });
+    }
+
+    if let Some(new) = &now_focused
+        && state.last_focus_notified.as_ref() != Some(new)
+        && state
+            .screens
+            .get(new)
+            .is_some_and(crate::screen::Screen::wants_focus_events)
+    {
+        cmds.push(Cmd::WritePty {
+            key: new.clone(),
+            bytes: b"\x1b[I".to_vec(),
+        });
+        state.last_focus_notified = Some(new.clone());
+    }
+
+    cmds
+}
+
+/// The whole forwarded OSC 52 sequence — header, selector, base64 body,
+/// terminator — must not exceed this many bytes. Real terminals disagree
+/// wildly on their own tolerance: VTE-based terminals (GNOME Terminal and
+/// its relatives) hard-cap a single OSC string at 4096 codepoints and
+/// silently drop anything longer, while Windows Terminal has been measured
+/// comfortable past 100 MiB. 100,000 is the number that actually converges
+/// across the ecosystem rather than picking a side: it is the de facto
+/// informal ceiling several independent tools already assume (Codex's own
+/// OSC 52 clipboard fallback, `clipboard_copy.rs`'s `OSC52_MAX_RAW_BYTES`,
+/// bounds its raw payload the same order of magnitude), and it's the default
+/// Windows Terminal's own maintainers discussed when they added support.
+/// Bounding here — not just trusting `vt100-psmux`'s own parse-time
+/// filtering — is deliberate: forwarding to the host terminal is a new trust
+/// boundary this crate is choosing to cross (arbitrary child output now
+/// reaching the operator's *real* terminal), not a restatement of the
+/// parser's own.
+const MAX_OSC52_SEQUENCE_LEN: usize = 100_000;
+
+/// The xterm-family OSC 52 selection alphabet: `c`/`p`/`q`/`s`
+/// (clipboard/primary/secondary/select) and cut buffers `0`-`7`. Matches
+/// `vt100-psmux`'s own `CLIPBOARD_SELECTOR` (`crates/vt100-psmux/src/
+/// perform.rs`) byte for byte, checked independently rather than trusted —
+/// see [`MAX_OSC52_SEQUENCE_LEN`]'s doc for why.
+const CLIPBOARD_SELECTORS: &[u8] = b"cpqs01234567";
+
+/// Base64 alphabet plus `=` padding, matching `vt100-psmux`'s own `BASE64`
+/// constant byte for byte — same independent-check reasoning as
+/// [`CLIPBOARD_SELECTORS`].
+const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+
+/// Build the literal OSC 52 sequence to forward to the host terminal for a
+/// clipboard payload a child staged (`Screen::take_clipboard`), or `None` if
+/// it must not be forwarded. Two distinct ways to fail: `selection` names
+/// something outside [`CLIPBOARD_SELECTORS`], or the fully-assembled
+/// sequence would exceed [`MAX_OSC52_SEQUENCE_LEN`]. Both are silent drops
+/// rather than truncation — truncating a base64 body does not shorten the
+/// copied text, it corrupts it into different bytes that either fail to
+/// decode or decode to something the child never asked to put on the
+/// clipboard, which is worse than forwarding nothing.
+fn build_clipboard_forward(selection: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if selection.is_empty() || !selection.iter().all(|b| CLIPBOARD_SELECTORS.contains(b)) {
+        return None;
+    }
+    if data.is_empty() || !data.iter().all(|b| BASE64_ALPHABET.contains(b)) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(7 + selection.len() + data.len());
+    bytes.extend_from_slice(b"\x1b]52;");
+    bytes.extend_from_slice(selection);
+    bytes.push(b';');
+    bytes.extend_from_slice(data);
+    bytes.push(0x07);
+    (bytes.len() <= MAX_OSC52_SEQUENCE_LEN).then_some(bytes)
 }
 
 fn update_resized(state: &mut EmporiumState, app: &mut App, width: u16, height: u16) -> Vec<Cmd> {
@@ -8073,5 +8259,350 @@ mod tests {
 
         assert!(cmds.is_empty());
         assert_eq!(state.focus, Focus::Sidebar);
+    }
+
+    // --- focus-event forwarding (DECSET 1004: CSI I / CSI O) ---------------
+
+    /// A neutral event whose own handler never emits a `Cmd` on this fixture
+    /// (fresh state, no pending kickoffs/submits, empty relay) — used purely
+    /// to run `update`'s unconditional tail (`emit_focus_transitions`) so a
+    /// test can inspect what it did without an unrelated handler's own `Cmd`s
+    /// mixed in.
+    fn settle(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick { relay: Vec::new() },
+            test_instant(),
+        )
+    }
+
+    #[test]
+    fn switching_pane_focus_sends_csi_o_to_the_loser_and_csi_i_to_the_winner() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), worker.clone()],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        let mut director_screen = screen_sized_for_pane(&state);
+        director_screen.process(b"\x1b[?1004h");
+        state.screens.insert(director.clone(), director_screen);
+        let mut worker_screen = screen_sized_for_pane(&state);
+        worker_screen.process(b"\x1b[?1004h");
+        state.screens.insert(worker.clone(), worker_screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        // The very first call always emits a `CSI I` for whoever already has
+        // focus (`last_focus_notified` starts `None`) — settle that before
+        // the transition this test actually checks.
+        settle(&mut state, &mut app, &brigade);
+
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        let cmds = settle(&mut state, &mut app, &brigade);
+
+        assert_eq!(
+            cmds,
+            vec![
+                Cmd::WritePty {
+                    key: director,
+                    bytes: b"\x1b[O".to_vec(),
+                },
+                Cmd::WritePty {
+                    key: worker,
+                    bytes: b"\x1b[I".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pane_that_never_asked_for_focus_events_is_sent_neither_csi() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![director.clone(), worker.clone()],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        // Neither pane ever sent DECSET 1004.
+        state
+            .screens
+            .insert(director.clone(), screen_sized_for_pane(&state));
+        state
+            .screens
+            .insert(worker.clone(), screen_sized_for_pane(&state));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        settle(&mut state, &mut app, &brigade);
+
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        let cmds = settle(&mut state, &mut app, &brigade);
+
+        assert!(cmds.is_empty(), "neither pane asked: {cmds:?}");
+    }
+
+    #[test]
+    fn focus_moving_to_the_sidebar_sends_csi_o_to_the_pane_that_lost_it() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1004h");
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        settle(&mut state, &mut app, &brigade);
+
+        state.focus = Focus::Sidebar;
+        let cmds = settle(&mut state, &mut app, &brigade);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key,
+                bytes: b"\x1b[O".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn banto_losing_and_regaining_os_focus_is_reported_to_the_focused_pane() {
+        // The operator alt-tabbing away from banto entirely must read to a
+        // hosted child exactly like losing focus within banto — it cannot
+        // tell the two apart.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1004h");
+        state.screens.insert(key.clone(), screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        settle(&mut state, &mut app, &brigade);
+
+        let lost = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: false },
+            test_instant(),
+        );
+        assert_eq!(
+            lost,
+            vec![Cmd::WritePty {
+                key: key.clone(),
+                bytes: b"\x1b[O".to_vec(),
+            }]
+        );
+
+        let regained = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: true },
+            test_instant(),
+        );
+        assert_eq!(
+            regained,
+            vec![Cmd::WritePty {
+                key,
+                bytes: b"\x1b[I".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unrelated_tick_does_not_repeat_a_focus_notification() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        let mut screen = screen_sized_for_pane(&state);
+        screen.process(b"\x1b[?1004h");
+        state.screens.insert(key, screen);
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let first = settle(&mut state, &mut app, &brigade);
+        assert_eq!(first.len(), 1, "the first settle reports the initial focus");
+
+        let second = settle(&mut state, &mut app, &brigade);
+        assert!(second.is_empty(), "nothing changed: {second:?}");
+    }
+
+    #[test]
+    fn a_pane_that_asks_for_focus_events_only_after_already_being_focused_still_gets_csi_i() {
+        // The bug this guards: a pane almost always gains focus (on open, or
+        // by being clicked) before its own output has had a chance to enable
+        // DECSET 1004 — Claude Code's own 1004 arrives a few bytes into its
+        // startup sequence, not before it. `emit_focus_transitions` must not
+        // treat "the focused key hasn't changed" as "nothing to do" — the
+        // pane's *readiness* changed even though its identity didn't.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        // Screen exists, but has not enabled DECSET 1004 yet.
+        state
+            .screens
+            .insert(key.clone(), screen_sized_for_pane(&state));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let before_1004 = settle(&mut state, &mut app, &brigade);
+        assert!(
+            before_1004.is_empty(),
+            "nothing to send before the pane asks: {before_1004:?}"
+        );
+
+        // The child's first bytes enable focus reporting — no pane switch,
+        // no window-focus change, `state.focus`/`state.stage` untouched.
+        state.screens.get_mut(&key).unwrap().process(b"\x1b[?1004h");
+        let after_1004 = settle(&mut state, &mut app, &brigade);
+
+        assert_eq!(
+            after_1004,
+            vec![Cmd::WritePty {
+                key,
+                bytes: b"\x1b[I".to_vec(),
+            }],
+            "the pane asked for focus events while already focused — it must still get one"
+        );
+    }
+
+    // --- clipboard forwarding (OSC 52) --------------------------------------
+
+    #[test]
+    fn a_well_formed_clipboard_copy_is_forwarded_to_the_host() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key,
+                chunk: b"\x1b]52;c;aGVsbG8=\x07".to_vec(),
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::ForwardClipboardToHost {
+                bytes: b"\x1b]52;c;aGVsbG8=\x07".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_oversized_clipboard_copy_is_dropped_not_forwarded() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        // Comfortably over `MAX_OSC52_SEQUENCE_LEN`, and still valid base64
+        // alphabet throughout, so size is the only thing that can reject it.
+        let oversized_data = vec![b'A'; MAX_OSC52_SEQUENCE_LEN];
+        let mut chunk = b"\x1b]52;c;".to_vec();
+        chunk.extend_from_slice(&oversized_data);
+        chunk.push(0x07);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput { key, chunk },
+            test_instant(),
+        );
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::ForwardClipboardToHost { .. })),
+            "an oversized payload must never reach the host terminal: {cmds:?}"
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("too large")),
+            "the drop must be visible, not silent: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn build_clipboard_forward_rejects_a_selector_outside_the_recognized_alphabet() {
+        assert_eq!(build_clipboard_forward(b"x", b"aGVsbG8="), None);
+    }
+
+    #[test]
+    fn build_clipboard_forward_rejects_data_outside_the_base64_alphabet() {
+        assert_eq!(build_clipboard_forward(b"c", b"not base64!!"), None);
+    }
+
+    #[test]
+    fn build_clipboard_forward_accepts_every_recognized_selector() {
+        for selector in CLIPBOARD_SELECTORS {
+            let selection = [*selector];
+            assert!(
+                build_clipboard_forward(&selection, b"aGVsbG8=").is_some(),
+                "selector {selector:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clipboard_read_request_is_not_forwarded() {
+        // `]52;c;?` is a read request, not a copy — `vt100-psmux` only
+        // stages `Screen::take_clipboard`'s slot from the copy path
+        // (`set_clipboard`), never from a `?` query, so this reaches
+        // `update` as ordinary output with nothing to drain.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key,
+                chunk: b"\x1b]52;c;?\x07".to_vec(),
+            },
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "a read request must not be forwarded: {cmds:?}"
+        );
     }
 }

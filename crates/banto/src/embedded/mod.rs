@@ -15,7 +15,6 @@ mod paste_accum;
 mod session;
 
 pub use banto_io::pty::PortablePtyHost;
-pub use banto_tui::render::screen_to_text;
 pub use emporium::EmporiumSettings;
 pub use emporium::run as run_emporium;
 pub use session::EmbeddedSession;
@@ -25,6 +24,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use banto_tui::paint::paint_screen;
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -33,7 +33,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Block;
 
 /// Host `argv` in a full-screen embedded pane until the user presses F12.
 /// Reached via the hidden `banto _embed` subcommand — the only caller of
@@ -75,7 +75,7 @@ fn embedded_loop(
             let block = Block::bordered().title("banto · embedded — F12 to detach");
             let content = block.inner(area);
             f.render_widget(block, area);
-            f.render_widget(Paragraph::new(screen_to_text(session.screen())), content);
+            paint_screen(session.screen(), content, f.buffer_mut());
 
             let screen = session.screen();
             if !screen.hide_cursor() {

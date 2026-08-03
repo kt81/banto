@@ -21,16 +21,86 @@ const SCROLLBACK_LEN: usize = 2000;
 /// caller knows whether to also resize the PTY itself — an I/O action this
 /// type never performs).
 pub struct Screen {
-    parser: vt100::Parser,
+    parser: vt100::Parser<PaneModes>,
     size: (u16, u16),
+}
+
+/// The two private modes banto acts on that `vt100` does not model itself.
+/// It reports anything it does not implement through `unhandled_csi`, and
+/// distinguishes that from modes it *does* implement (DECSET 2004 never
+/// arrives here), so this sees exactly the sequences nobody else consumed.
+///
+/// Both children banto hosts drive these: Codex wraps every `Tui::draw` in
+/// crossterm's `SynchronizedUpdate`, and Claude Code enables synchronized
+/// output whenever `WT_SESSION` is set — which banto's PTY passes through,
+/// since it inherits the environment it was launched from.
+#[derive(Default)]
+pub struct PaneModes {
+    synchronized_update: bool,
+    wants_focus_events: bool,
+}
+
+impl vt100::Callbacks for PaneModes {
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        intermediate: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        final_byte: char,
+    ) {
+        if intermediate != Some(b'?') {
+            return;
+        }
+        let enabled = match final_byte {
+            'h' => true,
+            'l' => false,
+            _ => return,
+        };
+        // A DECSET may carry several modes at once (Claude Code sets the four
+        // mouse modes in one sequence), so every parameter is inspected.
+        for mode in params.iter().filter_map(|p| p.first().copied()) {
+            match mode {
+                2026 => self.synchronized_update = enabled,
+                1004 => self.wants_focus_events = enabled,
+                _ => {}
+            }
+        }
+    }
 }
 
 impl Screen {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LEN),
+            parser: vt100::Parser::new_with_callbacks(
+                rows,
+                cols,
+                SCROLLBACK_LEN,
+                PaneModes::default(),
+            ),
             size: (rows, cols),
         }
+    }
+
+    /// Whether the child is part-way through a frame it asked not to be shown
+    /// mid-flight (DECSET 2026). The caller decides how long to honour that —
+    /// this type has no clock, and a child that dies between the open and the
+    /// close would otherwise freeze its pane forever.
+    pub fn in_synchronized_update(&self) -> bool {
+        self.parser.callbacks().synchronized_update
+    }
+
+    /// Whether the child asked to be told when it gains or loses focus
+    /// (DECSET 1004), which it answers with `CSI I` / `CSI O`.
+    pub fn wants_focus_events(&self) -> bool {
+        self.parser.callbacks().wants_focus_events
+    }
+
+    /// Take any clipboard payload the child staged with OSC 52, as
+    /// `(selection, base64)`. Draining is what makes it a one-shot: the same
+    /// copy must not be forwarded to the host terminal on every later poll.
+    pub fn take_clipboard(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.parser.screen_mut().take_clipboard()
     }
 
     /// Feed one chunk of the child's output into the model.
@@ -118,6 +188,61 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronized_update_opens_and_closes_with_decset_2026() {
+        let mut screen = Screen::new(4, 20);
+        assert!(!screen.in_synchronized_update());
+        screen.process(b"\x1b[?2026h");
+        assert!(screen.in_synchronized_update());
+        screen.process(b"\x1b[?2026l");
+        assert!(!screen.in_synchronized_update());
+    }
+
+    #[test]
+    fn focus_reporting_is_tracked_separately_from_synchronized_update() {
+        let mut screen = Screen::new(4, 20);
+        screen.process(b"\x1b[?1004h");
+        assert!(screen.wants_focus_events());
+        assert!(!screen.in_synchronized_update());
+        screen.process(b"\x1b[?1004l");
+        assert!(!screen.wants_focus_events());
+    }
+
+    #[test]
+    fn a_decset_carrying_several_modes_sets_every_one_it_names() {
+        // Claude Code enables its four mouse modes in a single sequence, so a
+        // reader that only inspected the first parameter would miss the rest.
+        let mut screen = Screen::new(4, 20);
+        screen.process(b"\x1b[?1004;2026h");
+        assert!(screen.wants_focus_events());
+        assert!(screen.in_synchronized_update());
+    }
+
+    #[test]
+    fn modes_vt100_implements_itself_never_reach_the_callback() {
+        // DECSET 2004 is handled inside vt100, so it is not reported as
+        // unhandled — the same discrimination that makes 2026 and 1004
+        // observable here at all. If this ever fails, the callback is being
+        // fed modes it must not interpret.
+        let mut screen = Screen::new(4, 20);
+        screen.process(b"\x1b[?2004h");
+        assert!(!screen.in_synchronized_update());
+        assert!(!screen.wants_focus_events());
+    }
+
+    #[test]
+    fn a_clipboard_payload_is_handed_over_once() {
+        let mut screen = Screen::new(4, 20);
+        screen.process(b"\x1b]52;c;aGVsbG8=\x07");
+        let (selection, data) = screen.take_clipboard().expect("staged by OSC 52");
+        assert_eq!(selection, b"c");
+        assert_eq!(data, b"aGVsbG8=");
+        assert!(
+            screen.take_clipboard().is_none(),
+            "a drained copy must not be forwarded to the host again"
+        );
+    }
 
     #[test]
     fn wants_sgr_mouse_is_false_before_any_child_output() {
