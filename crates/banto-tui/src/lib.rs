@@ -6,10 +6,13 @@
 //! Module map:
 //! - [`render_modal`] rendering `Modal` as a centered overlay — shared by
 //!   both modes (see its own module doc for why)
-//! - [`render`] `vt100` screen -> ratatui text (the emporium's embedded panes)
+//! - [`paint`] `vt100` screen -> ratatui buffer cells (the emporium's panes)
+//! - [`render`] `vt100` screen -> ratatui text, the predecessor `paint`
+//!   replaced; its width tests are the regression net for that swap
 //! - [`view`] the shared session-list / summary panel widgets
 //! - [`text`] column-aware text truncation, shared by `render_modal`/`view`
 
+pub mod paint;
 pub mod render;
 pub mod render_modal;
 pub mod text;
