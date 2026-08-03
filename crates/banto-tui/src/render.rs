@@ -101,4 +101,142 @@ mod tests {
         let normal_span = spans.iter().find(|s| s.content == "n").unwrap();
         assert!(!normal_span.style.add_modifier.contains(Modifier::DIM));
     }
+
+    // --- vt100 -> ratatui column-width contract (audit) --------------------
+    //
+    // `screen_to_text` pushes one `Span` per non-wide-continuation vt100
+    // cell. That only lines up on screen if, for every such cell, ratatui's
+    // own width measurement of `cell.contents()` agrees with how many
+    // columns vt100 itself decided that cell occupies — if the two disagree
+    // for some glyph, `Buffer::set_line`'s per-span x-advance
+    // (`buffer.rs`'s `set_stringn`) drifts out of step with vt100's column
+    // grid, and every span after it in the row paints at the wrong place.
+    //
+    // These tests check that agreement directly: parse a glyph through a
+    // real `vt100::Parser`, type a marker character right after it, and
+    // compare which column vt100 put the marker in against which column it
+    // actually landed in once the same screen goes through `screen_to_text`
+    // and a `ratatui::widgets::Paragraph`.
+    mod width_contract {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::{Paragraph, Widget};
+
+        use super::screen_to_text;
+
+        const COLS: u16 = 20;
+
+        /// The column vt100 placed a `Z` marker in, typed immediately after
+        /// `input` — i.e. how many grid columns vt100 believes `input`
+        /// occupied.
+        fn vt100_marker_column(input: &[u8]) -> u16 {
+            let mut parser = vt100::Parser::new(1, COLS, 0);
+            parser.process(input);
+            parser.process(b"Z");
+            let screen = parser.screen();
+            for col in 0..COLS {
+                if let Some(cell) = screen.cell(0, col)
+                    && cell.contents() == "Z"
+                {
+                    return col;
+                }
+            }
+            panic!("marker Z not found in vt100 screen for {input:?}");
+        }
+
+        /// The column ratatui actually painted the same `Z` marker into,
+        /// after round-tripping the same vt100 screen through
+        /// `screen_to_text` and a `Paragraph` — no `Terminal`, no real
+        /// backend: `Buffer::empty` + `Widget::render` is enough to observe
+        /// where content lands.
+        fn ratatui_marker_column(input: &[u8]) -> u16 {
+            let mut parser = vt100::Parser::new(1, COLS, 0);
+            parser.process(input);
+            parser.process(b"Z");
+            let text = screen_to_text(parser.screen());
+            let area = Rect::new(0, 0, COLS, 1);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(text).render(area, &mut buffer);
+            for col in 0..COLS {
+                if buffer[(col, 0)].symbol() == "Z" {
+                    return col;
+                }
+            }
+            panic!("marker Z not found in ratatui buffer for {input:?}");
+        }
+
+        /// Assert vt100 and ratatui agree on how many columns `input`
+        /// occupies. A failure here is the contract breaking: `input`
+        /// itself painted correctly (or not) is secondary to whether
+        /// everything typed *after* it in the same row lands where vt100
+        /// says it should.
+        fn assert_widths_agree(name: &str, input: &[u8]) {
+            let vt100_col = vt100_marker_column(input);
+            let ratatui_col = ratatui_marker_column(input);
+            assert_eq!(
+                vt100_col, ratatui_col,
+                "{name}: vt100 placed the marker at column {vt100_col}, \
+                 ratatui painted it at column {ratatui_col}"
+            );
+        }
+
+        #[test]
+        fn plain_emoji_name_badge_agrees() {
+            assert_widths_agree("U+1F4DB (name badge)", "\u{1F4DB}".as_bytes());
+        }
+
+        #[test]
+        fn plain_emoji_file_folder_agrees() {
+            assert_widths_agree("U+1F4C1 (file folder)", "\u{1F4C1}".as_bytes());
+        }
+
+        #[test]
+        fn eight_spoked_asterisk_plus_vs16_agrees() {
+            assert_widths_agree(
+                "U+2733 U+FE0F (eight spoked asterisk + VS16)",
+                "\u{2733}\u{FE0F}".as_bytes(),
+            );
+        }
+
+        #[test]
+        fn eight_spoked_asterisk_alone_agrees() {
+            assert_widths_agree("U+2733 alone, no VS16", "\u{2733}".as_bytes());
+        }
+
+        #[test]
+        fn nerd_font_pua_glyph_agrees() {
+            assert_widths_agree("U+E0A0 (nerd font PUA)", "\u{E0A0}".as_bytes());
+        }
+
+        #[test]
+        fn full_block_agrees() {
+            assert_widths_agree("U+2588 (full block)", "\u{2588}".as_bytes());
+        }
+
+        #[test]
+        fn light_shade_agrees() {
+            assert_widths_agree("U+2591 (light shade)", "\u{2591}".as_bytes());
+        }
+
+        #[test]
+        fn black_right_pointing_triangle_alone_agrees() {
+            assert_widths_agree("U+25B6 alone (text presentation)", "\u{25B6}".as_bytes());
+        }
+
+        #[test]
+        fn black_right_pointing_triangle_plus_vs16_agrees() {
+            assert_widths_agree(
+                "U+25B6 U+FE0F (triangle + VS16, emoji presentation)",
+                "\u{25B6}\u{FE0F}".as_bytes(),
+            );
+        }
+
+        #[test]
+        fn cjk_run_agrees() {
+            assert_widths_agree(
+                "banto\u{958B}\u{767A} (CJK run)",
+                "banto\u{958B}\u{767A}".as_bytes(),
+            );
+        }
+    }
 }

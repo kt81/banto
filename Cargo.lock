@@ -120,7 +120,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "unicode-width",
- "vt100",
+ "vt100-psmux",
 ]
 
 [[package]]
@@ -132,7 +132,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
- "vt100",
+ "vt100-psmux",
 ]
 
 [[package]]
@@ -162,7 +162,7 @@ dependencies = [
  "critical-section",
  "ratatui",
  "unicode-width",
- "vt100",
+ "vt100-psmux",
 ]
 
 [[package]]
@@ -2161,10 +2161,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vt100"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+name = "vt100-psmux"
+version = "0.16.9"
+source = "git+https://github.com/kt81/psmux?branch=banto%2Fvt100-patches#3a8186e3bd45526ef6b50948302910da638311ef"
 dependencies = [
  "itoa",
  "unicode-width",
