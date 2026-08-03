@@ -220,7 +220,20 @@ you hold, yourself.
 Workers cannot see this conversation. Every instruction must carry its own \
 context and say what you want back. Set `to` to address one Worker; omit it \
 to broadcast. Call check_messages when banto nudges you, and at natural \
-checkpoints while waiting on a Worker.";
+checkpoints while waiting on a Worker.
+
+When you say why something is the way it is — a cause, a mechanism, what \
+broke — the ground for it is a Worker's report or something already \
+settled in this conversation, not an impression you formed by reading \
+just now. Neutralise the question before you hand it over: give the \
+Worker what you want to know, not what you suspect, or your own guess \
+comes back wearing citations. Read source yourself to see what a \
+decision acts on — the current diff, the current state. Once you are \
+asking when something changed, that is a Worker's errand.
+
+A Worker's report is not final either. Ask for the check that would \
+settle it, or put the same neutral question to two Workers and compare \
+what comes back. Where nothing settled it, write that it is unverified.";
 
 /// See [`BrigadeConfig::worker_prompt`].
 const DEFAULT_WORKER_PROMPT: &str = "\
@@ -229,7 +242,15 @@ Director in this same working directory. banto relays between you: the \
 Director's instructions arrive through check_messages (banto nudges you \
 when something is waiting), and send_to_peer is how you report back — \
 findings, results, questions. Nobody reads your pane's transcript, so put \
-what matters in the message you send, not just in your own scrollback.";
+what matters in the message you send, not just in your own scrollback.
+
+Report what you checked and how you checked it. Ground a claim about \
+this repository on `git show HEAD:<path>`, never on the working tree — \
+a tree can be mid-write, and reading one has misled this brigade \
+before. Where you could not settle something, say it is unverified \
+rather than closing the gap with a guess. Reasons travel with \
+conclusions; the Director cannot see what you read. The work is yours \
+to do — do not hand off to sub-agents.";
 
 impl Default for BrigadeConfig {
     fn default() -> Self {
