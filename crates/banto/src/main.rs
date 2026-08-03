@@ -51,7 +51,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use banto_core::config::Config;
-use banto_core::model::AgentKind;
+use banto_core::model::{AgentKind, BrigadeRole};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
@@ -258,7 +258,7 @@ fn main() -> Result<()> {
                 session,
                 brigade,
                 member,
-                role: role.as_deref().and_then(mcp::parse_role),
+                role: role.as_deref().and_then(BrigadeRole::from_token),
             };
             mcp::run_stdio_server(store, identity, claude_home, codex_home)
         }

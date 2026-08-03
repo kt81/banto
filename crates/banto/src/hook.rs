@@ -41,8 +41,6 @@ use banto_core::model::{BrigadeId, BrigadeRole, SessionId};
 use banto_io::config as io_config;
 use banto_io::store::Store;
 
-use crate::mcp::parse_role;
-
 /// Member identity as read from the environment. Every field is optional
 /// because the whole point of this module is to degrade to "no briefing"
 /// rather than fail when any of it is missing or unparsable.
@@ -59,7 +57,9 @@ fn read_identity(get: impl Fn(&str) -> Option<String>) -> HookIdentity {
     HookIdentity {
         brigade_id: get("BANTO_BRIGADE").and_then(|value| value.parse().ok()),
         token: get("BANTO_MEMBER"),
-        role: get("BANTO_ROLE").as_deref().and_then(parse_role),
+        role: get("BANTO_ROLE")
+            .as_deref()
+            .and_then(BrigadeRole::from_token),
     }
 }
 
