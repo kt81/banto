@@ -21,3 +21,13 @@ strip = true
 # (fix also PR'd upstream; drop this patch when a release carries it).
 [patch.crates-io]
 crossterm = { git = "https://github.com/kt81/crossterm", branch = "banto/0.29-emoji-panel-fix" }
+# vt100 measures cell width one character at a time, so a base char followed
+# by U+FE0F settles as one narrow cell while every terminal — and the child
+# driving this grid — counts the pair as two columns. The grid then sits a
+# column short of what the child believes, and anything it repositions to
+# lands one cell off, leaving the skipped cell holding the previous frame
+# (measured 2026-08-03 on Claude Code's status line: a ten-cell bar drawn as
+# eleven). Upstream doy/vt100-rust has been unmaintained since 2025-07 and
+# the fix has sat in its PR #32 since 2026-05; psmux carries the patches we
+# need in every other respect, so banto rides a two-commit fork of it.
+vt100-psmux = { git = "https://github.com/kt81/psmux", branch = "banto/vt100-patches" }
