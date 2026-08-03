@@ -253,13 +253,14 @@ fn main() -> Result<()> {
         }) => {
             let store = open_store(&config)?;
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let codex_home = resolve_codex_home(cli.codex_home, &config);
             let identity = mcp::Identity {
                 session,
                 brigade,
                 member,
                 role: role.as_deref().and_then(mcp::parse_role),
             };
-            mcp::run_stdio_server(store, identity, claude_home)
+            mcp::run_stdio_server(store, identity, claude_home, codex_home)
         }
         Some(Command::Hook) => unreachable!("Command::Hook returns before load_config runs"),
         None => {
