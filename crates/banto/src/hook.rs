@@ -92,7 +92,9 @@ fn build_briefing(
     let store = store?;
     let template = config.brigade.prompt_for(role).unwrap_or("");
     let peers = crate::briefing::peers_of(store, brigade_id, role);
-    let rendered = crate::briefing::render(template, brigade_id, token, &peers);
+    // `None`: a Goinkyo is Claude-only, so this hook — Codex's own
+    // SessionStart briefing path — never renders one.
+    let rendered = crate::briefing::render(template, brigade_id, token, &peers, None);
     Some(crate::briefing::with_codex_addendum(&rendered))
 }
 

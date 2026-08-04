@@ -70,7 +70,8 @@ pub(crate) fn peers_of(store: &Store, brigade_id: BrigadeId, role: BrigadeRole) 
         .collect()
 }
 
-/// Substitute `{brigade}` / `{token}` / `{peers}` into a briefing template.
+/// Substitute `{brigade}` / `{token}` / `{peers}` — and, when `request` is
+/// given, `{request}` — into a briefing template.
 ///
 /// Plain string replacement, deliberately: this is banto's own config text
 /// being filled in for banto's own launch, not a templating language, and
@@ -78,21 +79,33 @@ pub(crate) fn peers_of(store: &Store, brigade_id: BrigadeId, role: BrigadeRole) 
 /// the same leniency the rest of the config layer promises. A member with
 /// no addressable peers yet renders as "none yet" rather than an empty gap,
 /// so the sentence still reads as a sentence.
+///
+/// `request` is `None` for a Director or a Worker — their templates have no
+/// `{request}` to begin with, and leaving the substitution out entirely
+/// (rather than passing an empty string) means a template that *did*
+/// happen to contain the literal text `{request}` would render unchanged
+/// for them, same as any other placeholder banto doesn't recognize in that
+/// role's template.
 pub(crate) fn render(
     template: &str,
     brigade_id: BrigadeId,
     token: &str,
     peers: &[String],
+    request: Option<&str>,
 ) -> String {
     let peers = if peers.is_empty() {
         "none yet".to_string()
     } else {
         peers.join(", ")
     };
-    template
+    let rendered = template
         .replace("{brigade}", &brigade_id.to_string())
         .replace("{token}", token)
-        .replace("{peers}", &peers)
+        .replace("{peers}", &peers);
+    match request {
+        Some(request) => rendered.replace("{request}", request),
+        None => rendered,
+    }
 }
 
 #[cfg(test)]
@@ -102,21 +115,35 @@ mod tests {
     #[test]
     fn substitutes_every_placeholder() {
         let out = render(
-            "brigade {brigade}, you are {token}, peers: {peers}",
+            "brigade {brigade}, you are {token}, peers: {peers}, request: {request}",
             7,
             "worker-1",
             &["director".to_string(), "worker-2".to_string()],
+            Some("/tmp/goinkyo/7.txt"),
         );
         assert_eq!(
             out,
-            "brigade 7, you are worker-1, peers: director, worker-2"
+            "brigade 7, you are worker-1, peers: director, worker-2, request: /tmp/goinkyo/7.txt"
+        );
+    }
+
+    #[test]
+    fn request_placeholder_is_left_alone_when_none_is_given() {
+        // A Director/Worker template happening to contain the literal text
+        // `{request}` must render unchanged for them, the same as any other
+        // placeholder banto doesn't recognize in that role's template — see
+        // `render`'s own doc for why `None` means "don't touch it" rather
+        // than "replace it with an empty string".
+        assert_eq!(
+            render("no request here: {request}", 1, "director", &[], None),
+            "no request here: {request}"
         );
     }
 
     #[test]
     fn an_empty_roster_still_reads_as_a_sentence() {
         assert_eq!(
-            render("peers: {peers}.", 1, "director", &[]),
+            render("peers: {peers}.", 1, "director", &[], None),
             "peers: none yet."
         );
     }
@@ -177,7 +204,7 @@ mod tests {
     // template is not worth failing a launch over.
     fn an_unknown_placeholder_is_left_alone() {
         assert_eq!(
-            render("{token} {nope}", 1, "director", &[]),
+            render("{token} {nope}", 1, "director", &[], None),
             "director {nope}"
         );
     }

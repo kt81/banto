@@ -44,8 +44,9 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
-    self, Cmd, EmporiumState, Event, Focus, GroupJoinTargetData, PrefixKey, RelayObservation,
-    SessionKey, Stage, StoreIntent, layout, stage_tiles,
+    self, Cmd, EmporiumState, Event, Focus, GoinkyoObservation, GoinkyoSpawnCandidate,
+    GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage, StoreIntent, layout,
+    stage_tiles,
 };
 use banto_core::input::InputEvent;
 use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
@@ -425,6 +426,8 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 app,
             );
             events.push_back(Event::Tick { relay });
+            let observation = gather_goinkyo_observation(&state, deps.store, app);
+            events.push_back(Event::GoinkyoAwaitingSpawn { observation });
         }
 
         // Drain the event queue through `update`, executing the `Cmd`s it
@@ -572,7 +575,19 @@ fn execute_cmd(
             target,
             brigade,
             model,
-        } => execute_open_embedded(key, target, brigade, model, deps, handles, discovery),
+            effort,
+        } => execute_open_embedded(
+            OpenEmbeddedRequest {
+                key,
+                target,
+                brigade,
+                model,
+                effort,
+            },
+            deps,
+            handles,
+            discovery,
+        ),
         Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
         Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
@@ -705,6 +720,7 @@ fn execute_open_codex_trust_pane(
 fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
+    effort: Option<&str>,
     briefing: Option<&str>,
     ctx: &opener::OpenContext,
 ) -> Option<opener::AgentLaunch> {
@@ -724,6 +740,7 @@ fn build_open_launch(
         AgentKind::ClaudeCode => opener::AgentLaunch::Claude {
             resume,
             model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
         },
@@ -732,7 +749,9 @@ fn build_open_launch(
         // by the `banto _hook` process the injected SessionStart hook spawns,
         // not passed on the argv. `brigade` is left `None` for the caller to
         // fill for the same reason `mcp_config` is — it needs the running
-        // executable's own path, which is I/O this stays free of.
+        // executable's own path, which is I/O this stays free of. `effort`
+        // is dropped for the same reason `AgentLaunch::Codex` carries no
+        // field for it at all — see that variant's own doc.
         AgentKind::Codex => opener::AgentLaunch::Codex {
             resume,
             model: model.map(str::to_string),
@@ -740,6 +759,19 @@ fn build_open_launch(
             brigade: None,
         },
     })
+}
+
+/// The per-call parameters of [`Cmd::OpenEmbedded`], bundled so
+/// [`execute_open_embedded`] takes one request plus shared process state
+/// (`deps`/`handles`/`discovery`) rather than five separate fields —
+/// keeps it under clippy's `too_many_arguments`, which the `effort` field
+/// pushed past on its own.
+struct OpenEmbeddedRequest {
+    key: SessionKey,
+    target: SessionToOpen,
+    brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard for a
@@ -750,14 +782,18 @@ fn build_open_launch(
 /// behavior: spawn anyway, without the flag, rather than losing the pane
 /// over a config-file write error).
 fn execute_open_embedded(
-    key: SessionKey,
-    target: SessionToOpen,
-    brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
-    model: Option<String>,
+    request: OpenEmbeddedRequest,
     deps: &Deps,
     handles: &mut HashMap<SessionKey, PtyHandle>,
     discovery: &mut Vec<DiscoveryTracker>,
 ) -> Vec<Event> {
+    let OpenEmbeddedRequest {
+        key,
+        target,
+        brigade,
+        model,
+        effort,
+    } = request;
     let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
     // fresh (unresumed) spawn never does.
@@ -776,9 +812,13 @@ fn execute_open_embedded(
         codex_home: deps.codex_home,
         start_time: &SysinfoStartTime,
     };
-    let Some(mut launch) =
-        build_open_launch(&target, model.as_deref(), briefing.as_deref(), &open_ctx)
-    else {
+    let Some(mut launch) = build_open_launch(
+        &target,
+        model.as_deref(),
+        effort.as_deref(),
+        briefing.as_deref(),
+        &open_ctx,
+    ) else {
         return vec![Event::SpawnFailed {
             key,
             error: "already running elsewhere".to_string(),
@@ -1354,6 +1394,53 @@ fn gather_relay_observations(
     observations
 }
 
+/// What the staged brigade's Goinkyo row (if any) means for
+/// `engine::update_goinkyo_awaiting_spawn` this tick — see
+/// [`GoinkyoObservation`]'s own doc for what each case tells the core to do.
+/// A store read failure is reported as [`GoinkyoObservation::Unchanged`],
+/// same as "no brigade staged": it is not itself evidence the row is gone,
+/// and misreporting it as [`GoinkyoObservation::NoGoinkyo`] would release
+/// the one-shot guard on a transient glitch rather than an actual ended
+/// consultation.
+///
+/// Deliberately does *not* also check whether a pane is already open or in
+/// flight for a would-be candidate: that would need the same synthetic key
+/// `stage_brigade`'s own Worker-awaiting-discovery branch builds
+/// (`SessionKey::new_worker`), which is private to `banto_core::engine` —
+/// this crate has no way to construct one to look `state.screens`/
+/// `pending_opens` up by. `update_goinkyo_awaiting_spawn` does that check
+/// itself instead, on the core side where the constructor is reachable; see
+/// its own doc for why `EmporiumState::goinkyo_open_attempted` is the
+/// primary guard either way, and that lookup only a defensive second one.
+fn gather_goinkyo_observation(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    app: &App,
+) -> GoinkyoObservation {
+    let Stage::Brigade { id, panes, .. } = &state.stage else {
+        return GoinkyoObservation::Unchanged;
+    };
+    let brigade_id = *id;
+    let Ok(members) = store.borrow().brigade_members(brigade_id) else {
+        return GoinkyoObservation::Unchanged;
+    };
+    let Some(goinkyo) = members.iter().find(|m| m.role == BrigadeRole::Goinkyo) else {
+        return GoinkyoObservation::NoGoinkyo { brigade_id };
+    };
+    if goinkyo.session_id.is_some() {
+        return GoinkyoObservation::Unchanged;
+    }
+    // Same cwd resolution as `add_worker`/`stage_brigade`: the Director's
+    // own row, first in `panes` by construction — a Goinkyo has no cwd of
+    // its own to fall back to, and belongs in the same working directory
+    // the rest of the brigade already runs in.
+    let director_row = panes.first().and_then(|key| app.row_for_id(key.as_str()));
+    let cwd = director_row
+        .and_then(|row| row.cwd.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+    GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate { brigade_id, cwd })
+}
+
 /// How many parent-pid hops [`gather_fork_observations`] walks looking for a
 /// staged pane's own child pid in a live entry's ancestry — covers `claude`
 /// launched through a cmd/npm shim (a couple of hops) with headroom to
@@ -1446,7 +1533,34 @@ fn member_briefing(
 ) -> Option<String> {
     let template = deps.brigade.prompt_for(role)?;
     let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
-    Some(crate::briefing::render(template, brigade_id, token, &peers))
+    let request = (role == BrigadeRole::Goinkyo)
+        .then(|| goinkyo_request_path(brigade_id))
+        .flatten();
+    Some(crate::briefing::render(
+        template,
+        brigade_id,
+        token,
+        &peers,
+        request.as_deref(),
+    ))
+}
+
+/// Where `crate::mcp::tool_consult_goinkyo` wrote this brigade's
+/// consultation request. Recomputed here rather than threaded through
+/// [`Deps`]: matches [`write_mcp_config`]'s own precedent of resolving
+/// banto's data directory directly at the point of use rather than
+/// injecting it. The join itself is `crate::mcp::resolve_goinkyo_dir` /
+/// `crate::mcp::goinkyo_request_path` — the same two calls
+/// `write_goinkyo_request` makes — rather than repeated here by hand: see
+/// `resolve_goinkyo_dir`'s own doc for why a second hand-written copy would
+/// be a bug waiting for only one side to be edited.
+fn goinkyo_request_path(brigade_id: BrigadeId) -> Option<String> {
+    let dir = crate::mcp::resolve_goinkyo_dir()?;
+    Some(
+        crate::mcp::goinkyo_request_path(&dir, brigade_id)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// The `BANTO_*` variables a brigade member's child is launched with.
@@ -3345,12 +3459,46 @@ mod tests {
             &open_target("sess-1"),
             Some("opus"),
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
             launch.argv("claude"),
             ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn build_open_launch_appends_effort_right_after_model_and_omits_it_when_none() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target(""),
+            Some("fable"),
+            Some("max"),
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.argv("claude"),
+            ["claude", "--model", "fable", "--effort", "max"].map(str::to_string)
+        );
+
+        let no_effort = build_open_launch(
+            &open_target(""),
+            Some("fable"),
+            None,
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            no_effort.argv("claude"),
+            ["claude", "--model", "fable"].map(str::to_string)
         );
     }
 
@@ -3363,6 +3511,7 @@ mod tests {
         let launch = build_open_launch(
             &open_target(""),
             Some("opus"),
+            None,
             None,
             &test_ctx(&probe, &[], &binaries),
         )
@@ -3381,6 +3530,7 @@ mod tests {
         let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
+            None,
             None,
             None,
             &test_ctx(&probe, &[], &binaries),
@@ -3412,6 +3562,7 @@ mod tests {
                 &open_target("sess-1"),
                 Some("opus"),
                 None,
+                None,
                 &test_ctx(&probe, &live, &binaries),
             )
             .is_none()
@@ -3429,6 +3580,9 @@ mod tests {
         let launch = build_open_launch(
             &target,
             Some("o3"),
+            // `effort` is Claude-only (`AgentLaunch::Claude`'s own doc);
+            // dropped here for the same reason the briefing below is.
+            None,
             // The caller resolves a briefing for any brigade member
             // regardless of product (`member_briefing` takes only
             // `brigade_id`/`token`/`role`, never `agent` — see
@@ -3468,6 +3622,7 @@ mod tests {
         let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
+            None,
             Some("you are the Director"),
             &test_ctx(&probe, &[], &binaries),
         )
@@ -3495,6 +3650,7 @@ mod tests {
         let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
+            None,
             None,
             None,
             &test_ctx(&probe, &[], &binaries),
@@ -3588,6 +3744,195 @@ mod tests {
             ),
             None,
             "an empty template launches with no flag at all"
+        );
+    }
+
+    #[test]
+    fn member_briefing_substitutes_request_for_a_goinkyo_and_leaves_it_alone_for_a_director() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let brigade_id = {
+            let mut store = store.borrow_mut();
+            let id = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(id, "director", BrigadeRole::Director, None)
+                .unwrap();
+            store
+                .add_brigade_member(id, "goinkyo", BrigadeRole::Goinkyo, None)
+                .unwrap();
+            id
+        };
+        let superseded_failed = RefCell::new(HashSet::new());
+        let thresholds = AgeThresholds::default();
+        let config = BrigadeConfig {
+            // The Director's own template happens to contain the literal
+            // text `{request}` too, to prove it is left untouched for a
+            // role `render` was not given a request path for.
+            director_prompt: "director sees: {request}".to_string(),
+            goinkyo_prompt: "read {request} first".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
+        let deps = Deps {
+            claude_home: &claude_home,
+            codex_home: None,
+            thresholds: &thresholds,
+            store: &store,
+            superseded_failed: &superseded_failed,
+            brigade: &config,
+            agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
+        };
+
+        let goinkyo_briefing = member_briefing(&deps, brigade_id, "goinkyo", BrigadeRole::Goinkyo)
+            .expect("goinkyo_prompt is non-empty");
+        assert!(
+            goinkyo_briefing.starts_with("read ")
+                && goinkyo_briefing.ends_with(&format!("{brigade_id}.txt first")),
+            "expected the request path spliced into the template, got {goinkyo_briefing:?}"
+        );
+        assert!(
+            !goinkyo_briefing.contains("{request}"),
+            "got {goinkyo_briefing:?}"
+        );
+
+        let director_briefing =
+            member_briefing(&deps, brigade_id, "director", BrigadeRole::Director)
+                .expect("director_prompt is non-empty");
+        assert_eq!(
+            director_briefing, "director sees: {request}",
+            "a Director's template must not have {{request}} substituted"
+        );
+    }
+
+    #[test]
+    fn goinkyo_request_path_matches_what_the_shared_join_computes() {
+        // `expected` is computed by calling `mcp::resolve_goinkyo_dir` /
+        // `mcp::goinkyo_request_path` directly here, independently of
+        // whatever this function's own body currently does — not just
+        // pinning the `.../goinkyo/42.txt` suffix as a hand-written
+        // literal, which a differently-based independent join could still
+        // satisfy. If this function's body ever stopped delegating to those
+        // same two calls (reverting to its own hand-rolled join, even one
+        // that happens to match today), or if `resolve_goinkyo_dir`'s own
+        // definition changed without this function picking it up, the two
+        // sides would diverge and this would fail.
+        let expected = crate::mcp::resolve_goinkyo_dir().map(|dir| {
+            crate::mcp::goinkyo_request_path(&dir, 42)
+                .to_string_lossy()
+                .into_owned()
+        });
+        assert_eq!(
+            goinkyo_request_path(42),
+            expected,
+            "this platform is assumed to have a data-local dir for the test to be meaningful"
+        );
+    }
+
+    // --- gather_goinkyo_observation ------------------------------------------
+
+    /// A staged brigade of a Director plus a Goinkyo member row with no
+    /// session id yet — the shape `gather_goinkyo_observation` reads.
+    /// `goinkyo_session_id`, when given, is written to the member row
+    /// instead, for the "already resolved" case.
+    fn staged_goinkyo(goinkyo_session_id: Option<&str>) -> (RefCell<Store>, EmporiumState, App) {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        let session = goinkyo_session_id.map(|id| SessionId(id.to_string()));
+        store
+            .add_brigade_member(
+                brigade_id,
+                "goinkyo",
+                BrigadeRole::Goinkyo,
+                session.as_ref(),
+            )
+            .unwrap();
+
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: brigade_id,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+        let mut dir_row = test_row("dir", AgentKind::ClaudeCode);
+        dir_row.cwd = Some(PathBuf::from("/work/alpha"));
+        let app = App::new(vec![dir_row]);
+        (RefCell::new(store), state, app)
+    }
+
+    #[test]
+    fn a_goinkyo_row_with_no_session_id_is_a_spawn_candidate_in_the_directors_cwd() {
+        let (store, state, app) = staged_goinkyo(None);
+        let GoinkyoObservation::AwaitingSpawn(candidate) =
+            gather_goinkyo_observation(&state, &store, &app)
+        else {
+            panic!("a Goinkyo row with no session id must be reported as awaiting spawn");
+        };
+        assert_eq!(candidate.cwd, PathBuf::from("/work/alpha"));
+    }
+
+    #[test]
+    fn a_goinkyo_row_already_holding_a_session_id_is_unchanged() {
+        // A session id means discovery (or a resume) already resolved this
+        // Goinkyo to a pane — nothing left for the tick to spawn, and this
+        // is not the "row is gone" case either, so the guard must not be
+        // released.
+        let (store, state, app) = staged_goinkyo(Some("g1"));
+        assert_eq!(
+            gather_goinkyo_observation(&state, &store, &app),
+            GoinkyoObservation::Unchanged
+        );
+    }
+
+    #[test]
+    fn no_goinkyo_member_at_all_reports_the_row_as_gone() {
+        // Distinct from every other "nothing to report" case: this is what
+        // tells `update_goinkyo_awaiting_spawn` a consultation was
+        // dismissed out from under a still-staged brigade, so it can
+        // release `goinkyo_open_attempted` for a later one. Disband does
+        // not reach this case at all — it un-stages the brigade first, so
+        // the next observation is `Unchanged`, not this.
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: brigade_id,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+        let app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+
+        assert_eq!(
+            gather_goinkyo_observation(&state, &RefCell::new(store), &app),
+            GoinkyoObservation::NoGoinkyo { brigade_id }
+        );
+    }
+
+    #[test]
+    fn outside_a_staged_brigade_is_always_unchanged() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let state = EmporiumState::new(PrefixKey::default());
+        let app = App::new(vec![]);
+        assert_eq!(
+            gather_goinkyo_observation(&state, &store, &app),
+            GoinkyoObservation::Unchanged
         );
     }
 

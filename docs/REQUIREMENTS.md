@@ -487,9 +487,31 @@ in code, not a schema constraint" (same comment, verbatim).
 **A third role, Goinkyo, exists in `BrigadeRole` and the messaging rules
 below** — the retired elder called back in to arbitrate a Director/Worker
 disagreement, addressable by name but never a broadcast recipient (see
-`send_to_peer` below) — but nothing in this build spawns or summons one:
-that, and the MCP tool a Director would use to call one in, is a later
-phase. No Goinkyo member row exists outside a test fixture today.
+`send_to_peer` below). A Director calls one in with the `consult_goinkyo`
+MCP tool (see "MCP mediation server" below), which files a written
+consultation request and creates the member row; once a tick observes that
+row with no session id yet, it is auto-spawned the same way a fresh Worker
+is (Claude only — `goinkyo_model`/`goinkyo_effort` below), briefed from
+`goinkyo_prompt` with `{request}` substituted for the consultation file's
+path. The spawn is attempted at most once per consultation
+(`EmporiumState::goinkyo_open_attempted`, one guard per brigade): a failed
+attempt is not retried automatically, and the guard is released the moment
+a tick observes a still-staged brigade with no Goinkyo row at all. Nothing
+reaches that today: dismissing a lone Goinkyo (the only thing that would
+leave a brigade staged with its row gone) is not implemented yet, and
+disband takes the brigade off stage *before* the row disappears, so the
+next tick's observation is "not staged" rather than "no row" — the guard
+for a disbanded brigade is simply never released, harmlessly, since that
+brigade id is never staged (and so never observed) again. **Reopening a
+brigade around an already-discovered Goinkyo (one that
+already has a session id) already works**, for free, through the same
+resumed-member path a Director's or Worker's own closed pane reopens
+through (`stage_brigade`) — a resume never carries `--model`, unlike a
+fresh spawn. A Goinkyo that was never discovered (its pane died before it
+had a session id) does *not* reopen through that path — `stage_brigade`'s
+undiscovered-member branch is Worker-only — but stays a fresh-spawn
+candidate for the ordinary tick mechanism above for as long as the brigade
+remains staged.
 
 **Formation.** `B` on a selected session appoints it Director and auto-spawns
 `workers` (config, default 1, clamped 1..=8) fresh Workers beside it. `b` spawns
@@ -589,7 +611,9 @@ pub struct BrigadeConfig {
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub director_prompt: String,    // role briefing template for the Director
     pub worker_prompt: String,      // role briefing template for each Worker
-    pub goinkyo_prompt: String,     // role briefing template for a Goinkyo — no goinkyo_model yet, nothing spawns one
+    pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
+    pub goinkyo_model: String,      // --model for an auto-spawned Goinkyo; "" = no flag; default "fable"; Claude only
+    pub goinkyo_effort: String,     // --effort for an auto-spawned Goinkyo; "" = no flag; default "max"; Claude only
 }
 ```
 
@@ -603,12 +627,15 @@ one shared field could never default sensibly for both at once.
 **Role briefing delivery differs by product.** `director_prompt`,
 `worker_prompt`, and `goinkyo_prompt` all render the same template,
 substituting `{brigade}` (the brigade id), `{token}` (this member's own
-token), and `{peers}` (a comma-joined list of its addressable peers) — an
-empty template means no briefing at all, deliberately a *setting* and not a
-constant: without one, a cell exists only in banto's data model and the
-operator's own screen, and a Director handed three MCP tool names with no
-notion that it leads a cell mostly never uses them. Only how the rendered
-text reaches the member differs by product:
+token), and `{peers}` (a comma-joined list of its addressable peers); a
+Goinkyo's template also substitutes `{request}` (the path to the
+consultation request `consult_goinkyo` filed — see "Brigade" above), left
+alone in the other two roles' templates the same way any unrecognized
+`{...}` is. An empty template means no briefing at all, deliberately a
+*setting* and not a constant: without one, a cell exists only in banto's
+data model and the operator's own screen, and a Director handed three MCP
+tool names with no notion that it leads a cell mostly never uses them. Only
+how the rendered text reaches the member differs by product:
 - **Claude**: on the launch argv, `--append-system-prompt <rendered>`.
 - **Codex has no equivalent flag.** Its briefing instead rides banto's own
   `SessionStart` hook: every Codex member's launch adds a `-c
@@ -662,7 +689,7 @@ tool approval and hook trust are Codex's own two separate mechanisms, solved
 two separate ways here.
 
 The server shares banto's own sqlite store with the TUI process and exposes
-three tools:
+four tools:
 - `send_to_peer(text[, to])` — enqueues a message: a Director broadcasts to
   every Worker by default, or a Worker/Goinkyo sends to the Director;
   `to` names one specific member instead — the only way a Director reaches
@@ -675,6 +702,13 @@ three tools:
   holding unread mail from this member. Replaces an earlier bare ping-style
   health check, added once dogfooding showed a Director launched with only
   the two message tools and no roster information mostly never used them.
+- `consult_goinkyo(question, my_case, settled, unsettled, blind_spot[,
+  their_case][, about])` — Director-only: files a written consultation
+  request and creates the Goinkyo's member row (see "Brigade" above for what
+  happens to that row next). `about` names the Worker the disagreement is
+  with, which makes `their_case` required too; omit both for an impasse with
+  no specific Worker. Refuses if a Goinkyo already exists for the brigade —
+  only one consults at a time, and nothing yet ends a consultation.
 
 Delivery is a pull, never a stdin injection: even though the embedded banto is
 the sole writer to a child's stdin, injecting a peer's message there would

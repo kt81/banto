@@ -317,6 +317,17 @@ pub(crate) enum AgentLaunch {
     Claude {
         resume: Option<String>,
         model: Option<String>,
+        /// `--effort <level>` (`claude --help`: `low`/`medium`/`high`/
+        /// `xhigh`/`max`) — so far only ever set for an auto-spawned
+        /// Goinkyo (`BrigadeConfig::goinkyo_effort`). No Codex counterpart
+        /// on [`Self::Codex`]: Claude's reasoning-effort flag has no
+        /// equivalent there (Codex's nearest is `-c
+        /// model_reasoning_effort`, a `-c` override like the rest of
+        /// [`CodexBrigade`], not a bare flag) — giving `Self::Codex` a
+        /// field this build never fills would be exactly the "unused field
+        /// nobody remembers to leave `None`" risk this enum's own doc says
+        /// the per-variant split exists to avoid.
+        effort: Option<String>,
         append_system_prompt: Option<String>,
         mcp_config: Option<PathBuf>,
     },
@@ -528,17 +539,20 @@ impl CodexBrigade {
 impl AgentLaunch {
     /// Render as `binary`'s own argv (see [`agent_binary`] for resolving
     /// it). Claude's fixed order is the one every existing call site already
-    /// agreed on before this type existed: `--resume`, then `--model`, then
-    /// `--append-system-prompt`, then `--mcp-config`. Codex's: the `resume
-    /// <uuid>` subcommand (or nothing, for a fresh launch), then `-m`, then
-    /// brigade `-c` overrides (if any — see [`CodexBrigade::overrides`]),
-    /// then `-C <cwd>` last, always present.
+    /// agreed on before this type existed, `effort` slotted in right after
+    /// `--model` since `claude --help` groups the two: `--resume`, then
+    /// `--model`, then `--effort`, then `--append-system-prompt`, then
+    /// `--mcp-config`. Codex's: the `resume <uuid>` subcommand (or nothing,
+    /// for a fresh launch), then `-m`, then brigade `-c` overrides (if any —
+    /// see [`CodexBrigade::overrides`]), then `-C <cwd>` last, always
+    /// present.
     pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
         let mut argv = vec![binary.to_string()];
         match self {
             AgentLaunch::Claude {
                 resume,
                 model,
+                effort,
                 append_system_prompt,
                 mcp_config,
             } => {
@@ -549,6 +563,10 @@ impl AgentLaunch {
                 if let Some(model) = model {
                     argv.push("--model".to_string());
                     argv.push(model.clone());
+                }
+                if let Some(effort) = effort {
+                    argv.push("--effort".to_string());
+                    argv.push(effort.clone());
                 }
                 if let Some(prompt) = append_system_prompt {
                     argv.push("--append-system-prompt".to_string());
@@ -603,6 +621,7 @@ pub(crate) fn inplace_argv(
         AgentKind::ClaudeCode => AgentLaunch::Claude {
             resume: session_id.map(str::to_string),
             model: None,
+            effort: None,
             append_system_prompt: None,
             mcp_config: None,
         },
@@ -756,6 +775,7 @@ fn wrap_argv(
         AgentKind::ClaudeCode => AgentLaunch::Claude {
             resume: Some(session_id.to_string()),
             model: None,
+            effort: None,
             append_system_prompt: None,
             mcp_config: None,
         },
@@ -820,6 +840,7 @@ fn new_session_wrap_argv(
     let launch = AgentLaunch::Claude {
         resume: None,
         model: None,
+        effort: None,
         append_system_prompt: None,
         mcp_config: None,
     };
@@ -1199,6 +1220,7 @@ mod tests {
         AgentLaunch::Claude {
             resume: None,
             model: None,
+            effort: None,
             append_system_prompt: None,
             mcp_config: None,
         }
@@ -1217,6 +1239,7 @@ mod tests {
         let launch = AgentLaunch::Claude {
             resume: None,
             model: None,
+            effort: None,
             append_system_prompt: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
         };
@@ -1232,10 +1255,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_launch_effort_renders_right_after_model_and_is_absent_when_none() {
+        let launch = AgentLaunch::Claude {
+            resume: None,
+            model: Some("fable".to_string()),
+            effort: Some("max".to_string()),
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            launch.argv("claude"),
+            ["claude", "--model", "fable", "--effort", "max"].map(str::to_string)
+        );
+
+        let no_effort = AgentLaunch::Claude {
+            resume: None,
+            model: Some("fable".to_string()),
+            effort: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            no_effort.argv("claude"),
+            ["claude", "--model", "fable"].map(str::to_string)
+        );
+    }
+
+    #[test]
     fn agent_launch_combines_every_flag_in_the_fixed_order() {
         let launch = AgentLaunch::Claude {
             resume: Some("sess-1".to_string()),
             model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
         };
@@ -1247,6 +1298,8 @@ mod tests {
                 "sess-1",
                 "--model",
                 "opus",
+                "--effort",
+                "high",
                 "--append-system-prompt",
                 "you are the Director",
                 "--mcp-config",

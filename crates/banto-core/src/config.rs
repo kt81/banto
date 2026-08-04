@@ -199,12 +199,26 @@ pub struct BrigadeConfig {
     /// Director's to give.
     pub worker_prompt: String,
     /// Role briefing appended to a Goinkyo's system prompt at launch. Same
-    /// substitutions and the same empty-string escape hatch as
-    /// [`Self::director_prompt`]/[`Self::worker_prompt`]. No `goinkyo_model`
-    /// counterpart to [`Self::worker_model`] exists yet — nothing spawns a
-    /// Goinkyo in this build, so a model setting for one would have no
-    /// reader.
+    /// substitutions as [`Self::director_prompt`]/[`Self::worker_prompt`],
+    /// plus `{request}` (the consultation request file's path — see
+    /// `crate::briefing::render`), and the same empty-string escape hatch.
     pub goinkyo_prompt: String,
+    /// `--model` an auto-spawned Goinkyo launches with, default `"fable"`.
+    /// Same empty-string escape hatch as [`Self::worker_model`]. Claude
+    /// only — a Goinkyo is always Claude (see [`Self::goinkyo_effort`]'s
+    /// doc for why this build never gives it a Codex counterpart).
+    pub goinkyo_model: String,
+    /// `--effort <level>` an auto-spawned Goinkyo launches with, default
+    /// `"max"` — Claude's own reasoning-effort flag (`claude --help`,
+    /// accepts `low`/`medium`/`high`/`xhigh`/`max`), not a general
+    /// per-product setting: a Goinkyo is Claude-only in this build (see
+    /// `AgentLaunch::Claude`'s own `effort` field), so there is no
+    /// `goinkyo_effort_codex` counterpart the way [`Self::worker_model`]
+    /// has [`Self::worker_model_codex`] — Codex's nearest equivalent would
+    /// be `-c model_reasoning_effort`, a different mechanism entirely, left
+    /// for whenever a Codex Goinkyo is a real feature rather than a
+    /// hypothetical. Same empty-string escape hatch as the model above.
+    pub goinkyo_effort: String,
 }
 
 /// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
@@ -268,10 +282,11 @@ of the time, you hold nothing from before this moment, and you have no \
 stake in what either of them concluded. That is the whole reason you \
 were called.
 
-Read the source yourself. The Director's account of the disagreement is \
-not the evidence — the Worker's own words and the code are. Where the \
-two accounts differ, say which one the code supports; where neither \
-does, say that instead of picking a side.
+The Director filed its request at {request} — read that first, then read \
+the source yourself. The Director's account of the disagreement is not \
+the evidence; the Worker's own words and the code are. Where the two \
+accounts differ, say which one the code supports; where neither does, \
+say that instead of picking a side.
 
 You advise, you do not take the work over. The moment you start \
 changing things you are a party to the argument rather than the one who \
@@ -289,6 +304,8 @@ impl Default for BrigadeConfig {
             director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
             worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
             goinkyo_prompt: DEFAULT_GOINKYO_PROMPT.to_string(),
+            goinkyo_model: "fable".to_string(),
+            goinkyo_effort: "max".to_string(),
         }
     }
 }
@@ -324,6 +341,18 @@ impl BrigadeConfig {
             AgentKind::Codex => &self.worker_model_codex,
         };
         (!raw.is_empty()).then_some(raw.as_str())
+    }
+
+    /// [`Self::goinkyo_model`], or `None` for the empty-string escape hatch.
+    /// No `agent` parameter, unlike [`Self::worker_model_for`]: a Goinkyo is
+    /// always Claude.
+    pub fn goinkyo_model(&self) -> Option<&str> {
+        (!self.goinkyo_model.is_empty()).then_some(self.goinkyo_model.as_str())
+    }
+
+    /// [`Self::goinkyo_effort`], or `None` for the empty-string escape hatch.
+    pub fn goinkyo_effort(&self) -> Option<&str> {
+        (!self.goinkyo_effort.is_empty()).then_some(self.goinkyo_effort.as_str())
     }
 }
 
@@ -685,7 +714,33 @@ mod tests {
         let config = parse("");
         let goinkyo = config.brigade.prompt_for(BrigadeRole::Goinkyo).unwrap();
         assert!(goinkyo.contains("{brigade}"));
+        assert!(goinkyo.contains("{request}"));
         assert!(goinkyo.contains("send_to_peer"));
+    }
+
+    #[test]
+    fn brigade_goinkyo_model_and_effort_default_and_have_their_own_empty_escape_hatch() {
+        let config = Config::default();
+        assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
+        assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
+
+        let cleared = parse("[brigade]\ngoinkyo_model = \"\"\ngoinkyo_effort = \"\"\n");
+        assert_eq!(cleared.brigade.goinkyo_model(), None);
+        assert_eq!(cleared.brigade.goinkyo_effort(), None);
+
+        let overridden = parse("[brigade]\ngoinkyo_model = \"opus\"\ngoinkyo_effort = \"low\"\n");
+        assert_eq!(overridden.brigade.goinkyo_model(), Some("opus"));
+        assert_eq!(overridden.brigade.goinkyo_effort(), Some("low"));
+    }
+
+    #[test]
+    fn an_existing_config_toml_without_goinkyo_model_or_effort_gets_the_defaults() {
+        // Same reasoning as `an_existing_config_toml_without_goinkyo_prompt_
+        // gets_the_default`: a file written before these two fields existed
+        // must keep loading with their own defaults, not an empty value.
+        let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
+        assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
+        assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
     }
 
     #[test]
