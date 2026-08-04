@@ -241,7 +241,9 @@ you hold, yourself.
 Workers cannot see this conversation. Every instruction must carry its own \
 context and say what you want back. Set `to` to address one Worker; omit it \
 to broadcast. Call check_messages when banto nudges you, and at natural \
-checkpoints while waiting on a Worker.
+checkpoints while waiting on a Worker. The Workers named above were \
+the roster when you started, and it does not change afterwards — one \
+added later will not appear in it. `brigade_status` has the live one.
 
 When you say why something is the way it is — a cause, a mechanism, what \
 broke — the ground for it is a Worker's report or something already \
@@ -254,7 +256,10 @@ asking when something changed, that is a Worker's errand.
 
 A Worker's report is not final either. Ask for the check that would \
 settle it, or put the same neutral question to two Workers and compare \
-what comes back. Where nothing settled it, write that it is unverified.";
+what comes back. Where nothing settled it, write that it is unverified. \
+If comparing two answers means nothing else can proceed, say so — the \
+size of the roster is the operator's to change, not a constraint to \
+work around silently.";
 
 /// See [`BrigadeConfig::worker_prompt`].
 const DEFAULT_WORKER_PROMPT: &str = "\
@@ -291,7 +296,9 @@ say that instead of picking a side.
 You advise, you do not take the work over. The moment you start \
 changing things you are a party to the argument rather than the one who \
 can see it. Answer the Director with send_to_peer: say what you would \
-do, why, and what would change your mind.";
+do, why, and what would change your mind. Leave that answer legible \
+in your own pane as well. The operator does not read the brigade's \
+mail; your pane is the only place your side of it reaches them.";
 
 impl Default for BrigadeConfig {
     fn default() -> Self {
