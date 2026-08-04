@@ -346,11 +346,10 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     if text.trim().is_empty() {
         return tool_error("send_to_peer requires a non-empty `text`.");
     }
-    let to = msg
-        .pointer("/params/arguments/to")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let to = match parse_to_arg(msg) {
+        Ok(to) => to,
+        Err(message) => return tool_error(&message),
+    };
     let target = match validate_target(ctx, brigade, role, to) {
         Ok(target) => target,
         Err(message) => return tool_error(&message),
@@ -379,6 +378,51 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
             false,
         ),
         Err(err) => tool_error(&format!("failed to send: {err}")),
+    }
+}
+
+/// Parses `to` from the raw JSON-RPC arguments, distinguishing "no value
+/// given" from "a value was given but it's unusable" — an earlier version
+/// of this collapsed both into the same `None` via a bare
+/// `.and_then(Value::as_str)`, which silently turned a caller's mistake
+/// into a broadcast instead of an error.
+///
+/// `Ok(None)`: `to` is absent, or explicitly `null` (treated the same as
+/// absent — a JSON serializer emitting `null` for a skipped optional field
+/// is exactly as much "no value" as omitting the key, and refusing it would
+/// break a legitimate caller). `Ok(Some(token))`: a non-empty string,
+/// trimmed. `Err`: the wrong JSON type, or a string that's empty once
+/// trimmed — the caller supplied *something*, so silently reinterpreting it
+/// as "no target" would be worse than telling them so.
+///
+/// This was harmless while only Director/Worker existed: every broadcast a
+/// mis-parsed `to` could fall back to was already the caller's only
+/// reachable role anyway. It stopped being harmless the day a Goinkyo could
+/// be in the brigade: a Director's `to` meant to name it — arbitration
+/// material about a Director/Worker disagreement, addressed so it stays off
+/// the Worker's own broadcast — silently falling back to `None` sends that
+/// same text to every Worker instead, including whichever one the
+/// disagreement is about.
+fn parse_to_arg(msg: &Value) -> Result<Option<&str>, String> {
+    match msg.pointer("/params/arguments/to") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Err(
+                    "`to` must not be empty — omit it entirely (or pass null) to broadcast \
+                     instead."
+                        .to_string(),
+                )
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Some(_) => Err(
+            "`to` must be a string naming a brigade member — omit it entirely (or \
+                         pass null) to broadcast instead."
+                .to_string(),
+        ),
     }
 }
 
@@ -1428,6 +1472,120 @@ mod tests {
         assert!(
             for_goinkyo.is_empty(),
             "a broadcast must never reach a Goinkyo, got {for_goinkyo:?}"
+        );
+    }
+
+    #[test]
+    fn send_to_peer_to_null_is_treated_the_same_as_omitting_it() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":60,"method":"tools/call",
+                "params":{"name":"send_to_peer","arguments":{"text":"hi","to":null}}}"#,
+        );
+        assert_eq!(response["result"]["isError"], false);
+        let pulled = ctx
+            .store
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(
+            pulled[0].to_member, None,
+            "`to: null` broadcasts, same as omitting it"
+        );
+    }
+
+    /// The scenario the fix exists for: a `to` that was clearly *supposed*
+    /// to name a target (present, but blank) must error rather than fall
+    /// through to a broadcast — the exact failure mode that, with a
+    /// Goinkyo in the brigade, would have sent arbitration material meant
+    /// for it to every Worker instead. Checks both inboxes stay empty, not
+    /// just that an error came back.
+    #[test]
+    fn send_to_peer_to_empty_or_blank_string_is_an_error_not_a_silent_broadcast() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        ctx.store
+            .add_brigade_member(1, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+
+        for to_value in ["\"\"", "\"   \""] {
+            let response = call(
+                &mut ctx,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":61,"method":"tools/call",
+                        "params":{{"name":"send_to_peer",
+                                  "arguments":{{"text":"hi","to":{to_value}}}}}}}"#
+                ),
+            );
+            assert_eq!(response["result"]["isError"], true, "to={to_value}");
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("broadcast"),
+                "the error should point at omitting `to`: {text:?}"
+            );
+        }
+        assert!(
+            ctx.store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty(),
+            "a rejected `to` must not fall through to a Worker broadcast"
+        );
+        assert!(
+            ctx.store
+                .fetch_brigade_messages(1, "goinkyo", BrigadeRole::Goinkyo)
+                .unwrap()
+                .is_empty(),
+            "a rejected `to` must not reach a Goinkyo either"
+        );
+    }
+
+    #[test]
+    fn send_to_peer_to_wrong_json_type_is_an_error() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+
+        for to_value in ["123", "true", "[]", "{}"] {
+            let response = call(
+                &mut ctx,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":62,"method":"tools/call",
+                        "params":{{"name":"send_to_peer",
+                                  "arguments":{{"text":"hi","to":{to_value}}}}}}}"#
+                ),
+            );
+            assert_eq!(response["result"]["isError"], true, "to={to_value}");
+        }
+        assert!(
+            ctx.store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .is_empty(),
+            "a rejected `to` must not fall through to a broadcast"
         );
     }
 
