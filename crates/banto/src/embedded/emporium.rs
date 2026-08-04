@@ -1442,7 +1442,7 @@ fn gather_goinkyo_observation(
     store: &RefCell<Store>,
     app: &App,
 ) -> GoinkyoObservation {
-    let Stage::Brigade { id, panes, .. } = &state.stage else {
+    let Stage::Brigade { id, director, .. } = &state.stage else {
         return GoinkyoObservation::Unchanged;
     };
     let brigade_id = *id;
@@ -1455,11 +1455,14 @@ fn gather_goinkyo_observation(
     if goinkyo.session_id.is_some() {
         return GoinkyoObservation::Unchanged;
     }
-    // Same cwd resolution as `add_worker`/`stage_brigade`: the Director's
-    // own row, first in `panes` by construction — a Goinkyo has no cwd of
-    // its own to fall back to, and belongs in the same working directory
-    // the rest of the brigade already runs in.
-    let director_row = panes.first().and_then(|key| app.row_for_id(key.as_str()));
+    // Same cwd resolution as `add_worker`: the Director's own row — a
+    // Goinkyo has no cwd of its own to fall back to, and belongs in the
+    // same working directory the rest of the brigade already runs in.
+    // `director: None` (unresolved, or its own pane closed) falls back to
+    // "." the same as `add_worker`'s does.
+    let director_row = director
+        .as_ref()
+        .and_then(|key| app.row_for_id(key.as_str()));
     let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -1838,7 +1841,7 @@ fn draw(
             };
             let focused_tile = focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let block = Block::bordered()
-                .title(tile_title(&state.stage, key))
+                .title(tile_title(state, key))
                 .border_style(border_style(focused_tile));
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
@@ -1885,13 +1888,32 @@ fn draw(
     }
 }
 
-fn tile_title(stage: &Stage, key: &SessionKey) -> String {
-    match stage {
-        Stage::Brigade { panes, .. } => match panes.iter().position(|k| k == key) {
-            Some(0) => "director".to_string(),
-            Some(n) => format!("worker {n}"),
-            _ => "session".to_string(),
-        },
+/// Role, not position: `director` (`Stage::Brigade`'s own field) answers
+/// the Director case directly, and `goinkyo_pane_for` — already tracking
+/// the Goinkyo's current pane through every rename, built for the one-shot
+/// spawn guard — answers the Goinkyo one without any new state. Everything
+/// else is still labeled by its position in `panes` ("worker N"), unchanged
+/// — the display gap this replaces was ever only the Goinkyo showing up as
+/// one of those.
+fn tile_title(state: &EmporiumState, key: &SessionKey) -> String {
+    match &state.stage {
+        Stage::Brigade {
+            id,
+            director,
+            panes,
+            ..
+        } => {
+            if director.as_ref() == Some(key) {
+                "director".to_string()
+            } else if state.goinkyo_pane_for(*id) == Some(key) {
+                "goinkyo".to_string()
+            } else {
+                match panes.iter().position(|k| k == key) {
+                    Some(n) => format!("worker {n}"),
+                    None => "session".to_string(),
+                }
+            }
+        }
         _ => "session".to_string(),
     }
 }
@@ -3132,6 +3154,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: brigade_id,
+            director: Some(SessionKey::from_id("dir")),
             panes: vec![
                 SessionKey::from_id("dir"),
                 SessionKey::from_id(worker_session_id),
@@ -3270,6 +3293,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: brigade_id,
+            director: Some(SessionKey::from_id("dir")),
             panes: vec![
                 SessionKey::from_id("dir"),
                 SessionKey::from_id(worker_session_id),
@@ -3885,6 +3909,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: brigade_id,
+            director: Some(SessionKey::from_id("dir")),
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
@@ -3897,6 +3922,32 @@ mod tests {
     #[test]
     fn a_goinkyo_row_with_no_session_id_is_a_spawn_candidate_in_the_directors_cwd() {
         let (store, state, app) = staged_goinkyo(None);
+        let GoinkyoObservation::AwaitingSpawn(candidate) =
+            gather_goinkyo_observation(&state, &store, &app)
+        else {
+            panic!("a Goinkyo row with no session id must be reported as awaiting spawn");
+        };
+        assert_eq!(candidate.cwd, PathBuf::from("/work/alpha"));
+    }
+
+    #[test]
+    fn a_goinkyo_row_with_no_session_id_is_a_spawn_candidate_in_the_directors_cwd_even_when_panes_are_reversed()
+     {
+        // The Worker staged solo first, ahead of the Director, so
+        // `panes[0]` is the Worker — proves the cwd lookup reads
+        // `director`, not position (the Worker's own row is a distinct,
+        // deliberately different cwd to catch a positional read).
+        let (store, mut state, _app) = staged_goinkyo(None);
+        let worker = SessionKey::from_id("w1");
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.insert(0, worker.clone());
+        }
+        let mut dir_row = test_row("dir", AgentKind::ClaudeCode);
+        dir_row.cwd = Some(PathBuf::from("/work/alpha"));
+        let mut worker_row = test_row("w1", AgentKind::ClaudeCode);
+        worker_row.cwd = Some(PathBuf::from("/work/wrong"));
+        let app = App::new(vec![worker_row, dir_row]);
+
         let GoinkyoObservation::AwaitingSpawn(candidate) =
             gather_goinkyo_observation(&state, &store, &app)
         else {
@@ -3939,6 +3990,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: brigade_id,
+            director: Some(SessionKey::from_id("dir")),
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
@@ -3959,6 +4011,76 @@ mod tests {
             gather_goinkyo_observation(&state, &store, &app),
             GoinkyoObservation::Unchanged
         );
+    }
+
+    // --- tile_title -----------------------------------------------------
+
+    #[test]
+    fn tile_title_labels_the_director_by_role_even_when_panes_are_reversed() {
+        // The Worker staged solo first, ahead of the Director, so
+        // `panes[0]` is the Worker — proves the "director" label reads
+        // `director`, not position, while the Worker's own label still
+        // reflects its actual position ("worker 0", not "worker 1").
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![worker.clone(), director.clone()],
+            focused: 0,
+        };
+        assert_eq!(tile_title(&state, &director), "director");
+        assert_eq!(tile_title(&state, &worker), "worker 0");
+    }
+
+    #[test]
+    fn tile_title_labels_the_goinkyo_pane_by_role_not_position() {
+        // Drives the real spawn path (`Event::GoinkyoAwaitingSpawn` then
+        // `Event::Spawned`) rather than poking at `goinkyo_pane` directly —
+        // it is private to `banto-core`, reachable from here only through
+        // the public events that populate it. This is the exact bug an
+        // operator hit before this fix: a Goinkyo pane showed up titled
+        // "worker 3".
+        let director = SessionKey::from_id("dir");
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![director],
+            focused: 0,
+        };
+        let mut app = App::new(vec![]);
+        let brigade = BrigadeConfig::default();
+        let now = Instant::now();
+
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+                    brigade_id: 1,
+                    cwd: PathBuf::from("/work/alpha"),
+                }),
+            },
+            now,
+        );
+        let goinkyo_key = match cmds.as_slice() {
+            [Cmd::OpenEmbedded { key, .. }] => key.clone(),
+            other => panic!("expected exactly one OpenEmbedded: {other:?}"),
+        };
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: goinkyo_key.clone(),
+            },
+            now,
+        );
+
+        assert_eq!(tile_title(&state, &goinkyo_key), "goinkyo");
     }
 
     // --- window_focus_event: the main loop's FocusGained/FocusLost translation --

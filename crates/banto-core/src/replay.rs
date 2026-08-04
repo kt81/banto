@@ -367,4 +367,66 @@ mod tests {
             Some("session ended: Demo Session")
         );
     }
+
+    // --- the director-fork fixture -----------------------------------------
+    //
+    // Same authoring discipline as `CANONICAL_FIXTURE` above, scoped to the
+    // one rename-following path that a real recording can actually produce:
+    // a brigade forms with zero Workers, the Director's own pane spawns,
+    // then its Claude session auto-compaction-forks in place
+    // (`Event::MemberSessionForked`) — pinning that `Stage::Brigade`'s
+    // `director` field follows the rename, not just `panes`.
+    // `update_discovery_result`'s own version of this same follow (see its
+    // doc) has no equivalent here: it only fires for a key
+    // `SessionKey::is_synthetic()` still calls true, and the Director's key
+    // is never synthetic in a real recording (`BrigadeFormed`'s
+    // `director_row_id` always names an already-known session) — a fixture
+    // built to exercise it would have to fake a shape the shell can't
+    // actually produce, unlike this one. It stays pinned as the direct
+    // `engine.rs` unit test
+    // `discovery_result_on_the_directors_own_key_renames_the_director_field`
+    // instead.
+    const DIRECTOR_FORK_FIXTURE: &str = concat!(
+        "{\"banto_event_stream\":1}\n",
+        "{\"offset_ms\":0,\"event\":{\"RowsLoaded\":{\"rows\":[{\"id\":\"dir-old\",\"agent\":\"ClaudeCode\",\"title\":\"Demo Director\",\"cwd\":\"/tmp/demo\",\"activity\":{\"Idle\":\"Today\"},\"is_agent\":false,\"preview\":null,\"mtime\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"size\":1234,\"source_archived\":false}],\"hidden\":[],\"directors\":[],\"superseded\":[]}}}\n",
+        "{\"offset_ms\":100,\"event\":{\"BrigadeFormed\":{\"director_row_id\":\"dir-old\",\"name\":\"cell\",\"cwd\":\"/tmp/demo\",\"worker_agent\":\"ClaudeCode\",\"worker_model\":\"\",\"result\":{\"Ok\":[1,[]]}}}}\n",
+        "{\"offset_ms\":200,\"event\":{\"Spawned\":{\"key\":\"dir-old\"}}}\n",
+        "{\"offset_ms\":300,\"event\":{\"MemberSessionForked\":{\"brigade_id\":1,\"token\":\"director\",\"old_id\":\"dir-old\",\"new_id\":\"dir-new\"}}}\n",
+    );
+
+    #[test]
+    fn director_fork_fixture_parses_and_replays_the_form_spawn_fork_sequence() {
+        let events = parse_stream(DIRECTOR_FORK_FIXTURE).expect("the fixture is well-formed");
+        assert_eq!(events.len(), 4);
+        let brigade = BrigadeConfig::default();
+        let base = test_instant();
+
+        // Through `Spawned` (offset 200): the brigade stages with the
+        // Director's original key, alone.
+        let mid = replay(&events[..3], &brigade, base);
+        let old_key = engine::SessionKey::from_id("dir-old");
+        assert!(
+            matches!(
+                &mid.state.stage,
+                Stage::Brigade { director, panes, .. }
+                    if director.as_ref() == Some(&old_key) && panes == std::slice::from_ref(&old_key)
+            ),
+            "expected a staged brigade directed by dir-old, got {:?}",
+            mid.state.stage
+        );
+
+        // The full sequence, `MemberSessionForked` (offset 300) included:
+        // both `director` and `panes` follow the rename.
+        let outcome = replay(&events, &brigade, base);
+        let new_key = engine::SessionKey::from_id("dir-new");
+        assert!(
+            matches!(
+                &outcome.state.stage,
+                Stage::Brigade { director, panes, .. }
+                    if director.as_ref() == Some(&new_key) && panes == std::slice::from_ref(&new_key)
+            ),
+            "expected the director rename to follow into both fields, got {:?}",
+            outcome.state.stage
+        );
+    }
 }
