@@ -493,6 +493,71 @@ struct PendingKickoff {
     notified_untrusted: bool,
 }
 
+/// How long a freshly-spawned Goinkyo pane's own output must have been
+/// quiet before [`update_tick`] checks whether it's safe to type
+/// [`GOINKYO_KICKOFF_LINE`] into it — the same bootstrap problem
+/// [`CODEX_KICKOFF_QUIET_PERIOD`]/[`CODEX_WORKER_KICKOFF_LINE`] solve for a
+/// Codex Worker (see that constant's own doc): a Claude session left with
+/// nothing ever typed into it never writes a `projects/*.jsonl` transcript
+/// either, so — like an idle Codex TUI that never runs its `SessionStart`
+/// hook — it stays permanently undiscoverable, and unreachable by relay,
+/// whose own idle detection (`gather_relay_observations`) needs that
+/// transcript to resolve a row at all. Measured 2026-08-04 on a real
+/// Goinkyo left with nothing typed into it: its `sessions/<pid>.json` live
+/// file was written once, 122ms after spawn, and never updated again for
+/// the next ~12 minutes — consistent with a process sitting at an empty
+/// prompt, not one that crashed. Reuses Codex's own measured value rather
+/// than inventing an unmeasured one for Claude's boot noise specifically:
+/// no reason to expect it settles slower, but this has not been separately
+/// measured the way [`CODEX_KICKOFF_QUIET_PERIOD`] was.
+const GOINKYO_KICKOFF_QUIET_PERIOD: Duration = Duration::from_millis(700);
+
+/// The fixed, ASCII-only line banto types into a freshly-spawned Goinkyo's
+/// stdin once its boot output goes quiet (see [`GOINKYO_KICKOFF_QUIET_PERIOD`])
+/// — the turn this starts is what lets it act on the request already
+/// delivered via `--append-system-prompt` (`goinkyo_prompt`'s own
+/// `{request}` substitution) at all: Claude Code does nothing with a
+/// system prompt alone until it receives an actual turn, confirmed on the
+/// same real Goinkyo cited above — no error, no crash, simply nothing
+/// happens until something is typed into it.
+///
+/// Deliberately doesn't repeat what the briefing already says (the
+/// request's path, its peers, why it was summoned) — what's missing is the
+/// trigger, not information; mirrors [`CODEX_WORKER_KICKOFF_LINE`]'s own
+/// "states only what's true, adds no content the model doesn't already
+/// have" philosophy. ASCII-only for the same untested-raw-UTF-8-paste
+/// reason [`RELAY_NUDGE_LINE`] is.
+const GOINKYO_KICKOFF_LINE: &str = "[banto] This pane just started as your brigade's Goinkyo.";
+
+/// A freshly-spawned Goinkyo pane awaiting its own boot output going quiet
+/// before [`update_tick`] asks whether it's safe to type
+/// [`GOINKYO_KICKOFF_LINE`] into it — see that constant's own doc for why
+/// the kickoff exists at all, and [`Cmd::CheckGoinkyoDirectoryTrust`]'s for
+/// why quiet alone isn't enough to type it blind. Queued by
+/// [`update_goinkyo_awaiting_spawn`]'s own `AwaitingSpawn` success branch —
+/// the exact same moment [`EmporiumState::goinkyo_pane`] records the pane,
+/// so the "attempt once per consultation" guarantee that already covers
+/// the spawn itself covers this too, with no separate marker needed.
+/// Removed once the kickoff is actually sent (its `\r` becomes an ordinary
+/// [`PendingSubmit`], the same two-phase shape as a relay nudge or a Codex
+/// kickoff) or the pane unstages first.
+struct PendingGoinkyoKickoff {
+    key: SessionKey,
+    /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
+    /// has no entry yet for this pane (nothing has arrived at all) — the
+    /// moment this tracker was created, i.e. spawn time.
+    spawned_at: Instant,
+    /// This Goinkyo's own cwd — echoed on [`Cmd::CheckGoinkyoDirectoryTrust`]
+    /// once the quiet period elapses, since the pure core has no way to read
+    /// Claude's own trust registry itself and the shell has no other way to
+    /// know which directory to check.
+    cwd: PathBuf,
+    /// Whether [`update_goinkyo_directory_trust_checked`] has already told
+    /// the operator this pane is waiting on an unanswered trust prompt —
+    /// same reasoning as [`PendingKickoff::notified_untrusted`].
+    notified_untrusted: bool,
+}
+
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
 /// `SpawnFailed` know what to do with the result.
 enum PendingOpen {
@@ -646,6 +711,12 @@ pub struct EmporiumState {
     /// as [`Self::last_forwarded_input`].
     last_output_at: HashMap<SessionKey, Instant>,
     pending_kickoffs: Vec<PendingKickoff>,
+    /// The Goinkyo analog of [`Self::pending_kickoffs`] — see
+    /// [`PendingGoinkyoKickoff`]'s own doc for why it's a separate list
+    /// rather than folded into that one (a different underlying trust
+    /// registry, no `needs_codex_kickoff`-style spawn-time flag to key off
+    /// since only [`update_goinkyo_awaiting_spawn`] ever creates one).
+    pending_goinkyo_kickoffs: Vec<PendingGoinkyoKickoff>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
     pending_membership: Option<PendingMembership>,
@@ -764,6 +835,7 @@ impl EmporiumState {
             last_forwarded_input: HashMap::new(),
             last_output_at: HashMap::new(),
             pending_kickoffs: Vec::new(),
+            pending_goinkyo_kickoffs: Vec::new(),
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
             pending_membership: None,
@@ -817,6 +889,8 @@ impl EmporiumState {
         self.last_forwarded_input.remove(key);
         self.last_output_at.remove(key);
         self.pending_kickoffs.retain(|pending| &pending.key != key);
+        self.pending_goinkyo_kickoffs
+            .retain(|pending| &pending.key != key);
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
         }
@@ -1247,6 +1321,26 @@ pub enum Cmd {
         key: SessionKey,
         cwd: PathBuf,
     },
+    /// Read whether Claude has already been told to trust `cwd` — before
+    /// typing [`GOINKYO_KICKOFF_LINE`] into `key`'s pane blind. Mirrors
+    /// [`Cmd::CheckWorkerDirectoryTrust`]'s reasoning above, but backed by
+    /// `banto_io::directory_trust::claude_directory_trust` — a different
+    /// underlying trust registry Codex's own check does not read
+    /// (`execute_check_worker_directory_trust` calls `codex_directory_trust`
+    /// specifically). The Goinkyo's `cwd` is ordinarily the Director's own
+    /// already-trusted one, so this is expected to pass immediately in the
+    /// common case — but this is the first time banto ever types blind into
+    /// a *Claude* pane at all (a Worker never gets typed into —
+    /// `poll_discovery`'s own doc), so the same risk
+    /// `CheckWorkerDirectoryTrust` exists to avoid for Codex applies here
+    /// too, however rarely it actually fires. Issued by [`update_tick`]
+    /// once a [`PendingGoinkyoKickoff`]'s quiet period has elapsed, every
+    /// tick, until the answer comes back trusted. The shell answers with
+    /// `Event::GoinkyoDirectoryTrustChecked`.
+    CheckGoinkyoDirectoryTrust {
+        key: SessionKey,
+        cwd: PathBuf,
+    },
     /// Re-emit a child's OSC 52 clipboard payload on banto's own stdout, so
     /// the real terminal banto is running in performs the copy — banto is a
     /// middleman here, not the clipboard owner (`crate::screen::Screen::
@@ -1370,6 +1464,13 @@ pub enum Event {
     /// here, so there is nothing a third state would let
     /// [`update_worker_directory_trust_checked`] do differently.
     WorkerDirectoryTrustChecked {
+        key: SessionKey,
+        trusted: bool,
+    },
+    /// Answers `Cmd::CheckGoinkyoDirectoryTrust`: whether Claude has been
+    /// told to trust `key`'s pane's own cwd. Same collapsed-bool reasoning
+    /// as [`Self::WorkerDirectoryTrustChecked`].
+    GoinkyoDirectoryTrustChecked {
         key: SessionKey,
         trusted: bool,
     },
@@ -1563,6 +1664,9 @@ pub fn update(
         Event::WorkerDirectoryTrustChecked { key, trusted } => {
             update_worker_directory_trust_checked(state, key, trusted, now)
         }
+        Event::GoinkyoDirectoryTrustChecked { key, trusted } => {
+            update_goinkyo_directory_trust_checked(state, key, trusted, now)
+        }
         Event::BrigadeFormed {
             director_row_id,
             name,
@@ -1617,7 +1721,7 @@ pub fn update(
         } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
         Event::GoinkyoAwaitingSpawn { observation } => {
-            update_goinkyo_awaiting_spawn(state, brigade, observation)
+            update_goinkyo_awaiting_spawn(state, brigade, observation, now)
         }
         Event::WindowFocusChanged { focused } => {
             state.window_focused = focused;
@@ -3652,6 +3756,24 @@ fn update_tick(
         }
     }
 
+    // Goinkyo kickoff: same shape as the Codex Worker kickoff above, once
+    // its own quiet period elapses — see `GOINKYO_KICKOFF_QUIET_PERIOD`'s
+    // own doc for why this exists, and `Cmd::CheckGoinkyoDirectoryTrust`'s
+    // for why quiet alone still isn't enough to type blind.
+    for pending in &state.pending_goinkyo_kickoffs {
+        let quiet_since = state
+            .last_output_at
+            .get(&pending.key)
+            .copied()
+            .unwrap_or(pending.spawned_at);
+        if now.saturating_duration_since(quiet_since) >= GOINKYO_KICKOFF_QUIET_PERIOD {
+            cmds.push(Cmd::CheckGoinkyoDirectoryTrust {
+                key: pending.key.clone(),
+                cwd: pending.cwd.clone(),
+            });
+        }
+    }
+
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
@@ -3712,10 +3834,17 @@ fn update_tick(
 /// Goinkyo actually has a pane, shell-side gathering stops reporting a
 /// candidate for it at all, so nothing is left here to re-fire on
 /// regardless of the guard.
+///
+/// Also queues a [`PendingGoinkyoKickoff`] on success — see that struct's
+/// own doc for why the Goinkyo needs one at all (unlike a Worker: an
+/// operator is always the one giving a fresh Worker its first turn, but
+/// nobody sits at the Goinkyo's own keyboard) — riding on this same
+/// one-shot guard rather than a separate marker of its own.
 fn update_goinkyo_awaiting_spawn(
     state: &mut EmporiumState,
     brigade: &BrigadeConfig,
     observation: GoinkyoObservation,
+    now: Instant,
 ) -> Vec<Cmd> {
     let candidate = match observation {
         GoinkyoObservation::Unchanged => return Vec::new(),
@@ -3772,6 +3901,12 @@ fn update_goinkyo_awaiting_spawn(
             cwd: candidate.cwd.clone(),
         },
     );
+    state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+        key: key.clone(),
+        spawned_at: now,
+        cwd: candidate.cwd.clone(),
+        notified_untrusted: false,
+    });
     vec![Cmd::OpenEmbedded {
         key,
         target: SessionToOpen {
@@ -3832,6 +3967,49 @@ fn update_worker_directory_trust_checked(
     let cmds = vec![Cmd::WritePty {
         key: entry.key.clone(),
         bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+    }];
+    state.pending_submits.push(PendingSubmit {
+        key: entry.key,
+        nudged_at: now,
+    });
+    cmds
+}
+
+/// Answers `Cmd::CheckGoinkyoDirectoryTrust`, always following a
+/// [`PendingGoinkyoKickoff`] whose quiet period has already elapsed. Same
+/// shape as [`update_worker_directory_trust_checked`] — see its own doc —
+/// typing [`GOINKYO_KICKOFF_LINE`] instead of [`CODEX_WORKER_KICKOFF_LINE`]
+/// once trusted, and re-asked every tick while it isn't.
+fn update_goinkyo_directory_trust_checked(
+    state: &mut EmporiumState,
+    key: SessionKey,
+    trusted: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let Some(pos) = state
+        .pending_goinkyo_kickoffs
+        .iter()
+        .position(|p| p.key == key)
+    else {
+        return Vec::new();
+    };
+    if !trusted {
+        if !state.pending_goinkyo_kickoffs[pos].notified_untrusted {
+            state.pending_goinkyo_kickoffs[pos].notified_untrusted = true;
+            state.set_status(
+                format!(
+                    "{GOINKYO_TOKEN}: Claude hasn't been told to trust this directory yet — \
+                     answer its prompt in the pane and it will pick up its first turn"
+                ),
+                now,
+            );
+        }
+        return Vec::new();
+    }
+    let entry = state.pending_goinkyo_kickoffs.remove(pos);
+    let cmds = vec![Cmd::WritePty {
+        key: entry.key.clone(),
+        bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
     }];
     state.pending_submits.push(PendingSubmit {
         key: entry.key,
@@ -7660,6 +7838,216 @@ mod tests {
             "a released guard must allow exactly one more spawn: {reconsult_cmds:?}"
         );
         assert!(state.goinkyo_pane.contains_key(&6));
+    }
+
+    // --- Goinkyo kickoff: PendingGoinkyoKickoff / CheckGoinkyoDirectoryTrust --
+
+    #[test]
+    fn spawning_a_goinkyo_queues_a_pending_kickoff() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(&mut state, &mut app, &brigade, awaiting_spawn(9), now);
+        let [Cmd::OpenEmbedded { key, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
+        assert_eq!(&state.pending_goinkyo_kickoffs[0].key, key);
+        assert_eq!(state.pending_goinkyo_kickoffs[0].spawned_at, now);
+        assert_eq!(
+            state.pending_goinkyo_kickoffs[0].cwd,
+            PathBuf::from("/work/alpha")
+        );
+        assert!(!state.pending_goinkyo_kickoffs[0].notified_untrusted);
+    }
+
+    #[test]
+    fn a_claude_worker_never_queues_a_goinkyo_kickoff() {
+        // The Goinkyo needs a kickoff because nobody sits at its keyboard —
+        // a Worker's operator always gives it its own first turn, so
+        // `open_worker` must never queue one of these regardless of
+        // product.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+
+        open_worker(
+            &mut state,
+            1,
+            "worker-1",
+            &PathBuf::from("/work"),
+            "",
+            AgentKind::ClaudeCode,
+        );
+
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+        // Sanity: the same spawn does queue an ordinary pending_open, so
+        // this isn't just an empty-because-nothing-happened false negative.
+        assert!(!state.pending_opens.is_empty());
+    }
+
+    #[test]
+    fn tick_checks_goinkyo_directory_trust_once_quiet_long_enough_but_not_before() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
+        let spawned_at = test_instant();
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: key.clone(),
+            spawned_at,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + GOINKYO_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
+        );
+        assert!(cmds.is_empty(), "not quiet long enough yet");
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            spawned_at + GOINKYO_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckGoinkyoDirectoryTrust {
+                key: key.clone(),
+                cwd: PathBuf::from("/work"),
+            }]
+        );
+        // Never typed blind: the entry stays queued until the trust check
+        // actually answers.
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
+        assert!(state.pending_submits.is_empty());
+    }
+
+    #[test]
+    fn a_trusted_goinkyo_directory_answer_types_the_kickoff_line_exactly_once() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: true,
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: key.clone(),
+                bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
+            }]
+        );
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+        assert_eq!(state.pending_submits.len(), 1);
+        assert_eq!(state.pending_submits[0].key, key);
+
+        // Re-answering trusted for the same (now-gone) entry is a no-op —
+        // "only once" for the same reason the spawn itself only happens
+        // once: nothing left in `pending_goinkyo_kickoffs` to act on.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked { key, trusted: true },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_goinkyo_directory_answer_keeps_waiting_and_notifies_once() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: false,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty(), "never types blind on an untrusted answer");
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
+        assert!(state.pending_goinkyo_kickoffs[0].notified_untrusted);
+        let status = state.status.clone().unwrap();
+        assert!(status.contains("Claude hasn't been told to trust"));
+
+        // A second untrusted answer must not restamp the same notice.
+        state.status = None;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key,
+                trusted: false,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn a_goinkyo_pane_unstaging_before_its_kickoff_fires_drops_the_pending_entry() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 1,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: key.clone(),
+            spawned_at: test_instant(),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+        });
+
+        state.unstage(&key);
+
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
     }
 
     // --- PrefixKey::parse ---------------------------------------------------
