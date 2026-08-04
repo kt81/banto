@@ -34,7 +34,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use banto_core::model::{
-    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
+    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken, SessionId,
 };
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
@@ -214,8 +214,8 @@ fn tools_list_result() -> Value {
                                 an impasse — by filing a written consultation request. No tool \
                                 exists yet to talk with it directly; it reads this once it \
                                 starts. Fails if a Goinkyo is already part of this brigade: \
-                                only one consults at a time, and nothing yet ends a \
-                                consultation, so a new one cannot start until that changes.",
+                                only one consults at a time — call dismiss_goinkyo to end the \
+                                current one first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -265,6 +265,13 @@ fn tools_list_result() -> Value {
                     "additionalProperties": false,
                 },
             },
+            {
+                "name": "dismiss_goinkyo",
+                "description": "Director only. End the brigade's active consultation, freeing \
+                                it for a later one. Fails if no Goinkyo is currently part of \
+                                this brigade.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            },
         ],
     })
 }
@@ -279,6 +286,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "check_messages" => tool_check_messages(ctx),
         "brigade_status" => tool_brigade_status(ctx),
         "consult_goinkyo" => tool_consult_goinkyo(ctx, msg),
+        "dismiss_goinkyo" => tool_dismiss_goinkyo(ctx),
         other => tool_error(&format!("unknown tool: {other}")),
     }
 }
@@ -633,9 +641,8 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
     };
     if members.iter().any(|m| m.role == BrigadeRole::Goinkyo) {
         return tool_error(
-            "A Goinkyo is already part of this brigade. Only one consults at a time, and \
-             nothing in this build can end a consultation yet, so a new one cannot be \
-             started.",
+            "A Goinkyo is already part of this brigade. Only one consults at a time — call \
+             dismiss_goinkyo to end the current one before starting another.",
         );
     }
 
@@ -716,7 +723,7 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
 
     match ctx
         .store
-        .add_brigade_member(brigade, "goinkyo", BrigadeRole::Goinkyo, None)
+        .add_brigade_member(brigade, GOINKYO_TOKEN, BrigadeRole::Goinkyo, None)
     {
         Ok(()) => tool_text(
             format!(
@@ -732,6 +739,57 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
              consult_goinkyo call for this brigade will overwrite it.",
             path.display()
         )),
+    }
+}
+
+/// `dismiss_goinkyo`: ends the brigade's active consultation by removing
+/// the Goinkyo's member row. Director-only, same as `consult_goinkyo` — its
+/// bookend.
+///
+/// Reuses [`banto_io::store::Store::dismiss_worker`] rather than a new
+/// store method: its SQL deletes by `(brigade_id, member_token)` with no
+/// role filter at all, so it already does exactly the right thing for a
+/// Goinkyo — the name is Worker-specific, the behavior was never
+/// Worker-specific. Whether to rename it (and the several `Worker`-named
+/// engine types built around the same operator-driven flow) is a separate,
+/// larger question flagged to the Director rather than folded in here.
+///
+/// The Goinkyo's own replies survive this: `dismiss_worker` purges mail
+/// *addressed to* the dismissed token, and a Goinkyo's own message is never
+/// that — `BrigadeRole::Goinkyo::addressability` names the Director as its
+/// only reachable peer, so every message a Goinkyo ever sends has
+/// `to_member` either `Some("director")` or `None` (its broadcast target,
+/// also the Director) — never `Some("goinkyo")`, which is the only value
+/// this deletes by. Verified by reading `tool_send_to_peer`'s addressing
+/// and `BrigadeRole::addressability`'s table, not assumed.
+///
+/// Closing whatever pane the Goinkyo had is not this function's job: this
+/// process shares only the store with the emporium, not its `EmporiumState`
+/// — the next tick observing the row gone is what actually closes it
+/// (`engine::update_goinkyo_awaiting_spawn`'s `GoinkyoObservation::NoGoinkyo`
+/// arm).
+fn tool_dismiss_goinkyo(ctx: &mut ServerContext) -> Value {
+    let (brigade, _, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Director {
+        return tool_error("dismiss_goinkyo may only be called by a Director.");
+    }
+    let members = match ctx.store.brigade_members(brigade) {
+        Ok(members) => members,
+        Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
+    };
+    if !members.iter().any(|m| m.role == BrigadeRole::Goinkyo) {
+        return tool_error("No Goinkyo is part of this brigade right now.");
+    }
+    match ctx.store.dismiss_worker(brigade, GOINKYO_TOKEN) {
+        Ok(()) => tool_text(
+            "Consultation ended. The Goinkyo's pane will close on its own shortly.".to_string(),
+            false,
+        ),
+        Err(err) => tool_error(&format!("failed to end the consultation: {err}")),
     }
 }
 
@@ -2441,5 +2499,133 @@ mod tests {
         let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
         assert_eq!(response["result"]["isError"], true);
         assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+    }
+
+    // --- dismiss_goinkyo -----------------------------------------------------
+
+    fn dismiss_call() -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 71,
+            "method": "tools/call",
+            "params": { "name": "dismiss_goinkyo", "arguments": {} }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn dismiss_goinkyo_removes_the_member_row() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+
+        let response = call(&mut ctx, &dismiss_call());
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+        assert!(
+            !ctx.store
+                .brigade_members(1)
+                .unwrap()
+                .iter()
+                .any(|m| m.role == BrigadeRole::Goinkyo),
+            "the Goinkyo row must be gone"
+        );
+    }
+
+    #[test]
+    fn dismiss_goinkyo_with_no_goinkyo_present_is_an_error() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+
+        let response = call(&mut ctx, &dismiss_call());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("No Goinkyo"), "got {text:?}");
+    }
+
+    #[test]
+    fn dismiss_goinkyo_may_only_be_called_by_a_director() {
+        let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
+        ctx.store
+            .add_brigade_member(1, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+
+        let response = call(&mut ctx, &dismiss_call());
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            ctx.store
+                .brigade_members(1)
+                .unwrap()
+                .iter()
+                .any(|m| m.role == BrigadeRole::Goinkyo),
+            "a refused call must not remove the row"
+        );
+    }
+
+    #[test]
+    fn dismiss_goinkyo_leaves_the_goinkyos_own_reply_to_the_director_intact() {
+        // The exact concern the Director asked to be verified before this
+        // was implemented: `Store::dismiss_worker` purges mail *addressed
+        // to* the dismissed token, so this proves the Goinkyo's own outgoing
+        // opinion — never addressed to itself — survives being dismissed.
+        // Both addressing forms a real Goinkyo might use: broadcast
+        // (`to` omitted — its only broadcast target is the Director, so
+        // `to_member` is `None`) and explicit (`to: "director"`, so
+        // `to_member` is `Some("director")`) — neither is ever
+        // `Some("goinkyo")`, the only value `dismiss_worker` deletes by.
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(
+                1,
+                "goinkyo",
+                BrigadeRole::Goinkyo,
+                Some(&SessionId("g".to_string())),
+            )
+            .unwrap();
+        ctx.store
+            .enqueue_brigade_message(
+                1,
+                "goinkyo",
+                BrigadeRole::Director,
+                None,
+                "broadcast opinion",
+            )
+            .unwrap();
+        ctx.store
+            .enqueue_brigade_message(
+                1,
+                "goinkyo",
+                BrigadeRole::Director,
+                Some("director"),
+                "addressed opinion",
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &dismiss_call());
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+
+        let pulled = ctx
+            .store
+            .fetch_brigade_messages(1, "director", BrigadeRole::Director)
+            .unwrap();
+        let bodies: Vec<&str> = pulled.iter().map(|m| m.body.as_str()).collect();
+        assert!(
+            bodies.contains(&"broadcast opinion") && bodies.contains(&"addressed opinion"),
+            "both of the Goinkyo's own messages must survive, got {bodies:?}"
+        );
     }
 }

@@ -494,15 +494,37 @@ row with no session id yet, it is auto-spawned the same way a fresh Worker
 is (Claude only — `goinkyo_model`/`goinkyo_effort` below), briefed from
 `goinkyo_prompt` with `{request}` substituted for the consultation file's
 path. The spawn is attempted at most once per consultation
-(`EmporiumState::goinkyo_open_attempted`, one guard per brigade): a failed
-attempt is not retried automatically, and the guard is released the moment
-a tick observes a still-staged brigade with no Goinkyo row at all. Nothing
-reaches that today: dismissing a lone Goinkyo (the only thing that would
-leave a brigade staged with its row gone) is not implemented yet, and
-disband takes the brigade off stage *before* the row disappears, so the
-next tick's observation is "not staged" rather than "no row" — the guard
-for a disbanded brigade is simply never released, harmlessly, since that
-brigade id is never staged (and so never observed) again. **Reopening a
+(`EmporiumState::goinkyo_pane`, one guard per brigade, mapped to the
+`SessionKey` that spawn used): a failed attempt is not retried
+automatically.
+
+**Ending a consultation** removes the Goinkyo's member row, which releases
+the guard above and — the next time a tick observes a still-staged brigade
+with no Goinkyo row at all — unstages and kills whatever pane was tracked
+for it, the same way dismissing a Worker already closes its pane. Two ways
+to end one: the Director's own `dismiss_goinkyo` MCP tool (see "MCP
+mediation server" below), or the operator picking Dismiss from the
+prefix-`x` kill-confirm dialog on the Goinkyo's own pane — the same choice
+a Worker's pane already offered.
+
+That dialog decides in two separate stages, not one: *whether to offer*
+Dismiss at all is still a pane-position check (`focused != 0` — the
+Director's own pane is conventionally `panes[0]`, but nothing actually
+enforces that: `Store::brigade_members`' `ORDER BY` puts the Director
+first, and the common formation path preserves that order into `panes`,
+but a resume where the Director's own pane needs a fresh `Cmd::OpenEmbedded`
+while another member's is already open can append them out of that order —
+see `engine.rs`'s `stage_brigade`/`update_spawned`). *Whether a confirmed
+Dismiss actually deletes anything* is a separate, later check on the
+member's real role from the store (`update_membership_resolved`), which
+refuses for a Director regardless of what the dialog showed. So the
+position check can only misfire toward a UX gap (Dismiss missing, or
+offered, on the wrong pane) — never toward an actual wrong deletion; the
+real gate is the role check downstream. Disband does *not* reach the
+brigade off stage *before* the row disappears, so the next tick's
+observation is "not staged" rather than "no row" — the guard for a
+disbanded brigade is simply never released, harmlessly, since that brigade
+id is never staged (and so never observed) again. **Reopening a
 brigade around an already-discovered Goinkyo (one that
 already has a session id) already works**, for free, through the same
 resumed-member path a Director's or Worker's own closed pane reopens
@@ -689,7 +711,7 @@ tool approval and hook trust are Codex's own two separate mechanisms, solved
 two separate ways here.
 
 The server shares banto's own sqlite store with the TUI process and exposes
-four tools:
+five tools:
 - `send_to_peer(text[, to])` — enqueues a message: a Director broadcasts to
   every Worker by default, or a Worker/Goinkyo sends to the Director;
   `to` names one specific member instead — the only way a Director reaches
@@ -708,7 +730,11 @@ four tools:
   happens to that row next). `about` names the Worker the disagreement is
   with, which makes `their_case` required too; omit both for an impasse with
   no specific Worker. Refuses if a Goinkyo already exists for the brigade —
-  only one consults at a time, and nothing yet ends a consultation.
+  only one consults at a time; `dismiss_goinkyo` ends the current one.
+- `dismiss_goinkyo()` — Director-only: ends the brigade's active
+  consultation by removing the Goinkyo's member row (see "Brigade" above for
+  what that triggers). Refuses if no Goinkyo is currently part of the
+  brigade.
 
 Delivery is a pull, never a stdin injection: even though the embedded banto is
 the sole writer to a child's stdin, injecting a peer's message there would

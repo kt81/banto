@@ -1410,8 +1410,8 @@ fn gather_relay_observations(
 /// this crate has no way to construct one to look `state.screens`/
 /// `pending_opens` up by. `update_goinkyo_awaiting_spawn` does that check
 /// itself instead, on the core side where the constructor is reachable; see
-/// its own doc for why `EmporiumState::goinkyo_open_attempted` is the
-/// primary guard either way, and that lookup only a defensive second one.
+/// its own doc for why `EmporiumState::goinkyo_pane` is the primary guard
+/// either way, and that lookup only a defensive second one.
 fn gather_goinkyo_observation(
     state: &EmporiumState,
     store: &RefCell<Store>,
@@ -3898,8 +3898,8 @@ mod tests {
         // Distinct from every other "nothing to report" case: this is what
         // tells `update_goinkyo_awaiting_spawn` a consultation was
         // dismissed out from under a still-staged brigade, so it can
-        // release `goinkyo_open_attempted` for a later one. Disband does
-        // not reach this case at all — it un-stages the brigade first, so
+        // release `goinkyo_pane` for a later one. Disband does not reach
+        // this case at all — it un-stages the brigade first, so
         // the next observation is `Unchanged`, not this.
         let mut store = Store::open_in_memory().unwrap();
         let brigade_id = store.create_brigade("cell").unwrap();

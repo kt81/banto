@@ -31,7 +31,9 @@ use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crate::key_encode::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
-use crate::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionRow, SessionToOpen};
+use crate::model::{
+    AgentKind, BrigadeId, BrigadeRole, GOINKYO_TOKEN, MemberToken, SessionRow, SessionToOpen,
+};
 
 /// Fixed width of the left sidebar (the session list), in columns.
 pub const SIDEBAR_WIDTH: u16 = 36;
@@ -65,6 +67,9 @@ impl SessionKey {
         Self(format!("new::{}::{discriminator}", cwd.display()))
     }
 
+    /// Named (and shaped) for a Worker, its first use, but carries no role
+    /// of its own — `update_goinkyo_awaiting_spawn` reuses it verbatim for
+    /// a still-undiscovered Goinkyo's placeholder, `token: "goinkyo"`.
     fn new_worker(brigade_id: BrigadeId, token: &str) -> Self {
         Self(format!("new-worker::{brigade_id}::{token}"))
     }
@@ -79,11 +84,12 @@ impl SessionKey {
         self.0.starts_with("new::") || self.0.starts_with("new-worker::")
     }
 
-    /// If this is a still-awaiting-discovery Worker's placeholder (built by
-    /// [`Self::new_worker`]), the `(brigade_id, token)` embedded in it —
-    /// `None` for every other key, including a *resolved* Worker's real
-    /// session id, which carries no brigade info of its own (that needs a
-    /// store round trip — see `confirm_kill_modal`'s dismiss path).
+    /// If this is a still-awaiting-discovery placeholder (built by
+    /// [`Self::new_worker`] — a Worker's or, per that constructor's own
+    /// doc, a Goinkyo's), the `(brigade_id, token)` embedded in it — `None`
+    /// for every other key, including a *resolved* member's real session
+    /// id, which carries no brigade info of its own (that needs a store
+    /// round trip — see `confirm_kill_modal`'s dismiss path).
     fn worker_identity(&self) -> Option<(BrigadeId, MemberToken)> {
         let rest = self.0.strip_prefix("new-worker::")?;
         let (id, token) = rest.split_once("::")?;
@@ -106,7 +112,24 @@ pub enum Stage {
     Solo(SessionKey),
     Brigade {
         id: BrigadeId,
-        /// Director first.
+        /// Director first, by convention rather than an enforced
+        /// invariant: `Store::brigade_members`' own `ORDER BY` puts the
+        /// Director first, and the common formation path
+        /// (`update_spawned`'s `BrigadeDirector` arm, then `BrigadeMember`)
+        /// preserves that order into this vec — but a resume where the
+        /// Director's own pane needs a fresh `Cmd::OpenEmbedded` while
+        /// another member's is already open (`stage_brigade`) can append
+        /// them out of that order, and closing just the Director's own
+        /// pane (prefix-`x`, `ClosePane` — never routed through dismiss,
+        /// see `PrefixAction::Kill`'s own doc) leaves this brigade staged
+        /// with whatever was `panes[1]` now at index 0. Several sites still
+        /// read index 0 as "the Director" without checking: `add_worker`
+        /// (a fresh Worker's cwd), `FocusPane`'s own doc (`1`-`9` prefix
+        /// keys), and — most consequentially — `update_disbanded`, which
+        /// decides what to *kill* by position, not by `App`'s own
+        /// `directors` id set that already exists and already gates
+        /// disband's own trigger. None of this is fixed here; flagged, not
+        /// yet acted on.
         panes: Vec<SessionKey>,
         focused: usize,
     },
@@ -398,10 +421,10 @@ pub struct GoinkyoSpawnCandidate {
 /// [`update_goinkyo_awaiting_spawn`] needs that distinction: "no Goinkyo
 /// member row, on a brigade that's still staged" is the one case that means
 /// a consultation was dismissed out from under it, and is the signal that
-/// releases [`EmporiumState::goinkyo_open_attempted`] for that brigade —
-/// every other "nothing to report" reason must leave it untouched. See
-/// `goinkyo_open_attempted`'s own doc for why a disbanded brigade never
-/// reaches this case at all.
+/// releases (and closes the pane tracked by) [`EmporiumState::goinkyo_pane`]
+/// for that brigade — every other "nothing to report" reason must leave it
+/// untouched. See `goinkyo_pane`'s own doc for why a disbanded brigade
+/// never reaches this case at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoinkyoObservation {
     /// Not a staged brigade, or the Goinkyo row already has a session id
@@ -684,32 +707,49 @@ pub struct EmporiumState {
     /// produces the one `CSI O`/`CSI I` pair it actually represents, not a
     /// repeat on every tick.
     last_focus_notified: Option<SessionKey>,
-    /// Brigades [`update_goinkyo_awaiting_spawn`] has already issued a
-    /// `Cmd::OpenEmbedded` for — a brigade is inserted the moment that
-    /// happens, success or failure, and *not* removed by
-    /// [`update_spawn_failed`] the way [`Self::pending_opens`] is. Without a
-    /// marker surviving past that removal, a failed spawn would look
-    /// identical next tick to "never tried" (no session id, no pane, either
-    /// way), and the tick fires every second the condition holds — this is
-    /// what turns that into "attempt once per consultation" instead of
-    /// "once a second until it works or the brigade is gone". A `HashSet`
-    /// rather than a single `Option<BrigadeId>` slot: more than one brigade
-    /// can be staged (in the store, even if only one is staged in the UI at
-    /// a time) and each attempts independently — a single slot would let
-    /// staging brigade B overwrite brigade A's own marker, so switching back
-    /// to A (its Goinkyo still unresolved) would look like "never tried"
-    /// again and re-fire. Removed for a brigade the instant
-    /// [`update_goinkyo_awaiting_spawn`] is told that brigade's Goinkyo row
-    /// is gone (`GoinkyoObservation::NoGoinkyo`) — a future "dismiss" that
-    /// leaves the brigade staged, so a later consultation on the same
-    /// brigade is not permanently blocked by a stale marker from the one
-    /// before it. Disband does *not* reach this removal: it un-stages the
-    /// brigade first (`update_disbanded`), so the next gather sees no
+    /// The brigades [`update_goinkyo_awaiting_spawn`] has already issued a
+    /// `Cmd::OpenEmbedded` for, each mapped to the `SessionKey` that spawn
+    /// used — a brigade is inserted the moment that happens, success or
+    /// failure, and *not* removed by [`update_spawn_failed`] the way
+    /// [`Self::pending_opens`] is. Without an entry surviving past that
+    /// removal, a failed spawn would look identical next tick to "never
+    /// tried" (no session id, no pane, either way), and the tick fires
+    /// every second the condition holds — this is what turns that into
+    /// "attempt once per consultation" instead of "once a second until it
+    /// works or the brigade is gone". A `HashMap` rather than a single
+    /// `Option<BrigadeId>` slot: more than one brigade can be staged (in the
+    /// store, even if only one is staged in the UI at a time) and each
+    /// attempts independently — a single slot would let staging brigade B
+    /// overwrite brigade A's own entry, so switching back to A (its Goinkyo
+    /// still unresolved) would look like "never tried" again and re-fire.
+    ///
+    /// The key half serves a second purpose besides the guard: when
+    /// [`update_goinkyo_awaiting_spawn`] is told a brigade's Goinkyo row is
+    /// gone (`GoinkyoObservation::NoGoinkyo` — dismissed via
+    /// `end_consultation`/an operator's own dismiss, both of which delete
+    /// the row while leaving the brigade staged), the entry is removed —
+    /// unblocking a later consultation on the same brigade — and, if the
+    /// pane it names is still actually staged, that pane is unstaged and
+    /// killed right there, the same way [`update_worker_dismissed`] already
+    /// closes a dismissed Worker's. The shell has no way to identify which
+    /// staged pane was the Goinkyo's once its row is gone (nothing else
+    /// about a pane says so), which is why this tracks it here instead of
+    /// asking the shell to work it out fresh each tick the way every other
+    /// gather function does. Kept current across a discovery rename
+    /// (`update_discovery_result`) or a compact fork
+    /// (`update_member_session_forked`) — both know the renamed member's
+    /// own token, so both update this entry in place when that token is
+    /// `"goinkyo"` and an entry for its brigade already exists — and
+    /// dropped (not `Cmd::KillPty`'d — nothing to kill twice) if the pane
+    /// closes on its own first (`update_pty_exited`).
+    ///
+    /// Disband does *not* reach the `NoGoinkyo` removal above: it un-stages
+    /// the brigade first (`update_disbanded`), so the next gather sees no
     /// staged brigade at all and reports `Unchanged`, never `NoGoinkyo` —
-    /// the marker for a disbanded brigade simply stays in this set forever,
+    /// the entry for a disbanded brigade simply stays here forever,
     /// harmlessly, since that brigade id is never staged (and so never
     /// gathered for) again.
-    goinkyo_open_attempted: HashSet<BrigadeId>,
+    goinkyo_pane: HashMap<BrigadeId, SessionKey>,
 }
 
 impl EmporiumState {
@@ -739,7 +779,7 @@ impl EmporiumState {
             next_plain_id: 0,
             window_focused: true,
             last_focus_notified: None,
-            goinkyo_open_attempted: HashSet::new(),
+            goinkyo_pane: HashMap::new(),
         }
     }
 
@@ -1967,11 +2007,14 @@ fn resolve_armed_prefix(
                 .map(|row| row.display_title().to_string())
                 .unwrap_or_else(|| target.as_str().to_string());
             // Director is always `panes[0]` (see `Stage::Brigade`'s doc), so
-            // any other focused pane in a staged brigade is a Worker —
-            // structural, no store round trip needed just to grow the
-            // dialog its second choice.
-            let is_worker = matches!(&state.stage, Stage::Brigade { focused, .. } if *focused != 0);
-            app.open_confirm_kill_modal(target.as_str().to_string(), title, is_worker);
+            // any other focused pane in a staged brigade is a dismissable
+            // member — Worker or Goinkyo, [`update_membership_resolved`]
+            // is what actually tells the two apart once dismiss is
+            // confirmed — structural, no store round trip needed just to
+            // grow the dialog its second choice.
+            let dismissable =
+                matches!(&state.stage, Stage::Brigade { focused, .. } if *focused != 0);
+            app.open_confirm_kill_modal(target.as_str().to_string(), title, dismissable);
             Vec::new()
         }
         PrefixAction::Unbound => {
@@ -2267,19 +2310,22 @@ fn confirm_disband_modal(app: &mut App) -> Vec<Cmd> {
 }
 
 /// Confirm the kill dialog. [`KillChoice::ClosePane`] (the only choice for a
-/// Director/solo pane, and the default for a Worker's) just makes the exit
-/// happen — no store mutation, membership persists, and a killed Worker
-/// respawns fresh under the same token the next time its brigade is staged
-/// (the existing, field-tested disposable-Worker semantics `stage_brigade`
-/// already has for one whose process is simply gone). The passive
-/// `Event::PtyExited` fold (unchanged, see `update_pty_exited`) is what
-/// actually cleans up the pane once the kill takes effect.
+/// Director/solo pane, and the default for a dismissable member's — Worker
+/// or Goinkyo) just makes the exit happen — no store mutation, membership
+/// persists, and a killed member respawns fresh under the same token the
+/// next time its brigade is staged (the existing, field-tested disposable-
+/// Worker semantics `stage_brigade` already has for one whose process is
+/// simply gone — equally true for a Goinkyo with a resolved session id, its
+/// own resumed-member branch there). The passive `Event::PtyExited` fold
+/// (unchanged, see `update_pty_exited`) is what actually cleans up the pane
+/// once the kill takes effect.
 ///
 /// [`KillChoice::Dismiss`] needs `(brigade_id, token)` before
 /// `StoreIntent::DismissWorker` can be built: a still-awaiting-discovery
-/// Worker's synthetic key already embeds them
-/// ([`SessionKey::worker_identity`]), so that path builds the intent right
-/// here; a resolved Worker's real session id does not, so that path stashes
+/// member's synthetic key already embeds them
+/// ([`SessionKey::worker_identity`] — Worker-named, Goinkyo-shaped too, see
+/// its own doc), so that path builds the intent right here; a resolved
+/// member's real session id does not, so that path stashes
 /// [`PendingMembership::DismissWorker`] and spends one `ResolveMembership`
 /// round trip instead. Either way `state.pending_dismiss` is set first, so
 /// [`update_worker_dismissed`] knows which pane to actually remove once the
@@ -2352,18 +2398,20 @@ fn update_membership_resolved(
     // (not a Worker anymore, or not found) matters regardless of whether
     // this session still has a row.
     if matches!(purpose, PendingMembership::DismissWorker) {
-        // `Some((.., Director | Goinkyo)) | None` spelled out rather than
-        // `_`: a role added later has to land in one arm or the other
-        // explicitly, not fall silently into whichever one the wildcard
-        // used to catch. A Goinkyo is no more a Worker than a Director is,
-        // so it lands here — nothing spawns one yet, but this dismiss flow
-        // is only ever reachable for a pane the operator is looking at, and
-        // an unexpected answer here has always meant "abort", never "guess".
+        // A Goinkyo dismisses exactly the way a Worker does — same store
+        // operation, same pane cleanup — so it shares this arm rather than
+        // landing in the abort one below; only a Director can't be
+        // dismissed this way (that's disband's job, `B`). `Some((_, _,
+        // BrigadeRole::Director)) | None` spelled out rather than `_`: a
+        // role added later has to land in one arm or the other explicitly,
+        // not fall silently into whichever one the wildcard used to catch —
+        // an unexpected answer here has always meant "abort", never
+        // "guess".
         return match membership {
-            Some((brigade_id, token, BrigadeRole::Worker)) => {
+            Some((brigade_id, token, BrigadeRole::Worker | BrigadeRole::Goinkyo)) => {
                 vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
             }
-            Some((_, _, BrigadeRole::Director | BrigadeRole::Goinkyo)) | None => {
+            Some((_, _, BrigadeRole::Director)) | None => {
                 state.pending_dismiss = None;
                 Vec::new()
             }
@@ -3124,6 +3172,15 @@ fn update_pty_exited(
 ) -> Vec<Cmd> {
     state.screens.remove(&key);
     state.unstage(&key);
+    // A Goinkyo pane can close this way without ever being dismissed (the
+    // operator plain-kills it, or its process just dies) — `goinkyo_pane`'s
+    // own doc: still discoverable, so a later re-stage reopens it the same
+    // way a killed Worker's pane does. Dropping the entry here is state
+    // hygiene, not correctness (a stale entry only means a future
+    // `NoGoinkyo` tries to unstage/kill an already-gone key, both harmless
+    // no-ops), but leaving it around would be one more stale-value question
+    // a future reader has to work through.
+    state.goinkyo_pane.retain(|_, pane| *pane != key);
     // A Director-reopen confirm killed exactly this pane and is waiting for
     // it to actually be gone before reopening it wired — see
     // `confirm_director_reopen_modal`'s doc for why "gone" can't be assumed
@@ -3223,6 +3280,20 @@ fn update_discovery_result(
         _ => {}
     }
     if let Some((brigade_id, token)) = member {
+        // Keep `goinkyo_pane` pointing at the pane it actually names: it was
+        // recorded under the *synthetic* key at spawn time
+        // (`update_goinkyo_awaiting_spawn`'s `AwaitingSpawn` branch), and
+        // this is the discovery that resolves that synthetic key to a real
+        // session id — the entry has to follow, or the eventual
+        // `NoGoinkyo` would try to close a pane under a key nothing is
+        // staged at anymore. `get_mut` rather than an unconditional insert:
+        // only follows an entry `update_goinkyo_awaiting_spawn` already
+        // created, never invents one for a brigade it never attempted.
+        if token == GOINKYO_TOKEN
+            && let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id)
+        {
+            *pane = new_key.clone();
+        }
         cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
             brigade_id,
             token,
@@ -3281,6 +3352,15 @@ fn update_member_session_forked(
                         *pane = new_key.clone();
                     }
                 }
+            }
+            // Same reasoning as `update_discovery_result`'s own version of
+            // this: `goinkyo_pane` has to follow a fork's rename too, or a
+            // later `NoGoinkyo` would try to close a pane under a key
+            // nothing is staged at anymore.
+            if token.as_str() == GOINKYO_TOKEN
+                && let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id)
+            {
+                *pane = new_key.clone();
             }
             cmds.push(Cmd::RekeyPty {
                 from: old_key,
@@ -3616,16 +3696,16 @@ fn update_tick(
 }
 
 /// Answers `Event::GoinkyoAwaitingSpawn`: spawn the Goinkyo `observation`
-/// names, at most once per consultation, and release the guard once a
-/// consultation is observed to have ended.
+/// names, at most once per consultation; once a consultation is observed to
+/// have ended, release the guard and close whatever pane it left staged.
 ///
-/// The one-shot guard is [`EmporiumState::goinkyo_open_attempted`], not
+/// The one-shot guard is [`EmporiumState::goinkyo_pane`], not
 /// [`EmporiumState::pending_opens`] (which this still populates, the same
 /// way [`open_worker`] does, so [`update_spawned`] knows to append the new
 /// pane to the staged brigade once it lands): `pending_opens` is cleared by
 /// [`update_spawn_failed`] the moment a spawn fails, which leaves exactly
 /// the same trace a Goinkyo that was never even attempted has — no session
-/// id, no pane, either way. Without a marker that survives past that
+/// id, no pane, either way. Without an entry that survives past that
 /// removal, this — reachable roughly once a second for as long as the
 /// condition holds — could not tell "just failed" from "never tried", and
 /// would fire again next tick. Success needs no matching care: once the
@@ -3645,30 +3725,42 @@ fn update_goinkyo_awaiting_spawn(
         // reaches this arm at all. Releasing the guard here rather than on
         // success/failure is what lets a *later* consultation on the same
         // brigade spawn again, without needing to know anything about the
-        // one before it.
+        // one before it — and closing whatever pane the removed entry names
+        // is the other half of `goinkyo_pane`'s own doc: nothing else knows
+        // which staged pane was the Goinkyo's once its row is gone.
         GoinkyoObservation::NoGoinkyo { brigade_id } => {
-            state.goinkyo_open_attempted.remove(&brigade_id);
-            return Vec::new();
+            let Some(key) = state.goinkyo_pane.remove(&brigade_id) else {
+                return Vec::new();
+            };
+            let staged = matches!(
+                &state.stage,
+                Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&key)
+            );
+            if !staged {
+                return Vec::new();
+            }
+            state.unstage(&key);
+            return vec![Cmd::KillPty { key }];
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
-    if state.goinkyo_open_attempted.contains(&candidate.brigade_id) {
+    if state.goinkyo_pane.contains_key(&candidate.brigade_id) {
         return Vec::new();
     }
-    let key = SessionKey::new_worker(candidate.brigade_id, "goinkyo");
-    // Belt-and-suspenders alongside `goinkyo_open_attempted` above: the
-    // guard is what actually distinguishes "just failed" from "never
-    // tried" (see this function's own doc), but a pane or an in-flight
-    // open already existing for this key — the same evidence
-    // `open_worker`'s reuse branch checks (line ~2674) — is a second,
-    // independent reason not to spawn again, cheap to check now that this
-    // crate can build the key at all (the shell-side gatherer cannot:
-    // `SessionKey::new_worker` is private to this crate, which is exactly
-    // why this check lives here and not there).
+    let key = SessionKey::new_worker(candidate.brigade_id, GOINKYO_TOKEN);
+    // Belt-and-suspenders alongside `goinkyo_pane` above: the guard is what
+    // actually distinguishes "just failed" from "never tried" (see this
+    // function's own doc), but a pane or an in-flight open already existing
+    // for this key — the same evidence `open_worker`'s reuse branch checks
+    // (line ~2674) — is a second, independent reason not to spawn again,
+    // cheap to check now that this crate can build the key at all (the
+    // shell-side gatherer cannot: `SessionKey::new_worker` is private to
+    // this crate, which is exactly why this check lives here and not
+    // there).
     if state.screens.contains_key(&key) || state.pending_opens.contains_key(&key) {
         return Vec::new();
     }
-    state.goinkyo_open_attempted.insert(candidate.brigade_id);
+    state.goinkyo_pane.insert(candidate.brigade_id, key.clone());
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
@@ -3690,7 +3782,7 @@ fn update_goinkyo_awaiting_spawn(
         },
         brigade: Some((
             candidate.brigade_id,
-            "goinkyo".to_string(),
+            GOINKYO_TOKEN.to_string(),
             BrigadeRole::Goinkyo,
         )),
         model: brigade.goinkyo_model().map(str::to_string),
@@ -7151,7 +7243,7 @@ mod tests {
             test_instant(),
         );
         assert!(cmds.is_empty());
-        assert!(state.goinkyo_open_attempted.is_empty());
+        assert!(state.goinkyo_pane.is_empty());
     }
 
     #[test]
@@ -7192,7 +7284,7 @@ mod tests {
         );
         assert_eq!(model.as_deref(), Some("fable"));
         assert_eq!(effort.as_deref(), Some("max"));
-        assert!(state.goinkyo_open_attempted.contains(&7));
+        assert!(state.goinkyo_pane.contains_key(&7));
     }
 
     #[test]
@@ -7261,7 +7353,7 @@ mod tests {
         // The spawn fails — `update_spawn_failed`'s own doc: this clears
         // `pending_opens` unconditionally, leaving exactly the same trace a
         // Goinkyo that was never even attempted has (no session id, no
-        // pane). `goinkyo_open_attempted` is the only thing left standing
+        // pane). `goinkyo_pane` is the only thing left standing
         // that can tell the two apart.
         update(
             &mut state,
@@ -7292,7 +7384,7 @@ mod tests {
 
     #[test]
     fn an_already_open_pane_is_a_second_reason_not_to_spawn() {
-        // Defense in depth alongside `goinkyo_open_attempted`: if a pane for
+        // Defense in depth alongside `goinkyo_pane`: if a pane for
         // this Goinkyo's synthetic key is already known open, the guard must
         // refuse regardless of the marker, since the marker is untouched
         // (never inserted before the call under test).
@@ -7311,7 +7403,7 @@ mod tests {
         );
         assert!(cmds.is_empty());
         assert!(
-            !state.goinkyo_open_attempted.contains(&4),
+            !state.goinkyo_pane.contains_key(&4),
             "the marker must not be inserted on a path that never actually spawned anything"
         );
     }
@@ -7347,7 +7439,7 @@ mod tests {
         );
         assert!(cmds.is_empty());
         assert!(
-            !state.goinkyo_open_attempted.contains(&5),
+            !state.goinkyo_pane.contains_key(&5),
             "the marker must not be inserted on a path that never actually spawned anything"
         );
     }
@@ -7355,13 +7447,12 @@ mod tests {
     #[test]
     fn attempting_for_one_brigade_survives_another_brigade_being_attempted_in_between() {
         // A single `Option<BrigadeId>` slot would let staging brigade 2
-        // overwrite brigade 1's own marker, so switching back to 1 (its
+        // overwrite brigade 1's own entry, so switching back to 1 (its
         // Goinkyo still unresolved) would look like "never tried" and
-        // re-fire — exactly the bug `goinkyo_open_attempted` becoming a
-        // `HashSet` fixes. Two different brigades can each hold a Goinkyo
-        // row in the store independently; only one is ever staged in the UI
-        // at a time, but switching which one is staged must not disturb the
-        // other's guard.
+        // re-fire — exactly the bug `goinkyo_pane` being a `HashMap` fixes.
+        // Two different brigades can each hold a Goinkyo row in the store
+        // independently; only one is ever staged in the UI at a time, but
+        // switching which one is staged must not disturb the other's guard.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -7395,8 +7486,8 @@ mod tests {
             for_1_again.is_empty(),
             "brigade 1's own marker must survive brigade 2 being attempted in between: {for_1_again:?}"
         );
-        assert!(state.goinkyo_open_attempted.contains(&1));
-        assert!(state.goinkyo_open_attempted.contains(&2));
+        assert!(state.goinkyo_pane.contains_key(&1));
+        assert!(state.goinkyo_pane.contains_key(&2));
     }
 
     #[test]
@@ -7413,7 +7504,7 @@ mod tests {
             test_instant(),
         );
         assert!(matches!(first.as_slice(), [Cmd::OpenEmbedded { .. }]));
-        assert!(state.goinkyo_open_attempted.contains(&6));
+        assert!(state.goinkyo_pane.contains_key(&6));
 
         // Stand-in for the pane cleanup a real "consultation ended" path
         // would also do (`update_pty_exited` removes a closed pane from
@@ -7437,7 +7528,7 @@ mod tests {
             test_instant(),
         );
         assert!(released.is_empty());
-        assert!(!state.goinkyo_open_attempted.contains(&6));
+        assert!(!state.goinkyo_pane.contains_key(&6));
 
         let second = update(
             &mut state,
@@ -7450,7 +7541,125 @@ mod tests {
             matches!(second.as_slice(), [Cmd::OpenEmbedded { .. }]),
             "a released guard must allow exactly one more spawn: {second:?}"
         );
-        assert!(state.goinkyo_open_attempted.contains(&6));
+        assert!(state.goinkyo_pane.contains_key(&6));
+    }
+
+    #[test]
+    fn end_to_end_consult_spawn_end_close_reconsult_spawns_exactly_once_more() {
+        // The full round trip `update_goinkyo_awaiting_spawn`'s `NoGoinkyo`
+        // arm exists for: a real pane actually staged, closed by the guard
+        // release itself (not by some other event this test stages first —
+        // see the sibling test above for that narrower case), and a second
+        // consultation on the same brigade spawning again afterward.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 6,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        // Consult + spawn.
+        let spawn_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        let [Cmd::OpenEmbedded { key, .. }] = spawn_cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {spawn_cmds:?}");
+        };
+        let goinkyo_key = key.clone();
+        assert_eq!(state.goinkyo_pane.get(&6), Some(&goinkyo_key));
+
+        // The shell's own `PtyHandle::open` succeeded — same fold any other
+        // spawn goes through, which is what actually pushes the pane into
+        // `Stage::Brigade.panes`.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: goinkyo_key.clone(),
+            },
+            test_instant(),
+        );
+        assert!(state.screens.contains_key(&goinkyo_key));
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert!(panes.contains(&goinkyo_key));
+
+        // End: the row is gone, the pane is still staged.
+        let end_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::NoGoinkyo { brigade_id: 6 },
+            },
+            test_instant(),
+        );
+        assert!(
+            matches!(&end_cmds[..], [Cmd::KillPty { key }] if *key == goinkyo_key),
+            "expected exactly one KillPty for the Goinkyo's own pane, got {end_cmds:?}"
+        );
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected the brigade to stay staged — only the one pane leaves");
+        };
+        assert!(
+            !panes.contains(&goinkyo_key),
+            "the pane must be unstaged the moment the row is gone, not wait for PtyExited"
+        );
+        assert!(!state.goinkyo_pane.contains_key(&6));
+
+        // Reconsult before the killed pane has actually finished exiting:
+        // `goinkyo_pane` no longer blocks it, but the old pane's `screens`
+        // entry — under the very same synthetic key, since this Goinkyo was
+        // never discovered — still does, the same defense-in-depth that
+        // stops any other double-spawn under a key still in flight. A brief
+        // delay, not a permanent block: the next tick's `PtyExited` clears
+        // it.
+        let too_soon = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert!(
+            too_soon.is_empty(),
+            "must not spawn onto a key the old pane hasn't actually vacated yet: {too_soon:?}"
+        );
+
+        // The shell confirms the killed pane actually exited.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: goinkyo_key.clone(),
+            },
+            test_instant(),
+        );
+        assert!(!state.screens.contains_key(&goinkyo_key));
+
+        // Reconsult: a fresh candidate for the same brigade spawns exactly
+        // once more.
+        let reconsult_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert!(
+            matches!(reconsult_cmds.as_slice(), [Cmd::OpenEmbedded { .. }]),
+            "a released guard must allow exactly one more spawn: {reconsult_cmds:?}"
+        );
+        assert!(state.goinkyo_pane.contains_key(&6));
     }
 
     // --- PrefixKey::parse ---------------------------------------------------
@@ -8166,6 +8375,42 @@ mod tests {
     }
 
     #[test]
+    fn kill_confirm_dismiss_on_a_synthetic_goinkyo_key_emits_dismiss_worker_directly() {
+        // `SessionKey::worker_identity` never checked role to begin with
+        // (see its own doc) — this pins that the synthetic-key path already
+        // worked for a still-undiscovered Goinkyo before this round, same
+        // as it does for a Worker.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::new_worker(1, "goinkyo");
+        let mut app = app_with(vec![]);
+        app.open_confirm_kill_modal(key.as_str().to_string(), "goinkyo".to_string(), true);
+        app.modal_select_next(); // ClosePane -> Dismiss
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::Store(StoreIntent::DismissWorker {
+                brigade_id: 1,
+                token: "goinkyo".to_string(),
+            })]
+        );
+        assert_eq!(state.pending_dismiss, Some(key));
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
     fn kill_confirm_dismiss_on_a_resolved_worker_key_spends_a_resolve_membership_round_trip() {
         // A real session id carries no brigade info of its own — one
         // ResolveMembership round trip is needed before DismissWorker can
@@ -8216,6 +8461,83 @@ mod tests {
                 token: "worker-1".to_string(),
             })]
         );
+    }
+
+    #[test]
+    fn kill_confirm_dismiss_on_a_resolved_goinkyo_key_works_the_same_way_as_a_worker() {
+        // The actual bug this round fixes: `update_membership_resolved`
+        // used to abort silently for anything but `BrigadeRole::Worker`,
+        // which meant choosing Dismiss on a discovered Goinkyo's own pane
+        // did nothing at all.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("g1")]);
+        app.open_confirm_kill_modal("g1".to_string(), "g1".to_string(), true);
+        app.modal_select_next(); // ClosePane -> Dismiss
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        assert_eq!(state.pending_dismiss, Some(SessionKey::from_id("g1")));
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "g1".to_string(),
+                membership: Some((1, "goinkyo".to_string(), BrigadeRole::Goinkyo)),
+                members: None,
+            },
+            now,
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::Store(StoreIntent::DismissWorker {
+                brigade_id: 1,
+                token: "goinkyo".to_string(),
+            })]
+        );
+    }
+
+    #[test]
+    fn kill_confirm_dismiss_on_the_directors_own_resolved_key_aborts() {
+        // The Director never even gets the Dismiss choice in the first
+        // place (`dismissable` is false for it — see `PrefixAction::Kill`'s
+        // own doc) — this proves the engine's own decision, independent of
+        // the modal ever offering it, still refuses: dismissing a Director
+        // is disband's job, not this flow's, no matter how the round trip
+        // was reached.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        state.pending_membership = Some(PendingMembership::DismissWorker);
+        state.pending_dismiss = Some(SessionKey::from_id("dir"));
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: None,
+            },
+            now,
+        );
+
+        assert!(cmds.is_empty());
+        assert!(state.pending_dismiss.is_none());
     }
 
     #[test]

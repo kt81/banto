@@ -127,13 +127,17 @@ pub enum Modal {
     ConfirmKill {
         key: String,
         title: String,
-        /// `Some` only when the focused pane is a Worker's (the engine
-        /// decides this structurally, from which pane is focused — see
+        /// `Some` only when the focused pane is a brigade member other than
+        /// the Director's — a Worker or a Goinkyo (the engine decides this
+        /// structurally, from which pane is focused: never `panes[0]` — see
         /// `crate::embedded::engine::PrefixAction::Kill`) — which of the
         /// dialog's two choices is currently highlighted. `None` for a
         /// Director or solo pane, whose dialog stays the single kill-only
         /// confirm it always was: dismissing a Director is disband's job
         /// (`B`), and a solo pane has no brigade to dismiss from at all.
+        /// Still named for the Worker it originally meant only — see
+        /// `crate::embedded::engine::update_membership_resolved`'s own doc
+        /// for the same "rename or not" question, deferred the same way.
         worker_choice: Option<KillChoice>,
     },
     /// The emporium's formation-time picker for `[brigade] worker_agent =
@@ -1515,14 +1519,17 @@ impl App {
     }
 
     /// Open the emporium's kill confirm dialog for the given session (bound
-    /// to prefix-`x` on the focused pane). `is_worker` grows the dialog a
+    /// to prefix-`x` on the focused pane). `dismissable` grows the dialog a
     /// second choice, defaulted to [`KillChoice::ClosePane`] — see
-    /// [`Modal::ConfirmKill`].
-    pub fn open_confirm_kill_modal(&mut self, key: String, title: String, is_worker: bool) {
+    /// [`Modal::ConfirmKill`]. True for a Worker or a Goinkyo pane, never
+    /// for the Director's own or a solo session (dismiss is a brigade-
+    /// membership concept; the field itself is still named `worker_choice`,
+    /// see its own doc for why that's a separate question from this one).
+    pub fn open_confirm_kill_modal(&mut self, key: String, title: String, dismissable: bool) {
         self.modal = Some(Modal::ConfirmKill {
             key,
             title,
-            worker_choice: is_worker.then_some(KillChoice::ClosePane),
+            worker_choice: dismissable.then_some(KillChoice::ClosePane),
         });
     }
 

@@ -155,10 +155,16 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a Worker from its brigade for good (the emporium's prefix-`x`
-    /// "dismiss" choice, as opposed to just closing its pane): membership,
-    /// its read cursor, AND — unlike [`Self::remove_brigade_member`], which
-    /// this does not reuse, since that one is used elsewhere to tidy up a
+    /// Removes a member from its brigade for good — the emporium's
+    /// prefix-`x` "dismiss" choice on a Worker or a Goinkyo pane (as
+    /// opposed to just closing its pane), and `dismiss_goinkyo`'s own way
+    /// of ending a consultation from the other process. `token` is the only
+    /// thing this ever filters by, no role — named for the first of those
+    /// two callers, kept for the second rather than adding a
+    /// same-shaped sibling with a different name (see
+    /// `crate::mcp::tool_dismiss_goinkyo`'s own doc): membership, its read
+    /// cursor, AND — unlike [`Self::remove_brigade_member`], which this
+    /// does not reuse, since that one is used elsewhere to tidy up a
     /// resolved fork/collision and must leave mail alone — any message
     /// addressed specifically to it (`to_member = token`). The mail purge is
     /// load-bearing, not tidiness: `token` numbers get reused (a future
