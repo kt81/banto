@@ -498,6 +498,17 @@ path. The spawn is attempted at most once per consultation
 `SessionKey` that spawn used): a failed attempt is not retried
 automatically.
 
+The briefing alone is not a turn: Claude Code does nothing with a system
+prompt until it receives one, so once the Goinkyo's own pane goes quiet
+(`GOINKYO_KICKOFF_QUIET_PERIOD`), banto checks whether Claude has been told
+to trust its cwd (`Cmd::CheckGoinkyoDirectoryTrust` — a different trust
+registry from Codex's own directory-trust check, re-asked every tick until
+trusted) and types a fixed kickoff line into it — the same bootstrap
+problem, and the same shape of fix, `CODEX_WORKER_KICKOFF_LINE` solves for
+a freshly-spawned Codex Worker. A Worker never needs this: the operator
+gives it its own first turn by typing into its pane themselves, which
+nobody does for an unattended Goinkyo.
+
 **Ending a consultation** removes the Goinkyo's member row, which releases
 the guard above and — the next time a tick observes a still-staged brigade
 with no Goinkyo row at all — unstages and kills whatever pane was tracked

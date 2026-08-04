@@ -593,6 +593,9 @@ fn execute_cmd(
         Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
             execute_check_worker_directory_trust(key, &cwd, deps)
         }
+        Cmd::CheckGoinkyoDirectoryTrust { key, cwd } => {
+            execute_check_goinkyo_directory_trust(key, &cwd, deps)
+        }
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
         Cmd::ForwardClipboardToHost { bytes } => {
@@ -655,6 +658,22 @@ fn execute_check_worker_directory_trust(
             == banto_io::directory_trust::DirectoryTrust::Trusted
     });
     vec![Event::WorkerDirectoryTrustChecked { key, trusted }]
+}
+
+/// Same shape as [`execute_check_worker_directory_trust`], but reads
+/// Claude's own trust registry (`banto_io::directory_trust::claude_directory_trust`)
+/// instead of Codex's — a different underlying file, not just a different
+/// product label; `deps.claude_home` is never optional the way
+/// `deps.codex_home` is, so there is no "product absent" case to fold in
+/// here.
+fn execute_check_goinkyo_directory_trust(
+    key: SessionKey,
+    cwd: &std::path::Path,
+    deps: &Deps,
+) -> Vec<Event> {
+    let trusted = banto_io::directory_trust::claude_directory_trust(deps.claude_home, cwd)
+        == banto_io::directory_trust::DirectoryTrust::Trusted;
+    vec![Event::GoinkyoDirectoryTrustChecked { key, trusted }]
 }
 
 /// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`
@@ -1200,10 +1219,16 @@ fn codex_briefed_session_id(
 /// reads as definitively [`banto_io::directory_trust::DirectoryTrust::NotTrusted`]
 /// reports [`Event::ClaudeWorkerDirectoryUntrusted`] once — this pane isn't
 /// silent because anything is broken, it's sitting behind an unanswered
-/// trust prompt the same as a fresh Codex Worker would, just with no
-/// kickoff mechanism of its own to gate: Claude never gets typed into by
-/// banto at all, so there's nothing to hold back, only a silence to
-/// explain.
+/// trust prompt the same as a fresh Codex Worker would, just with nothing
+/// *here* to gate: `poll_discovery` itself never types into a pane — a
+/// Worker's own first turn is always the operator's, and a Goinkyo's own
+/// kickoff (which does type, once its own `Cmd::CheckGoinkyoDirectoryTrust`
+/// answers trusted) already checks this same condition independently, on
+/// its own schedule — so this report is only ever a silence to explain,
+/// never an action to hold back. (Not true of banto as a whole: an
+/// already-*discovered* Claude Worker's pane does get typed into, by the
+/// relay nudge — but this paragraph is about a tracker that never got that
+/// far.)
 ///
 /// Deliberately narrower than Codex's own gate
 /// ([`execute_check_worker_directory_trust`] collapses `NotTrusted` and
