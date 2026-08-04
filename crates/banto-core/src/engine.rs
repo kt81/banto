@@ -379,6 +379,41 @@ pub struct RelayObservation {
     pub is_idle_this_tick: Option<bool>,
 }
 
+/// A brigade's Goinkyo member row that exists but has neither a session id
+/// nor a pane yet — what [`update_goinkyo_awaiting_spawn`] needs to decide
+/// whether to spawn it. Gathered shell-side (store + `app` reads) alongside
+/// [`RelayObservation`] but reported separately, not folded into it: a
+/// `RelayObservation` only ever describes a member already staged with a
+/// live pane, which a Goinkyo waiting to be opened has neither of — there
+/// is no shared shape to widen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoinkyoSpawnCandidate {
+    pub brigade_id: BrigadeId,
+    pub cwd: PathBuf,
+}
+
+/// What the shell observed about the staged brigade's Goinkyo this tick —
+/// [`Event::GoinkyoAwaitingSpawn`]'s payload. A plain `Option<GoinkyoSpawnCandidate>`
+/// cannot say why there's nothing to spawn, and
+/// [`update_goinkyo_awaiting_spawn`] needs that distinction: "no Goinkyo
+/// member row, on a brigade that's still staged" is the one case that means
+/// a consultation was dismissed out from under it, and is the signal that
+/// releases [`EmporiumState::goinkyo_open_attempted`] for that brigade —
+/// every other "nothing to report" reason must leave it untouched. See
+/// `goinkyo_open_attempted`'s own doc for why a disbanded brigade never
+/// reaches this case at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoinkyoObservation {
+    /// Not a staged brigade, or the Goinkyo row already has a session id
+    /// (already spawned, or resolved by discovery) — nothing to do either
+    /// way.
+    Unchanged,
+    /// The staged brigade has no Goinkyo member row.
+    NoGoinkyo { brigade_id: BrigadeId },
+    /// A member row exists with no session id yet.
+    AwaitingSpawn(GoinkyoSpawnCandidate),
+}
+
 /// A nudge awaiting its phase-two Enter (see [`update_tick`]).
 struct PendingSubmit {
     key: SessionKey,
@@ -649,6 +684,32 @@ pub struct EmporiumState {
     /// produces the one `CSI O`/`CSI I` pair it actually represents, not a
     /// repeat on every tick.
     last_focus_notified: Option<SessionKey>,
+    /// Brigades [`update_goinkyo_awaiting_spawn`] has already issued a
+    /// `Cmd::OpenEmbedded` for — a brigade is inserted the moment that
+    /// happens, success or failure, and *not* removed by
+    /// [`update_spawn_failed`] the way [`Self::pending_opens`] is. Without a
+    /// marker surviving past that removal, a failed spawn would look
+    /// identical next tick to "never tried" (no session id, no pane, either
+    /// way), and the tick fires every second the condition holds — this is
+    /// what turns that into "attempt once per consultation" instead of
+    /// "once a second until it works or the brigade is gone". A `HashSet`
+    /// rather than a single `Option<BrigadeId>` slot: more than one brigade
+    /// can be staged (in the store, even if only one is staged in the UI at
+    /// a time) and each attempts independently — a single slot would let
+    /// staging brigade B overwrite brigade A's own marker, so switching back
+    /// to A (its Goinkyo still unresolved) would look like "never tried"
+    /// again and re-fire. Removed for a brigade the instant
+    /// [`update_goinkyo_awaiting_spawn`] is told that brigade's Goinkyo row
+    /// is gone (`GoinkyoObservation::NoGoinkyo`) — a future "dismiss" that
+    /// leaves the brigade staged, so a later consultation on the same
+    /// brigade is not permanently blocked by a stale marker from the one
+    /// before it. Disband does *not* reach this removal: it un-stages the
+    /// brigade first (`update_disbanded`), so the next gather sees no
+    /// staged brigade at all and reports `Unchanged`, never `NoGoinkyo` —
+    /// the marker for a disbanded brigade simply stays in this set forever,
+    /// harmlessly, since that brigade id is never staged (and so never
+    /// gathered for) again.
+    goinkyo_open_attempted: HashSet<BrigadeId>,
 }
 
 impl EmporiumState {
@@ -678,6 +739,7 @@ impl EmporiumState {
             next_plain_id: 0,
             window_focused: true,
             last_focus_notified: None,
+            goinkyo_open_attempted: HashSet::new(),
         }
     }
 
@@ -1074,14 +1136,19 @@ pub enum Cmd {
     },
     /// Spawn (or, if already running elsewhere, refuse) `target` under
     /// `key`. `brigade` wires the launch to banto's own MCP server; `model`
-    /// is `--model <model>` for a freshly-spawned Worker (never set for a
-    /// resume — the model was already fixed at the session's original
-    /// launch). The shell answers with `Event::Spawned`/`SpawnFailed`.
+    /// is `--model <model>` for a freshly-spawned Worker or Goinkyo (never
+    /// set for a resume — the model was already fixed at the session's
+    /// original launch). `effort` is `--effort <level>`, so far only ever
+    /// set for a freshly-spawned Goinkyo (`BrigadeConfig::goinkyo_effort`)
+    /// — the shell drops it for a Codex target, which has no such flag; see
+    /// `opener::AgentLaunch::Claude`'s own `effort` field. The shell answers
+    /// with `Event::Spawned`/`SpawnFailed`.
     OpenEmbedded {
         key: SessionKey,
         target: SessionToOpen,
         brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
         model: Option<String>,
+        effort: Option<String>,
     },
     /// Kill the child at `key` — active termination (prefix-`x` confirm, or
     /// a disbanded brigade's Workers). The passive `Event::PtyExited` fold
@@ -1328,6 +1395,16 @@ pub enum Event {
     Tick {
         relay: Vec<RelayObservation>,
     },
+    /// ~1/s: what the shell observed about the staged brigade's Goinkyo —
+    /// gathered shell-side alongside `Tick`'s own observations, but its own
+    /// event rather than a field added to `Tick`: every existing
+    /// `Event::Tick` literal (production and the many in tests) would
+    /// otherwise need a new field just to keep compiling, for a fact only
+    /// ever relevant to a brigade that has summoned a Goinkyo. See
+    /// [`GoinkyoObservation`]'s own doc for what each case means.
+    GoinkyoAwaitingSpawn {
+        observation: GoinkyoObservation,
+    },
     /// banto's own process gained or lost OS focus (crossterm's
     /// `FocusGained`/`FocusLost`, reported only once `EnableFocusChange` is
     /// on) — distinct from *which pane* has focus within banto, tracked
@@ -1499,6 +1576,9 @@ pub fn update(
             new_id,
         } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
         Event::Tick { relay } => update_tick(state, brigade, relay, now),
+        Event::GoinkyoAwaitingSpawn { observation } => {
+            update_goinkyo_awaiting_spawn(state, brigade, observation)
+        }
         Event::WindowFocusChanged { focused } => {
             state.window_focused = focused;
             Vec::new()
@@ -2173,6 +2253,7 @@ fn update_new_session_cwd_checked(
         },
         brigade: None,
         model: None,
+        effort: None,
     }]
 }
 
@@ -2522,6 +2603,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         },
         brigade: None,
         model: None,
+        effort: None,
     }]
 }
 
@@ -2591,6 +2673,11 @@ fn stage_brigade(
                         .then(|| brigade.worker_model_for(row.agent))
                         .flatten()
                         .map(str::to_string);
+                    // `effort` stays `None` on every resume, including a
+                    // Goinkyo's: re-staging a brigade around an already-
+                    // discovered Goinkyo — resuming one that was spawned
+                    // before — has no case that reaches this arm with a
+                    // real value to give it yet.
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -2601,6 +2688,7 @@ fn stage_brigade(
                         },
                         brigade: Some((brigade_id, token.clone(), *role)),
                         model,
+                        effort: None,
                     });
                 }
             }
@@ -3012,6 +3100,7 @@ fn open_worker(
         },
         brigade: Some((brigade_id, token.to_string(), BrigadeRole::Worker)),
         model: (!worker_model.is_empty()).then(|| worker_model.to_string()),
+        effort: None,
     }]
 }
 
@@ -3320,6 +3409,7 @@ fn open_director_with_wiring(
         },
         brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
         model: None,
+        effort: None,
     }]
 }
 
@@ -3523,6 +3613,89 @@ fn update_tick(
     }
 
     cmds
+}
+
+/// Answers `Event::GoinkyoAwaitingSpawn`: spawn the Goinkyo `observation`
+/// names, at most once per consultation, and release the guard once a
+/// consultation is observed to have ended.
+///
+/// The one-shot guard is [`EmporiumState::goinkyo_open_attempted`], not
+/// [`EmporiumState::pending_opens`] (which this still populates, the same
+/// way [`open_worker`] does, so [`update_spawned`] knows to append the new
+/// pane to the staged brigade once it lands): `pending_opens` is cleared by
+/// [`update_spawn_failed`] the moment a spawn fails, which leaves exactly
+/// the same trace a Goinkyo that was never even attempted has — no session
+/// id, no pane, either way. Without a marker that survives past that
+/// removal, this — reachable roughly once a second for as long as the
+/// condition holds — could not tell "just failed" from "never tried", and
+/// would fire again next tick. Success needs no matching care: once the
+/// Goinkyo actually has a pane, shell-side gathering stops reporting a
+/// candidate for it at all, so nothing is left here to re-fire on
+/// regardless of the guard.
+fn update_goinkyo_awaiting_spawn(
+    state: &mut EmporiumState,
+    brigade: &BrigadeConfig,
+    observation: GoinkyoObservation,
+) -> Vec<Cmd> {
+    let candidate = match observation {
+        GoinkyoObservation::Unchanged => return Vec::new(),
+        // The row disappearing out from under a still-staged brigade is
+        // what actually means a consultation was dismissed — see
+        // `GoinkyoObservation`'s own doc for why a disbanded brigade never
+        // reaches this arm at all. Releasing the guard here rather than on
+        // success/failure is what lets a *later* consultation on the same
+        // brigade spawn again, without needing to know anything about the
+        // one before it.
+        GoinkyoObservation::NoGoinkyo { brigade_id } => {
+            state.goinkyo_open_attempted.remove(&brigade_id);
+            return Vec::new();
+        }
+        GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
+    };
+    if state.goinkyo_open_attempted.contains(&candidate.brigade_id) {
+        return Vec::new();
+    }
+    let key = SessionKey::new_worker(candidate.brigade_id, "goinkyo");
+    // Belt-and-suspenders alongside `goinkyo_open_attempted` above: the
+    // guard is what actually distinguishes "just failed" from "never
+    // tried" (see this function's own doc), but a pane or an in-flight
+    // open already existing for this key — the same evidence
+    // `open_worker`'s reuse branch checks (line ~2674) — is a second,
+    // independent reason not to spawn again, cheap to check now that this
+    // crate can build the key at all (the shell-side gatherer cannot:
+    // `SessionKey::new_worker` is private to this crate, which is exactly
+    // why this check lives here and not there).
+    if state.screens.contains_key(&key) || state.pending_opens.contains_key(&key) {
+        return Vec::new();
+    }
+    state.goinkyo_open_attempted.insert(candidate.brigade_id);
+    state.pending_opens.insert(
+        key.clone(),
+        PendingOpen::BrigadeMember {
+            brigade_id: candidate.brigade_id,
+            // A Codex kickoff is a Worker-only concern (`open_worker`'s own
+            // doc) — a Goinkyo is always Claude, never Codex (see
+            // `BrigadeConfig::goinkyo_model`'s doc), so this never applies.
+            needs_codex_kickoff: false,
+            cwd: candidate.cwd.clone(),
+        },
+    );
+    vec![Cmd::OpenEmbedded {
+        key,
+        target: SessionToOpen {
+            id: String::new(),
+            agent: AgentKind::ClaudeCode,
+            title: "goinkyo".to_string(),
+            cwd: candidate.cwd,
+        },
+        brigade: Some((
+            candidate.brigade_id,
+            "goinkyo".to_string(),
+            BrigadeRole::Goinkyo,
+        )),
+        model: brigade.goinkyo_model().map(str::to_string),
+        effort: brigade.goinkyo_effort().map(str::to_string),
+    }]
 }
 
 /// Answers `Cmd::CheckWorkerDirectoryTrust`, always following a
@@ -6947,6 +7120,339 @@ mod tests {
         assert!(status.contains("disk full"));
     }
 
+    // --- Goinkyo: update_goinkyo_awaiting_spawn (spawn-once guard) ---------
+
+    fn goinkyo_candidate(brigade_id: BrigadeId) -> GoinkyoSpawnCandidate {
+        GoinkyoSpawnCandidate {
+            brigade_id,
+            cwd: PathBuf::from("/work/alpha"),
+        }
+    }
+
+    fn awaiting_spawn(brigade_id: BrigadeId) -> Event {
+        Event::GoinkyoAwaitingSpawn {
+            observation: GoinkyoObservation::AwaitingSpawn(goinkyo_candidate(brigade_id)),
+        }
+    }
+
+    #[test]
+    fn unchanged_means_no_cmd() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::Unchanged,
+            },
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(state.goinkyo_open_attempted.is_empty());
+    }
+
+    #[test]
+    fn a_candidate_issues_an_open_embedded_carrying_the_goinkyo_model_and_effort() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = BrigadeConfig {
+            goinkyo_model: "fable".to_string(),
+            goinkyo_effort: "max".to_string(),
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(7),
+            test_instant(),
+        );
+        let [
+            Cmd::OpenEmbedded {
+                target,
+                brigade: member,
+                model,
+                effort,
+                ..
+            },
+        ] = cmds.as_slice()
+        else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        assert_eq!(target.cwd, PathBuf::from("/work/alpha"));
+        assert_eq!(
+            member
+                .as_ref()
+                .map(|(id, token, role)| (*id, token.as_str(), *role)),
+            Some((7, "goinkyo", BrigadeRole::Goinkyo))
+        );
+        assert_eq!(model.as_deref(), Some("fable"));
+        assert_eq!(effort.as_deref(), Some("max"));
+        assert!(state.goinkyo_open_attempted.contains(&7));
+    }
+
+    #[test]
+    fn the_tick_equivalent_event_never_opens_the_same_goinkyo_twice() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        for _ in 0..5 {
+            let cmds = update(
+                &mut state,
+                &mut app,
+                &brigade,
+                awaiting_spawn(3),
+                test_instant(),
+            );
+            // Only the very first of these repeated firings may open a pane —
+            // this is the invariant the whole guard exists for: a spawn
+            // attempted at most once per consultation, no matter how many
+            // times the tick that notices the candidate fires while it's
+            // still pending.
+            if cmds.is_empty() {
+                continue;
+            }
+            assert!(
+                matches!(cmds.as_slice(), [Cmd::OpenEmbedded { .. }]),
+                "unexpected cmd on a repeat firing: {cmds:?}"
+            );
+        }
+        let opens = (0..5)
+            .map(|_| {
+                update(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    awaiting_spawn(3),
+                    test_instant(),
+                )
+            })
+            .filter(|cmds| !cmds.is_empty())
+            .count();
+        assert_eq!(
+            opens, 0,
+            "the guard must already be set from the loop above"
+        );
+    }
+
+    #[test]
+    fn a_spawn_failure_is_not_retried_on_the_next_tick() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(9),
+            test_instant(),
+        );
+        let Some(Cmd::OpenEmbedded { key, .. }) = cmds.into_iter().next() else {
+            panic!("expected an OpenEmbedded on the first firing");
+        };
+        assert!(state.pending_opens.contains_key(&key));
+
+        // The spawn fails — `update_spawn_failed`'s own doc: this clears
+        // `pending_opens` unconditionally, leaving exactly the same trace a
+        // Goinkyo that was never even attempted has (no session id, no
+        // pane). `goinkyo_open_attempted` is the only thing left standing
+        // that can tell the two apart.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::SpawnFailed {
+                key: key.clone(),
+                error: "boom".to_string(),
+            },
+            test_instant(),
+        );
+        assert!(!state.pending_opens.contains_key(&key));
+
+        // The candidate is still shell-reported next tick (nothing about it
+        // resolved), but the guard must refuse to spawn it again.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(9),
+            test_instant(),
+        );
+        assert!(
+            cmds.is_empty(),
+            "a failed spawn must not auto-retry: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn an_already_open_pane_is_a_second_reason_not_to_spawn() {
+        // Defense in depth alongside `goinkyo_open_attempted`: if a pane for
+        // this Goinkyo's synthetic key is already known open, the guard must
+        // refuse regardless of the marker, since the marker is untouched
+        // (never inserted before the call under test).
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::new_worker(4, "goinkyo");
+        state.screens.insert(key, Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(4),
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(
+            !state.goinkyo_open_attempted.contains(&4),
+            "the marker must not be inserted on a path that never actually spawned anything"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_pending_open_is_also_a_second_reason_not_to_spawn() {
+        // The other half of the same defense-in-depth check: a pane that
+        // isn't open *yet* but already has an open in flight (between this
+        // function issuing a `Cmd::OpenEmbedded` and the matching
+        // `Event::Spawned`/`SpawnFailed` landing) must refuse too — covered
+        // separately from the `screens` case above because either condition
+        // alone must be sufficient, and a test that only ever sets both
+        // together cannot tell that apart.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::new_worker(5, "goinkyo");
+        state.pending_opens.insert(
+            key,
+            PendingOpen::BrigadeMember {
+                brigade_id: 5,
+                needs_codex_kickoff: false,
+                cwd: PathBuf::from("/work/alpha"),
+            },
+        );
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(5),
+            test_instant(),
+        );
+        assert!(cmds.is_empty());
+        assert!(
+            !state.goinkyo_open_attempted.contains(&5),
+            "the marker must not be inserted on a path that never actually spawned anything"
+        );
+    }
+
+    #[test]
+    fn attempting_for_one_brigade_survives_another_brigade_being_attempted_in_between() {
+        // A single `Option<BrigadeId>` slot would let staging brigade 2
+        // overwrite brigade 1's own marker, so switching back to 1 (its
+        // Goinkyo still unresolved) would look like "never tried" and
+        // re-fire — exactly the bug `goinkyo_open_attempted` becoming a
+        // `HashSet` fixes. Two different brigades can each hold a Goinkyo
+        // row in the store independently; only one is ever staged in the UI
+        // at a time, but switching which one is staged must not disturb the
+        // other's guard.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let for_1 = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(1),
+            test_instant(),
+        );
+        assert!(matches!(for_1.as_slice(), [Cmd::OpenEmbedded { .. }]));
+
+        let for_2 = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(2),
+            test_instant(),
+        );
+        assert!(matches!(for_2.as_slice(), [Cmd::OpenEmbedded { .. }]));
+
+        let for_1_again = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(1),
+            test_instant(),
+        );
+        assert!(
+            for_1_again.is_empty(),
+            "brigade 1's own marker must survive brigade 2 being attempted in between: {for_1_again:?}"
+        );
+        assert!(state.goinkyo_open_attempted.contains(&1));
+        assert!(state.goinkyo_open_attempted.contains(&2));
+    }
+
+    #[test]
+    fn the_goinkyo_row_disappearing_releases_the_guard_for_a_later_consultation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let first = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert!(matches!(first.as_slice(), [Cmd::OpenEmbedded { .. }]));
+        assert!(state.goinkyo_open_attempted.contains(&6));
+
+        // Stand-in for the pane cleanup a real "consultation ended" path
+        // would also do (`update_pty_exited` removes a closed pane from
+        // `screens`; `update_spawn_failed` already removes a failed one from
+        // `pending_opens`) — this test is only exercising the guard itself,
+        // not that cleanup.
+        let key = SessionKey::new_worker(6, "goinkyo");
+        state.screens.remove(&key);
+        state.pending_opens.remove(&key);
+
+        // The consultation is dismissed, brigade still staged, and the
+        // shell reports the row is simply gone (this is the only path that
+        // reaches `NoGoinkyo` at all — see `GoinkyoObservation`'s own doc).
+        let released = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::NoGoinkyo { brigade_id: 6 },
+            },
+            test_instant(),
+        );
+        assert!(released.is_empty());
+        assert!(!state.goinkyo_open_attempted.contains(&6));
+
+        let second = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert!(
+            matches!(second.as_slice(), [Cmd::OpenEmbedded { .. }]),
+            "a released guard must allow exactly one more spawn: {second:?}"
+        );
+        assert!(state.goinkyo_open_attempted.contains(&6));
+    }
+
     // --- PrefixKey::parse ---------------------------------------------------
 
     #[test]
@@ -7430,6 +7936,7 @@ mod tests {
                     target,
                     brigade: None,
                     model: None,
+                    effort: None,
                 },
             ] => {
                 assert!(key.is_synthetic());

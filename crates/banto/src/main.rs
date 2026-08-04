@@ -255,11 +255,13 @@ fn main() -> Result<()> {
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let codex_home = resolve_codex_home(cli.codex_home, &config);
             // Same base as `embedded::emporium::write_mcp_config`'s
-            // `dirs::data_local_dir()/banto/mcp/`, one level further down:
-            // a consultation request isn't an `--mcp-config` file, so it
-            // gets its own subdirectory rather than sharing that one.
-            let goinkyo_dir =
-                dirs::data_local_dir().map(|dir| dir.join("banto").join("mcp").join("goinkyo"));
+            // `dirs::data_local_dir()/banto/mcp/`, one level further down: a
+            // consultation request isn't an `--mcp-config` file, so it gets
+            // its own subdirectory rather than sharing that one. The join
+            // itself lives in `mcp::resolve_goinkyo_dir` — see its own doc
+            // for why `embedded::emporium` calls the same function rather
+            // than re-deriving this.
+            let goinkyo_dir = mcp::resolve_goinkyo_dir();
             let identity = mcp::Identity {
                 session,
                 brigade,

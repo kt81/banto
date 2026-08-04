@@ -766,25 +766,46 @@ fn render_goinkyo_request(request: &GoinkyoRequest) -> String {
     out
 }
 
-/// Writes the rendered request to `<dir>/<brigade_id>.txt` and returns its
-/// path, creating `dir` if needed.
+/// The base directory every consultation request lives under —
+/// `dirs::data_local_dir()/banto/mcp/goinkyo`. The single place that join is
+/// written: `main.rs` calls this to build [`ServerContext::goinkyo_dir`],
+/// and `embedded::emporium`'s `{request}` briefing substitution calls it
+/// too, rather than each re-deriving the same three-segment join by hand —
+/// a duplicate that would silently drift the day only one of them changed,
+/// and a Goinkyo would read a path that no longer matches what this process
+/// writes to.
+pub(crate) fn resolve_goinkyo_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("banto").join("mcp").join("goinkyo"))
+}
+
+/// Where `brigade_id`'s consultation request lives under `dir` — the other
+/// half of the shared join (see [`resolve_goinkyo_dir`]'s own doc for why
+/// it's split out): [`write_goinkyo_request`] writes here, and
+/// `embedded::emporium`'s `{request}` substitution reads the same path back
+/// by calling this directly rather than re-deriving `<brigade_id>.txt`
+/// itself.
+pub(crate) fn goinkyo_request_path(dir: &Path, brigade_id: BrigadeId) -> PathBuf {
+    dir.join(format!("{brigade_id}.txt"))
+}
+
+/// Writes the rendered request to [`goinkyo_request_path`]`(dir, brigade_id)`
+/// and returns that path, creating `dir` if needed.
 ///
 /// Takes `dir` as a parameter rather than resolving it itself — production
-/// always passes [`ServerContext::goinkyo_dir`]
-/// (`dirs::data_local_dir()/banto/mcp/goinkyo`, resolved once in
-/// `main.rs`), tests pass a tempdir — so this needs no real filesystem
-/// stubbing to exercise (same reasoning as `banto_io::config`'s
-/// path-taking `load`/`load_explicit`). Only one Goinkyo consults at a time
-/// (`tool_consult_goinkyo`'s own "already exists" check), so one file per
-/// brigade is enough; a later consultation overwrites whatever the last one
-/// left.
+/// always passes [`ServerContext::goinkyo_dir`] (built from
+/// [`resolve_goinkyo_dir`] in `main.rs`), tests pass a tempdir — so this
+/// needs no real filesystem stubbing to exercise (same reasoning as
+/// `banto_io::config`'s path-taking `load`/`load_explicit`). Only one
+/// Goinkyo consults at a time (`tool_consult_goinkyo`'s own "already
+/// exists" check), so one file per brigade is enough; a later consultation
+/// overwrites whatever the last one left.
 fn write_goinkyo_request(
     dir: &Path,
     brigade_id: BrigadeId,
     request: &GoinkyoRequest,
 ) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{brigade_id}.txt"));
+    let path = goinkyo_request_path(dir, brigade_id);
     std::fs::write(&path, render_goinkyo_request(request))?;
     Ok(path)
 }
@@ -2093,6 +2114,40 @@ mod tests {
         assert_eq!(response["error"]["code"], -32601);
     }
 
+    // --- resolve_goinkyo_dir / goinkyo_request_path: the shared join -------
+
+    #[test]
+    fn goinkyo_request_path_joins_the_brigade_id_as_a_txt_file() {
+        assert_eq!(
+            goinkyo_request_path(Path::new("/data/goinkyo"), 42),
+            PathBuf::from("/data/goinkyo").join("42.txt")
+        );
+    }
+
+    #[test]
+    fn write_goinkyo_request_writes_to_exactly_what_the_shared_join_computes() {
+        // The regression this pins: `write_goinkyo_request` and
+        // `embedded::emporium`'s `{request}` substitution both resolve a
+        // consultation's path by calling `goinkyo_request_path` — not by
+        // each re-deriving `<brigade_id>.txt` by hand. If a future edit
+        // reintroduced a second hand-written copy in either place, this
+        // test fails the moment the two diverge, which a `contains`-style
+        // check on the written file's location would not catch.
+        let tmp = tempfile::tempdir().unwrap();
+        let request = GoinkyoRequest {
+            requested_by: "director",
+            about: None,
+            question: "q",
+            my_case: "m",
+            their_case: None,
+            settled: "s",
+            unsettled: "u",
+            blind_spot: "b",
+        };
+        let written = write_goinkyo_request(tmp.path(), 13, &request).unwrap();
+        assert_eq!(written, goinkyo_request_path(tmp.path(), 13));
+    }
+
     fn goinkyo_call(arguments: Value) -> String {
         json!({
             "jsonrpc": "2.0",
@@ -2132,7 +2187,7 @@ mod tests {
             "a rejected call must not create a Goinkyo member row, got {members:?}"
         );
         assert!(
-            !dir.join(format!("{brigade}.txt")).exists(),
+            !goinkyo_request_path(dir, brigade).exists(),
             "a rejected call must not leave a consultation request file"
         );
     }
