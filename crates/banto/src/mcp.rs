@@ -28,6 +28,7 @@
 //! stdout, so diagnostics would go to stderr.
 
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -63,12 +64,16 @@ pub struct Identity {
 
 /// Per-connection state: the caller's identity, the shared store, and
 /// `claude_home` and (when available) `codex_home` — [`tool_brigade_status`]
-/// checks each product's separate live-state source.
+/// checks each product's separate live-state source. `goinkyo_dir` is where
+/// [`tool_consult_goinkyo`] writes a consultation request; `None` when the
+/// platform's data-local directory couldn't be determined (see
+/// `banto_io::config::default_db_path`, the same fallibility).
 struct ServerContext {
     identity: Identity,
     store: Store,
     claude_home: ClaudeHome,
     codex_home: Option<CodexHome>,
+    goinkyo_dir: Option<PathBuf>,
 }
 
 /// Run the MCP server on stdio until the client closes the connection (EOF on
@@ -78,12 +83,14 @@ pub fn run_stdio_server(
     identity: Identity,
     claude_home: ClaudeHome,
     codex_home: Option<CodexHome>,
+    goinkyo_dir: Option<PathBuf>,
 ) -> Result<()> {
     let mut ctx = ServerContext {
         identity,
         store,
         claude_home,
         codex_home,
+        goinkyo_dir,
     };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -200,6 +207,64 @@ fn tools_list_result() -> Value {
                                 to know whether there is anyone to delegate to.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
+            {
+                "name": "consult_goinkyo",
+                "description": "Director only. Summon the Goinkyo — banto's retired elder, \
+                                called back in to arbitrate a Director/Worker disagreement or \
+                                an impasse — by filing a written consultation request. No tool \
+                                exists yet to talk with it directly; it reads this once it \
+                                starts. Fails if a Goinkyo is already part of this brigade: \
+                                only one consults at a time, and nothing yet ends a \
+                                consultation, so a new one cannot start until that changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The neutral question — what you want judged, not \
+                                            your own conclusion about it."
+                        },
+                        "my_case": {
+                            "type": "string",
+                            "description": "Your position as Director, and your grounds for it."
+                        },
+                        "their_case": {
+                            "type": "string",
+                            "description": "The Worker's position and grounds. Required when \
+                                            `about` names one — quote their own words if you \
+                                            have them, rather than paraphrasing; a paraphrase \
+                                            the Goinkyo can't check against the source is your \
+                                            case wearing their name. Omit for an impasse with \
+                                            no specific Worker."
+                        },
+                        "settled": {
+                            "type": "string",
+                            "description": "What is actually settled, with its source."
+                        },
+                        "unsettled": {
+                            "type": "string",
+                            "description": "What has not been confirmed."
+                        },
+                        "blind_spot": {
+                            "type": "string",
+                            "description": "What you might be missing — a bias, an assumption, \
+                                            something you have not checked yourself. Naming \
+                                            this yourself is the point: the Goinkyo has no \
+                                            other way to know what you might not be seeing."
+                        },
+                        "about": {
+                            "type": "string",
+                            "description": "Optional: the Worker token this disagreement is \
+                                            with (e.g. \"worker-2\"). Omit for a consultation \
+                                            about being stuck, not about a disagreement with a \
+                                            specific Worker. Naming one makes `their_case` \
+                                            required."
+                        }
+                    },
+                    "required": ["question", "my_case", "settled", "unsettled", "blind_spot"],
+                    "additionalProperties": false,
+                },
+            },
         ],
     })
 }
@@ -213,6 +278,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "send_to_peer" => tool_send_to_peer(ctx, msg),
         "check_messages" => tool_check_messages(ctx),
         "brigade_status" => tool_brigade_status(ctx),
+        "consult_goinkyo" => tool_consult_goinkyo(ctx, msg),
         other => tool_error(&format!("unknown tool: {other}")),
     }
 }
@@ -381,19 +447,42 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     }
 }
 
-/// Parses `to` from the raw JSON-RPC arguments, distinguishing "no value
-/// given" from "a value was given but it's unusable" — an earlier version
-/// of this collapsed both into the same `None` via a bare
+/// The absent/`null` vs. present-but-unusable distinction every optional
+/// string argument needs — an earlier version of `to`'s own parsing
+/// collapsed both into the same `None` via a bare
 /// `.and_then(Value::as_str)`, which silently turned a caller's mistake
-/// into a broadcast instead of an error.
+/// into "no value given" instead of an error.
 ///
-/// `Ok(None)`: `to` is absent, or explicitly `null` (treated the same as
+/// `Ok(None)`: `name` is absent, or explicitly `null` (treated the same as
 /// absent — a JSON serializer emitting `null` for a skipped optional field
 /// is exactly as much "no value" as omitting the key, and refusing it would
-/// break a legitimate caller). `Ok(Some(token))`: a non-empty string,
+/// break a legitimate caller). `Ok(Some(value))`: a non-empty string,
 /// trimmed. `Err`: the wrong JSON type, or a string that's empty once
 /// trimmed — the caller supplied *something*, so silently reinterpreting it
-/// as "no target" would be worse than telling them so.
+/// as "no value" would be worse than telling them so. The message only
+/// names what's structurally wrong; a caller with something more specific
+/// to say about what "no value" means for *this* argument (see
+/// [`parse_to_arg`]) builds its own from it instead.
+fn parse_optional_arg<'a>(msg: &'a Value, name: &str) -> Result<Option<&'a str>, String> {
+    match msg.pointer(&format!("/params/arguments/{name}")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Err(format!("`{name}` must not be an empty string."))
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Some(_) => Err(format!("`{name}` must be a string.")),
+    }
+}
+
+/// [`parse_optional_arg`] for `to`, plus the "omit it to broadcast" guidance
+/// specific to that argument — appended to whichever of
+/// [`parse_optional_arg`]'s two distinct messages applies, not replacing it:
+/// a caller told only "omit `to` to broadcast" can't tell whether it sent an
+/// empty string or the wrong JSON type.
 ///
 /// This was harmless while only Director/Worker existed: every broadcast a
 /// mis-parsed `to` could fall back to was already the caller's only
@@ -404,25 +493,17 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
 /// same text to every Worker instead, including whichever one the
 /// disagreement is about.
 fn parse_to_arg(msg: &Value) -> Result<Option<&str>, String> {
-    match msg.pointer("/params/arguments/to") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Err(
-                    "`to` must not be empty — omit it entirely (or pass null) to broadcast \
-                     instead."
-                        .to_string(),
-                )
-            } else {
-                Ok(Some(trimmed))
-            }
-        }
-        Some(_) => Err(
-            "`to` must be a string naming a brigade member — omit it entirely (or \
-                         pass null) to broadcast instead."
-                .to_string(),
-        ),
+    parse_optional_arg(msg, "to")
+        .map_err(|message| format!("{message} Omit `to` entirely (or pass null) to broadcast."))
+}
+
+/// A required version of [`parse_optional_arg`]: `None` (absent, `null`, or
+/// blank) is also an error here, naming the missing argument so the caller
+/// knows exactly what to add rather than having to infer it.
+fn require_string_arg<'a>(msg: &'a Value, name: &str) -> Result<&'a str, String> {
+    match parse_optional_arg(msg, name)? {
+        Some(value) => Ok(value),
+        None => Err(format!("`{name}` is required.")),
     }
 }
 
@@ -518,6 +599,194 @@ fn tool_check_messages(ctx: &mut ServerContext) -> Value {
         }
         Err(err) => tool_error(&format!("failed to read messages: {err}")),
     }
+}
+
+/// `consult_goinkyo`: files a written consultation request and creates the
+/// Goinkyo's member row. Director-only.
+///
+/// This is step one of a larger plan this module's own doc doesn't yet
+/// need to name: nothing here starts a process, issues a `Cmd`, or touches
+/// anything outside `ctx.store` and `ctx.goinkyo_dir`. A member row with no
+/// pane is exactly the shape a later step watches for; making that step
+/// exist is not this function's job.
+fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
+    let (brigade, _, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Director {
+        return tool_error("consult_goinkyo may only be called by a Director.");
+    }
+
+    // This read, not the later insert's primary key, is what a normal
+    // "already consulting" refusal goes through — it's just for a message
+    // that names the reason, not the actual guard. Two calls racing between
+    // this check and `add_brigade_member` below (unconfirmed whether that's
+    // reachable at all — a Director's own tool calls are sequential) would
+    // still leave only one Goinkyo row: `(brigade_id, member_token)` is a
+    // primary key, so the loser's insert fails there regardless of what
+    // this check saw.
+    let members = match ctx.store.brigade_members(brigade) {
+        Ok(members) => members,
+        Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
+    };
+    if members.iter().any(|m| m.role == BrigadeRole::Goinkyo) {
+        return tool_error(
+            "A Goinkyo is already part of this brigade. Only one consults at a time, and \
+             nothing in this build can end a consultation yet, so a new one cannot be \
+             started.",
+        );
+    }
+
+    let question = match require_string_arg(msg, "question") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let my_case = match require_string_arg(msg, "my_case") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let settled = match require_string_arg(msg, "settled") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let unsettled = match require_string_arg(msg, "unsettled") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let blind_spot = match require_string_arg(msg, "blind_spot") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let about = match parse_optional_arg(msg, "about") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let their_case = match parse_optional_arg(msg, "their_case") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    if about.is_some() && their_case.is_none() {
+        return tool_error(
+            "`their_case` is required when `about` names a Worker — quote their own words \
+             if you have them, rather than paraphrasing.",
+        );
+    }
+    // Worker-only, not `role.can_reach` / `validate_target`: those answer
+    // "can a Director message this member", which also allows a Goinkyo —
+    // but a disagreement is never with the Goinkyo being summoned to weigh
+    // it (and this call is the only way one could even come to exist).
+    if let Some(about_token) = about
+        && !members
+            .iter()
+            .any(|m| m.role == BrigadeRole::Worker && m.token == about_token)
+    {
+        return tool_error(&format!(
+            "\"{about_token}\" is not a Worker in this brigade — `about` must name the \
+             Worker this disagreement is with (or omit it for an impasse with no specific \
+             Worker)."
+        ));
+    }
+
+    let Some(goinkyo_dir) = ctx.goinkyo_dir.clone() else {
+        return tool_error("could not determine banto's data directory");
+    };
+    let request = GoinkyoRequest {
+        requested_by: "director",
+        about,
+        question,
+        my_case,
+        their_case,
+        settled,
+        unsettled,
+        blind_spot,
+    };
+    // Write before row, never the reverse: the next phase starts a process
+    // the moment it sees a paneless Goinkyo row, on the assumption that a
+    // row existing means its request file does too. Creating the row first
+    // would let a write failure leave that assumption false — a Goinkyo
+    // started with nothing to read. This way the only reachable mismatch is
+    // the harmless direction: a written file with no row yet, which
+    // nothing acts on and a later successful call here just overwrites.
+    let path = match write_goinkyo_request(&goinkyo_dir, brigade, &request) {
+        Ok(path) => path,
+        Err(err) => return tool_error(&format!("failed to file the consultation: {err}")),
+    };
+
+    match ctx
+        .store
+        .add_brigade_member(brigade, "goinkyo", BrigadeRole::Goinkyo, None)
+    {
+        Ok(()) => tool_text(
+            format!(
+                "Consultation filed at {}. A Goinkyo member row now exists for this brigade \
+                 — nothing has started a process for it yet.",
+                path.display()
+            ),
+            false,
+        ),
+        Err(err) => tool_error(&format!(
+            "failed to register the Goinkyo: {err}. The consultation file was already \
+             written to {} — no member row points at it, so nothing will read it; a later \
+             consult_goinkyo call for this brigade will overwrite it.",
+            path.display()
+        )),
+    }
+}
+
+/// The fields one `consult_goinkyo` call supplies, ready for
+/// [`render_goinkyo_request`].
+struct GoinkyoRequest<'a> {
+    requested_by: &'a str,
+    about: Option<&'a str>,
+    question: &'a str,
+    my_case: &'a str,
+    their_case: Option<&'a str>,
+    settled: &'a str,
+    unsettled: &'a str,
+    blind_spot: &'a str,
+}
+
+/// Plain text, one labeled section per argument. English, like everything
+/// else banto hands an agent product.
+fn render_goinkyo_request(request: &GoinkyoRequest) -> String {
+    let about = request
+        .about
+        .unwrap_or("(none — this is about being stuck, not a disagreement with a specific Worker)");
+    let mut out = format!("Requested by: {}\nAbout: {about}\n\n", request.requested_by);
+    out.push_str(&format!("Question:\n{}\n\n", request.question));
+    out.push_str(&format!("Director's case:\n{}\n\n", request.my_case));
+    if let Some(their_case) = request.their_case {
+        out.push_str(&format!("Worker's case:\n{their_case}\n\n"));
+    }
+    out.push_str(&format!("Settled:\n{}\n\n", request.settled));
+    out.push_str(&format!("Unsettled:\n{}\n\n", request.unsettled));
+    out.push_str(&format!("Possible blind spot:\n{}\n", request.blind_spot));
+    out
+}
+
+/// Writes the rendered request to `<dir>/<brigade_id>.txt` and returns its
+/// path, creating `dir` if needed.
+///
+/// Takes `dir` as a parameter rather than resolving it itself — production
+/// always passes [`ServerContext::goinkyo_dir`]
+/// (`dirs::data_local_dir()/banto/mcp/goinkyo`, resolved once in
+/// `main.rs`), tests pass a tempdir — so this needs no real filesystem
+/// stubbing to exercise (same reasoning as `banto_io::config`'s
+/// path-taking `load`/`load_explicit`). Only one Goinkyo consults at a time
+/// (`tool_consult_goinkyo`'s own "already exists" check), so one file per
+/// brigade is enough; a later consultation overwrites whatever the last one
+/// left.
+fn write_goinkyo_request(
+    dir: &Path,
+    brigade_id: BrigadeId,
+    request: &GoinkyoRequest,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{brigade_id}.txt"));
+    std::fs::write(&path, render_goinkyo_request(request))?;
+    Ok(path)
 }
 
 /// Resolve this connection's *current* `(brigade, member_token, role)`, live
@@ -700,6 +969,10 @@ mod tests {
             // real live-state files into its own temp home instead.
             claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
             codex_home: None,
+            // `None` here too: a test exercising `consult_goinkyo`'s
+            // success path sets a tempdir instead, so nothing ever writes
+            // under the real `dirs::data_local_dir()`.
+            goinkyo_dir: None,
         }
     }
 
@@ -736,6 +1009,7 @@ mod tests {
         assert!(names.contains(&"send_to_peer"));
         assert!(names.contains(&"check_messages"));
         assert!(names.contains(&"brigade_status"));
+        assert!(names.contains(&"consult_goinkyo"));
     }
 
     /// `brigade_status` on a caller banto never registered: it can only
@@ -1817,5 +2091,300 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":8,"method":"resources/list"}"#,
         );
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    fn goinkyo_call(arguments: Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 70,
+            "method": "tools/call",
+            "params": { "name": "consult_goinkyo", "arguments": arguments }
+        })
+        .to_string()
+    }
+
+    /// A complete, valid `consult_goinkyo` argument set (the disagreement
+    /// shape, `about` included) — each test starts from this and removes or
+    /// overrides just the field it's exercising.
+    fn full_goinkyo_args() -> Value {
+        json!({
+            "question": "Should worker-1's refactor land as-is?",
+            "my_case": "It simplifies the module and every test still passes.",
+            "their_case": "It changes behavior a caller relies on.",
+            "settled": "The test suite passes on both versions.",
+            "unsettled": "Whether any caller actually relies on the old behavior.",
+            "blind_spot": "I have not read that caller myself.",
+            "about": "worker-1",
+        })
+    }
+
+    /// The net for the ordering `tool_consult_goinkyo` depends on (see its
+    /// own "write before row" comment): a rejected call must leave neither
+    /// side effect behind. Passes today because the code already gets the
+    /// order right; it's here so a future edit that got it wrong — writing
+    /// the file, or creating the row, before the rest of validation runs —
+    /// would fail a test instead of only showing up once the next phase
+    /// starts a Goinkyo with nothing to read.
+    fn assert_no_goinkyo_side_effects(ctx: &ServerContext, brigade: i64, dir: &Path) {
+        let members = ctx.store.brigade_members(brigade).unwrap();
+        assert!(
+            !members.iter().any(|m| m.role == BrigadeRole::Goinkyo),
+            "a rejected call must not create a Goinkyo member row, got {members:?}"
+        );
+        assert!(
+            !dir.join(format!("{brigade}.txt")).exists(),
+            "a rejected call must not leave a consultation request file"
+        );
+    }
+
+    #[test]
+    fn consult_goinkyo_succeeds_and_creates_the_member_row_and_request_file() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+
+        let members = ctx.store.brigade_members(1).unwrap();
+        assert!(
+            members
+                .iter()
+                .any(|m| m.token == "goinkyo" && m.role == BrigadeRole::Goinkyo),
+            "no Goinkyo member row was created: {members:?}"
+        );
+
+        let path = tmp.path().join("1.txt");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("request file {path:?} missing: {err}"));
+        for expected in [
+            "Should worker-1's refactor land as-is?",
+            "It simplifies the module and every test still passes.",
+            "It changes behavior a caller relies on.",
+            "The test suite passes on both versions.",
+            "Whether any caller actually relies on the old behavior.",
+            "I have not read that caller myself.",
+            "worker-1",
+        ] {
+            assert!(
+                contents.contains(expected),
+                "request file missing {expected:?}, got:\n{contents}"
+            );
+        }
+    }
+
+    #[test]
+    fn consult_goinkyo_succeeds_without_about_for_an_impasse() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let mut args = full_goinkyo_args();
+        let obj = args.as_object_mut().unwrap();
+        obj.remove("about");
+        obj.remove("their_case");
+
+        let response = call(&mut ctx, &goinkyo_call(args));
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+    }
+
+    #[test]
+    fn consult_goinkyo_names_each_missing_required_field() {
+        for field in ["question", "my_case", "settled", "unsettled", "blind_spot"] {
+            let mut ctx = ctx(
+                "dir",
+                Some(1),
+                Some("director"),
+                Some(BrigadeRole::Director),
+            );
+            ctx.store
+                .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+                .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+            let mut args = full_goinkyo_args();
+            args.as_object_mut().unwrap().remove(field);
+
+            let response = call(&mut ctx, &goinkyo_call(args));
+            assert_eq!(response["result"]["isError"], true, "field={field}");
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains(field),
+                "error should name the missing field {field:?}: {text:?}"
+            );
+            assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+        }
+    }
+
+    #[test]
+    fn consult_goinkyo_requires_their_case_when_about_is_given() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let mut args = full_goinkyo_args();
+        args.as_object_mut().unwrap().remove("their_case");
+
+        let response = call(&mut ctx, &goinkyo_call(args));
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("their_case"), "got {text:?}");
+        assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+    }
+
+    #[test]
+    fn consult_goinkyo_about_must_name_a_real_member() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let mut args = full_goinkyo_args();
+        args["about"] = json!("worker-99");
+
+        let response = call(&mut ctx, &goinkyo_call(args));
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("worker-99"), "got {text:?}");
+        assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+    }
+
+    #[test]
+    fn consult_goinkyo_about_must_name_a_worker_not_the_director() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let mut args = full_goinkyo_args();
+        args["about"] = json!("director");
+        args["their_case"] = json!("N/A — director is not a Worker");
+
+        let response = call(&mut ctx, &goinkyo_call(args));
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("director"), "got {text:?}");
+        assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+    }
+
+    #[test]
+    fn consult_goinkyo_required_field_empty_or_blank_is_an_error() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        for blank in ["", "   "] {
+            let mut args = full_goinkyo_args();
+            args["question"] = json!(blank);
+            let response = call(&mut ctx, &goinkyo_call(args));
+            assert_eq!(response["result"]["isError"], true, "blank={blank:?}");
+            assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+        }
+    }
+
+    #[test]
+    fn consult_goinkyo_required_field_wrong_json_type_is_an_error() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        for value in [json!(123), json!(true), json!([]), json!({})] {
+            let mut args = full_goinkyo_args();
+            args["my_case"] = value.clone();
+            let response = call(&mut ctx, &goinkyo_call(args));
+            assert_eq!(response["result"]["isError"], true, "value={value:?}");
+            assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
+        }
+    }
+
+    #[test]
+    fn consult_goinkyo_refuses_when_a_goinkyo_already_exists() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("already"), "got {text:?}");
+        // Not `assert_no_goinkyo_side_effects`: one Goinkyo row already
+        // exists here on purpose. The rejected call must not add a second
+        // one, or a request file for it.
+        assert_eq!(
+            ctx.store
+                .brigade_members(1)
+                .unwrap()
+                .iter()
+                .filter(|m| m.role == BrigadeRole::Goinkyo)
+                .count(),
+            1,
+            "a rejected call must not create a second Goinkyo row"
+        );
+        assert!(!tmp.path().join("1.txt").exists());
+    }
+
+    #[test]
+    fn consult_goinkyo_may_only_be_called_by_a_director() {
+        let mut ctx = ctx("w1", Some(1), Some("worker-1"), Some(BrigadeRole::Worker));
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert_eq!(response["result"]["isError"], true);
+        assert_no_goinkyo_side_effects(&ctx, 1, tmp.path());
     }
 }
