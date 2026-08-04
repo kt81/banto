@@ -254,13 +254,19 @@ fn main() -> Result<()> {
             let store = open_store(&config)?;
             let claude_home = resolve_claude_home(cli.claude_home, &config)?;
             let codex_home = resolve_codex_home(cli.codex_home, &config);
+            // Same base as `embedded::emporium::write_mcp_config`'s
+            // `dirs::data_local_dir()/banto/mcp/`, one level further down:
+            // a consultation request isn't an `--mcp-config` file, so it
+            // gets its own subdirectory rather than sharing that one.
+            let goinkyo_dir =
+                dirs::data_local_dir().map(|dir| dir.join("banto").join("mcp").join("goinkyo"));
             let identity = mcp::Identity {
                 session,
                 brigade,
                 member,
                 role: role.as_deref().and_then(BrigadeRole::from_token),
             };
-            mcp::run_stdio_server(store, identity, claude_home, codex_home)
+            mcp::run_stdio_server(store, identity, claude_home, codex_home, goinkyo_dir)
         }
         Some(Command::Hook) => unreachable!("Command::Hook returns before load_config runs"),
         None => {
