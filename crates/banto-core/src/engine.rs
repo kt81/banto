@@ -112,24 +112,29 @@ pub enum Stage {
     Solo(SessionKey),
     Brigade {
         id: BrigadeId,
-        /// Director first, by convention rather than an enforced
-        /// invariant: `Store::brigade_members`' own `ORDER BY` puts the
-        /// Director first, and the common formation path
-        /// (`update_spawned`'s `BrigadeDirector` arm, then `BrigadeMember`)
-        /// preserves that order into this vec — but a resume where the
-        /// Director's own pane needs a fresh `Cmd::OpenEmbedded` while
-        /// another member's is already open (`stage_brigade`) can append
-        /// them out of that order, and closing just the Director's own
-        /// pane (prefix-`x`, `ClosePane` — never routed through dismiss,
-        /// see `PrefixAction::Kill`'s own doc) leaves this brigade staged
-        /// with whatever was `panes[1]` now at index 0. Several sites still
-        /// read index 0 as "the Director" without checking: `add_worker`
-        /// (a fresh Worker's cwd), `FocusPane`'s own doc (`1`-`9` prefix
-        /// keys), and — most consequentially — `update_disbanded`, which
-        /// decides what to *kill* by position, not by `App`'s own
-        /// `directors` id set that already exists and already gates
-        /// disband's own trigger. None of this is fixed here; flagged, not
-        /// yet acted on.
+        /// The Director's own key, authoritative — role no longer has to be
+        /// derived from position anywhere (`add_worker`, `update_disbanded`,
+        /// `PrefixAction::Kill`, `gather_goinkyo_observation`, `tile_title`
+        /// all read this instead of assuming `panes[0]`). `None` is a
+        /// legitimate state, not a gap to close: `stage_brigade` sets it
+        /// leniently from the store's own member row (no session id
+        /// recorded yet there → `None`), and closing just the Director's
+        /// own pane (prefix-`x`, `ClosePane` — never routed through
+        /// dismiss, see `PrefixAction::Kill`'s own doc; `Stage::remove`
+        /// clears this field the same moment it drops that pane from
+        /// `panes`) leaves a brigade legitimately staged around its other
+        /// members with the Director simply unknown-for-now. Every
+        /// consumer's own `None` behavior is its safe default, not an
+        /// error path — see each site's own doc.
+        director: Option<SessionKey>,
+        /// Every staged pane, Director included. Order is display/geometry
+        /// only now (`stage_tiles`'s master+stack layout, `tile_title`'s
+        /// fallback "worker N" numbering, `FocusPane`'s `1`-`9`) — a
+        /// best-effort convention (`update_spawned`'s `BrigadeMember` arm
+        /// still inserts the Director's own key at the front when it
+        /// recognizes it, everyone else appended in arrival order), never
+        /// a source of role truth. Nothing here still infers a role from
+        /// where a key sits — `director` above is what changed that.
         panes: Vec<SessionKey>,
         focused: usize,
     },
@@ -150,11 +155,23 @@ impl Stage {
 
     /// Drop `key` from the stage (a session exited). `Solo` collapses to
     /// `Empty`; a brigade pane is removed with `focused` clamped into range
-    /// (collapsing to `Empty` if that was the last pane).
+    /// (collapsing to `Empty` if that was the last pane) — and, if `key` was
+    /// the Director's own, `director` clears to `None` in the same step:
+    /// the invariant every consumer relies on is that `Some` always still
+    /// has a pane in `panes` to back it, never a stale reference to one
+    /// that's already gone.
     fn remove(&mut self, key: &SessionKey) {
         match self {
             Stage::Solo(k) if k == key => *self = Stage::Empty,
-            Stage::Brigade { panes, focused, .. } => {
+            Stage::Brigade {
+                director,
+                panes,
+                focused,
+                ..
+            } => {
+                if director.as_ref() == Some(key) {
+                    *director = None;
+                }
                 if let Some(pos) = panes.iter().position(|k| k == key) {
                     panes.remove(pos);
                     if panes.is_empty() {
@@ -171,8 +188,10 @@ impl Stage {
 
 /// The outer (bordered) tile rects for the currently-staged sessions, each
 /// paired with its key. A solo session fills the whole pane; a brigade puts
-/// the Director on the left and stacks the Workers down the right (a
-/// "master + stack" layout).
+/// its first pane on the left as the master tile and stacks the rest down
+/// the right — geometry only, keyed by position in `panes`
+/// (`Stage::Brigade::panes`'s own doc), independent of which pane actually
+/// holds the Director.
 pub fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(SessionKey, Rect)> {
     match stage {
         Stage::Empty => Vec::new(),
@@ -895,6 +914,14 @@ impl EmporiumState {
             self.focus = Focus::Sidebar;
         }
     }
+
+    /// `brigade_id`'s Goinkyo pane, if [`Self::goinkyo_pane`] currently
+    /// tracks one — read-only, for the shell's own display purposes
+    /// (`tile_title`): the field itself stays private so only this crate's
+    /// own one-shot-guard bookkeeping ever writes to it.
+    pub fn goinkyo_pane_for(&self, brigade_id: BrigadeId) -> Option<&SessionKey> {
+        self.goinkyo_pane.get(&brigade_id)
+    }
 }
 
 /// How long the prefix stays armed with no follow-up key before
@@ -983,9 +1010,10 @@ enum PrefixAction {
     Move(Direction),
     /// `1`-`9`, in range: focus the pane at this 0-based index. This
     /// addresses `Stage`'s pane list directly (`1` is always `panes[0]`,
-    /// the director) and is deliberately untouched by the focus ring's
-    /// sidebar slot — ring position and pane number are different axes,
-    /// don't conflate them when touching this again.
+    /// the master tile — geometry, not role; see `Stage::Brigade::panes`'s
+    /// own doc) and is deliberately untouched by the focus ring's sidebar
+    /// slot — ring position and pane number are different axes, don't
+    /// conflate them when touching this again.
     FocusPane(usize),
     /// `1`-`9`, but the staged brigade doesn't have that many panes.
     OutOfRange,
@@ -1033,10 +1061,10 @@ fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> 
 }
 
 /// A position in the arrow/cycle focus ring: the sidebar, or a 0-based pane
-/// index into the staged brigade (`0` is the director/solo pane, `1..` are
-/// workers in stack order). Distinct from [`PrefixAction::FocusPane`], which
-/// addresses panes directly and never includes the sidebar — see that
-/// variant's doc comment.
+/// index into the staged brigade (`0` is the master/solo pane, `1..` are the
+/// stack, in `panes` order — geometry, not role). Distinct from
+/// [`PrefixAction::FocusPane`], which addresses panes directly and never
+/// includes the sidebar — see that variant's doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusSlot {
     Sidebar,
@@ -1090,10 +1118,10 @@ fn cycle_forward(from: FocusSlot, pane_count: usize) -> FocusSlot {
 }
 
 /// One armed arrow key's target slot, navigating the three-column grid
-/// (sidebar | director-or-solo | worker stack) by geometry rather than ring
-/// order. Left/Right cross columns; Up/Down step within the worker stack
-/// only, clamped (no wrap). Every edge case (sidebar's Left, a solo/director
-/// pane's Up/Down, a worker's Right) is a deliberate no-op, not an omission.
+/// (sidebar | master/solo | stack) by geometry rather than ring order.
+/// Left/Right cross columns; Up/Down step within the stack only, clamped
+/// (no wrap). Every edge case (sidebar's Left, a solo/master pane's
+/// Up/Down, a stack pane's Right) is a deliberate no-op, not an omission.
 fn arrow_target(from: FocusSlot, direction: Direction, pane_count: usize) -> FocusSlot {
     match (from, direction) {
         (FocusSlot::Sidebar, Direction::Right) => {
@@ -2110,14 +2138,19 @@ fn resolve_armed_prefix(
                 .row_for_id(target.as_str())
                 .map(|row| row.display_title().to_string())
                 .unwrap_or_else(|| target.as_str().to_string());
-            // Director is always `panes[0]` (see `Stage::Brigade`'s doc), so
-            // any other focused pane in a staged brigade is a dismissable
-            // member — Worker or Goinkyo, [`update_membership_resolved`]
-            // is what actually tells the two apart once dismiss is
-            // confirmed — structural, no store round trip needed just to
-            // grow the dialog its second choice.
-            let dismissable =
-                matches!(&state.stage, Stage::Brigade { focused, .. } if *focused != 0);
+            // Role, not position: the focused pane is dismissable when we
+            // know who the Director is *and* it isn't them —
+            // `update_membership_resolved` is what actually tells Worker
+            // from Goinkyo apart once dismiss is confirmed, so no store
+            // round trip is needed just to grow the dialog its second
+            // choice. `director == None` (the Director's own pane closed,
+            // or never resolved) is the safe side: refuse rather than guess
+            // — see `Stage::Brigade::director`'s own doc.
+            let dismissable = matches!(
+                &state.stage,
+                Stage::Brigade { director, focused, panes, .. }
+                    if director.is_some() && director.as_ref() != panes.get(*focused)
+            );
             app.open_confirm_kill_modal(target.as_str().to_string(), title, dismissable);
             Vec::new()
         }
@@ -2775,11 +2808,15 @@ fn stage_brigade(
     members: &[(MemberToken, BrigadeRole, Option<String>)],
     brigade: &BrigadeConfig,
 ) -> Vec<Cmd> {
-    let director_row = members
+    let director_session_id = members
         .iter()
         .find(|(_, role, _)| *role == BrigadeRole::Director)
-        .and_then(|(_, _, sid)| sid.as_deref())
-        .and_then(|sid| app.row_for_id(sid));
+        .and_then(|(_, _, sid)| sid.as_deref());
+    // Leniently `None` when the store's own Director row has no session id
+    // recorded yet — `Stage::Brigade::director`'s own doc explains why that's
+    // a legitimate state, not something to work around here.
+    let director = director_session_id.map(SessionKey::from_id);
+    let director_row = director_session_id.and_then(|sid| app.row_for_id(sid));
     let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -2879,6 +2916,7 @@ fn stage_brigade(
     }
     state.stage = Stage::Brigade {
         id: brigade_id,
+        director,
         panes,
         focused: 0,
     };
@@ -2897,15 +2935,19 @@ fn toggle_pin(app: &mut App) -> Vec<Cmd> {
 }
 
 /// `b`: spawn one more fresh Worker into the staged brigade. `cwd` is the
-/// Director's own row cwd, resolved from `app` via the Director's key
-/// (always `panes[0]`, always a known real id) — no extra round trip needed.
+/// Director's own row cwd, resolved from `app` via `Stage::Brigade::director`
+/// — no extra round trip needed as long as that's `Some` and the row is
+/// already known; `None` (either one) falls back to `"."`, same as an
+/// unresolved Director always has.
 fn add_worker(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig) -> Vec<Cmd> {
-    let Stage::Brigade { id, panes, .. } = &state.stage else {
+    let Stage::Brigade { id, director, .. } = &state.stage else {
         state.status = Some("no brigade staged — press B to start one".to_string());
         return Vec::new();
     };
     let brigade_id = *id;
-    let director_row = panes.first().and_then(|key| app.row_for_id(key.as_str()));
+    let director_row = director
+        .as_ref()
+        .and_then(|key| app.row_for_id(key.as_str()));
     let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -3159,6 +3201,7 @@ fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> V
         } => {
             state.stage = Stage::Brigade {
                 id: brigade_id,
+                director: Some(key.clone()),
                 panes: vec![key],
                 focused: 0,
             };
@@ -3175,11 +3218,24 @@ fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> V
             needs_codex_kickoff,
             cwd,
         } => {
-            if let Stage::Brigade { id, panes, .. } = &mut state.stage
+            if let Stage::Brigade {
+                id,
+                director,
+                panes,
+                ..
+            } = &mut state.stage
                 && *id == brigade_id
                 && !panes.contains(&key)
             {
-                panes.push(key.clone());
+                // Best-effort Director-first ordering (display only — see
+                // `Stage::Brigade::panes`'s own doc): if this arrival is
+                // the Director's own key, put it back at the front rather
+                // than wherever it landed in arrival order.
+                if director.as_ref() == Some(&key) {
+                    panes.insert(0, key.clone());
+                } else {
+                    panes.push(key.clone());
+                }
             }
             if needs_codex_kickoff {
                 state.pending_kickoffs.push(PendingKickoff {
@@ -3374,7 +3430,19 @@ fn update_discovery_result(
     }
     match &mut state.stage {
         Stage::Solo(k) if *k == old_key => *k = new_key.clone(),
-        Stage::Brigade { panes, .. } => {
+        Stage::Brigade {
+            director, panes, ..
+        } => {
+            // Defensive, not believed reachable today: `old_key` here is
+            // always a synthetic key (`poll_discovery` only tracks those —
+            // `key.is_synthetic()`), and the Director's own key never is
+            // one (always built from an already-known real id, at
+            // formation or resume). Kept anyway for the same reason
+            // `goinkyo_pane`'s own follow below is — cheap, and correct if
+            // that assumption is ever wrong.
+            if director.as_ref() == Some(&old_key) {
+                *director = Some(new_key.clone());
+            }
             for pane in panes.iter_mut() {
                 if *pane == old_key {
                     *pane = new_key.clone();
@@ -3450,7 +3518,17 @@ fn update_member_session_forked(
             if let Some(screen) = state.screens.remove(&old_key) {
                 state.screens.insert(new_key.clone(), screen);
             }
-            if let Stage::Brigade { panes, .. } = &mut state.stage {
+            if let Stage::Brigade {
+                director, panes, ..
+            } = &mut state.stage
+            {
+                // Unlike `update_discovery_result`'s own version of this,
+                // genuinely reachable: an auto-compaction fork can happen
+                // to any already-running Claude session, the Director's own
+                // included, not just a freshly-discovered member's.
+                if director.as_ref() == Some(&old_key) {
+                    *director = Some(new_key.clone());
+                }
                 for pane in panes.iter_mut() {
                     if *pane == old_key {
                         *pane = new_key.clone();
@@ -3619,12 +3697,21 @@ fn update_worker_added(
 }
 
 /// On success while the disbanded brigade is staged: fall the stage back to
-/// `Solo(director)` (unchanged), and additionally kill every staged Worker
-/// pane (`panes[1..]` — the Director, `panes[0]`, is the operator's own
-/// session and survives). Workers are banto-spawned creatures that die with
-/// their brigade; the kills flow through the same passive `PtyExited` fold
-/// as any other exit — a killed-but-unstaged Worker (already gone, or one
-/// this stage never resolved) is simply skipped, nothing to kill.
+/// `Solo(director)` and kill every *other* staged pane — Workers and a
+/// Goinkyo alike, whatever role they hold; disband tears down the whole
+/// cell, not just Workers specifically. Requires knowing the Director for
+/// certain: `Stage::Brigade::director` is `Some` *and* its own pane is
+/// still actually staged (the ordinary case — belt-and-suspenders past the
+/// `Some` alone, since kill is irreversible and this is cheap to check).
+/// Anything short of that certainty — `director` is `None`, or points at a
+/// pane that already isn't staged — kills nobody and drops straight to
+/// `Stage::Empty` instead of guessing who's safe to spare: an operator who
+/// disbands with the Director's own pane already closed gets a
+/// no-op-on-the-kills-but-still-collapses-the-stage outcome, not a wrong
+/// kill. Workers are banto-spawned creatures that die with their brigade;
+/// the kills flow through the same passive `PtyExited` fold as any other
+/// exit — a killed-but-unstaged member (already gone, or one this stage
+/// never resolved) is simply skipped, nothing to kill.
 fn update_disbanded(
     state: &mut EmporiumState,
     app: &mut App,
@@ -3636,11 +3723,20 @@ fn update_disbanded(
         Ok((hidden, directors)) => {
             app.set_hidden_worker_ids(hidden);
             app.set_directors(directors);
-            let (director_key, worker_keys) = if let Stage::Brigade { id, panes, .. } = &state.stage
+            let (director_key, other_keys) = if let Stage::Brigade {
+                id,
+                director,
+                panes,
+                ..
+            } = &state.stage
                 && *id == brigade_id
+                && let Some(d) = director
+                && panes.contains(d)
             {
-                let mut panes = panes.iter();
-                (panes.next().cloned(), panes.cloned().collect())
+                (
+                    Some(d.clone()),
+                    panes.iter().filter(|k| *k != d).cloned().collect(),
+                )
             } else {
                 (None, Vec::new())
             };
@@ -3649,7 +3745,7 @@ fn update_disbanded(
                 None => Stage::Empty,
             };
             state.set_status("brigade disbanded".to_string(), now);
-            worker_keys
+            other_keys
                 .into_iter()
                 .map(|key| Cmd::KillPty { key })
                 .collect()
@@ -4108,6 +4204,7 @@ mod tests {
         let director = SessionKey::from_id("dir");
         let stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director.clone()],
             focused: 0,
         };
@@ -4122,6 +4219,7 @@ mod tests {
         let w1 = SessionKey::from_id("w1");
         let stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director.clone(), w0.clone(), w1.clone()],
             focused: 0,
         };
@@ -4156,6 +4254,7 @@ mod tests {
         let w1 = SessionKey::from_id("w1");
         let stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![
                 SessionKey::from_id("dir"),
                 SessionKey::from_id("w0"),
@@ -4178,6 +4277,7 @@ mod tests {
     fn stage_remove_clamps_focused_in_a_brigade() {
         let mut stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![
                 SessionKey::from_id("dir"),
                 SessionKey::from_id("w1"),
@@ -4199,11 +4299,34 @@ mod tests {
     fn stage_remove_last_pane_collapses_to_empty() {
         let mut stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
         stage.remove(&SessionKey::from_id("dir"));
         assert!(matches!(stage, Stage::Empty));
+    }
+
+    #[test]
+    fn stage_remove_of_the_directors_own_pane_clears_director_but_leaves_other_panes_staged() {
+        let director = SessionKey::from_id("dir");
+        let w1 = SessionKey::from_id("w1");
+        let mut stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![director.clone(), w1.clone()],
+            focused: 0,
+        };
+        stage.remove(&director);
+        match &stage {
+            Stage::Brigade {
+                director, panes, ..
+            } => {
+                assert!(director.is_none());
+                assert_eq!(panes, &vec![w1]);
+            }
+            other => panic!("expected the brigade to stay staged, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4706,6 +4829,7 @@ mod tests {
         }
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes,
             focused: 0,
         };
@@ -4757,6 +4881,41 @@ mod tests {
             Cmd::Store(StoreIntent::SetMemberSession { token, session_id, .. })
                 if token == "worker-1" && session_id == "w1"
         )));
+    }
+
+    #[test]
+    fn discovery_result_on_the_directors_own_key_renames_the_director_field() {
+        // Defensive path per `update_discovery_result`'s own doc: the
+        // Director's key is never actually synthetic in production, but the
+        // rename must still be correct if that assumption is ever wrong.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let pending_director = SessionKey::new_worker(1, "director");
+        let worker = SessionKey::from_id("w1");
+        staged_brigade(&mut state, &pending_director, std::slice::from_ref(&worker));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let _cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: pending_director.clone(),
+                session_id: "dir".to_string(),
+                member: None,
+            },
+            test_instant(),
+        );
+
+        let discovered = SessionKey::from_id("dir");
+        let Stage::Brigade {
+            director, panes, ..
+        } = &state.stage
+        else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(director.as_ref(), Some(&discovered));
+        assert_eq!(panes, &[discovered, worker]);
     }
 
     #[test]
@@ -4923,6 +5082,43 @@ mod tests {
             Cmd::Store(StoreIntent::SetMemberSession { token, session_id, .. })
                 if token == "worker-1" && session_id == "w1-new"
         )));
+    }
+
+    #[test]
+    fn member_session_forked_on_the_directors_own_session_renames_the_director_field() {
+        // Genuinely reachable, unlike discovery's own version of this: an
+        // auto-compaction fork can happen to any already-running Claude
+        // session, the Director's own included.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir-old");
+        let worker = SessionKey::from_id("w1");
+        staged_brigade(&mut state, &director, std::slice::from_ref(&worker));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let _cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "director".to_string(),
+                old_id: "dir-old".to_string(),
+                new_id: "dir-new".to_string(),
+            },
+            now,
+        );
+
+        let new_director = SessionKey::from_id("dir-new");
+        let Stage::Brigade {
+            director, panes, ..
+        } = &state.stage
+        else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(director.as_ref(), Some(&new_director));
+        assert_eq!(panes, &[new_director, worker]);
     }
 
     #[test]
@@ -5326,6 +5522,7 @@ mod tests {
         let director = SessionKey::from_id("dir");
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director],
             focused: 0,
         };
@@ -5342,6 +5539,41 @@ mod tests {
                 worker_agent: AgentKind::Codex,
                 ..
             })]
+        ));
+    }
+
+    #[test]
+    fn add_worker_resolves_the_directors_row_even_when_panes_are_reversed() {
+        // The Worker staged solo first, ahead of the Director, so
+        // `panes[0]` is the Worker — proves the cwd/agent lookup reads
+        // `director`, not position (`panes[0]`'s own row is a distinct,
+        // deliberately different cwd/agent to catch a positional read).
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![worker.clone(), director],
+            focused: 0,
+        };
+        let mut worker_row = row("w1");
+        worker_row.agent = AgentKind::Codex;
+        worker_row.cwd = Some(PathBuf::from("/work/wrong"));
+        let mut director_row = row("dir");
+        director_row.cwd = Some(PathBuf::from("/work/right"));
+        let mut app = app_with(vec![worker_row, director_row]);
+        let brigade = brigade_config(); // Inherit — must follow the Director's own product
+
+        let cmds = add_worker(&mut state, &mut app, &brigade);
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::AddWorker {
+                cwd,
+                worker_agent: AgentKind::ClaudeCode,
+                ..
+            })] if cwd == &PathBuf::from("/work/right")
         ));
     }
 
@@ -5868,6 +6100,7 @@ mod tests {
         let director = SessionKey::from_id("dir");
         state.stage = Stage::Brigade {
             id: 7,
+            director: Some(director.clone()),
             panes: vec![director],
             focused: 0,
         };
@@ -6204,6 +6437,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker.clone()],
             focused: 0,
         };
@@ -6384,6 +6618,7 @@ mod tests {
         }
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director.clone(), worker.clone()],
             focused: 1,
         };
@@ -6401,9 +6636,19 @@ mod tests {
         );
 
         match &state.stage {
-            Stage::Brigade { panes, focused, .. } => {
-                assert_eq!(panes, &[director]);
+            Stage::Brigade {
+                director: staged_director,
+                panes,
+                focused,
+                ..
+            } => {
+                assert_eq!(panes, std::slice::from_ref(&director));
                 assert_eq!(*focused, 0);
+                assert_eq!(
+                    staged_director.as_ref(),
+                    Some(&director),
+                    "a Worker's own pane exiting must not touch director"
+                );
             }
             other => panic!(
                 "expected a surviving Brigade stage, got a different Stage variant: {}",
@@ -6546,6 +6791,7 @@ mod tests {
         state.screens.insert(worker.clone(), Screen::new(24, 80));
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker.clone()],
             focused: 0,
         };
@@ -7012,6 +7258,7 @@ mod tests {
         state.screens.insert(worker.clone(), Screen::new(24, 80));
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director.clone(), worker.clone()],
             focused,
         };
@@ -7732,6 +7979,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: 6,
+            director: None,
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
@@ -7873,6 +8121,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
@@ -8034,6 +8283,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
@@ -8159,6 +8409,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker],
             focused: 0,
         };
@@ -8195,6 +8446,7 @@ mod tests {
         let w2 = SessionKey::from_id("w2");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, w1, w2],
             focused: 0,
         };
@@ -8313,6 +8565,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director, worker],
             focused: 1,
         };
@@ -8350,8 +8603,50 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director, worker],
             focused: 0,
+        };
+        state.focus = Focus::Pane;
+        state.prefix_armed = Some(test_instant());
+        let mut app = app_with(vec![row("dir"), row("w1")]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmKill {
+                key,
+                worker_choice: None,
+                ..
+            }) if key == "dir"
+        ));
+    }
+
+    #[test]
+    fn armed_x_on_the_director_pane_has_no_dismiss_choice_even_when_panes_are_reversed() {
+        // The Worker staged solo first, ahead of the Director, so `panes[0]`
+        // is the Worker — proves the dismissable check reads `director`,
+        // not position.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![worker, director],
+            focused: 1,
         };
         state.focus = Focus::Pane;
         state.prefix_armed = Some(test_instant());
@@ -8967,6 +9262,7 @@ mod tests {
         let w2 = SessionKey::from_id("w2");
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director.clone(), w1.clone(), w2.clone()],
             focused: 1,
         };
@@ -9006,6 +9302,7 @@ mod tests {
         let w1 = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director, w1.clone()],
             focused: 1,
         };
@@ -9047,6 +9344,7 @@ mod tests {
         let w2 = SessionKey::from_id("w2");
         state.stage = Stage::Brigade {
             id: 1,
+            director: Some(director.clone()),
             panes: vec![director.clone(), w1.clone(), w2.clone()],
             focused: 0,
         };
@@ -9080,6 +9378,75 @@ mod tests {
             Stage::Solo(key) => assert_eq!(key, &director),
             _ => panic!("expected the director to remain staged solo"),
         }
+    }
+
+    #[test]
+    fn disband_while_staged_kills_workers_but_not_the_director_even_when_panes_are_reversed() {
+        // The Worker staged solo first, ahead of the Director, so
+        // `panes[0]` is a Worker — proves the "who survives" split reads
+        // `director`, not position.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let w1 = SessionKey::from_id("w1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![w1.clone(), director.clone()],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+
+        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }]);
+        match &state.stage {
+            Stage::Solo(key) => assert_eq!(key, &director),
+            _ => panic!("expected the director to remain staged solo"),
+        }
+    }
+
+    #[test]
+    fn disbanding_with_no_known_director_kills_nobody() {
+        // Kill is irreversible: `director == None` (unresolved, or its own
+        // pane already closed) must not fall back to guessing who's safe —
+        // see `update_disbanded`'s own doc.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let w1 = SessionKey::from_id("w1");
+        let w2 = SessionKey::from_id("w2");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: None,
+            panes: vec![w1, w2],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+
+        assert!(cmds.is_empty(), "nobody may be killed: {cmds:?}");
+        assert!(matches!(state.stage, Stage::Empty));
     }
 
     #[test]
@@ -9150,6 +9517,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker],
             focused: 0,
         };
@@ -9183,6 +9551,7 @@ mod tests {
         let director = SessionKey::from_id("dir");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director],
             focused: 0,
         };
@@ -9238,6 +9607,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker],
             focused: 0,
         };
@@ -9311,6 +9681,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker],
             focused: 0,
         };
@@ -9409,6 +9780,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker],
             focused: 0,
         };
@@ -9444,6 +9816,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director, worker],
             focused: 1,
         };
@@ -9523,6 +9896,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director.clone(), worker.clone()],
             focused: 0,
         };
@@ -9569,6 +9943,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
         state.stage = Stage::Brigade {
             id: 1,
+            director: None,
             panes: vec![director.clone(), worker.clone()],
             focused: 0,
         };

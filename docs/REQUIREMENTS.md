@@ -518,20 +518,25 @@ mediation server" below), or the operator picking Dismiss from the
 prefix-`x` kill-confirm dialog on the Goinkyo's own pane — the same choice
 a Worker's pane already offered.
 
-That dialog decides in two separate stages, not one: *whether to offer*
-Dismiss at all is still a pane-position check (`focused != 0` — the
-Director's own pane is conventionally `panes[0]`, but nothing actually
-enforces that: `Store::brigade_members`' `ORDER BY` puts the Director
-first, and the common formation path preserves that order into `panes`,
-but a resume where the Director's own pane needs a fresh `Cmd::OpenEmbedded`
-while another member's is already open can append them out of that order —
-see `engine.rs`'s `stage_brigade`/`update_spawned`). *Whether a confirmed
-Dismiss actually deletes anything* is a separate, later check on the
-member's real role from the store (`update_membership_resolved`), which
-refuses for a Director regardless of what the dialog showed. So the
-position check can only misfire toward a UX gap (Dismiss missing, or
-offered, on the wrong pane) — never toward an actual wrong deletion; the
-real gate is the role check downstream. Disband does *not* reach the
+That dialog decides in two separate stages, not one, both role-based now:
+*whether to offer* Dismiss at all reads `Stage::Brigade`'s own `director:
+Option<SessionKey>` field directly (`director.is_some() &&
+director.as_ref() != panes.get(focused)`) — not the focused pane's
+position. `panes`' own order is display-only and best-effort (a convenience
+`update_spawned` attempts on arrival, director-first when it can, never
+load-bearing): `Store::brigade_members`' `ORDER BY` puts the Director
+first and the common formation path preserves that into `panes`, but a
+resume where the Director's own pane needs a fresh `Cmd::OpenEmbedded`
+while another member's is already open can still append them out of that
+order (see `engine.rs`'s `stage_brigade`/`update_spawned`) — this no longer
+matters for correctness, only for which pane a fresh operator's eye lands
+on first. *Whether a confirmed Dismiss actually deletes anything* is a
+separate, later check on the member's real role from the store
+(`update_membership_resolved`), which refuses for a Director regardless of
+what the dialog showed — unchanged, and still the check that actually
+guards deletion; the two stages agreeing is what closes the old UX gap
+(Dismiss missing, or offered, on the wrong pane) that a position-derived
+first stage used to risk. Disband does *not* reach the
 brigade off stage *before* the row disappears, so the next tick's
 observation is "not staged" rather than "no row" — the guard for a
 disbanded brigade is simply never released, harmlessly, since that brigade
