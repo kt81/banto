@@ -274,6 +274,36 @@ pub type BrigadeId = i64;
 /// and never reused across brigades).
 pub type MemberToken = String;
 
+/// The Goinkyo's own [`MemberToken`] — a fixed value, unlike a Worker's
+/// numbered one, since a brigade only ever has at most one Goinkyo at a
+/// time. A different concept from `BrigadeRole::Goinkyo`'s own
+/// [`BrigadeRole::as_token`] form (`"goinkyo"` too, but the *role's* string
+/// form, read from/written to the `role` column) — they only coincide
+/// because this token was chosen to read the same way; nothing enforces
+/// that they must match, the same way a Worker's own token (`"worker-1"`)
+/// and its role's string form (`"worker"`) already don't.
+///
+/// Minted once, here, and used everywhere a member-token comparison or
+/// construction needs "the Goinkyo, specifically" rather than "whichever
+/// role this row has": `mcp::tool_consult_goinkyo` (where the token is
+/// actually chosen), `mcp::tool_dismiss_goinkyo`,
+/// `engine::update_goinkyo_awaiting_spawn` (both the synthetic key and the
+/// `Cmd::OpenEmbedded` member tuple), and `engine::update_discovery_result`/
+/// `update_member_session_forked` (recognizing a rename as the Goinkyo's
+/// own, to keep `EmporiumState::goinkyo_pane` pointed at the right pane).
+/// Before this constant, all six hardcoded the literal independently;
+/// letting even one of them drift from the rest would have broken
+/// `dismiss_goinkyo` (silently — `Store::dismiss_worker` no-ops on an
+/// unknown token), the spawn/discovery/pane-close chain (wrong token
+/// embedded in the synthetic key or the launch's `--member`), or the
+/// rename-following that keeps `goinkyo_pane` from going stale — each in a
+/// different way, none of them raising an error. A pane's own *display*
+/// title happens to also read `"goinkyo"` at spawn time
+/// (`update_goinkyo_awaiting_spawn`'s `SessionToOpen.title`) but is a third,
+/// unrelated concept — cosmetic text nothing reads back or compares — and
+/// is left as its own literal rather than reusing this constant.
+pub const GOINKYO_TOKEN: &str = "goinkyo";
+
 /// A member's role within a brigade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrigadeRole {
