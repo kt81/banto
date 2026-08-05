@@ -278,6 +278,12 @@ pub type BrigadeId = i64;
 /// and never reused across brigades).
 pub type MemberToken = String;
 
+/// The Director's own [`MemberToken`]. This is deliberately distinct from
+/// [`BrigadeRole::Director`]'s [`BrigadeRole::as_token`] role-column string,
+/// even though both currently spell `"director"`: member identity is what
+/// formation and launches carry, while a role is a separate classification.
+pub const DIRECTOR_TOKEN: &str = "director";
+
 /// The Goinkyo's own [`MemberToken`] — a fixed value, unlike a Worker's
 /// numbered one, since a brigade only ever has at most one Goinkyo at a
 /// time. A different concept from `BrigadeRole::Goinkyo`'s own
