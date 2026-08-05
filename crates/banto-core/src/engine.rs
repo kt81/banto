@@ -1412,6 +1412,13 @@ pub enum Event {
         #[serde(default)]
         reason: Option<PtyExitReason>,
     },
+    /// The shell's `Cmd::WritePty` executor found no live handle for `key`
+    /// — see `update_pty_write_dropped`'s own doc for why this is expected
+    /// to mean a bug, not an ordinary race, and is surfaced rather than
+    /// silently swallowed the way it used to be.
+    PtyWriteDropped {
+        key: SessionKey,
+    },
     /// The shell's answer to `Cmd::CheckNewSessionCwd` — see
     /// `update_new_session_cwd_checked`'s doc for why `cwd` is echoed back
     /// and how a stale answer is handled.
@@ -1636,6 +1643,7 @@ pub fn update(
         Event::PtyExited { key, reason } => {
             update_pty_exited(state, app, brigade, key, reason, now)
         }
+        Event::PtyWriteDropped { key } => update_pty_write_dropped(state, key, now),
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
@@ -3394,6 +3402,36 @@ fn update_pty_exited(
     Vec::new()
 }
 
+/// `Cmd::WritePty`'s target had no live handle when the shell went to write
+/// it — `execute_cmd`'s own `Cmd::WritePty` arm in `emporium.rs` reports
+/// this instead of the silent no-op it used to be. Deliberately not
+/// filtered by which `Cmd::WritePty` producer this traces back to: every
+/// direct keystroke-forwarding path (`Focus::Pane`'s own key handling,
+/// `PrefixAction::Literal`, mouse SGR forwarding, paste) reads its target
+/// key fresh out of `state.stage`/`state.screens` on the same `update` call
+/// that emits the `Cmd` — the same state `Cmd::RekeyPty` keeps in lockstep
+/// with the shell's own handle map — so none of those can name a key with
+/// no live handle. Only a *queued* write can: one stashed under a key at
+/// one tick (a Goinkyo/Codex kickoff's own `PendingGoinkyoKickoff`/
+/// `PendingKickoff`, a relay nudge's `PendingSubmit`) and executed at a
+/// later one, after that key might have been renamed or the pane closed in
+/// between. This is exactly the shape of the bug `update_discovery_result`/
+/// `update_member_session_forked`'s `pending_goinkyo_kickoffs` follow now
+/// fixes for the Goinkyo kickoff specifically — this status line is the
+/// generic backstop for that whole class, Goinkyo or otherwise, so a future
+/// instance of it is never silent again. Never fires on an ordinary
+/// keystroke, so this cannot become a per-keypress status flicker.
+fn update_pty_write_dropped(state: &mut EmporiumState, key: SessionKey, now: Instant) -> Vec<Cmd> {
+    state.set_status(
+        format!(
+            "internal: a write to {} found no live pane — this is a bug",
+            key.as_str()
+        ),
+        now,
+    );
+    Vec::new()
+}
+
 fn update_discovery_result(
     state: &mut EmporiumState,
     old_key: SessionKey,
@@ -3469,20 +3507,60 @@ fn update_discovery_result(
         }
         _ => {}
     }
+    // A queued `PendingSubmit` (the delayed `\r` for a relay nudge or
+    // either kickoff's phase two) names a pane the same way `screens`/
+    // `Stage` do, and needs the same follow: left on `old_key`, the write
+    // it stands for lands on a `Cmd::WritePty { key: old_key, .. }` with no
+    // live handle behind it, same silently-dropped-until-now shape
+    // `pending_goinkyo_kickoffs`'s own follow below fixes. Unconditional on
+    // `member` (unlike the block below) because a nudge/kickoff's own
+    // producer never distinguishes Goinkyo from anything else this way —
+    // there is exactly one `pending_submits`, shared by every role.
+    for pending in state.pending_submits.iter_mut() {
+        if pending.key == old_key {
+            pending.key = new_key.clone();
+        }
+    }
     if let Some((brigade_id, token)) = member {
-        // Keep `goinkyo_pane` pointing at the pane it actually names: it was
-        // recorded under the *synthetic* key at spawn time
-        // (`update_goinkyo_awaiting_spawn`'s `AwaitingSpawn` branch), and
-        // this is the discovery that resolves that synthetic key to a real
-        // session id — the entry has to follow, or the eventual
-        // `NoGoinkyo` would try to close a pane under a key nothing is
-        // staged at anymore. `get_mut` rather than an unconditional insert:
-        // only follows an entry `update_goinkyo_awaiting_spawn` already
-        // created, never invents one for a brigade it never attempted.
-        if token == GOINKYO_TOKEN
-            && let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id)
-        {
-            *pane = new_key.clone();
+        // Keep `goinkyo_pane` and any queued `PendingGoinkyoKickoff` pointed
+        // at the pane they actually name: both were recorded under the
+        // *synthetic* key at spawn time (`update_goinkyo_awaiting_spawn`'s
+        // `AwaitingSpawn` branch), and this is the discovery that resolves
+        // that synthetic key to a real session id — both entries have to
+        // follow, or `goinkyo_pane`'s eventual `NoGoinkyo` would try to
+        // close a pane under a key nothing is staged at anymore, and the
+        // kickoff would keep addressing a key nothing is listening on
+        // either. The kickoff side of this is not a rare corner: unlike an
+        // ordinary Worker (which never has a `PendingGoinkyoKickoff` at
+        // all — the operator gives it its own first turn), a Goinkyo's
+        // kickoff is queued the moment it's spawned, and Claude Code writes
+        // `sessions/<pid>.json` — what resolves this synthetic key — within
+        // the first couple hundred milliseconds of boot, well inside
+        // `GOINKYO_KICKOFF_QUIET_PERIOD`. So discovery routinely resolves
+        // before the kickoff's own quiet-period even elapses, let alone
+        // before the trust check and write that follow it; left un-renamed,
+        // every later step (`update_tick`'s quiet-period check, the trust
+        // round trip, the final `Cmd::WritePty`) keeps addressing the dead
+        // synthetic key, and a `Cmd::WritePty` against a key with no live
+        // handle is a silent no-op (`emporium.rs`'s own `execute_cmd`) — the
+        // kickoff simply never lands, with nothing to say why. Measured
+        // live 2026-08-05: a Goinkyo's `sessions/<pid>.json` updated once,
+        // 123ms after spawn, and never again — this rename is what that
+        // traced back to. `get_mut`/`find` rather than an unconditional
+        // insert for either: only follows an entry
+        // `update_goinkyo_awaiting_spawn` already created, never invents
+        // one for a brigade it never attempted.
+        if token == GOINKYO_TOKEN {
+            if let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id) {
+                *pane = new_key.clone();
+            }
+            if let Some(pending) = state
+                .pending_goinkyo_kickoffs
+                .iter_mut()
+                .find(|p| p.key == old_key)
+            {
+                pending.key = new_key.clone();
+            }
         }
         cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
             brigade_id,
@@ -3553,14 +3631,37 @@ fn update_member_session_forked(
                     }
                 }
             }
+            // Same reasoning, and same unconditional-on-`token` scope, as
+            // `update_discovery_result`'s own version of this: a queued
+            // `PendingSubmit` names a pane the same way `screens`/`Stage`
+            // do, and needs the same follow regardless of role.
+            for pending in state.pending_submits.iter_mut() {
+                if pending.key == old_key {
+                    pending.key = new_key.clone();
+                }
+            }
             // Same reasoning as `update_discovery_result`'s own version of
-            // this: `goinkyo_pane` has to follow a fork's rename too, or a
-            // later `NoGoinkyo` would try to close a pane under a key
-            // nothing is staged at anymore.
-            if token.as_str() == GOINKYO_TOKEN
-                && let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id)
-            {
-                *pane = new_key.clone();
+            // this: `goinkyo_pane` and any queued `PendingGoinkyoKickoff`
+            // both have to follow a fork's rename too, or a later
+            // `NoGoinkyo` would try to close a pane under a key nothing is
+            // staged at anymore, and a still-pending kickoff would keep
+            // addressing a key nothing is listening on. Less routinely hit
+            // than `update_discovery_result`'s own version (a fork this
+            // early, before the kickoff even fires, needs Claude's
+            // auto-compaction to land inside the first ~700ms of a fresh
+            // Goinkyo's life), but the same silent-`Cmd::WritePty`-to-a-dead-
+            // key failure if it ever does.
+            if token.as_str() == GOINKYO_TOKEN {
+                if let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id) {
+                    *pane = new_key.clone();
+                }
+                if let Some(pending) = state
+                    .pending_goinkyo_kickoffs
+                    .iter_mut()
+                    .find(|p| p.key == old_key)
+                {
+                    pending.key = new_key.clone();
+                }
             }
             cmds.push(Cmd::RekeyPty {
                 from: old_key,
@@ -6672,6 +6773,27 @@ mod tests {
     }
 
     #[test]
+    fn a_pty_write_dropped_for_lack_of_a_live_handle_is_reported_not_silent() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::from_id("gone");
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyWriteDropped { key },
+            test_instant(),
+        );
+
+        assert!(cmds.is_empty());
+        let status = state.status.as_deref().unwrap();
+        assert!(status.contains("gone"), "got {status:?}");
+        assert!(status.contains("bug"), "got {status:?}");
+    }
+
+    #[test]
     fn the_sidebar_answers_keys_again_after_its_last_pane_exits() {
         // The assertion above is the state; this is what the operator
         // experiences. A solo pane's exit used to leave `Focus::Pane`
@@ -8416,6 +8538,302 @@ mod tests {
         state.unstage(&key);
 
         assert!(state.pending_goinkyo_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn a_kickoff_queued_before_discovery_still_reaches_the_pane_after_it_renames() {
+        // The regression this pins: discovery routinely resolves a Goinkyo's
+        // synthetic key well inside `GOINKYO_KICKOFF_QUIET_PERIOD` (measured
+        // live, ~123ms vs. 700ms — see `update_discovery_result`'s own doc
+        // on its `pending_goinkyo_kickoffs` rename). Before that rename
+        // existed, every step downstream kept addressing the dead synthetic
+        // key, and `Cmd::WritePty` against a key nothing is listening on is
+        // a silent no-op — the kickoff simply never landed, with nothing to
+        // say why. `screens` stands in here for the shell's own `handles`
+        // map (a different crate, unreachable from this test): both are
+        // kept in lockstep by the same `Cmd::RekeyPty`, so a key present in
+        // `screens` is a live key exactly when the shell's own handle is —
+        // this is what makes "the Cmd was emitted" and "the Cmd's key is
+        // actually still listening" two different, both-necessary claims.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let t0 = test_instant();
+
+        let cmds = update(&mut state, &mut app, &brigade, awaiting_spawn(1), t0);
+        let [Cmd::OpenEmbedded { key: syn_key, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        let syn_key = syn_key.clone();
+        assert_eq!(state.pending_goinkyo_kickoffs[0].key, syn_key);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: syn_key.clone(),
+            },
+            t0,
+        );
+        assert!(state.screens.contains_key(&syn_key));
+
+        let real_key = SessionKey::from_id("goinkyo-real-id");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: syn_key.clone(),
+                session_id: "goinkyo-real-id".to_string(),
+                member: Some((1, GOINKYO_TOKEN.to_string())),
+            },
+            t0,
+        );
+        assert_eq!(
+            state.pending_goinkyo_kickoffs[0].key, real_key,
+            "the pending kickoff must follow the rename, not stay on the dead synthetic key"
+        );
+        assert!(state.screens.contains_key(&real_key));
+        assert!(!state.screens.contains_key(&syn_key));
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::CheckGoinkyoDirectoryTrust {
+                key: real_key.clone(),
+                cwd: PathBuf::from("/work/alpha"),
+            }],
+            "the quiet-period check must ask about the renamed key"
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key: real_key.clone(),
+                trusted: true,
+            },
+            t0,
+        );
+        let [Cmd::WritePty { key: write_key, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one WritePty, got {cmds:?}");
+        };
+        assert_eq!(
+            write_key, &real_key,
+            "the kickoff must be written to the renamed key"
+        );
+        assert!(
+            state.screens.contains_key(write_key),
+            "the key the kickoff is written to must still be a live pane"
+        );
+    }
+
+    #[test]
+    fn a_kickoff_queued_before_an_auto_compaction_fork_still_reaches_the_pane_after_it_renames() {
+        // Same guarantee as the discovery-side test above, for the other of
+        // the two rename-following paths: a Goinkyo's own Claude session can
+        // auto-compaction-fork before its kickoff ever fires, same as any
+        // other member's can (`update_member_session_forked`'s own doc).
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let old_key = SessionKey::new_worker(1, GOINKYO_TOKEN);
+        state.screens.insert(old_key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(SessionKey::from_id("dir")),
+            panes: vec![SessionKey::from_id("dir"), old_key.clone()],
+            focused: 0,
+        };
+        let t0 = test_instant();
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: old_key.clone(),
+            spawned_at: t0,
+            cwd: PathBuf::from("/work/alpha"),
+            notified_untrusted: false,
+        });
+
+        let new_key = SessionKey::from_id("goinkyo-forked-id");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: GOINKYO_TOKEN.to_string(),
+                old_id: old_key.as_str().to_string(),
+                new_id: "goinkyo-forked-id".to_string(),
+            },
+            t0,
+        );
+        assert_eq!(
+            state.pending_goinkyo_kickoffs[0].key, new_key,
+            "the pending kickoff must follow the fork's rename too"
+        );
+        assert!(state.screens.contains_key(&new_key));
+        assert!(!state.screens.contains_key(&old_key));
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key: new_key.clone(),
+                trusted: true,
+            },
+            t0,
+        );
+        let [Cmd::WritePty { key: write_key, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one WritePty, got {cmds:?}");
+        };
+        assert_eq!(
+            write_key, &new_key,
+            "the kickoff must be written to the renamed key"
+        );
+        assert!(
+            state.screens.contains_key(write_key),
+            "the key the kickoff is written to must still be a live pane"
+        );
+    }
+
+    #[test]
+    fn a_pending_submit_queued_before_discovery_still_reaches_the_pane_after_it_renames() {
+        // Same bug class as the kickoff tests above, for `PendingSubmit`
+        // (the delayed `\r` behind a relay nudge or either kickoff's own
+        // phase two): `update_discovery_result` must rename it too, and
+        // unconditionally — `member: None` here on purpose, to prove the
+        // rename isn't gated on being a recognized brigade member the way
+        // `goinkyo_pane`/`pending_goinkyo_kickoffs`'s own follow is.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let old_key = SessionKey::new_worker(1, "worker-1");
+        state.screens.insert(old_key.clone(), Screen::new(24, 80));
+        let t0 = test_instant();
+        state.pending_submits.push(PendingSubmit {
+            key: old_key.clone(),
+            nudged_at: t0,
+        });
+
+        let new_key = SessionKey::from_id("w1-real");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: old_key.clone(),
+                session_id: "w1-real".to_string(),
+                member: None,
+            },
+            t0,
+        );
+        assert_eq!(
+            state.pending_submits[0].key, new_key,
+            "the pending submit must follow the rename, not stay on the dead synthetic key"
+        );
+        assert!(state.screens.contains_key(&new_key));
+        assert!(!state.screens.contains_key(&old_key));
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + RELAY_SUBMIT_DELAY,
+        );
+        let [
+            Cmd::WritePty {
+                key: write_key,
+                bytes,
+            },
+        ] = cmds.as_slice()
+        else {
+            panic!("expected exactly one WritePty, got {cmds:?}");
+        };
+        assert_eq!(
+            write_key, &new_key,
+            "the submit must be written to the renamed key"
+        );
+        assert_eq!(bytes, b"\r");
+        assert!(
+            state.screens.contains_key(write_key),
+            "the key the submit is written to must still be a live pane"
+        );
+    }
+
+    #[test]
+    fn a_pending_submit_queued_before_an_auto_compaction_fork_still_reaches_the_pane_after_it_renames()
+     {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let old_key = SessionKey::from_id("w1-old");
+        state.screens.insert(old_key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(SessionKey::from_id("dir")),
+            panes: vec![SessionKey::from_id("dir"), old_key.clone()],
+            focused: 0,
+        };
+        let t0 = test_instant();
+        state.pending_submits.push(PendingSubmit {
+            key: old_key.clone(),
+            nudged_at: t0,
+        });
+
+        let new_key = SessionKey::from_id("w1-new");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                old_id: "w1-old".to_string(),
+                new_id: "w1-new".to_string(),
+            },
+            t0,
+        );
+        assert_eq!(
+            state.pending_submits[0].key, new_key,
+            "the pending submit must follow the fork's rename too"
+        );
+        assert!(state.screens.contains_key(&new_key));
+        assert!(!state.screens.contains_key(&old_key));
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + RELAY_SUBMIT_DELAY,
+        );
+        let [
+            Cmd::WritePty {
+                key: write_key,
+                bytes,
+            },
+        ] = cmds.as_slice()
+        else {
+            panic!("expected exactly one WritePty, got {cmds:?}");
+        };
+        assert_eq!(
+            write_key, &new_key,
+            "the submit must be written to the renamed key"
+        );
+        assert_eq!(bytes, b"\r");
+        assert!(
+            state.screens.contains_key(write_key),
+            "the key the submit is written to must still be a live pane"
+        );
     }
 
     // --- PrefixKey::parse ---------------------------------------------------

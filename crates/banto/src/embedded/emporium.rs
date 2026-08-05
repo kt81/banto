@@ -548,8 +548,16 @@ fn execute_cmd(
         Cmd::WritePty { key, bytes } => {
             if let Some(handle) = handles.get_mut(&key) {
                 handle.send_bytes(&bytes);
+                Vec::new()
+            } else {
+                // Reported rather than swallowed — see
+                // `engine::update_pty_write_dropped`'s own doc for why this
+                // is expected to mean a bug, not an ordinary race, and for
+                // the exact class of bug (a stale key surviving in some
+                // queued-write state past a rename) this is the backstop
+                // for.
+                vec![Event::PtyWriteDropped { key }]
             }
-            Vec::new()
         }
         Cmd::ResizePty { key, rows, cols } => {
             if let Some(handle) = handles.get_mut(&key) {
@@ -2649,6 +2657,91 @@ mod tests {
             handles.contains_key(&discovered),
             "the same live child, now reachable under its real id"
         );
+    }
+
+    #[test]
+    fn write_pty_reaches_the_child_and_reports_nothing_when_the_handle_is_live() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let host = MockPtyHost {
+            captured: captured.clone(),
+            ..Default::default()
+        };
+        let key = SessionKey::from_id("sess-1");
+        let mut handles = HashMap::new();
+        handles.insert(key.clone(), open(&host));
+        let mut discovery = Vec::new();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let superseded_failed = RefCell::new(HashSet::new());
+        let thresholds = AgeThresholds::default();
+        let brigade = BrigadeConfig::default();
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
+        let deps = Deps {
+            claude_home: &claude_home,
+            codex_home: None,
+            thresholds: &thresholds,
+            store: &store,
+            superseded_failed: &superseded_failed,
+            brigade: &brigade,
+            agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
+        };
+
+        let events = execute_cmd(
+            Cmd::WritePty {
+                key,
+                bytes: b"hello".to_vec(),
+            },
+            &deps,
+            &mut handles,
+            &mut discovery,
+        );
+
+        assert!(events.is_empty());
+        assert_eq!(&*captured.lock().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_pty_against_a_key_with_no_live_handle_reports_it_instead_of_vanishing() {
+        // The regression this pins: before `Event::PtyWriteDropped` existed,
+        // this branch returned `Vec::new()` — a `Cmd::WritePty` whose
+        // target had already been renamed or closed (the exact shape of
+        // the Goinkyo kickoff bug `pending_goinkyo_kickoffs`'s own rename
+        // fix addresses) simply vanished, with nothing left to say a write
+        // was ever attempted.
+        let key = SessionKey::from_id("gone");
+        let mut handles = HashMap::new();
+        let mut discovery = Vec::new();
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let superseded_failed = RefCell::new(HashSet::new());
+        let thresholds = AgeThresholds::default();
+        let brigade = BrigadeConfig::default();
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
+        let deps = Deps {
+            claude_home: &claude_home,
+            codex_home: None,
+            thresholds: &thresholds,
+            store: &store,
+            superseded_failed: &superseded_failed,
+            brigade: &brigade,
+            agent_binaries: &agent_binaries,
+            enabled_agents: &enabled_agents,
+        };
+
+        let events = execute_cmd(
+            Cmd::WritePty {
+                key: key.clone(),
+                bytes: b"hello".to_vec(),
+            },
+            &deps,
+            &mut handles,
+            &mut discovery,
+        );
+
+        assert_eq!(events, vec![Event::PtyWriteDropped { key }]);
     }
 
     /// Write a session jsonl whose head records `cwd`, the shape
