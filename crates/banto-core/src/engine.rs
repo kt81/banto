@@ -1239,8 +1239,8 @@ pub enum StoreIntent {
         session_id: String,
     },
     /// Resets a Goinkyo's `session_id` back to `None` — see
-    /// `stage_brigade`'s own doc on the gravestone case this answers, and
-    /// `Store::clear_member_session`'s own doc for why the store side is
+    /// `stage_brigade`'s own doc on the stranded-Goinkyo case this answers,
+    /// and `Store::clear_member_session`'s own doc for why the store side is
     /// safe to call unconditionally.
     ClearMemberSession {
         brigade_id: BrigadeId,
@@ -2954,8 +2954,8 @@ fn stage_brigade(
                     ));
                 }
             }
-            // The gravestone case: a Goinkyo whose row has a `session_id`
-            // but no resolvable row — unlike an undiscovered Worker (whose
+            // The stranded case: a Goinkyo whose row has a `session_id` but
+            // no resolvable row — unlike an undiscovered Worker (whose
             // `session_id` is still `None` at this point, caught above), a
             // Goinkyo's discovery already ran once and assigned it a real
             // id, but `app.row_for_id` still can't find a row for it because
@@ -2974,16 +2974,20 @@ fn stage_brigade(
                     // result`), so it's alive right now — `resolved_row`
                     // above came back `None` only because `app`'s own row
                     // list hasn't caught up with the not-yet-written
-                    // transcript, not because the pane is gone. Reusing it
-                    // here, the same way the `Some(row)` arm's own `screens`
-                    // check does just above, is what keeps this from being
-                    // treated as the true gravestone case below: clearing
-                    // `session_id` on a live pane would spawn a second
-                    // Goinkyo the moment the next tick's `AwaitingSpawn`
-                    // fired, orphaning this one under the shell's handle map.
+                    // transcript, not because the pane is gone; this Goinkyo
+                    // isn't stranded at all, just momentarily unresolved.
+                    // Reusing it here, the same way the `Some(row)` arm's
+                    // own `screens` check does just above, is what keeps
+                    // this from being treated as the true stranded case
+                    // below: clearing `session_id` on a live pane would
+                    // sever it from the row identifying it mid-consultation
+                    // — its own `_mcp` connection resolves who's calling
+                    // through `Store::brigade_of_session`, keyed on this
+                    // same id, so `send_to_peer`/`check_messages` would stop
+                    // working for it the moment the id went missing.
                     panes.push(key);
                 } else {
-                    // True gravestone, not a timing window: no live pane is
+                    // Truly stranded, not a timing window: no live pane is
                     // claiming this id, and none ever will — a Goinkyo that
                     // never ran a turn writes no transcript, ever, not just
                     // on this tick. Reset `session_id` so the next tick's
@@ -5551,16 +5555,17 @@ mod tests {
         );
     }
 
-    // --- stage_brigade: the Goinkyo gravestone -------------------------------
+    // --- stage_brigade: a stranded Goinkyo -----------------------------------
 
     #[test]
-    fn stage_brigade_resets_a_goinkyo_gravestones_session_id_instead_of_reporting_it_missing() {
+    fn stage_brigade_resets_a_stranded_goinkyos_session_id_instead_of_reporting_it_missing() {
         // A Goinkyo that never ran a single turn: `session_id` is set (its
         // own discovery already ran once) but no row exists for it (no
         // `projects/*.jsonl` transcript ever written, so `app.row_for_id`
         // never resolves it) — and no pane is alive under that id either
-        // (`state.screens` empty of it), so this is the true gravestone, not
-        // the discovery window (see the reuse test just below).
+        // (`state.screens` empty of it), so this one is truly stranded, not
+        // just caught in the discovery window (see the reuse test just
+        // below).
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
@@ -5597,12 +5602,12 @@ mod tests {
                 Cmd::Store(StoreIntent::ClearMemberSession { brigade_id: 1, token })
                     if token == "goinkyo"
             )),
-            "expected a ClearMemberSession for the gravestoned goinkyo: {cmds:?}"
+            "expected a ClearMemberSession for the stranded goinkyo: {cmds:?}"
         );
         match &state.stage {
             Stage::Brigade { panes, .. } => assert!(
                 !panes.iter().any(|k| k.as_str() == "g1"),
-                "the gravestoned goinkyo has no live pane to stage: {panes:?}"
+                "the stranded goinkyo has no live pane to stage: {panes:?}"
             ),
             other => panic!("expected a staged brigade, got {other:?}"),
         }
@@ -5610,22 +5615,23 @@ mod tests {
         // unexplained absence the operator needs a status line about.
         assert!(
             state.status.is_none(),
-            "gravestone healing must not read as \"not found\": {:?}",
+            "resetting a stranded goinkyo must not read as \"not found\": {:?}",
             state.status
         );
     }
 
     #[test]
     fn stage_brigade_reuses_a_goinkyos_live_pane_in_the_discovery_window_instead_of_clearing_it() {
-        // The trap the gravestone fix must not fall into: `session_id` is
-        // set and `app.row_for_id` still can't resolve it (same as the
-        // gravestone above), but this time the pane is already alive under
-        // that id key — `Cmd::RekeyPty` already renamed it
+        // The trap the stranded-goinkyo fix must not fall into: `session_id`
+        // is set and `app.row_for_id` still can't resolve it (same as the
+        // truly stranded case above), but this time the pane is already
+        // alive under that id key — `Cmd::RekeyPty` already renamed it
         // (`update_discovery_result`), `app`'s own row list just hasn't
         // caught up yet (no transcript written until the first turn). If
-        // this cleared `session_id` here, the very next tick's
-        // `AwaitingSpawn` would spawn a second Goinkyo, orphaning the first
-        // one's handle in the shell.
+        // this cleared `session_id` here, it would sever a *live* Goinkyo
+        // from the row its own `_mcp` connection resolves itself through
+        // (`Store::brigade_of_session`), breaking `send_to_peer`/
+        // `check_messages` for it mid-consultation.
         let mut state = EmporiumState::new(PrefixKey::default());
         state
             .screens

@@ -4194,13 +4194,13 @@ mod tests {
     }
 
     #[test]
-    fn a_gravestoned_goinkyos_session_clears_for_real_and_respawns_exactly_once() {
-        // The other half of the `stage_brigade` gravestone fix, exercised
-        // through the real store round trip `engine.rs`'s own pure unit
-        // tests can't reach: does clearing `session_id` actually flip
-        // `gather_goinkyo_observation` back to `AwaitingSpawn`, and does the
-        // existing one-shot guard (`EmporiumState::goinkyo_pane`) still stop
-        // it from spawning a second time once it has.
+    fn a_stranded_goinkyos_session_clears_for_real_and_respawns_exactly_once() {
+        // The other half of the `stage_brigade` fix for a stranded Goinkyo,
+        // exercised through the real store round trip `engine.rs`'s own
+        // pure unit tests can't reach: does clearing `session_id` actually
+        // flip `gather_goinkyo_observation` back to `AwaitingSpawn`, and
+        // does the existing one-shot guard (`EmporiumState::goinkyo_pane`)
+        // still stop it from spawning a second time once it has.
         let (store, mut state, app) = staged_goinkyo(Some("g1"));
         let Stage::Brigade { id: brigade_id, .. } = state.stage else {
             panic!("staged_goinkyo always stages a Stage::Brigade");
@@ -4209,7 +4209,7 @@ mod tests {
         // Simulates `stage_brigade`'s own `Cmd::Store(ClearMemberSession)`
         // actually executing — proven separately, at the pure-logic level,
         // by `engine.rs`'s own
-        // `stage_brigade_resets_a_goinkyo_gravestones_session_id_instead_of_
+        // `stage_brigade_resets_a_stranded_goinkyos_session_id_instead_of_
         // reporting_it_missing`.
         let events = execute_store_intent(
             StoreIntent::ClearMemberSession {

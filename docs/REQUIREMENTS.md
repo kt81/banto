@@ -561,27 +561,31 @@ path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
 stays a fresh-spawn candidate for the ordinary tick mechanism above for as
 long as the brigade remains staged.
 
-**A third case — the gravestone — sits between those two.** A Goinkyo can
-have a session id (its own discovery already ran once) that still resolves
-to no row: Claude Code writes no `projects/*.jsonl` transcript until a
-session's first turn, so a Goinkyo that never got as far as its own kickoff
-(closed, or the operator's machine restarted, before it ran one) has a real
-id but nothing `app.row_for_id` can find — permanently, not just this tick.
-Left alone this reads as `missing` forever: the session id never clears on
-its own, so the ordinary tick mechanism's `AwaitingSpawn` check (which only
-fires on no session id at all) never sees this member as spawnable again —
-a consultation the operator can't restart short of dismissing it outright
-and filing a new one. `stage_brigade` now resets the session id back to
-`None` for exactly this case, which lets the next tick's `AwaitingSpawn`
-restart the very same consultation (its request file outlives this, kept
-until dismissal) through the ordinary spawn path — the Goinkyo analog of a
-Worker's own disposable, respawnable design. The one trap this has to dodge:
-a pane can be alive under the id key already (`Cmd::RekeyPty` renamed it)
-while `app`'s own row list simply hasn't caught up yet with the
-not-yet-written transcript — resetting the session id in that window would
-spawn a second Goinkyo next tick, orphaning the first one's handle in the
-shell. `stage_brigade` tells the two apart by checking whether a live pane
-already answers to that key; if one does, it's reused, not reset.
+**A third case — a stranded Goinkyo — sits between those two.** A Goinkyo
+can have a session id (its own discovery already ran once) that still
+resolves to no row: Claude Code writes no `projects/*.jsonl` transcript
+until a session's first turn, so a Goinkyo that never got as far as its own
+kickoff (closed, or the operator's machine restarted, before it ran one)
+has a real id but nothing `app.row_for_id` can find — permanently, not just
+this tick. Left alone this reads as `missing` forever: the session id never
+clears on its own, so the ordinary tick mechanism's `AwaitingSpawn` check
+(which only fires on no session id at all) never sees this member as
+spawnable again — a consultation the operator can't restart short of
+dismissing it outright and filing a new one. `stage_brigade` now resets the
+session id back to `None` for exactly this case, which lets the next tick's
+`AwaitingSpawn` restart the very same consultation (its request file
+outlives this, kept until dismissal) through the ordinary spawn path — the
+Goinkyo analog of a Worker's own disposable, respawnable design. The one
+trap this has to dodge: a pane can be alive under the id key already
+(`Cmd::RekeyPty` renamed it) while `app`'s own row list simply hasn't caught
+up yet with the not-yet-written transcript — that Goinkyo isn't stranded at
+all, just momentarily unresolved, and resetting its session id in that
+window would sever a *live* member from the row identifying it: its own
+`_mcp` connection resolves who's calling through `brigade_of_session`,
+keyed on that same session id, so clearing it would break `send_to_peer`/
+`check_messages` for a Goinkyo still mid-consultation. `stage_brigade` tells
+the two apart by checking whether a live pane already answers to that key;
+if one does, it's reused, not reset.
 
 **Formation.** `B` on a selected session appoints it Director and auto-spawns
 `workers` (config, default 1, clamped 1..=8) fresh Workers beside it. `b` spawns
