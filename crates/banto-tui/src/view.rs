@@ -477,6 +477,9 @@ fn summary_meta(
         model::humanize_size(row.size),
         model::short_id(&row.id),
     ];
+    if row.activity == Activity::Waiting {
+        parts.push("waiting".to_string());
+    }
     if pinned {
         parts.push("pinned".to_string());
     }
@@ -495,6 +498,7 @@ fn summary_meta(
 fn activity_color(activity: Activity) -> Color {
     match activity {
         Activity::Busy => Color::Green,
+        Activity::Waiting => Color::Magenta,
         Activity::Alive => Color::Cyan,
         Activity::Idle(AgeBucket::Today) => Color::Yellow,
         Activity::Idle(AgeBucket::ThisWeek) => Color::Gray,
@@ -1252,6 +1256,7 @@ mod tests {
         // dot until someone looked at a row and wondered why.
         for dot in [
             Color::Green,
+            Color::Magenta,
             Color::Cyan,
             Color::Yellow,
             Color::Gray,

@@ -847,8 +847,11 @@ themselves.
 
 1. `sessions/<pid>.json` exists, PID alive, and `status=busy` → **busy**
    (special color, highest priority)
-2. PID alive (not busy) → **active** (idle)
-3. Otherwise bucket by jsonl mtime: today / this week / older
+2. `sessions/<pid>.json` exists, PID alive, and `status=waiting` → **waiting**
+   (Claude Code only; human input is required)
+3. PID alive with any other status → **active** (idle). Unknown upstream
+   statuses deliberately degrade here.
+4. Otherwise bucket by jsonl mtime: today / this week / older
    (thresholds and colors configurable)
 
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
