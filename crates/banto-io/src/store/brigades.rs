@@ -135,17 +135,18 @@ impl Store {
         Ok(())
     }
 
-    /// Resets a member's `session_id` back to `None` — the gravestone fix
-    /// for a Goinkyo that never ran a single turn: Claude Code writes no
-    /// `projects/*.jsonl` transcript until a session's first turn, so
-    /// `session_id` staying set forever (nothing else ever clears it) keeps
-    /// `gather_goinkyo_observation`'s `AwaitingSpawn` check (which fires only
-    /// on `session_id: None`) from ever seeing this row as spawnable again —
-    /// a member stuck exactly as unreachable-but-not-gone as it looks, until
-    /// dismissed. Its consultation request file outlives this (kept until
-    /// `dismiss_worker`/`dismiss_goinkyo` actually removes the row), so the
-    /// next `AwaitingSpawn` restarts the very same consultation, not a fresh
-    /// one. A no-op if `(brigade_id, token)` doesn't exist.
+    /// Resets a member's `session_id` back to `None` — the fix for a
+    /// stranded Goinkyo, one that never ran a single turn: Claude Code
+    /// writes no `projects/*.jsonl` transcript until a session's first turn,
+    /// so `session_id` staying set forever (nothing else ever clears it)
+    /// keeps `gather_goinkyo_observation`'s `AwaitingSpawn` check (which
+    /// fires only on `session_id: None`) from ever seeing this row as
+    /// spawnable again — a member stuck exactly as unreachable-but-not-gone
+    /// as it looks, until dismissed. Its consultation request file outlives
+    /// this (kept until `dismiss_worker`/`dismiss_goinkyo` actually removes
+    /// the row), so the next `AwaitingSpawn` restarts the very same
+    /// consultation, not a fresh one. A no-op if `(brigade_id, token)`
+    /// doesn't exist.
     pub fn clear_member_session(
         &mut self,
         brigade_id: BrigadeId,
