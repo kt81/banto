@@ -1378,7 +1378,10 @@ impl App {
     /// session would lie about what's actually going on.
     fn is_hidden_superseded(&self, i: usize) -> bool {
         self.superseded.contains(&self.rows[i].id)
-            && !matches!(self.rows[i].activity, Activity::Busy | Activity::Alive)
+            && !matches!(
+                self.rows[i].activity,
+                Activity::Busy | Activity::Waiting | Activity::Alive
+            )
     }
 
     /// Seed the initial pinned-id set (loaded once from the store at

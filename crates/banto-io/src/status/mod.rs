@@ -4,8 +4,13 @@
 //!
 //! Sources, in priority order (docs/REQUIREMENTS.md, "Activity indicator"):
 //! 1. `<claude_home>/sessions/<pid>.json` + PID alive + status=busy -> Busy
-//! 2. PID alive, not busy -> Alive
-//! 3. otherwise bucket the session file mtime into Today / ThisWeek / Older
+//! 2. `<claude_home>/sessions/<pid>.json` + PID alive + status=waiting -> Waiting
+//! 3. PID alive, any other or unknown status -> Alive
+//! 4. otherwise bucket the session file mtime into Today / ThisWeek / Older
+//!
+//! The status values belong to Claude Code, not banto. Unknown values must
+//! degrade to [`Activity::Alive`], preserving today's behavior if upstream
+//! adds another state.
 //!
 //! PID liveness sits behind [`ProcessProbe`] so tests can mock it (no real
 //! processes in tests). Bucketing itself lives in `banto_core::status`, a
@@ -26,9 +31,10 @@ use banto_core::status::{AgeThresholds, age_bucket};
 ///
 /// A live entry matches `meta` when its `session_id` equals `meta.id.0`.
 /// Precedence: a matching entry whose PID is alive with status `"busy"` wins
-/// ([`Activity::Busy`]), then any other matching entry with a live PID
-/// ([`Activity::Alive`]); otherwise the session is [`Activity::Idle`] with an
-/// [`age_bucket`] computed from `meta.mtime`.
+/// ([`Activity::Busy`]), then `"waiting"` ([`Activity::Waiting`]), then any
+/// other matching entry with a live PID ([`Activity::Alive`]); otherwise the
+/// session is [`Activity::Idle`] with an [`age_bucket`] computed from
+/// `meta.mtime`.
 pub fn classify(
     meta: &SessionMeta,
     live: &[LiveSession],
@@ -37,6 +43,7 @@ pub fn classify(
     thresholds: &AgeThresholds,
 ) -> Activity {
     let mut any_alive = false;
+    let mut any_waiting = false;
     for entry in live {
         if entry.session_id.as_deref() != Some(meta.id.0.as_str()) {
             continue;
@@ -45,12 +52,19 @@ pub fn classify(
             continue;
         }
         if entry.status.as_deref() == Some("busy") {
-            // Busy wins over Alive even when multiple entries match.
+            // Busy wins over Waiting: multiple live entries are anomalous, and
+            // under-reporting a stale waiting entry preserves today's behavior
+            // while over-reporting would train the operator to distrust it.
             return Activity::Busy;
+        }
+        if entry.status.as_deref() == Some("waiting") {
+            any_waiting = true;
         }
         any_alive = true;
     }
-    if any_alive {
+    if any_waiting {
+        Activity::Waiting
+    } else if any_alive {
         Activity::Alive
     } else {
         Activity::Idle(age_bucket(meta.mtime, now, thresholds))
@@ -142,6 +156,14 @@ mod tests {
     }
 
     #[test]
+    fn matching_alive_waiting_is_waiting() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let live = [live_entry(100, Some(SESSION_ID), Some("waiting"))];
+        let probe = MockProbe::with_alive(&[100]);
+        assert_eq!(classify_default(&meta, &live, &probe), Activity::Waiting);
+    }
+
+    #[test]
     fn matching_alive_non_busy_is_alive() {
         let meta = meta_with_age(Duration::from_secs(60));
         let live = [live_entry(100, Some(SESSION_ID), Some("idle"))];
@@ -176,10 +198,54 @@ mod tests {
     }
 
     #[test]
+    fn busy_wins_over_waiting_regardless_of_order() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let probe = MockProbe::with_alive(&[100, 200]);
+
+        let waiting_first = [
+            live_entry(100, Some(SESSION_ID), Some("waiting")),
+            live_entry(200, Some(SESSION_ID), Some("busy")),
+        ];
+        assert_eq!(
+            classify_default(&meta, &waiting_first, &probe),
+            Activity::Busy
+        );
+
+        let busy_first = [
+            live_entry(200, Some(SESSION_ID), Some("busy")),
+            live_entry(100, Some(SESSION_ID), Some("waiting")),
+        ];
+        assert_eq!(classify_default(&meta, &busy_first, &probe), Activity::Busy);
+    }
+
+    #[test]
+    fn matching_alive_unknown_status_is_alive() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let live = [live_entry(
+            100,
+            Some(SESSION_ID),
+            Some("upstream-future-state"),
+        )];
+        let probe = MockProbe::with_alive(&[100]);
+        assert_eq!(classify_default(&meta, &live, &probe), Activity::Alive);
+    }
+
+    #[test]
     fn dead_pid_falls_through_to_age_bucket() {
         let meta = meta_with_age(Duration::from_secs(60));
         let live = [live_entry(100, Some(SESSION_ID), Some("busy"))];
         let probe = MockProbe::with_alive(&[]); // PID 100 is dead
+        assert_eq!(
+            classify_default(&meta, &live, &probe),
+            Activity::Idle(AgeBucket::Today)
+        );
+    }
+
+    #[test]
+    fn dead_waiting_pid_falls_through_to_age_bucket() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let live = [live_entry(100, Some(SESSION_ID), Some("waiting"))];
+        let probe = MockProbe::with_alive(&[]);
         assert_eq!(
             classify_default(&meta, &live, &probe),
             Activity::Idle(AgeBucket::Today)

@@ -110,6 +110,10 @@ pub struct SessionMeta {
 pub enum Activity {
     /// A live process reports status=busy for this session.
     Busy,
+    /// A live process reports that this session is waiting for a human.
+    ///
+    /// Only Claude Code currently reports this state.
+    Waiting,
     /// A live process exists for this session but is idle.
     Alive,
     /// No live process; bucketed by source-file mtime.

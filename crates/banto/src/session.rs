@@ -40,6 +40,7 @@ pub fn thresholds_from(activity: &ActivityConfig) -> AgeThresholds {
 pub fn activity_tag(activity: Activity) -> &'static str {
     match activity {
         Activity::Busy => "busy",
+        Activity::Waiting => "waiting",
         Activity::Alive => "alive",
         Activity::Idle(AgeBucket::Today) => "today",
         Activity::Idle(AgeBucket::ThisWeek) => "week",
@@ -319,6 +320,7 @@ mod tests {
     #[test]
     fn activity_tags_cover_every_variant() {
         assert_eq!(activity_tag(Activity::Busy), "busy");
+        assert_eq!(activity_tag(Activity::Waiting), "waiting");
         assert_eq!(activity_tag(Activity::Alive), "alive");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::Today)), "today");
         assert_eq!(activity_tag(Activity::Idle(AgeBucket::ThisWeek)), "week");
