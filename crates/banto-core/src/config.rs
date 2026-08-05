@@ -235,6 +235,27 @@ pub struct BrigadeConfig {
     /// just started on its own (the kickoff fix above landing) then sat
     /// waiting for an operator who wasn't watching to approve a tool call.
     pub goinkyo_permission_mode: String,
+    /// `--disallowedTools <tools>` an auto-spawned Goinkyo launches with,
+    /// default `"Edit,Write,NotebookEdit"` (`claude --help`: comma- or
+    /// space-separated tool names to deny). Same empty-string escape hatch
+    /// as the model/effort/permission-mode above, and — unlike `effort`,
+    /// like `permission_mode` — passed on a resume too: which tools a
+    /// Goinkyo may use is a property of the *role*, not of whether this
+    /// particular launch happens to be fresh or resumed.
+    ///
+    /// Not containment: Bash stays available (this is a tool-name denylist,
+    /// not a sandbox), so it is no barrier against anything actually
+    /// adversarial. It exists because `goinkyo_permission_mode`'s own
+    /// `"auto"` default changed what "unattended" means here — under
+    /// `"manual"` an edit stopped for approval nobody was there to give;
+    /// under `"auto"` it doesn't, so an unattended Goinkyo could now write
+    /// to the same working tree the Director is using without anyone
+    /// having agreed to that. This is a deterrent against that drift, not a
+    /// defense against a hostile session. The cost worth stating plainly:
+    /// it also blocks whatever a scratchpad or memory write would use
+    /// (`Edit`/`Write`/`NotebookEdit`) — consistent with a role meant to be
+    /// called holding nothing of its own, but a real cost, not a free one.
+    pub goinkyo_disallowed_tools: String,
 }
 
 /// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
@@ -275,7 +296,11 @@ settle it, or put the same neutral question to two Workers and compare \
 what comes back. Where nothing settled it, write that it is unverified. \
 If comparing two answers means nothing else can proceed, say so — the \
 size of the roster is the operator's to change, not a constraint to \
-work around silently.";
+work around silently.
+
+If you have consulted the Goinkyo, send_to_peer(to: \"goinkyo\") reaches \
+it again while the consultation stays open — you are not limited to \
+the request that started it.";
 
 /// See [`BrigadeConfig::worker_prompt`].
 const DEFAULT_WORKER_PROMPT: &str = "\
@@ -307,7 +332,8 @@ The Director filed its request at {request} — read that first, then read \
 the source yourself. The Director's account of the disagreement is not \
 the evidence; the Worker's own words and the code are. Where the two \
 accounts differ, say which one the code supports; where neither does, \
-say that instead of picking a side.
+say that instead of picking a side. If what you have is not enough to \
+judge, say what is missing with send_to_peer and wait.
 
 You advise, you do not take the work over. The moment you start \
 changing things you are a party to the argument rather than the one who \
@@ -330,6 +356,7 @@ impl Default for BrigadeConfig {
             goinkyo_model: "fable".to_string(),
             goinkyo_effort: "max".to_string(),
             goinkyo_permission_mode: "auto".to_string(),
+            goinkyo_disallowed_tools: "Edit,Write,NotebookEdit".to_string(),
         }
     }
 }
@@ -383,6 +410,13 @@ impl BrigadeConfig {
     /// escape hatch.
     pub fn goinkyo_permission_mode(&self) -> Option<&str> {
         (!self.goinkyo_permission_mode.is_empty()).then_some(self.goinkyo_permission_mode.as_str())
+    }
+
+    /// [`Self::goinkyo_disallowed_tools`], or `None` for the empty-string
+    /// escape hatch.
+    pub fn goinkyo_disallowed_tools(&self) -> Option<&str> {
+        (!self.goinkyo_disallowed_tools.is_empty())
+            .then_some(self.goinkyo_disallowed_tools.as_str())
     }
 }
 
@@ -749,32 +783,39 @@ mod tests {
     }
 
     #[test]
-    fn brigade_goinkyo_model_effort_and_permission_mode_default_and_have_their_own_empty_escape_hatch()
+    fn brigade_goinkyo_model_effort_permission_mode_and_disallowed_tools_default_and_have_their_own_empty_escape_hatch()
      {
         let config = Config::default();
         assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
         assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
         assert_eq!(config.brigade.goinkyo_permission_mode(), Some("auto"));
+        assert_eq!(
+            config.brigade.goinkyo_disallowed_tools(),
+            Some("Edit,Write,NotebookEdit")
+        );
 
         let cleared = parse(
             "[brigade]\ngoinkyo_model = \"\"\ngoinkyo_effort = \"\"\n\
-             goinkyo_permission_mode = \"\"\n",
+             goinkyo_permission_mode = \"\"\ngoinkyo_disallowed_tools = \"\"\n",
         );
         assert_eq!(cleared.brigade.goinkyo_model(), None);
         assert_eq!(cleared.brigade.goinkyo_effort(), None);
         assert_eq!(cleared.brigade.goinkyo_permission_mode(), None);
+        assert_eq!(cleared.brigade.goinkyo_disallowed_tools(), None);
 
         let overridden = parse(
             "[brigade]\ngoinkyo_model = \"opus\"\ngoinkyo_effort = \"low\"\n\
-             goinkyo_permission_mode = \"plan\"\n",
+             goinkyo_permission_mode = \"plan\"\ngoinkyo_disallowed_tools = \"Bash\"\n",
         );
         assert_eq!(overridden.brigade.goinkyo_model(), Some("opus"));
         assert_eq!(overridden.brigade.goinkyo_effort(), Some("low"));
         assert_eq!(overridden.brigade.goinkyo_permission_mode(), Some("plan"));
+        assert_eq!(overridden.brigade.goinkyo_disallowed_tools(), Some("Bash"));
     }
 
     #[test]
-    fn an_existing_config_toml_without_goinkyo_model_effort_or_permission_mode_gets_the_defaults() {
+    fn an_existing_config_toml_without_goinkyo_model_effort_permission_mode_or_disallowed_tools_gets_the_defaults()
+     {
         // Same reasoning as `an_existing_config_toml_without_goinkyo_prompt_
         // gets_the_default`: a file written before these fields existed
         // must keep loading with their own defaults, not an empty value.
@@ -782,6 +823,10 @@ mod tests {
         assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
         assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
         assert_eq!(config.brigade.goinkyo_permission_mode(), Some("auto"));
+        assert_eq!(
+            config.brigade.goinkyo_disallowed_tools(),
+            Some("Edit,Write,NotebookEdit")
+        );
     }
 
     #[test]

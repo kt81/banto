@@ -211,11 +211,13 @@ fn tools_list_result() -> Value {
                 "name": "consult_goinkyo",
                 "description": "Director only. Summon the Goinkyo — banto's retired elder, \
                                 called back in to arbitrate a Director/Worker disagreement or \
-                                an impasse — by filing a written consultation request. No tool \
-                                exists yet to talk with it directly; it reads this once it \
-                                starts. Fails if a Goinkyo is already part of this brigade: \
-                                only one consults at a time — call dismiss_goinkyo to end the \
-                                current one first.",
+                                an impasse — by filing a written consultation request; it \
+                                reads this once it starts. send_to_peer(to: \"goinkyo\") \
+                                reaches it directly from then on, for as long as the \
+                                consultation stays open — you are not limited to the request \
+                                that started it. Fails if a Goinkyo is already part of this \
+                                brigade: only one consults at a time — call dismiss_goinkyo to \
+                                end the current one first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

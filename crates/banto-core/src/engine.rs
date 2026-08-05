@@ -798,6 +798,13 @@ pub struct EmporiumState {
     /// produces the one `CSI O`/`CSI I` pair it actually represents, not a
     /// repeat on every tick.
     last_focus_notified: Option<SessionKey>,
+    /// This map carries two roles at once — spawn-attempt guard, and live-
+    /// consultation pane ledger — and every drift found here so far sat at
+    /// the seam between the store's own row (truth) and this map (cache).
+    /// Before changing anything, check all eight cells of (row present? ×
+    /// pane staged? × entry present?) rather than trusting a fresh read of
+    /// the design below.
+    ///
     /// The brigades [`update_goinkyo_awaiting_spawn`] has already issued a
     /// `Cmd::OpenEmbedded` for, each mapped to the `SessionKey` that spawn
     /// used — a brigade is inserted the moment that happens, success or
@@ -1293,10 +1300,16 @@ pub enum Cmd {
     /// set for a freshly-spawned Goinkyo (`BrigadeConfig::goinkyo_effort`)
     /// — the shell drops it for a Codex target, which has no such flag; see
     /// `opener::AgentLaunch::Claude`'s own `effort` field. `permission_mode`
-    /// is `--permission-mode <mode>`, same shape and same freshly-spawned-
-    /// Goinkyo-only scope as `effort` (`BrigadeConfig::goinkyo_permission_
-    /// mode`) — Worker and Director launches are untouched. The shell
-    /// answers with `Event::Spawned`/`SpawnFailed`.
+    /// (`--permission-mode <mode>`, `BrigadeConfig::goinkyo_permission_mode`)
+    /// and `disallowed_tools` (`--disallowedTools <tools>`,
+    /// `BrigadeConfig::goinkyo_disallowed_tools`) both diverge from `effort`
+    /// the same way and for the same reason: unlike a model or a reasoning
+    /// level, who may approve a tool call and which tools exist to call are
+    /// properties of the *role*, not of whether this particular launch
+    /// happens to be fresh or a resume — so both are set for a Goinkyo
+    /// either way, never for a Worker or Director, and never for Codex
+    /// (Claude-only flags; `opener::AgentLaunch::Codex` carries neither
+    /// field at all). The shell answers with `Event::Spawned`/`SpawnFailed`.
     OpenEmbedded {
         key: SessionKey,
         target: SessionToOpen,
@@ -1304,6 +1317,7 @@ pub enum Cmd {
         model: Option<String>,
         effort: Option<String>,
         permission_mode: Option<String>,
+        disallowed_tools: Option<String>,
     },
     /// Kill the child at `key` — active termination (prefix-`x` confirm, or
     /// a disbanded brigade's Workers). The passive `Event::PtyExited` fold
@@ -2468,6 +2482,7 @@ fn update_new_session_cwd_checked(
         model: None,
         effort: None,
         permission_mode: None,
+        disallowed_tools: None,
     }]
 }
 
@@ -2824,6 +2839,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         model: None,
         effort: None,
         permission_mode: None,
+        disallowed_tools: None,
     }]
 }
 
@@ -2869,6 +2885,19 @@ fn stage_brigade(
         match resolved_row {
             Some(row) => {
                 let key = SessionKey::from_id(&row.id);
+                // Seeded here, ahead of the resume's own success or failure:
+                // this is the one-shot spawn guard `update_goinkyo_awaiting_
+                // spawn` checks (and, from here, the record that lets a
+                // *later* re-stage tell "this consultation already has a
+                // pane, live or in flight" from "the row is new" — see that
+                // function's own doc for how it now tells the two apart by
+                // whether the key it finds here is synthetic or real). Never
+                // seeded for a Worker or Director — `goinkyo_pane` only ever
+                // means "the current brigade's Goinkyo", nothing else reads
+                // it for any other role.
+                if *role == BrigadeRole::Goinkyo {
+                    state.goinkyo_pane.insert(brigade_id, key.clone());
+                }
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
@@ -2901,16 +2930,22 @@ fn stage_brigade(
                     // Goinkyo's: re-staging a brigade around an already-
                     // discovered Goinkyo — resuming one that was spawned
                     // before — has no case that reaches this arm with a
-                    // real value to give it yet. `permission_mode` is
-                    // different: unlike `--model`/`--effort`, it answers
-                    // "who's here to click 'allow'", not "what should this
-                    // session think with" — unrelated to whether the launch
-                    // is fresh or a resume. Closing a consultation's pane
-                    // mid-conversation and re-staging the brigade brings the
-                    // Goinkyo right back to an unattended prompt if one
-                    // comes up, same as a fresh spawn.
+                    // real value to give it yet. `permission_mode` and
+                    // `disallowed_tools` are different: unlike `--model`/
+                    // `--effort`, they answer "who's here to click 'allow'"
+                    // and "what may this role even attempt", not "what
+                    // should this session think with" — properties of the
+                    // role, unrelated to whether the launch is fresh or a
+                    // resume. Closing a consultation's pane mid-conversation
+                    // and re-staging the brigade brings the Goinkyo right
+                    // back to an unattended prompt (or an editable working
+                    // tree) if one comes up, same as a fresh spawn.
                     let permission_mode = (*role == BrigadeRole::Goinkyo)
                         .then(|| brigade.goinkyo_permission_mode())
+                        .flatten()
+                        .map(str::to_string);
+                    let disallowed_tools = (*role == BrigadeRole::Goinkyo)
+                        .then(|| brigade.goinkyo_disallowed_tools())
                         .flatten()
                         .map(str::to_string);
                     cmds.push(Cmd::OpenEmbedded {
@@ -2925,6 +2960,7 @@ fn stage_brigade(
                         model,
                         effort: None,
                         permission_mode,
+                        disallowed_tools,
                     });
                 }
             }
@@ -2985,6 +3021,15 @@ fn stage_brigade(
                     // through `Store::brigade_of_session`, keyed on this
                     // same id, so `send_to_peer`/`check_messages` would stop
                     // working for it the moment the id went missing.
+                    //
+                    // Also seeded here for the same reason the `Some(row)`
+                    // arm's own resume seeds it: after a banto restart,
+                    // `goinkyo_pane` starts empty, so reusing an
+                    // already-live pane through *this* arm needs to record
+                    // it too — not just a resume through the other one — or
+                    // the guard stays unset for a Goinkyo this build never
+                    // saw spawn.
+                    state.goinkyo_pane.insert(brigade_id, key.clone());
                     panes.push(key);
                 } else {
                     // Truly stranded, not a timing window: no live pane is
@@ -3406,6 +3451,7 @@ fn open_worker(
         model: (!worker_model.is_empty()).then(|| worker_model.to_string()),
         effort: None,
         permission_mode: None,
+        disallowed_tools: None,
     }]
 }
 
@@ -3868,6 +3914,7 @@ fn open_director_with_wiring(
         model: None,
         effort: None,
         permission_mode: None,
+        disallowed_tools: None,
     }]
 }
 
@@ -4132,6 +4179,20 @@ fn update_tick(
 /// operator is always the one giving a fresh Worker its first turn, but
 /// nobody sits at the Goinkyo's own keyboard) — riding on this same
 /// one-shot guard rather than a separate marker of its own.
+///
+/// The `AwaitingSpawn` arm reads more than presence out of the guard: a
+/// *synthetic* key there means a spawn for the current consultation is in
+/// flight or already failed (the ordinary attempt-once case, above); a
+/// *real* one means `goinkyo_pane` is still naming a pane from a
+/// consultation that already ended without `NoGoinkyo` ever firing to
+/// release it (`dismiss_goinkyo` immediately followed by a fresh
+/// `consult_goinkyo`, or a banto restart before the resumed guard — see
+/// `stage_brigade`'s own doc — ever got the chance to). Left alone, that
+/// stale pane's own eventual discovery would silently write its session id
+/// into whichever row now holds the `goinkyo` token, adopting it as the new
+/// consultation's member with no generation check to catch the mismatch —
+/// so this tears it down the same way `NoGoinkyo` does, rather than
+/// spawning the new one on top of it.
 fn update_goinkyo_awaiting_spawn(
     state: &mut EmporiumState,
     brigade: &BrigadeConfig,
@@ -4165,7 +4226,51 @@ fn update_goinkyo_awaiting_spawn(
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
-    if state.goinkyo_pane.contains_key(&candidate.brigade_id) {
+    if let Some(existing) = state.goinkyo_pane.get(&candidate.brigade_id).cloned() {
+        if existing.is_synthetic() {
+            // A spawn for the current consultation is already in flight, or
+            // already failed and left this as its trace (see this
+            // function's own doc on "just failed" vs "never tried") —
+            // either way the attempt-once guarantee holds: don't retry.
+            return Vec::new();
+        }
+        // A *real* key here, while this observation is `AwaitingSpawn` (the
+        // row it's looking at right now has no session id), can only mean
+        // one thing: `goinkyo_pane` still names a pane from a consultation
+        // that already ended. Discovery and fork-rename both always write a
+        // real id back to a row (`update_discovery_result`/`update_member_
+        // session_forked`), and a live consultation's own row always keeps
+        // its session id (`gather_goinkyo_observation` reports `Unchanged`
+        // for one, never `AwaitingSpawn`) — so a real key paired with a
+        // session-id-less row cannot arise from the same, still-open
+        // consultation; the row behind that key was deleted and a new one
+        // took its place. Two ways that happens without `NoGoinkyo` ever
+        // firing to release the guard first: `dismiss_goinkyo` immediately
+        // followed by a fresh `consult_goinkyo`, close enough together that
+        // the ~1Hz tick never observes the row-less moment in between; or a
+        // banto restart, after which `stage_brigade`'s own resume of an
+        // already-discovered Goinkyo is what seeds this entry (`stage_
+        // brigade`'s own doc) — not `update_goinkyo_awaiting_spawn` — so a
+        // dismiss right after *that* restart, before any fresh spawn ever
+        // ran, hits the exact same "no entry to release" gap `NoGoinkyo`'s
+        // own `let Some(key) = ... else { return }` already tolerates.
+        // Left alone, the stale pane keeps running — invisibly adopted as
+        // the new consultation's own member the moment its now-delayed
+        // discovery finally writes a session id into whichever row still
+        // holds the `goinkyo` token, since nothing here checks that it's
+        // still the *same* request. Same teardown `NoGoinkyo` performs, so
+        // the *next* tick starts the new consultation clean instead of
+        // layering it onto a still-running process from the old one.
+        state.goinkyo_pane.remove(&candidate.brigade_id);
+        let staged = matches!(
+            &state.stage,
+            Stage::Brigade { id, panes, .. }
+                if *id == candidate.brigade_id && panes.contains(&existing)
+        );
+        if staged {
+            state.unstage(&existing);
+            return vec![Cmd::KillPty { key: existing }];
+        }
         return Vec::new();
     }
     let key = SessionKey::new_worker(candidate.brigade_id, GOINKYO_TOKEN);
@@ -4215,6 +4320,7 @@ fn update_goinkyo_awaiting_spawn(
         model: brigade.goinkyo_model().map(str::to_string),
         effort: brigade.goinkyo_effort().map(str::to_string),
         permission_mode: brigade.goinkyo_permission_mode().map(str::to_string),
+        disallowed_tools: brigade.goinkyo_disallowed_tools().map(str::to_string),
     }]
 }
 
@@ -5488,12 +5594,13 @@ mod tests {
     }
 
     #[test]
-    fn stage_brigade_passes_the_configured_permission_mode_to_a_resumed_goinkyo_but_never_to_worker_or_director()
+    fn stage_brigade_passes_the_configured_permission_mode_and_disallowed_tools_to_a_resumed_goinkyo_but_never_to_worker_or_director()
      {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
         let brigade = BrigadeConfig {
             goinkyo_permission_mode: "bypassPermissions".to_string(),
+            goinkyo_disallowed_tools: "Bash".to_string(),
             ..BrigadeConfig::default()
         };
         let now = test_instant();
@@ -5528,30 +5635,39 @@ mod tests {
             now,
         );
 
-        let modes: Vec<(String, Option<String>)> = cmds
+        let modes: Vec<(String, Option<String>, Option<String>)> = cmds
             .iter()
             .filter_map(|cmd| match cmd {
                 Cmd::OpenEmbedded {
                     target,
                     permission_mode,
+                    disallowed_tools,
                     ..
-                } => Some((target.id.clone(), permission_mode.clone())),
+                } => Some((
+                    target.id.clone(),
+                    permission_mode.clone(),
+                    disallowed_tools.clone(),
+                )),
                 _ => None,
             })
             .collect();
         assert!(
-            modes.iter().any(|(id, mode)| id == "dir" && mode.is_none()),
-            "the Director must never carry --permission-mode: {modes:?}"
-        );
-        assert!(
-            modes.iter().any(|(id, mode)| id == "w1" && mode.is_none()),
-            "a resumed Worker must never carry --permission-mode: {modes:?}"
+            modes
+                .iter()
+                .any(|(id, mode, tools)| id == "dir" && mode.is_none() && tools.is_none()),
+            "the Director must never carry --permission-mode or --disallowedTools: {modes:?}"
         );
         assert!(
             modes
                 .iter()
-                .any(|(id, mode)| id == "g1" && mode.as_deref() == Some("bypassPermissions")),
-            "a resumed Goinkyo must carry the configured permission mode: {modes:?}"
+                .any(|(id, mode, tools)| id == "w1" && mode.is_none() && tools.is_none()),
+            "a resumed Worker must never carry --permission-mode or --disallowedTools: {modes:?}"
+        );
+        assert!(
+            modes.iter().any(|(id, mode, tools)| id == "g1"
+                && mode.as_deref() == Some("bypassPermissions")
+                && tools.as_deref() == Some("Bash")),
+            "a resumed Goinkyo must carry both configured values: {modes:?}"
         );
     }
 
@@ -8246,13 +8362,15 @@ mod tests {
     }
 
     #[test]
-    fn a_candidate_issues_an_open_embedded_carrying_the_goinkyo_model_effort_and_permission_mode() {
+    fn a_candidate_issues_an_open_embedded_carrying_the_goinkyo_model_effort_permission_mode_and_disallowed_tools()
+     {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
-        // `goinkyo_permission_mode` left at its own default ("auto") on
-        // purpose: this doubles as the "default value reaches argv" case,
+        // `goinkyo_permission_mode`/`goinkyo_disallowed_tools` both left at
+        // their own defaults ("auto"/"Edit,Write,NotebookEdit") on purpose:
+        // this doubles as the "default value reaches argv" case for both,
         // the same way `goinkyo_model`/`goinkyo_effort` are overridden here
-        // to prove an *explicit* value reaches it.
+        // to prove an *explicit* value reaches them.
         let brigade = BrigadeConfig {
             goinkyo_model: "fable".to_string(),
             goinkyo_effort: "max".to_string(),
@@ -8273,6 +8391,7 @@ mod tests {
                 model,
                 effort,
                 permission_mode,
+                disallowed_tools,
                 ..
             },
         ] = cmds.as_slice()
@@ -8289,6 +8408,7 @@ mod tests {
         assert_eq!(model.as_deref(), Some("fable"));
         assert_eq!(effort.as_deref(), Some("max"));
         assert_eq!(permission_mode.as_deref(), Some("auto"));
+        assert_eq!(disallowed_tools.as_deref(), Some("Edit,Write,NotebookEdit"));
         assert!(state.goinkyo_pane.contains_key(&7));
     }
 
@@ -8317,6 +8437,33 @@ mod tests {
             panic!("expected exactly one OpenEmbedded, got {cmds:?}");
         };
         assert_eq!(permission_mode, &None);
+    }
+
+    #[test]
+    fn an_empty_goinkyo_disallowed_tools_drops_the_field_entirely() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = BrigadeConfig {
+            goinkyo_disallowed_tools: String::new(),
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(7),
+            test_instant(),
+        );
+        let [
+            Cmd::OpenEmbedded {
+                disallowed_tools, ..
+            },
+        ] = cmds.as_slice()
+        else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        assert_eq!(disallowed_tools, &None);
     }
 
     #[test]
@@ -8694,6 +8841,179 @@ mod tests {
             "a released guard must allow exactly one more spawn: {reconsult_cmds:?}"
         );
         assert!(state.goinkyo_pane.contains_key(&6));
+    }
+
+    #[test]
+    fn a_row_swap_without_an_intervening_no_goinkyo_tears_down_the_stale_pane_first() {
+        // The gap `NoGoinkyo`'s own guard release can miss entirely:
+        // `dismiss_goinkyo` immediately followed by a fresh
+        // `consult_goinkyo`, close enough together that the ~1Hz tick's one
+        // `gather_goinkyo_observation` call never observes the row-less
+        // moment in between — it only ever sees the *new* row, session-id-
+        // less, which reads as an ordinary `AwaitingSpawn`. `goinkyo_pane`
+        // still names the *old* pane's real key at that point, since
+        // `NoGoinkyo` never fired to release it. Exercises
+        // `update_goinkyo_awaiting_spawn`'s real-key branch, not the
+        // synthetic-key attempt-once one the sibling tests above cover.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 6,
+            director: None,
+            panes: vec![SessionKey::from_id("dir")],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        // Consult + spawn + land, same as the end-to-end test above.
+        let spawn_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        let [Cmd::OpenEmbedded { key, .. }] = spawn_cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {spawn_cmds:?}");
+        };
+        let synthetic_key = key.clone();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: synthetic_key.clone(),
+            },
+            test_instant(),
+        );
+        assert!(state.screens.contains_key(&synthetic_key));
+
+        // Discovery resolves it to a real id — `goinkyo_pane` now names a
+        // *real* key, the precondition this whole test exists to exercise
+        // (without this step, `goinkyo_pane` would still hold the synthetic
+        // key, and the very next `awaiting_spawn` would just hit the
+        // ordinary attempt-once branch the sibling tests above already
+        // cover).
+        let old_key = SessionKey::from_id("g1");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: synthetic_key,
+                session_id: "g1".to_string(),
+                member: Some((6, GOINKYO_TOKEN.to_string())),
+            },
+            test_instant(),
+        );
+        assert_eq!(state.goinkyo_pane.get(&6), Some(&old_key));
+        assert!(state.screens.contains_key(&old_key));
+
+        // Dismiss + a fresh consult, without ever going through `NoGoinkyo`:
+        // the very next observation jumps straight to `AwaitingSpawn` for
+        // the same brigade, as if a new, session-id-less row had simply
+        // replaced the old one between two ticks.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: old_key.clone()
+            }],
+            "the stale pane must be torn down, not layered under a fresh spawn"
+        );
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected the brigade to stay staged");
+        };
+        assert!(!panes.contains(&old_key), "the stale pane must be unstaged");
+        assert!(
+            !state.goinkyo_pane.contains_key(&6),
+            "the guard must be released, not left pointing at the stale key"
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_resumed_through_stage_brigade_is_torn_down_correctly_on_dismiss() {
+        // Hole 2: before `stage_brigade` seeded `goinkyo_pane` on resume
+        // too, a Goinkyo resumed this way — the only path reachable after a
+        // banto restart, since `update_goinkyo_awaiting_spawn` was the
+        // *only* other place that ever wrote to the guard — left it unset.
+        // `NoGoinkyo`'s own `let Some(key) = state.goinkyo_pane.remove(...)
+        // else { return }` found nothing, so a dismissed-but-still-alive
+        // pane was never torn down at all.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir"), row("g1")]);
+        let brigade = brigade_config();
+        // Both already open (as a real restart would find them: banto's own
+        // in-memory state is gone, but the PTY handles/screens the shell
+        // rebuilds from the still-running processes are not) — the
+        // Director's own pane is only here so removing the Goinkyo's below
+        // doesn't collapse the whole stage to `Empty` as a side effect,
+        // which isn't what this test is about.
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        state
+            .screens
+            .insert(SessionKey::from_id("g1"), Screen::new(24, 80));
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            (
+                "goinkyo".to_string(),
+                BrigadeRole::Goinkyo,
+                Some("g1".to_string()),
+            ),
+        ];
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            test_instant(),
+        );
+        assert_eq!(
+            state.goinkyo_pane.get(&1),
+            Some(&SessionKey::from_id("g1")),
+            "the resume must seed the guard, not just stage the pane"
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::NoGoinkyo { brigade_id: 1 },
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: SessionKey::from_id("g1")
+            }]
+        );
+        assert!(!state.goinkyo_pane.contains_key(&1));
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert!(!panes.iter().any(|k| k.as_str() == "g1"));
     }
 
     // --- Goinkyo kickoff: PendingGoinkyoKickoff / CheckGoinkyoDirectoryTrust --
@@ -9734,6 +10054,7 @@ mod tests {
                     model: None,
                     effort: None,
                     permission_mode: None,
+                    disallowed_tools: None,
                 },
             ] => {
                 assert!(key.is_synthetic());

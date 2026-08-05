@@ -491,10 +491,11 @@ disagreement, addressable by name but never a broadcast recipient (see
 MCP tool (see "MCP mediation server" below), which files a written
 consultation request and creates the member row; once a tick observes that
 row with no session id yet, it is auto-spawned the same way a fresh Worker
-is (Claude only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`
-below), briefed from `goinkyo_prompt` with `{request}` substituted for the
-consultation file's path. The spawn is attempted at most once per
-consultation (`EmporiumState::goinkyo_pane`, one guard per brigade, mapped
+is (Claude only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`/
+`goinkyo_disallowed_tools` below), briefed from `goinkyo_prompt` with
+`{request}` substituted for the consultation file's path. The spawn is
+attempted at most once per consultation (`EmporiumState::goinkyo_pane`, one
+guard per brigade, mapped
 to the `SessionKey` that spawn used): a failed attempt is not retried
 automatically.
 
@@ -505,6 +506,18 @@ through a human approval at the end) reliably stops there. Not a guarantee
 of unattended operation either — Claude Code falls back to its ordinary
 confirmation flow after repeated denials even under `"auto"`, and that flow
 stops the same way `"manual"` does.
+
+`goinkyo_disallowed_tools` defaults to `"Edit,Write,NotebookEdit"`
+(`--disallowedTools`), passed on a resume too, not just a fresh spawn — same
+reasoning as `goinkyo_permission_mode` above, since which tools a Goinkyo
+may use is a property of the role, not of whether this particular launch
+happens to be fresh or resumed. It exists because `"auto"` changed what
+"unattended" means: under `"manual"` an edit stopped for approval nobody was
+there to give, under `"auto"` it doesn't, so an unattended Goinkyo could now
+write to the same working tree the Director is using without anyone having
+agreed to that. Not containment — Bash stays available, so this is a
+deterrent against that drift, not a defense against a hostile session — and
+not free: it also blocks whatever a scratchpad or memory write would use.
 
 The briefing alone is not a turn: Claude Code does nothing with a system
 prompt until it receives one, so once the Goinkyo's own pane goes quiet
@@ -689,6 +702,7 @@ pub struct BrigadeConfig {
     pub goinkyo_model: String,      // --model for an auto-spawned Goinkyo; "" = no flag; default "fable"; Claude only
     pub goinkyo_effort: String,     // --effort for an auto-spawned Goinkyo; "" = no flag; default "max"; Claude only
     pub goinkyo_permission_mode: String, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; default "auto"; Claude only
+    pub goinkyo_disallowed_tools: String, // --disallowedTools for an auto-spawned Goinkyo; "" = no flag; default "Edit,Write,NotebookEdit"; Claude only
 }
 ```
 
