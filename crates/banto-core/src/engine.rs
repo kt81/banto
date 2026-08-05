@@ -32,7 +32,8 @@ use crate::input::{
 };
 use crate::key_encode::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
 use crate::model::{
-    AgentKind, BrigadeId, BrigadeRole, GOINKYO_TOKEN, MemberToken, SessionRow, SessionToOpen,
+    AgentKind, BrigadeId, BrigadeRole, GOINKYO_TOKEN, MemberToken, PtyExitReason, SessionRow,
+    SessionToOpen,
 };
 
 /// Fixed width of the left sidebar (the session list), in columns.
@@ -1400,6 +1401,16 @@ pub enum Event {
     },
     PtyExited {
         key: SessionKey,
+        /// What the shell's own `child.wait()` reported, if anything —
+        /// `None` covers both a stream recorded before this field existed
+        /// (`#[serde(default)]`, same precedent as `RowsLoaded::superseded`)
+        /// and a live tick where the shell reported the pane gone before its
+        /// own wait-observation caught up (`banto::embedded::session::
+        /// PtyHandle::poll`'s doc has the race). [`PtyExitReason::Unknown`]
+        /// is different from either: the shell *did* observe the exit, but
+        /// `wait()` itself returned an error rather than a status.
+        #[serde(default)]
+        reason: Option<PtyExitReason>,
     },
     /// The shell's answer to `Cmd::CheckNewSessionCwd` — see
     /// `update_new_session_cwd_checked`'s doc for why `cwd` is echoed back
@@ -1622,7 +1633,9 @@ pub fn update(
             }
             cmds
         }
-        Event::PtyExited { key } => update_pty_exited(state, app, brigade, key, now),
+        Event::PtyExited { key, reason } => {
+            update_pty_exited(state, app, brigade, key, reason, now)
+        }
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
@@ -3328,6 +3341,7 @@ fn update_pty_exited(
     app: &mut App,
     brigade: &BrigadeConfig,
     key: SessionKey,
+    reason: Option<PtyExitReason>,
     now: Instant,
 ) -> Vec<Cmd> {
     state.screens.remove(&key);
@@ -3372,7 +3386,11 @@ fn update_pty_exited(
         .row_for_id(key.as_str())
         .map(|row| row.display_title().to_string())
         .unwrap_or_else(|| key.as_str().to_string());
-    state.set_status(format!("session ended: {title}"), now);
+    let status = match reason {
+        Some(reason) => format!("session ended: {title} — {}", reason.describe()),
+        None => format!("session ended: {title}"),
+    };
+    state.set_status(status, now);
     Vec::new()
 }
 
@@ -5444,6 +5462,7 @@ mod tests {
             &brigade,
             Event::PtyExited {
                 key: SessionKey::from_id("dir"),
+                reason: None,
             },
             test_instant(),
         );
@@ -5715,6 +5734,7 @@ mod tests {
             &brigade,
             Event::PtyExited {
                 key: SessionKey::from_id("dir"),
+                reason: None,
             },
             test_instant(),
         );
@@ -5802,6 +5822,7 @@ mod tests {
             &brigade,
             Event::PtyExited {
                 key: SessionKey::from_id("dir"),
+                reason: None,
             },
             test_instant(),
         );
@@ -6547,7 +6568,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::PtyExited { key: key.clone() },
+            Event::PtyExited {
+                key: key.clone(),
+                reason: None,
+            },
             test_instant(),
         );
 
@@ -6559,6 +6583,92 @@ mod tests {
             Focus::Sidebar,
             "focus must not outlive the pane it points at"
         );
+    }
+
+    #[test]
+    fn pty_exited_with_no_reason_keeps_the_plain_status_wording() {
+        // `reason: None` is what an old-format replay stream deserializes
+        // to (`#[serde(default)]`) as well as a live tick that lost the
+        // shell's own observation race — both must fall back to exactly the
+        // pre-existing wording, with no trailing " — ..." clause.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key, reason: None },
+            test_instant(),
+        );
+
+        assert_eq!(state.status.as_deref(), Some("session ended: sess-1"));
+    }
+
+    #[test]
+    fn pty_exited_reports_a_zero_exit_code_as_exited_normally() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        let mut app = app_with(vec![row("sess-1")]);
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key,
+                reason: Some(PtyExitReason::Code(0)),
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            state.status.as_deref(),
+            Some("session ended: sess-1 — exited normally")
+        );
+    }
+
+    #[test]
+    fn pty_exited_reports_a_nonzero_exit_code_signal_and_unknown_reason_distinctly() {
+        let brigade = brigade_config();
+        let reasons_and_expected = [
+            (
+                PtyExitReason::Code(1),
+                "session ended: sess-1 — exited with code 1",
+            ),
+            (
+                PtyExitReason::Signal("SIGKILL".to_string()),
+                "session ended: sess-1 — terminated by SIGKILL",
+            ),
+            (
+                PtyExitReason::Unknown,
+                "session ended: sess-1 — exit reason unknown",
+            ),
+        ];
+        for (reason, expected) in reasons_and_expected {
+            let mut state = EmporiumState::new(PrefixKey::default());
+            let key = SessionKey::from_id("sess-1");
+            state.stage = Stage::Solo(key.clone());
+            let mut app = app_with(vec![row("sess-1")]);
+
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::PtyExited {
+                    key,
+                    reason: Some(reason.clone()),
+                },
+                test_instant(),
+            );
+
+            assert_eq!(state.status.as_deref(), Some(expected), "for {reason:?}");
+        }
     }
 
     #[test]
@@ -6581,7 +6691,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::PtyExited { key: key.clone() },
+            Event::PtyExited {
+                key: key.clone(),
+                reason: None,
+            },
             now,
         );
 
@@ -6631,6 +6744,7 @@ mod tests {
             &brigade,
             Event::PtyExited {
                 key: worker.clone(),
+                reason: None,
             },
             test_instant(),
         );
@@ -7230,7 +7344,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::PtyExited { key: key.clone() },
+            Event::PtyExited {
+                key: key.clone(),
+                reason: None,
+            },
             test_instant(),
         );
 
@@ -8067,6 +8184,7 @@ mod tests {
             &brigade,
             Event::PtyExited {
                 key: goinkyo_key.clone(),
+                reason: None,
             },
             test_instant(),
         );

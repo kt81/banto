@@ -368,6 +368,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_fixtures_own_pty_exited_line_has_no_reason_field_and_that_is_the_point() {
+        // `PtyExited`'s `reason` field (added after `CANONICAL_FIXTURE` was
+        // frozen) is `#[serde(default)]` exactly so this fixture's own
+        // pre-existing JSON line — "{"PtyExited":{"key":"row-1"}}", no
+        // `reason` key at all — keeps parsing as a stream recorded before
+        // the field existed, deserializing to `reason: None`. The test just
+        // above already exercises this end to end (the fixture parses, and
+        // its final status is the short, reason-less wording); this pins
+        // the same fact at the JSON layer directly, so a future edit that
+        // makes the field non-optional fails here with a clear message
+        // instead of a confusing status-string mismatch three functions
+        // away.
+        let events = parse_stream(CANONICAL_FIXTURE).expect("the fixture is well-formed");
+        let exited = events
+            .iter()
+            .find(|timed| matches!(timed.event, Event::PtyExited { .. }))
+            .expect("the fixture has a PtyExited line");
+        assert!(matches!(
+            &exited.event,
+            Event::PtyExited { reason: None, .. }
+        ));
+    }
+
+    #[test]
+    fn a_freshly_recorded_pty_exited_with_a_reason_round_trips_and_replays_into_the_richer_status()
+    {
+        let events = vec![
+            TimedEvent {
+                offset_ms: 0,
+                event: Event::RowsLoaded {
+                    rows: vec![],
+                    hidden: Default::default(),
+                    directors: Default::default(),
+                    superseded: Default::default(),
+                },
+            },
+            TimedEvent {
+                offset_ms: 100,
+                event: Event::PtyExited {
+                    key: engine::SessionKey::from_id("row-1"),
+                    reason: Some(crate::model::PtyExitReason::Code(1)),
+                },
+            },
+        ];
+        let text = stream(&events);
+        let parsed = parse_stream(&text).expect("a freshly serialized stream must parse");
+        assert_eq!(parsed, events);
+
+        let brigade = BrigadeConfig::default();
+        let outcome = replay(&parsed, &brigade, test_instant());
+        assert_eq!(
+            outcome.state.status.as_deref(),
+            Some("session ended: row-1 — exited with code 1")
+        );
+    }
+
     // --- the director-fork fixture -----------------------------------------
     //
     // Same authoring discipline as `CANONICAL_FIXTURE` above, scoped to the
