@@ -588,6 +588,7 @@ fn execute_cmd(
             model,
             effort,
             permission_mode,
+            disallowed_tools,
         } => execute_open_embedded(
             OpenEmbeddedRequest {
                 key,
@@ -596,6 +597,7 @@ fn execute_cmd(
                 model,
                 effort,
                 permission_mode,
+                disallowed_tools,
             },
             deps,
             handles,
@@ -754,6 +756,7 @@ fn build_open_launch(
     model: Option<&str>,
     effort: Option<&str>,
     permission_mode: Option<&str>,
+    disallowed_tools: Option<&str>,
     briefing: Option<&str>,
     ctx: &opener::OpenContext,
 ) -> Option<opener::AgentLaunch> {
@@ -775,6 +778,7 @@ fn build_open_launch(
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
             permission_mode: permission_mode.map(str::to_string),
+            disallowed_tools: disallowed_tools.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
         },
@@ -783,11 +787,11 @@ fn build_open_launch(
         // by the `banto _hook` process the injected SessionStart hook spawns,
         // not passed on the argv. `brigade` is left `None` for the caller to
         // fill for the same reason `mcp_config` is — it needs the running
-        // executable's own path, which is I/O this stays free of. `effort`
-        // and `permission_mode` are both dropped for the same reason
-        // `AgentLaunch::Codex` carries no field for either — a Goinkyo (the
-        // only source of either today) is Claude-only, so this arm never
-        // actually receives one; see that variant's own doc.
+        // executable's own path, which is I/O this stays free of. `effort`,
+        // `permission_mode`, and `disallowed_tools` are all dropped for the
+        // same reason `AgentLaunch::Codex` carries no field for any of them
+        // — a Goinkyo (the only source of any today) is Claude-only, so
+        // this arm never actually receives one; see that variant's own doc.
         AgentKind::Codex => opener::AgentLaunch::Codex {
             resume,
             model: model.map(str::to_string),
@@ -809,6 +813,7 @@ struct OpenEmbeddedRequest {
     model: Option<String>,
     effort: Option<String>,
     permission_mode: Option<String>,
+    disallowed_tools: Option<String>,
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard for a
@@ -836,6 +841,7 @@ fn execute_open_embedded(
         model,
         effort,
         permission_mode,
+        disallowed_tools,
     } = request;
     let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
@@ -860,6 +866,7 @@ fn execute_open_embedded(
         model.as_deref(),
         effort.as_deref(),
         permission_mode.as_deref(),
+        disallowed_tools.as_deref(),
         briefing.as_deref(),
         &open_ctx,
     ) else {
@@ -3636,6 +3643,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
@@ -3657,6 +3665,7 @@ mod tests {
             Some("max"),
             None,
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
@@ -3668,6 +3677,7 @@ mod tests {
         let no_effort = build_open_launch(
             &open_target(""),
             Some("fable"),
+            None,
             None,
             None,
             None,
@@ -3692,6 +3702,7 @@ mod tests {
             Some("max"),
             Some("auto"),
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
@@ -3715,12 +3726,71 @@ mod tests {
             Some("max"),
             None,
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
             no_permission_mode.argv("claude"),
             ["claude", "--model", "fable", "--effort", "max"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn build_open_launch_appends_disallowed_tools_right_after_permission_mode_and_omits_it_when_none()
+     {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target(""),
+            Some("fable"),
+            Some("max"),
+            Some("auto"),
+            Some("Edit,Write,NotebookEdit"),
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "fable",
+                "--effort",
+                "max",
+                "--permission-mode",
+                "auto",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit"
+            ]
+            .map(str::to_string)
+        );
+
+        let no_disallowed_tools = build_open_launch(
+            &open_target(""),
+            Some("fable"),
+            Some("max"),
+            Some("auto"),
+            None,
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            no_disallowed_tools.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "fable",
+                "--effort",
+                "max",
+                "--permission-mode",
+                "auto"
+            ]
+            .map(str::to_string)
         );
     }
 
@@ -3733,6 +3803,7 @@ mod tests {
         let launch = build_open_launch(
             &open_target(""),
             Some("opus"),
+            None,
             None,
             None,
             None,
@@ -3753,6 +3824,7 @@ mod tests {
         let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
+            None,
             None,
             None,
             None,
@@ -3788,6 +3860,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &test_ctx(&probe, &live, &binaries),
             )
             .is_none()
@@ -3805,9 +3878,10 @@ mod tests {
         let launch = build_open_launch(
             &target,
             Some("o3"),
-            // `effort`/`permission_mode` are Claude-only
-            // (`AgentLaunch::Claude`'s own doc); dropped here for the same
-            // reason the briefing below is.
+            // `effort`/`permission_mode`/`disallowed_tools` are all
+            // Claude-only (`AgentLaunch::Claude`'s own doc); dropped here
+            // for the same reason the briefing below is.
+            None,
             None,
             None,
             // The caller resolves a briefing for any brigade member
@@ -3851,6 +3925,7 @@ mod tests {
             Some("opus"),
             None,
             None,
+            None,
             Some("you are the Director"),
             &test_ctx(&probe, &[], &binaries),
         )
@@ -3878,6 +3953,7 @@ mod tests {
         let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
+            None,
             None,
             None,
             None,

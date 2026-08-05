@@ -329,11 +329,21 @@ pub(crate) enum AgentLaunch {
         /// the per-variant split exists to avoid.
         effort: Option<String>,
         /// `--permission-mode <mode>` (`claude --help`: `manual`/
-        /// `acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`) — same
-        /// scope as `effort` above, so far only ever set for an
-        /// auto-spawned Goinkyo (`BrigadeConfig::goinkyo_permission_mode`),
-        /// same "no Codex counterpart on `Self::Codex`" reasoning too.
+        /// `acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`) —
+        /// unlike `effort` above, set for a Goinkyo
+        /// (`BrigadeConfig::goinkyo_permission_mode`) on a resume too, not
+        /// just a fresh spawn: who may approve a tool call is a property of
+        /// the role, not of whether this particular launch is fresh. Same
+        /// "no Codex counterpart on `Self::Codex`" reasoning as `effort`.
         permission_mode: Option<String>,
+        /// `--disallowedTools <tools>` (`claude --help`: comma- or
+        /// space-separated tool names to deny) —
+        /// `BrigadeConfig::goinkyo_disallowed_tools`, same scope as
+        /// `permission_mode` just above (Goinkyo, fresh spawn or resume
+        /// alike — which tools exist to call is as much a role property as
+        /// who approves them) and the same "no Codex counterpart" reasoning
+        /// as `effort`.
+        disallowed_tools: Option<String>,
         append_system_prompt: Option<String>,
         mcp_config: Option<PathBuf>,
     },
@@ -560,6 +570,7 @@ impl AgentLaunch {
                 model,
                 effort,
                 permission_mode,
+                disallowed_tools,
                 append_system_prompt,
                 mcp_config,
             } => {
@@ -578,6 +589,10 @@ impl AgentLaunch {
                 if let Some(mode) = permission_mode {
                     argv.push("--permission-mode".to_string());
                     argv.push(mode.clone());
+                }
+                if let Some(tools) = disallowed_tools {
+                    argv.push("--disallowedTools".to_string());
+                    argv.push(tools.clone());
                 }
                 if let Some(prompt) = append_system_prompt {
                     argv.push("--append-system-prompt".to_string());
@@ -634,6 +649,7 @@ pub(crate) fn inplace_argv(
             model: None,
             effort: None,
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         },
@@ -789,6 +805,7 @@ fn wrap_argv(
             model: None,
             effort: None,
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         },
@@ -855,6 +872,7 @@ fn new_session_wrap_argv(
         model: None,
         effort: None,
         permission_mode: None,
+        disallowed_tools: None,
         append_system_prompt: None,
         mcp_config: None,
     };
@@ -1236,6 +1254,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         }
@@ -1256,6 +1275,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
         };
@@ -1277,6 +1297,7 @@ mod tests {
             model: Some("fable".to_string()),
             effort: Some("max".to_string()),
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -1290,6 +1311,7 @@ mod tests {
             model: Some("fable".to_string()),
             effort: None,
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -1306,6 +1328,7 @@ mod tests {
             model: Some("fable".to_string()),
             effort: Some("max".to_string()),
             permission_mode: Some("auto".to_string()),
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -1328,6 +1351,7 @@ mod tests {
             model: Some("fable".to_string()),
             effort: Some("max".to_string()),
             permission_mode: None,
+            disallowed_tools: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -1338,12 +1362,64 @@ mod tests {
     }
 
     #[test]
+    fn agent_launch_disallowed_tools_renders_right_after_permission_mode_and_is_absent_when_none() {
+        let launch = AgentLaunch::Claude {
+            resume: None,
+            model: Some("fable".to_string()),
+            effort: Some("max".to_string()),
+            permission_mode: Some("auto".to_string()),
+            disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            launch.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "fable",
+                "--effort",
+                "max",
+                "--permission-mode",
+                "auto",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit"
+            ]
+            .map(str::to_string)
+        );
+
+        let no_disallowed_tools = AgentLaunch::Claude {
+            resume: None,
+            model: Some("fable".to_string()),
+            effort: Some("max".to_string()),
+            permission_mode: Some("auto".to_string()),
+            disallowed_tools: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            no_disallowed_tools.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "fable",
+                "--effort",
+                "max",
+                "--permission-mode",
+                "auto"
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
     fn agent_launch_combines_every_flag_in_the_fixed_order() {
         let launch = AgentLaunch::Claude {
             resume: Some("sess-1".to_string()),
             model: Some("opus".to_string()),
             effort: Some("high".to_string()),
             permission_mode: Some("auto".to_string()),
+            disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
         };
@@ -1359,6 +1435,8 @@ mod tests {
                 "high",
                 "--permission-mode",
                 "auto",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit",
                 "--append-system-prompt",
                 "you are the Director",
                 "--mcp-config",
