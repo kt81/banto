@@ -134,7 +134,7 @@ pub fn run(
         let pinned = crate::tui::load_pinned(&store);
         let groups = crate::tui::load_groups(&store);
         let session_groups = crate::tui::load_session_groups(&store, &groups);
-        let hidden = crate::tui::load_hidden_worker_ids(&store);
+        let hidden = crate::tui::load_hidden_member_ids(&store);
         let directors = crate::tui::load_directors(&store);
         (
             rows,
@@ -149,7 +149,7 @@ pub fn run(
     let mut app = App::new(rows)
         .with_pinned(pinned)
         .with_groups(groups, session_groups)
-        .with_hidden_worker_ids(hidden)
+        .with_hidden_member_ids(hidden)
         .with_directors(directors)
         .with_superseded(superseded)
         // Two lines per row (title/age, then cwd/agent) — the sidebar has
@@ -587,6 +587,7 @@ fn execute_cmd(
             brigade,
             model,
             effort,
+            permission_mode,
         } => execute_open_embedded(
             OpenEmbeddedRequest {
                 key,
@@ -594,6 +595,7 @@ fn execute_cmd(
                 brigade,
                 model,
                 effort,
+                permission_mode,
             },
             deps,
             handles,
@@ -751,6 +753,7 @@ fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
     effort: Option<&str>,
+    permission_mode: Option<&str>,
     briefing: Option<&str>,
     ctx: &opener::OpenContext,
 ) -> Option<opener::AgentLaunch> {
@@ -771,6 +774,7 @@ fn build_open_launch(
             resume,
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
+            permission_mode: permission_mode.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
         },
@@ -780,8 +784,10 @@ fn build_open_launch(
         // not passed on the argv. `brigade` is left `None` for the caller to
         // fill for the same reason `mcp_config` is — it needs the running
         // executable's own path, which is I/O this stays free of. `effort`
-        // is dropped for the same reason `AgentLaunch::Codex` carries no
-        // field for it at all — see that variant's own doc.
+        // and `permission_mode` are both dropped for the same reason
+        // `AgentLaunch::Codex` carries no field for either — a Goinkyo (the
+        // only source of either today) is Claude-only, so this arm never
+        // actually receives one; see that variant's own doc.
         AgentKind::Codex => opener::AgentLaunch::Codex {
             resume,
             model: model.map(str::to_string),
@@ -802,6 +808,7 @@ struct OpenEmbeddedRequest {
     brigade: Option<(BrigadeId, MemberToken, BrigadeRole)>,
     model: Option<String>,
     effort: Option<String>,
+    permission_mode: Option<String>,
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard for a
@@ -828,6 +835,7 @@ fn execute_open_embedded(
         brigade,
         model,
         effort,
+        permission_mode,
     } = request;
     let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
@@ -851,6 +859,7 @@ fn execute_open_embedded(
         &target,
         model.as_deref(),
         effort.as_deref(),
+        permission_mode.as_deref(),
         briefing.as_deref(),
         &open_ctx,
     ) else {
@@ -1024,7 +1033,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .map_err(|err| err.to_string())
                 .map(|()| {
                     (
-                        crate::tui::load_hidden_worker_ids(&store),
+                        crate::tui::load_hidden_member_ids(&store),
                         crate::tui::load_directors(&store),
                     )
                 });
@@ -1037,7 +1046,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .map_err(|err| err.to_string())
                 .map(|()| {
                     (
-                        crate::tui::load_hidden_worker_ids(&store),
+                        crate::tui::load_hidden_member_ids(&store),
                         crate::tui::load_directors(&store),
                     )
                 });
@@ -1051,7 +1060,18 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let mut store = store.borrow_mut();
             let _ = store.set_member_session(brigade_id, &token, &SessionId(session_id));
             vec![Event::MemberSessionRecorded {
-                hidden: crate::tui::load_hidden_worker_ids(&store),
+                hidden: crate::tui::load_hidden_member_ids(&store),
+                directors: crate::tui::load_directors(&store),
+            }]
+        }
+        StoreIntent::ClearMemberSession { brigade_id, token } => {
+            let mut store = store.borrow_mut();
+            let _ = store.clear_member_session(brigade_id, &token);
+            // Same refresh `SetMemberSession` answers with: this member's id
+            // just left (or, if it had none, stayed out of) the hidden set,
+            // so the sidebar's own filter needs to catch up either way.
+            vec![Event::MemberSessionRecorded {
+                hidden: crate::tui::load_hidden_member_ids(&store),
                 directors: crate::tui::load_directors(&store),
             }]
         }
@@ -1161,7 +1181,7 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     let superseded = crate::tui::superseded_from_metas(&metas, &store, deps.superseded_failed);
     let rows = session::rows_from_metas(metas, deps.claude_home, deps.thresholds);
     let rows = crate::tui::exclude_archived(rows, &store);
-    let hidden = crate::tui::load_hidden_worker_ids(&store);
+    let hidden = crate::tui::load_hidden_member_ids(&store);
     let directors = crate::tui::load_directors(&store);
     vec![Event::RowsLoaded {
         rows,
@@ -3615,6 +3635,7 @@ mod tests {
             Some("opus"),
             None,
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
@@ -3635,6 +3656,7 @@ mod tests {
             Some("fable"),
             Some("max"),
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
@@ -3648,12 +3670,57 @@ mod tests {
             Some("fable"),
             None,
             None,
+            None,
             &test_ctx(&probe, &[], &binaries),
         )
         .unwrap();
         assert_eq!(
             no_effort.argv("claude"),
             ["claude", "--model", "fable"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn build_open_launch_appends_permission_mode_right_after_effort_and_omits_it_when_none() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &open_target(""),
+            Some("fable"),
+            Some("max"),
+            Some("auto"),
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            launch.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "fable",
+                "--effort",
+                "max",
+                "--permission-mode",
+                "auto"
+            ]
+            .map(str::to_string)
+        );
+
+        let no_permission_mode = build_open_launch(
+            &open_target(""),
+            Some("fable"),
+            Some("max"),
+            None,
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert_eq!(
+            no_permission_mode.argv("claude"),
+            ["claude", "--model", "fable", "--effort", "max"].map(str::to_string)
         );
     }
 
@@ -3666,6 +3733,7 @@ mod tests {
         let launch = build_open_launch(
             &open_target(""),
             Some("opus"),
+            None,
             None,
             None,
             &test_ctx(&probe, &[], &binaries),
@@ -3685,6 +3753,7 @@ mod tests {
         let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
+            None,
             None,
             None,
             None,
@@ -3718,6 +3787,7 @@ mod tests {
                 Some("opus"),
                 None,
                 None,
+                None,
                 &test_ctx(&probe, &live, &binaries),
             )
             .is_none()
@@ -3735,8 +3805,10 @@ mod tests {
         let launch = build_open_launch(
             &target,
             Some("o3"),
-            // `effort` is Claude-only (`AgentLaunch::Claude`'s own doc);
-            // dropped here for the same reason the briefing below is.
+            // `effort`/`permission_mode` are Claude-only
+            // (`AgentLaunch::Claude`'s own doc); dropped here for the same
+            // reason the briefing below is.
+            None,
             None,
             // The caller resolves a briefing for any brigade member
             // regardless of product (`member_briefing` takes only
@@ -3778,6 +3850,7 @@ mod tests {
             &open_target("sess-1"),
             Some("opus"),
             None,
+            None,
             Some("you are the Director"),
             &test_ctx(&probe, &[], &binaries),
         )
@@ -3805,6 +3878,7 @@ mod tests {
         let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
+            None,
             None,
             None,
             None,
@@ -4116,6 +4190,87 @@ mod tests {
         assert_eq!(
             gather_goinkyo_observation(&state, &store, &app),
             GoinkyoObservation::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_gravestoned_goinkyos_session_clears_for_real_and_respawns_exactly_once() {
+        // The other half of the `stage_brigade` gravestone fix, exercised
+        // through the real store round trip `engine.rs`'s own pure unit
+        // tests can't reach: does clearing `session_id` actually flip
+        // `gather_goinkyo_observation` back to `AwaitingSpawn`, and does the
+        // existing one-shot guard (`EmporiumState::goinkyo_pane`) still stop
+        // it from spawning a second time once it has.
+        let (store, mut state, app) = staged_goinkyo(Some("g1"));
+        let Stage::Brigade { id: brigade_id, .. } = state.stage else {
+            panic!("staged_goinkyo always stages a Stage::Brigade");
+        };
+
+        // Simulates `stage_brigade`'s own `Cmd::Store(ClearMemberSession)`
+        // actually executing — proven separately, at the pure-logic level,
+        // by `engine.rs`'s own
+        // `stage_brigade_resets_a_goinkyo_gravestones_session_id_instead_of_
+        // reporting_it_missing`.
+        let events = execute_store_intent(
+            StoreIntent::ClearMemberSession {
+                brigade_id,
+                token: "goinkyo".to_string(),
+            },
+            &store,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [Event::MemberSessionRecorded { .. }]
+        ));
+
+        // Next tick: the same consultation is spawnable again.
+        let observation = gather_goinkyo_observation(&state, &store, &app);
+        let GoinkyoObservation::AwaitingSpawn(candidate) = &observation else {
+            panic!("expected AwaitingSpawn once session_id cleared, got {observation:?}");
+        };
+        assert_eq!(candidate.brigade_id, brigade_id);
+
+        let brigade = BrigadeConfig::default();
+        let cmds = engine::update(
+            &mut state,
+            &mut App::new(vec![]),
+            &brigade,
+            Event::GoinkyoAwaitingSpawn { observation },
+            Instant::now(),
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::OpenEmbedded { .. }]),
+            "expected exactly one respawn: {cmds:?}"
+        );
+
+        // A further tick before the respawned pane even reports back
+        // (`Event::Spawned`, which is what actually records a session id
+        // and would make `gather_goinkyo_observation` itself report
+        // `Unchanged`) must not spawn a second one. The store still shows
+        // `session_id: None` at this point — the shell's own observation is
+        // correctly still `AwaitingSpawn`, same as just above; it's
+        // `update_goinkyo_awaiting_spawn`'s own one-shot guard
+        // (`EmporiumState::goinkyo_pane`, armed by the first spawn above)
+        // that has to be the thing stopping a second one — the guard this
+        // whole fix has to respect, not bypass.
+        let observation_again = gather_goinkyo_observation(&state, &store, &app);
+        assert!(
+            matches!(observation_again, GoinkyoObservation::AwaitingSpawn(_)),
+            "the store genuinely hasn't changed yet, so the shell's own \
+             observation is unchanged too: {observation_again:?}"
+        );
+        let cmds_again = engine::update(
+            &mut state,
+            &mut App::new(vec![]),
+            &brigade,
+            Event::GoinkyoAwaitingSpawn {
+                observation: observation_again,
+            },
+            Instant::now(),
+        );
+        assert!(
+            cmds_again.is_empty(),
+            "the one-shot spawn guard must stop a second respawn: {cmds_again:?}"
         );
     }
 

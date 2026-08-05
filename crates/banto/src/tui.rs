@@ -258,7 +258,7 @@ pub fn run(
         let pinned = load_pinned(&store);
         let groups = load_groups(&store);
         let session_groups = load_session_groups(&store, &groups);
-        let hidden = load_hidden_worker_ids(&store);
+        let hidden = load_hidden_member_ids(&store);
         let directors = load_directors(&store);
         (
             rows,
@@ -273,7 +273,7 @@ pub fn run(
     let mut app = App::new(rows)
         .with_pinned(pinned)
         .with_groups(groups, session_groups)
-        .with_hidden_worker_ids(hidden)
+        .with_hidden_member_ids(hidden)
         .with_directors(directors)
         .with_superseded(superseded)
         .with_enabled_agents(enabled_agents.clone());
@@ -387,13 +387,13 @@ pub(crate) fn load_pinned(store: &Store) -> HashSet<String> {
         .collect()
 }
 
-/// Load every brigade Worker's Claude session id, across every brigade, that
-/// has been assigned one so far — [`App`] hides these from the list (see
-/// `App::hidden`). Tolerant: a read failure just means nothing is hidden yet,
-/// rather than blocking the TUI from starting.
-pub(crate) fn load_hidden_worker_ids(store: &Store) -> HashSet<String> {
+/// Load every brigade Worker's or Goinkyo's Claude session id, across every
+/// brigade, that has been assigned one so far — [`App`] hides these from the
+/// list (see `App::hidden`). Tolerant: a read failure just means nothing is
+/// hidden yet, rather than blocking the TUI from starting.
+pub(crate) fn load_hidden_member_ids(store: &Store) -> HashSet<String> {
     store
-        .brigade_worker_session_ids()
+        .brigade_hidden_session_ids()
         .unwrap_or_default()
         .into_iter()
         .map(|id| id.0)
@@ -1748,7 +1748,7 @@ fn reload(app: &mut App, ctx: &Context) {
         let rows = session::rows_from_metas(metas, &ctx.claude_home, ctx.thresholds);
         let rows = exclude_archived(rows, &store);
         app.replace_rows(rows);
-        app.set_hidden_worker_ids(load_hidden_worker_ids(&store));
+        app.set_hidden_member_ids(load_hidden_member_ids(&store));
         app.set_directors(load_directors(&store));
         app.set_superseded(superseded);
     }

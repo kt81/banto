@@ -338,6 +338,7 @@ mod tests {
             brigade: cmd_brigade,
             model,
             effort,
+            permission_mode,
         } = &open_embedded[0].1
         else {
             unreachable!("just matched OpenEmbedded above");
@@ -347,6 +348,7 @@ mod tests {
         assert!(cmd_brigade.is_none());
         assert!(model.is_none());
         assert!(effort.is_none());
+        assert!(permission_mode.is_none());
         assert!(
             matches!(&mid.state.stage, Stage::Solo(k) if k == &expected_key),
             "expected Solo({expected_key:?}), got {:?}",

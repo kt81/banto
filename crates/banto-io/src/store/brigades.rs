@@ -135,6 +135,30 @@ impl Store {
         Ok(())
     }
 
+    /// Resets a member's `session_id` back to `None` — the gravestone fix
+    /// for a Goinkyo that never ran a single turn: Claude Code writes no
+    /// `projects/*.jsonl` transcript until a session's first turn, so
+    /// `session_id` staying set forever (nothing else ever clears it) keeps
+    /// `gather_goinkyo_observation`'s `AwaitingSpawn` check (which fires only
+    /// on `session_id: None`) from ever seeing this row as spawnable again —
+    /// a member stuck exactly as unreachable-but-not-gone as it looks, until
+    /// dismissed. Its consultation request file outlives this (kept until
+    /// `dismiss_worker`/`dismiss_goinkyo` actually removes the row), so the
+    /// next `AwaitingSpawn` restarts the very same consultation, not a fresh
+    /// one. A no-op if `(brigade_id, token)` doesn't exist.
+    pub fn clear_member_session(
+        &mut self,
+        brigade_id: BrigadeId,
+        token: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE brigade_members SET session_id = NULL
+             WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, token],
+        )?;
+        Ok(())
+    }
+
     /// Removes a member from a brigade together with its cursor. Removing a
     /// non-member is a no-op.
     pub fn remove_brigade_member(
@@ -276,14 +300,25 @@ impl Store {
             .optional()?)
     }
 
-    /// Every known Worker's session id, across every brigade, that has
-    /// been assigned one so far (a Worker banto is still waiting on its
-    /// agent product to assign one has no entry). Used to hide Workers from
-    /// the session list.
-    pub fn brigade_worker_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
+    /// Every known Worker's or Goinkyo's session id, across every brigade,
+    /// that has been assigned one so far (a member banto is still waiting on
+    /// its agent product to assign one has no entry). Used to hide these
+    /// from the session list — their own pane already represents them, so a
+    /// second row for the same content is noise, not information. The
+    /// Director is deliberately excluded: that pane is the operator's own
+    /// interactive session, not a redundant view of it.
+    ///
+    /// A Goinkyo is hidden only *while* it's still a member — dismissal
+    /// deletes its row (`Self::dismiss_worker`), and the moment it drops out
+    /// of this query the session list is the only trace of it left: the
+    /// operator never reads brigade mail, so a dismissed Goinkyo's own pane
+    /// (already closed) leaves its transcript as the sole copy of what it
+    /// actually said, and hiding that too would bury the one place its
+    /// answer still reaches the operator.
+    pub fn brigade_hidden_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id FROM brigade_members
-             WHERE role = 'worker' AND session_id IS NOT NULL",
+             WHERE role IN ('worker', 'goinkyo') AND session_id IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |row| Ok(SessionId(row.get(0)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -580,6 +615,28 @@ mod tests {
     }
 
     #[test]
+    fn clear_member_session_resets_it_back_to_none() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+            .unwrap();
+
+        store.clear_member_session(br, "goinkyo").unwrap();
+
+        let member = store.brigade_member(br, "goinkyo").unwrap().unwrap();
+        assert_eq!(member.session_id, None);
+    }
+
+    #[test]
+    fn clear_member_session_of_a_non_member_is_a_noop() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+
+        store.clear_member_session(br, "goinkyo").unwrap();
+    }
+
+    #[test]
     fn one_session_belongs_to_one_member_the_older_row_is_cleared() {
         // Two Workers spawned into one cwd once resolved to a single
         // discovered id, leaving both rows claiming it — after which
@@ -686,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_and_director_session_id_sets_are_reported_separately() {
+    fn hidden_and_director_session_id_sets_are_reported_separately() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
@@ -699,9 +756,37 @@ mod tests {
         store
             .add_brigade_member(br, "worker-2", BrigadeRole::Worker, None)
             .unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+            .unwrap();
 
-        assert_eq!(store.brigade_worker_session_ids().unwrap(), [sid("w1")]);
+        let mut hidden = store.brigade_hidden_session_ids().unwrap();
+        hidden.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(hidden, [sid("g1"), sid("w1")]);
         assert_eq!(store.brigade_director_session_ids().unwrap(), [sid("dir")]);
+    }
+
+    #[test]
+    fn a_dismissed_goinkyo_drops_out_of_the_hidden_set() {
+        // The Director is never hidden (that pane is the operator's own
+        // session), and a dismissed Goinkyo's row is gone entirely — its own
+        // pane already closed by then, so the session list becomes the only
+        // place its answer is still readable (`brigade_hidden_session_ids`'s
+        // own doc). No special-casing needed: `dismiss_worker` deletes the
+        // row outright, so it simply stops matching this query.
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+            .unwrap();
+        assert_eq!(store.brigade_hidden_session_ids().unwrap(), [sid("g1")]);
+
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        assert_eq!(store.brigade_hidden_session_ids().unwrap(), []);
     }
 
     #[test]
