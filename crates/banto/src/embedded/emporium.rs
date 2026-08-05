@@ -49,7 +49,9 @@ use banto_core::engine::{
     stage_tiles,
 };
 use banto_core::input::InputEvent;
-use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, MemberToken, SessionId, SessionToOpen};
+use banto_core::model::{
+    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberToken, SessionId, SessionToOpen,
+};
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::screen::Screen;
 use banto_core::status::AgeThresholds;
@@ -1132,7 +1134,7 @@ fn form_brigade_store(
     store
         .add_brigade_member(
             brigade_id,
-            "director",
+            DIRECTOR_TOKEN,
             BrigadeRole::Director,
             Some(&SessionId(director_row_id.to_string())),
         )
@@ -1939,27 +1941,21 @@ fn draw(
 /// Role, not position: `director` (`Stage::Brigade`'s own field) answers
 /// the Director case directly, and `goinkyo_pane_for` — already tracking
 /// the Goinkyo's current pane through every rename, built for the one-shot
-/// spawn guard — answers the Goinkyo one without any new state. Everything
-/// else is still labeled by its position in `panes` ("worker N"), unchanged
-/// — the display gap this replaces was ever only the Goinkyo showing up as
-/// one of those.
+/// spawn guard — answers the Goinkyo one. Workers read their durable member
+/// token from core state, so the title agrees with the token accepted by the
+/// brigade tools even when pane geometry changes.
 fn tile_title(state: &EmporiumState, key: &SessionKey) -> String {
     match &state.stage {
-        Stage::Brigade {
-            id,
-            director,
-            panes,
-            ..
-        } => {
+        Stage::Brigade { id, director, .. } => {
             if director.as_ref() == Some(key) {
                 "director".to_string()
             } else if state.goinkyo_pane_for(*id) == Some(key) {
                 "goinkyo".to_string()
             } else {
-                match panes.iter().position(|k| k == key) {
-                    Some(n) => format!("worker {n}"),
-                    None => "session".to_string(),
-                }
+                state
+                    .member_token_for(key)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "session".to_string())
             }
         }
         _ => "session".to_string(),
@@ -4353,22 +4349,64 @@ mod tests {
     // --- tile_title -----------------------------------------------------
 
     #[test]
-    fn tile_title_labels_the_director_by_role_even_when_panes_are_reversed() {
-        // The Worker staged solo first, ahead of the Director, so
-        // `panes[0]` is the Worker — proves the "director" label reads
-        // `director`, not position, while the Worker's own label still
-        // reflects its actual position ("worker 0", not "worker 1").
-        let director = SessionKey::from_id("dir");
-        let worker = SessionKey::from_id("w1");
+    fn tile_title_uses_member_token_even_when_panes_are_reversed() {
+        // Drive formation through the core so this test proves the renderer
+        // receives the token as state data, then reverse geometry to prove
+        // neither label is derived from a pane index.
         let mut state = EmporiumState::new(PrefixKey::default());
-        state.stage = Stage::Brigade {
-            id: 1,
-            director: Some(director.clone()),
-            panes: vec![worker.clone(), director.clone()],
-            focused: 0,
+        let mut app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+        let brigade = BrigadeConfig::default();
+        let now = Instant::now();
+        let director_cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::ClaudeCode,
+                worker_model: "sonnet".to_string(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            now,
+        );
+        let director = match director_cmds.as_slice() {
+            [Cmd::OpenEmbedded { key, .. }] => key.clone(),
+            other => panic!("expected a Director open, got {other:?}"),
         };
+        let worker_cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: director.clone(),
+            },
+            now,
+        );
+        assert_eq!(state.member_token_for(&director), Some("director"));
+        let worker = worker_cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                Cmd::OpenEmbedded { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a Worker open, got {worker_cmds:?}"));
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: worker.clone(),
+            },
+            now,
+        );
+        let Stage::Brigade { panes, .. } = &mut state.stage else {
+            panic!("expected a staged brigade");
+        };
+        *panes = vec![worker.clone(), director.clone()];
         assert_eq!(tile_title(&state, &director), "director");
-        assert_eq!(tile_title(&state, &worker), "worker 0");
+        assert_eq!(tile_title(&state, &worker), "worker-1");
     }
 
     #[test]

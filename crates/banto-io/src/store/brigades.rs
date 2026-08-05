@@ -217,10 +217,11 @@ impl Store {
         Ok(())
     }
 
-    /// Returns a brigade's members: the Director first, then Workers ordered
-    /// by token (`worker-1`, `worker-2`, ... — lexicographic ordering is only
-    /// numerically correct up to single-digit tokens, which the emporium's
-    /// worker-count clamp of 1..=8 guarantees).
+    /// Returns a brigade's members: the Director first, then every other role
+    /// ordered by token. This puts `goinkyo` before `worker-1`; Worker tokens
+    /// remain lexicographically ordered (`worker-1`, `worker-2`, ...), which
+    /// is numerically correct up to single digits because the emporium clamps
+    /// its worker count to 1..=8.
     pub fn brigade_members(&self, brigade_id: BrigadeId) -> Result<Vec<BrigadeMember>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT member_token, role, session_id, briefed_at_ms, briefed_session_id

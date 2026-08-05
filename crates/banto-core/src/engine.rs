@@ -32,8 +32,8 @@ use crate::input::{
 };
 use crate::key_encode::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
 use crate::model::{
-    AgentKind, BrigadeId, BrigadeRole, GOINKYO_TOKEN, MemberToken, PtyExitReason, SessionRow,
-    SessionToOpen,
+    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberToken, PtyExitReason,
+    SessionRow, SessionToOpen,
 };
 
 /// Fixed width of the left sidebar (the session list), in columns.
@@ -848,6 +848,12 @@ pub struct EmporiumState {
     /// harmlessly, since that brigade id is never staged (and so never
     /// gathered for) again.
     goinkyo_pane: HashMap<BrigadeId, SessionKey>,
+    /// Durable brigade member identity carried alongside a live pane key.
+    /// Every key in `Stage::Brigade::panes` has one entry here; `panes`
+    /// deliberately remains geometry-only, so the renderer reads this map
+    /// rather than deriving a member name from a tile position. Rekey paths
+    /// keep the token attached when a live key changes.
+    member_tokens: HashMap<SessionKey, MemberToken>,
 }
 
 impl EmporiumState {
@@ -879,6 +885,7 @@ impl EmporiumState {
             window_focused: true,
             last_focus_notified: None,
             goinkyo_pane: HashMap::new(),
+            member_tokens: HashMap::new(),
         }
     }
 
@@ -913,6 +920,7 @@ impl EmporiumState {
     /// step it has no reason to know about.
     fn unstage(&mut self, key: &SessionKey) {
         self.stage.remove(key);
+        self.member_tokens.remove(key);
         self.last_forwarded_input.remove(key);
         self.last_output_at.remove(key);
         self.pending_kickoffs.retain(|pending| &pending.key != key);
@@ -929,6 +937,13 @@ impl EmporiumState {
     /// own one-shot-guard bookkeeping ever writes to it.
     pub fn goinkyo_pane_for(&self, brigade_id: BrigadeId) -> Option<&SessionKey> {
         self.goinkyo_pane.get(&brigade_id)
+    }
+
+    /// The durable brigade token associated with a currently staged pane.
+    /// This is supplied by formation and membership events, never inferred
+    /// from a pane's geometry position.
+    pub fn member_token_for(&self, key: &SessionKey) -> Option<&str> {
+        self.member_tokens.get(key).map(String::as_str)
     }
 }
 
@@ -2885,6 +2900,7 @@ fn stage_brigade(
         match resolved_row {
             Some(row) => {
                 let key = SessionKey::from_id(&row.id);
+                state.member_tokens.insert(key.clone(), token.clone());
                 // Seeded here, ahead of the resume's own success or failure:
                 // this is the one-shot spawn guard `update_goinkyo_awaiting_
                 // spawn` checks (and, from here, the record that lets a
@@ -2976,6 +2992,7 @@ fn stage_brigade(
                 // the live one — closing its PTY, killing it on Unix — and
                 // the pane would blink back to an empty prompt.
                 let key = SessionKey::new_worker(brigade_id, token);
+                state.member_tokens.insert(key.clone(), token.clone());
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
@@ -3004,6 +3021,7 @@ fn stage_brigade(
             // operator can't restart short of dismissing it outright.
             None if *role == BrigadeRole::Goinkyo && session_id.is_some() => {
                 let key = SessionKey::from_id(session_id.as_deref().unwrap());
+                state.member_tokens.insert(key.clone(), token.clone());
                 if state.screens.contains_key(&key) {
                     // The discovery window: `Cmd::RekeyPty` already renamed
                     // this pane's key to the real id (`update_discovery_
@@ -3340,6 +3358,9 @@ fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> V
             worker_agent,
             worker_model,
         } => {
+            state
+                .member_tokens
+                .insert(key.clone(), DIRECTOR_TOKEN.to_string());
             state.stage = Stage::Brigade {
                 id: brigade_id,
                 director: Some(key.clone()),
@@ -3431,6 +3452,7 @@ fn open_worker(
     agent: AgentKind,
 ) -> Vec<Cmd> {
     let key = SessionKey::new_worker(brigade_id, token);
+    state.member_tokens.insert(key.clone(), token.to_string());
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
@@ -3629,6 +3651,9 @@ fn update_discovery_result(
         }
         _ => {}
     }
+    if let Some(token) = state.member_tokens.remove(&old_key) {
+        state.member_tokens.insert(new_key.clone(), token);
+    }
     // A queued `PendingSubmit` (the delayed `\r` for a relay nudge or
     // either kickoff's phase two) names a pane the same way `screens`/
     // `Stage` do, and needs the same follow: left on `old_key`, the write
@@ -3644,6 +3669,10 @@ fn update_discovery_result(
         }
     }
     if let Some((brigade_id, token)) = member {
+        state
+            .member_tokens
+            .entry(new_key.clone())
+            .or_insert_with(|| token.clone());
         // Keep `goinkyo_pane` and any queued `PendingGoinkyoKickoff` pointed
         // at the pane they actually name: both were recorded under the
         // *synthetic* key at spawn time (`update_goinkyo_awaiting_spawn`'s
@@ -3753,6 +3782,13 @@ fn update_member_session_forked(
                     }
                 }
             }
+            if let Some(member_token) = state.member_tokens.remove(&old_key) {
+                state.member_tokens.insert(new_key.clone(), member_token);
+            }
+            state
+                .member_tokens
+                .entry(new_key.clone())
+                .or_insert_with(|| token.clone());
             // Same reasoning, and same unconditional-on-`token` scope, as
             // `update_discovery_result`'s own version of this: a queued
             // `PendingSubmit` names a pane the same way `screens`/`Stage`
@@ -3910,7 +3946,11 @@ fn open_director_with_wiring(
             title: row.display_title().to_string(),
             cwd,
         },
-        brigade: Some((brigade_id, "director".to_string(), BrigadeRole::Director)),
+        brigade: Some((
+            brigade_id,
+            DIRECTOR_TOKEN.to_string(),
+            BrigadeRole::Director,
+        )),
         model: None,
         effort: None,
         permission_mode: None,
@@ -4287,6 +4327,9 @@ fn update_goinkyo_awaiting_spawn(
         return Vec::new();
     }
     state.goinkyo_pane.insert(candidate.brigade_id, key.clone());
+    state
+        .member_tokens
+        .insert(key.clone(), GOINKYO_TOKEN.to_string());
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
@@ -5172,6 +5215,7 @@ mod tests {
             panic!("expected a staged brigade");
         };
         assert_eq!(panes, &[director, discovered.clone()]);
+        assert_eq!(state.member_token_for(&discovered), Some("worker-1"));
         assert!(
             cmds.iter().any(|cmd| matches!(
                 cmd,
