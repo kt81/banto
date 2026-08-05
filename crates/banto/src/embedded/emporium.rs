@@ -311,7 +311,10 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                     }),
                     PtyPoll::Empty => break,
                     PtyPoll::Disconnected => {
-                        events.push_back(Event::PtyExited { key: key.clone() });
+                        events.push_back(Event::PtyExited {
+                            key: key.clone(),
+                            reason: handle.exit_reason(),
+                        });
                         break;
                     }
                 }
@@ -797,9 +800,14 @@ struct OpenEmbeddedRequest {
 /// known (non-empty) id — reusing the chōba in-place decision — or
 /// skipping it entirely for a fresh (empty-id) spawn, which has no existing
 /// session to double-resume. `brigade` wires the launch to banto's own MCP
-/// server; a write failure there degrades gracefully (the pre-migration
-/// behavior: spawn anyway, without the flag, rather than losing the pane
-/// over a config-file write error).
+/// server; a write failure there now refuses the spawn outright
+/// (`Event::SpawnFailed`) rather than the pre-migration behavior of
+/// spawning anyway, without the flag. That silent degrade was measured live:
+/// a member launches, reads its briefing off the argv/hook same as always,
+/// and then simply has no `send_to_peer`/`check_messages` — indistinguishable
+/// on screen from a session that is merely quiet. A pane an operator can see
+/// is worse than no pane at all when it looks alive but cannot actually act
+/// as a brigade member.
 fn execute_open_embedded(
     request: OpenEmbeddedRequest,
     deps: &Deps,
@@ -845,20 +853,20 @@ fn execute_open_embedded(
     };
     // Each product reaches banto's own MCP server a different way: Claude via
     // a config file named on the argv, Codex via `-c` overrides built from
-    // banto's executable path. Claude's file write degrades gracefully (spawn
-    // without the flag rather than lose the pane over a write error); Codex's
-    // side writes nothing, so the only way it can fail is not knowing its own
-    // executable.
+    // banto's executable path. Either can fail (a full disk, a moved
+    // executable, ...) — refused outright rather than spawned wireless (see
+    // this function's own doc for why).
     if let Some((brigade_id, token, role)) = &brigade {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
-        match &mut launch {
+        let wiring = match &mut launch {
             opener::AgentLaunch::Claude { mcp_config, .. } => {
-                if let Ok(path) = write_mcp_config(*brigade_id, token, *role, known_id) {
+                write_mcp_config(*brigade_id, token, *role, known_id).map(|path| {
                     *mcp_config = Some(path);
-                }
+                })
             }
-            opener::AgentLaunch::Codex { brigade: slot, .. } => {
-                if let Ok(exe) = std::env::current_exe() {
+            opener::AgentLaunch::Codex { brigade: slot, .. } => std::env::current_exe()
+                .map_err(anyhow::Error::from)
+                .map(|exe| {
                     *slot = Some(opener::CodexBrigade {
                         exe,
                         brigade_id: *brigade_id,
@@ -866,8 +874,13 @@ fn execute_open_embedded(
                         role: *role,
                         session: known_id.map(str::to_string),
                     });
-                }
-            }
+                }),
+        };
+        if let Err(err) = wiring {
+            return vec![Event::SpawnFailed {
+                key,
+                error: format!("brigade channel wiring failed: {err}"),
+            }];
         }
     }
     let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));

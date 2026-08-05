@@ -312,9 +312,11 @@ pub enum BrigadeRole {
     /// Carries out the Director's instructions.
     Worker,
     /// The retired elder called back in to arbitrate a Director/Worker
-    /// disagreement or an impasse — advises, never spawned by this build
-    /// (no summon path exists yet), addressable only by name, never a
-    /// broadcast recipient.
+    /// disagreement or an impasse — advises, never takes the work over.
+    /// Auto-spawned by banto itself once a Director's `consult_goinkyo`
+    /// files a request (Claude only — see `BrigadeConfig::goinkyo_model` —
+    /// never opened by the operator directly), addressable only by name,
+    /// never a broadcast recipient.
     Goinkyo,
 }
 
@@ -433,6 +435,38 @@ pub struct BrigadeMessage {
     /// broadcast to every member of the recipient role — the original,
     /// still-default addressing.
     pub to_member: Option<MemberToken>,
+}
+
+/// Why a hosted child process exited, as far as banto could tell — plain
+/// data, translated at the shell boundary from the PTY host's own richer
+/// exit status (`banto_io::pty::PtyIo::exited`, `Child::wait()`'s own
+/// `portable_pty::ExitStatus`) since this crate cannot depend on the I/O
+/// crate that type lives in (docs/DISCIPLINE.md §2). `Unknown` is `wait()`
+/// itself failing, not merely "no observation yet" — that case has no
+/// `PtyExitReason` at all (see `Event::PtyExited::reason`'s own doc).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PtyExitReason {
+    /// The child ran to completion with this exit code (0 is success).
+    Code(u32),
+    /// The child was terminated by this named signal. Unix only —
+    /// `portable_pty::ExitStatus` never reports one on Windows.
+    Signal(String),
+    /// The child is known to have exited, but `wait()` on it returned an
+    /// error rather than a status.
+    Unknown,
+}
+
+impl PtyExitReason {
+    /// A short, lowercase, unpunctuated fragment fit for the middle of a
+    /// status sentence (`format!("session ended: {title} — {}", reason.describe())`).
+    pub fn describe(&self) -> String {
+        match self {
+            PtyExitReason::Code(0) => "exited normally".to_string(),
+            PtyExitReason::Code(code) => format!("exited with code {code}"),
+            PtyExitReason::Signal(signal) => format!("terminated by {signal}"),
+            PtyExitReason::Unknown => "exit reason unknown".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]

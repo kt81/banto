@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use banto_core::input::KeyEvent;
 use banto_core::key_encode::key_to_bytes;
+use banto_core::model::PtyExitReason;
 use banto_core::screen::Screen;
 use banto_io::pty::{PtyHost, PtyIo, Resizer};
 
@@ -36,11 +37,12 @@ pub(crate) enum PtyPoll {
 /// `engine::SessionKey` — never touched from `update`.
 pub(crate) struct PtyHandle {
     io: PtyIo,
-    /// Latches once `io.exited` has fired — see [`Self::poll`]'s doc for why
-    /// this can't just be "check `io.exited` every time" (a `Receiver<()>`
-    /// only ever fires once, and the one-poll grace period needs to
-    /// remember it already happened).
-    exit_observed: bool,
+    /// Latches once `io.exited` has fired, carrying what it reported — see
+    /// [`Self::poll`]'s doc for why this can't just be "check `io.exited`
+    /// every time" (a `Receiver` only ever fires once, and the one-poll
+    /// grace period needs to remember it already happened, not just that a
+    /// fresh recv succeeded).
+    exit_reason: Option<PtyExitReason>,
 }
 
 impl PtyHandle {
@@ -54,7 +56,7 @@ impl PtyHandle {
     ) -> Result<Self> {
         Ok(Self {
             io: host.open(argv, cwd, env, rows, cols)?,
-            exit_observed: false,
+            exit_reason: None,
         })
     }
 
@@ -84,11 +86,11 @@ impl PtyHandle {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return PtyPoll::Disconnected,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        if self.exit_observed {
+        if self.exit_reason.is_some() {
             return PtyPoll::Disconnected;
         }
-        if self.io.exited.try_recv().is_ok() {
-            self.exit_observed = true;
+        if let Ok(reason) = self.io.exited.try_recv() {
+            self.exit_reason = Some(reason);
         }
         PtyPoll::Empty
     }
@@ -98,6 +100,24 @@ impl PtyHandle {
     /// writes at startup (see `PtyIo::pid`).
     pub(crate) fn pid(&self) -> Option<u32> {
         self.io.pid
+    }
+
+    /// What `io.exited` reported, for a handle [`Self::poll`] or
+    /// [`Self::has_exited`] has already found `Disconnected`/`true` — read
+    /// once, right after, to build `Event::PtyExited`. One more opportunistic
+    /// `try_recv` here even if an earlier call already latched a reason (a
+    /// harmless no-op then): on the Unix path, `poll`'s `output`-disconnected
+    /// branch can return `Disconnected` before the independent wait-thread's
+    /// own signal has arrived (see `poll`'s doc) — giving the race one more
+    /// tick to resolve here costs nothing and often wins it. `None` means it
+    /// still hasn't: honestly reported as no reason, not guessed.
+    pub(crate) fn exit_reason(&mut self) -> Option<PtyExitReason> {
+        if self.exit_reason.is_none()
+            && let Ok(reason) = self.io.exited.try_recv()
+        {
+            self.exit_reason = Some(reason);
+        }
+        self.exit_reason.clone()
     }
 
     /// Encode `key` and forward it to the child's stdin.
@@ -162,10 +182,12 @@ impl PtyHandle {
     /// before reporting `Disconnected`) — shutdown only cares whether it's
     /// gone, and is never followed by another `poll()` on the same handle.
     pub(crate) fn has_exited(&mut self) -> bool {
-        if !self.exit_observed && self.io.exited.try_recv().is_ok() {
-            self.exit_observed = true;
+        if self.exit_reason.is_none()
+            && let Ok(reason) = self.io.exited.try_recv()
+        {
+            self.exit_reason = Some(reason);
         }
-        self.exit_observed
+        self.exit_reason.is_some()
     }
 }
 
@@ -262,6 +284,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use banto_core::input::{KeyCode, KeyEvent, Modifiers};
+    use banto_core::model::PtyExitReason;
     use banto_io::pty::mock::MockPtyHost;
 
     use super::{EmbeddedSession, PtyHandle, PtyPoll, wait_for_exit_or_deadline};
@@ -375,6 +398,38 @@ mod tests {
         handle.kill().unwrap();
         assert!(matches!(handle.poll(), PtyPoll::Empty), "one-tick grace");
         assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+    }
+
+    // --- exit_reason: what actually reached Event::PtyExited --------------
+
+    #[test]
+    fn exit_reason_is_none_before_the_child_exits() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        assert_eq!(handle.exit_reason(), None);
+    }
+
+    #[test]
+    fn exit_reason_carries_what_fire_exit_with_reason_sent() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        host.fire_exit_with_reason(PtyExitReason::Code(17));
+        assert_eq!(handle.exit_reason(), Some(PtyExitReason::Code(17)));
+        // Latched: still the same reason on a second read, not consumed.
+        assert_eq!(handle.exit_reason(), Some(PtyExitReason::Code(17)));
+    }
+
+    #[test]
+    fn exit_reason_survives_being_first_observed_through_poll_or_has_exited() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        host.fire_exit_with_reason(PtyExitReason::Signal("SIGTERM".to_string()));
+        assert!(handle.has_exited());
+        assert_eq!(
+            handle.exit_reason(),
+            Some(PtyExitReason::Signal("SIGTERM".to_string())),
+            "has_exited must not swallow the reason poll/exit_reason still need"
+        );
     }
 
     // --- graceful shutdown: begin_graceful_close / has_exited / wait ------

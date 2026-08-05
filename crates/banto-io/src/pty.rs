@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
 use anyhow::Result;
+use banto_core::model::PtyExitReason;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// Everything a hosted child is reachable by: its output chunks, an input
@@ -34,14 +35,17 @@ pub struct PtyIo {
     /// shim spawned through a shell, say — in which case id discovery falls
     /// back to matching session files by cwd.
     pub pid: Option<u32>,
-    /// Fires exactly once, when the child has actually exited. On ConPTY, a
-    /// child's exit does **not** produce EOF on `output` (the pseudoconsole
-    /// keeps the pipe open), so `output` disconnecting is a Unix-only signal
-    /// — this channel is the active, cross-platform one. See
-    /// `PortablePtyHost::open`'s exit-waiter thread and, in the `banto`
-    /// crate, `embedded::session::PtyHandle::poll`'s doc for how the two
-    /// combine.
-    pub exited: Receiver<()>,
+    /// Fires exactly once, when the child has actually exited, carrying
+    /// what `Child::wait()` reported (translated to banto-core's own plain
+    /// [`PtyExitReason`] here, at the I/O boundary — see that type's own
+    /// doc for why the richer `portable_pty::ExitStatus` never leaves this
+    /// crate). On ConPTY, a child's exit does **not** produce EOF on
+    /// `output` (the pseudoconsole keeps the pipe open), so `output`
+    /// disconnecting is a Unix-only signal — this channel is the active,
+    /// cross-platform one. See `PortablePtyHost::open`'s exit-waiter thread
+    /// and, in the `banto` crate, `embedded::session::PtyHandle::poll`'s
+    /// doc for how the two combine.
+    pub exited: Receiver<PtyExitReason>,
 }
 
 /// Resizes a hosted child's PTY.
@@ -169,10 +173,9 @@ impl PtyHost for PortablePtyHost {
         // every platform, so it also does what holding `child` here used to
         // do (keep the handle alive for the pane's lifetime); the resizer
         // holder below now keeps only the master.
-        let (exited_tx, exited_rx) = mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = mpsc::channel::<PtyExitReason>();
         std::thread::spawn(move || {
-            let _ = child.wait();
-            let _ = exited_tx.send(());
+            let _ = exited_tx.send(pty_exit_reason(child.wait()));
         });
 
         Ok(PtyIo {
@@ -186,6 +189,65 @@ impl PtyHost for PortablePtyHost {
             pid,
             exited: exited_rx,
         })
+    }
+}
+
+/// Translate `Child::wait()`'s own result into banto-core's plain
+/// [`PtyExitReason`] — the I/O-crate side of the boundary that type's own
+/// doc describes. `portable_pty::ExitStatus` carries a `signal` only on
+/// Unix (`ExitStatus::from(std::process::ExitStatus)`, `pty.rs`'s upstream
+/// conversion); a status with none is reported by exit code alone,
+/// regardless of platform. `wait()` itself returning `Err` — observed on no
+/// real machine so far, but the trait allows it — is not treated as "still
+/// running": the exit-waiter thread only ever reaches this after `wait()`
+/// has returned at all, so the child is known gone, just not how.
+fn pty_exit_reason(result: std::io::Result<portable_pty::ExitStatus>) -> PtyExitReason {
+    match result {
+        Ok(status) => match status.signal() {
+            Some(signal) => PtyExitReason::Signal(signal.to_string()),
+            None => PtyExitReason::Code(status.exit_code()),
+        },
+        Err(_) => PtyExitReason::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod pty_exit_reason_tests {
+    use portable_pty::ExitStatus;
+
+    use super::pty_exit_reason;
+    use banto_core::model::PtyExitReason;
+
+    #[test]
+    fn a_zero_exit_code_maps_to_code_zero() {
+        assert_eq!(
+            pty_exit_reason(Ok(ExitStatus::with_exit_code(0))),
+            PtyExitReason::Code(0)
+        );
+    }
+
+    #[test]
+    fn a_nonzero_exit_code_maps_to_that_code() {
+        assert_eq!(
+            pty_exit_reason(Ok(ExitStatus::with_exit_code(42))),
+            PtyExitReason::Code(42)
+        );
+    }
+
+    #[test]
+    fn a_signal_maps_to_signal_by_name_regardless_of_its_own_code() {
+        assert_eq!(
+            pty_exit_reason(Ok(ExitStatus::with_signal("SIGKILL"))),
+            PtyExitReason::Signal("SIGKILL".to_string())
+        );
+    }
+
+    #[test]
+    fn a_wait_error_maps_to_unknown_not_treated_as_still_running() {
+        assert_eq!(
+            pty_exit_reason(Err(std::io::Error::other("wait() failed"))),
+            PtyExitReason::Unknown
+        );
     }
 }
 
@@ -274,6 +336,7 @@ pub mod mock {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
+    use banto_core::model::PtyExitReason;
 
     use super::{Hangup, Killer, PtyHost, PtyIo, Resizer};
 
@@ -297,7 +360,7 @@ pub mod mock {
         /// [`Self::fire_exit`]) — `pub` only because struct-update syntax
         /// (`..Default::default()`) requires every field to be nameable
         /// from the construction site, even ones taken from `Default`.
-        pub exit_sender: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+        pub exit_sender: Arc<Mutex<Option<mpsc::Sender<PtyExitReason>>>>,
         /// Reported as the spawned child's pid (real hosts read it from the
         /// OS). `None` by default, matching a platform that can't report
         /// one.
@@ -313,12 +376,21 @@ pub mod mock {
     }
 
     impl MockPtyHost {
-        /// Simulate the child exiting: fires the `exited` channel of the
-        /// most recently opened `PtyIo`. A no-op if nothing is open, or the
-        /// exit was already fired (a real exit only ever happens once).
+        /// Simulate the child exiting cleanly (`PtyExitReason::Code(0)`):
+        /// fires the `exited` channel of the most recently opened `PtyIo`. A
+        /// no-op if nothing is open, or the exit was already fired (a real
+        /// exit only ever happens once). Use
+        /// [`Self::fire_exit_with_reason`] for a test that cares which
+        /// reason lands.
         pub fn fire_exit(&self) {
+            self.fire_exit_with_reason(PtyExitReason::Code(0));
+        }
+
+        /// Same as [`Self::fire_exit`], but with the exact reason a test
+        /// wants observed downstream (a nonzero code, a signal, `Unknown`).
+        pub fn fire_exit_with_reason(&self, reason: PtyExitReason) {
             if let Some(tx) = self.exit_sender.lock().unwrap().take() {
-                let _ = tx.send(());
+                let _ = tx.send(reason);
             }
         }
     }
@@ -395,13 +467,22 @@ pub mod mock {
     /// Mirrors reality: killing a child makes it exit, so `kill` also fires
     /// the same `exited` signal a real `child.wait()` returning would —
     /// keeps `session.rs`'s `poll_reaches_disconnected_after_kill` honest.
-    struct MockKiller(Arc<Mutex<u32>>, Arc<Mutex<Option<mpsc::Sender<()>>>>);
+    /// The reason sent is `Unknown`: a real kill on Unix is a signal (which
+    /// platform-specific one depends on `Killer::kill`'s own implementation,
+    /// not modeled here), and on Windows a forced termination reports
+    /// through the same `ExitStatus` a graceful exit does — nothing this
+    /// mock can say with a straight face beyond "gone, not by its own
+    /// choosing."
+    struct MockKiller(
+        Arc<Mutex<u32>>,
+        Arc<Mutex<Option<mpsc::Sender<PtyExitReason>>>>,
+    );
 
     impl Killer for MockKiller {
         fn kill(&mut self) -> Result<()> {
             *self.0.lock().unwrap() += 1;
             if let Some(tx) = self.1.lock().unwrap().take() {
-                let _ = tx.send(());
+                let _ = tx.send(PtyExitReason::Unknown);
             }
             Ok(())
         }
