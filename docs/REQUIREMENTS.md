@@ -491,12 +491,20 @@ disagreement, addressable by name but never a broadcast recipient (see
 MCP tool (see "MCP mediation server" below), which files a written
 consultation request and creates the member row; once a tick observes that
 row with no session id yet, it is auto-spawned the same way a fresh Worker
-is (Claude only — `goinkyo_model`/`goinkyo_effort` below), briefed from
-`goinkyo_prompt` with `{request}` substituted for the consultation file's
-path. The spawn is attempted at most once per consultation
-(`EmporiumState::goinkyo_pane`, one guard per brigade, mapped to the
-`SessionKey` that spawn used): a failed attempt is not retried
+is (Claude only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`
+below), briefed from `goinkyo_prompt` with `{request}` substituted for the
+consultation file's path. The spawn is attempted at most once per
+consultation (`EmporiumState::goinkyo_pane`, one guard per brigade, mapped
+to the `SessionKey` that spawn used): a failed attempt is not retried
 automatically.
+
+`goinkyo_permission_mode` defaults to `"auto"`, not Claude's own default of
+`"manual"`: nobody is at an unattended Goinkyo's keyboard to answer a
+permission prompt, and `manual` (like `"plan"`, whose own design still exits
+through a human approval at the end) reliably stops there. Not a guarantee
+of unattended operation either — Claude Code falls back to its ordinary
+confirmation flow after repeated denials even under `"auto"`, and that flow
+stops the same way `"manual"` does.
 
 The briefing alone is not a turn: Claude Code does nothing with a system
 prompt until it receives one, so once the Goinkyo's own pane goes quiet
@@ -541,15 +549,39 @@ brigade off stage *before* the row disappears, so the next tick's
 observation is "not staged" rather than "no row" — the guard for a
 disbanded brigade is simply never released, harmlessly, since that brigade
 id is never staged (and so never observed) again. **Reopening a
-brigade around an already-discovered Goinkyo (one that
-already has a session id) already works**, for free, through the same
-resumed-member path a Director's or Worker's own closed pane reopens
-through (`stage_brigade`) — a resume never carries `--model`, unlike a
-fresh spawn. A Goinkyo that was never discovered (its pane died before it
-had a session id) does *not* reopen through that path — `stage_brigade`'s
-undiscovered-member branch is Worker-only — but stays a fresh-spawn
-candidate for the ordinary tick mechanism above for as long as the brigade
-remains staged.
+brigade around an already-discovered Goinkyo (one that already has a
+session id, resolvable to a real row) already works**, for free, through
+the same resumed-member path a Director's or Worker's own closed pane
+reopens through (`stage_brigade`) — a resume never carries `--model`
+(unlike a fresh spawn), but does carry `--permission-mode`, since that flag
+answers "who's here to click 'allow'", not "what should this session think
+with" — unrelated to fresh-vs-resumed. A Goinkyo that was never discovered
+(its pane died before it had a session id) does *not* reopen through that
+path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
+stays a fresh-spawn candidate for the ordinary tick mechanism above for as
+long as the brigade remains staged.
+
+**A third case — the gravestone — sits between those two.** A Goinkyo can
+have a session id (its own discovery already ran once) that still resolves
+to no row: Claude Code writes no `projects/*.jsonl` transcript until a
+session's first turn, so a Goinkyo that never got as far as its own kickoff
+(closed, or the operator's machine restarted, before it ran one) has a real
+id but nothing `app.row_for_id` can find — permanently, not just this tick.
+Left alone this reads as `missing` forever: the session id never clears on
+its own, so the ordinary tick mechanism's `AwaitingSpawn` check (which only
+fires on no session id at all) never sees this member as spawnable again —
+a consultation the operator can't restart short of dismissing it outright
+and filing a new one. `stage_brigade` now resets the session id back to
+`None` for exactly this case, which lets the next tick's `AwaitingSpawn`
+restart the very same consultation (its request file outlives this, kept
+until dismissal) through the ordinary spawn path — the Goinkyo analog of a
+Worker's own disposable, respawnable design. The one trap this has to dodge:
+a pane can be alive under the id key already (`Cmd::RekeyPty` renamed it)
+while `app`'s own row list simply hasn't caught up yet with the
+not-yet-written transcript — resetting the session id in that window would
+spawn a second Goinkyo next tick, orphaning the first one's handle in the
+shell. `stage_brigade` tells the two apart by checking whether a live pane
+already answers to that key; if one does, it's reused, not reset.
 
 **Formation.** `B` on a selected session appoints it Director and auto-spawns
 `workers` (config, default 1, clamped 1..=8) fresh Workers beside it. `b` spawns
@@ -652,6 +684,7 @@ pub struct BrigadeConfig {
     pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
     pub goinkyo_model: String,      // --model for an auto-spawned Goinkyo; "" = no flag; default "fable"; Claude only
     pub goinkyo_effort: String,     // --effort for an auto-spawned Goinkyo; "" = no flag; default "max"; Claude only
+    pub goinkyo_permission_mode: String, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; default "auto"; Claude only
 }
 ```
 

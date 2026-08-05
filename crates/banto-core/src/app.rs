@@ -669,12 +669,16 @@ pub struct App {
     /// Ids of pinned sessions. A cache for sorting/display only — the store
     /// is the durable source of truth; see [`Self::toggle_pin`].
     pinned: HashSet<String>,
-    /// Claude session ids of brigade Workers, hidden from `filtered` (see
-    /// [`Self::compute_filtered`]) — a Worker is banto's own implementation
-    /// detail, not a session the user picks directly. A cache loaded from the
-    /// store at startup and on every reload (see [`Self::with_hidden_worker_ids`]/
-    /// [`Self::set_hidden_worker_ids`]); never used to pre-filter `base_rows`
-    /// itself, so `row_for_id` can still resolve a hidden Worker's row when
+    /// Claude session ids of brigade Workers and Goinkyos (while still a
+    /// member of one — see `Store::brigade_hidden_session_ids`'s own doc for
+    /// why a Goinkyo drops out on dismissal instead of staying hidden),
+    /// hidden from `filtered` (see [`Self::compute_filtered`]) — both are
+    /// banto's own implementation detail, not a session the user picks
+    /// directly; the Director is deliberately not in this set, since that
+    /// pane *is* the operator's own session. A cache loaded from the store
+    /// at startup and on every reload (see [`Self::with_hidden_member_ids`]/
+    /// [`Self::set_hidden_member_ids`]); never used to pre-filter `base_rows`
+    /// itself, so `row_for_id` can still resolve a hidden member's row when
     /// staging its brigade.
     hidden: HashSet<String>,
     /// Claude session ids of brigade Directors, for the list/summary marker
@@ -1387,19 +1391,19 @@ impl App {
         self
     }
 
-    /// Seed the initial hidden-worker-id set (loaded from the store at
-    /// startup — see [`Self::set_hidden_worker_ids`] for reloads).
-    pub fn with_hidden_worker_ids(mut self, hidden: HashSet<String>) -> Self {
+    /// Seed the initial hidden-member-id set (loaded from the store at
+    /// startup — see [`Self::set_hidden_member_ids`] for reloads).
+    pub fn with_hidden_member_ids(mut self, hidden: HashSet<String>) -> Self {
         self.hidden = hidden;
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
         self
     }
 
-    /// Replace the hidden-worker-id set (e.g. after a reload, or once a
+    /// Replace the hidden-member-id set (e.g. after a reload, or once a
     /// brigade is formed/disbanded), keeping the current selection if it's
     /// still visible.
-    pub fn set_hidden_worker_ids(&mut self, hidden: HashSet<String>) {
+    pub fn set_hidden_member_ids(&mut self, hidden: HashSet<String>) {
         self.hidden = hidden;
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
@@ -1436,7 +1440,7 @@ impl App {
 
     /// Seed the initial brigade-director-id set (loaded from the store at
     /// startup — see [`Self::set_directors`] for reloads). Unlike
-    /// [`Self::with_hidden_worker_ids`], this never affects filtering
+    /// [`Self::with_hidden_member_ids`], this never affects filtering
     /// (`directors` is display-only), so no re-filter is needed.
     pub fn with_directors(mut self, directors: HashSet<String>) -> Self {
         self.directors = directors;
@@ -1452,7 +1456,7 @@ impl App {
     /// Seed the initial superseded-session-id set (loaded from the store at
     /// startup — see [`Self::set_superseded`] for reloads). Unlike
     /// [`Self::with_directors`], this affects filtering (see
-    /// [`Self::compute_filtered`]), so — like [`Self::with_hidden_worker_ids`]
+    /// [`Self::compute_filtered`]), so — like [`Self::with_hidden_member_ids`]
     /// — it re-filters and keeps the current selection if it's still visible.
     pub fn with_superseded(mut self, superseded: HashSet<String>) -> Self {
         self.superseded = superseded;
@@ -3444,11 +3448,11 @@ mod tests {
     }
 
     #[test]
-    fn hidden_worker_ids_are_excluded_from_filtered_but_still_resolve_by_id() {
+    fn hidden_member_ids_are_excluded_from_filtered_but_still_resolve_by_id() {
         let mut app = App::new(numbered(3)); // id0, id1, id2
         app.set_viewport_height(10);
 
-        app = app.with_hidden_worker_ids(["id1".to_string()].into_iter().collect());
+        app = app.with_hidden_member_ids(["id1".to_string()].into_iter().collect());
 
         assert_eq!(ids(&app), vec!["id0", "id2"]);
         // Still resolvable by id (e.g. to stage its brigade), just not listed.
@@ -3456,16 +3460,17 @@ mod tests {
     }
 
     #[test]
-    fn set_hidden_worker_ids_updates_the_filter_after_a_reload() {
+    fn set_hidden_member_ids_updates_the_filter_after_a_reload() {
         let mut app = App::new(numbered(2)); // id0, id1
         app.set_viewport_height(10);
         assert_eq!(ids(&app), vec!["id0", "id1"]);
 
-        app.set_hidden_worker_ids(["id0".to_string()].into_iter().collect());
+        app.set_hidden_member_ids(["id0".to_string()].into_iter().collect());
         assert_eq!(ids(&app), vec!["id1"]);
 
-        // Un-hiding (e.g. the brigade was disbanded) brings it back.
-        app.set_hidden_worker_ids(HashSet::new());
+        // Un-hiding (e.g. the brigade was disbanded, or a Goinkyo dismissed)
+        // brings it back.
+        app.set_hidden_member_ids(HashSet::new());
         assert_eq!(ids(&app), vec!["id0", "id1"]);
     }
 

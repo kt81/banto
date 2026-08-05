@@ -219,6 +219,22 @@ pub struct BrigadeConfig {
     /// for whenever a Codex Goinkyo is a real feature rather than a
     /// hypothetical. Same empty-string escape hatch as the model above.
     pub goinkyo_effort: String,
+    /// `--permission-mode <mode>` an auto-spawned Goinkyo launches with,
+    /// default `"auto"` (`claude --help`, accepts `manual`/`acceptEdits`/
+    /// `plan`/`auto`/`dontAsk`/`bypassPermissions`). Same empty-string
+    /// escape hatch as the model/effort above.
+    ///
+    /// `auto` and not `manual` (Claude's own default) because nobody is at
+    /// the Goinkyo's keyboard to answer a permission prompt — `manual`
+    /// reliably stops there, and so does `plan`, whose own design still
+    /// exits through a human approval at the end. Not a guarantee of
+    /// unattended operation either, though: Claude Code falls back to its
+    /// ordinary confirmation flow after repeated denials even under `auto`,
+    /// and that flow stops the same way `manual` does. This only removes
+    /// one specific stop, observed live 2026-08-05 — a Goinkyo that had
+    /// just started on its own (the kickoff fix above landing) then sat
+    /// waiting for an operator who wasn't watching to approve a tool call.
+    pub goinkyo_permission_mode: String,
 }
 
 /// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
@@ -313,6 +329,7 @@ impl Default for BrigadeConfig {
             goinkyo_prompt: DEFAULT_GOINKYO_PROMPT.to_string(),
             goinkyo_model: "fable".to_string(),
             goinkyo_effort: "max".to_string(),
+            goinkyo_permission_mode: "auto".to_string(),
         }
     }
 }
@@ -360,6 +377,12 @@ impl BrigadeConfig {
     /// [`Self::goinkyo_effort`], or `None` for the empty-string escape hatch.
     pub fn goinkyo_effort(&self) -> Option<&str> {
         (!self.goinkyo_effort.is_empty()).then_some(self.goinkyo_effort.as_str())
+    }
+
+    /// [`Self::goinkyo_permission_mode`], or `None` for the empty-string
+    /// escape hatch.
+    pub fn goinkyo_permission_mode(&self) -> Option<&str> {
+        (!self.goinkyo_permission_mode.is_empty()).then_some(self.goinkyo_permission_mode.as_str())
     }
 }
 
@@ -726,28 +749,39 @@ mod tests {
     }
 
     #[test]
-    fn brigade_goinkyo_model_and_effort_default_and_have_their_own_empty_escape_hatch() {
+    fn brigade_goinkyo_model_effort_and_permission_mode_default_and_have_their_own_empty_escape_hatch()
+     {
         let config = Config::default();
         assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
         assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
+        assert_eq!(config.brigade.goinkyo_permission_mode(), Some("auto"));
 
-        let cleared = parse("[brigade]\ngoinkyo_model = \"\"\ngoinkyo_effort = \"\"\n");
+        let cleared = parse(
+            "[brigade]\ngoinkyo_model = \"\"\ngoinkyo_effort = \"\"\n\
+             goinkyo_permission_mode = \"\"\n",
+        );
         assert_eq!(cleared.brigade.goinkyo_model(), None);
         assert_eq!(cleared.brigade.goinkyo_effort(), None);
+        assert_eq!(cleared.brigade.goinkyo_permission_mode(), None);
 
-        let overridden = parse("[brigade]\ngoinkyo_model = \"opus\"\ngoinkyo_effort = \"low\"\n");
+        let overridden = parse(
+            "[brigade]\ngoinkyo_model = \"opus\"\ngoinkyo_effort = \"low\"\n\
+             goinkyo_permission_mode = \"plan\"\n",
+        );
         assert_eq!(overridden.brigade.goinkyo_model(), Some("opus"));
         assert_eq!(overridden.brigade.goinkyo_effort(), Some("low"));
+        assert_eq!(overridden.brigade.goinkyo_permission_mode(), Some("plan"));
     }
 
     #[test]
-    fn an_existing_config_toml_without_goinkyo_model_or_effort_gets_the_defaults() {
+    fn an_existing_config_toml_without_goinkyo_model_effort_or_permission_mode_gets_the_defaults() {
         // Same reasoning as `an_existing_config_toml_without_goinkyo_prompt_
-        // gets_the_default`: a file written before these two fields existed
+        // gets_the_default`: a file written before these fields existed
         // must keep loading with their own defaults, not an empty value.
         let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
         assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
         assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
+        assert_eq!(config.brigade.goinkyo_permission_mode(), Some("auto"));
     }
 
     #[test]

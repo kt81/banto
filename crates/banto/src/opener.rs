@@ -328,6 +328,12 @@ pub(crate) enum AgentLaunch {
         /// nobody remembers to leave `None`" risk this enum's own doc says
         /// the per-variant split exists to avoid.
         effort: Option<String>,
+        /// `--permission-mode <mode>` (`claude --help`: `manual`/
+        /// `acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`) — same
+        /// scope as `effort` above, so far only ever set for an
+        /// auto-spawned Goinkyo (`BrigadeConfig::goinkyo_permission_mode`),
+        /// same "no Codex counterpart on `Self::Codex`" reasoning too.
+        permission_mode: Option<String>,
         append_system_prompt: Option<String>,
         mcp_config: Option<PathBuf>,
     },
@@ -553,6 +559,7 @@ impl AgentLaunch {
                 resume,
                 model,
                 effort,
+                permission_mode,
                 append_system_prompt,
                 mcp_config,
             } => {
@@ -567,6 +574,10 @@ impl AgentLaunch {
                 if let Some(effort) = effort {
                     argv.push("--effort".to_string());
                     argv.push(effort.clone());
+                }
+                if let Some(mode) = permission_mode {
+                    argv.push("--permission-mode".to_string());
+                    argv.push(mode.clone());
                 }
                 if let Some(prompt) = append_system_prompt {
                     argv.push("--append-system-prompt".to_string());
@@ -622,6 +633,7 @@ pub(crate) fn inplace_argv(
             resume: session_id.map(str::to_string),
             model: None,
             effort: None,
+            permission_mode: None,
             append_system_prompt: None,
             mcp_config: None,
         },
@@ -776,6 +788,7 @@ fn wrap_argv(
             resume: Some(session_id.to_string()),
             model: None,
             effort: None,
+            permission_mode: None,
             append_system_prompt: None,
             mcp_config: None,
         },
@@ -841,6 +854,7 @@ fn new_session_wrap_argv(
         resume: None,
         model: None,
         effort: None,
+        permission_mode: None,
         append_system_prompt: None,
         mcp_config: None,
     };
@@ -1221,6 +1235,7 @@ mod tests {
             resume: None,
             model: None,
             effort: None,
+            permission_mode: None,
             append_system_prompt: None,
             mcp_config: None,
         }
@@ -1240,6 +1255,7 @@ mod tests {
             resume: None,
             model: None,
             effort: None,
+            permission_mode: None,
             append_system_prompt: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
         };
@@ -1260,6 +1276,7 @@ mod tests {
             resume: None,
             model: Some("fable".to_string()),
             effort: Some("max".to_string()),
+            permission_mode: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -1272,6 +1289,7 @@ mod tests {
             resume: None,
             model: Some("fable".to_string()),
             effort: None,
+            permission_mode: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -1282,11 +1300,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_launch_permission_mode_renders_right_after_effort_and_is_absent_when_none() {
+        let launch = AgentLaunch::Claude {
+            resume: None,
+            model: Some("fable".to_string()),
+            effort: Some("max".to_string()),
+            permission_mode: Some("auto".to_string()),
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            launch.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "fable",
+                "--effort",
+                "max",
+                "--permission-mode",
+                "auto"
+            ]
+            .map(str::to_string)
+        );
+
+        let no_permission_mode = AgentLaunch::Claude {
+            resume: None,
+            model: Some("fable".to_string()),
+            effort: Some("max".to_string()),
+            permission_mode: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            no_permission_mode.argv("claude"),
+            ["claude", "--model", "fable", "--effort", "max"].map(str::to_string)
+        );
+    }
+
+    #[test]
     fn agent_launch_combines_every_flag_in_the_fixed_order() {
         let launch = AgentLaunch::Claude {
             resume: Some("sess-1".to_string()),
             model: Some("opus".to_string()),
             effort: Some("high".to_string()),
+            permission_mode: Some("auto".to_string()),
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
         };
@@ -1300,6 +1357,8 @@ mod tests {
                 "opus",
                 "--effort",
                 "high",
+                "--permission-mode",
+                "auto",
                 "--append-system-prompt",
                 "you are the Director",
                 "--mcp-config",
