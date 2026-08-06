@@ -12,26 +12,39 @@ use std::path::Path;
 /// Runs the resumed session's process to completion with inherited stdio.
 pub trait ProcessRunner {
     /// Run `argv` (`argv[0]` is the program, the rest its arguments) and
-    /// block until it exits. Returns the exit code, or `None` if the process
-    /// was terminated by a signal (never observed on Windows). Inherits this
-    /// process's own working directory — correct for `_wrap`, whose own cwd
-    /// is already the session's cwd (set by the opener at pane-creation
-    /// time); in-place mode uses [`Self::run_in`] instead, since banto's own
-    /// long-lived process cwd is not the session's.
-    fn run(&self, argv: &[String]) -> io::Result<Option<i32>>;
+    /// block until it exits. `env_remove` strips these keys from the
+    /// inherited environment before the child sees it (see
+    /// [`crate::pty::STRIPPED_CHILD_ENV_VARS`] — this is the `_wrap`-side
+    /// half of the same fix, since `_wrap` reaches the child on a different
+    /// path than the embedded `PtyHost` does). Returns the exit code, or
+    /// `None` if the process was terminated by a signal (never observed on
+    /// Windows). Inherits this process's own working directory — correct
+    /// for `_wrap`, whose own cwd is already the session's cwd (set by the
+    /// opener at pane-creation time); in-place mode uses [`Self::run_in`]
+    /// instead, since banto's own long-lived process cwd is not the
+    /// session's.
+    fn run(&self, argv: &[String], env_remove: &[&str]) -> io::Result<Option<i32>>;
 
-    /// Spawn `argv` with inherited stdio and return a handle for polling it
-    /// without blocking (see [`SpawnedProcess`]). Used by the new-session
-    /// wrap flow, which needs to keep polling for the session id `claude`
-    /// creates while the child is still running — `run`'s blocking `.wait()`
-    /// can't interleave with that.
-    fn spawn(&self, argv: &[String]) -> io::Result<Box<dyn SpawnedProcess>>;
+    /// Spawn `argv` with inherited stdio (minus `env_remove`, same as
+    /// [`Self::run`]) and return a handle for polling it without blocking
+    /// (see [`SpawnedProcess`]). Used by the new-session wrap flow, which
+    /// needs to keep polling for the session id `claude` creates while the
+    /// child is still running — `run`'s blocking `.wait()` can't interleave
+    /// with that.
+    fn spawn(&self, argv: &[String], env_remove: &[&str]) -> io::Result<Box<dyn SpawnedProcess>>;
 
     /// Like [`Self::run`], but in `cwd` rather than this process's own
     /// working directory — used by in-place mode (`crate::tui`'s
     /// teardown/run/re-init loop), where banto is a single long-lived
-    /// process whose own cwd is not necessarily the session's.
-    fn run_in(&self, argv: &[String], cwd: &Path) -> io::Result<Option<i32>>;
+    /// process whose own cwd is not necessarily the session's. `env_remove`
+    /// does real work here, not decoration: `run_pending_inplace` passes
+    /// [`crate::pty::STRIPPED_CHILD_ENV_VARS`] into this exact parameter,
+    /// and the in-place launch route depends on it being honored the same
+    /// as [`Self::run`]/[`Self::spawn`]'s. Separately, and only because
+    /// this specific path is untested — see [`mock::MockProcessRunner`]'s
+    /// own doc for why — no test in this repo would catch that dependency
+    /// breaking; only re-measurement would.
+    fn run_in(&self, argv: &[String], cwd: &Path, env_remove: &[&str]) -> io::Result<Option<i32>>;
 }
 
 /// A spawned, possibly still-running child process — see
@@ -47,39 +60,51 @@ pub trait SpawnedProcess {
 pub struct SystemProcessRunner;
 
 impl ProcessRunner for SystemProcessRunner {
-    fn run(&self, argv: &[String]) -> io::Result<Option<i32>> {
+    fn run(&self, argv: &[String], env_remove: &[&str]) -> io::Result<Option<i32>> {
         let [program, args @ ..] = argv else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "empty argv passed to _wrap",
             ));
         };
-        let status = std::process::Command::new(program).args(args).status()?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        for key in env_remove {
+            cmd.env_remove(key);
+        }
+        let status = cmd.status()?;
         Ok(status.code())
     }
 
-    fn spawn(&self, argv: &[String]) -> io::Result<Box<dyn SpawnedProcess>> {
+    fn spawn(&self, argv: &[String], env_remove: &[&str]) -> io::Result<Box<dyn SpawnedProcess>> {
         let [program, args @ ..] = argv else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "empty argv passed to _wrap",
             ));
         };
-        let child = std::process::Command::new(program).args(args).spawn()?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        for key in env_remove {
+            cmd.env_remove(key);
+        }
+        let child = cmd.spawn()?;
         Ok(Box::new(SystemSpawnedProcess(child)))
     }
 
-    fn run_in(&self, argv: &[String], cwd: &Path) -> io::Result<Option<i32>> {
+    fn run_in(&self, argv: &[String], cwd: &Path, env_remove: &[&str]) -> io::Result<Option<i32>> {
         let [program, args @ ..] = argv else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "empty argv passed to run_in",
             ));
         };
-        let status = std::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .status()?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).current_dir(cwd);
+        for key in env_remove {
+            cmd.env_remove(key);
+        }
+        let status = cmd.status()?;
         Ok(status.code())
     }
 }
@@ -103,21 +128,24 @@ pub mod mock {
 
     use super::{ProcessRunner, SpawnedProcess};
 
-    /// Records every argv it was asked to run/spawn and replies with a
-    /// canned exit code; never spawns a real process. `run`/`run_in` report
-    /// it immediately; a `spawn`ed [`MockSpawnedProcess`] reports "still
-    /// running" for `still_running_polls` polls first (0 by default, i.e.
-    /// already exited) — see [`Self::new_spawning`]. `run_in` isn't
-    /// currently exercised by any test (in-place mode's `run_pending_inplace`
-    /// is a thin, untested-by-design shell, same as `event_loop` — see
+    /// Records every argv (and, separately, every `env_remove` list) it was
+    /// asked to run/spawn, and replies with a canned exit code; never spawns
+    /// a real process. `run`/`run_in` report it immediately; a `spawn`ed
+    /// [`MockSpawnedProcess`] reports "still running" for
+    /// `still_running_polls` polls first (0 by default, i.e. already
+    /// exited) — see [`Self::new_spawning`]. `run_in` isn't currently
+    /// exercised by any test (in-place mode's `run_pending_inplace` is a
+    /// thin, untested-by-design shell, same as `event_loop` — see
     /// `banto::tui`), so unlike `run`/`spawn` it doesn't bother recording
-    /// its calls.
+    /// its calls, `env_remove` included.
     #[derive(Debug, Default)]
     pub struct MockProcessRunner {
         exit_code: Option<i32>,
         still_running_polls: usize,
         run_calls: RefCell<Vec<Vec<String>>>,
         spawn_calls: RefCell<Vec<Vec<String>>>,
+        run_env_removes: RefCell<Vec<Vec<String>>>,
+        spawn_env_removes: RefCell<Vec<Vec<String>>>,
     }
 
     impl MockProcessRunner {
@@ -146,23 +174,50 @@ pub mod mock {
         pub fn spawn_calls(&self) -> Vec<Vec<String>> {
             self.spawn_calls.borrow().clone()
         }
+
+        /// Every `env_remove` list passed to [`ProcessRunner::run`], in call
+        /// order.
+        pub fn run_env_removes(&self) -> Vec<Vec<String>> {
+            self.run_env_removes.borrow().clone()
+        }
+
+        /// Every `env_remove` list passed to [`ProcessRunner::spawn`], in
+        /// call order.
+        pub fn spawn_env_removes(&self) -> Vec<Vec<String>> {
+            self.spawn_env_removes.borrow().clone()
+        }
     }
 
     impl ProcessRunner for MockProcessRunner {
-        fn run(&self, argv: &[String]) -> io::Result<Option<i32>> {
+        fn run(&self, argv: &[String], env_remove: &[&str]) -> io::Result<Option<i32>> {
             self.run_calls.borrow_mut().push(argv.to_vec());
+            self.run_env_removes
+                .borrow_mut()
+                .push(env_remove.iter().map(|s| s.to_string()).collect());
             Ok(self.exit_code)
         }
 
-        fn spawn(&self, argv: &[String]) -> io::Result<Box<dyn SpawnedProcess>> {
+        fn spawn(
+            &self,
+            argv: &[String],
+            env_remove: &[&str],
+        ) -> io::Result<Box<dyn SpawnedProcess>> {
             self.spawn_calls.borrow_mut().push(argv.to_vec());
+            self.spawn_env_removes
+                .borrow_mut()
+                .push(env_remove.iter().map(|s| s.to_string()).collect());
             Ok(Box::new(MockSpawnedProcess::new(
                 self.still_running_polls,
                 self.exit_code,
             )))
         }
 
-        fn run_in(&self, _argv: &[String], _cwd: &Path) -> io::Result<Option<i32>> {
+        fn run_in(
+            &self,
+            _argv: &[String],
+            _cwd: &Path,
+            _env_remove: &[&str],
+        ) -> io::Result<Option<i32>> {
             Ok(self.exit_code)
         }
     }
@@ -202,13 +257,15 @@ mod tests {
 
     #[test]
     fn empty_argv_is_rejected() {
-        let err = SystemProcessRunner.run(&[]).unwrap_err();
+        let err = SystemProcessRunner.run(&[], &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn run_in_empty_argv_is_rejected() {
-        let err = SystemProcessRunner.run_in(&[], Path::new(".")).unwrap_err();
+        let err = SystemProcessRunner
+            .run_in(&[], Path::new("."), &[])
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

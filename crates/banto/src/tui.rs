@@ -42,6 +42,7 @@ use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::lineage::resolve_lineage;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::{ProcessRunner, SystemProcessRunner};
+use banto_io::pty::STRIPPED_CHILD_ENV_VARS;
 use banto_io::status::{SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
 use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource};
@@ -505,7 +506,12 @@ fn run_pending_inplace(
     ));
     pause_for_child()?;
     draw_splash(&pending.startup_message);
-    let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd);
+    // `SystemProcessRunner` is named directly here, not injected — this
+    // function is a thin, untested-by-design shell (same as `event_loop`;
+    // see `banto_io::process::mock::MockProcessRunner`'s own doc), so no
+    // gate in this repository would catch `STRIPPED_CHILD_ENV_VARS` being
+    // dropped from this line. Only re-measurement covers it.
+    let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd, STRIPPED_CHILD_ENV_VARS);
     *terminal = setup_terminal()?;
     ctx.log(&format!("run_pending_inplace child result={result:?}"));
 

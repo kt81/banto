@@ -17,7 +17,7 @@ use banto_core::input::KeyEvent;
 use banto_core::key_encode::key_to_bytes;
 use banto_core::model::PtyExitReason;
 use banto_core::screen::Screen;
-use banto_io::pty::{PtyHost, PtyIo, Resizer};
+use banto_io::pty::{PtyHost, PtyIo, Resizer, STRIPPED_CHILD_ENV_VARS};
 
 /// The result of one non-blocking poll of a [`PtyHandle`]'s output channel.
 pub(crate) enum PtyPoll {
@@ -51,11 +51,12 @@ impl PtyHandle {
         argv: &[String],
         cwd: Option<&Path>,
         env: &[(String, String)],
+        env_remove: &[&str],
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
         Ok(Self {
-            io: host.open(argv, cwd, env, rows, cols)?,
+            io: host.open(argv, cwd, env, env_remove, rows, cols)?,
             exit_reason: None,
         })
     }
@@ -244,8 +245,10 @@ impl EmbeddedSession {
         Ok(Self {
             screen: Screen::new(rows, cols),
             // No added environment: this is the `_embed` path, which hosts a
-            // bare command rather than a brigade member.
-            handle: PtyHandle::open(host, argv, cwd, &[], rows, cols)?,
+            // bare command rather than a brigade member. Still strips
+            // `STRIPPED_CHILD_ENV_VARS` — that fix applies to every agent
+            // banto starts, not only brigade members.
+            handle: PtyHandle::open(host, argv, cwd, &[], STRIPPED_CHILD_ENV_VARS, rows, cols)?,
         })
     }
 
@@ -294,7 +297,28 @@ mod tests {
     }
 
     fn open_handle(host: &MockPtyHost) -> PtyHandle {
-        PtyHandle::open(host, &["child".to_string()], None, &[], 24, 80).unwrap()
+        PtyHandle::open(host, &["child".to_string()], None, &[], &[], 24, 80).unwrap()
+    }
+
+    #[test]
+    fn open_forwards_env_remove_to_the_host_unchanged() {
+        let host = MockPtyHost::default();
+        let _handle = PtyHandle::open(
+            &host,
+            &["child".to_string()],
+            None,
+            &[],
+            &["CLAUDE_CODE_CHILD_SESSION"],
+            24,
+            80,
+        )
+        .unwrap();
+        assert_eq!(
+            *host.env_removes.lock().unwrap(),
+            vec![vec!["CLAUDE_CODE_CHILD_SESSION".to_string()]],
+            "PtyHandle::open must pass its own env_remove argument through to the host \
+             unchanged — a call site silently dropping it would be invisible without this"
+        );
     }
 
     #[test]

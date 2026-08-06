@@ -81,17 +81,42 @@ pub trait Hangup: Send {
     fn hangup(&mut self) -> Result<()>;
 }
 
+/// Environment variables banto strips from every agent process it spawns,
+/// on every launch route (embedded PTY, in-place, `_wrap`) — see each
+/// [`PtyHost::open`]/`ProcessRunner` call site for where this is threaded
+/// through.
+///
+/// `CLAUDE_CODE_CHILD_SESSION` is the one entry: measured on this machine
+/// against `claude` 2.1.222, 2026-08-05 — inherited (present, value `"1"`)
+/// by a bare `claude` launch (no `--resume`/`--session-id`), it wrote no
+/// `sessions/<pid>.json` for its entire observed life (boot through two
+/// completed turns, zero appearances polled at 1s resolution); the same
+/// variable present, `claude --session-id <uuid>` still wrote one normally.
+/// The boundary is the launch shape, not the variable's mere presence —
+/// every fresh (non-`--resume`) launch banto itself makes is exactly the
+/// shape that loses the file, so stripping this one variable removes an
+/// inherited-but-false signal at the point it actually changes behavior.
+/// banto's own code never reads this variable (repo-wide search, 0 hits) —
+/// stripping it can only change what the *child* does with it.
+pub const STRIPPED_CHILD_ENV_VARS: &[&str] = &["CLAUDE_CODE_CHILD_SESSION"];
+
 /// Spawns a child inside a PTY.
 ///
 /// `env` is *added* to the environment banto itself is running under, not a
 /// replacement for it — a child agent needs the operator's own `PATH`, home
 /// and terminal settings to behave like one they started themselves.
+/// `env_remove` is the opposite: entries stripped from that same inherited
+/// environment before the child ever sees them (see
+/// [`STRIPPED_CHILD_ENV_VARS`]) — carried as its own parameter, not folded
+/// into `env`, so [`mock::MockPtyHost`] can record it independently of the
+/// additions list.
 pub trait PtyHost {
     fn open(
         &self,
         argv: &[String],
         cwd: Option<&Path>,
         env: &[(String, String)],
+        env_remove: &[&str],
         rows: u16,
         cols: u16,
     ) -> Result<PtyIo>;
@@ -117,6 +142,7 @@ impl PtyHost for PortablePtyHost {
         argv: &[String],
         cwd: Option<&Path>,
         env: &[(String, String)],
+        env_remove: &[&str],
         rows: u16,
         cols: u16,
     ) -> Result<PtyIo> {
@@ -136,6 +162,14 @@ impl PtyHost for PortablePtyHost {
         }
         for (key, value) in env {
             cmd.env(key, value);
+        }
+        // `CommandBuilder::new` above already seeded `cmd`'s environment
+        // from banto's own (`portable-pty-psmux` 0.9.6,
+        // `cmdbuilder.rs::get_base_env`), so this removes a single key from
+        // that inherited base — not a rebuild-from-scratch, and independent
+        // of the additions loop just above.
+        for key in env_remove {
+            cmd.env_remove(key);
         }
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -373,6 +407,14 @@ pub mod mock {
         /// where a child's exit never closes this side by itself; only
         /// `fire_exit`/`kill` (via `exited`) ever end the session.
         pub unix_style_exit: bool,
+        /// Every `env_remove` list `open` was called with, in call order —
+        /// unlike `argv`/`cwd`/`env`, which this mock still discards, this
+        /// one is recorded so a test can catch a call site silently
+        /// dropping [`super::STRIPPED_CHILD_ENV_VARS`] (a change that would
+        /// otherwise pass every gate in this repo and be caught only by a
+        /// real re-measurement — see that constant's own doc for why it
+        /// matters).
+        pub env_removes: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl MockPtyHost {
@@ -401,9 +443,14 @@ pub mod mock {
             _argv: &[String],
             _cwd: Option<&Path>,
             _env: &[(String, String)],
+            env_remove: &[&str],
             _rows: u16,
             _cols: u16,
         ) -> Result<PtyIo> {
+            self.env_removes
+                .lock()
+                .unwrap()
+                .push(env_remove.iter().map(|s| s.to_string()).collect());
             let (tx, rx) = mpsc::channel();
             // Sent synchronously, before `open` returns: a caller's very
             // first `poll()` must see it, not race a background thread.

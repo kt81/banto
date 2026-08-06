@@ -61,7 +61,7 @@ use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
-use banto_io::pty::PortablePtyHost;
+use banto_io::pty::{PortablePtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
     LiveSession, ProcessProbe, SysinfoProbe, ancestry_reaches, read_live_sessions,
 };
@@ -716,7 +716,22 @@ fn execute_open_codex_trust_pane(
     };
     let argv = crate::codex_trust::trust_argv(&exe, deps.agent_binaries);
     let cwd = std::env::current_dir().ok();
-    match PtyHandle::open(&PortablePtyHost, &argv, cwd.as_deref(), &[], 24, 80) {
+    // `&PortablePtyHost` is hardcoded here, not taken from `deps` — no mock
+    // ever reaches this call, so no gate in this repository would catch
+    // `STRIPPED_CHILD_ENV_VARS` being dropped from this specific line;
+    // `PtyHandle::open`'s own test coverage confirms it forwards whatever
+    // `env_remove` it's given, but not that this call site keeps passing
+    // it. Only re-measurement covers this one, same as `run_pending_inplace`'s
+    // call into `SystemProcessRunner::run_in` (`crate::tui`).
+    match PtyHandle::open(
+        &PortablePtyHost,
+        &argv,
+        cwd.as_deref(),
+        &[],
+        STRIPPED_CHILD_ENV_VARS,
+        24,
+        80,
+    ) {
         Ok(handle) => {
             handles.insert(key.clone(), handle);
             vec![Event::Spawned { key }]
@@ -912,7 +927,19 @@ fn execute_open_embedded(
     let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
     let env = brigade_env(brigade.as_ref());
     // Size is corrected on this same tick's resize pass, once staged.
-    match PtyHandle::open(&PortablePtyHost, &argv, Some(&target.cwd), &env, 24, 80) {
+    // Same caveat as `execute_open_codex_trust_pane`'s own call: `deps`
+    // carries no `PtyHost`, `&PortablePtyHost` is hardcoded, and no test in
+    // this repository can observe `STRIPPED_CHILD_ENV_VARS` being dropped
+    // from this line — only re-measurement does.
+    match PtyHandle::open(
+        &PortablePtyHost,
+        &argv,
+        Some(&target.cwd),
+        &env,
+        STRIPPED_CHILD_ENV_VARS,
+        24,
+        80,
+    ) {
         Ok(handle) => {
             let pid = handle.pid();
             handles.insert(key.clone(), handle);
@@ -2262,7 +2289,7 @@ mod tests {
     use super::*;
 
     fn open(host: &MockPtyHost) -> PtyHandle {
-        PtyHandle::open(host, &["child".to_string()], None, &[], 24, 80).unwrap()
+        PtyHandle::open(host, &["child".to_string()], None, &[], &[], 24, 80).unwrap()
     }
 
     /// Every product this build supports — the "nothing restricted" `Deps`
