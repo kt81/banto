@@ -740,6 +740,10 @@ pub struct App {
     /// a cache alongside the list result so an embedded PTY-output update can
     /// ask its count/membership without re-scanning a potentially large list.
     filtered_waiting: HashSet<String>,
+    /// Monotonically changes whenever `filtered_waiting` is rebuilt. The
+    /// emporium uses this to avoid copying the cached list set on every PTY
+    /// chunk; only a real list/filter change needs that O(n) work.
+    filtered_waiting_generation: u64,
     /// Selected position within `filtered`.
     selected: usize,
     /// First visible position within [`Self::display_sequence`] (scroll
@@ -843,6 +847,7 @@ impl App {
             query_cursor: 0,
             filtered: Vec::new(),
             filtered_waiting: HashSet::new(),
+            filtered_waiting_generation: 0,
             selected: 0,
             offset: 0,
             viewport_height: 0,
@@ -1650,6 +1655,7 @@ impl App {
             .filter(|row| row.activity == Activity::Waiting)
             .map(|row| row.id.clone())
             .collect();
+        self.filtered_waiting_generation = self.filtered_waiting_generation.wrapping_add(1);
     }
 
     /// Rank `rows` against the current query, then drop agent-run and
@@ -2115,6 +2121,18 @@ impl App {
     /// the full session list merely to render their sidebar title.
     pub fn filtered_waiting_count(&self) -> usize {
         self.filtered_waiting.len()
+    }
+
+    /// The cached visible Waiting ids, for the emporium's edge-triggered
+    /// attention set. Callers should use [`Self::filtered_waiting_generation`]
+    /// to avoid copying it when the filter has not changed.
+    pub fn filtered_waiting_ids(&self) -> &HashSet<String> {
+        &self.filtered_waiting
+    }
+
+    /// Generation paired with [`Self::filtered_waiting_ids`].
+    pub fn filtered_waiting_generation(&self) -> u64 {
+        self.filtered_waiting_generation
     }
 
     /// Whether the currently selected session is pinned (for the summary

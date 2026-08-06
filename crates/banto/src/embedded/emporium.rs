@@ -634,6 +634,14 @@ fn execute_cmd(
             let _ = stdout.write_all(&bytes).and_then(|()| stdout.flush());
             Vec::new()
         }
+        Cmd::RingHostBell => {
+            // Like OSC 52 above, BEL changes neither cells nor cursor, so
+            // emitting it before draw cannot desynchronize ratatui's model.
+            // It is deliberately a fixed byte, not child-controlled payload.
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(b"\x07").and_then(|()| stdout.flush());
+            Vec::new()
+        }
     }
 }
 
