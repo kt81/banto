@@ -129,13 +129,14 @@ pub enum Stage {
         /// error path — see each site's own doc.
         director: Option<SessionKey>,
         /// Every staged pane, Director included. Order is display/geometry
-        /// only now (`stage_tiles`'s master+stack layout, `tile_title`'s
-        /// fallback "worker N" numbering, `FocusPane`'s `1`-`9`) — a
-        /// best-effort convention (`update_spawned`'s `BrigadeMember` arm
-        /// still inserts the Director's own key at the front when it
-        /// recognizes it, everyone else appended in arrival order), never
-        /// a source of role truth. Nothing here still infers a role from
-        /// where a key sits — `director` above is what changed that.
+        /// only now (`stage_tiles`'s master+stack layout, `FocusPane`'s
+        /// `1`-`9`) — a best-effort convention (`update_spawned`'s
+        /// `BrigadeMember` arm still inserts the Director's own key at the
+        /// front when it recognizes it, everyone else appended in arrival
+        /// order), never a source of role truth. Nothing here still infers
+        /// a role — or, since `EmporiumState::member_tokens` landed, a
+        /// member's identity at all — from where a key sits; `director`
+        /// above and `member_tokens` are what changed that.
         panes: Vec<SessionKey>,
         focused: usize,
     },
