@@ -552,6 +552,97 @@ impl CodexBrigade {
     }
 }
 
+/// `-c tui.notifications=["approval-requested"]`: opts a Codex launch into
+/// its own approval-pending notification event — the one Codex fires when a
+/// tool call is waiting on the operator. This is the most fragile of the
+/// three overrides below, and the one that breaks with no local edit
+/// whatsoever: `--strict-config` (Codex's own config-validation flag)
+/// rejects an unknown config *key*, but does not validate the strings
+/// inside a list *value* — a typo here, or an upstream rename of the event
+/// itself, passes validation silently. The launch still succeeds, nothing
+/// warns, and the bell simply stops existing. See [`NOTIFICATION_OVERRIDES`]
+/// for the build/date this was last checked against, and why nothing in
+/// this repository can catch it going stale.
+const NOTIFICATION_EVENT_OVERRIDE: &str = "tui.notifications=[\"approval-requested\"]";
+
+/// `-c tui.notification_method="bel"`: the transport for the event above.
+/// Breaks in two different shapes, neither of them a single obvious tidy:
+///
+/// - Switching to Codex's `auto` looks safe today — `auto` happens to fall
+///   back to BEL in this environment — but that is one upstream
+///   fallback-logic change away from silently going quiet; nothing local
+///   would need to change again for it to break.
+/// - Switching to `osc9` looks like the more "correct" choice — Codex's
+///   approval notification really is a plain OSC 9 — but it breaks
+///   immediately, with no upstream change needed at all, for the only kind
+///   of pane that can ring today (external — see [`NOTIFICATION_OVERRIDES`]
+///   for why an embedded one can't yet regardless): psmux, the terminal
+///   multiplexer banto opens those panes through, models OSC 9;4 (the
+///   progress-bar form) but drops any other OSC 9 payload as unmodelled, so
+///   a plain-text notification dies inside the multiplexer before it ever
+///   reaches the real terminal a human is looking at. That parser is
+///   psmux's own, not part of this repository, so no path here would stay
+///   accurate — this is the mechanism, not a citation.
+///
+/// See [`NOTIFICATION_OVERRIDES`] for the build/date this was checked
+/// against.
+const NOTIFICATION_METHOD_OVERRIDE: &str = "tui.notification_method=\"bel\"";
+
+/// `-c tui.notification_condition="always"`: without it, Codex's own
+/// documented default (`unfocused`) produces zero bells in any pane banto
+/// opens, because Codex considers a banto-embedded pane focused regardless
+/// of whether the operator is actually looking at it. Breaks from a single
+/// local tidy back to that default — the most fragile-looking failure of
+/// the three, even though it needs the most deliberate edit to trigger. See
+/// [`NOTIFICATION_OVERRIDES`] for the build/date this was checked against.
+const NOTIFICATION_CONDITION_OVERRIDE: &str = "tui.notification_condition=\"always\"";
+
+/// The three `-c` overrides above, injected on every Codex launch
+/// unconditionally by [`AgentLaunch::argv`]'s Codex arm — unlike
+/// [`CodexBrigade::overrides`], these do not depend on brigade context at
+/// all, and land on the ordinary resume/new-session routes too.
+///
+/// This alone only completes half of what the notification needs. An
+/// external Codex tab/pane (opened outside banto's own embedded TUI) has
+/// its BEL forwarded straight through psmux to the real terminal, so those
+/// start ringing the moment this lands. An *embedded* pane's BEL still
+/// dies inside banto's own vt100 parser (`banto_core::screen::Screen`)
+/// before it ever reaches banto's stdout — draining that is a separate,
+/// later change, not made here. Landing this first costs nothing and
+/// changes nothing for an embedded pane in the meantime.
+///
+/// None of the three values above is verified by anything inside this
+/// repository: every external process banto spawns is mocked in tests by
+/// design (`docs/DISCIPLINE.md`), so nothing here can catch a value that
+/// has quietly stopped doing what its own doc comment says. Re-running
+/// against a real `codex` build is the only gate.
+///
+/// Measured against codex-cli 0.146.1, 2026-08-06, via a PTY harness driving
+/// a real Codex turn end to end (not part of this repository — external
+/// processes are mocked here by design, see above): a plain turn producing
+/// zero bells, then a shell-command turn forced to request approval
+/// (`-c approval_policy="untrusted"`) producing exactly one bare `0x07`
+/// with `notification_condition="always"` and zero with the condition left
+/// at its default — confirming both the suppression `["approval-requested"]`
+/// gives over ordinary turn completion and the `unfocused` default's zero
+/// bells in a ConPTY-hosted pane. The same shape was first observed on
+/// codex-cli 0.146.0 the same day, before the installed build moved out
+/// from under this measurement mid-session — two builds agreeing here is
+/// why the wording above says "still" and not just "was".
+///
+/// One thing this run also surfaced, worth knowing rather than assuming:
+/// neither of Codex's own launch routes banto uses sets `approval_policy`,
+/// and this account's default (with `guardian_approval` stable/on) silently
+/// auto-approved a plain workspace-write shell command with no prompt and
+/// no notification at all — the override chain here is correct, but how
+/// often it actually fires in real use depends on Codex's own approval
+/// heuristics, not on anything in this repository.
+const NOTIFICATION_OVERRIDES: [&str; 3] = [
+    NOTIFICATION_EVENT_OVERRIDE,
+    NOTIFICATION_METHOD_OVERRIDE,
+    NOTIFICATION_CONDITION_OVERRIDE,
+];
+
 impl AgentLaunch {
     /// Render as `binary`'s own argv (see [`agent_binary`] for resolving
     /// it). Claude's fixed order is the one every existing call site already
@@ -559,9 +650,10 @@ impl AgentLaunch {
     /// `--model` since `claude --help` groups the two: `--resume`, then
     /// `--model`, then `--effort`, then `--append-system-prompt`, then
     /// `--mcp-config`. Codex's: the `resume <uuid>` subcommand (or nothing,
-    /// for a fresh launch), then `-m`, then brigade `-c` overrides (if any —
-    /// see [`CodexBrigade::overrides`]), then `-C <cwd>` last, always
-    /// present.
+    /// for a fresh launch), then `-m`, then the notification `-c` overrides
+    /// (always present — see [`NOTIFICATION_OVERRIDES`]), then brigade `-c`
+    /// overrides (if any — see [`CodexBrigade::overrides`]), then `-C <cwd>`
+    /// last, always present.
     pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
         let mut argv = vec![binary.to_string()];
         match self {
@@ -616,6 +708,10 @@ impl AgentLaunch {
                 if let Some(model) = model {
                     argv.push("-m".to_string());
                     argv.push(model.clone());
+                }
+                for value in NOTIFICATION_OVERRIDES {
+                    argv.push("-c".to_string());
+                    argv.push(value.to_string());
                 }
                 if let Some(brigade) = brigade {
                     for value in brigade.overrides() {
@@ -1447,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_codex_fresh_launch_is_bare_codex_plus_cwd() {
+    fn agent_launch_codex_fresh_launch_carries_the_notification_overrides_plus_cwd() {
         let launch = AgentLaunch::Codex {
             resume: None,
             model: None,
@@ -1456,12 +1552,23 @@ mod tests {
         };
         assert_eq!(
             launch.argv("codex"),
-            ["codex", "-C", "/work/alpha"].map(str::to_string)
+            [
+                "codex",
+                "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
         );
     }
 
     #[test]
-    fn agent_launch_codex_resume_renders_the_subcommand_then_model_then_cwd() {
+    fn agent_launch_codex_resume_renders_the_subcommand_then_model_then_notifications_then_cwd() {
         let launch = AgentLaunch::Codex {
             resume: Some("codex-uuid-1".to_string()),
             model: Some("o3".to_string()),
@@ -1476,6 +1583,12 @@ mod tests {
                 "codex-uuid-1",
                 "-m",
                 "o3",
+                "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
                 "-C",
                 "/work/alpha",
             ]
@@ -1484,7 +1597,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_codex_brigade_inserts_four_overrides_between_model_and_cwd() {
+    fn agent_launch_codex_brigade_inserts_notification_then_brigade_overrides_between_model_and_cwd()
+     {
         let launch = AgentLaunch::Codex {
             resume: None,
             model: None,
@@ -1502,6 +1616,12 @@ mod tests {
             [
                 "codex",
                 "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
+                "-c",
                 "hooks.SessionStart=[{matcher=\"\",hooks=[{type=\"command\",timeout_sec=600,command=\"/opt/banto/banto _hook\"}]}]",
                 "-c",
                 "mcp_servers.banto.command=\"/opt/banto/banto\"",
@@ -1517,16 +1637,31 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_codex_without_a_brigade_never_emits_any_dash_c_override() {
-        // Regression: adding the `brigade` field must not perturb a single
-        // byte of an ordinary (non-brigade) Codex launch.
+    fn agent_launch_codex_without_a_brigade_still_carries_the_three_notification_overrides() {
+        // The case that does not exist today: an ordinary (non-brigade)
+        // Codex launch used to emit no `-c` at all. It must now carry
+        // exactly the three notification overrides, and nothing else that
+        // brigade context would have added (no hook, no MCP server).
         let launch = AgentLaunch::Codex {
             resume: Some("codex-uuid-1".to_string()),
             model: Some("o3".to_string()),
             cwd: PathBuf::from("/work/alpha"),
             brigade: None,
         };
-        assert!(!launch.argv("codex").contains(&"-c".to_string()));
+        let argv = launch.argv("codex");
+        assert_eq!(
+            argv.iter().filter(|arg| arg.as_str() == "-c").count(),
+            3,
+            "expected exactly the three notification overrides: {argv:?}"
+        );
+        for value in NOTIFICATION_OVERRIDES {
+            assert!(
+                argv.contains(&value.to_string()),
+                "missing {value:?} in {argv:?}"
+            );
+        }
+        assert!(!argv.iter().any(|arg| arg.contains("mcp_servers")));
+        assert!(!argv.iter().any(|arg| arg.contains("hooks.SessionStart")));
     }
 
     #[test]
@@ -1692,7 +1827,20 @@ mod tests {
                 Path::new("/work/alpha"),
                 &AgentBinaries::default(),
             ),
-            ["codex", "resume", "codex-uuid-1", "-C", "/work/alpha"].map(str::to_string)
+            [
+                "codex",
+                "resume",
+                "codex-uuid-1",
+                "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
         );
     }
 
@@ -1741,7 +1889,20 @@ mod tests {
 
         assert_eq!(
             launch.argv,
-            ["codex", "resume", "sess-1", "-C", "/work/alpha"].map(str::to_string)
+            [
+                "codex",
+                "resume",
+                "sess-1",
+                "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
         );
     }
 
@@ -2305,6 +2466,12 @@ mod tests {
                 "codex",
                 "resume",
                 "codex-uuid-1",
+                "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
                 "-C",
                 "/work/alpha",
             ]

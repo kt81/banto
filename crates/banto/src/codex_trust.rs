@@ -39,6 +39,11 @@ use crate::opener::{agent_binary, forward_slash_path, session_start_hook_overrid
 /// building its own copy of the string — see that function's own doc for
 /// why a second implementation here would be worse than none at all.
 ///
+/// Also no `opener::NOTIFICATION_OVERRIDES`, for the same reason as the MCP
+/// overrides: this pane exists only to show Codex's own startup trust
+/// prompt. There is no turn to complete and no approval to request here, so
+/// a notification has no addressee.
+///
 /// `pub(crate)`: `crate::embedded::emporium::execute_open_codex_trust_pane`
 /// is the only caller now that this isn't a CLI subcommand anymore, but it
 /// lives in a different module.
@@ -81,9 +86,11 @@ mod tests {
                 session: None,
             }),
         };
-        let brigade_hook = launch.argv("codex")[2].clone();
 
-        assert_eq!(trust_hook, brigade_hook);
+        // Found by content, not position: the notification overrides now
+        // sit ahead of the brigade overrides in a real launch's argv, so
+        // the hook string no longer lands at a fixed index.
+        assert!(launch.argv("codex").contains(&trust_hook));
     }
 
     #[test]
