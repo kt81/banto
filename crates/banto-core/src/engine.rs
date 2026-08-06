@@ -3080,31 +3080,63 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                     );
-                    // A resume's `--model` matters exactly like a fresh
-                    // spawn's (see `open_worker`): a Worker resumed without
-                    // it silently falls back to the operator's own default
-                    // model rather than the brigade's configured one. Never
-                    // for the Director — that's the operator's own session,
-                    // launched (and re-launched) entirely outside banto's
-                    // control. Resolved from *this row's own* `agent`, not
-                    // `fresh_worker_agent`: a resumed member already has a
-                    // fixed product, unrelated to what a brand-new spawn
-                    // would pick.
-                    let model = (*role == BrigadeRole::Worker)
-                        .then(|| brigade.worker_model_for(row.agent))
+                    // Both `model` and `effort` are properties of the role —
+                    // banto's configuration is authoritative for what a
+                    // member *is*, on every launch, fresh or resumed, the
+                    // same as `permission_mode`/`disallowed_tools` below —
+                    // not properties of whether this particular launch
+                    // happens to be fresh or a resume.
+                    //
+                    // `model` used to look like a launch property instead,
+                    // passed only for a resumed Worker, because of an
+                    // incident: before `46f2b8a8` (2026-07-25) added that
+                    // branch, a resumed Worker silently ran on the
+                    // operator's own default model instead of the brigade's
+                    // configured one, observed live as Opus 5 Workers on
+                    // WSL. The Goinkyo role didn't exist yet when that
+                    // landed (added 2026-08-04, adf9a27/26a3987), and nobody
+                    // made the equivalent trip for it afterward — not a
+                    // decision that a Goinkyo's model should be fixed at
+                    // birth, just a branch written before the role it was
+                    // missing even existed.
+                    //
+                    // Measured (claude 2.1.223, 2026-08-06, one scratch
+                    // session resumed repeatedly) that Claude Code remembers
+                    // a session's model without being told again —
+                    // `--model haiku` once, then resumed with no `--model`
+                    // at all, stayed on Haiku — while it does *not* remember
+                    // effort the same way: `--effort low` once, then
+                    // resumed with no `--effort` at all, reverted straight
+                    // to the operator's own global `effortLevel` setting,
+                    // not to `low`. That difference does not mean model may
+                    // be omitted here; it means giving it again is usually a
+                    // no-op, and "usually" is exactly how the Goinkyo's own
+                    // missing case went unnoticed for two days — the value
+                    // happened to already be right. Both are given below,
+                    // unconditionally, so a `worker_model` or `goinkyo_model`
+                    // edit plus a restart reaches an already-launched member
+                    // the same way `worker_model` always has for a Worker,
+                    // and the way it now also does for a Goinkyo. The
+                    // Director gets neither: `BrigadeConfig` has no
+                    // `director_model`/`director_effort` field at all — that
+                    // session is the operator's own, launched (and
+                    // re-launched) entirely outside banto's control.
+                    let model = match *role {
+                        BrigadeRole::Worker => brigade.worker_model_for(row.agent),
+                        BrigadeRole::Goinkyo => brigade.goinkyo_model(),
+                        BrigadeRole::Director => None,
+                    }
+                    .map(str::to_string);
+                    let effort = (*role == BrigadeRole::Goinkyo)
+                        .then(|| brigade.goinkyo_effort())
                         .flatten()
                         .map(str::to_string);
-                    // `effort` stays `None` on every resume, including a
-                    // Goinkyo's: re-staging a brigade around an already-
-                    // discovered Goinkyo — resuming one that was spawned
-                    // before — has no case that reaches this arm with a
-                    // real value to give it yet. `permission_mode` and
-                    // `disallowed_tools` are different: unlike `--model`/
-                    // `--effort`, they answer "who's here to click 'allow'"
-                    // and "what may this role even attempt", not "what
-                    // should this session think with" — properties of the
-                    // role, unrelated to whether the launch is fresh or a
-                    // resume. Closing a consultation's pane mid-conversation
+                    // `permission_mode` and `disallowed_tools` answer "who's
+                    // here to click 'allow'" and "what may this role even
+                    // attempt", not "what should this session think with" —
+                    // properties of the role, unrelated to whether the
+                    // launch is fresh or a resume, same as `effort` just
+                    // above. Closing a consultation's pane mid-conversation
                     // and re-staging the brigade brings the Goinkyo right
                     // back to an unattended prompt (or an editable working
                     // tree) if one comes up, same as a fresh spawn.
@@ -3126,7 +3158,7 @@ fn stage_brigade(
                         },
                         brigade: Some((brigade_id, token.clone(), *role)),
                         model,
-                        effort: None,
+                        effort,
                         permission_mode,
                         disallowed_tools,
                     });
@@ -5733,14 +5765,14 @@ mod tests {
         );
     }
 
-    // --- worker model on resume ---------------------------------------------
+    // --- model on resume ------------------------------------------------------
 
     #[test]
-    fn stage_brigade_passes_the_configured_worker_model_to_a_resumed_worker_but_never_to_the_director()
+    fn stage_brigade_passes_the_configured_model_to_a_resumed_worker_and_goinkyo_but_never_to_the_director()
      {
         let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("dir"), row("w1")]);
-        let brigade = brigade_config(); // worker_model defaults to "sonnet"
+        let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
+        let brigade = brigade_config(); // worker_model "sonnet", goinkyo_model "fable"
         let now = test_instant();
         state.pending_membership = Some(PendingMembership::Activate);
 
@@ -5754,6 +5786,11 @@ mod tests {
                 "worker-1".to_string(),
                 BrigadeRole::Worker,
                 Some("w1".to_string()),
+            ),
+            (
+                "goinkyo".to_string(),
+                BrigadeRole::Goinkyo,
+                Some("g1".to_string()),
             ),
         ];
         let cmds = update(
@@ -5786,6 +5823,12 @@ mod tests {
                 .iter()
                 .any(|(id, model)| id == "w1" && model.as_deref() == Some("sonnet")),
             "a resumed Worker must carry the configured worker_model: {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|(id, model)| id == "g1" && model.as_deref() == Some("fable")),
+            "a resumed Goinkyo must carry the configured goinkyo_model: {models:?}"
         );
     }
 
@@ -5864,6 +5907,128 @@ mod tests {
                 && mode.as_deref() == Some("bypassPermissions")
                 && tools.as_deref() == Some("Bash")),
             "a resumed Goinkyo must carry both configured values: {modes:?}"
+        );
+    }
+
+    #[test]
+    fn stage_brigade_passes_the_configured_effort_to_a_resumed_goinkyo_but_never_to_worker_or_director()
+     {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
+        let brigade = BrigadeConfig {
+            goinkyo_effort: "low".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let now = test_instant();
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            (
+                "worker-1".to_string(),
+                BrigadeRole::Worker,
+                Some("w1".to_string()),
+            ),
+            (
+                "goinkyo".to_string(),
+                BrigadeRole::Goinkyo,
+                Some("g1".to_string()),
+            ),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            now,
+        );
+
+        let efforts: Vec<(String, Option<String>)> = cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::OpenEmbedded { target, effort, .. } => {
+                    Some((target.id.clone(), effort.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            efforts
+                .iter()
+                .any(|(id, effort)| id == "dir" && effort.is_none()),
+            "the Director must never carry --effort: {efforts:?}"
+        );
+        assert!(
+            efforts
+                .iter()
+                .any(|(id, effort)| id == "w1" && effort.is_none()),
+            "a resumed Worker must never carry --effort: {efforts:?}"
+        );
+        assert!(
+            efforts
+                .iter()
+                .any(|(id, effort)| id == "g1" && effort.as_deref() == Some("low")),
+            "a resumed Goinkyo must carry the configured effort: {efforts:?}"
+        );
+    }
+
+    #[test]
+    fn stage_brigade_resumed_goinkyo_carries_no_effort_when_the_config_value_is_the_empty_escape_hatch()
+     {
+        // The same accessor (`BrigadeConfig::goinkyo_effort`) backs both the
+        // fresh-spawn path (`update_goinkyo_awaiting_spawn`) and this resume
+        // path, so an empty-string config value can't mean "pass nothing" on
+        // one and something else on the other — this pins that down for the
+        // resume path specifically.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir"), row("g1")]);
+        let brigade = BrigadeConfig {
+            goinkyo_effort: String::new(),
+            ..BrigadeConfig::default()
+        };
+        let now = test_instant();
+        state.pending_membership = Some(PendingMembership::Activate);
+
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            (
+                "goinkyo".to_string(),
+                BrigadeRole::Goinkyo,
+                Some("g1".to_string()),
+            ),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+            },
+            now,
+        );
+
+        let goinkyo_effort = cmds.iter().find_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { target, effort, .. } if target.id == "g1" => Some(effort.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            goinkyo_effort,
+            Some(None),
+            "expected no --effort: {goinkyo_effort:?}"
         );
     }
 
