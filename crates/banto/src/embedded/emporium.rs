@@ -4084,6 +4084,12 @@ mod tests {
                 "codex-uuid-1",
                 "-m",
                 "o3",
+                "-c",
+                "tui.notifications=[\"approval-requested\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
                 "-C",
                 "/work/alpha",
             ]
