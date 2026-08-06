@@ -294,6 +294,10 @@ const RELAY_NUDGE_LINE: &str =
 const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Minimum gap between host bells for newly visible attention marks. This is
+/// a policy throttle, not a measured terminal limit: an arrival remains
+/// prompt, while a burst of panes cannot turn into an alarm.
+const ATTENTION_BELL_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// How long a freshly-spawned Codex Worker pane's own output must have been
 /// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
@@ -855,11 +859,10 @@ pub struct EmporiumState {
     /// rather than deriving a member name from a tile position. Rekey paths
     /// keep the token attached when a live key changes.
     member_tokens: HashMap<SessionKey, MemberToken>,
-    /// The staged panes whose loaded session row currently reports
-    /// [`crate::model::Activity::Waiting`]. This is the one authoritative display set:
-    /// rendering reads it for magenta borders, and the future bell can diff it
-    /// for edges, so the two views cannot silently acquire different filters.
-    /// Synthetic or not-yet-loaded keys have no row and are deliberately absent.
+    /// The staged panes with an on-screen attention mark: loaded Claude
+    /// Waiting rows plus BEL latches. This is the one authoritative tile
+    /// display set; rendering reads it for magenta borders while the same
+    /// update-boundary computation derives host-bell edges.
     /// Derived by [`refresh_waiting_display`] only; the shell gets it through
     /// [`Self::attention_panes`], never a mutable field.
     attention_panes: HashSet<SessionKey>,
@@ -868,6 +871,19 @@ pub struct EmporiumState {
     /// because the sidebar's labelled Claude count includes list rows too,
     /// while its border set can only contain panes.
     visible_waiting_count: usize,
+    /// Panes whose child rang BEL while they were not effectively focused.
+    /// Folded into `attention_panes`, never drawn separately.
+    latched_attention_panes: HashSet<SessionKey>,
+    /// Cached list-visible Waiting ids as pane keys, refreshed only when
+    /// App's matching cache generation changes. Discovery imposes no bound on
+    /// these ids, so the edge diff must not rebuild this set for every PTY
+    /// chunk merely because each one runs the display refresh.
+    ring_list_waiting: HashSet<SessionKey>,
+    ring_list_generation: u64,
+    /// `None` seeds the first refresh silently; thereafter this is the prior
+    /// visible-mark set used to detect attention edges.
+    previous_ring_set: Option<HashSet<SessionKey>>,
+    last_attention_bell: Option<Instant>,
 }
 
 impl EmporiumState {
@@ -902,6 +918,11 @@ impl EmporiumState {
             member_tokens: HashMap::new(),
             attention_panes: HashSet::new(),
             visible_waiting_count: 0,
+            latched_attention_panes: HashSet::new(),
+            ring_list_waiting: HashSet::new(),
+            ring_list_generation: 0,
+            previous_ring_set: None,
+            last_attention_bell: None,
         }
     }
 
@@ -939,6 +960,7 @@ impl EmporiumState {
         self.member_tokens.remove(key);
         self.last_forwarded_input.remove(key);
         self.last_output_at.remove(key);
+        self.latched_attention_panes.remove(key);
         self.pending_kickoffs.retain(|pending| &pending.key != key);
         self.pending_goinkyo_kickoffs
             .retain(|pending| &pending.key != key);
@@ -1449,6 +1471,10 @@ pub enum Cmd {
     ForwardClipboardToHost {
         bytes: Vec<u8>,
     },
+    /// Ring the host terminal once for one or more newly visible attention
+    /// marks. A bare BEL changes neither cells nor cursor, so the shell may
+    /// emit it before the next draw just like OSC 52 forwarding.
+    RingHostBell,
     Store(StoreIntent),
     Reload,
 }
@@ -1689,8 +1715,10 @@ pub fn update(
         Event::PtyOutput { key, chunk } => {
             state.last_output_at.insert(key.clone(), now);
             let mut cmds = Vec::new();
+            let mut rang = false;
             if let Some(screen) = state.screens.get_mut(&key) {
                 screen.process(&chunk);
+                rang = screen.take_audible_bell();
                 // Drained right after the chunk that staged it is processed
                 // (Screen::take_clipboard's own doc: it's one-shot, so the
                 // same copy must never be forwarded again on a later poll).
@@ -1706,6 +1734,9 @@ pub fn update(
                         ),
                     }
                 }
+            }
+            if rang && effective_focused_pane(state).as_ref() != Some(&key) {
+                state.latched_attention_panes.insert(key.clone());
             }
             cmds
         }
@@ -1847,20 +1878,41 @@ pub fn update(
         }
     };
     cmds.extend(resize_staged_tiles(state));
-    refresh_waiting_display(state, app);
+    cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
     cmds
 }
 
-/// Refresh the derived activity display state after every pure update. This
-/// mirrors [`resize_staged_tiles`]'s "one small scan at the update boundary"
-/// contract: stage mutations, row reloads, filtering input, rekeys, and
-/// unstage paths cannot forget to refresh one display consumer while another
-/// remains stale. The shell never recomputes this fact during drawing. Its
-/// list half is O(1): [`App`] caches Waiting membership/count when filtering
-/// changes, because this function also runs for every PTY-output event; only
-/// the handful of staged panes are scanned here.
-fn refresh_waiting_display(state: &mut EmporiumState, app: &App) {
+/// Refresh the one fact behind both attention views: a mark is on screen when
+/// a Claude Waiting row/tile is visible or a staged pane has latched BEL. The
+/// border reads the staged subset, the sidebar keeps its Claude-only count,
+/// and the host bell is the edge where this full visible set gains a member.
+/// Keeping all three here prevents their filters from drifting apart.
+///
+/// App caches its list result; this refresh copies that cache only when its
+/// generation changes. Ordinary PTY chunks therefore inspect only staged
+/// panes, rather than re-scanning a potentially large Waiting list.
+fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -> Vec<Cmd> {
+    // `effective_focused_pane` is also the contract used for DECSET 1004:
+    // `window_focused` starts true and self-corrects on crossterm's first
+    // FocusGained/FocusLost, so before that small self-healing window banto
+    // assumes it is frontmost. Clearing here therefore means the operator can
+    // see this pane by the same already-accepted focus fact, not a new host
+    // focus-reporting mechanism.
+    if let Some(key) = effective_focused_pane(state) {
+        state.latched_attention_panes.remove(&key);
+    }
+
+    let list_changed = state.ring_list_generation != app.filtered_waiting_generation();
+    if list_changed {
+        state.ring_list_waiting = app
+            .filtered_waiting_ids()
+            .iter()
+            .map(|id| SessionKey::from_id(id))
+            .collect();
+        state.ring_list_generation = app.filtered_waiting_generation();
+    }
+
     let mut count = app.filtered_waiting_count();
     let mut staged_ids = HashSet::new();
     let mut panes = HashSet::new();
@@ -1871,14 +1923,56 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App) {
             }
             panes.insert(key.clone());
         }
+        if state.latched_attention_panes.contains(key) {
+            panes.insert(key.clone());
+        }
     };
     match &state.stage {
         Stage::Empty => {}
         Stage::Solo(key) => inspect(key),
         Stage::Brigade { panes: staged, .. } => staged.iter().for_each(&mut inspect),
     }
-    state.attention_panes = panes;
+    let old_panes = std::mem::replace(&mut state.attention_panes, panes);
     state.visible_waiting_count = count;
+
+    let mut gained = false;
+    match &mut state.previous_ring_set {
+        None => {
+            let mut seeded = state.ring_list_waiting.clone();
+            seeded.extend(state.attention_panes.iter().cloned());
+            state.previous_ring_set = Some(seeded);
+        }
+        Some(previous) if list_changed => {
+            let mut current = state.ring_list_waiting.clone();
+            current.extend(state.attention_panes.iter().cloned());
+            gained = current.iter().any(|key| !previous.contains(key));
+            *previous = current;
+        }
+        Some(previous) => {
+            let mut changed = old_panes;
+            changed.extend(state.attention_panes.iter().cloned());
+            for key in changed {
+                let visible =
+                    state.ring_list_waiting.contains(&key) || state.attention_panes.contains(&key);
+                if visible {
+                    gained |= previous.insert(key);
+                } else {
+                    previous.remove(&key);
+                }
+            }
+        }
+    }
+
+    if gained
+        && state
+            .last_attention_bell
+            .is_none_or(|last| now.saturating_duration_since(last) >= ATTENTION_BELL_COOLDOWN)
+    {
+        state.last_attention_bell = Some(now);
+        vec![Cmd::RingHostBell]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
@@ -11456,6 +11550,158 @@ mod tests {
                 bytes: b"\x1b]52;c;aGVsbG8=\x07".to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn bell_for_selected_pane_while_away_latches_rings_and_clears_on_regain() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        // The selected pane is not effectively focused once banto sits behind
+        // another window, even though its internal selection stays put.
+        let seeded = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: false },
+            now,
+        );
+        assert!(
+            !seeded.iter().any(|cmd| matches!(cmd, Cmd::RingHostBell)),
+            "startup seeds state but must not announce it: {seeded:?}"
+        );
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"\x07\x07".to_vec(),
+            },
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(cmds, vec![Cmd::RingHostBell]);
+        assert!(state.attention_panes().contains(&key));
+        assert_eq!(
+            state.visible_waiting_count(),
+            0,
+            "BEL is not Claude Waiting"
+        );
+
+        // Regaining banto's OS focus makes this selected pane effectively
+        // focused and clears its latch without a bespoke focus-edge record.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: true },
+            now + Duration::from_millis(2),
+        );
+        assert!(cmds.is_empty());
+        assert!(!state.attention_panes().contains(&key));
+    }
+
+    #[test]
+    fn bell_for_selected_frontmost_pane_neither_latches_nor_rings() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("sess-1");
+        state.stage = Stage::Solo(key.clone());
+        state.focus = Focus::Pane;
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        // Seed under the default frontmost assumption. A BEL from the pane
+        // already visible to the operator is not a new attention mark.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: Vec::new() },
+            now,
+        );
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"\x07".to_vec(),
+            },
+            now + Duration::from_millis(1),
+        );
+        assert!(cmds.is_empty());
+        assert!(!state.attention_panes().contains(&key));
+    }
+
+    #[test]
+    fn attention_edges_coalesce_and_respect_the_global_cooldown() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let a = SessionKey::from_id("a");
+        let b = SessionKey::from_id("b");
+        let c = SessionKey::from_id("c");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: None,
+            panes: vec![a.clone(), b.clone(), c.clone()],
+            focused: 0,
+        };
+        for key in [&a, &b, &c] {
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+        }
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: Vec::new() },
+            now,
+        );
+
+        state.focus = Focus::Sidebar;
+        let first = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: a,
+                chunk: b"\x07".to_vec(),
+            },
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(first, vec![Cmd::RingHostBell]);
+        let suppressed = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: b,
+                chunk: b"\x07".to_vec(),
+            },
+            now + Duration::from_millis(2),
+        );
+        assert!(suppressed.is_empty(), "the second edge is inside cooldown");
+        let after_cooldown = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: c,
+                chunk: b"\x07".to_vec(),
+            },
+            now + ATTENTION_BELL_COOLDOWN + Duration::from_millis(1),
+        );
+        assert_eq!(after_cooldown, vec![Cmd::RingHostBell]);
     }
 
     #[test]

@@ -103,6 +103,13 @@ impl Screen {
         self.parser.screen_mut().take_clipboard()
     }
 
+    /// Take whether the child rang BEL since the previous call. The pinned
+    /// vt100 fork coalesces however many BEL bytes arrived into this one-shot
+    /// fact, which is exactly what the emporium needs for a pane latch.
+    pub fn take_audible_bell(&mut self) -> bool {
+        self.parser.screen_mut().take_audible_bell()
+    }
+
     /// Feed one chunk of the child's output into the model.
     pub fn process(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
@@ -376,5 +383,13 @@ mod tests {
             3,
             "a resize must not yank a scrolled-back pane down to the live bottom"
         );
+    }
+
+    #[test]
+    fn audible_bell_is_handed_over_once() {
+        let mut screen = Screen::new(4, 20);
+        screen.process(b"\x07\x07");
+        assert!(screen.take_audible_bell());
+        assert!(!screen.take_audible_bell());
     }
 }
