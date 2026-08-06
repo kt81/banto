@@ -27,6 +27,28 @@ use std::time::SystemTime;
 use banto_core::model::{Activity, SessionMeta};
 use banto_core::status::{AgeThresholds, age_bucket};
 
+/// The two [`LiveSession::status`] values compared against anywhere in this
+/// codebase — Claude Code's own vocabulary, not banto's, so an unrecognized
+/// third value (this crate has only ever seen these two plus `"idle"`) must
+/// keep degrading to [`Activity::Alive`] here and to `None` at every other
+/// reader, never break. Observed set as of `claude` 2.1.222, 2026-08-06:
+/// exactly `{"idle", "busy", "waiting"}`, live-polled at 1s resolution
+/// through a real permission prompt and a real plan-mode prompt — `"idle"`
+/// itself needs no constant, since anything that isn't one of the two below
+/// already falls through to `Activity::Alive`'s catch-all.
+///
+/// `banto::session::activity_tag` also emits the strings `"busy"` and
+/// `"waiting"`, and that is a coincidence, not a shared fact: those are
+/// banto's own `list`-subcommand output vocabulary, keyed off the already-
+/// classified [`Activity`] enum, never off this raw field. Do not route it
+/// through these constants — the two vocabularies are independent, agreeing
+/// today only by coincidence, and keeping them separate is what stops a
+/// change to one (upstream renaming this field's value, say) from silently
+/// moving the other. Nothing here would catch that if they were unified —
+/// renaming a shared constant compiles cleanly either way.
+pub const LIVE_STATUS_BUSY: &str = "busy";
+pub const LIVE_STATUS_WAITING: &str = "waiting";
+
 /// Classify one session's activity from live state and file age.
 ///
 /// A live entry matches `meta` when its `session_id` equals `meta.id.0`.
@@ -51,13 +73,13 @@ pub fn classify(
         if !probe.is_alive(entry.pid) {
             continue;
         }
-        if entry.status.as_deref() == Some("busy") {
+        if entry.status.as_deref() == Some(LIVE_STATUS_BUSY) {
             // Busy wins over Waiting: multiple live entries are anomalous, and
             // under-reporting a stale waiting entry preserves today's behavior
             // while over-reporting would train the operator to distrust it.
             return Activity::Busy;
         }
-        if entry.status.as_deref() == Some("waiting") {
+        if entry.status.as_deref() == Some(LIVE_STATUS_WAITING) {
             any_waiting = true;
         }
         any_alive = true;

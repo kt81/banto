@@ -63,7 +63,8 @@ use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::{PortablePtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
-    LiveSession, ProcessProbe, SysinfoProbe, ancestry_reaches, read_live_sessions,
+    LIVE_STATUS_BUSY, LIVE_STATUS_WAITING, LiveSession, ProcessProbe, SysinfoProbe,
+    ancestry_reaches, read_live_sessions,
 };
 use banto_io::store::Store;
 use banto_tui::paint;
@@ -1445,6 +1446,25 @@ fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String>
 /// default here, never "idle" — see [`codex_activity::is_thread_idle`]'s doc
 /// for why manufacturing a false idle signal is the one outcome this must
 /// never produce.
+///
+/// The Claude arm excludes [`LIVE_STATUS_WAITING`] as well as
+/// [`LIVE_STATUS_BUSY`] — see that constant's own doc for the measurement
+/// behind it. Before this, `!= Some("busy")` alone counted a pending human
+/// decision as idle, which let a relay nudge's text land in the middle of
+/// that decision instead of the member's own input — the defect this fix
+/// closes.
+///
+/// Codex has no equivalent exclusion, and cannot cheaply get one:
+/// `codex_activity::is_thread_idle` reads the rollout's own `task_started`/
+/// `task_complete` markers, which pair 1:1 per whole turn (that module's own
+/// doc) with no marker in between for "the model is waiting on a tool
+/// approval mid-turn" — a Codex member stuck at an approval prompt already
+/// reads `Some(false)` here, the same as one still generating, so it cannot
+/// reach the idle streak a nudge requires either way. That happens to avoid
+/// this exact defect for Codex, but not because the state is detected —
+/// nothing in this crate reads a Codex-side signal finer than "mid-turn or
+/// not", so a human-facing wait that begins *after* `task_complete` (if one
+/// exists) would be as invisible to this function as it was before.
 fn gather_relay_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
@@ -1479,7 +1499,11 @@ fn gather_relay_observations(
                 .iter()
                 .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
                 .map(|entry| {
-                    SysinfoProbe.is_alive(entry.pid) && entry.status.as_deref() != Some("busy")
+                    SysinfoProbe.is_alive(entry.pid)
+                        && !matches!(
+                            entry.status.as_deref(),
+                            Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
+                        )
                 }),
             Some(AgentKind::Codex) => {
                 codex_home.and_then(|home| codex_activity::is_thread_idle(home, &session_id.0))
@@ -2812,13 +2836,27 @@ mod tests {
     /// Write a `sessions/<pid>.json` live-state file, the thing `claude`
     /// publishes at startup — before any session history exists.
     fn write_live_state(claude_home: &Path, pid: u32, session_id: &str, cwd: &Path) {
+        write_live_state_with_status(claude_home, pid, session_id, cwd, "idle");
+    }
+
+    /// Same as [`write_live_state`], but with an explicit `status` rather
+    /// than always `"idle"` — for exercising the `"busy"`/`"waiting"` arms
+    /// of [`gather_relay_observations`]'s Claude-side idle check.
+    fn write_live_state_with_status(
+        claude_home: &Path,
+        pid: u32,
+        session_id: &str,
+        cwd: &Path,
+        status: &str,
+    ) {
         let dir = claude_home.join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{pid}.json")),
             format!(
-                "{{\"pid\":{pid},\"sessionId\":\"{session_id}\",\"cwd\":{},\"status\":\"idle\"}}",
-                serde_json::to_string(&cwd.to_string_lossy()).unwrap()
+                "{{\"pid\":{pid},\"sessionId\":\"{session_id}\",\"cwd\":{},\"status\":{}}}",
+                serde_json::to_string(&cwd.to_string_lossy()).unwrap(),
+                serde_json::to_string(status).unwrap()
             ),
         )
         .unwrap();
@@ -3536,8 +3574,9 @@ mod tests {
     #[test]
     fn a_claude_members_idle_detection_is_unchanged_by_the_codex_split() {
         // Same live-file-based check as before this round, now reached via
-        // the AgentKind::ClaudeCode arm instead of being the only arm —
-        // covers both the alive-and-idle and the alive-and-busy cases.
+        // the AgentKind::ClaudeCode arm instead of being the only arm — the
+        // alive-and-busy and alive-and-waiting cases are their own tests
+        // below, not this one.
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         write_live_state(
@@ -3560,6 +3599,57 @@ mod tests {
             Some(true),
             "this process's own pid is alive and the live file reports no busy status"
         );
+    }
+
+    #[test]
+    fn a_claude_member_reported_busy_is_not_idle() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        write_live_state_with_status(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+            "busy",
+        );
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, Some(false));
+    }
+
+    #[test]
+    fn a_claude_member_reported_waiting_is_not_idle() {
+        // The regression this pins: a member sitting at a permission or
+        // plan-mode prompt reports `status: "waiting"` (see
+        // `LIVE_STATUS_WAITING`'s own doc for the measurement behind it).
+        // `!= Some("busy")` alone would have called this idle, which is
+        // exactly the state a relay nudge must never type into.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        write_live_state_with_status(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+            "waiting",
+        );
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, Some(false));
     }
 
     #[test]
