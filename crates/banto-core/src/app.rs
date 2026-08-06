@@ -669,6 +669,10 @@ pub struct App {
     /// Ids of pinned sessions. A cache for sorting/display only — the store
     /// is the durable source of truth; see [`Self::toggle_pin`].
     pinned: HashSet<String>,
+    /// Loaded session ids whose current Activity is Waiting. Rebuilt with the
+    /// row cache, so the emporium can classify a staged key in O(1) even when
+    /// that member is hidden from the list.
+    waiting_rows: HashSet<String>,
     /// Claude session ids of brigade Workers and Goinkyos (while still a
     /// member of one — see `Store::brigade_hidden_session_ids`'s own doc for
     /// why a Goinkyo drops out on dismissal instead of staying hidden),
@@ -732,6 +736,10 @@ pub struct App {
     query_cursor: usize,
     /// Indices into `rows` that match the query, in display order.
     filtered: Vec<usize>,
+    /// Session ids in `filtered` whose row currently reports Waiting. Kept as
+    /// a cache alongside the list result so an embedded PTY-output update can
+    /// ask its count/membership without re-scanning a potentially large list.
+    filtered_waiting: HashSet<String>,
     /// Selected position within `filtered`.
     selected: usize,
     /// First visible position within [`Self::display_sequence`] (scroll
@@ -820,6 +828,7 @@ impl App {
             rows: Vec::new(),
             haystacks: Vec::new(),
             pinned: HashSet::new(),
+            waiting_rows: HashSet::new(),
             hidden: HashSet::new(),
             directors: HashSet::new(),
             superseded: HashSet::new(),
@@ -833,6 +842,7 @@ impl App {
             query: String::new(),
             query_cursor: 0,
             filtered: Vec::new(),
+            filtered_waiting: HashSet::new(),
             selected: 0,
             offset: 0,
             viewport_height: 0,
@@ -844,7 +854,7 @@ impl App {
             should_quit: false,
         };
         app.resort_rows();
-        app.filtered = app.compute_filtered();
+        app.rebuild_filtered();
         app
     }
 
@@ -1389,8 +1399,9 @@ impl App {
     pub fn with_pinned(mut self, pinned: HashSet<String>) -> Self {
         self.pinned = pinned;
         self.resort_rows();
-        let selected_id = self.selected_row().map(|row| row.id.clone());
-        self.refilter_keeping_selected(selected_id);
+        // Startup intentionally selects the new first (pinned) row, rather
+        // than preserving the old first row across the initial sort.
+        self.refilter_keeping_selected(None);
         self
     }
 
@@ -1597,11 +1608,20 @@ impl App {
     /// mtime-descending, so each group (pinned / not) keeps that relative
     /// order without needing to know actual mtimes here. Always rebuilding
     /// from `base_rows` (rather than re-sorting `rows` in place) is what
-    /// makes pin/unpin round trips restore the exact original order.
+    /// makes pin/unpin round trips restore the exact original order. This
+    /// deliberately does not rebuild `filtered`: callers changing rows must
+    /// immediately call `refilter_keeping_selected` to make those indices
+    /// valid again and preserve the selection in one filter computation.
     fn resort_rows(&mut self) {
         self.rows = self.base_rows.clone();
         self.rows.sort_by_key(|row| !self.pinned.contains(&row.id));
         self.haystacks = self.rows.iter().map(SessionRow::haystack).collect();
+        self.waiting_rows = self
+            .rows
+            .iter()
+            .filter(|row| row.activity == Activity::Waiting)
+            .map(|row| row.id.clone())
+            .collect();
     }
 
     /// Recompute `filtered` from the current query/haystacks, then re-select
@@ -1610,12 +1630,26 @@ impl App {
     /// the list. Clears `last_click`, whose filtered index no longer
     /// corresponds to anything meaningful after a reorder.
     fn refilter_keeping_selected(&mut self, keep_id: Option<String>) {
-        self.filtered = self.compute_filtered();
+        self.rebuild_filtered();
         self.selected = keep_id
             .and_then(|id| self.filtered.iter().position(|&i| self.rows[i].id == id))
             .unwrap_or(0);
         self.last_click = None;
         self.ensure_visible();
+    }
+
+    /// Rebuild the filter result and its Waiting cache together. This is the
+    /// sole assignment path for `filtered`, so a new caller cannot update the
+    /// list result without also keeping the PTY-update cache in sync.
+    fn rebuild_filtered(&mut self) {
+        self.filtered = self.compute_filtered();
+        self.filtered_waiting = self
+            .filtered
+            .iter()
+            .map(|&i| &self.rows[i])
+            .filter(|row| row.activity == Activity::Waiting)
+            .map(|row| row.id.clone())
+            .collect();
     }
 
     /// Rank `rows` against the current query, then drop agent-run and
@@ -1700,7 +1734,7 @@ impl App {
 
     /// Recompute the filter result and reset selection/scroll to the top.
     fn refilter(&mut self) {
-        self.filtered = self.compute_filtered();
+        self.rebuild_filtered();
         self.selected = 0;
         self.offset = 0;
         self.clear_status();
@@ -2063,6 +2097,26 @@ impl App {
         self.base_rows.iter().find(|row| row.id == id)
     }
 
+    /// Whether `id` is a Waiting row in the current list result. This
+    /// intentionally follows `filtered`, rather than `base_rows`: a brigade
+    /// member hidden from the list is represented by its staged tile instead.
+    pub fn is_filtered_waiting_id(&self, id: &str) -> bool {
+        self.filtered_waiting.contains(id)
+    }
+
+    /// Whether a loaded session currently reports Waiting, regardless of list
+    /// filtering. Hidden brigade members need this to light their staged tile.
+    pub fn is_waiting_id(&self, id: &str) -> bool {
+        self.waiting_rows.contains(id)
+    }
+
+    /// Number of Waiting rows in the current list result. Cached when the
+    /// filter changes so frequent embedded PTY-output updates do not rescan
+    /// the full session list merely to render their sidebar title.
+    pub fn filtered_waiting_count(&self) -> usize {
+        self.filtered_waiting.len()
+    }
+
     /// Whether the currently selected session is pinned (for the summary
     /// panel's marker); `false` when nothing is selected.
     pub fn is_selected_pinned(&self) -> bool {
@@ -2254,6 +2308,26 @@ mod tests {
         assert!(got.contains(&"a".to_string()));
         assert!(got.contains(&"c".to_string()));
         assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn search_rebuilds_waiting_membership_cache() {
+        let mut waiting = row("waiting", "Waiting task", "");
+        waiting.activity = Activity::Waiting;
+        let mut app = App::new(vec![waiting, row("other", "Apple task", "")]);
+        app.set_viewport_height(10);
+
+        assert_eq!(app.filtered_waiting_count(), 1);
+        assert!(app.is_filtered_waiting_id("waiting"));
+
+        // This is the former drift: the list no longer contains the Waiting
+        // session, so the cached count and membership must leave with it.
+        for c in "app".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(ids(&app), vec!["other"]);
+        assert_eq!(app.filtered_waiting_count(), 0);
+        assert!(!app.is_filtered_waiting_id("waiting"));
     }
 
     #[test]

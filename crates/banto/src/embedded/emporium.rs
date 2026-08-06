@@ -68,7 +68,7 @@ use banto_io::status::{
 };
 use banto_io::store::Store;
 use banto_tui::paint;
-use banto_tui::view;
+use banto_tui::view::{self, WAITING_ACTIVITY_COLOR};
 
 use crate::opener;
 use crate::session;
@@ -1909,11 +1909,11 @@ fn draw(
     let sidebar_title = if app.mode() == Mode::Search {
         format!("/ {}", app.query())
     } else {
-        "banto".to_string()
+        format!("banto · waiting {} (Claude)", state.visible_waiting_count())
     };
     let sidebar_block = Block::bordered()
         .title(sidebar_title)
-        .border_style(border_style(focus == Focus::Sidebar));
+        .border_style(border_style(focus == Focus::Sidebar, false));
     let sidebar_inner = sidebar_block.inner(areas.sidebar);
     frame.render_widget(sidebar_block, areas.sidebar);
     view::render_list(frame, app, sidebar_inner, now);
@@ -1924,7 +1924,7 @@ fn draw(
     if tiles.is_empty() {
         let block = Block::bordered()
             .title("session")
-            .border_style(border_style(false));
+            .border_style(border_style(false, false));
         let content = block.inner(areas.pane);
         frame.render_widget(block, areas.pane);
         frame.render_widget(
@@ -1941,9 +1941,10 @@ fn draw(
                 continue;
             };
             let focused_tile = focus == Focus::Pane && focused_key.as_ref() == Some(key);
+            let waiting = state.attention_panes().contains(key);
             let block = Block::bordered()
                 .title(tile_title(state, key))
-                .border_style(border_style(focused_tile));
+                .border_style(border_style(focused_tile, waiting));
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
             let cursor = paint_pane(
@@ -2063,9 +2064,11 @@ fn render_status_bar(
     );
 }
 
-fn border_style(focused: bool) -> Style {
+fn border_style(focused: bool, waiting: bool) -> Style {
     Style::default().fg(if focused {
         Color::Cyan
+    } else if waiting {
+        WAITING_ACTIVITY_COLOR
     } else {
         Color::DarkGray
     })
@@ -3450,6 +3453,69 @@ mod tests {
             size: 0,
             source_archived: false,
         }
+    }
+
+    #[test]
+    fn waiting_count_unions_list_rows_and_staged_tiles() {
+        let mut listed = test_row("listed", AgentKind::ClaudeCode);
+        listed.activity = Activity::Waiting;
+        let mut hidden_staged = test_row("hidden-staged", AgentKind::ClaudeCode);
+        hidden_staged.activity = Activity::Waiting;
+        let mut app = App::new(vec![listed, hidden_staged])
+            .with_hidden_member_ids(["hidden-staged".to_string()].into_iter().collect());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: None,
+            // `listed` occurs in both surfaces; the hidden member is tile-only
+            // in the list. The unloaded pane deliberately has no row to count.
+            panes: vec![
+                SessionKey::from_id("listed"),
+                SessionKey::from_id("hidden-staged"),
+                SessionKey::from_id("not-loaded"),
+            ],
+            focused: 0,
+        };
+
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::Resized {
+                width: 80,
+                height: 24,
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.visible_waiting_count(), 2);
+        let expected_attention_panes: HashSet<_> = [
+            SessionKey::from_id("listed"),
+            SessionKey::from_id("hidden-staged"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(state.attention_panes(), &expected_attention_panes);
+        app.set_hidden_member_ids(["listed".to_string()].into_iter().collect());
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::Resized {
+                width: 80,
+                height: 24,
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.visible_waiting_count(), 2);
+    }
+
+    #[test]
+    fn focused_border_wins_over_waiting() {
+        assert_eq!(border_style(true, true), border_style(true, false));
+        assert_eq!(
+            border_style(false, true),
+            Style::default().fg(WAITING_ACTIVITY_COLOR)
+        );
     }
 
     /// A staged Director ("dir", Claude) plus one Worker at

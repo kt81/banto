@@ -76,6 +76,12 @@ const AGENT_EMOJI: &str = "\u{1F916}"; // 🤖
 const GROUP_EMOJI: &str = "\u{1F4C2}"; // 📂
 const UNGROUPED_EMOJI: &str = "\u{1F4C1}"; // 📁
 
+/// One activity fact has one colour across banto's surfaces: magenta means a
+/// Claude Code session has reported that it is waiting for a human. The
+/// emporium reuses this for an unfocused staged tile's border, so a hidden
+/// brigade member is not denied the same signal its list row would have had.
+pub const WAITING_ACTIVITY_COLOR: Color = Color::Magenta;
+
 /// dot(2) + pin(0 or 3) + role(3), the row's fixed left-hand slots — see the
 /// module doc's "Row layout" section for why the pin slot is conditional.
 /// A present slot is a 2-column emoji plus a 1-column trailing separator
@@ -498,7 +504,7 @@ fn summary_meta(
 fn activity_color(activity: Activity) -> Color {
     match activity {
         Activity::Busy => Color::Green,
-        Activity::Waiting => Color::Magenta,
+        Activity::Waiting => WAITING_ACTIVITY_COLOR,
         Activity::Alive => Color::Cyan,
         Activity::Idle(AgeBucket::Today) => Color::Yellow,
         Activity::Idle(AgeBucket::ThisWeek) => Color::Gray,
