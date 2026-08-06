@@ -37,6 +37,7 @@ use banto_core::model::SessionId;
 use banto_io::opener::{Backend, CommandRunner, CommandSpec, SessionHandle};
 use banto_io::process::{ProcessRunner, SpawnedProcess};
 use banto_io::provider::SessionProvider;
+use banto_io::pty::STRIPPED_CHILD_ENV_VARS;
 use banto_io::store::{PaneRecord, Store};
 
 /// Register this process's PID, run `argv` to completion, then clean up the
@@ -66,7 +67,7 @@ pub fn run(
     register_pid(store, &id);
 
     let code = runner
-        .run(argv)
+        .run(argv, STRIPPED_CHILD_ENV_VARS)
         .with_context(|| format!("failed to run wrapped command: {argv:?}"))?;
     log.log(&format!("run (resume) child exited code={code:?}"));
 
@@ -236,7 +237,7 @@ pub fn run_new_session(
         log.log("no focusable pane resolved -> running claude directly, untracked");
         let code = deps
             .process_runner
-            .run(argv)
+            .run(argv, STRIPPED_CHILD_ENV_VARS)
             .with_context(|| format!("failed to run new session: {argv:?}"))?;
         log.log(&format!("untracked child exited code={code:?}"));
         return Ok(code.unwrap_or(1));
@@ -253,7 +254,7 @@ pub fn run_new_session(
     ));
     let mut spawned = deps
         .process_runner
-        .spawn(argv)
+        .spawn(argv, STRIPPED_CHILD_ENV_VARS)
         .with_context(|| format!("failed to spawn new session: {argv:?}"))?;
 
     let mut recorded: Option<SessionId> = None;
@@ -511,6 +512,32 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(runner.calls(), vec![argv]);
         assert_eq!(store.get_pane(&SessionId("s1".to_string())).unwrap(), None);
+    }
+
+    #[test]
+    fn run_strips_the_inherited_child_session_marker() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_pane(&pane("s1")).unwrap();
+        let runner = MockProcessRunner::new(Some(0));
+        let argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "s1".to_string(),
+        ];
+
+        run(&store, "s1", &argv, &runner).unwrap();
+
+        assert_eq!(
+            runner.run_env_removes(),
+            vec![
+                STRIPPED_CHILD_ENV_VARS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            ],
+            "a resumed session's own child process must have \
+             CLAUDE_CODE_CHILD_SESSION stripped, same as a fresh one"
+        );
     }
 
     #[test]
@@ -864,6 +891,16 @@ mod tests {
         assert_eq!(process_runner.calls(), vec![vec!["claude".to_string()]]);
         assert!(process_runner.spawn_calls().is_empty());
         assert!(command_runner.calls().is_empty());
+        assert_eq!(
+            process_runner.run_env_removes(),
+            vec![
+                STRIPPED_CHILD_ENV_VARS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            ],
+            "the untracked fallback path must still strip CLAUDE_CODE_CHILD_SESSION"
+        );
     }
 
     #[test]
@@ -901,6 +938,16 @@ mod tests {
         assert!(process_runner.calls().is_empty());
         assert_eq!(command_runner.calls().len(), 1);
         assert!(store.list_panes().unwrap().is_empty());
+        assert_eq!(
+            process_runner.spawn_env_removes(),
+            vec![
+                STRIPPED_CHILD_ENV_VARS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            ],
+            "the tracked spawn path must still strip CLAUDE_CODE_CHILD_SESSION"
+        );
     }
 
     #[test]
