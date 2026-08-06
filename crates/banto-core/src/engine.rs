@@ -855,6 +855,19 @@ pub struct EmporiumState {
     /// rather than deriving a member name from a tile position. Rekey paths
     /// keep the token attached when a live key changes.
     member_tokens: HashMap<SessionKey, MemberToken>,
+    /// The staged panes whose loaded session row currently reports
+    /// [`crate::model::Activity::Waiting`]. This is the one authoritative display set:
+    /// rendering reads it for magenta borders, and the future bell can diff it
+    /// for edges, so the two views cannot silently acquire different filters.
+    /// Synthetic or not-yet-loaded keys have no row and are deliberately absent.
+    /// Derived by [`refresh_waiting_display`] only; the shell gets it through
+    /// [`Self::attention_panes`], never a mutable field.
+    attention_panes: HashSet<SessionKey>,
+    /// Number of distinct Waiting sessions the operator can reach through the
+    /// current list result or a staged pane. Kept alongside [`Self::attention_panes`]
+    /// because the sidebar's labelled Claude count includes list rows too,
+    /// while its border set can only contain panes.
+    visible_waiting_count: usize,
 }
 
 impl EmporiumState {
@@ -887,6 +900,8 @@ impl EmporiumState {
             last_focus_notified: None,
             goinkyo_pane: HashMap::new(),
             member_tokens: HashMap::new(),
+            attention_panes: HashSet::new(),
+            visible_waiting_count: 0,
         }
     }
 
@@ -945,6 +960,18 @@ impl EmporiumState {
     /// from a pane's geometry position.
     pub fn member_token_for(&self, key: &SessionKey) -> Option<&str> {
         self.member_tokens.get(key).map(String::as_str)
+    }
+
+    /// The derived staged panes currently marked as needing operator attention.
+    /// [`refresh_waiting_display`] is its sole writer.
+    pub fn attention_panes(&self) -> &HashSet<SessionKey> {
+        &self.attention_panes
+    }
+
+    /// The derived count for the sidebar's labelled Claude Waiting display.
+    /// [`refresh_waiting_display`] is its sole writer.
+    pub fn visible_waiting_count(&self) -> usize {
+        self.visible_waiting_count
     }
 }
 
@@ -1820,8 +1847,38 @@ pub fn update(
         }
     };
     cmds.extend(resize_staged_tiles(state));
+    refresh_waiting_display(state, app);
     cmds.extend(emit_focus_transitions(state));
     cmds
+}
+
+/// Refresh the derived activity display state after every pure update. This
+/// mirrors [`resize_staged_tiles`]'s "one small scan at the update boundary"
+/// contract: stage mutations, row reloads, filtering input, rekeys, and
+/// unstage paths cannot forget to refresh one display consumer while another
+/// remains stale. The shell never recomputes this fact during drawing. Its
+/// list half is O(1): [`App`] caches Waiting membership/count when filtering
+/// changes, because this function also runs for every PTY-output event; only
+/// the handful of staged panes are scanned here.
+fn refresh_waiting_display(state: &mut EmporiumState, app: &App) {
+    let mut count = app.filtered_waiting_count();
+    let mut staged_ids = HashSet::new();
+    let mut panes = HashSet::new();
+    let mut inspect = |key: &SessionKey| {
+        if app.is_waiting_id(key.as_str()) {
+            if !app.is_filtered_waiting_id(key.as_str()) && staged_ids.insert(key.clone()) {
+                count += 1;
+            }
+            panes.insert(key.clone());
+        }
+    };
+    match &state.stage {
+        Stage::Empty => {}
+        Stage::Solo(key) => inspect(key),
+        Stage::Brigade { panes: staged, .. } => staged.iter().for_each(&mut inspect),
+    }
+    state.attention_panes = panes;
+    state.visible_waiting_count = count;
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
