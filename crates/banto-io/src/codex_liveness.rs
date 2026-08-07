@@ -133,6 +133,96 @@ pub fn live_thread_ids(
         .collect()
 }
 
+/// Return the subset of `candidate_ids` whose newest Codex log row still
+/// proves a live process.  This is the resident-list counterpart to
+/// [`live_thread_ids`]: it deliberately limits SQLite work to the rows the
+/// caller is about to render, then refreshes every candidate PID through one
+/// `sysinfo::System` snapshot rather than constructing one system per PID.
+///
+/// Missing/corrupt data degrades to an empty set.  That is an honest absence
+/// of proof, never a claim that a Codex session is dead.
+pub fn live_candidate_thread_ids(
+    codex_home: &CodexHome,
+    candidate_ids: impl IntoIterator<Item = String>,
+) -> BTreeSet<String> {
+    let candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
+    if candidate_ids.is_empty() {
+        return BTreeSet::new();
+    }
+    let db_path = codex_home.logs_db_path();
+    if !db_path.exists() {
+        return BTreeSet::new();
+    }
+    let Ok(conn) = open_read_only(&db_path) else {
+        return BTreeSet::new();
+    };
+    let candidates = newest_candidate_processes(&conn, &candidate_ids);
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    let pids = candidates
+        .iter()
+        .map(|candidate| Pid::from_u32(candidate.pid))
+        .collect::<Vec<_>>();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            system
+                .process(Pid::from_u32(candidate.pid))
+                .is_some_and(|process| process.start_time() as i64 <= candidate.log_ts)
+        })
+        .map(|candidate| candidate.thread_id)
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CandidateProcess {
+    thread_id: String,
+    log_ts: i64,
+    pid: u32,
+}
+
+/// Read one newest process record per already-known candidate.  The resident
+/// caller supplies the list from `threads`, so this never scans every thread
+/// that has ever appeared in `logs` (unlike pull-only [`live_thread_ids`]).
+fn newest_candidate_processes(
+    conn: &Connection,
+    candidate_ids: &[String],
+) -> Vec<CandidateProcess> {
+    let Ok(mut statement) = conn.prepare(
+        "SELECT ts, process_uuid FROM logs \
+         WHERE thread_id = ?1 AND process_uuid IS NOT NULL \
+         ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1",
+    ) else {
+        return Vec::new();
+    };
+    candidate_ids
+        .iter()
+        .filter_map(|thread_id| {
+            statement
+                .query_row([thread_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()
+                .ok()
+                .flatten()
+                .and_then(|(log_ts, process_uuid)| {
+                    parse_pid(&process_uuid).map(|pid| CandidateProcess {
+                        thread_id: thread_id.clone(),
+                        log_ts,
+                        pid,
+                    })
+                })
+        })
+        .collect()
+}
+
 fn newest_thread_is_alive(
     conn: &Connection,
     thread_id: &str,
@@ -216,12 +306,10 @@ mod tests {
             self.0.get(&pid).copied()
         }
     }
-
     #[test]
     fn parse_pid_extracts_the_middle_field() {
         assert_eq!(parse_pid("pid:44220:6596caaf-a68f"), Some(44220));
     }
-
     #[test]
     fn parse_pid_rejects_a_non_numeric_or_malformed_value() {
         assert_eq!(parse_pid("pid:not-a-number:x"), None);
@@ -306,6 +394,24 @@ mod tests {
         assert_eq!(
             live_thread_ids(&home, &start_time),
             std::collections::BTreeSet::from(["live".to_string()])
+        );
+    }
+
+    #[test]
+    fn candidate_processes_reads_only_requested_newest_rows() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 1_000, "wanted", Some("pid:100:old"));
+        write_log_row(&home, 2_000, "wanted", Some("pid:200:new"));
+        write_log_row(&home, 3_000, "unwanted", Some("pid:300:x"));
+        let conn = open_read_only(&home.logs_db_path()).unwrap();
+        assert_eq!(
+            newest_candidate_processes(&conn, &["wanted".to_string(), "missing".to_string()]),
+            vec![CandidateProcess {
+                thread_id: "wanted".to_string(),
+                log_ts: 2_000,
+                pid: 200,
+            }]
         );
     }
 
