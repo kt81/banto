@@ -132,7 +132,7 @@ pub fn run(
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
         let superseded = crate::tui::superseded_from_metas(&metas, &store, &superseded_failed);
-        let rows = session::rows_from_metas(metas, claude_home, thresholds);
+        let rows = session::rows_from_metas(metas, claude_home, codex_home, thresholds);
         let rows = crate::tui::exclude_archived(rows, &store);
         let pinned = crate::tui::load_pinned(&store);
         let groups = crate::tui::load_groups(&store);
@@ -1224,7 +1224,7 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     };
     let store = deps.store.borrow();
     let superseded = crate::tui::superseded_from_metas(&metas, &store, deps.superseded_failed);
-    let rows = session::rows_from_metas(metas, deps.claude_home, deps.thresholds);
+    let rows = session::rows_from_metas(metas, deps.claude_home, deps.codex_home, deps.thresholds);
     let rows = crate::tui::exclude_archived(rows, &store);
     let hidden = crate::tui::load_hidden_member_ids(&store);
     let directors = crate::tui::load_directors(&store);

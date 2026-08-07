@@ -254,7 +254,7 @@ pub fn run(
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &superseded_failed);
-        let rows = session::rows_from_metas(metas, claude_home, thresholds);
+        let rows = session::rows_from_metas(metas, claude_home, codex_home.as_ref(), thresholds);
         let rows = exclude_archived(rows, &store);
         let pinned = load_pinned(&store);
         let groups = load_groups(&store);
@@ -1751,7 +1751,12 @@ fn reload(app: &mut App, ctx: &Context) {
     ) {
         let store = ctx.store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);
-        let rows = session::rows_from_metas(metas, &ctx.claude_home, ctx.thresholds);
+        let rows = session::rows_from_metas(
+            metas,
+            &ctx.claude_home,
+            ctx.codex_home.as_ref(),
+            ctx.thresholds,
+        );
         let rows = exclude_archived(rows, &store);
         app.replace_rows(rows);
         app.set_hidden_member_ids(load_hidden_member_ids(&store));

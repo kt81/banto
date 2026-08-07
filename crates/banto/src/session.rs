@@ -12,9 +12,10 @@ use std::time::{Duration, SystemTime};
 use banto_core::config::{ActivityConfig, ResolvedAgents};
 pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
-use banto_core::status::AgeThresholds;
+use banto_core::status::{AgeThresholds, age_bucket};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::live_candidate_thread_ids;
 use banto_io::codex_trust::HookTrustState;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
@@ -146,7 +147,7 @@ pub fn load_rows(
     enabled: &BTreeSet<AgentKind>,
 ) -> Result<Vec<SessionRow>, ProviderError> {
     let metas = discover_all(claude_home, codex_home, enabled)?;
-    Ok(rows_from_metas(metas, claude_home, thresholds))
+    Ok(rows_from_metas(metas, claude_home, codex_home, thresholds))
 }
 
 /// Every session every *enabled* provider knows about, merged (not
@@ -195,18 +196,37 @@ pub fn discover_all(
 pub fn rows_from_metas(
     mut metas: Vec<SessionMeta>,
     claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
     thresholds: &AgeThresholds,
 ) -> Vec<SessionRow> {
     metas.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.id.0.cmp(&b.id.0)));
 
     let live = status::read_live_sessions(&claude_home.sessions_dir());
+    // Codex list activity deliberately stops at alive-or-aged.  Busy exists
+    // in principle (`codex_activity::is_thread_idle` can read a rollout's
+    // task markers) but would add a state-db open plus a tail read growing
+    // toward 4 MiB per row on every debounced reload, so it is a separate
+    // costed slice rather than hidden work here.  Waiting is unavailable:
+    // those markers cannot distinguish a human approval pause from model
+    // generation.  Do not synthesize a Claude `LiveSession` for Codex; its
+    // status vocabulary would imply that unavailable Waiting state.
+    let live_codex = codex_home.map_or_else(BTreeSet::new, |home| {
+        live_candidate_thread_ids(
+            home,
+            metas
+                .iter()
+                .filter(|meta| meta.agent == AgentKind::Codex)
+                .map(|meta| meta.id.0.clone()),
+        )
+    });
     let probe = SysinfoProbe;
     let now = SystemTime::now();
 
     metas
         .into_iter()
         .map(|meta| {
-            let activity = status::classify(&meta, &live, &probe, now, thresholds);
+            let activity =
+                activity_from_observations(&meta, &live, &live_codex, &probe, now, thresholds);
             SessionRow {
                 id: meta.id.0,
                 agent: meta.agent,
@@ -221,6 +241,21 @@ pub fn rows_from_metas(
             }
         })
         .collect()
+}
+
+fn activity_from_observations(
+    meta: &SessionMeta,
+    live_claude: &[banto_io::status::LiveSession],
+    live_codex: &BTreeSet<String>,
+    probe: &SysinfoProbe,
+    now: SystemTime,
+    thresholds: &AgeThresholds,
+) -> Activity {
+    match meta.agent {
+        AgentKind::ClaudeCode => status::classify(meta, live_claude, probe, now, thresholds),
+        AgentKind::Codex if live_codex.contains(&meta.id.0) => Activity::Alive,
+        AgentKind::Codex => Activity::Idle(age_bucket(meta.mtime, now, thresholds)),
+    }
 }
 
 #[cfg(test)]
@@ -591,13 +626,32 @@ mod tests {
         let metas = vec![meta("old", older), meta("new", newer)];
 
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
-        let rows = rows_from_metas(metas, &claude_home, &AgeThresholds::default());
+        let rows = rows_from_metas(metas, &claude_home, None, &AgeThresholds::default());
 
         let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
         assert_eq!(ids, vec!["new".to_string(), "old".to_string()]);
         assert_eq!(rows[0].title.as_deref(), Some("Title new"));
         assert_eq!(rows[0].agent, AgentKind::ClaudeCode);
         assert_eq!(rows[0].size, 42);
+    }
+
+    #[test]
+    fn a_proven_live_codex_session_is_alive_not_aged() {
+        let now = SystemTime::now();
+        let mut codex = meta("codex-live", now - Duration::from_secs(SECS_PER_DAY * 30));
+        codex.agent = AgentKind::Codex;
+        let live_codex = BTreeSet::from(["codex-live".to_string()]);
+        assert_eq!(
+            activity_from_observations(
+                &codex,
+                &[],
+                &live_codex,
+                &SysinfoProbe,
+                now,
+                &AgeThresholds::default(),
+            ),
+            Activity::Alive
+        );
     }
 
     /// Set a file's mtime without pulling in an extra crate: reopen and write
