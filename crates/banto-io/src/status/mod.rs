@@ -38,6 +38,16 @@ use banto_core::status::{AgeThresholds, age_bucket};
 /// itself needs no constant, since anything that isn't one of the two below
 /// already falls through to `Activity::Alive`'s catch-all.
 ///
+/// A third way a session stops for a person was measured separately on
+/// 2.1.224, 2026-08-07, because nothing said it had to behave like the other
+/// two: an MCP server's `elicitation/create`, which Claude Code answers with
+/// an interactive dialog. Polled through a real one — a scratch MCP server
+/// that blocks until answered — the field read `"busy"` as the tool call
+/// started, `"waiting"` for the whole thirteen seconds the dialog was on
+/// screen, and `"idle"` once it was answered. So this needs no MCP-specific
+/// handling, and the reason it needs none is written down rather than
+/// assumed.
+///
 /// `banto::session::activity_tag` also emits the strings `"busy"` and
 /// `"waiting"`, and that is a coincidence, not a shared fact: those are
 /// banto's own `list`-subcommand output vocabulary, keyed off the already-
