@@ -517,6 +517,12 @@ fn run_pending_inplace(
     // see `banto_io::process::mock::MockProcessRunner`'s own doc), so no
     // gate in this repository would catch `STRIPPED_CHILD_ENV_VARS` being
     // dropped from this line. Only re-measurement covers it.
+    //
+    // The emporium's two equivalents no longer have this problem — their
+    // host arrives through `Deps` and a mock can watch what they pass. The
+    // same could be done here and deliberately was not: this is the chōba,
+    // which takes bug fixes and platform parity only (docs/REQUIREMENTS.md,
+    // 2026-07-26), and a seam is neither. It is a live gap, not a solved one.
     let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd, STRIPPED_CHILD_ENV_VARS);
     *terminal = setup_terminal()?;
     ctx.log(&format!("run_pending_inplace child result={result:?}"));

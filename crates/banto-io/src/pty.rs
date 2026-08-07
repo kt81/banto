@@ -384,7 +384,7 @@ impl Killer for PortablePtyKiller {
 /// references it, so it never reaches the linked binary).
 pub mod mock {
     use std::io::{self, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
@@ -426,14 +426,27 @@ pub mod mock {
         /// where a child's exit never closes this side by itself; only
         /// `fire_exit`/`kill` (via `exited`) ever end the session.
         pub unix_style_exit: bool,
-        /// Every `env_remove` list `open` was called with, in call order —
-        /// unlike `argv`/`cwd`/`env`, which this mock still discards, this
-        /// one is recorded so a test can catch a call site silently
-        /// dropping [`super::STRIPPED_CHILD_ENV_VARS`] (a change that would
+        /// Every `env_remove` list `open` was called with, in call order, so
+        /// a test can catch a call site silently dropping
+        /// [`super::STRIPPED_CHILD_ENV_VARS`] — a change that would
         /// otherwise pass every gate in this repo and be caught only by a
-        /// real re-measurement — see that constant's own doc for why it
+        /// real re-measurement (see that constant's own doc for why it
         /// matters).
         pub env_removes: Arc<Mutex<Vec<Vec<String>>>>,
+        /// What each `open` was asked to start, in call order: argv, cwd and
+        /// the environment additions. Recorded for the same reason as
+        /// `env_removes` — a call site that assembles a launch and then hands
+        /// over the wrong one fails no gate otherwise, and the launch is
+        /// where a session's identity, model and briefing all live.
+        pub launches: Arc<Mutex<Vec<MockLaunch>>>,
+    }
+
+    /// One recorded call to [`MockPtyHost::open`].
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct MockLaunch {
+        pub argv: Vec<String>,
+        pub cwd: Option<PathBuf>,
+        pub env: Vec<(String, String)>,
     }
 
     impl MockPtyHost {
@@ -459,9 +472,9 @@ pub mod mock {
     impl PtyHost for MockPtyHost {
         fn open(
             &self,
-            _argv: &[String],
-            _cwd: Option<&Path>,
-            _env: &[(String, String)],
+            argv: &[String],
+            cwd: Option<&Path>,
+            env: &[(String, String)],
             env_remove: &[&str],
             _rows: u16,
             _cols: u16,
@@ -470,6 +483,11 @@ pub mod mock {
                 .lock()
                 .unwrap()
                 .push(env_remove.iter().map(|s| s.to_string()).collect());
+            self.launches.lock().unwrap().push(MockLaunch {
+                argv: argv.to_vec(),
+                cwd: cwd.map(Path::to_path_buf),
+                env: env.to_vec(),
+            });
             let (tx, rx) = mpsc::channel();
             // Sent synchronously, before `open` returns: a caller's very
             // first `poll()` must see it, not race a background thread.
