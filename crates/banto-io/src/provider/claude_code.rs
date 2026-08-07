@@ -1198,7 +1198,7 @@ mod tests {
             "{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
         );
 
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let uncached = discover_sorted(&root);
         let first = discover_cached_sorted(&root, &cache);
         let second = discover_cached_sorted(&root, &cache);
@@ -1218,7 +1218,7 @@ mod tests {
         let first_line = "{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n";
         let path = write_session(&root, "proj", "s1.jsonl", first_line);
 
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         assert_eq!(
             discover_cached_sorted(&root, &cache)[0].title.as_deref(),
             Some("hello")
@@ -1246,7 +1246,7 @@ mod tests {
             "{\"type\":\"custom-title\",\"customTitle\":\"one\"}\n",
         );
 
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         assert_eq!(discover_cached_sorted(&root, &cache).len(), 1);
 
         fs::remove_file(&path).unwrap();
@@ -1269,7 +1269,7 @@ mod tests {
         let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         set_mtime(&path, frozen);
 
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         assert_eq!(
             discover_cached_sorted(&root, &cache)[0].title.as_deref(),
             Some("one")
