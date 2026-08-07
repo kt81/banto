@@ -17,6 +17,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use super::cache::{MetaCache, Parsed};
 use super::{ProviderError, SessionProvider};
 use crate::claude_home::ClaudeHome;
 use banto_core::model::{AgentKind, SessionId, SessionMeta};
@@ -50,14 +51,20 @@ impl ClaudeCodeProvider {
     pub fn new(claude_home: ClaudeHome) -> Self {
         Self { claude_home }
     }
-}
 
-impl SessionProvider for ClaudeCodeProvider {
-    fn name(&self) -> AgentKind {
-        AgentKind::ClaudeCode
+    /// [`SessionProvider::discover`], with the parse of each unchanged file
+    /// answered from `cache` instead of repeated. Same walk, same stats, same
+    /// results — see [`cache`] for why a memo cannot change the answer.
+    ///
+    /// Separate from the trait method rather than a field on the provider
+    /// because a provider is built per call at the discovery entry point,
+    /// while the cache has to outlive every reload; the caller that owns the
+    /// loop owns the cache, and hands it in.
+    pub fn discover_cached(&self, cache: &MetaCache) -> Result<Vec<SessionMeta>, ProviderError> {
+        self.walk(Some(cache))
     }
 
-    fn discover(&self) -> Result<Vec<SessionMeta>, ProviderError> {
+    fn walk(&self, cache: Option<&MetaCache>) -> Result<Vec<SessionMeta>, ProviderError> {
         let projects = self.claude_home.projects_dir();
         let entries = match fs::read_dir(&projects) {
             Ok(entries) => entries,
@@ -66,6 +73,7 @@ impl SessionProvider for ClaudeCodeProvider {
             Err(err) => return Err(ProviderError::Io(err)),
         };
 
+        let mut memo = cache.and_then(MetaCache::walk);
         let mut sessions = Vec::new();
         for project in entries {
             let Ok(project) = project else { continue };
@@ -79,12 +87,32 @@ impl SessionProvider for ClaudeCodeProvider {
             };
             for file in files {
                 let Ok(file) = file else { continue };
-                if let Some(meta) = read_session(&file.path()) {
+                let path = file.path();
+                let Some((mtime, size)) = stat_session(&path) else {
+                    continue;
+                };
+                let meta = match &mut memo {
+                    Some(memo) => {
+                        memo.parsed(&path, mtime, size, || parse_session(&path, mtime, size))
+                    }
+                    None => parse_session(&path, mtime, size).into_answer(),
+                };
+                if let Some(meta) = meta {
                     sessions.push(meta);
                 }
             }
         }
         Ok(sessions)
+    }
+}
+
+impl SessionProvider for ClaudeCodeProvider {
+    fn name(&self) -> AgentKind {
+        AgentKind::ClaudeCode
+    }
+
+    fn discover(&self) -> Result<Vec<SessionMeta>, ProviderError> {
+        self.walk(None)
     }
 
     fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
@@ -139,49 +167,84 @@ impl SessionProvider for ClaudeCodeProvider {
     }
 }
 
-/// Build a [`SessionMeta`] for one candidate path, or `None` if the entry
-/// is not a readable, non-empty `.jsonl` file.
-fn read_session(path: &Path) -> Option<SessionMeta> {
+/// The half of session reading a `stat` can decide: whether this entry is a
+/// non-empty `.jsonl` file at all, and the `(mtime, size)` that [`cache`]
+/// keys a parse by. Cheap — the whole walk's worth of these is a few
+/// milliseconds, against tens for the parsing they gate.
+///
+/// Says nothing about whether the file can be *opened*: that is not a fact
+/// about the file's content and must not end up in the key (see [`cache`]'s
+/// "only what was read is remembered").
+fn stat_session(path: &Path) -> Option<(SystemTime, u64)> {
     if !path.extension().is_some_and(|ext| ext == "jsonl") {
         return None;
     }
-    if !path.is_file() {
-        return None;
-    }
-    let id = path.file_stem()?.to_str()?.to_string();
     let metadata = fs::metadata(path).ok()?;
-    if metadata.len() == 0 {
+    if !metadata.is_file() || metadata.len() == 0 {
         return None;
     }
-    let mtime = metadata.modified().ok()?;
-    let head = read_head(path, HEAD_CAP_BYTES).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+/// Build a [`SessionMeta`] for one candidate path already accepted by
+/// [`stat_session`], and say whether the answer is one a memo may keep.
+///
+/// Everything the result depends on is the path or the key: the path names
+/// the session and becomes `source_path`, and `mtime`/`size` are the stat's
+/// own, passed in rather than read again so the stored values are the ones
+/// the key describes. The exception is whether the file could be read at all,
+/// which is why this returns [`Parsed`] instead of an `Option` — an
+/// unreadable transcript and one that says nothing are the same answer today
+/// and different answers tomorrow.
+fn parse_session(path: &Path, mtime: SystemTime, size: u64) -> Parsed {
+    // A name banto cannot turn into a session id is a fact about the path,
+    // and the path is part of the key.
+    let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Parsed::Settled(None);
+    };
+    let Ok(head) = read_head(path, HEAD_CAP_BYTES) else {
+        return Parsed::Provisional(None);
+    };
     let mut fields = extract_head_fields(&head);
     // A rename can append a fresh custom-title record well past the head; a
     // bounded tail read catches the latest one without scanning the whole
     // file. Skipped when the head read already covered the whole file.
-    if metadata.len() > HEAD_CAP_BYTES
-        && let Ok(tail) = read_tail(path, TAIL_CAP_BYTES)
-        && let Some(latest) = latest_custom_title(&tail)
-    {
-        fields.custom_title = Some(latest);
+    let mut settled = true;
+    if size > HEAD_CAP_BYTES {
+        match read_tail(path, TAIL_CAP_BYTES) {
+            Ok(tail) => {
+                if let Some(latest) = latest_custom_title(&tail) {
+                    fields.custom_title = Some(latest);
+                }
+            }
+            // The head still yields a usable row, and that is what this
+            // returns — but a title the tail would have overridden is a title
+            // this parse did not get to see, so it is not one to remember.
+            Err(_) => settled = false,
+        }
     }
     let title = fields.title();
     let preview = fields.preview();
-    Some(SessionMeta {
-        id: SessionId(id),
+    let meta = Some(SessionMeta {
+        id: SessionId(id.to_string()),
         agent: AgentKind::ClaudeCode,
         title,
         cwd: fields.cwd,
         source_path: path.to_path_buf(),
         mtime,
-        size: metadata.len(),
+        size,
         is_agent: fields.is_agent,
         preview,
         continuation_of_uuid: fields.continuation_of_uuid,
         // No equivalent signal exists yet — see SessionMeta::source_archived's
         // doc for why false, not a guess, is the correct value here.
         source_archived: false,
-    })
+    });
+    if settled {
+        Parsed::Settled(meta)
+    } else {
+        Parsed::Provisional(meta)
+    }
 }
 
 /// Read at most `cap` bytes from the head of `path` as lossy UTF-8.
@@ -1104,5 +1167,124 @@ mod tests {
 
         let sessions = discover_sorted(&root);
         assert_eq!(sessions[0].title.as_deref(), Some("only title"));
+    }
+
+    // --- the memoized walk (see `super::super::cache`) --------------------
+    //
+    // The cache's own tests drive it with closures; these drive it through
+    // real files, which is the only place the two halves of the split
+    // (`stat_session` forming a key, `parse_session` deciding whether the
+    // answer is one to keep) meet a filesystem.
+
+    fn discover_cached_sorted(root: &TempDir, cache: &MetaCache) -> Vec<SessionMeta> {
+        let mut sessions = provider(root).discover_cached(cache).unwrap();
+        sessions.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        sessions
+    }
+
+    #[test]
+    fn a_cached_walk_returns_what_an_uncached_one_does() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            "{\"type\":\"custom-title\",\"customTitle\":\"one\",\"cwd\":\"/tmp/one\"}\n",
+        );
+        write_session(
+            &root,
+            "other",
+            "s2.jsonl",
+            "{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
+        );
+
+        let cache = MetaCache::new();
+        let uncached = discover_sorted(&root);
+        let first = discover_cached_sorted(&root, &cache);
+        let second = discover_cached_sorted(&root, &cache);
+
+        assert_eq!(first, uncached);
+        assert_eq!(second, uncached, "the second walk is the memoized one");
+    }
+
+    /// A session gaining a record — the ordinary case, and the one the memo
+    /// must never answer for. The appended record is a `custom-title` over a
+    /// session that had only a user message to be named by, because that is
+    /// what a second walk can actually be seen to have re-read: within the
+    /// head, an *earlier* custom-title already wins over a later one.
+    #[test]
+    fn an_appended_session_is_read_again_rather_than_remembered() {
+        let root = TempDir::new().unwrap();
+        let first_line = "{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n";
+        let path = write_session(&root, "proj", "s1.jsonl", first_line);
+
+        let cache = MetaCache::new();
+        assert_eq!(
+            discover_cached_sorted(&root, &cache)[0].title.as_deref(),
+            Some("hello")
+        );
+
+        fs::write(
+            &path,
+            format!("{first_line}{{\"type\":\"custom-title\",\"customTitle\":\"renamed\"}}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_cached_sorted(&root, &cache)[0].title.as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[test]
+    fn a_session_that_disappears_is_not_answered_from_the_cache() {
+        let root = TempDir::new().unwrap();
+        let path = write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            "{\"type\":\"custom-title\",\"customTitle\":\"one\"}\n",
+        );
+
+        let cache = MetaCache::new();
+        assert_eq!(discover_cached_sorted(&root, &cache).len(), 1);
+
+        fs::remove_file(&path).unwrap();
+        assert!(discover_cached_sorted(&root, &cache).is_empty());
+    }
+
+    /// A file rewritten to a different length under a preserved mtime — the
+    /// half of the key that catches a same-length rewrite is not the half
+    /// doing the work here. Uses the same `set_mtime` helper the mtime tests
+    /// above use, because a plain rewrite would move both.
+    #[test]
+    fn a_rewrite_that_only_moves_the_size_is_still_noticed() {
+        let root = TempDir::new().unwrap();
+        let path = write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            "{\"type\":\"custom-title\",\"customTitle\":\"one\"}\n",
+        );
+        let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        set_mtime(&path, frozen);
+
+        let cache = MetaCache::new();
+        assert_eq!(
+            discover_cached_sorted(&root, &cache)[0].title.as_deref(),
+            Some("one")
+        );
+
+        fs::write(
+            &path,
+            "{\"type\":\"custom-title\",\"customTitle\":\"one and a half\"}\n",
+        )
+        .unwrap();
+        set_mtime(&path, frozen);
+
+        assert_eq!(
+            discover_cached_sorted(&root, &cache)[0].title.as_deref(),
+            Some("one and a half")
+        );
     }
 }

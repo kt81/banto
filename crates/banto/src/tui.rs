@@ -249,7 +249,13 @@ pub fn run(
     // Computed before `resolved_agents.enabled` moves below.
     let agents_notice = session::agents_ignored_notice(&resolved_agents);
     let enabled_agents = resolved_agents.enabled;
-    let metas = session::discover_all(claude_home, codex_home.as_ref(), &enabled_agents)?;
+    // Uncached here and in [`reload`], unlike the emporium — not because the
+    // chōba would not benefit (it reloads off the same `LiveWatch` and the
+    // same debounce, so it re-parses the same unchanged files just as often),
+    // but because carrying parses between reloads is new capability, and the
+    // chōba takes bug fixes and platform parity only (docs/REQUIREMENTS.md,
+    // 2026-07-26 decision).
+    let metas = session::discover_all(claude_home, codex_home.as_ref(), &enabled_agents, None)?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
@@ -1748,6 +1754,7 @@ fn reload(app: &mut App, ctx: &Context) {
         &ctx.claude_home,
         ctx.codex_home.as_ref(),
         &ctx.enabled_agents,
+        None,
     ) {
         let store = ctx.store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &ctx.superseded_failed);

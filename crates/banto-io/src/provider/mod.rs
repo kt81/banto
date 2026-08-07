@@ -3,7 +3,13 @@
 //! [`SessionProvider`] abstracts the agent product whose sessions we index:
 //! Claude Code ([`claude_code`], tolerant JSONL parsing) and Codex
 //! ([`codex`], a sqlite index).
+//!
+//! [`cache`] memoizes the first one's parsing across reloads. It is not part
+//! of the trait: Codex discovery reads a sqlite index rather than parsing
+//! every session's text, and costs a couple of milliseconds for the whole
+//! set, so there is nothing there worth remembering.
 
+pub mod cache;
 pub mod claude_code;
 pub mod codex;
 

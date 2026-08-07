@@ -60,6 +60,7 @@ use banto_io::codex_activity;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
+use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::{PortablePtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
@@ -118,7 +119,11 @@ pub fn run(
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    let metas = session::discover_all(claude_home, codex_home, enabled_agents)?;
+    // Same lifetime and the same reason as `superseded_failed` below: created
+    // once here so the bootstrap walk's parses are already in it when the
+    // loop's first `gather_reload` runs a second later.
+    let meta_cache = MetaCache::new();
+    let metas = session::discover_all(claude_home, codex_home, enabled_agents, Some(&meta_cache))?;
     // In-memory only, for this process's lifetime — see
     // `crate::tui::superseded_from_metas`'s doc. Created once here and
     // threaded through every reload (the bootstrap below and every later
@@ -198,6 +203,7 @@ pub fn run(
         thresholds,
         store,
         superseded_failed: &superseded_failed,
+        meta_cache: &meta_cache,
         brigade,
         agent_binaries,
         enabled_agents,
@@ -260,6 +266,12 @@ struct Deps<'a> {
     /// See [`crate::tui::superseded_from_metas`]'s doc: in-memory only, for
     /// this process's lifetime.
     superseded_failed: &'a RefCell<HashSet<SessionId>>,
+    /// Transcript parses carried between reloads (`banto_io::provider::cache`).
+    /// Measured here: the watcher fires with as little as half a second
+    /// between reloads, almost always because a session banto does not own
+    /// wrote a line to its transcript, while barely one file per interval is
+    /// one whose parse could have changed.
+    meta_cache: &'a MetaCache,
     /// `[brigade]` from config.toml. Lives here rather than as its own
     /// `event_loop` parameter because `execute_cmd` needs it too now (a
     /// member's launch argv carries its role briefing — see
@@ -1218,8 +1230,12 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
 /// lineage-resolution budget against the same discover() pass (see
 /// [`crate::tui::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(metas) = session::discover_all(deps.claude_home, deps.codex_home, deps.enabled_agents)
-    else {
+    let Ok(metas) = session::discover_all(
+        deps.claude_home,
+        deps.codex_home,
+        deps.enabled_agents,
+        Some(deps.meta_cache),
+    ) else {
         return Vec::new();
     };
     let store = deps.store.borrow();
@@ -2649,6 +2665,7 @@ mod tests {
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let mut discovery = Vec::new();
         let superseded_failed = RefCell::new(HashSet::new());
+        let meta_cache = MetaCache::new();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2660,6 +2677,7 @@ mod tests {
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            meta_cache: &meta_cache,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2710,6 +2728,7 @@ mod tests {
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let mut discovery = Vec::new();
         let superseded_failed = RefCell::new(HashSet::new());
+        let meta_cache = MetaCache::new();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2721,6 +2740,7 @@ mod tests {
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            meta_cache: &meta_cache,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2757,6 +2777,7 @@ mod tests {
         let mut discovery = Vec::new();
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let superseded_failed = RefCell::new(HashSet::new());
+        let meta_cache = MetaCache::new();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2768,6 +2789,7 @@ mod tests {
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            meta_cache: &meta_cache,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2800,6 +2822,7 @@ mod tests {
         let mut discovery = Vec::new();
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let superseded_failed = RefCell::new(HashSet::new());
+        let meta_cache = MetaCache::new();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2811,6 +2834,7 @@ mod tests {
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            meta_cache: &meta_cache,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4196,6 +4220,7 @@ mod tests {
             id
         };
         let superseded_failed = RefCell::new(HashSet::new());
+        let meta_cache = MetaCache::new();
         let thresholds = AgeThresholds::default();
         let config = BrigadeConfig {
             director_prompt: "I am {token}; my team is {peers}".to_string(),
@@ -4215,6 +4240,7 @@ mod tests {
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            meta_cache: &meta_cache,
             brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4261,6 +4287,7 @@ mod tests {
             id
         };
         let superseded_failed = RefCell::new(HashSet::new());
+        let meta_cache = MetaCache::new();
         let thresholds = AgeThresholds::default();
         let config = BrigadeConfig {
             // The Director's own template happens to contain the literal
@@ -4279,6 +4306,7 @@ mod tests {
             thresholds: &thresholds,
             store: &store,
             superseded_failed: &superseded_failed,
+            meta_cache: &meta_cache,
             brigade: &config,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
