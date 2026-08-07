@@ -75,6 +75,19 @@ impl CodexHome {
         self.0.join("sessions")
     }
 
+    /// `<root>/packages/standalone/current/codex-package.json`: the package
+    /// manifest selected by Codex's current standalone release link.
+    pub fn standalone_current_package_path(&self) -> PathBuf {
+        self.0
+            .join("packages/standalone/current/codex-package.json")
+    }
+
+    /// `<root>/packages/standalone/releases`: Codex's upstream standalone
+    /// release history.  Each child directory is one retained release.
+    pub fn standalone_releases_dir(&self) -> PathBuf {
+        self.0.join("packages/standalone/releases")
+    }
+
     /// `<root>/config.toml`: Codex's own settings file, including the
     /// `[hooks.state]` trust records [`crate::codex_trust`] reads. Read-only,
     /// like every other accessor here — invariant 1 extends to `~/.codex`.
@@ -102,6 +115,14 @@ mod tests {
         assert_eq!(
             home.rollout_dir(),
             PathBuf::from("/synthetic/codex-home/sessions")
+        );
+        assert_eq!(
+            home.standalone_current_package_path(),
+            PathBuf::from("/synthetic/codex-home/packages/standalone/current/codex-package.json")
+        );
+        assert_eq!(
+            home.standalone_releases_dir(),
+            PathBuf::from("/synthetic/codex-home/packages/standalone/releases")
         );
         assert_eq!(
             home.config_path(),

@@ -46,6 +46,7 @@ mod wrap;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -53,12 +54,19 @@ use clap::{Parser, Subcommand};
 use banto_core::config::Config;
 use banto_core::model::{AgentKind, BrigadeRole};
 use banto_core::status::AgeThresholds;
+use banto_io::agent_versions::{
+    read_claude_last_auto_update, read_codex_current_version, read_codex_release_history,
+    read_codex_session_version,
+};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
+use banto_io::codex_liveness::{SysinfoStartTime, live_thread_ids};
 use banto_io::config;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::SystemProcessRunner;
+use banto_io::provider::SessionProvider;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::provider::codex::CodexProvider;
 use banto_io::store::Store;
 
 use session::{activity_tag, load_rows, thresholds_from};
@@ -99,6 +107,9 @@ struct Cli {
 enum Command {
     /// Print all sessions as plain text (newest first), one per line.
     List,
+    /// Pull and print agent version facts retained by Claude Code and Codex.
+    /// This never changes banto's session list, tiles, or sidebar.
+    Versions,
     /// Internal: supervises a resumed or brand-new session's process. The
     /// opener spawns this; it is not meant to be invoked directly.
     #[command(name = "_wrap", hide = true)]
@@ -208,6 +219,11 @@ fn main() -> Result<()> {
                 &thresholds,
                 &resolved_agents.enabled,
             )
+        }
+        Some(Command::Versions) => {
+            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+            let codex_home = resolve_codex_home(cli.codex_home, &config);
+            run_versions(&claude_home, codex_home.as_ref())
         }
         Some(Command::Wrap {
             session,
@@ -387,4 +403,149 @@ fn run_list(
         );
     }
     Ok(())
+}
+
+/// `banto versions`: a deliberately pull-only juxtaposition of upstream
+/// version facts.  It does not persist a second ledger: Codex retains its
+/// release history itself, while Claude retains only its most recent
+/// automatic-update result.
+fn run_versions(claude_home: &ClaudeHome, codex_home: Option<&CodexHome>) -> Result<()> {
+    println!("Claude Code");
+    match read_claude_last_auto_update(&claude_home.last_update_result_path()) {
+        Some(update) => {
+            let from = update.version_from.as_deref().unwrap_or("unknown");
+            let to = update.version_to.as_deref().unwrap_or("unknown");
+            println!(
+                "  last auto-update attempt by a Claude Code binary: {from} -> {to} at {}",
+                update.timestamp
+            );
+        }
+        None => println!("  last auto-update attempt by a Claude Code binary: unknown"),
+    }
+    println!(
+        "  history before that last hop is not retained upstream; banto does not fabricate it."
+    );
+    println!(
+        "  currently running session versions (not listed means no live process was detected):"
+    );
+    let live = banto_io::status::read_live_sessions(&claude_home.sessions_dir());
+    if live.is_empty() {
+        println!("    none detected");
+    }
+    for session in live {
+        let id = session
+            .session_id
+            .unwrap_or_else(|| format!("pid {}", session.pid));
+        println!(
+            "    {id}: {}",
+            session.version.as_deref().unwrap_or("unknown")
+        );
+    }
+
+    println!("Codex");
+    let Some(codex_home) = codex_home else {
+        println!("  current standalone package: unknown");
+        println!("  release history: unavailable (no Codex home)");
+        println!("  session versions: unknown");
+        return Ok(());
+    };
+    match read_codex_current_version(&codex_home.standalone_current_package_path()) {
+        Some(version) => println!("  current standalone package: {version}"),
+        None => println!("  current standalone package: unknown"),
+    }
+    println!("  retained standalone release history (landed on this machine):");
+    let releases = read_codex_release_history(&codex_home.standalone_releases_dir());
+    if releases.is_empty() {
+        println!("    unknown");
+    } else {
+        for release in releases {
+            println!(
+                "    {} at {}",
+                release.version,
+                format_timestamp(release.modified)
+            );
+        }
+    }
+    println!(
+        "  currently running session CLI versions (not listed means no live process was detected):"
+    );
+    // This is intentionally not `gather_reload`/discovery work.  Codex
+    // discovery reads its sqlite index and only metadata of each rollout;
+    // this pull reads a rollout head solely to expose session_meta.cli_version.
+    let metas = CodexProvider::new(codex_home.clone())
+        .discover()
+        .unwrap_or_default();
+    // Resolve liveness in one logs-db connection, then pay rollout-head I/O
+    // only for the small running subset rather than every retained session.
+    let live_codex = live_thread_ids(codex_home, &SysinfoStartTime);
+    let has_codex_sessions = metas
+        .iter()
+        .any(|meta| meta.agent == AgentKind::Codex && live_codex.contains(&meta.id.0));
+    for meta in metas
+        .into_iter()
+        .filter(|meta| meta.agent == AgentKind::Codex && live_codex.contains(&meta.id.0))
+    {
+        let version =
+            read_codex_session_version(&meta.source_path).unwrap_or_else(|| "unknown".into());
+        println!("    {}: {version}", meta.id);
+    }
+    if !has_codex_sessions {
+        println!("    none detected");
+    }
+    Ok(())
+}
+
+fn format_timestamp(time: Option<SystemTime>) -> String {
+    let Some(duration) = time.and_then(|time| time.duration_since(UNIX_EPOCH).ok()) else {
+        return "unknown".to_string();
+    };
+    let seconds = duration.as_secs();
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_date_from_unix_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60
+    )
+}
+
+/// Gregorian civil date for a count of whole days since 1970-01-01.
+/// Kept local instead of adding a time-formatting dependency for one
+/// pull-only display line.
+fn civil_date_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_prime = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (year + i64::from(month <= 2), month as u32, day as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn formats_release_time_as_an_iso_utc_timestamp() {
+        assert_eq!(
+            format_timestamp(Some(UNIX_EPOCH + Duration::from_secs(1_786_066_319))),
+            "2026-08-07T01:31:59Z"
+        );
+    }
+
+    #[test]
+    fn pre_epoch_release_time_is_unknown() {
+        assert_eq!(
+            format_timestamp(Some(UNIX_EPOCH - Duration::from_secs(1))),
+            "unknown"
+        );
+    }
 }

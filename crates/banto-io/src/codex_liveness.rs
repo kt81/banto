@@ -25,7 +25,9 @@
 //! (cross-checked via `Win32_Process`), and three finished sessions'
 //! newest rows named three dead pids.
 
-use rusqlite::OptionalExtension;
+use std::collections::BTreeSet;
+
+use rusqlite::{Connection, OptionalExtension};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::codex_home::CodexHome;
@@ -101,6 +103,41 @@ pub fn is_thread_alive(
     let Ok(conn) = open_read_only(&db_path) else {
         return false;
     };
+    newest_thread_is_alive(&conn, thread_id, start_time)
+}
+
+/// Every thread for which Codex's log database can currently prove a live
+/// process.  Opens the database once for a pull that needs to inspect many
+/// sessions, rather than repeating the connection setup per row.
+pub fn live_thread_ids(
+    codex_home: &CodexHome,
+    start_time: &dyn ProcessStartTime,
+) -> BTreeSet<String> {
+    let db_path = codex_home.logs_db_path();
+    if !db_path.exists() {
+        return BTreeSet::new();
+    }
+    let Ok(conn) = open_read_only(&db_path) else {
+        return BTreeSet::new();
+    };
+    let Ok(mut statement) = conn.prepare(
+        "SELECT DISTINCT thread_id FROM logs WHERE thread_id IS NOT NULL AND process_uuid IS NOT NULL",
+    ) else {
+        return BTreeSet::new();
+    };
+    let Ok(ids) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return BTreeSet::new();
+    };
+    ids.flatten()
+        .filter(|thread_id| newest_thread_is_alive(&conn, thread_id, start_time))
+        .collect()
+}
+
+fn newest_thread_is_alive(
+    conn: &Connection,
+    thread_id: &str,
+    start_time: &dyn ProcessStartTime,
+) -> bool {
     let newest: Option<(i64, String)> = conn
         .query_row(
             "SELECT ts, process_uuid FROM logs \
@@ -257,6 +294,19 @@ mod tests {
         write_log_row(&home, 2_000, "thread-1", None); // newest, but no pid info
         let start_time = MockStartTime(HashMap::from([(100, 500)]));
         assert!(is_thread_alive(&home, "thread-1", &start_time));
+    }
+
+    #[test]
+    fn live_thread_ids_collects_only_threads_with_a_live_current_process() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 1_000, "live", Some("pid:100:x"));
+        write_log_row(&home, 1_000, "dead", Some("pid:200:x"));
+        let start_time = MockStartTime(HashMap::from([(100, 900)]));
+        assert_eq!(
+            live_thread_ids(&home, &start_time),
+            std::collections::BTreeSet::from(["live".to_string()])
+        );
     }
 
     #[test]

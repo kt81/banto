@@ -59,6 +59,14 @@ impl ClaudeHome {
         self.0.join("sessions")
     }
 
+    /// `<root>/.last-update-result.json`: Claude Code's record of its most
+    /// recent automatic update attempt.  This is not an installed-version
+    /// probe; see [`crate::agent_versions`] for that deliberately narrower
+    /// fact.
+    pub fn last_update_result_path(&self) -> PathBuf {
+        self.0.join(".last-update-result.json")
+    }
+
     /// `~/.claude.json`: Claude Code's own project registry (workspace trust
     /// among other things — see `crate::directory_trust`), a *sibling* of
     /// `<root>` rather than nested under it (the real file sits beside
@@ -91,6 +99,10 @@ mod tests {
         assert_eq!(
             home.sessions_dir(),
             PathBuf::from("/synthetic/claude-home/sessions")
+        );
+        assert_eq!(
+            home.last_update_result_path(),
+            PathBuf::from("/synthetic/claude-home/.last-update-result.json")
         );
         assert_eq!(
             home.trust_registry_path(),

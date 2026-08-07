@@ -3,6 +3,7 @@
 //! this crate (`docs/DISCIPLINE.md` §2); this crate depends on it.
 //!
 //! Module map:
+//! - [`agent_versions`] pull-only readers for upstream agent-version facts
 //! - [`claude_home`] the root Claude Code stores its state under, plus its subdirs
 //! - [`codex_activity`] whether a Codex session is busy or idle right now (the relay engine's Codex-side signal)
 //! - [`codex_home`] the root the Codex CLI stores its state under: threads/logs db, rollout tree
@@ -20,6 +21,7 @@
 //! - [`store`]   sqlite: groups/pins/archived, brigades, session<->pane map
 //! - [`watch`]   filesystem watching (notify) for live TUI updates
 
+pub mod agent_versions;
 pub mod claude_home;
 pub mod codex_activity;
 pub mod codex_home;

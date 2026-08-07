@@ -38,6 +38,12 @@ pub struct LiveSession {
     /// or unrecognized value degrades to `None` rather than to a parse
     /// error.
     pub proc_start: Option<String>,
+    /// Version of the Claude binary running this session (JSON key
+    /// `version`, observed 2026-08-07).  The live-state writer keeps this
+    /// session fact stable across status rewrites, so it can differ from an
+    /// update now present on disk; it is intentionally not rendered by the
+    /// TUI.
+    pub version: Option<String>,
 }
 
 /// Raw serde target. Unknown fields are ignored (serde default behavior);
@@ -53,6 +59,7 @@ struct RawLiveSession {
     kind: Option<String>,
     name: Option<String>,
     proc_start: Option<String>,
+    version: Option<String>,
 }
 
 /// Read every `*.json` file in `sessions_dir` as a [`LiveSession`].
@@ -94,6 +101,7 @@ fn parse_live_session_file(path: &Path) -> Option<LiveSession> {
         kind: raw.kind,
         name: raw.name,
         proc_start: raw.proc_start,
+        version: raw.version,
     })
 }
 
@@ -126,7 +134,8 @@ mod tests {
                 "status": "busy",
                 "kind": "interactive",
                 "name": "fixture session",
-                "procStart": "1105463"
+                "procStart": "1105463",
+                "version": "2.1.224"
             }"#,
         );
 
@@ -141,6 +150,7 @@ mod tests {
                 kind: Some("interactive".into()),
                 name: Some("fixture session".into()),
                 proc_start: Some("1105463".into()),
+                version: Some("2.1.224".into()),
             }]
         );
     }
@@ -207,6 +217,7 @@ mod tests {
                 kind: None,
                 name: None,
                 proc_start: None,
+                version: None,
             }]
         );
     }
