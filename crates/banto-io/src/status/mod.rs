@@ -22,6 +22,7 @@ mod probe;
 pub use live::{LiveSession, read_live_sessions};
 pub use probe::{ProcessProbe, SysinfoProbe, ancestry_reaches};
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use banto_core::model::{Activity, SessionMeta};
@@ -64,13 +65,34 @@ pub fn classify(
     now: SystemTime,
     thresholds: &AgeThresholds,
 ) -> Activity {
+    let alive_pids = live
+        .iter()
+        .filter(|entry| entry.session_id.as_deref() == Some(meta.id.0.as_str()))
+        .filter(|entry| probe.is_alive(entry.pid))
+        .map(|entry| entry.pid)
+        .collect();
+    classify_from_alive_pids(meta, live, &alive_pids, now, thresholds)
+}
+
+/// The one activity decision, supplied with a snapshot of alive PIDs.
+///
+/// The set is taken rather than probed here so one list pass can obtain it
+/// through a single batched system refresh.  [`classify`] is the point-query
+/// compatibility shim for existing callers and mocks.
+pub fn classify_from_alive_pids(
+    meta: &SessionMeta,
+    live: &[LiveSession],
+    alive_pids: &HashSet<u32>,
+    now: SystemTime,
+    thresholds: &AgeThresholds,
+) -> Activity {
     let mut any_alive = false;
     let mut any_waiting = false;
     for entry in live {
         if entry.session_id.as_deref() != Some(meta.id.0.as_str()) {
             continue;
         }
-        if !probe.is_alive(entry.pid) {
+        if !alive_pids.contains(&entry.pid) {
             continue;
         }
         if entry.status.as_deref() == Some(LIVE_STATUS_BUSY) {
