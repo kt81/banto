@@ -162,6 +162,7 @@ mod tests {
             kind: None,
             name: None,
             proc_start: None,
+            version: None,
         }
     }
 
