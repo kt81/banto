@@ -62,7 +62,7 @@ use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
-use banto_io::pty::{PortablePtyHost, STRIPPED_CHILD_ENV_VARS};
+use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
     LIVE_STATUS_BUSY, LIVE_STATUS_WAITING, LiveSession, ProcessProbe, SysinfoProbe,
     ancestry_reaches, read_live_sessions,
@@ -204,6 +204,7 @@ pub fn run(
         store,
         superseded_failed: &superseded_failed,
         meta_cache: &meta_cache,
+        pty_host: &PortablePtyHost,
         brigade,
         agent_binaries,
         enabled_agents,
@@ -272,6 +273,17 @@ struct Deps<'a> {
     /// wrote a line to its transcript, while barely one file per interval is
     /// one whose parse could have changed.
     meta_cache: &'a MetaCache,
+    /// What actually starts a child. `&PortablePtyHost` in a real run; a
+    /// mock in a test, which is the whole point of it being here.
+    ///
+    /// It used to be named at each call site instead, and that made the two
+    /// lines that open a pane unreachable by any test in this repository —
+    /// including the argument that strips `CLAUDE_CODE_CHILD_SESSION`, which
+    /// `cf519a7` had to establish by re-measuring a live `claude` because
+    /// nothing else could see it. Every `Cmd::OpenEmbedded` the core
+    /// produces, from any of its producers, funnels through one of those
+    /// calls.
+    pty_host: &'a dyn PtyHost,
     /// `[brigade]` from config.toml. Lives here rather than as its own
     /// `event_loop` parameter because `execute_cmd` needs it too now (a
     /// member's launch argv carries its role briefing — see
@@ -737,15 +749,8 @@ fn execute_open_codex_trust_pane(
     };
     let argv = crate::codex_trust::trust_argv(&exe, deps.agent_binaries);
     let cwd = std::env::current_dir().ok();
-    // `&PortablePtyHost` is hardcoded here, not taken from `deps` — no mock
-    // ever reaches this call, so no gate in this repository would catch
-    // `STRIPPED_CHILD_ENV_VARS` being dropped from this specific line;
-    // `PtyHandle::open`'s own test coverage confirms it forwards whatever
-    // `env_remove` it's given, but not that this call site keeps passing
-    // it. Only re-measurement covers this one, same as `run_pending_inplace`'s
-    // call into `SystemProcessRunner::run_in` (`crate::tui`).
     match PtyHandle::open(
-        &PortablePtyHost,
+        deps.pty_host,
         &argv,
         cwd.as_deref(),
         &[],
@@ -948,12 +953,8 @@ fn execute_open_embedded(
     let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
     let env = brigade_env(brigade.as_ref());
     // Size is corrected on this same tick's resize pass, once staged.
-    // Same caveat as `execute_open_codex_trust_pane`'s own call: `deps`
-    // carries no `PtyHost`, `&PortablePtyHost` is hardcoded, and no test in
-    // this repository can observe `STRIPPED_CHILD_ENV_VARS` being dropped
-    // from this line — only re-measurement does.
     match PtyHandle::open(
-        &PortablePtyHost,
+        deps.pty_host,
         &argv,
         Some(&target.cwd),
         &env,
@@ -2666,6 +2667,7 @@ mod tests {
         let mut discovery = Vec::new();
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2678,6 +2680,7 @@ mod tests {
             store: &store,
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
+            pty_host: &pty_host,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2729,6 +2732,7 @@ mod tests {
         let mut discovery = Vec::new();
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2741,6 +2745,7 @@ mod tests {
             store: &store,
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
+            pty_host: &pty_host,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2778,6 +2783,7 @@ mod tests {
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2790,6 +2796,7 @@ mod tests {
             store: &store,
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
+            pty_host: &pty_host,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2823,6 +2830,7 @@ mod tests {
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2835,6 +2843,7 @@ mod tests {
             store: &store,
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
+            pty_host: &pty_host,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4221,6 +4230,7 @@ mod tests {
         };
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
         let thresholds = AgeThresholds::default();
         let config = BrigadeConfig {
             director_prompt: "I am {token}; my team is {peers}".to_string(),
@@ -4241,6 +4251,7 @@ mod tests {
             store: &store,
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
+            pty_host: &pty_host,
             brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4288,6 +4299,7 @@ mod tests {
         };
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
         let thresholds = AgeThresholds::default();
         let config = BrigadeConfig {
             // The Director's own template happens to contain the literal
@@ -4307,6 +4319,7 @@ mod tests {
             store: &store,
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
+            pty_host: &pty_host,
             brigade: &config,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4991,5 +5004,220 @@ mod tests {
 
         let first = paint_row(&mut cache, &key, &screen, content, Instant::now());
         assert_eq!(first, "          ", "must not leak the in-progress frame");
+    }
+
+    // --- what actually reaches the PTY host ------------------------------
+    //
+    // `Cmd::OpenEmbedded` has seven producers in `engine.rs` and they all
+    // funnel through one `PtyHandle::open` call. Until `Deps` carried a
+    // `PtyHost`, that call named `&PortablePtyHost` itself and no test could
+    // see what it passed — which is how `cf519a7` came to establish an
+    // argument of that very call by re-measuring a live `claude` instead.
+
+    /// A `Deps` whose PTY host is a mock, plus the pieces it borrows. Kept
+    /// as one struct because `Deps` is all references and a helper returning
+    /// it alone would borrow locals that die at the end of the helper.
+    struct SpawnFixture {
+        store: RefCell<Store>,
+        superseded_failed: RefCell<HashSet<SessionId>>,
+        meta_cache: MetaCache,
+        pty_host: MockPtyHost,
+        thresholds: AgeThresholds,
+        brigade: BrigadeConfig,
+        claude_home: ClaudeHome,
+        agent_binaries: AgentBinaries,
+        enabled_agents: BTreeSet<AgentKind>,
+    }
+
+    impl SpawnFixture {
+        fn new(claude_home: PathBuf) -> Self {
+            Self {
+                store: RefCell::new(Store::open_in_memory().unwrap()),
+                superseded_failed: RefCell::new(HashSet::new()),
+                meta_cache: MetaCache::new(),
+                pty_host: MockPtyHost::default(),
+                thresholds: AgeThresholds::default(),
+                brigade: BrigadeConfig::default(),
+                claude_home: ClaudeHome::new(claude_home),
+                agent_binaries: AgentBinaries::default(),
+                enabled_agents: all_agents(),
+            }
+        }
+
+        fn deps(&self) -> Deps<'_> {
+            Deps {
+                claude_home: &self.claude_home,
+                codex_home: None,
+                thresholds: &self.thresholds,
+                store: &self.store,
+                superseded_failed: &self.superseded_failed,
+                meta_cache: &self.meta_cache,
+                pty_host: &self.pty_host,
+                brigade: &self.brigade,
+                agent_binaries: &self.agent_binaries,
+                enabled_agents: &self.enabled_agents,
+            }
+        }
+
+        fn launches(&self) -> Vec<banto_io::pty::mock::MockLaunch> {
+            self.pty_host.launches.lock().unwrap().clone()
+        }
+
+        fn env_removes(&self) -> Vec<Vec<String>> {
+            self.pty_host.env_removes.lock().unwrap().clone()
+        }
+    }
+
+    fn open_embedded_cmd(agent: AgentKind, id: &str, cwd: &Path) -> Cmd {
+        Cmd::OpenEmbedded {
+            key: SessionKey::from_id("pane"),
+            target: SessionToOpen {
+                id: id.to_string(),
+                agent,
+                title: "a session".to_string(),
+                cwd: cwd.to_path_buf(),
+            },
+            brigade: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            disallowed_tools: None,
+        }
+    }
+
+    #[test]
+    fn opening_a_pane_strips_the_marker_that_hides_a_session_from_banto() {
+        // The argument `cf519a7` had to prove by re-measurement. A call site
+        // that drops it produces a session banto's activity indicator can
+        // never see, and nothing else about the launch looks wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let mut handles = HashMap::new();
+        let mut discovery = Vec::new();
+
+        let events = execute_cmd(
+            open_embedded_cmd(AgentKind::ClaudeCode, "", dir.path()),
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+
+        assert_eq!(
+            events,
+            vec![Event::Spawned {
+                key: SessionKey::from_id("pane")
+            }]
+        );
+        assert_eq!(
+            fixture.env_removes(),
+            vec![
+                STRIPPED_CHILD_ENV_VARS
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+            ]
+        );
+    }
+
+    #[test]
+    fn opening_a_pane_starts_the_launch_that_was_built_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let mut handles = HashMap::new();
+        let mut discovery = Vec::new();
+
+        execute_cmd(
+            open_embedded_cmd(AgentKind::ClaudeCode, "", dir.path()),
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+
+        let launches = fixture.launches();
+        assert_eq!(launches.len(), 1, "one pane, one child");
+        assert_eq!(
+            launches[0].cwd.as_deref(),
+            Some(dir.path()),
+            "a pane starts where its session lives"
+        );
+        assert!(
+            launches[0]
+                .argv
+                .first()
+                .is_some_and(|exe| exe.contains("claude")),
+            "the agent binary, not something else: {:?}",
+            launches[0].argv
+        );
+        assert!(
+            !launches[0].argv.iter().any(|arg| arg == "--resume"),
+            "a fresh pane resumes nothing: {:?}",
+            launches[0].argv
+        );
+    }
+
+    #[test]
+    fn a_pane_that_never_reached_the_host_reports_a_failure_instead() {
+        // The other half of the seam: `build_open_launch` refusing (here,
+        // because the session id is already live elsewhere — CLAUDE.md
+        // invariant 4) must not reach the host at all.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = tempfile::tempdir().unwrap();
+        let sessions = claude_home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let pid = std::process::id();
+        std::fs::write(
+            sessions.join(format!("{pid}.json")),
+            format!("{{\"sessionId\":\"live-1\",\"pid\":{pid},\"status\":\"idle\"}}"),
+        )
+        .unwrap();
+        let fixture = SpawnFixture::new(claude_home.path().to_path_buf());
+        let mut handles = HashMap::new();
+        let mut discovery = Vec::new();
+
+        let events = execute_cmd(
+            open_embedded_cmd(AgentKind::ClaudeCode, "live-1", dir.path()),
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+
+        assert!(
+            matches!(&events[..], [Event::SpawnFailed { .. }]),
+            "a session already open elsewhere must not be resumed twice: {events:?}"
+        );
+        assert!(
+            fixture.launches().is_empty(),
+            "and nothing may reach the host: {:?}",
+            fixture.launches()
+        );
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn the_codex_trust_pane_strips_the_marker_too() {
+        // Its own call site, reached by a different Cmd — the coverage the
+        // first test buys does not extend to it for free.
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let mut handles = HashMap::new();
+        let mut discovery = Vec::new();
+
+        execute_cmd(
+            Cmd::OpenCodexTrustPane {
+                key: SessionKey::from_id("trust"),
+            },
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+
+        assert_eq!(
+            fixture.env_removes(),
+            vec![
+                STRIPPED_CHILD_ENV_VARS
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+            ]
+        );
     }
 }
