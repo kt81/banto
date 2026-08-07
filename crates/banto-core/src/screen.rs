@@ -162,7 +162,7 @@ impl Screen {
     /// Which children this actually applies to is worth not guessing at.
     /// Codex was assumed to be one of them and is not: raw PTY captures
     /// found no `\x1b[?1049h` at cold start or through a full turn, both
-    /// before and after the ConPTY passthrough switch
+    /// before and after the ConPTY crate swap
     /// (`banto_io::pty::PortablePtyHost`'s doc). It scrolls in the normal
     /// buffer like a shell does, which is the case this scrollback exists
     /// to serve.
