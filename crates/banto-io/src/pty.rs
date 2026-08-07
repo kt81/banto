@@ -123,16 +123,35 @@ pub trait PtyHost {
 }
 
 /// [`PtyHost`] backed by `portable-pty-psmux` (ConPTY on Windows, a Unix pty
-/// elsewhere) — a fork of `portable-pty`, not the crates.io original: it
-/// requests `PSEUDOCONSOLE_PASSTHROUGH_MODE` on Windows 11 22H2+ (build
-/// ≥22621), which makes ConPTY relay a child's VT bytes verbatim instead of
-/// reinterpreting them through its own legacy Win32 console buffer and
-/// re-serializing its own reconstruction. Without it, a child that reserves
-/// a footer via DECSTBM (Codex does) never gets a single line into
-/// `vt100`'s scrollback, because ConPTY's own re-serialization uses a
-/// narrow scroll region unconditionally — measured 2026-08-02 with a
-/// controlled A/B (same Codex binary, same prompt, only the PTY crate
-/// swapped): scrollback stayed 0 without this flag, reached 191 with it.
+/// elsewhere) — a fork of `portable-pty`, not the crates.io original.
+///
+/// **Why the fork.** A Codex pane kept no scrollback at all: nothing the
+/// operator scrolled back to, ever. Swapping this one dependency fixed it,
+/// measured 2026-08-02 with the same Codex binary, prompt and geometry on
+/// both sides — no scrollback with crates.io `portable-pty`, 191 lines with
+/// the fork. That difference is real and is why banto depends on the fork.
+///
+/// **Which of the fork's differences fixes it is not known.** The fork adds
+/// three things to vanilla — `PSEUDOCONSOLE_PASSTHROUGH_MODE`,
+/// `RESIZE_QUIRK`, `WIN32_INPUT_MODE` — and that A/B swapped the crate
+/// whole, so it could not attribute the effect to any one of them. This doc
+/// used to say passthrough was the mechanism. It is not: on 2026-08-07 the
+/// same comparison was run with the fork held constant and only
+/// `PSMUX_NO_PASSTHROUGH` varied, with the crate's own log lines checked to
+/// confirm passthrough really was on in one arm and off in the other, and
+/// `scrollback_filled()` came back 289 in all four runs. The remaining two
+/// flags are always on in the fork with no toggle, so neither has been
+/// tested; one of them is presumably doing the work.
+///
+/// Two facts worth keeping for whoever picks this up. The fork silently
+/// recreates the ConPTY without passthrough when `CreateProcessW` rejects
+/// the handle, which its own comment says happens on "Insider/Canary builds
+/// like 26200" — this machine's build, and the psmux maintainer reports
+/// exactly that on their own 26200 box. It did not happen here: that
+/// fallback's warning never fired across the runs above. And `scrollback()`
+/// is the current scroll *offset*, not how much history is held —
+/// `scrollback_filled()` is the count, which is what a measurement of this
+/// wants.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PortablePtyHost;
 

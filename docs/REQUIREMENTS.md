@@ -460,19 +460,21 @@ and non-Windows behavior beyond one dated Unix teardown follow-up
 comparison of graceful vs. force-kill teardown timing on that platform).
 
 **Scrollback** was on that unverified list and turned out to fail outright: a
-child that reserves a footer via DECSTBM (Codex does) never got a single line
-into `vt100`'s scrollback tracking, because vanilla `portable-pty`'s ConPTY
-session reinterprets the child's VT bytes through its own legacy console
-buffer and re-serializes its own reconstruction — which for a DECSTBM footer
-means a narrow scroll region synthesized unconditionally, regardless of what
-the child actually drew. Fixed by requesting `PSEUDOCONSOLE_PASSTHROUGH_MODE`
-(Windows 11 22H2+, build ≥22621) instead, which makes ConPTY relay the
-child's bytes verbatim; banto-io depends on `portable-pty-psmux`, a fork that
-requests this flag, rather than the crates.io `portable-pty`
-(`crates/banto-io/src/pty.rs`'s `PortablePtyHost` doc). Measured 2026-08-02
-with a controlled A/B — same Codex binary, same prompt, same geometry, only
-the PTY crate swapped: scrollback stayed 0 without the flag, reached 191
-lines with it.
+Codex pane kept no scrollback at all. Fixed by depending on
+`portable-pty-psmux`, a fork of `portable-pty`, rather than the crates.io
+original — measured 2026-08-02 with the same Codex binary, prompt and
+geometry on both sides: no scrollback with vanilla, 191 lines with the fork.
+
+**Why the fork fixes it is still open.** It differs from vanilla in three
+flags (`PSEUDOCONSOLE_PASSTHROUGH_MODE`, `RESIZE_QUIRK`, `WIN32_INPUT_MODE`)
+and that A/B swapped the crate whole. Passthrough was written up as the
+mechanism and has since been ruled out: on 2026-08-07 the fork was held
+constant and only `PSMUX_NO_PASSTHROUGH` varied, with the crate's own logs
+confirming the flag really was on in one arm and off in the other, and the
+scrollback count was identical across all four runs. The other two flags have
+no toggle and remain untested. See `crates/banto-io/src/pty.rs`'s
+`PortablePtyHost` doc for the details and for two traps a re-measurement
+needs to know about.
 
 ## Brigade (Director/Worker cells)
 
