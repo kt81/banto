@@ -17,6 +17,7 @@ use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::live_candidate_thread_ids;
 use banto_io::codex_trust::HookTrustState;
+use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
@@ -146,7 +147,9 @@ pub fn load_rows(
     thresholds: &AgeThresholds,
     enabled: &BTreeSet<AgentKind>,
 ) -> Result<Vec<SessionRow>, ProviderError> {
-    let metas = discover_all(claude_home, codex_home, enabled)?;
+    // No cache: every caller of this wrapper walks once and exits (`banto
+    // list`), and a memo nothing consults twice is only a copy of the answer.
+    let metas = discover_all(claude_home, codex_home, enabled, None)?;
     Ok(rows_from_metas(metas, claude_home, codex_home, thresholds))
 }
 
@@ -173,10 +176,15 @@ pub fn discover_all(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
     enabled: &BTreeSet<AgentKind>,
+    cache: Option<&MetaCache>,
 ) -> Result<Vec<SessionMeta>, ProviderError> {
     let mut metas = Vec::new();
     if enabled.contains(&AgentKind::ClaudeCode) {
-        metas.extend(ClaudeCodeProvider::new(claude_home.clone()).discover()?);
+        let provider = ClaudeCodeProvider::new(claude_home.clone());
+        metas.extend(match cache {
+            Some(cache) => provider.discover_cached(cache)?,
+            None => provider.discover()?,
+        });
     }
     if enabled.contains(&AgentKind::Codex)
         && let Some(codex_home) = codex_home
@@ -542,7 +550,7 @@ mod tests {
         drop(conn); // clean close: no -wal left behind for discover() to open around
 
         let claude_home = ClaudeHome::new(claude_root);
-        let metas = discover_all(&claude_home, Some(&codex_home), &all_agents()).unwrap();
+        let metas = discover_all(&claude_home, Some(&codex_home), &all_agents(), None).unwrap();
         let mut ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["claude-1".to_string(), "codex-1".to_string()]);
@@ -575,7 +583,7 @@ mod tests {
 
         let claude_home = ClaudeHome::new(claude_root);
         let enabled = BTreeSet::from([AgentKind::ClaudeCode]);
-        let metas = discover_all(&claude_home, Some(&codex_home), &enabled).unwrap();
+        let metas = discover_all(&claude_home, Some(&codex_home), &enabled, None).unwrap();
         let ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
         assert_eq!(ids, vec!["claude-1".to_string()]);
     }
@@ -609,7 +617,7 @@ mod tests {
 
         let claude_home = ClaudeHome::new(claude_root);
         let enabled = BTreeSet::from([AgentKind::Codex]);
-        let metas = discover_all(&claude_home, Some(&codex_home), &enabled).unwrap();
+        let metas = discover_all(&claude_home, Some(&codex_home), &enabled, None).unwrap();
         let ids: Vec<_> = metas.iter().map(|m| m.id.0.clone()).collect();
         assert_eq!(ids, vec!["codex-1".to_string()]);
     }
@@ -618,7 +626,7 @@ mod tests {
     fn discover_all_skips_codex_entirely_when_its_home_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
-        let metas = discover_all(&claude_home, None, &all_agents()).unwrap();
+        let metas = discover_all(&claude_home, None, &all_agents(), None).unwrap();
         assert!(metas.is_empty());
     }
 
