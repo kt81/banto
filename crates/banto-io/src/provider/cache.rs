@@ -159,6 +159,23 @@ impl MetaCache {
         }
     }
 
+    /// An empty cache with the verification mode explicitly off, for tests.
+    ///
+    /// [`Self::new`] reads `BANTO_VERIFY_CACHE` from the environment, and an
+    /// operator dogfooding that mode exports it for banto — which hands its
+    /// whole environment to everything it spawns, including the shell a
+    /// `cargo test` runs in. Every "this must not parse again" assertion in
+    /// this crate fired at once the first time that happened, because a hit
+    /// in verification mode re-parses by design.
+    #[cfg(test)]
+    pub(crate) fn quiet_for_test() -> Self {
+        Self {
+            entries: RefCell::new(HashMap::new()),
+            generation: Cell::new(0),
+            verify: None,
+        }
+    }
+
     /// Begin a walk, or `None` if one is already in flight on this cache.
     ///
     /// Entries are stamped with the walk that touched them and the rest are
@@ -356,7 +373,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_key_is_answered_without_parsing() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         let mut walk = cache.walk().unwrap();
@@ -375,7 +392,7 @@ mod tests {
 
     #[test]
     fn a_moved_mtime_or_size_parses_again() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         cache
@@ -409,7 +426,7 @@ mod tests {
     /// module's doc for which writers can do that and why banto accepts it.
     #[test]
     fn a_same_length_rewrite_under_the_same_mtime_is_not_noticed() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         cache
@@ -424,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_parse_that_settled_on_nothing_is_remembered_too() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         assert_eq!(
@@ -449,7 +466,7 @@ mod tests {
     /// change when the file did not.
     #[test]
     fn a_provisional_answer_is_not_remembered() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         assert_eq!(
@@ -478,7 +495,7 @@ mod tests {
     /// change from the uncached walk, and in the right direction.
     #[test]
     fn a_provisional_answer_after_a_key_change_leaves_nothing_remembered() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         cache
@@ -503,7 +520,7 @@ mod tests {
 
     #[test]
     fn a_path_the_walk_did_not_visit_is_evicted() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let (a, b) = (Path::new("a.jsonl"), Path::new("b.jsonl"));
 
         let mut walk = cache.walk().unwrap();
@@ -524,7 +541,7 @@ mod tests {
 
     #[test]
     fn a_second_overlapping_walk_is_refused_rather_than_interleaved() {
-        let cache = MetaCache::new();
+        let cache = MetaCache::quiet_for_test();
         let path = Path::new("a.jsonl");
 
         let mut first = cache.walk().unwrap();
