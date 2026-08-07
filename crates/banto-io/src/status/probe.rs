@@ -1,5 +1,7 @@
 //! PID liveness (and ancestry) behind a mockable trait.
 
+use std::collections::HashSet;
+
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Checks whether a process id refers to a live process, and its parentage.
@@ -42,18 +44,37 @@ pub trait ProcessProbe {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SysinfoProbe;
 
-impl ProcessProbe for SysinfoProbe {
-    fn is_alive(&self, pid: u32) -> bool {
-        let pid = Pid::from_u32(pid);
-        // Refresh only the queried PID with the cheapest refresh kind;
-        // never walk the full process table.
+impl SysinfoProbe {
+    /// Snapshot which of `pids` are alive through one `sysinfo::System`
+    /// refresh.  This belongs outside [`ProcessProbe`]: it serves a list
+    /// pass that already knows every PID, while the trait deliberately stays
+    /// a small mockable point-query interface for open/resume and ancestry.
+    pub fn alive_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<u32> {
+        let pids = pids
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(Pid::from_u32)
+            .collect::<Vec<_>>();
+        if pids.is_empty() {
+            return HashSet::new();
+        }
         let mut system = System::new();
         system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
+            ProcessesToUpdate::Some(&pids),
             true,
             ProcessRefreshKind::nothing(),
         );
-        system.process(pid).is_some()
+        pids.into_iter()
+            .filter(|pid| system.process(*pid).is_some())
+            .map(Pid::as_u32)
+            .collect()
+    }
+}
+
+impl ProcessProbe for SysinfoProbe {
+    fn is_alive(&self, pid: u32) -> bool {
+        Self::alive_pids([pid]).contains(&pid)
     }
 
     fn parent_pid(&self, pid: u32) -> Option<u32> {
@@ -189,6 +210,13 @@ mod tests {
     fn sysinfo_probe_sees_current_process() {
         let probe = SysinfoProbe;
         assert!(probe.is_alive(std::process::id()));
+    }
+
+    #[test]
+    fn batched_probe_sees_current_process() {
+        let alive = SysinfoProbe::alive_pids([std::process::id(), u32::MAX]);
+        assert!(alive.contains(&std::process::id()));
+        assert!(!alive.contains(&u32::MAX));
     }
 
     /// A probe whose parentage is an explicit `child -> parent` map — no

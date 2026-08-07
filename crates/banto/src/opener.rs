@@ -243,6 +243,11 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
 /// since the live-state file was written is not mistaken for the original
 /// session still running, which would otherwise block a resume forever with
 /// no self-heal (see that method's doc comment).
+///
+/// This intentionally remains a fresh point query, rather than using the
+/// list's batched liveness snapshot: opening/resuming is a user action and
+/// the `proc_start` identity comparison is a correctness guard, not a
+/// reload-path throughput question.
 pub(crate) fn is_live(session: &SessionToOpen, ctx: &OpenContext) -> bool {
     match session.agent {
         AgentKind::ClaudeCode => ctx.live.iter().any(|entry| {

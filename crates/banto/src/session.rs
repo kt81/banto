@@ -6,7 +6,7 @@
 //! here writes to disk. Everything under `claude_home` is treated as
 //! strictly read-only.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::{ActivityConfig, ResolvedAgents};
@@ -219,14 +219,20 @@ pub fn rows_from_metas(
                 .map(|meta| meta.id.0.clone()),
         )
     });
-    let probe = SysinfoProbe;
+    let live_claude = SysinfoProbe::alive_pids(live.iter().map(|entry| entry.pid));
     let now = SystemTime::now();
 
     metas
         .into_iter()
         .map(|meta| {
-            let activity =
-                activity_from_observations(&meta, &live, &live_codex, &probe, now, thresholds);
+            let activity = activity_from_observations(
+                &meta,
+                &live,
+                &live_claude,
+                &live_codex,
+                now,
+                thresholds,
+            );
             SessionRow {
                 id: meta.id.0,
                 agent: meta.agent,
@@ -246,13 +252,15 @@ pub fn rows_from_metas(
 fn activity_from_observations(
     meta: &SessionMeta,
     live_claude: &[banto_io::status::LiveSession],
+    alive_claude: &HashSet<u32>,
     live_codex: &BTreeSet<String>,
-    probe: &SysinfoProbe,
     now: SystemTime,
     thresholds: &AgeThresholds,
 ) -> Activity {
     match meta.agent {
-        AgentKind::ClaudeCode => status::classify(meta, live_claude, probe, now, thresholds),
+        AgentKind::ClaudeCode => {
+            status::classify_from_alive_pids(meta, live_claude, alive_claude, now, thresholds)
+        }
         AgentKind::Codex if live_codex.contains(&meta.id.0) => Activity::Alive,
         AgentKind::Codex => Activity::Idle(age_bucket(meta.mtime, now, thresholds)),
     }
@@ -645,8 +653,8 @@ mod tests {
             activity_from_observations(
                 &codex,
                 &[],
+                &HashSet::new(),
                 &live_codex,
-                &SysinfoProbe,
                 now,
                 &AgeThresholds::default(),
             ),
