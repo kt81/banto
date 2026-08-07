@@ -884,6 +884,42 @@ pub struct EmporiumState {
     /// visible-mark set used to detect attention edges.
     previous_ring_set: Option<HashSet<SessionKey>>,
     last_attention_bell: Option<Instant>,
+    /// Panes banto itself asked to end, so that [`update_pty_exited`] can
+    /// tell an exit banto caused from one it merely observed.
+    ///
+    /// Those two arrive as the same event through the same poll loop
+    /// (`Cmd::KillPty`'s own doc: the Cmd only makes the exit happen, the
+    /// passive fold is what cleans up), and only this record separates them.
+    /// Written by [`kill_pane`] and nowhere else — a `Cmd::KillPty` built by
+    /// hand somewhere else would read, correctly as far as this state can
+    /// see, as a child that died on its own.
+    expected_exits: HashSet<SessionKey>,
+    /// When each member's pane was last restarted by [`update_pty_exited`],
+    /// so a member that cannot stay up is not restarted forever. Never
+    /// cleared on success: a member that dies once an hour should be
+    /// restarted each time, and one that dies twice in a minute should not.
+    last_relaunch: HashMap<SessionKey, Instant>,
+}
+
+/// How soon after restarting a member's pane banto declines to restart it
+/// again. A member that dies once — an agent CLI replacing itself during an
+/// auto-update is the case this was built for — is back before the operator
+/// notices. A member that cannot start at all dies again immediately, and
+/// without this it would be respawned as fast as the process can fail.
+const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Ask for `key`'s pane to end, recording that banto is the one asking.
+///
+/// Every kill banto performs goes through here. The alternative — reading the
+/// surrounding state at exit time — very nearly works: dismissing a Worker,
+/// disbanding, and both Goinkyo paths all un-stage before they kill, so by
+/// the time the exit arrives the key is already gone from the stage. The one
+/// that does not is the plain `x` kill, which sets nothing and un-stages
+/// nothing, and is therefore indistinguishable at exit time from a child that
+/// died by itself. That asymmetry is what this exists to remove.
+fn kill_pane(state: &mut EmporiumState, key: SessionKey) -> Cmd {
+    state.expected_exits.insert(key.clone());
+    Cmd::KillPty { key }
 }
 
 impl EmporiumState {
@@ -923,6 +959,8 @@ impl EmporiumState {
             ring_list_generation: 0,
             previous_ring_set: None,
             last_attention_bell: None,
+            expected_exits: HashSet::new(),
+            last_relaunch: HashMap::new(),
         }
     }
 
@@ -2694,7 +2732,7 @@ fn confirm_kill_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let dismiss = *worker_choice == Some(KillChoice::Dismiss);
     app.close_modal();
     if !dismiss {
-        return vec![Cmd::KillPty { key }];
+        return vec![kill_pane(state, key)];
     }
     state.pending_dismiss = Some(key.clone());
     match key.worker_identity() {
@@ -2982,7 +3020,7 @@ fn confirm_director_reopen_modal(state: &mut EmporiumState, app: &mut App) -> Ve
     app.close_modal();
     let director_key = SessionKey::from_id(&director_row_id);
     state.pending_director_reopen = Some(director_row_id);
-    vec![Cmd::KillPty { key: director_key }]
+    vec![kill_pane(state, director_key)]
 }
 
 /// Stage `row` solo: reuse its screen if already open, else request a spawn.
@@ -3008,6 +3046,77 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         permission_mode: None,
         disallowed_tools: None,
     }]
+}
+
+/// What a role is launched with, by role and product — everything about a
+/// member that banto's configuration decides rather than the session itself.
+///
+/// All four are properties of the *role*, on every launch, fresh or resumed,
+/// which is why they are computed in one place from the role alone and not
+/// at each site that happens to start a member.
+///
+/// `model` used to look like a launch property instead, passed only for a
+/// resumed Worker, because of an incident: before `46f2b8a8` (2026-07-25)
+/// added that branch, a resumed Worker silently ran on the operator's own
+/// default model instead of the brigade's configured one, observed live as
+/// Opus 5 Workers on WSL. The Goinkyo role didn't exist yet when that landed
+/// (added 2026-08-04, adf9a27/26a3987), and nobody made the equivalent trip
+/// for it afterward — not a decision that a Goinkyo's model should be fixed
+/// at birth, just a branch written before the role it was missing even
+/// existed. Two launch sites drifting apart is the whole failure mode; there
+/// is one now.
+///
+/// Measured (claude 2.1.223, 2026-08-06, one scratch session resumed
+/// repeatedly) that Claude Code remembers a session's model without being
+/// told again — `--model haiku` once, then resumed with no `--model` at all,
+/// stayed on Haiku — while it does *not* remember effort the same way:
+/// `--effort low` once, then resumed with no `--effort` at all, reverted
+/// straight to the operator's own global `effortLevel` setting, not to `low`.
+/// That difference does not mean model may be omitted; it means giving it
+/// again is usually a no-op, and "usually" is exactly how the Goinkyo's own
+/// missing case went unnoticed for two days — the value happened to already
+/// be right.
+///
+/// `permission_mode` and `disallowed_tools` answer "who's here to click
+/// 'allow'" and "what may this role even attempt", not "what should this
+/// session think with". Closing a consultation's pane mid-conversation and
+/// re-staging the brigade brings the Goinkyo right back to an unattended
+/// prompt (or an editable working tree) if one comes up, same as a fresh
+/// spawn.
+///
+/// The Director gets none of them: `BrigadeConfig` has no `director_model`
+/// or `director_effort` field at all — that session is the operator's own,
+/// launched (and re-launched) entirely outside banto's control.
+struct RoleLaunch {
+    model: Option<String>,
+    effort: Option<String>,
+    permission_mode: Option<String>,
+    disallowed_tools: Option<String>,
+}
+
+impl RoleLaunch {
+    fn of(role: BrigadeRole, agent: AgentKind, brigade: &BrigadeConfig) -> Self {
+        Self {
+            model: match role {
+                BrigadeRole::Worker => brigade.worker_model_for(agent),
+                BrigadeRole::Goinkyo => brigade.goinkyo_model(),
+                BrigadeRole::Director => None,
+            }
+            .map(str::to_string),
+            effort: (role == BrigadeRole::Goinkyo)
+                .then(|| brigade.goinkyo_effort())
+                .flatten()
+                .map(str::to_string),
+            permission_mode: (role == BrigadeRole::Goinkyo)
+                .then(|| brigade.goinkyo_permission_mode())
+                .flatten()
+                .map(str::to_string),
+            disallowed_tools: (role == BrigadeRole::Goinkyo)
+                .then(|| brigade.goinkyo_disallowed_tools())
+                .flatten()
+                .map(str::to_string),
+        }
+    }
 }
 
 /// Stage brigade `brigade_id`: `members` is its full roster (token, role,
@@ -3080,74 +3189,7 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                     );
-                    // Both `model` and `effort` are properties of the role —
-                    // banto's configuration is authoritative for what a
-                    // member *is*, on every launch, fresh or resumed, the
-                    // same as `permission_mode`/`disallowed_tools` below —
-                    // not properties of whether this particular launch
-                    // happens to be fresh or a resume.
-                    //
-                    // `model` used to look like a launch property instead,
-                    // passed only for a resumed Worker, because of an
-                    // incident: before `46f2b8a8` (2026-07-25) added that
-                    // branch, a resumed Worker silently ran on the
-                    // operator's own default model instead of the brigade's
-                    // configured one, observed live as Opus 5 Workers on
-                    // WSL. The Goinkyo role didn't exist yet when that
-                    // landed (added 2026-08-04, adf9a27/26a3987), and nobody
-                    // made the equivalent trip for it afterward — not a
-                    // decision that a Goinkyo's model should be fixed at
-                    // birth, just a branch written before the role it was
-                    // missing even existed.
-                    //
-                    // Measured (claude 2.1.223, 2026-08-06, one scratch
-                    // session resumed repeatedly) that Claude Code remembers
-                    // a session's model without being told again —
-                    // `--model haiku` once, then resumed with no `--model`
-                    // at all, stayed on Haiku — while it does *not* remember
-                    // effort the same way: `--effort low` once, then
-                    // resumed with no `--effort` at all, reverted straight
-                    // to the operator's own global `effortLevel` setting,
-                    // not to `low`. That difference does not mean model may
-                    // be omitted here; it means giving it again is usually a
-                    // no-op, and "usually" is exactly how the Goinkyo's own
-                    // missing case went unnoticed for two days — the value
-                    // happened to already be right. Both are given below,
-                    // unconditionally, so a `worker_model` or `goinkyo_model`
-                    // edit plus a restart reaches an already-launched member
-                    // the same way `worker_model` always has for a Worker,
-                    // and the way it now also does for a Goinkyo. The
-                    // Director gets neither: `BrigadeConfig` has no
-                    // `director_model`/`director_effort` field at all — that
-                    // session is the operator's own, launched (and
-                    // re-launched) entirely outside banto's control.
-                    let model = match *role {
-                        BrigadeRole::Worker => brigade.worker_model_for(row.agent),
-                        BrigadeRole::Goinkyo => brigade.goinkyo_model(),
-                        BrigadeRole::Director => None,
-                    }
-                    .map(str::to_string);
-                    let effort = (*role == BrigadeRole::Goinkyo)
-                        .then(|| brigade.goinkyo_effort())
-                        .flatten()
-                        .map(str::to_string);
-                    // `permission_mode` and `disallowed_tools` answer "who's
-                    // here to click 'allow'" and "what may this role even
-                    // attempt", not "what should this session think with" —
-                    // properties of the role, unrelated to whether the
-                    // launch is fresh or a resume, same as `effort` just
-                    // above. Closing a consultation's pane mid-conversation
-                    // and re-staging the brigade brings the Goinkyo right
-                    // back to an unattended prompt (or an editable working
-                    // tree) if one comes up, same as a fresh spawn.
-                    let permission_mode = (*role == BrigadeRole::Goinkyo)
-                        .then(|| brigade.goinkyo_permission_mode())
-                        .flatten()
-                        .map(str::to_string);
-                    let disallowed_tools = (*role == BrigadeRole::Goinkyo)
-                        .then(|| brigade.goinkyo_disallowed_tools())
-                        .flatten()
-                        .map(str::to_string);
+                    let launch = RoleLaunch::of(*role, row.agent, brigade);
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -3157,10 +3199,10 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                         brigade: Some((brigade_id, token.clone(), *role)),
-                        model,
-                        effort,
-                        permission_mode,
-                        disallowed_tools,
+                        model: launch.model,
+                        effort: launch.effort,
+                        permission_mode: launch.permission_mode,
+                        disallowed_tools: launch.disallowed_tools,
                     });
                 }
             }
@@ -3523,6 +3565,10 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
 }
 
 fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> Vec<Cmd> {
+    // A kill that never produced an exit — the child was already gone — would
+    // otherwise leave its record behind to suppress the first genuine crash
+    // of whatever opens under this key next.
+    state.expected_exits.remove(&key);
     state
         .screens
         .insert(key.clone(), crate::screen::Screen::new(24, 80));
@@ -3672,6 +3718,114 @@ fn update_spawn_failed(
     Vec::new()
 }
 
+/// What [`relaunch_member`] decided about an exit it recognised.
+enum ExitHandling {
+    /// Put the member back: the tile stays, this rebuilds what was under it.
+    /// Boxed because a `Cmd` is far larger than the other answer, and clippy
+    /// is right that an enum should not cost its largest variant everywhere.
+    Relaunch(Box<Cmd>),
+    /// A member that would have been restarted, except that it was restarted
+    /// a moment ago and is evidently not able to stay up. Handled as an
+    /// ordinary exit from here, but the operator is told which kind it was.
+    GaveUp,
+}
+
+/// A staged Worker's pane ended without banto asking, so put it back.
+///
+/// The case this exists for: an agent CLI updates itself, its process is
+/// replaced, and the pane goes with it. Everything banto persists about the
+/// member survives that — the store row, its token, its session id — so what
+/// was lost is only the pane, and re-opening the whole brigade is a heavy way
+/// to get one back. `Some(cmd)` means the tile stays where it is and its
+/// screen is rebuilt when the spawn lands (`update_spawned` already tolerates
+/// a key that is still staged); `None` means this exit is handled the way
+/// every exit was before.
+///
+/// Five things have to hold, and each of them is a way this could resurrect
+/// something that was meant to stay dead:
+///
+/// - **banto did not ask for the exit** ([`kill_pane`]). This is what keeps a
+///   plain `x` kill dead: the operator ending a Worker's pane is the one
+///   deliberate exit that changes nothing else observable, and without the
+///   record it looks exactly like a process that fell over.
+/// - **The pane is still staged.** Dismissing, disbanding and both Goinkyo
+///   paths all un-stage before they kill, so anything already gone from the
+///   stage was on its way out for a reason this function cannot see.
+/// - **It is a Worker.** The Director's own pane has two reopen paths of its
+///   own that run before this, and a Goinkyo's absence is answered by
+///   `gather_goinkyo_observation` against the store rather than here.
+/// - **Its session resolves to a row**, because this restarts a session
+///   rather than starting one. A Worker still awaiting discovery has nothing
+///   to resume; it keeps the old behaviour, and staging respawns it fresh.
+/// - **It was not restarted a moment ago** ([`RELAUNCH_COOLDOWN`]).
+fn relaunch_member(
+    state: &mut EmporiumState,
+    app: &App,
+    brigade: &BrigadeConfig,
+    key: &SessionKey,
+    banto_asked: bool,
+    now: Instant,
+) -> Option<ExitHandling> {
+    if banto_asked {
+        return None;
+    }
+    let Stage::Brigade {
+        id,
+        director,
+        panes,
+        ..
+    } = &state.stage
+    else {
+        return None;
+    };
+    if !panes.contains(key) || director.as_ref() == Some(key) {
+        return None;
+    }
+    if state.goinkyo_pane.values().any(|pane| pane == key) {
+        return None;
+    }
+    let brigade_id = *id;
+    let token = state.member_tokens.get(key)?.clone();
+    let row = app.row_for_id(key.as_str())?;
+    if state
+        .last_relaunch
+        .get(key)
+        .is_some_and(|at| now.saturating_duration_since(*at) < RELAUNCH_COOLDOWN)
+    {
+        return Some(ExitHandling::GaveUp);
+    }
+    state.last_relaunch.insert(key.clone(), now);
+    state.screens.remove(key);
+    let cwd = row.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+    state.pending_opens.insert(
+        key.clone(),
+        PendingOpen::BrigadeMember {
+            brigade_id,
+            // Resuming a session that already exists, exactly as a re-stage
+            // does — the kickoff only ever belongs to a Codex Worker being
+            // started for the first time.
+            needs_codex_kickoff: false,
+            cwd: cwd.clone(),
+        },
+    );
+    let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
+    state.set_status(format!("worker {token} exited — restarting"), now);
+    Some(ExitHandling::Relaunch(Box::new(Cmd::OpenEmbedded {
+        key: key.clone(),
+        target: SessionToOpen {
+            id: row.id.clone(),
+            agent: row.agent,
+            title: row.display_title().to_string(),
+            cwd,
+        },
+        brigade: Some((brigade_id, token, BrigadeRole::Worker)),
+        model: launch.model,
+        effort: launch.effort,
+        permission_mode: launch.permission_mode,
+        disallowed_tools: launch.disallowed_tools,
+    })))
+}
+
 fn update_pty_exited(
     state: &mut EmporiumState,
     app: &mut App,
@@ -3680,6 +3834,12 @@ fn update_pty_exited(
     reason: Option<PtyExitReason>,
     now: Instant,
 ) -> Vec<Cmd> {
+    let banto_asked = state.expected_exits.remove(&key);
+    let gave_up = match relaunch_member(state, app, brigade, &key, banto_asked, now) {
+        Some(ExitHandling::Relaunch(cmd)) => return vec![*cmd],
+        Some(ExitHandling::GaveUp) => true,
+        None => false,
+    };
     state.screens.remove(&key);
     state.unstage(&key);
     // A Goinkyo pane can close this way without ever being dismissed (the
@@ -3722,10 +3882,16 @@ fn update_pty_exited(
         .row_for_id(key.as_str())
         .map(|row| row.display_title().to_string())
         .unwrap_or_else(|| key.as_str().to_string());
-    let status = match reason {
+    let mut status = match reason {
         Some(reason) => format!("session ended: {title} — {}", reason.describe()),
         None => format!("session ended: {title}"),
     };
+    if gave_up {
+        // The one exit that would otherwise read as an ordinary one while
+        // meaning something else entirely: banto tried this member a moment
+        // ago and is declining to try again.
+        status.push_str(" (restarted once already — left closed)");
+    }
     state.set_status(status, now);
     Vec::new()
 }
@@ -4076,7 +4242,7 @@ fn update_brigade_formed(
         // MCP/hook wiring), so it is killed and reopened here too, same as
         // the interactive gate, just without asking first.
         state.pending_director_wiring = Some(wiring);
-        vec![Cmd::KillPty { key: director_key }]
+        vec![kill_pane(state, director_key)]
     } else {
         open_director_with_wiring(state, app, wiring)
     };
@@ -4214,7 +4380,7 @@ fn update_disbanded(
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
                 .into_iter()
-                .map(|key| Cmd::KillPty { key })
+                .map(|key| kill_pane(state, key))
                 .collect()
         }
         Err(err) => {
@@ -4260,7 +4426,7 @@ fn update_worker_dismissed(
             state.set_status(format!("{title} dismissed from the brigade"), now);
             if staged {
                 state.unstage(&key);
-                vec![Cmd::KillPty { key }]
+                vec![kill_pane(state, key)]
             } else {
                 Vec::new()
             }
@@ -4446,7 +4612,7 @@ fn update_goinkyo_awaiting_spawn(
                 return Vec::new();
             }
             state.unstage(&key);
-            return vec![Cmd::KillPty { key }];
+            return vec![kill_pane(state, key)];
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
@@ -4493,7 +4659,7 @@ fn update_goinkyo_awaiting_spawn(
         );
         if staged {
             state.unstage(&existing);
-            return vec![Cmd::KillPty { key: existing }];
+            return vec![kill_pane(state, existing)];
         }
         return Vec::new();
     }
@@ -11954,6 +12120,256 @@ mod tests {
         assert!(
             cmds.is_empty(),
             "a read request must not be forwarded: {cmds:?}"
+        );
+    }
+
+    // --- a member's pane dying on its own (`relaunch_member`) -------------
+
+    /// A staged brigade with one Director pane and one Worker pane, both
+    /// already open, and the Worker carrying its member token the way
+    /// `stage_brigade` leaves it.
+    fn staged_brigade_with_worker() -> (EmporiumState, App) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let worker = SessionKey::from_id("w1");
+        state.screens.insert(director.clone(), Screen::new(24, 80));
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(director.clone(), DIRECTOR_TOKEN.to_string());
+        state
+            .member_tokens
+            .insert(worker.clone(), "worker-1".to_string());
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![director, worker],
+            focused: 0,
+        };
+        (state, app_with(vec![row("dir"), row("w1")]))
+    }
+
+    /// Losing a pane relayouts the tiles that remain, so every exit here
+    /// also emits a `ResizePty` for the survivor. That is the stage doing
+    /// its job, not an answer to "was this member put back".
+    fn without_resizes(cmds: Vec<Cmd>) -> Vec<Cmd> {
+        cmds.into_iter()
+            .filter(|cmd| !matches!(cmd, Cmd::ResizePty { .. }))
+            .collect()
+    }
+
+    fn worker_exits(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        without_resizes(update(
+            state,
+            app,
+            brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("w1"),
+                reason: Some(PtyExitReason::Code(1)),
+            },
+            now,
+        ))
+    }
+
+    #[test]
+    fn a_worker_that_dies_on_its_own_is_restarted_in_place() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        match &cmds[..] {
+            [
+                Cmd::OpenEmbedded {
+                    key,
+                    target,
+                    brigade: Some((id, token, role)),
+                    ..
+                },
+            ] => {
+                assert_eq!(key, &worker);
+                assert_eq!(target.id, "w1", "the same session, resumed");
+                assert_eq!(*id, 1);
+                assert_eq!(token, "worker-1");
+                assert_eq!(*role, BrigadeRole::Worker);
+            }
+            other => panic!("expected one OpenEmbedded, got {other:?}"),
+        }
+        assert!(
+            matches!(&state.stage, Stage::Brigade { panes, .. } if panes.contains(&worker)),
+            "the tile keeps its place while the pane comes back"
+        );
+        assert!(
+            !state.screens.contains_key(&worker),
+            "its screen is gone until the spawn lands"
+        );
+        assert!(state.status.unwrap().contains("restarting"));
+    }
+
+    #[test]
+    fn a_worker_the_operator_killed_stays_dead() {
+        // The plain `x` kill: the one deliberate exit that changes nothing
+        // else observable, and so the one that needs `kill_pane`'s record to
+        // be told from a crash at all.
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), true);
+
+        let kill = confirm_kill_modal(&mut state, &mut app);
+        assert!(matches!(&kill[..], [Cmd::KillPty { key }] if *key == worker));
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        assert!(
+            cmds.is_empty(),
+            "a killed Worker must not come back: {cmds:?}"
+        );
+        assert!(
+            matches!(&state.stage, Stage::Brigade { panes, .. } if !panes.contains(&worker)),
+            "and its tile goes with it"
+        );
+    }
+
+    #[test]
+    fn a_worker_dismissed_from_the_brigade_stays_dead() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        state.pending_dismiss = Some(worker.clone());
+
+        let kill = update_worker_dismissed(
+            &mut state,
+            &mut app,
+            1,
+            Ok((HashSet::new(), HashSet::new())),
+            test_instant(),
+        );
+        assert!(matches!(&kill[..], [Cmd::KillPty { key }] if *key == worker));
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        assert!(
+            cmds.is_empty(),
+            "a dismissed Worker must not come back: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn the_directors_own_pane_is_not_restarted_by_this() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let director = SessionKey::from_id("dir");
+
+        let cmds = without_resizes(update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: director,
+                reason: None,
+            },
+            test_instant(),
+        ));
+
+        assert!(
+            cmds.is_empty(),
+            "the Director has its own reopen paths: {cmds:?}"
+        );
+        assert!(state.status.unwrap().contains("session ended"));
+    }
+
+    #[test]
+    fn a_goinkyos_pane_is_not_restarted_by_this() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        // Same shape as a Worker as far as the stage is concerned; only
+        // `goinkyo_pane` says otherwise, and that is what must be consulted.
+        state.goinkyo_pane.insert(1, SessionKey::from_id("w1"));
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        assert!(
+            cmds.is_empty(),
+            "a Goinkyo's absence is answered against the store, not here: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_cannot_stay_up_is_restarted_once_and_then_left_closed() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        let start = test_instant();
+
+        assert_eq!(
+            worker_exits(&mut state, &mut app, &brigade, start).len(),
+            1,
+            "the first death is restarted"
+        );
+        // The spawn landed and the child fell over again a second later.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: worker.clone(),
+            },
+            start + Duration::from_secs(1),
+        );
+        let cmds = worker_exits(
+            &mut state,
+            &mut app,
+            &brigade,
+            start + Duration::from_secs(2),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "a member that cannot start must not be respawned as fast as it fails: {cmds:?}"
+        );
+        assert!(
+            state.status.as_deref().unwrap().contains("left closed"),
+            "and the operator is told why the tile went, not left guessing: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn a_worker_that_dies_again_much_later_is_restarted_again() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        let start = test_instant();
+
+        worker_exits(&mut state, &mut app, &brigade, start);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: worker.clone(),
+            },
+            start + Duration::from_secs(1),
+        );
+
+        let cmds = worker_exits(
+            &mut state,
+            &mut app,
+            &brigade,
+            start + RELAUNCH_COOLDOWN + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            cmds.len(),
+            1,
+            "one death an hour is an agent updating itself, not a broken one: {cmds:?}"
         );
     }
 }
