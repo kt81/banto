@@ -807,7 +807,7 @@ fn build_open_launch(
         None
     } else {
         // Called for its refusal, not its value: this is the no-double-resume
-        // guard (CLAUDE.md invariant 4), and `?` is what turns a session that
+        // guard (AGENTS.md invariant 4), and `?` is what turns a session that
         // is already live somewhere else into `None`. The `InPlaceLaunch` it
         // hands back is dropped because its argv is by construction
         // `inplace_argv(target.agent, Some(&target.id), ...)` — the same id
@@ -5277,7 +5277,7 @@ mod tests {
     #[test]
     fn a_pane_that_never_reached_the_host_reports_a_failure_instead() {
         // The other half of the seam: `build_open_launch` refusing (here,
-        // because the session id is already live elsewhere — CLAUDE.md
+        // because the session id is already live elsewhere — AGENTS.md
         // invariant 4) must not reach the host at all.
         let dir = tempfile::tempdir().unwrap();
         let claude_home = tempfile::tempdir().unwrap();

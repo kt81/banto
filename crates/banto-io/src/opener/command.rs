@@ -1,4 +1,4 @@
-//! External command execution behind a mockable trait (CLAUDE.md invariant:
+//! External command execution behind a mockable trait (AGENTS.md invariant:
 //! external invocations sit behind an abstraction) — see [`CommandRunner`],
 //! and `opener`'s own module doc for the design contract this serves.
 

@@ -1,4 +1,4 @@
-//! Codex session liveness — the Codex-side half of CLAUDE.md invariant 4
+//! Codex session liveness — the Codex-side half of AGENTS.md invariant 4
 //! (never double-resume). Separate from [`crate::status`], which stays
 //! product-agnostic (bare pid arithmetic, no process-name matching) and is
 //! not touched by this module at all: the per-product dispatch this would
@@ -82,7 +82,7 @@ impl ProcessStartTime for SysinfoStartTime {
 /// `thread_id` with no rows yet (the startup window before anything is
 /// tagged), a malformed `process_uuid`, or a pruned/corrupt log database.
 /// `false` is the safe direction here: a caller uses this to *refuse* a
-/// resume (CLAUDE.md invariant 4) only when it gets back a positive "yes,
+/// resume (AGENTS.md invariant 4) only when it gets back a positive "yes,
 /// this is live" signal, so under-reporting liveness never manufactures a
 /// refusal banto can't justify — the same asymmetry `banto_io::status`'s
 /// own bare-pid fallback already accepts on the Claude side. The residual

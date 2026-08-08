@@ -3,7 +3,7 @@
 //!
 //! Decides whether a session's existing pane is still alive (focus it) or a
 //! new one must be spawned (open it and record where it landed), enforcing
-//! the "never resume a session twice" invariant (CLAUDE.md invariant 4;
+//! the "never resume a session twice" invariant (AGENTS.md invariant 4;
 //! docs/REQUIREMENTS.md "Opener spec"). Liveness is judged purely by PID (the
 //! `banto _wrap` process registers its own PID once it starts — see
 //! [`crate::wrap`] — mirroring how `banto_io::status` judges session
@@ -36,7 +36,7 @@ pub enum OpenOutcome {
     /// but its own live-state file shows it's still running — most likely a
     /// session launched via the `n` new-session modal, which has no
     /// pre-existing session id to key a pane record against. Refuses to
-    /// `--resume` it, since that would fork its history (CLAUDE.md
+    /// `--resume` it, since that would fork its history (AGENTS.md
     /// invariant 4) while it's already open somewhere banto can't locate.
     AlreadyRunningUntracked,
     /// No backend could be determined (`OpenerMode::Auto` with neither
@@ -768,7 +768,7 @@ pub(crate) fn inplace_argv(
 /// over the terminal for a session that's already running somewhere else (a
 /// split pane, another banto instance, or a directly-launched agent
 /// process) would `--resume`/`resume` it a second time and fork its history
-/// (CLAUDE.md invariant 4). `ctx` is the same context [`open_session`]'s
+/// (AGENTS.md invariant 4). `ctx` is the same context [`open_session`]'s
 /// untracked-but-live guard uses (see [`is_live`]) — the only guard
 /// available here, since in-place mode has no pane map of its own to
 /// consult first.

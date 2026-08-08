@@ -1,6 +1,6 @@
 //! PTY host abstraction: spawn a child in a pseudo-terminal and expose its
 //! output stream, an input sink, and a resize handle. Behind a trait so tests
-//! never spawn a real process (CLAUDE.md: every external process invocation
+//! never spawn a real process (AGENTS.md: every external process invocation
 //! sits behind a mockable abstraction).
 
 use std::io::{Read, Write};
