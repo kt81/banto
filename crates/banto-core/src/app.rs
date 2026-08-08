@@ -208,12 +208,31 @@ pub struct GroupJoinState {
     /// Char-index position of the text cursor within `input` (0..=its char
     /// length); see [`Self::push_char`]/[`Self::move_cursor_left`] etc.
     cursor: usize,
-    /// Indices into `candidates` whose name contains `input`
-    /// (case-insensitive), in the same order as `candidates`.
-    filtered: Vec<usize>,
+    /// The rows currently offered, in display order — the groups whose name
+    /// contains `input` (case-insensitive), plus [`GroupJoinRow::Leave`]
+    /// when it applies.
+    filtered: Vec<GroupJoinRow>,
     /// Selected position within `filtered`.
     selected: usize,
+    /// Whether this session is in a group at all. Decides whether leaving
+    /// one is offered: a session that belongs to nothing has nothing to
+    /// leave, and a row that would do nothing is worse than no row.
+    grouped: bool,
 }
+
+/// One row of the group-join modal's list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GroupJoinRow {
+    /// The group at this index in `candidates`.
+    Group(usize),
+    /// Take the session out of its group without putting it in another.
+    Leave,
+}
+
+/// What the row that leaves a group is labelled. A real group could be named
+/// this too; the two are still told apart, because a row's meaning comes
+/// from which variant it is and never from the text drawn for it.
+pub const LEAVE_GROUP_LABEL: &str = "(no group)";
 
 /// What confirming the group-join modal would do.
 #[derive(Debug)]
@@ -222,10 +241,12 @@ pub enum GroupJoinTarget {
     Existing(GroupId, String),
     /// Create a new group with this name, then join it.
     New(String),
+    /// Leave the group this session is in, joining no other.
+    Leave,
 }
 
 impl GroupJoinState {
-    fn new(session_id: String, candidates: Vec<(GroupId, String)>) -> Self {
+    fn new(session_id: String, candidates: Vec<(GroupId, String)>, grouped: bool) -> Self {
         let mut state = Self {
             session_id,
             candidates,
@@ -233,6 +254,7 @@ impl GroupJoinState {
             cursor: 0,
             filtered: Vec::new(),
             selected: 0,
+            grouped,
         };
         state.refilter();
         state
@@ -245,8 +267,16 @@ impl GroupJoinState {
             .iter()
             .enumerate()
             .filter(|(_, (_, name))| needle.is_empty() || name.to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
+            .map(|(i, _)| GroupJoinRow::Group(i))
             .collect();
+        // Offered only with the input empty, and last. Typing means the user
+        // is naming a group — an existing one or a new one — and a row that
+        // removed them from their group instead would be reachable by typing
+        // a name that happens to match its label. Last, so the selection this
+        // resets to is a group whenever there is one.
+        if self.grouped && self.input.is_empty() {
+            self.filtered.push(GroupJoinRow::Leave);
+        }
         self.selected = 0;
     }
 
@@ -313,11 +343,16 @@ impl GroupJoinState {
         &self.input
     }
 
-    /// Existing group names matching the input, alphabetical.
+    /// The rows on offer, in display order: existing group names matching
+    /// the input, alphabetical, then [`LEAVE_GROUP_LABEL`] when leaving is
+    /// offered.
     pub fn candidates(&self) -> Vec<&str> {
         self.filtered
             .iter()
-            .map(|&i| self.candidates[i].1.as_str())
+            .map(|row| match row {
+                GroupJoinRow::Group(i) => self.candidates[*i].1.as_str(),
+                GroupJoinRow::Leave => LEAVE_GROUP_LABEL,
+            })
             .collect()
     }
 
@@ -331,9 +366,13 @@ impl GroupJoinState {
     /// group if any match, otherwise create a new one named after the raw
     /// input (`None` if that's empty too — nothing to confirm).
     fn target(&self) -> Option<GroupJoinTarget> {
-        if let Some(&i) = self.filtered.get(self.selected) {
-            let (id, name) = &self.candidates[i];
-            return Some(GroupJoinTarget::Existing(*id, name.clone()));
+        match self.filtered.get(self.selected) {
+            Some(GroupJoinRow::Group(i)) => {
+                let (id, name) = &self.candidates[*i];
+                return Some(GroupJoinTarget::Existing(*id, name.clone()));
+            }
+            Some(GroupJoinRow::Leave) => return Some(GroupJoinTarget::Leave),
+            None => {}
         }
         (!self.input.is_empty()).then(|| GroupJoinTarget::New(self.input.clone()))
     }
@@ -962,9 +1001,11 @@ impl App {
     /// selected; bound to `g` in [`Mode::Normal`]).
     pub fn open_group_join_modal(&mut self) {
         if let Some(row) = self.selected_row() {
+            let grouped = self.session_group.contains_key(&row.id);
             self.modal = Some(Modal::GroupJoin(GroupJoinState::new(
                 row.id.clone(),
                 self.groups.clone(),
+                grouped,
             )));
         }
     }
@@ -1223,6 +1264,16 @@ impl App {
             self.groups.push((group_id, group_name));
             self.groups.sort_by(|a, b| a.1.cmp(&b.1));
         }
+        let selected_id = Some(session_id.to_string());
+        self.refilter_keeping_selected(selected_id);
+    }
+
+    /// The counterpart for a session that just left its group. The group
+    /// itself stays in `groups` whether or not this emptied it: what is
+    /// still on offer in the join modal is the store's business, and this
+    /// cache is rebuilt from it on the next reload anyway.
+    pub fn clear_session_group_cache(&mut self, session_id: &str) {
+        self.session_group.remove(session_id);
         let selected_id = Some(session_id.to_string());
         self.refilter_keeping_selected(selected_id);
     }
@@ -3842,6 +3893,128 @@ mod tests {
         }
     }
 
+    // --- leaving a group (the `(no group)` row) ---------------------------
+
+    fn app_with_one_group() -> App {
+        let mut app = App::new(vec![row("a", "Alpha", "")])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app
+    }
+
+    #[test]
+    fn a_session_in_no_group_is_not_offered_a_way_out_of_one() {
+        let mut app = app_with_one_group();
+
+        app.open_group_join_modal();
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(
+            state.candidates(),
+            vec!["work"],
+            "a row that would do nothing is worse than no row"
+        );
+    }
+
+    #[test]
+    fn leaving_is_offered_last_so_opening_and_confirming_never_removes_a_group() {
+        // The reason it is last: the selection resets to the top on every
+        // refilter, so a first-position row would make `g` then Enter — the
+        // fastest thing a hand does — mean "take this out of its group".
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+
+        app.open_group_join_modal();
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(state.candidates(), vec!["work", LEAVE_GROUP_LABEL]);
+        assert_eq!(state.selected(), Some(0));
+        assert!(matches!(
+            app.modal_group_join_target(),
+            Some(GroupJoinTarget::Existing(1, _))
+        ));
+    }
+
+    #[test]
+    fn selecting_the_last_row_leaves_the_group() {
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+
+        app.modal_select_next();
+
+        assert!(matches!(
+            app.modal_group_join_target(),
+            Some(GroupJoinTarget::Leave)
+        ));
+    }
+
+    #[test]
+    fn typing_a_name_takes_the_leave_row_away() {
+        // The footgun this avoids: with the row filtered by its own label,
+        // typing a new group name containing "no" would leave it on offer,
+        // and — with nothing else matching — selected. Enter would then
+        // remove the session from its group while the operator was naming a
+        // new one.
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+
+        for c in "notes".chars() {
+            app.modal_push_char(c);
+        }
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert!(state.candidates().is_empty(), "{:?}", state.candidates());
+        match app.modal_group_join_target() {
+            Some(GroupJoinTarget::New(name)) => assert_eq!(name, "notes"),
+            other => panic!("typing names a group: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clearing_the_input_brings_the_leave_row_back() {
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        for c in "notes".chars() {
+            app.modal_push_char(c);
+        }
+
+        for _ in "notes".chars() {
+            app.modal_backspace();
+        }
+
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(state.candidates(), vec!["work", LEAVE_GROUP_LABEL]);
+    }
+
+    #[test]
+    fn clear_session_group_cache_takes_the_session_out_of_its_group() {
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+
+        app.clear_session_group_cache("a");
+
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(
+            state.candidates(),
+            vec!["work"],
+            "no longer grouped, so nothing to leave — and the group itself stays on offer"
+        );
+    }
+
     #[test]
     fn set_session_group_cache_updates_map_and_inserts_a_new_group() {
         let mut app = App::new(vec![row("a", "Alpha", "")])
@@ -3854,7 +4027,8 @@ mod tests {
         let Some(Modal::GroupJoin(state)) = app.modal() else {
             panic!("expected an open group-join modal");
         };
-        assert_eq!(state.candidates(), vec!["work"]);
+        // The session is in a group now, so leaving one is on offer too.
+        assert_eq!(state.candidates(), vec!["work", LEAVE_GROUP_LABEL]);
         app.close_modal();
 
         // Joining a brand-new group id adds it to the known-groups cache.
@@ -3863,7 +4037,7 @@ mod tests {
         let Some(Modal::GroupJoin(state)) = app.modal() else {
             panic!("expected an open group-join modal");
         };
-        assert_eq!(state.candidates(), vec!["play", "work"]);
+        assert_eq!(state.candidates(), vec!["play", "work", LEAVE_GROUP_LABEL]);
     }
 
     #[test]

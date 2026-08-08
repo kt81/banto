@@ -993,6 +993,20 @@ fn confirm_group_join_modal(app: &mut App, ctx: &Context) {
 
     let mut store = ctx.store.borrow_mut();
     let (group_id, group_name, result) = match target {
+        GroupJoinTarget::Leave => {
+            let result = store.clear_session_group(&SessionId(session_id.clone()));
+            drop(store);
+            let message = match &result {
+                Ok(()) => "left the group".to_string(),
+                Err(err) => format!("failed to leave the group: {err}"),
+            };
+            app.set_status(message, Instant::now());
+            if result.is_ok() {
+                app.clear_session_group_cache(&session_id);
+            }
+            app.close_modal();
+            return;
+        }
         GroupJoinTarget::Existing(group_id, name) => {
             let result = store.set_session_group(&SessionId(session_id.clone()), group_id);
             (group_id, name, result)

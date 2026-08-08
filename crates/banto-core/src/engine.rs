@@ -1365,6 +1365,8 @@ pub enum StoreIntent {
 pub enum GroupJoinTargetData {
     Existing(i64, String),
     New(String),
+    /// Take the session out of whatever group it is in, joining no other.
+    Leave,
 }
 
 /// An instruction for the shell to execute — plain data, never executed
@@ -1615,7 +1617,12 @@ pub enum Event {
     },
     GroupJoinDone {
         session_id: String,
-        result: Result<(i64, String), String>,
+        /// `Ok(None)` is the session leaving its group rather than joining
+        /// one — the same modal's other outcome. An `Option` rather than its
+        /// own event so the failure path stays in one place; a recorded
+        /// stream from before it existed still reads back, since a present
+        /// pair deserializes as `Some`.
+        result: Result<Option<(i64, String)>, String>,
     },
     MembershipResolved {
         session_id: String,
@@ -1831,9 +1838,13 @@ pub fn update(
         }
         Event::GroupJoinDone { session_id, result } => {
             match result {
-                Ok((group_id, group_name)) => {
+                Ok(Some((group_id, group_name))) => {
                     state.set_status(format!("joined group \"{group_name}\""), now);
                     app.set_session_group_cache(&session_id, group_id, group_name);
+                }
+                Ok(None) => {
+                    state.set_status("left the group".to_string(), now);
+                    app.clear_session_group_cache(&session_id);
                 }
                 Err(err) => state.set_status(format!("failed to join group: {err}"), now),
             }
@@ -2618,6 +2629,7 @@ fn confirm_group_join_modal(app: &mut App) -> Vec<Cmd> {
     let target = match target {
         GroupJoinTarget::Existing(id, name) => GroupJoinTargetData::Existing(id, name),
         GroupJoinTarget::New(name) => GroupJoinTargetData::New(name),
+        GroupJoinTarget::Leave => GroupJoinTargetData::Leave,
     };
     vec![Cmd::Store(StoreIntent::JoinGroup { session_id, target })]
 }
