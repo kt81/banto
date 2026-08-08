@@ -112,6 +112,17 @@ pub enum Modal {
     ConfirmArchive { session_id: String, title: String },
     /// The `g` group-join dialog: pick an existing group or type a new name.
     GroupJoin(GroupJoinState),
+    /// The `g` dialog's Ctrl+R on a highlighted existing group: type a
+    /// replacement name (`GroupRenameState`), kept as its own `Modal` rather
+    /// than a `GroupJoin` field so the join filter's input and the new name
+    /// are never the same buffer. See `App::open_group_rename_modal`.
+    GroupRename(GroupRenameState),
+    /// The `g` dialog's Ctrl+X on a highlighted existing group: Enter
+    /// deletes it, Esc cancels. Deleting only removes `group_id`'s
+    /// membership rows (`Store::delete_group`) — the sessions that were in
+    /// it are untouched and simply become ungrouped, same as
+    /// `GroupJoinTarget::Leave`.
+    ConfirmGroupDelete { group_id: GroupId, name: String },
     /// The emporium's `B`-on-a-Director disband confirm dialog: Enter
     /// disbands the brigade (`brigade_id`), Esc cancels. `name` is the
     /// Director's title, for the prompt. The chōba never opens this, but
@@ -422,6 +433,82 @@ impl GroupJoinState {
             None => {}
         }
         (!self.input.is_empty()).then(|| GroupJoinTarget::New(self.input.clone()))
+    }
+}
+
+/// State for the group-rename sub-modal: reached by Ctrl+R from the `g`
+/// dialog on a highlighted existing group (never `(no group)`, never a typed
+/// name with no match — see [`App::open_group_rename_modal`]'s guard). A
+/// single free-text buffer, no candidate list, so it can't reuse
+/// [`GroupJoinState`] itself — its `push_char`/cursor methods mirror that
+/// state's own rather than share it, since sharing would also drag along a
+/// `filtered`/`candidates` list this has no use for.
+pub struct GroupRenameState {
+    group_id: GroupId,
+    old_name: String,
+    /// The new name typed so far — starts empty, never pre-filled with
+    /// `old_name`: the prompt shows `old_name` as a label
+    /// (`old_name -> <input>`), so pre-filling would make Backspace-to-clear
+    /// the first thing anyone renaming a group has to do.
+    input: String,
+    cursor: usize,
+}
+
+impl GroupRenameState {
+    fn new(group_id: GroupId, old_name: String) -> Self {
+        Self {
+            group_id,
+            old_name,
+            input: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn push_char(&mut self, c: char) {
+        insert_at_cursor(&mut self.input, self.cursor, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if remove_before_cursor(&mut self.input, self.cursor) {
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        remove_at_cursor(&mut self.input, self.cursor);
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(char_len(&self.input));
+    }
+
+    fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_cursor_end(&mut self) {
+        self.cursor = char_len(&self.input);
+    }
+
+    pub fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+
+    pub fn old_name(&self) -> &str {
+        &self.old_name
+    }
+
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 }
 
@@ -1006,6 +1093,7 @@ impl App {
             self.modal,
             Some(Modal::NewSession(_))
                 | Some(Modal::GroupJoin(_))
+                | Some(Modal::GroupRename(_))
                 | Some(Modal::WorkerAgentPicker(_))
         )
     }
@@ -1057,6 +1145,25 @@ impl App {
         }
     }
 
+    /// Open the group-rename sub-modal (Ctrl+R from the `g` dialog). No-op
+    /// unless `Modal::GroupJoin` is open with an existing group highlighted
+    /// — `(no group)` and a typed name with no match both resolve to
+    /// something other than `GroupJoinTarget::Existing` and so leave this
+    /// untouched, same guard `open_confirm_group_delete_modal` uses.
+    pub fn open_group_rename_modal(&mut self) {
+        if let Some(GroupJoinTarget::Existing(group_id, name)) = self.modal_group_join_target() {
+            self.modal = Some(Modal::GroupRename(GroupRenameState::new(group_id, name)));
+        }
+    }
+
+    /// Open the group delete-confirm sub-modal (Ctrl+X from the `g`
+    /// dialog). Same guard as [`Self::open_group_rename_modal`].
+    pub fn open_confirm_group_delete_modal(&mut self) {
+        if let Some(GroupJoinTarget::Existing(group_id, name)) = self.modal_group_join_target() {
+            self.modal = Some(Modal::ConfirmGroupDelete { group_id, name });
+        }
+    }
+
     /// Close whatever modal is open (no-op if none); bound to Esc while a
     /// modal is open.
     pub fn close_modal(&mut self) {
@@ -1073,8 +1180,10 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.push_char(c),
             Some(Modal::GroupJoin(state)) => state.push_char(c),
+            Some(Modal::GroupRename(state)) => state.push_char(c),
             Some(Modal::WorkerAgentPicker(state)) => state.push_char(c),
             Some(Modal::ConfirmArchive { .. })
+            | Some(Modal::ConfirmGroupDelete { .. })
             | Some(Modal::ConfirmDisband { .. })
             | Some(Modal::ConfirmKill { .. })
             | Some(Modal::ConfirmCodexTrust)
@@ -1090,6 +1199,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.backspace(),
             Some(Modal::GroupJoin(state)) => state.backspace(),
+            Some(Modal::GroupRename(state)) => state.backspace(),
             Some(Modal::WorkerAgentPicker(state)) => state.backspace(),
             _ => {}
         }
@@ -1102,6 +1212,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.delete_forward(),
             Some(Modal::GroupJoin(state)) => state.delete_forward(),
+            Some(Modal::GroupRename(state)) => state.delete_forward(),
             Some(Modal::WorkerAgentPicker(state)) => state.delete_forward(),
             _ => {}
         }
@@ -1113,6 +1224,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_left(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_left(),
+            Some(Modal::GroupRename(state)) => state.move_cursor_left(),
             Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_left(),
             _ => {}
         }
@@ -1124,6 +1236,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_right(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_right(),
+            Some(Modal::GroupRename(state)) => state.move_cursor_right(),
             Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_right(),
             _ => {}
         }
@@ -1135,6 +1248,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_home(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_home(),
+            Some(Modal::GroupRename(state)) => state.move_cursor_home(),
             Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_home(),
             _ => {}
         }
@@ -1146,6 +1260,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_cursor_end(),
             Some(Modal::GroupJoin(state)) => state.move_cursor_end(),
+            Some(Modal::GroupRename(state)) => state.move_cursor_end(),
             Some(Modal::WorkerAgentPicker(state)) => state.move_cursor_end(),
             _ => {}
         }
@@ -1269,6 +1384,22 @@ impl App {
         }
     }
 
+    /// What confirming the open group-rename modal would do: `(group_id,
+    /// old_name, new_name)`. `None` if no rename modal is open or the typed
+    /// name is still empty — mirrors [`Self::modal_group_join_target`]'s own
+    /// "nothing to confirm yet" contract for
+    /// [`GroupJoinTarget::New`]'s empty-input case.
+    pub fn modal_group_rename_target(&self) -> Option<(GroupId, String, String)> {
+        match &self.modal {
+            Some(Modal::GroupRename(state)) if !state.input().is_empty() => Some((
+                state.group_id(),
+                state.old_name().to_string(),
+                state.input().to_string(),
+            )),
+            _ => None,
+        }
+    }
+
     /// Set the open modal's inline validation error (e.g. "not a
     /// directory"), leaving it open so the user can correct the input. No-op
     /// when no modal is open, or it has no text input.
@@ -1322,6 +1453,29 @@ impl App {
     pub fn clear_session_group_cache(&mut self, session_id: &str) {
         self.session_group.remove(session_id);
         let selected_id = Some(session_id.to_string());
+        self.refilter_keeping_selected(selected_id);
+    }
+
+    /// Record a group rename in the cache after the rename modal confirms
+    /// (caller persists to the store first). No-op if `group_id` isn't
+    /// cached (nothing to rename, so nothing to do).
+    pub fn rename_group_cache(&mut self, group_id: GroupId, new_name: String) {
+        if let Some(entry) = self.groups.iter_mut().find(|(id, _)| *id == group_id) {
+            entry.1 = new_name;
+            self.groups.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+    }
+
+    /// Record a group deletion in the cache after the delete-confirm modal
+    /// confirms (caller persists to the store first) — every session that
+    /// was in it moves to Ungrouped in the cache too, mirroring
+    /// `Store::delete_group`'s own membership-row cleanup, so the grouped
+    /// view doesn't keep showing a section for a group that no longer
+    /// exists until the next full reload.
+    pub fn delete_group_cache(&mut self, group_id: GroupId) {
+        self.groups.retain(|(id, _)| *id != group_id);
+        self.session_group.retain(|_, id| *id != group_id);
+        let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
     }
 
@@ -4198,6 +4352,133 @@ mod tests {
             panic!("expected an open group-join modal");
         };
         assert_eq!(state.candidates(), vec!["play", "work", LEAVE_GROUP_LABEL]);
+    }
+
+    // --- renaming/deleting a group from the `g` dialog (Ctrl+R/Ctrl+X) -----
+
+    #[test]
+    fn open_group_rename_modal_is_a_noop_on_the_leave_row() {
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        app.modal_select_next(); // onto the `(no group)` row
+
+        app.open_group_rename_modal();
+
+        assert!(
+            matches!(app.modal(), Some(Modal::GroupJoin(_))),
+            "the leave row names no group to rename"
+        );
+    }
+
+    #[test]
+    fn open_group_rename_modal_is_a_noop_with_nothing_selected() {
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+        for c in "brand-new".chars() {
+            app.modal_push_char(c);
+        }
+
+        app.open_group_rename_modal();
+
+        assert!(
+            matches!(app.modal(), Some(Modal::GroupJoin(_))),
+            "a typed name with no match isn't an existing group to rename"
+        );
+    }
+
+    #[test]
+    fn open_group_rename_modal_opens_on_the_highlighted_existing_group() {
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+
+        app.open_group_rename_modal();
+
+        let Some(Modal::GroupRename(state)) = app.modal() else {
+            panic!("expected the rename sub-modal to open");
+        };
+        assert_eq!(state.group_id(), 1);
+        assert_eq!(state.old_name(), "work");
+        assert_eq!(state.input(), "", "starts empty, never pre-filled");
+    }
+
+    #[test]
+    fn open_confirm_group_delete_modal_is_a_noop_on_the_leave_row() {
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        app.modal_select_next(); // onto the `(no group)` row
+
+        app.open_confirm_group_delete_modal();
+
+        assert!(
+            matches!(app.modal(), Some(Modal::GroupJoin(_))),
+            "the leave row names no group to delete"
+        );
+    }
+
+    #[test]
+    fn open_confirm_group_delete_modal_opens_on_the_highlighted_existing_group() {
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+
+        app.open_confirm_group_delete_modal();
+
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmGroupDelete { group_id: 1, name }) if name == "work"
+        ));
+    }
+
+    #[test]
+    fn modal_group_rename_target_is_none_while_the_typed_name_is_empty() {
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+        app.open_group_rename_modal();
+
+        assert_eq!(app.modal_group_rename_target(), None);
+
+        app.modal_push_char('x');
+        assert_eq!(
+            app.modal_group_rename_target(),
+            Some((1, "work".to_string(), "x".to_string()))
+        );
+    }
+
+    #[test]
+    fn rename_group_cache_renames_and_resorts() {
+        let mut app = App::new(vec![row("a", "Alpha", "")]).with_groups(
+            vec![(1, "aaa".to_string()), (2, "zzz".to_string())],
+            HashMap::new(),
+        );
+        app.set_viewport_height(10);
+
+        app.rename_group_cache(2, "aaa-then".to_string());
+
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(state.candidates(), vec!["aaa", "aaa-then"]);
+    }
+
+    #[test]
+    fn delete_group_cache_removes_the_group_and_ungroups_its_members() {
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+
+        app.delete_group_cache(1);
+
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert!(
+            state.candidates().is_empty(),
+            "the deleted group is gone, and session \"a\" (now ungrouped) has nothing left \
+             to leave either: {:?}",
+            state.candidates()
+        );
     }
 
     #[test]
