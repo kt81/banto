@@ -29,6 +29,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -210,14 +211,19 @@ fn tools_list_result() -> Value {
             {
                 "name": "consult_goinkyo",
                 "description": "Director only. Summon the Goinkyo — banto's retired elder, \
-                                called back in to arbitrate a Director/Worker disagreement or \
-                                an impasse — by filing a written consultation request; it \
-                                reads this once it starts. send_to_peer(to: \"goinkyo\") \
+                                called back in either to arbitrate (a Director/Worker \
+                                disagreement, or an impasse) or to think through an initial \
+                                design with you — by filing a written consultation request; \
+                                it reads this once it starts. `kind` says which, and the two \
+                                ask different things of you. send_to_peer(to: \"goinkyo\") \
                                 reaches it directly from then on, for as long as the \
                                 consultation stays open — you are not limited to the request \
                                 that started it. Fails if a Goinkyo is already part of this \
                                 brigade: only one consults at a time — call dismiss_goinkyo to \
-                                end the current one first.",
+                                end the current one first. Nothing else ends one: an \
+                                arbitration you already have your answer to is finished, and \
+                                leaving it open costs a running session with nothing left to \
+                                do.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -256,14 +262,38 @@ fn tools_list_result() -> Value {
                         },
                         "about": {
                             "type": "string",
-                            "description": "Optional: the Worker token this disagreement is \
-                                            with (e.g. \"worker-2\"). Omit for a consultation \
-                                            about being stuck, not about a disagreement with a \
-                                            specific Worker. Naming one makes `their_case` \
-                                            required."
+                            "description": "Arbitration only. The Worker token this \
+                                            disagreement is with (e.g. \"worker-2\"). Omit for \
+                                            an impasse with no specific Worker. Naming one \
+                                            makes `their_case` required."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["arbitration", "design"],
+                            "description": "What you are asking for. \"arbitration\": there is \
+                                            a disagreement or an impasse, you want it judged, \
+                                            and it is over once you have the answer. \
+                                            \"design\": you are working out an initial design \
+                                            and want it thought through before it is built. \
+                                            One of these is expected to be short and the other \
+                                            to last as long as the design is being settled — \
+                                            which is why you say which it is. \
+                                            `about`/`their_case` belong to arbitration and are \
+                                            refused here; `alternatives` is required instead."
+                        },
+                        "alternatives": {
+                            "type": "string",
+                            "description": "Design only, and required. What other shapes you \
+                                            considered and why you set each aside. If you only \
+                                            ever saw one shape, say exactly that — a design \
+                                            with no discarded alternative is a fact about the \
+                                            design, and one the Goinkyo should be told rather \
+                                            than have to infer from silence."
                         }
                     },
-                    "required": ["question", "my_case", "settled", "unsettled", "blind_spot"],
+                    "required": [
+                        "kind", "question", "my_case", "settled", "unsettled", "blind_spot"
+                    ],
                     "additionalProperties": false,
                 },
             },
@@ -359,12 +389,17 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
                 .has_unseen_brigade_messages(brigade, &peer.token, peer.role)
                 .unwrap_or(false);
             out.push_str(&format!(
-                "  {} — {activity}{}\n",
+                "  {} — {activity}{}{}\n",
                 peer.token,
                 if waiting {
                     " — has unread mail from you"
                 } else {
                     ""
+                },
+                if peer.role == BrigadeRole::Goinkyo {
+                    consultation_age(ctx, brigade, &peer.token)
+                } else {
+                    String::new()
                 }
             ));
         }
@@ -375,6 +410,76 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
         role_label(role.broadcast_target())
     ));
     tool_text(out, false)
+}
+
+/// How long a Goinkyo's consultation has been open and how long since it was
+/// last spoken to, rendered for the roster line — or an empty string when
+/// neither can be read.
+///
+/// Facts, never a verdict. A design consultation quiet for three hours is
+/// ordinary and an arbitration quiet for three hours has been answered and
+/// forgotten, and no threshold banto could pick tells those apart. The
+/// Director knows which one it filed; what it does not reliably know is that
+/// one is still open at all, which is the whole failure this addresses —
+/// nothing ends a consultation except the Director remembering to.
+///
+/// The filing time comes from the request file's own mtime rather than
+/// anything stored: `consult_goinkyo` writes that file before it writes the
+/// row, so it exists for every consultation that exists.
+fn consultation_age(ctx: &ServerContext, brigade: BrigadeId, token: &str) -> String {
+    let now_ms = unix_ms(SystemTime::now());
+    let filed = ctx
+        .goinkyo_dir
+        .as_ref()
+        .map(|dir| goinkyo_request_path(dir, brigade))
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok())
+        .map(unix_ms);
+    let spoken = ctx
+        .store
+        .last_member_exchange_ms(brigade, token)
+        .unwrap_or(None);
+    match (filed, spoken) {
+        (None, None) => String::new(),
+        (Some(filed), None) => format!(
+            " — consulted {} ago, no exchange yet",
+            elapsed_label(now_ms - filed)
+        ),
+        (None, Some(spoken)) => {
+            format!(" — last exchange {} ago", elapsed_label(now_ms - spoken))
+        }
+        (Some(filed), Some(spoken)) => format!(
+            " — consulted {} ago, last exchange {} ago",
+            elapsed_label(now_ms - filed),
+            elapsed_label(now_ms - spoken)
+        ),
+    }
+}
+
+/// Unix milliseconds, saturating to 0 for anything before the epoch — the
+/// store writes timestamps in the same units, and a clock that disagrees is
+/// not worth an error path in a roster line.
+fn unix_ms(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A duration in milliseconds as the coarsest unit that still says something:
+/// minutes, then hours, then days. Nothing here is timing anything — it is
+/// read by a person (or a Director) deciding whether a consultation is still
+/// live, and "2d" answers that better than 172800000 does.
+fn elapsed_label(ms: i64) -> String {
+    let minutes = ms.max(0) / 60_000;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        format!("{hours}h")
+    } else {
+        format!("{}d", hours / 24)
+    }
 }
 
 /// What a peer is doing, as far as banto can tell: Claude's live-state entry
@@ -648,6 +753,16 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         );
     }
 
+    let kind = match require_string_arg(msg, "kind") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    if kind != "arbitration" && kind != "design" {
+        return tool_error(
+            "`kind` must be \"arbitration\" (a disagreement or an impasse, judged and then \
+             over) or \"design\" (an initial design thought through before it is built).",
+        );
+    }
     let question = match require_string_arg(msg, "question") {
         Ok(value) => value,
         Err(message) => return tool_error(&message),
@@ -676,6 +791,35 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         Ok(value) => value,
         Err(message) => return tool_error(&message),
     };
+    let alternatives = match parse_optional_arg(msg, "alternatives") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    if kind == "design" {
+        // Refused rather than ignored. A design consultation carrying a
+        // Worker's case would be filed, read, and answered as if the
+        // disagreement were part of the design question — the Goinkyo has no
+        // way to tell that those sections arrived by mistake.
+        if about.is_some() || their_case.is_some() {
+            return tool_error(
+                "`about` and `their_case` belong to an arbitration. A design consultation \
+                 has no opposing party — drop them, or file this as \
+                 kind=\"arbitration\" instead.",
+            );
+        }
+        if alternatives.is_none() {
+            return tool_error(
+                "`alternatives` is required for a design consultation: what other shapes you \
+                 considered and why you set each aside. If you only ever saw one shape, say \
+                 exactly that.",
+            );
+        }
+    } else if alternatives.is_some() {
+        return tool_error(
+            "`alternatives` belongs to a design consultation. An arbitration is judged on \
+             the two cases and the evidence, not on what else you might have built.",
+        );
+    }
     if about.is_some() && their_case.is_none() {
         return tool_error(
             "`their_case` is required when `about` names a Worker — quote their own words \
@@ -703,6 +847,7 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
     };
     let request = GoinkyoRequest {
         requested_by: "director",
+        kind,
         about,
         question,
         my_case,
@@ -710,6 +855,7 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         settled,
         unsettled,
         blind_spot,
+        alternatives,
     };
     // Write before row, never the reverse: the next phase starts a process
     // the moment it sees a paneless Goinkyo row, on the assumption that a
@@ -799,6 +945,10 @@ fn tool_dismiss_goinkyo(ctx: &mut ServerContext) -> Value {
 /// [`render_goinkyo_request`].
 struct GoinkyoRequest<'a> {
     requested_by: &'a str,
+    /// Which duty this consultation is: `"arbitration"` or `"design"`. The
+    /// Goinkyo reads it to know which of its two roles it was called for,
+    /// which is why it is the first line of the rendered request.
+    kind: &'a str,
     about: Option<&'a str>,
     question: &'a str,
     my_case: &'a str,
@@ -806,19 +956,35 @@ struct GoinkyoRequest<'a> {
     settled: &'a str,
     unsettled: &'a str,
     blind_spot: &'a str,
+    /// Design consultations only — what else the Director considered.
+    alternatives: Option<&'a str>,
 }
 
 /// Plain text, one labeled section per argument. English, like everything
 /// else banto hands an agent product.
 fn render_goinkyo_request(request: &GoinkyoRequest) -> String {
-    let about = request
-        .about
-        .unwrap_or("(none — this is about being stuck, not a disagreement with a specific Worker)");
-    let mut out = format!("Requested by: {}\nAbout: {about}\n\n", request.requested_by);
+    let mut out = format!(
+        "Kind: {}\nRequested by: {}\n",
+        request.kind, request.requested_by
+    );
+    // Only where it means something. An arbitration with nobody named is
+    // about being stuck, and saying so is worth a line; a design
+    // consultation has no "about" at all, and printing "(none)" there would
+    // answer a question nobody asked.
+    if request.about.is_some() || request.alternatives.is_none() {
+        let about = request.about.unwrap_or(
+            "(none — this is about being stuck, not a disagreement with a specific Worker)",
+        );
+        out.push_str(&format!("About: {about}\n"));
+    }
+    out.push('\n');
     out.push_str(&format!("Question:\n{}\n\n", request.question));
     out.push_str(&format!("Director's case:\n{}\n\n", request.my_case));
     if let Some(their_case) = request.their_case {
         out.push_str(&format!("Worker's case:\n{their_case}\n\n"));
+    }
+    if let Some(alternatives) = request.alternatives {
+        out.push_str(&format!("Alternatives considered:\n{alternatives}\n\n"));
     }
     out.push_str(&format!("Settled:\n{}\n\n", request.settled));
     out.push_str(&format!("Unsettled:\n{}\n\n", request.unsettled));
@@ -2196,6 +2362,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let request = GoinkyoRequest {
             requested_by: "director",
+            kind: "arbitration",
             about: None,
             question: "q",
             my_case: "m",
@@ -2203,6 +2370,7 @@ mod tests {
             settled: "s",
             unsettled: "u",
             blind_spot: "b",
+            alternatives: None,
         };
         let written = write_goinkyo_request(tmp.path(), 13, &request).unwrap();
         assert_eq!(written, goinkyo_request_path(tmp.path(), 13));
@@ -2223,6 +2391,7 @@ mod tests {
     /// overrides just the field it's exercising.
     fn full_goinkyo_args() -> Value {
         json!({
+            "kind": "arbitration",
             "question": "Should worker-1's refactor land as-is?",
             "my_case": "It simplifies the module and every test still passes.",
             "their_case": "It changes behavior a caller relies on.",
@@ -2231,6 +2400,161 @@ mod tests {
             "blind_spot": "I have not read that caller myself.",
             "about": "worker-1",
         })
+    }
+
+    /// Drive one `consult_goinkyo` call against a fresh Director context and
+    /// return the text it answered with, error or not.
+    fn goinkyo_response(arguments: Value) -> String {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+        let response = call(&mut ctx, &goinkyo_call(arguments));
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A complete, valid design consultation — the other kind, with the
+    /// arbitration-only fields absent and `alternatives` present.
+    fn full_design_args() -> Value {
+        json!({
+            "kind": "design",
+            "question": "Should the parse cache be keyed on the path or the session id?",
+            "my_case": "Path, because the walk already has it and an id needs a parse.",
+            "settled": "Live state is never cached (docs/DISCIPLINE.md).",
+            "unsettled": "Whether a renamed file must keep its entry.",
+            "blind_spot": "I have not looked at what renames a transcript.",
+            "alternatives": "Keyed on session id — set aside because reading the id is the \
+                             parse this exists to skip.",
+        })
+    }
+
+    #[test]
+    fn a_consultation_without_a_kind_is_refused() {
+        let mut args = full_goinkyo_args();
+        args.as_object_mut().unwrap().remove("kind");
+
+        let response = goinkyo_response(args);
+
+        assert!(response.contains("kind"), "{response}");
+    }
+
+    #[test]
+    fn a_kind_that_is_neither_duty_is_refused() {
+        let mut args = full_goinkyo_args();
+        args["kind"] = json!("review");
+
+        let response = goinkyo_response(args);
+
+        assert!(response.contains("arbitration"), "{response}");
+        assert!(response.contains("design"), "{response}");
+    }
+
+    #[test]
+    fn a_design_consultation_is_filed_with_its_alternatives() {
+        let response = goinkyo_response(full_design_args());
+
+        assert!(response.contains("Consultation filed"), "{response}");
+    }
+
+    #[test]
+    fn a_design_consultation_without_alternatives_is_refused() {
+        // Required rather than optional: "I only saw one shape" is an answer
+        // the Goinkyo needs, and silence does not distinguish it from "I
+        // considered three and did not say".
+        let mut args = full_design_args();
+        args.as_object_mut().unwrap().remove("alternatives");
+
+        let response = goinkyo_response(args);
+
+        assert!(response.contains("alternatives"), "{response}");
+    }
+
+    #[test]
+    fn a_design_consultation_carrying_an_opposing_party_is_refused_not_ignored() {
+        // Ignored, these would still be filed and read, and the Goinkyo has
+        // no way to tell that a Worker's case arrived here by mistake.
+        let mut args = full_design_args();
+        args["about"] = json!("worker-1");
+        args["their_case"] = json!("worker-1 wants it keyed on the id.");
+
+        let response = goinkyo_response(args);
+
+        assert!(response.contains("arbitration"), "{response}");
+    }
+
+    #[test]
+    fn an_arbitration_carrying_alternatives_is_refused() {
+        let mut args = full_goinkyo_args();
+        args["alternatives"] = json!("I could have written it differently.");
+
+        let response = goinkyo_response(args);
+
+        assert!(response.contains("design consultation"), "{response}");
+    }
+
+    #[test]
+    fn the_filed_request_leads_with_its_kind_and_omits_what_that_kind_has_no_use_for() {
+        let arbitration = render_goinkyo_request(&GoinkyoRequest {
+            requested_by: "director",
+            kind: "arbitration",
+            about: None,
+            question: "q",
+            my_case: "m",
+            their_case: None,
+            settled: "s",
+            unsettled: "u",
+            blind_spot: "b",
+            alternatives: None,
+        });
+        assert!(
+            arbitration.starts_with("Kind: arbitration\n"),
+            "{arbitration}"
+        );
+        assert!(arbitration.contains("About: (none"), "{arbitration}");
+        assert!(!arbitration.contains("Alternatives"), "{arbitration}");
+
+        let design = render_goinkyo_request(&GoinkyoRequest {
+            requested_by: "director",
+            kind: "design",
+            about: None,
+            question: "q",
+            my_case: "m",
+            their_case: None,
+            settled: "s",
+            unsettled: "u",
+            blind_spot: "b",
+            alternatives: Some("considered X, set aside because Y"),
+        });
+        assert!(design.starts_with("Kind: design\n"), "{design}");
+        assert!(
+            !design.contains("About:"),
+            "a design consultation has no opposing party, so no line saying it has none: {design}"
+        );
+        assert!(design.contains("Alternatives considered:"), "{design}");
+    }
+
+    #[test]
+    fn elapsed_label_says_the_coarsest_unit_that_still_means_something() {
+        assert_eq!(elapsed_label(0), "0m");
+        assert_eq!(elapsed_label(59 * 60_000), "59m");
+        assert_eq!(elapsed_label(60 * 60_000), "1h");
+        assert_eq!(elapsed_label(47 * 60 * 60_000), "47h");
+        assert_eq!(elapsed_label(48 * 60 * 60_000), "2d");
+        assert_eq!(
+            elapsed_label(-1),
+            "0m",
+            "a clock that went backwards is not a negative age"
+        );
     }
 
     /// The net for the ordering `tool_consult_goinkyo` depends on (see its
