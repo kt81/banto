@@ -460,6 +460,28 @@ impl Store {
     /// whether to nudge an idle member; consuming the cursor here would make
     /// that polling itself the thing that swallows messages before the
     /// member ever pulls them.
+    /// When `member_token` last had a message in either direction, as unix
+    /// milliseconds, or `None` if it never has.
+    ///
+    /// Matches on the token in both columns because `from_session` holds a
+    /// member token despite its name (see [`Self::enqueue_brigade_message`]'s
+    /// `from_token` parameter). A broadcast (`to_member IS NULL`) is
+    /// deliberately not counted as reaching this member: the one caller that
+    /// needs this asks about a Goinkyo, and a Director's broadcast never
+    /// reaches one.
+    pub fn last_member_exchange_ms(
+        &self,
+        brigade_id: BrigadeId,
+        member_token: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(created_at_ms) FROM brigade_messages
+             WHERE brigade_id = ?1 AND (from_session = ?2 OR to_member = ?2)",
+            params![brigade_id, member_token],
+            |row| row.get::<_, Option<i64>>(0),
+        )?)
+    }
+
     pub fn has_unseen_brigade_messages(
         &self,
         brigade_id: BrigadeId,
