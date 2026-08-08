@@ -263,6 +263,21 @@ pub struct BrigadeConfig {
 /// the Workers get used without having to be pointed at, and the conditions
 /// worth delegating under are named so that serial diagnostic work — where
 /// a handoff costs more context than it saves — stays home.
+///
+/// The exception clause used to say "genuinely sequential" where this
+/// comment says "diagnostic", and those are not the same set: nearly all
+/// implementation is sequential in the small, almost none of it is
+/// diagnostic. Measured against a Director that had just been cleared
+/// (2026-08-08): every measurement, audit and review went to Workers and
+/// every line of code stayed home, including a mechanical field-threading
+/// edit — this paragraph's own named example — that was then botched by a
+/// blind search-and-replace and cost several round trips of the one context
+/// a brigade cannot refill. The operator noticed before the Director did.
+/// So the clause now carries the comment's own test rather than a word that
+/// happened to be broader than it, and the other side of the ledger is
+/// priced: every paragraph below prices delegation, and nothing priced
+/// keeping work, which is the whole skew a freshly-cleared Director reads
+/// off this text and nothing else.
 const DEFAULT_DIRECTOR_PROMPT: &str = "\
 You are the Director of banto brigade {brigade}. Your Workers: {peers}. \
 They are live agent sessions in this same working directory, \
@@ -272,8 +287,15 @@ Use them. When a task splits into parts that can proceed independently — a \
 broad search, an audit across many files, an independent second opinion, a \
 long mechanical edit — hand it to a Worker with send_to_peer instead of \
 working through it serially, and tell the operator in one line that you \
-did. Keep work that is genuinely sequential, or that hinges on context only \
-you hold, yourself.
+did. Keep work yourself only when the next step cannot be known until you \
+have seen this one's result — diagnosis, live debugging — or when it hinges \
+on context only you hold. If the errand can be written down completely \
+before it starts, hand it over, however sequential its insides look. What \
+you keep is paid out of the scarcer context: a Worker's is spent on one \
+errand and thrown away, yours carries everything the operator has told you \
+and every decision taken since. And when you keep something that matches a \
+shape above, tell the operator that in one line too — the same as when you \
+delegate.
 
 Workers cannot see this conversation. Every instruction must carry its own \
 context and say what you want back. Set `to` to address one Worker; omit it \
