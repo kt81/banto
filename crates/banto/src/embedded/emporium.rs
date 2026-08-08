@@ -1032,6 +1032,33 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             };
             vec![Event::GroupJoinDone { session_id, result }]
         }
+        StoreIntent::RenameGroup {
+            group_id,
+            old_name,
+            new_name,
+        } => {
+            let result = store
+                .borrow()
+                .rename_group(group_id, &new_name)
+                .map_err(|err| err.to_string());
+            vec![Event::GroupRenameDone {
+                group_id,
+                old_name,
+                new_name,
+                result,
+            }]
+        }
+        StoreIntent::DeleteGroup { group_id, name } => {
+            let result = store
+                .borrow_mut()
+                .delete_group(group_id)
+                .map_err(|err| err.to_string());
+            vec![Event::GroupDeleteDone {
+                group_id,
+                name,
+                result,
+            }]
+        }
         StoreIntent::ResolveMembership { session_id } => {
             // `&mut` (not `&`): healing a member below persists a moved
             // session_id (`set_member_session`), not just reads one.

@@ -757,18 +757,27 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
     // this same key press posts its own message (see e.g. `toggle_pin`),
     // that happens further down this same call and overwrites the clear.
     app.clear_status();
-    if mods.contains(KeyModifiers::CONTROL) {
-        if code == KeyCode::Char('c') {
-            app.request_quit();
-        }
+    // Ctrl+C quits regardless of what's open, modal included — preserved
+    // exactly as it always was. Checked ahead of the modal branch below
+    // (rather than folded into the general Ctrl gate further down) so a
+    // modal's own Ctrl+R/Ctrl+X never has to special-case it.
+    if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+        app.request_quit();
         return;
     }
     // A modal takes over all key handling while it's open — including
     // Up/Down, which mean "move the candidate selection" there rather than
     // "move the list selection", and Left/Right/Home/End, which move its
-    // text-input cursor rather than the list.
+    // text-input cursor rather than the list. Checked before the general
+    // Ctrl gate below, not after: a modal's own chords (the `g` dialog's
+    // Ctrl+R/Ctrl+X) need `mods` to reach `handle_modal_key`, which the gate
+    // would otherwise swallow first — every *other* Ctrl chord stays
+    // swallowed by that gate exactly as before once no modal is open.
     if app.modal().is_some() {
-        handle_modal_key(app, code, ctx);
+        handle_modal_key(app, code, mods, ctx);
+        return;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
         return;
     }
     match code {
@@ -830,7 +839,24 @@ fn toggle_grouped_view(app: &mut App) {
 /// kind — each of `App`'s `modal_*` methods is a no-op for a modal that
 /// doesn't have the relevant piece (e.g. the archive confirm dialog has no
 /// text input or candidate list).
-fn handle_modal_key(app: &mut App, code: KeyCode, ctx: &Context) {
+///
+/// `mods` is checked first, unconditionally: a bare `Char('r')` can't tell
+/// Ctrl+R (the `g` dialog's rename verb) from a plain `r` typed into a text
+/// field, so every other arm below only ever runs once Ctrl is known to be
+/// absent — a modal with no Ctrl-bound verb of its own just eats the chord
+/// here instead of falling through to `modal_push_char`.
+/// `open_group_rename_modal`/`open_confirm_group_delete_modal` are
+/// themselves the guard for "only from `GroupJoin`, only on an existing
+/// group"; this dispatch doesn't duplicate that check.
+fn handle_modal_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ctx: &Context) {
+    if mods.contains(KeyModifiers::CONTROL) {
+        match code {
+            KeyCode::Char('r') => app.open_group_rename_modal(),
+            KeyCode::Char('x') => app.open_confirm_group_delete_modal(),
+            _ => {}
+        }
+        return;
+    }
     match code {
         KeyCode::Esc => app.close_modal(),
         KeyCode::Up => app.modal_select_prev(),
@@ -859,6 +885,8 @@ fn confirm_modal(app: &mut App, ctx: &Context) {
         Some(Modal::NewSession(_)) => confirm_new_session_modal(app, ctx),
         Some(Modal::ConfirmArchive { .. }) => confirm_archive_modal(app, ctx),
         Some(Modal::GroupJoin(_)) => confirm_group_join_modal(app, ctx),
+        Some(Modal::GroupRename(_)) => confirm_group_rename_modal(app, ctx),
+        Some(Modal::ConfirmGroupDelete { .. }) => confirm_group_delete_modal(app, ctx),
         Some(Modal::ConfirmDisband { .. })
         | Some(Modal::ConfirmKill { .. })
         | Some(Modal::WorkerAgentPicker(_))
@@ -1049,6 +1077,50 @@ fn confirm_group_join_modal(app: &mut App, ctx: &Context) {
     app.set_status(message, Instant::now());
     if result.is_ok() {
         app.set_session_group_cache(&session_id, group_id, group_name);
+    }
+    app.close_modal();
+}
+
+/// Confirm the group-rename sub-modal (Ctrl+R from the `g` dialog): persist
+/// the typed name via `Store::rename_group` (fails on a duplicate name —
+/// left as a status message rather than an inline modal error, same
+/// treatment `confirm_group_join_modal`'s own `create_group` failure gets),
+/// then update `App`'s group cache so it's reflected without waiting for a
+/// reload.
+fn confirm_group_rename_modal(app: &mut App, ctx: &Context) {
+    let Some((group_id, old_name, new_name)) = app.modal_group_rename_target() else {
+        return;
+    };
+    let result = ctx.store.borrow().rename_group(group_id, &new_name);
+    let message = match &result {
+        Ok(()) => format!("renamed group \"{old_name}\" to \"{new_name}\""),
+        Err(err) => format!("failed to rename group \"{old_name}\": {err}"),
+    };
+    app.set_status(message, Instant::now());
+    if result.is_ok() {
+        app.rename_group_cache(group_id, new_name);
+    }
+    app.close_modal();
+}
+
+/// Confirm the group delete-confirm sub-modal (Ctrl+X from the `g` dialog):
+/// `Store::delete_group` removes the group and its membership rows —
+/// sessions that were in it are untouched (see the modal's own consequence
+/// line, `render_modal::render_confirm_group_delete_modal`).
+fn confirm_group_delete_modal(app: &mut App, ctx: &Context) {
+    let Some(Modal::ConfirmGroupDelete { group_id, name }) = app.modal() else {
+        return;
+    };
+    let group_id = *group_id;
+    let name = name.clone();
+    let result = ctx.store.borrow_mut().delete_group(group_id);
+    let message = match &result {
+        Ok(()) => format!("deleted group \"{name}\" \u{2014} its members are now ungrouped"),
+        Err(err) => format!("failed to delete group \"{name}\": {err}"),
+    };
+    app.set_status(message, Instant::now());
+    if result.is_ok() {
+        app.delete_group_cache(group_id);
     }
     app.close_modal();
 }
@@ -3478,6 +3550,177 @@ mod tests {
         assert!(matches!(app.modal(), Some(Modal::GroupJoin(_))));
     }
 
+    // --- Ctrl+R/Ctrl+X in the `g` dialog (rename/delete a group) -----------
+
+    fn app_and_store_with_one_group() -> (RefCell<Store>, App) {
+        let store = Store::open_in_memory().unwrap();
+        let group_id = store.create_group("work").unwrap();
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)])
+            .with_groups(vec![(group_id, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        (RefCell::new(store), app)
+    }
+
+    #[test]
+    fn ctrl_r_opens_the_rename_sub_modal_on_the_highlighted_group() {
+        let (store, mut app) = app_and_store_with_one_group();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        app.open_group_join_modal();
+
+        handle_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &ctx);
+
+        let Some(Modal::GroupRename(state)) = app.modal() else {
+            panic!("expected the rename sub-modal to open");
+        };
+        assert_eq!(state.old_name(), "work");
+    }
+
+    #[test]
+    fn ctrl_r_on_the_leave_row_is_a_noop() {
+        let (store, mut app) = app_and_store_with_one_group();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        app.modal_select_next(); // onto the `(no group)` row
+
+        handle_key(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL, &ctx);
+
+        assert!(
+            matches!(app.modal(), Some(Modal::GroupJoin(_))),
+            "the leave row names no group to rename"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_opens_the_delete_confirm_sub_modal_on_the_highlighted_group() {
+        let (store, mut app) = app_and_store_with_one_group();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        app.open_group_join_modal();
+
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL, &ctx);
+
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmGroupDelete { name, .. }) if name == "work"
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_even_with_a_modal_open() {
+        // Regression pin for the Ctrl-gate reorder that opened Ctrl+R/Ctrl+X
+        // through to `handle_modal_key`: Ctrl+C's own always-quits behavior
+        // (checked ahead of that reorder, not through it) must survive
+        // unchanged.
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_confirm_archive_modal();
+
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL, &ctx);
+
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn an_unrelated_ctrl_chord_while_a_modal_is_open_does_not_leak_into_its_text_input() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        let mut app = App::new(vec![row("a", "Alpha", "/work/alpha", Activity::Alive)]);
+        app.set_viewport_height(10);
+        app.open_new_session_modal();
+
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL, &ctx);
+
+        let Some(Modal::NewSession(state)) = app.modal() else {
+            panic!("expected the new-session modal to still be open");
+        };
+        assert_eq!(
+            state.input(),
+            "",
+            "Ctrl+A names no verb here and must not type 'a'"
+        );
+    }
+
+    #[test]
+    fn confirming_group_rename_persists_via_the_store_and_updates_the_cache() {
+        let (store, mut app) = app_and_store_with_one_group();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        app.open_group_join_modal();
+        app.open_group_rename_modal();
+        for c in "projects".chars() {
+            app.modal_push_char(c);
+        }
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+
+        assert!(app.modal().is_none());
+        assert_eq!(app.status(), Some("renamed group \"work\" to \"projects\""));
+        let names: Vec<String> = ctx
+            .store
+            .borrow()
+            .list_groups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["projects"],
+            "the store itself must reflect the rename"
+        );
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(state)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(
+            state.candidates(),
+            vec!["projects"],
+            "the in-memory cache must reflect it too, without waiting for a reload"
+        );
+    }
+
+    #[test]
+    fn confirming_group_delete_persists_via_the_store_and_states_the_consequence() {
+        let (store, mut app) = app_and_store_with_one_group();
+        store
+            .borrow_mut()
+            .set_session_group(&SessionId("a".to_string()), 1)
+            .unwrap();
+        let thresholds = AgeThresholds::default();
+        let ctx = test_context(&store, &thresholds);
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        app.open_confirm_group_delete_modal();
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &ctx);
+
+        assert!(app.modal().is_none());
+        let status = app.status().unwrap_or_default();
+        assert!(
+            status.contains("ungrouped"),
+            "the delete confirmation's outcome must be stated: {status:?}"
+        );
+        assert!(
+            ctx.store.borrow().list_groups().unwrap().is_empty(),
+            "the group itself must be gone from the store"
+        );
+        assert_eq!(
+            ctx.store
+                .borrow()
+                .group_for_session(&SessionId("a".to_string()))
+                .unwrap(),
+            None,
+            "the session that was in it survives, just ungrouped"
+        );
+    }
+
     #[test]
     fn tab_toggles_grouped_view_in_normal_mode() {
         let store = RefCell::new(Store::open_in_memory().unwrap());
@@ -3540,6 +3783,53 @@ mod tests {
         assert!(text.contains("Join Group"), "title missing:\n{text}");
         assert!(text.contains('w'), "typed input missing:\n{text}");
         assert!(text.contains("work"), "matching group missing:\n{text}");
+    }
+
+    #[test]
+    fn render_group_join_modal_hints_ctrl_r_and_ctrl_x() {
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+
+        let text = draw_with_width(&app, 110);
+        assert!(text.contains("Ctrl+R"), "rename hint missing:\n{text}");
+        assert!(text.contains("Ctrl+X"), "delete hint missing:\n{text}");
+    }
+
+    #[test]
+    fn render_group_rename_modal_shows_the_old_name_and_typed_input() {
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+        app.open_group_rename_modal();
+        for c in "play".chars() {
+            app.modal_push_char(c);
+        }
+
+        let text = draw_with_width(&app, 110);
+        assert!(text.contains("Rename Group"), "title missing:\n{text}");
+        assert!(text.contains("work"), "old name missing:\n{text}");
+        assert!(text.contains("play"), "typed new name missing:\n{text}");
+    }
+
+    #[test]
+    fn render_confirm_group_delete_modal_states_the_consequence() {
+        let mut app = App::new(vec![row("a", "Alpha", "", Activity::Alive)])
+            .with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app.open_group_join_modal();
+        app.open_confirm_group_delete_modal();
+
+        let text = draw_with_width(&app, 110);
+        assert!(text.contains("Delete Group"), "title missing:\n{text}");
+        assert!(text.contains("work"), "group name missing:\n{text}");
+        assert!(
+            text.contains("Ungrouped") && text.contains("sessions themselves"),
+            "the modal must state its own consequence, not just what it will do \
+             (long line, may be truncated by the modal's fixed width):\n{text}"
+        );
     }
 
     #[test]

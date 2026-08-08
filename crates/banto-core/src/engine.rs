@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use ratatui_core::layout::{Constraint, Layout, Position, Rect};
 use serde::{Deserialize, Serialize};
 
-use crate::app::{App, ClickOutcome, GroupJoinTarget, KillChoice, Modal, Mode};
+use crate::app::{App, ClickOutcome, GroupId, GroupJoinTarget, KillChoice, Modal, Mode};
 use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1317,6 +1317,18 @@ pub enum StoreIntent {
         session_id: String,
         target: GroupJoinTargetData,
     },
+    RenameGroup {
+        group_id: GroupId,
+        old_name: String,
+        new_name: String,
+    },
+    /// `name` travels with the id purely for the status message
+    /// (`Event::GroupDeleteDone`'s doc) — `Store::delete_group` itself only
+    /// needs `group_id`.
+    DeleteGroup {
+        group_id: GroupId,
+        name: String,
+    },
     ResolveMembership {
         session_id: String,
     },
@@ -1656,6 +1668,23 @@ pub enum Event {
         /// pair deserializes as `Some`.
         result: Result<Option<(i64, String)>, String>,
     },
+    /// Answers `Cmd::Store(StoreIntent::RenameGroup)`. `old_name`/`new_name`
+    /// travel through even on `Err` so the status message can name both —
+    /// `Store::rename_group` fails on a duplicate name, and "failed to
+    /// rename to X" without saying what it was renaming from reads as if the
+    /// modal lost track of its own target.
+    GroupRenameDone {
+        group_id: GroupId,
+        old_name: String,
+        new_name: String,
+        result: Result<(), String>,
+    },
+    /// Answers `Cmd::Store(StoreIntent::DeleteGroup)`.
+    GroupDeleteDone {
+        group_id: GroupId,
+        name: String,
+        result: Result<(), String>,
+    },
     MembershipResolved {
         session_id: String,
         membership: Option<(BrigadeId, MemberToken, BrigadeRole)>,
@@ -1887,6 +1916,45 @@ pub fn update(
                     app.clear_session_group_cache(&session_id);
                 }
                 Err(err) => state.set_status(format!("failed to join group: {err}"), now),
+            }
+            Vec::new()
+        }
+        Event::GroupRenameDone {
+            group_id,
+            old_name,
+            new_name,
+            result,
+        } => {
+            match result {
+                Ok(()) => {
+                    state.set_status(
+                        format!("renamed group \"{old_name}\" to \"{new_name}\""),
+                        now,
+                    );
+                    app.rename_group_cache(group_id, new_name);
+                }
+                Err(err) => {
+                    state.set_status(format!("failed to rename group \"{old_name}\": {err}"), now)
+                }
+            }
+            Vec::new()
+        }
+        Event::GroupDeleteDone {
+            group_id,
+            name,
+            result,
+        } => {
+            match result {
+                Ok(()) => {
+                    state.set_status(
+                        format!("deleted group \"{name}\" \u{2014} its members are now ungrouped"),
+                        now,
+                    );
+                    app.delete_group_cache(group_id);
+                }
+                Err(err) => {
+                    state.set_status(format!("failed to delete group \"{name}\": {err}"), now)
+                }
             }
             Vec::new()
         }
@@ -2256,7 +2324,7 @@ fn update_key(
     let code = key.code;
 
     if app.modal().is_some() {
-        return update_modal_key(state, app, code);
+        return update_modal_key(state, app, code, key.modifiers);
     }
     if app.mode() == Mode::Search {
         update_search_key(app, code);
@@ -2481,7 +2549,30 @@ fn update_search_key(app: &mut App, code: KeyCode) {
     }
 }
 
-fn update_modal_key(state: &mut EmporiumState, app: &mut App, code: KeyCode) -> Vec<Cmd> {
+/// Keys while a modal is open. `mods` exists solely for the `g` dialog's
+/// Ctrl+R/Ctrl+X verbs (rename/delete the highlighted group) — every other
+/// arm ignores it, same as it always has, since a modal's other keys have
+/// never been chords. Checked first and unconditionally: `code` alone (a
+/// bare `Char('r')`) cannot tell Ctrl+R from a plain `r` typed into a text
+/// field, and typed text must never be swallowed by a would-be verb that
+/// doesn't apply to whatever modal happens to be open (`App::open_group_
+/// rename_modal`/`open_confirm_group_delete_modal` are themselves the guard
+/// for "only on `GroupJoin`, only on an existing group" — this dispatch
+/// doesn't duplicate that check).
+fn update_modal_key(
+    state: &mut EmporiumState,
+    app: &mut App,
+    code: KeyCode,
+    mods: Modifiers,
+) -> Vec<Cmd> {
+    if mods.ctrl {
+        match code {
+            KeyCode::Char('r') => app.open_group_rename_modal(),
+            KeyCode::Char('x') => app.open_confirm_group_delete_modal(),
+            _ => {}
+        }
+        return Vec::new();
+    }
     match code {
         KeyCode::Esc => {
             app.close_modal();
@@ -2556,6 +2647,8 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     enum Kind {
         Archive,
         Group,
+        GroupRename,
+        GroupDelete,
         New,
         Disband,
         Kill,
@@ -2566,6 +2659,8 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let kind = match app.modal() {
         Some(Modal::ConfirmArchive { .. }) => Some(Kind::Archive),
         Some(Modal::GroupJoin(_)) => Some(Kind::Group),
+        Some(Modal::GroupRename(_)) => Some(Kind::GroupRename),
+        Some(Modal::ConfirmGroupDelete { .. }) => Some(Kind::GroupDelete),
         Some(Modal::NewSession(_)) => Some(Kind::New),
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
@@ -2577,6 +2672,8 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     match kind {
         Some(Kind::Archive) => confirm_archive_modal(app),
         Some(Kind::Group) => confirm_group_join_modal(app),
+        Some(Kind::GroupRename) => confirm_group_rename_modal(app),
+        Some(Kind::GroupDelete) => confirm_group_delete_modal(app),
         Some(Kind::New) => confirm_new_session_modal(app),
         Some(Kind::Disband) => confirm_disband_modal(app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
@@ -2674,6 +2771,28 @@ fn confirm_group_join_modal(app: &mut App) -> Vec<Cmd> {
         GroupJoinTarget::Leave => GroupJoinTargetData::Leave,
     };
     vec![Cmd::Store(StoreIntent::JoinGroup { session_id, target })]
+}
+
+fn confirm_group_rename_modal(app: &mut App) -> Vec<Cmd> {
+    let Some((group_id, old_name, new_name)) = app.modal_group_rename_target() else {
+        return Vec::new();
+    };
+    app.close_modal();
+    vec![Cmd::Store(StoreIntent::RenameGroup {
+        group_id,
+        old_name,
+        new_name,
+    })]
+}
+
+fn confirm_group_delete_modal(app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::ConfirmGroupDelete { group_id, name }) = app.modal() else {
+        return Vec::new();
+    };
+    let group_id = *group_id;
+    let name = name.clone();
+    app.close_modal();
+    vec![Cmd::Store(StoreIntent::DeleteGroup { group_id, name })]
 }
 
 /// `is_dir()` is a stat — file I/O this crate may never do itself
@@ -6917,7 +7036,7 @@ mod tests {
         let mut app = app_with(vec![row("dir")]);
         app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
 
-        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
 
         assert!(cmds.is_empty());
         assert!(app.modal().is_none());
@@ -7249,7 +7368,7 @@ mod tests {
         });
         app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
 
-        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
 
         assert!(cmds.is_empty());
         assert!(app.modal().is_none());
@@ -7265,7 +7384,7 @@ mod tests {
         let mut app = app_with(vec![]);
         app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
 
-        update_modal_key(&mut state, &mut app, KeyCode::BackTab);
+        update_modal_key(&mut state, &mut app, KeyCode::BackTab, Modifiers::NONE);
 
         assert!(matches!(
             app.modal(),
@@ -7367,7 +7486,7 @@ mod tests {
         });
         app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
 
-        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc);
+        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
 
         assert!(cmds.is_empty());
         assert!(app.modal().is_none());
@@ -8064,6 +8183,253 @@ mod tests {
             panic!("expected the group-join modal to still be open");
         };
         assert_eq!(gstate.input(), "myteam");
+    }
+
+    // --- Ctrl+R/Ctrl+X in the `g` dialog (rename/delete a group) -----------
+
+    fn app_with_one_group() -> App {
+        let mut app =
+            App::new(vec![row("a")]).with_groups(vec![(1, "work".to_string())], HashMap::new());
+        app.set_viewport_height(10);
+        app
+    }
+
+    fn ctrl_key(c: char) -> Event {
+        Event::Input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            Modifiers::CONTROL,
+        )))
+    }
+
+    #[test]
+    fn ctrl_r_in_the_group_join_modal_opens_the_rename_sub_modal() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            ctrl_key('r'),
+            test_instant(),
+        );
+
+        assert!(
+            cmds.is_empty(),
+            "opening the sub-modal is a pure App mutation, no Cmd"
+        );
+        let Some(Modal::GroupRename(gstate)) = app.modal() else {
+            panic!(
+                "expected the rename sub-modal to open, got {:?}",
+                app.modal().is_some()
+            );
+        };
+        assert_eq!(gstate.group_id(), 1);
+        assert_eq!(gstate.old_name(), "work");
+    }
+
+    #[test]
+    fn ctrl_r_on_the_leave_row_is_a_noop() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        app.modal_select_next(); // onto the `(no group)` row
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            ctrl_key('r'),
+            test_instant(),
+        );
+
+        assert!(
+            matches!(app.modal(), Some(Modal::GroupJoin(_))),
+            "the leave row names no group to rename"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_in_the_group_join_modal_opens_the_delete_confirm_sub_modal() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            ctrl_key('x'),
+            test_instant(),
+        );
+
+        assert!(cmds.is_empty());
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmGroupDelete { group_id: 1, name }) if name == "work"
+        ));
+    }
+
+    #[test]
+    fn ctrl_x_on_the_leave_row_is_a_noop() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        app.set_session_group_cache("a", 1, "work".to_string());
+        app.open_group_join_modal();
+        app.modal_select_next();
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            ctrl_key('x'),
+            test_instant(),
+        );
+
+        assert!(matches!(app.modal(), Some(Modal::GroupJoin(_))));
+    }
+
+    #[test]
+    fn confirming_group_rename_issues_a_rename_group_store_cmd_and_closes_the_modal() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+        app.open_group_rename_modal();
+        for c in "projects".chars() {
+            app.modal_push_char(c);
+        }
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))),
+            test_instant(),
+        );
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::RenameGroup { group_id: 1, old_name, new_name })]
+                if old_name == "work" && new_name == "projects"
+        ));
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn confirming_group_delete_issues_a_delete_group_store_cmd_and_closes_the_modal() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        app.open_group_join_modal();
+        app.open_confirm_group_delete_modal();
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))),
+            test_instant(),
+        );
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::DeleteGroup { group_id: 1, name })] if name == "work"
+        ));
+        assert!(app.modal().is_none());
+    }
+
+    #[test]
+    fn group_rename_done_updates_the_cache_on_success() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GroupRenameDone {
+                group_id: 1,
+                old_name: "work".to_string(),
+                new_name: "projects".to_string(),
+                result: Ok(()),
+            },
+            test_instant(),
+        );
+
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(gstate)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(gstate.candidates(), vec!["projects"]);
+    }
+
+    #[test]
+    fn group_rename_done_leaves_the_cache_alone_on_failure() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GroupRenameDone {
+                group_id: 1,
+                old_name: "work".to_string(),
+                new_name: "play".to_string(),
+                result: Err("duplicate name".to_string()),
+            },
+            test_instant(),
+        );
+
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(gstate)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert_eq!(
+            gstate.candidates(),
+            vec!["work"],
+            "a failed rename must not touch the cached name"
+        );
+    }
+
+    #[test]
+    fn group_delete_done_removes_the_group_from_the_cache_on_success() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with_one_group();
+        let brigade = brigade_config();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GroupDeleteDone {
+                group_id: 1,
+                name: "work".to_string(),
+                result: Ok(()),
+            },
+            test_instant(),
+        );
+
+        app.open_group_join_modal();
+        let Some(Modal::GroupJoin(gstate)) = app.modal() else {
+            panic!("expected an open group-join modal");
+        };
+        assert!(gstate.candidates().is_empty());
     }
 
     #[test]

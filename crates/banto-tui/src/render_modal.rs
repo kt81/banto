@@ -15,7 +15,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::app::{
-    GroupJoinState, KillChoice, Modal, NewSessionPlacement, NewSessionState, WorkerAgentPickerState,
+    GroupJoinState, GroupRenameState, KillChoice, Modal, NewSessionPlacement, NewSessionState,
+    WorkerAgentPickerState,
 };
 
 use crate::text::truncate_to_width;
@@ -176,6 +177,10 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_cho
         Modal::NewSession(state) => render_new_session_modal(frame, state, area, agent_choice),
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
         Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
+        Modal::GroupRename(state) => render_group_rename_modal(frame, state, area),
+        Modal::ConfirmGroupDelete { name, .. } => {
+            render_confirm_group_delete_modal(frame, name, area)
+        }
         Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
         Modal::ConfirmKill {
             title,
@@ -503,12 +508,16 @@ fn render_confirm_kill_modal(
 /// Render the `g` group-join dialog: a one-line new-group-name input (same
 /// input/cursor convention as the search box and the new-session modal)
 /// above a substring-filtered list of existing groups to pick from instead.
+/// Ctrl+R/Ctrl+X (rename/delete the highlighted group — `App::open_group_
+/// rename_modal`/`open_confirm_group_delete_modal`) are named in the bottom
+/// hint even though they only do something on an existing-group row: a chord
+/// nobody knows exists is a chord nobody uses.
 fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
         .title(" Join Group ")
-        .title_bottom(" Enter join/create  Esc cancel ");
+        .title_bottom(" Enter join/create  Ctrl+R rename  Ctrl+X delete  Esc cancel ");
     let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
@@ -554,6 +563,63 @@ fn render_group_join_modal(frame: &mut Frame, state: &GroupJoinState, area: Rect
     let mut list_state = ListState::default();
     list_state.select(state.selected());
     frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+/// Render the group-rename sub-modal (Ctrl+R from the `g` dialog): the old
+/// name as a label, a one-line free-text input for the new one (same
+/// input/cursor convention as [`render_group_join_modal`]'s own).
+fn render_group_rename_modal(frame: &mut Frame, state: &GroupRenameState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" Rename Group ")
+        .title_bottom(" Enter rename  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let [hint_area, input_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(truncate_to_width(
+            &format!("rename \"{}\" ->", state.old_name()),
+            hint_area.width,
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+        hint_area,
+    );
+
+    let (visible_input, cursor_col) =
+        windowed_view(state.input(), state.cursor(), input_area.width);
+    frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
+    if input_area.width > 0 {
+        let cursor_x = (input_area.x + cursor_col).min(input_area.x + input_area.width - 1);
+        frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    }
+}
+
+/// Render the group delete-confirm sub-modal (Ctrl+X from the `g` dialog):
+/// a one-line yes/no prompt plus the consequence — `Store::delete_group`
+/// only removes membership rows, so the sessions that were in the group
+/// keep existing, just ungrouped.
+fn render_confirm_group_delete_modal(frame: &mut Frame, name: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Delete Group \u{2014} confirm ")
+        .title_bottom(" Enter delete  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let prompt = truncate_to_width(&format!("Delete group \"{name}\"?"), inner.width);
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(Span::styled(
+            "Its members return to Ungrouped; the sessions themselves aren't deleted.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]
