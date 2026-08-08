@@ -438,7 +438,15 @@ fn consultation_age(ctx: &ServerContext, brigade: BrigadeId, token: &str) -> Str
     let spoken = ctx
         .store
         .last_member_exchange_ms(brigade, token)
-        .unwrap_or(None);
+        .unwrap_or(None)
+        // Mail outlives the consultation it belonged to: `dismiss_worker`
+        // purges what was addressed *to* the token, and a Goinkyo's own
+        // replies are addressed to the Director, so they stay. Counted as
+        // this consultation's, the previous one's last word reads as a day
+        // of silence on a consultation two minutes old — which is the exact
+        // opposite of what this line exists to say. Observed on the first
+        // live consultation after the one before it was ended.
+        .filter(|at| filed.is_none_or(|filed| *at >= filed));
     match (filed, spoken) {
         (None, None) => String::new(),
         (Some(filed), None) => format!(
@@ -2541,6 +2549,74 @@ mod tests {
             "a design consultation has no opposing party, so no line saying it has none: {design}"
         );
         assert!(design.contains("Alternatives considered:"), "{design}");
+    }
+
+    /// A `ServerContext` whose store and consultation directory a test can
+    /// drive, for the roster line's own timing.
+    fn age_ctx(dir: &Path) -> ServerContext {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.goinkyo_dir = Some(dir.to_path_buf());
+        ctx
+    }
+
+    #[test]
+    fn a_fresh_consultation_does_not_inherit_the_previous_ones_last_word() {
+        // Mail addressed *to* a dismissed token is purged; a Goinkyo's own
+        // replies go to the Director and survive. Counted as this
+        // consultation's, they read as a day of silence on a consultation
+        // filed a minute ago — the opposite of what the line is for. Caught
+        // on the first live consultation filed after another had ended.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = age_ctx(tmp.path());
+        ctx.store
+            .enqueue_brigade_message(1, "goinkyo", BrigadeRole::Director, Some("director"), "old")
+            .unwrap();
+        // The filing time is set explicitly rather than taken from "write it
+        // second": both land in the same millisecond often enough that the
+        // ordering this test is about would hold only sometimes.
+        let path = goinkyo_request_path(tmp.path(), 1);
+        std::fs::write(&path, "request").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+
+        let line = consultation_age(&ctx, 1, "goinkyo");
+
+        assert!(
+            line.contains("no exchange yet"),
+            "a consultation filed after that message has not been spoken to: {line}"
+        );
+    }
+
+    #[test]
+    fn an_exchange_within_the_current_consultation_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = age_ctx(tmp.path());
+        std::fs::write(goinkyo_request_path(tmp.path(), 1), "request").unwrap();
+        ctx.store
+            .enqueue_brigade_message(1, "goinkyo", BrigadeRole::Director, Some("director"), "new")
+            .unwrap();
+
+        let line = consultation_age(&ctx, 1, "goinkyo");
+
+        assert!(line.contains("last exchange"), "{line}");
+        assert!(!line.contains("no exchange yet"), "{line}");
+    }
+
+    #[test]
+    fn a_member_with_no_consultation_on_file_gets_no_age_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = age_ctx(tmp.path());
+
+        assert_eq!(consultation_age(&ctx, 1, "goinkyo"), "");
     }
 
     #[test]
