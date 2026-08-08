@@ -102,16 +102,28 @@ completed 2026-07-25 (`docs/DISCIPLINE.md` §2's own status marker).
 
 ## Architecture decision (2026-07-26): the chōba is feature-frozen
 
-**The chōba (formerly the "classic" list mode; `banto` with no flags) takes bug fixes
-and platform parity from here on, not new capability.** New behavior belongs
-in the emporium, which is where the hosted-pane work is going.
+**The chōba (formerly the "classic" list mode; `banto` with no flags) takes no
+work done *for the chōba*.** New capability aimed at it belongs in the
+emporium instead, which is where the hosted-pane work is going. Bug fixes and
+platform parity remain in scope on their own.
+
+**What this does not exclude: a change made for the emporium that lands in
+the chōba because the two share the code it lives in** — a shared modal,
+shared `App` state, a shared confirm. That is the intended outcome, not an
+exception to be argued for case by case. The freeze is about where effort is
+aimed, not about holding the two modes apart.
+
+That sentence is here because the wording it replaces did not say it, and
+misled two readers in one afternoon (2026-08-08): both a Director and a
+Goinkyo read "new behavior belongs in the emporium" as covering anything that
+reaches the chōba at all, and treated a shared-modal change as an exception
+needing the operator's sign-off. It was not one.
 
 "Platform parity" is what admitted the tmux backend above under the freeze:
 `s` invoking a `psmux` binary that does not exist on Linux is a mode that
 does not work off Windows, not a feature it lacks. The same reading covers
-the input-path fix that preceded it. Anything that would make the chōba do
-something new — rather than do what it already claims, on a platform where
-it currently cannot — is out of scope by default.
+the input-path fix that preceded it. What is out of scope is work whose
+reason is the chōba — making it do something new, for its own sake.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
