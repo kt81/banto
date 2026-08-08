@@ -1572,6 +1572,20 @@ fn gather_goinkyo_observation(
     store: &RefCell<Store>,
     app: &App,
 ) -> GoinkyoObservation {
+    // A consultation that ended, first and independently of the stage: the
+    // Director's session can call `dismiss_goinkyo` while the operator is
+    // looking anywhere at all, and the pane it leaves behind keeps running
+    // (off-stage panes are pumped too). Asked only about brigades banto has
+    // a Goinkyo pane recorded for, so this is one roster read for the one
+    // entry that normally exists, not a scan of the store.
+    for brigade_id in state.goinkyo_brigades() {
+        let Ok(members) = store.borrow().brigade_members(brigade_id) else {
+            continue;
+        };
+        if !members.iter().any(|m| m.role == BrigadeRole::Goinkyo) {
+            return GoinkyoObservation::NoGoinkyo { brigade_id };
+        }
+    }
     let Stage::Brigade { id, director, .. } = &state.stage else {
         return GoinkyoObservation::Unchanged;
     };
@@ -4412,6 +4426,66 @@ mod tests {
         dir_row.cwd = Some(PathBuf::from("/work/alpha"));
         let app = App::new(vec![dir_row]);
         (RefCell::new(store), state, app)
+    }
+
+    #[test]
+    fn a_consultation_that_ends_while_another_brigade_is_on_stage_is_still_noticed() {
+        // `dismiss_goinkyo` is an MCP call the Director's own session makes,
+        // so it lands whenever that session decides to — not when the
+        // operator happens to be looking at the brigade it belongs to. Tied
+        // to the stage, this observation would never fire for those, and the
+        // pane would keep running with no row behind it and nothing left
+        // that knew which pane it was.
+        let (store, mut state, app) = staged_goinkyo(None);
+        let mut app = app;
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        let config = BrigadeConfig::default();
+
+        // Record the pane the ordinary way: gather says "awaiting spawn",
+        // the fold opens it and remembers which brigade it belongs to.
+        let observation = gather_goinkyo_observation(&state, &store, &app);
+        assert!(matches!(observation, GoinkyoObservation::AwaitingSpawn(_)));
+        engine::update(
+            &mut state,
+            &mut app,
+            &config,
+            Event::GoinkyoAwaitingSpawn { observation },
+            Instant::now(),
+        );
+
+        // The consultation ends, and the operator is looking elsewhere.
+        store
+            .borrow_mut()
+            .dismiss_worker(brigade_id, "goinkyo")
+            .unwrap();
+        state.stage = Stage::Empty;
+
+        assert!(
+            matches!(
+                gather_goinkyo_observation(&state, &store, &app),
+                GoinkyoObservation::NoGoinkyo { brigade_id: id } if id == brigade_id
+            ),
+            "the ended consultation must be reported whatever is on stage"
+        );
+    }
+
+    #[test]
+    fn a_brigade_with_no_goinkyo_pane_recorded_is_not_asked_about() {
+        // The scan above is over panes banto actually opened, not over the
+        // store: a brigade that never had a consultation must not produce an
+        // observation just because it has no Goinkyo row.
+        let (store, mut state, app) = staged_goinkyo(None);
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        store
+            .borrow_mut()
+            .dismiss_worker(brigade_id, "goinkyo")
+            .unwrap();
+        state.stage = Stage::Empty;
+
+        assert!(matches!(
+            gather_goinkyo_observation(&state, &store, &app),
+            GoinkyoObservation::Unchanged
+        ));
     }
 
     #[test]

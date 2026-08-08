@@ -456,7 +456,17 @@ pub enum GoinkyoObservation {
     /// (already spawned, or resolved by discovery) — nothing to do either
     /// way.
     Unchanged,
-    /// The staged brigade has no Goinkyo member row.
+    /// A brigade with a Goinkyo pane no longer has a Goinkyo member row:
+    /// its consultation has ended.
+    ///
+    /// Deliberately not limited to the staged brigade. `dismiss_goinkyo` is
+    /// an MCP call the Director's own session makes, so it lands whenever
+    /// that session decides to make it — including while the operator is
+    /// looking at a different brigade, or at no brigade at all. Tied to the
+    /// stage, this would never be reported for those, and the pane would go
+    /// on running with no row left to justify it. A Worker's dismissal
+    /// cannot reach that state: it is a key the operator presses while
+    /// looking at the brigade it belongs to.
     NoGoinkyo { brigade_id: BrigadeId },
     /// A member row exists with no session id yet.
     AwaitingSpawn(GoinkyoSpawnCandidate),
@@ -962,6 +972,18 @@ impl EmporiumState {
             expected_exits: HashSet::new(),
             last_relaunch: HashMap::new(),
         }
+    }
+
+    /// Every brigade this run has a Goinkyo pane recorded for, smallest id
+    /// first. Read by the shell's own gather so that noticing a consultation
+    /// has ended does not depend on which brigade is on stage — see
+    /// [`GoinkyoObservation::NoGoinkyo`]. Sorted because a `HashMap`'s order
+    /// is not one, and an observation that varies run to run is a poor thing
+    /// to hand a fold that gets replayed.
+    pub fn goinkyo_brigades(&self) -> Vec<BrigadeId> {
+        let mut ids: Vec<BrigadeId> = self.goinkyo_pane.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     fn set_status(&mut self, message: impl Into<String>, now: Instant) {
@@ -4616,14 +4638,19 @@ fn update_goinkyo_awaiting_spawn(
             let Some(key) = state.goinkyo_pane.remove(&brigade_id) else {
                 return Vec::new();
             };
+            // Unstaging only applies to a pane that is on stage; ending it
+            // applies either way. A pane whose brigade is off stage is still
+            // a running process — panes are pumped whether staged or not —
+            // and this entry was the last thing that knew which process it
+            // was. `Cmd::KillPty` naming a key with no handle is a no-op, so
+            // a pane that already closed on its own costs nothing here.
             let staged = matches!(
                 &state.stage,
                 Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&key)
             );
-            if !staged {
-                return Vec::new();
+            if staged {
+                state.unstage(&key);
             }
-            state.unstage(&key);
             return vec![kill_pane(state, key)];
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
@@ -9233,9 +9260,10 @@ mod tests {
         state.screens.remove(&key);
         state.pending_opens.remove(&key);
 
-        // The consultation is dismissed, brigade still staged, and the
-        // shell reports the row is simply gone (this is the only path that
-        // reaches `NoGoinkyo` at all — see `GoinkyoObservation`'s own doc).
+        // The consultation is dismissed and the shell reports the row gone.
+        // Nothing here is on stage, which is exactly the case that used to
+        // return without ending anything — see `GoinkyoObservation::
+        // NoGoinkyo`'s own doc for why a pane off stage is still a process.
         let released = update(
             &mut state,
             &mut app,
@@ -9245,7 +9273,10 @@ mod tests {
             },
             test_instant(),
         );
-        assert!(released.is_empty());
+        assert!(
+            matches!(released.as_slice(), [Cmd::KillPty { key }] if *key == SessionKey::new_worker(6, "goinkyo")),
+            "the pane goes with the row, staged or not: {released:?}"
+        );
         assert!(!state.goinkyo_pane.contains_key(&6));
 
         let second = update(
