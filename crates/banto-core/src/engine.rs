@@ -1307,6 +1307,12 @@ pub enum StoreIntent {
         id: String,
         title: String,
     },
+    /// The other direction, reached by `D` on a row the operator can see
+    /// only at [`crate::app::Reveal::Archived`].
+    Unarchive {
+        id: String,
+        title: String,
+    },
     JoinGroup {
         session_id: String,
         target: GroupJoinTargetData,
@@ -1637,6 +1643,10 @@ pub enum Event {
         title: String,
         result: Result<(), String>,
     },
+    UnarchiveDone {
+        title: String,
+        result: Result<(), String>,
+    },
     GroupJoinDone {
         session_id: String,
         /// `Ok(None)` is the session leaving its group rather than joining
@@ -1856,6 +1866,14 @@ pub fn update(
                 },
                 now,
             );
+            vec![Cmd::Reload]
+        }
+        Event::UnarchiveDone { title, result } => {
+            let message = match result {
+                Ok(()) => format!("restored session {title}"),
+                Err(err) => format!("failed to restore session {title}: {err}"),
+            };
+            state.set_status(message, now);
             vec![Cmd::Reload]
         }
         Event::GroupJoinDone { session_id, result } => {
@@ -2340,9 +2358,11 @@ fn update_key(
                     Vec::new()
                 }
                 (KeyCode::Char('a'), Modifiers::NONE) => {
-                    app.toggle_agent_filter();
+                    let reveal = app.cycle_reveal();
+                    state.set_status(format!("showing {}", reveal.label()), now);
                     Vec::new()
                 }
+                (KeyCode::Char('D'), Modifiers::NONE) => unarchive_selected(state, app, now),
                 (KeyCode::Char('p'), Modifiers::NONE) => toggle_pin(app),
                 (KeyCode::Char('d'), Modifiers::NONE) => {
                     app.open_confirm_archive_modal();
@@ -3860,6 +3880,25 @@ fn relaunch_member(
     })))
 }
 
+/// `D`: take the selected session back out of banto's archive. No confirm —
+/// see the chōba's own `unarchive_selected` for why burying is guarded and
+/// restoring is not.
+fn unarchive_selected(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
+    let Some(row) = app.selected_row() else {
+        return Vec::new();
+    };
+    if !row.archived {
+        state.set_status(
+            "that session is not archived — press `a` until archived sessions show",
+            now,
+        );
+        return Vec::new();
+    }
+    let id = row.id.clone();
+    let title = row.display_title().to_string();
+    vec![Cmd::Store(StoreIntent::Unarchive { id, title })]
+}
+
 fn update_pty_exited(
     state: &mut EmporiumState,
     app: &mut App,
@@ -4877,6 +4916,7 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         }
     }
 

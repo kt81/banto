@@ -75,6 +75,7 @@ const SUPERSEDED_EMOJI: &str = "\u{1F9EC}"; // 🧬
 const AGENT_EMOJI: &str = "\u{1F916}"; // 🤖
 const GROUP_EMOJI: &str = "\u{1F4C2}"; // 📂
 const UNGROUPED_EMOJI: &str = "\u{1F4C1}"; // 📁
+const ARCHIVED_EMOJI: &str = "\u{1F5C3}"; // 🗃
 
 /// One activity fact has one colour across banto's surfaces: magenta means a
 /// Claude Code session has reported that it is waiting for a human. The
@@ -251,7 +252,14 @@ fn row_line(
         "\u{25cf} ",
         Style::default().fg(activity_color(visible.row.activity)),
     );
-    let role = marker_slot(if visible.director {
+    // Archived outranks the rest: it is the only class here the operator put
+    // on the row themselves, and the only one a key (`D`) acts on. Rows at
+    // `Reveal::Archived` sit mixed in among ordinary ones, so without this
+    // the level that exists to show what was buried cannot say which rows
+    // those are.
+    let role = marker_slot(if visible.row.archived {
+        Some(ARCHIVED_EMOJI)
+    } else if visible.director {
         Some(DIRECTOR_EMOJI)
     } else if visible.superseded {
         Some(SUPERSEDED_EMOJI)
@@ -536,6 +544,7 @@ mod tests {
             mtime,
             size: 0,
             source_archived: false,
+            archived: false,
         }
     }
 
@@ -654,7 +663,7 @@ mod tests {
         .with_directors(["director".to_string()].into_iter().collect());
         app.set_viewport_height(10);
         app.toggle_grouped_view(); // flat: markers unrelated to sections
-        app.toggle_agent_filter(); // agents are hidden by default
+        app.cycle_reveal(); // agents are hidden by default
 
         let text = draw_list(&app, 60, 10, now);
         let line_for = |title: &str| {
@@ -783,7 +792,7 @@ mod tests {
         let mut app = App::new(vec![agent_row("both", "Both Row", "", now)])
             .with_directors(["both".to_string()].into_iter().collect());
         app.set_viewport_height(10);
-        app.toggle_agent_filter(); // agents are hidden by default
+        app.cycle_reveal(); // agents are hidden by default
 
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Both Row")).unwrap();
@@ -797,7 +806,7 @@ mod tests {
         let mut app = App::new(vec![row("s", "Superseded Row", "", now)])
             .with_superseded(["s".to_string()].into_iter().collect());
         app.set_viewport_height(10);
-        app.toggle_agent_filter(); // superseded rows are hidden by default too
+        app.cycle_reveal(); // superseded rows are hidden by default too
 
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Superseded Row")).unwrap();
@@ -811,7 +820,7 @@ mod tests {
             .with_directors(["both".to_string()].into_iter().collect())
             .with_superseded(["both".to_string()].into_iter().collect());
         app.set_viewport_height(10);
-        app.toggle_agent_filter(); // reveal the superseded row
+        app.cycle_reveal(); // reveal the superseded row
 
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Both Row")).unwrap();
@@ -825,7 +834,7 @@ mod tests {
         let mut app = App::new(vec![agent_row("both", "Both Row", "", now)])
             .with_superseded(["both".to_string()].into_iter().collect());
         app.set_viewport_height(10);
-        app.toggle_agent_filter(); // agents/superseded are hidden by default
+        app.cycle_reveal(); // agents/superseded are hidden by default
 
         let text = draw_list(&app, 60, 10, now);
         let line = text.lines().find(|l| l.contains("Both Row")).unwrap();
@@ -877,7 +886,7 @@ mod tests {
         let mut app = App::new(vec![row("s", "Superseded Session", "", now)])
             .with_superseded(["s".to_string()].into_iter().collect());
         app.set_viewport_height(10);
-        app.toggle_agent_filter(); // reveal the superseded row so it can be selected
+        app.cycle_reveal(); // reveal the superseded row so it can be selected
 
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal

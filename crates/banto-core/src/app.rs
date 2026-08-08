@@ -195,6 +195,53 @@ impl KillChoice {
     }
 }
 
+/// How much of the list the `a` key is currently revealing.
+///
+/// The order is the taxonomy, not a preference: **who hid a row decides
+/// where it reappears.** `Hidden` reveals what banto hid on its own
+/// judgment — agent-run sessions and superseded ancestors, presumed noise.
+/// `Archived` additionally reveals what the *operator* buried one row at a
+/// time with `d`, which is a different kind of fact and so sits a step
+/// further in rather than beside it.
+///
+/// Monotonic on purpose: each level is a strict superset of the one before,
+/// so the count of what is still hidden means the same thing at every step
+/// and the key stays one verb — "show me more".
+///
+/// Un-archiving is `D`, never `d` on a revealed row. A single key whose verb
+/// flips depending on a mark drawn beside the row would put the meaning in
+/// what is drawn rather than in what the key is — the same mistake
+/// [`LEAVE_GROUP_LABEL`] exists to avoid one layer down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reveal {
+    /// Ordinary sessions only.
+    Ordinary,
+    /// Plus what banto hid: agent-run and non-live superseded sessions.
+    Hidden,
+    /// Plus what the operator archived.
+    Archived,
+}
+
+impl Reveal {
+    /// The next step of the `a` cycle, wrapping back to [`Self::Ordinary`].
+    pub fn next(self) -> Self {
+        match self {
+            Reveal::Ordinary => Reveal::Hidden,
+            Reveal::Hidden => Reveal::Archived,
+            Reveal::Archived => Reveal::Ordinary,
+        }
+    }
+
+    /// A word for the status line, naming what is now on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            Reveal::Ordinary => "ordinary sessions",
+            Reveal::Hidden => "hidden sessions",
+            Reveal::Archived => "hidden and archived sessions",
+        }
+    }
+}
+
 /// State for the group-join modal: a free-text new-group-name input plus a
 /// substring-filtered list of existing groups to pick from instead.
 pub struct GroupJoinState {
@@ -751,7 +798,7 @@ pub struct App {
     /// superseded sessions are included in `filtered`. Off by default: a
     /// human browsing their own sessions doesn't usually want every
     /// spawned-agent or superseded-ancestor session cluttering the list.
-    show_agents: bool,
+    reveal: Reveal,
     /// Every known group, alphabetical by name — a cache for sorting/display
     /// only, the store is the durable source of truth; see [`Self::with_groups`].
     groups: Vec<(GroupId, String)>,
@@ -876,7 +923,7 @@ impl App {
             directors: HashSet::new(),
             superseded: HashSet::new(),
             enabled_agents: AgentKind::ALL.into_iter().collect(),
-            show_agents: false,
+            reveal: Reveal::Ordinary,
             groups: Vec::new(),
             session_group: HashMap::new(),
             grouped_view: true,
@@ -1408,18 +1455,26 @@ impl App {
 
     /// Whether agent-run sessions are currently included in the list. Only
     /// used by tests; production code reads `hidden_agent_count()` instead.
-    #[cfg(test)]
-    fn show_agents(&self) -> bool {
-        self.show_agents
+    /// Whether any row on screen right now is one the operator archived —
+    /// what decides whether `D`'s hint is worth the width it costs. True
+    /// only at [`Reveal::Archived`] with something actually buried, which is
+    /// exactly when the key has anything to act on.
+    pub fn any_archived_visible(&self) -> bool {
+        self.filtered.iter().any(|&i| self.rows[i].archived)
     }
 
-    /// Toggle whether agent-run sessions are included, returning the new
-    /// state. Keeps the current selection (by id) if it's still visible.
-    pub fn toggle_agent_filter(&mut self) -> bool {
-        self.show_agents = !self.show_agents;
+    /// What the list is currently revealing — see [`Reveal`].
+    pub fn reveal(&self) -> Reveal {
+        self.reveal
+    }
+
+    /// Advance the `a` cycle one step and return where it landed. Keeps the
+    /// current selection (by id) if it's still visible.
+    pub fn cycle_reveal(&mut self) -> Reveal {
+        self.reveal = self.reveal.next();
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
-        self.show_agents
+        self.reveal
     }
 
     /// Number of sessions matching the current query that the `a` toggle is
@@ -1428,13 +1483,24 @@ impl App {
     /// [`Self::is_hidden_superseded`]). Always `0` once [`Self::show_agents`]
     /// is on.
     pub fn hidden_count(&self) -> usize {
-        if self.show_agents {
-            return 0;
-        }
         rank_indices(&self.query, &self.haystacks)
             .into_iter()
-            .filter(|&i| self.rows[i].is_agent || self.is_hidden_superseded(i))
+            .filter(|&i| !self.revealed(i))
             .count()
+    }
+
+    /// Whether the current [`Reveal`] level shows `rows[i]` at all —
+    /// the one place the three levels are turned into a yes or no, so
+    /// `compute_filtered` and `hidden_count` can never drift apart about
+    /// what "hidden" means.
+    fn revealed(&self, i: usize) -> bool {
+        let machine_hidden = self.rows[i].is_agent || self.is_hidden_superseded(i);
+        let operator_hidden = self.rows[i].archived;
+        match self.reveal {
+            Reveal::Ordinary => !machine_hidden && !operator_hidden,
+            Reveal::Hidden => !operator_hidden,
+            Reveal::Archived => true,
+        }
     }
 
     /// True when `rows[i]` has a known auto-compaction continuation and is
@@ -1723,8 +1789,7 @@ impl App {
     fn compute_filtered(&self) -> Vec<usize> {
         let mut ranked: Vec<usize> = rank_indices(&self.query, &self.haystacks)
             .into_iter()
-            .filter(|&i| self.show_agents || !self.rows[i].is_agent)
-            .filter(|&i| self.show_agents || !self.is_hidden_superseded(i))
+            .filter(|&i| self.revealed(i))
             .filter(|&i| !self.hidden.contains(&self.rows[i].id))
             .collect();
         if self.grouped_view_active(&ranked) {
@@ -2300,6 +2365,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         }
     }
 
@@ -3113,7 +3179,7 @@ mod tests {
         // Only "orange fruit" (agent) matches "orange"; "apple pie" doesn't.
         assert_eq!(app.hidden_count(), 1);
 
-        app.toggle_agent_filter();
+        app.cycle_reveal();
         assert_eq!(app.hidden_count(), 0);
     }
 
@@ -3125,7 +3191,7 @@ mod tests {
         ]);
         app.set_viewport_height(10);
 
-        assert!(!app.show_agents());
+        assert_eq!(app.reveal(), Reveal::Ordinary);
         assert_eq!(app.total_len(), 2);
         assert_eq!(ids(&app), vec!["h1"]);
     }
@@ -3138,14 +3204,15 @@ mod tests {
         ]);
         app.set_viewport_height(10);
 
-        let showing = app.toggle_agent_filter();
-
-        assert!(showing);
-        assert!(app.show_agents());
+        assert_eq!(app.cycle_reveal(), Reveal::Hidden);
         assert_eq!(ids(&app), vec!["h1", "a1"]);
 
-        let hiding = app.toggle_agent_filter();
-        assert!(!hiding);
+        // Archived is a further step in, not a different toggle, so the
+        // agent row stays on screen through it.
+        assert_eq!(app.cycle_reveal(), Reveal::Archived);
+        assert_eq!(ids(&app), vec!["h1", "a1"]);
+
+        assert_eq!(app.cycle_reveal(), Reveal::Ordinary);
         assert_eq!(ids(&app), vec!["h1"]);
     }
 
@@ -3199,7 +3266,7 @@ mod tests {
         app.set_viewport_height(10);
         app.select_next(); // h2
 
-        app.toggle_agent_filter();
+        app.cycle_reveal();
 
         assert_eq!(app.selected_row().unwrap().id, "h2");
     }
@@ -3218,7 +3285,7 @@ mod tests {
         // The agent session matches the query too, but stays hidden.
         assert_eq!(ids(&app), vec!["h1"]);
 
-        app.toggle_agent_filter();
+        app.cycle_reveal();
         assert_eq!(ids(&app), vec!["h1", "a1"]);
     }
 
@@ -3682,17 +3749,110 @@ mod tests {
         assert_eq!(ids(&app), vec!["id0", "id1"]);
     }
 
+    fn archived_row(id: &str, title: &str) -> SessionRow {
+        SessionRow {
+            archived: true,
+            ..row(id, title, "")
+        }
+    }
+
     #[test]
-    fn toggle_agent_filter_reveals_superseded_sessions_too() {
+    fn archived_rows_appear_only_at_the_last_step_of_the_cycle() {
+        let mut app = App::new(vec![
+            row("h1", "Human session", ""),
+            agent_row("a1", "Agent session", ""),
+            archived_row("z1", "Buried session"),
+        ]);
+        app.set_viewport_height(10);
+
+        assert_eq!(ids(&app), vec!["h1"]);
+        assert_eq!(app.cycle_reveal(), Reveal::Hidden);
+        assert_eq!(
+            ids(&app),
+            vec!["h1", "a1"],
+            "what banto hid comes back first; what the operator buried does not"
+        );
+        assert_eq!(app.cycle_reveal(), Reveal::Archived);
+        assert_eq!(ids(&app), vec!["h1", "a1", "z1"]);
+        assert_eq!(app.cycle_reveal(), Reveal::Ordinary);
+        assert_eq!(ids(&app), vec!["h1"]);
+    }
+
+    #[test]
+    fn the_hidden_count_is_always_answerable_by_pressing_a_again() {
+        // The rule: it counts rows the current level hides that some further
+        // level reveals. A number that included rows no key can reach would
+        // send the operator hunting for a reveal that does not exist.
+        let mut app = App::new(vec![
+            row("h1", "Human session", ""),
+            agent_row("a1", "Agent session", ""),
+            archived_row("z1", "Buried session"),
+        ]);
+        app.set_viewport_height(10);
+
+        assert_eq!(app.hidden_count(), 2, "the agent row and the buried one");
+        app.cycle_reveal();
+        assert_eq!(app.hidden_count(), 1, "only the buried one is left");
+        app.cycle_reveal();
+        assert_eq!(app.hidden_count(), 0);
+    }
+
+    #[test]
+    fn nothing_archived_on_screen_means_nothing_to_say_about_restoring() {
+        let mut app = App::new(vec![
+            row("h1", "Human session", ""),
+            archived_row("z1", "Buried session"),
+        ]);
+        app.set_viewport_height(10);
+
+        assert!(!app.any_archived_visible());
+        app.cycle_reveal();
+        assert!(
+            !app.any_archived_visible(),
+            "still not revealed at this step"
+        );
+        app.cycle_reveal();
+        assert!(app.any_archived_visible());
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_buried_hides_the_restore_hint_again() {
+        // `any_archived_visible` reads the filtered set, not the roster: at
+        // the archived level with a query that excludes every buried row,
+        // `D` has nothing to act on and the hint would be noise.
+        let mut app = App::new(vec![
+            row("h1", "Human session", ""),
+            archived_row("z1", "Buried session"),
+        ]);
+        app.set_viewport_height(10);
+        app.cycle_reveal();
+        app.cycle_reveal();
+        assert!(app.any_archived_visible());
+
+        app.enter_search();
+        for c in "Human".chars() {
+            app.push_char(c);
+        }
+
+        assert!(!app.any_archived_visible());
+    }
+
+    #[test]
+    fn the_reveal_cycle_shows_superseded_sessions_too() {
         let mut app = App::new(numbered(2)); // id0, id1
         app.set_viewport_height(10);
         app = app.with_superseded(["id1".to_string()].into_iter().collect());
         assert_eq!(ids(&app), vec!["id0"]);
 
-        app.toggle_agent_filter();
+        app.cycle_reveal();
         assert_eq!(ids(&app), vec!["id0", "id1"]);
 
-        app.toggle_agent_filter();
+        // Still shown one step further in — the levels stack rather than
+        // trading one hidden class for another.
+        app.cycle_reveal();
+        assert_eq!(ids(&app), vec!["id0", "id1"]);
+
+        app.cycle_reveal();
         assert_eq!(ids(&app), vec!["id0"]);
     }
 
@@ -3718,7 +3878,7 @@ mod tests {
         app = app.with_superseded(["id1".to_string()].into_iter().collect());
 
         assert_eq!(app.hidden_count(), 1);
-        app.toggle_agent_filter();
+        app.cycle_reveal();
         assert_eq!(app.hidden_count(), 0);
     }
 
@@ -3751,7 +3911,7 @@ mod tests {
         let mut app = App::new(numbered(3));
         app.set_viewport_height(10);
         app = app.with_superseded(["id1".to_string()].into_iter().collect());
-        app.toggle_agent_filter(); // reveal it so it shows up in `visible()`
+        app.cycle_reveal(); // reveal it so it shows up in `visible()`
         app.toggle_grouped_view(); // flat: unrelated to sections
 
         let flags: Vec<bool> = app
@@ -4115,7 +4275,7 @@ mod tests {
             vec![("Pinned".to_string(), 1), ("Ungrouped".to_string(), 1)]
         );
 
-        app.toggle_agent_filter();
+        app.cycle_reveal();
 
         // Now a1 joins Ungrouped too.
         assert_eq!(
