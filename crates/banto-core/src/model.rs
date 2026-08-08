@@ -100,7 +100,7 @@ pub struct SessionMeta {
     /// own archive (`Store::archive_session`, bound to `d`): that one is
     /// banto's per-session-id fact, product-neutral and always reversible
     /// from within banto; this one banto can only ever read, never clear —
-    /// `~/.codex` stays read-only (see `banto::tui::exclude_archived` for
+    /// `~/.codex` stays read-only (see `banto::tui::mark_archived` for
     /// how the two combine into what the list actually hides).
     pub source_archived: bool,
 }
@@ -152,6 +152,18 @@ pub struct SessionRow {
     /// session, rather than the user starting it interactively. See
     /// [`SessionMeta::is_agent`].
     pub is_agent: bool,
+    /// True when the operator archived this session in banto (`d`), which is
+    /// banto's own per-session fact and reversible from within banto (`D`) —
+    /// unlike [`Self::source_archived`], which the source product owns and
+    /// banto can only ever read. A row carrying this is listed only at
+    /// [`crate::app::Reveal::Archived`].
+    ///
+    /// `#[serde(default)]` for the same reason as `Event::PtyExited::reason`
+    /// and `RowsLoaded::superseded`: a `docs/DISCIPLINE.md` §8 stream
+    /// recorded before this field existed still replays, and "not archived"
+    /// is the honest reading of a recording made when banto could not say.
+    #[serde(default)]
+    pub archived: bool,
     /// Short single-line excerpt of the first user message, for the summary
     /// panel. See [`SessionMeta::preview`].
     pub preview: Option<String>,
@@ -498,6 +510,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -515,6 +528,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -532,6 +546,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }

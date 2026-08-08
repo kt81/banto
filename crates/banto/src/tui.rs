@@ -262,7 +262,7 @@ pub fn run(
         let store = store.borrow();
         let superseded = superseded_from_metas(&metas, &store, &superseded_failed);
         let rows = session::rows_from_metas(metas, claude_home, codex_home.as_ref(), thresholds);
-        let rows = exclude_archived(rows, &store);
+        let rows = mark_archived(rows, &store);
         let pinned = load_pinned(&store);
         let groups = load_groups(&store);
         let session_groups = load_session_groups(&store, &groups);
@@ -333,7 +333,7 @@ pub fn run(
 /// own archive is lifted — a real store write, unaffected by anything
 /// Codex reports. A store read failure is tolerated: nothing gets excluded
 /// rather than blocking the TUI.
-pub(crate) fn exclude_archived(
+pub(crate) fn mark_archived(
     rows: Vec<session::SessionRow>,
     store: &Store,
 ) -> Vec<session::SessionRow> {
@@ -344,7 +344,17 @@ pub(crate) fn exclude_archived(
         .map(|id| id.0)
         .collect();
     rows.into_iter()
-        .filter(|row| !row.source_archived && !archived.contains(&row.id))
+        // `source_archived` is still dropped outright, and always will be:
+        // it is the source product's own flag, banto can only read it, and a
+        // row offering `D` that banto could never carry out would be worse
+        // than one that is simply absent. banto's own archive is a different
+        // fact — carried on the row and hidden by `Reveal`, so `D` can reach
+        // it at the level that shows it.
+        .filter(|row| !row.source_archived)
+        .map(|mut row| {
+            row.archived = archived.contains(&row.id);
+            row
+        })
         .collect()
 }
 
@@ -791,7 +801,8 @@ fn handle_normal_key(app: &mut App, code: KeyCode, ctx: &Context) {
         KeyCode::Char('g') => app.open_group_join_modal(),
         KeyCode::Tab => toggle_grouped_view(app),
         KeyCode::Char('p') => toggle_pin(app, ctx),
-        KeyCode::Char('a') => toggle_agent_filter(app),
+        KeyCode::Char('a') => cycle_reveal(app),
+        KeyCode::Char('D') => unarchive_selected(app, ctx),
         KeyCode::Char('q') | KeyCode::Esc => app.request_quit(),
         _ => {}
     }
@@ -1749,16 +1760,39 @@ fn toggle_pin(app: &mut App, ctx: &Context) {
     app.set_status(message, Instant::now());
 }
 
-fn toggle_agent_filter(app: &mut App) {
-    let showing = app.toggle_agent_filter();
-    app.set_status(
-        if showing {
-            "showing hidden sessions".to_string()
-        } else {
-            "hiding agent/superseded sessions".to_string()
-        },
-        Instant::now(),
-    );
+/// Bring the selected session back out of banto's archive.
+///
+/// No confirm, unlike `d`'s. Burying is what disorients — a row leaves a list
+/// the operator is reading — and that is what the confirm guards. Bringing
+/// one back puts a row where the operator was already looking at its archived
+/// form, and `d` undoes it again in one key.
+fn unarchive_selected(app: &mut App, ctx: &Context) {
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+    if !row.archived {
+        // Said rather than ignored: `D` on an ordinary row is most likely
+        // meant for a row the operator cannot currently see.
+        app.set_status(
+            "that session is not archived — press `a` until archived sessions show".to_string(),
+            Instant::now(),
+        );
+        return;
+    }
+    let id = row.id.clone();
+    let title = row.display_title().to_string();
+    let result = ctx.store.borrow().unarchive_session(&SessionId(id));
+    let message = match result {
+        Ok(()) => format!("restored session {title}"),
+        Err(err) => format!("failed to restore session {title}: {err}"),
+    };
+    app.set_status(message, Instant::now());
+    reload(app, ctx);
+}
+
+fn cycle_reveal(app: &mut App) {
+    let reveal = app.cycle_reveal();
+    app.set_status(format!("showing {}", reveal.label()), Instant::now());
 }
 
 /// Re-read sessions from disk and re-classify their activity, preserving
@@ -1786,7 +1820,7 @@ fn reload(app: &mut App, ctx: &Context) {
             ctx.codex_home.as_ref(),
             ctx.thresholds,
         );
-        let rows = exclude_archived(rows, &store);
+        let rows = mark_archived(rows, &store);
         app.replace_rows(rows);
         app.set_hidden_member_ids(load_hidden_member_ids(&store));
         app.set_directors(load_directors(&store));
@@ -1841,7 +1875,13 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  s split  \
                                 / search  n new  N new-split  d archive  g group  Tab view  \
-                                p pin  a hidden  q/Esc quit";
+                                p pin  a reveal  q/Esc quit";
+    /// Appended only while an archived row is on screen. The bar was already
+    /// tight enough that the operator named it as the constraint on adding
+    /// anything at all, and `D` has nothing to act on at the two reveal
+    /// levels that show nothing archived. Discoverability lands at the moment
+    /// of need instead of costing width at every other moment.
+    const ARCHIVED_HINT: &str = "  D restore";
     const SEARCH_HINTS: &str =
         "type to search  \u{2191}\u{2193} move  Enter confirm  Esc cancel search";
 
@@ -1859,6 +1899,9 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
                 Mode::Search => SEARCH_HINTS,
             };
             let mut hints = hints.to_string();
+            if app.mode() == Mode::Normal && app.any_archived_visible() {
+                hints.push_str(ARCHIVED_HINT);
+            }
             if app.mode() == Mode::Normal && !app.grouped_view() {
                 hints.push_str("  (flat)");
             }
@@ -1905,6 +1948,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         }
     }
 
@@ -2000,41 +2044,46 @@ mod tests {
         assert!(failed.borrow().contains(&SessionId("child".to_string())));
     }
 
-    // --- exclude_archived: banto's archive and Codex's own flag, unioned --
+    // --- mark_archived: banto's archive is carried, Codex's is dropped ---
 
     #[test]
-    fn exclude_archived_hides_a_row_banto_itself_archived() {
+    fn mark_archived_marks_a_row_banto_itself_archived() {
         let store = Store::open_in_memory().unwrap();
         store.archive_session(&SessionId("a".to_string())).unwrap();
         let rows = vec![row("a", "A", "", Activity::Alive)];
 
-        assert!(exclude_archived(rows, &store).is_empty());
+        let marked = mark_archived(rows, &store);
+        assert_eq!(marked.len(), 1, "banto's own archive keeps the row, marked");
+        assert!(marked[0].archived);
     }
 
     #[test]
-    fn exclude_archived_hides_a_row_only_codex_marked_archived() {
+    fn mark_archived_still_drops_a_row_only_codex_marked_archived() {
         let store = Store::open_in_memory().unwrap();
         // banto's own archive table has nothing for "a" at all — this row's
         // only reason to be hidden is `source_archived`, set by discovery
         // from Codex's own `threads.archived` (see `provider::codex`).
         let rows = vec![SessionRow {
             source_archived: true,
+            archived: false,
             ..row("a", "A", "", Activity::Alive)
         }];
 
-        assert!(exclude_archived(rows, &store).is_empty());
+        assert!(mark_archived(rows, &store).is_empty());
     }
 
     #[test]
-    fn exclude_archived_leaves_an_unarchived_row_alone() {
+    fn mark_archived_leaves_an_unarchived_row_unmarked() {
         let store = Store::open_in_memory().unwrap();
         let rows = vec![row("a", "A", "", Activity::Alive)];
 
-        assert_eq!(exclude_archived(rows, &store).len(), 1);
+        let marked = mark_archived(rows, &store);
+        assert_eq!(marked.len(), 1);
+        assert!(!marked[0].archived);
     }
 
     #[test]
-    fn exclude_archived_stays_hidden_via_bantos_own_archive_even_after_codex_unarchives() {
+    fn mark_archived_marks_via_bantos_own_archive_even_after_codex_unarchives() {
         // The disagreement case: the operator archived "a" in banto (`d`)
         // independently of Codex; Codex's own `archived` flag has since
         // gone back to false (`codex unarchive`, reflected on the next
@@ -2045,10 +2094,13 @@ mod tests {
         store.archive_session(&SessionId("a".to_string())).unwrap();
         let rows = vec![SessionRow {
             source_archived: false,
+            archived: false,
             ..row("a", "A", "", Activity::Alive)
         }];
 
-        assert!(exclude_archived(rows, &store).is_empty());
+        let marked = mark_archived(rows, &store);
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].archived);
     }
 
     /// A `Context` for tests exercising `handle_key`/`handle_normal_key`/
@@ -2244,7 +2296,7 @@ mod tests {
             "missing hidden indicator:\n{wide_text}"
         );
 
-        app.toggle_agent_filter();
+        app.cycle_reveal();
         let text = draw(&app);
         assert!(
             text.contains("Agent task"),

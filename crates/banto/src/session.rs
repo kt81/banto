@@ -159,7 +159,7 @@ pub fn load_rows(
 /// `enabled` (resolved from `Config::agents` by
 /// `banto_core::config::resolve_agents`) gates which provider *runs at
 /// all*, not which of its already-discovered rows get kept — unlike
-/// `App::show_agents`/`crate::tui::exclude_archived`, which both filter
+/// `App::reveal`/`crate::tui::mark_archived`, which filter or mark
 /// rows banto has already read off disk. That distinction matters here
 /// specifically: `CodexProvider::discover` opens a foreign sqlite database,
 /// under a read-only exception this crate had to earn (see
@@ -252,6 +252,10 @@ pub fn rows_from_metas(
                 mtime: meta.mtime,
                 size: meta.size,
                 source_archived: meta.source_archived,
+                // Discovery reads `~/.claude` and `~/.codex`; banto's own
+                // archive lives in banto's store, which this never opens.
+                // `crate::tui::mark_archived` fills it in from there.
+                archived: false,
             }
         })
         .collect()
@@ -313,6 +317,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         };
         assert_eq!(row.haystack(), "Fix login /work/app");
     }
@@ -330,6 +335,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         };
         assert_eq!(row.haystack(), " ");
     }
@@ -347,6 +353,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         };
         assert_eq!(row.display_title(), "the-id");
     }

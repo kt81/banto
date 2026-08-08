@@ -138,7 +138,7 @@ pub fn run(
         let store = store.borrow();
         let superseded = crate::tui::superseded_from_metas(&metas, &store, &superseded_failed);
         let rows = session::rows_from_metas(metas, claude_home, codex_home, thresholds);
-        let rows = crate::tui::exclude_archived(rows, &store);
+        let rows = crate::tui::mark_archived(rows, &store);
         let pinned = crate::tui::load_pinned(&store);
         let groups = crate::tui::load_groups(&store);
         let session_groups = crate::tui::load_session_groups(&store, &groups);
@@ -1004,6 +1004,13 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .map_err(|err| err.to_string());
             vec![Event::ArchiveDone { title, result }]
         }
+        StoreIntent::Unarchive { id, title } => {
+            let result = store
+                .borrow()
+                .unarchive_session(&SessionId(id))
+                .map_err(|err| err.to_string());
+            vec![Event::UnarchiveDone { title, result }]
+        }
         StoreIntent::JoinGroup { session_id, target } => {
             let mut store = store.borrow_mut();
             let result = match target {
@@ -1246,7 +1253,7 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     let store = deps.store.borrow();
     let superseded = crate::tui::superseded_from_metas(&metas, &store, deps.superseded_failed);
     let rows = session::rows_from_metas(metas, deps.claude_home, deps.codex_home, deps.thresholds);
-    let rows = crate::tui::exclude_archived(rows, &store);
+    let rows = crate::tui::mark_archived(rows, &store);
     let hidden = crate::tui::load_hidden_member_ids(&store);
     let directors = crate::tui::load_directors(&store);
     vec![Event::RowsLoaded {
@@ -2069,7 +2076,10 @@ fn render_status_bar(
 ) {
     const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade/disband · b +worker · \
                                 F3 pane · / search · n new · d archive · g group · Tab view · \
-                                p pin · a hidden · q quit";
+                                p pin · a reveal · q quit";
+    /// Appended only while an archived row is on screen — see the chōba's
+    /// own `ARCHIVED_HINT` for why this one is not in the bar unconditionally.
+    const ARCHIVED_HINT: &str = " · D restore";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
     const PREFIX_HINTS: &str =
         "prefix: o/Tab cycle · arrows move · 1-9 pane · b literal · s sidebar · x kill";
@@ -2085,12 +2095,15 @@ fn render_status_bar(
         match status {
             Some(message) => (message.to_string(), Color::Yellow),
             None => {
-                let hints = if app.mode() == Mode::Search {
-                    SEARCH_HINTS
+                let mut hints = if app.mode() == Mode::Search {
+                    SEARCH_HINTS.to_string()
                 } else {
-                    NORMAL_HINTS
+                    NORMAL_HINTS.to_string()
                 };
-                (hints.to_string(), Color::Gray)
+                if app.mode() != Mode::Search && app.any_archived_visible() {
+                    hints.push_str(ARCHIVED_HINT);
+                }
+                (hints, Color::Gray)
             }
         }
     };
@@ -3511,6 +3524,7 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH,
             size: 0,
             source_archived: false,
+            archived: false,
         }
     }
 
