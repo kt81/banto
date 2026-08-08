@@ -1,19 +1,20 @@
 # banto — Requirements & Design
 
-A resident TUI tool that manages local Claude Code session history with
-Claude-Desktop-like listing and grouping, and resumes a selected session —
-by default **in-place**, in banto's own terminal, with resuming in a
-separate psmux pane / Windows Terminal tab as a first-class alternate.
-Windows-first.
+A resident TUI tool that manages local Claude Code and Codex session
+history with Claude-Desktop-like listing and grouping, and resumes a
+selected session — by default **in-place**, in banto's own terminal, with
+resuming in a separate psmux pane / Windows Terminal tab as a first-class
+alternate. Windows-first.
 
 Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese shop, who
 stays on the premises and directs and watches over the guests (sessions).
 
 ## MVP requirements
 
-- Fast search over local session history (Claude Code CLI only)
+- Fast search over local session history (Claude Code and Codex CLI)
 - Grouping (a session belongs to at most one group), pinning, and archiving
-  (soft-hide) — all stored by banto itself, never writing to Claude's files
+  (soft-hide) — all stored by banto itself, never writing to either agent's
+  own files
 - Enter on a search result resumes the session **in-place**: banto tears
   down its own TUI (leaves the alt screen, disables raw mode and mouse
   capture), runs the session as a direct child process in the same
@@ -37,12 +38,10 @@ stays on the premises and directs and watches over the guests (sessions).
   to `"auto"` / `"tmux"` / `"psmux"` / `"windows-terminal"` instead picks
   which split backend `s` uses (see Opener spec)
 
-Out of MVP scope: Claude Desktop (claude.ai) history, other agents (trait only),
-remote/SSH. ("Built-in PTY" was also listed here originally — superseded
-2026-07-22 by the emporium mode; see the architecture decision below and
-"Emporium mode" further down. The MVP itself was never revised to include
-it: the emporium is later, additional scope layered on top, not a rewrite
-of what "MVP" meant at the time this list was written.)
+Out of MVP scope: Claude Desktop (claude.ai) history, remote/SSH. ("Built-in
+PTY" was superseded 2026-07-22 by the emporium mode. "Other agents" left the
+list when Codex support landed (`CodexProvider`, `AgentKind::Codex`). Neither
+was an MVP revision; both are later scope layered on top.)
 
 ## Architecture decision (2026-07-19)
 
@@ -395,8 +394,6 @@ other CLI, so the flavor is carried explicitly
   `swap-pane` works, so a Desktop-like "sidebar + main" switcher is possible.
 - Windows Terminal: spawn with `wt -w 0 new-tab`. **There is no API to
   enumerate or focus tabs**, so activating an existing tab is best-effort.
-  When reliability is required, a "one session = one window" mode
-  (SetForegroundWindow via HWND) is provided as a config option.
 - Every split backend goes through
   `banto _wrap --session <id> -- claude --resume <id>`, which registers the
   PID, tracks liveness, detects exit, and prevents double resume
@@ -466,10 +463,15 @@ relay's nudge Enter is sent ~300ms after the nudge text rather than
 back-to-back, see "Auto-relay" below); a child's exit produces no EOF on some
 paths, so an active waiter thread is needed rather than relying on read
 returning empty. The spike's own "not yet verified" list, stated plainly
-rather than glossed over: mouse-forwarding into children, resize-under-stress,
-and non-Windows behavior beyond one dated Unix teardown follow-up
-(`docs/notes/embedded-pty-spike.md`, 2026-07-25 addendum — a measured
-comparison of graceful vs. force-kill teardown timing on that platform).
+rather than glossed over: resize-under-stress and non-Windows behavior beyond
+one dated Unix teardown follow-up (`docs/notes/embedded-pty-spike.md`,
+2026-07-25 addendum — a measured comparison of graceful vs. force-kill
+teardown timing on that platform). Mouse forwarding into children was also on
+that list and has since landed: `Screen::wants_sgr_mouse`
+(`crates/banto-core/src/engine.rs:3610`) gates whether a wheel/click event
+reaches the child's own SGR mouse mode instead of banto's own pane-scroll,
+tested by `wheel_over_a_pane_that_wants_sgr_mouse_is_forwarded_not_consumed`
+(`engine.rs:7680`).
 
 **Scrollback** was on that unverified list and turned out to fail outright: a
 Codex pane kept no scrollback at all. Fixed by depending on
@@ -897,8 +899,8 @@ Unix builds additionally depend on `libc`.
    through 2026-07-25 (`docs/DISCIPLINE.md` §10) — done.
 
 Delivered alongside groups: a new-session modal (`n`), session archiving
-(`d`, soft-hide only — the real jsonl file under `~/.claude` is never
-touched), and an always-visible summary panel below the list.
+(`d`, soft-hide only — the real session file on disk is never touched), and
+an always-visible summary panel below the list.
 
 ## Risks
 

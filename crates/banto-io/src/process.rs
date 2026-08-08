@@ -3,7 +3,7 @@
 //! `banto-core`'s `CommandRunner` captures the output of short-lived CLI
 //! invocations (`psmux`, `wt`). `_wrap`'s child is different: it inherits
 //! stdio and runs for the resumed session's entire lifetime, so it gets its
-//! own narrow, bin-local trait (CLAUDE.md: every external process invocation
+//! own narrow, bin-local trait (AGENTS.md: every external process invocation
 //! sits behind an abstraction that tests can mock).
 
 use std::io;

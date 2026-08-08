@@ -4,14 +4,15 @@
 terminal list, while clerks carry boxed sessions between the shelves —
 one box glowing mid-handoff](docs/assets/banto-hero.png)
 
-**banto knows which Claude Code sessions exist on this machine, which are
-still alive, and which one you actually meant.**
+**banto knows which Claude Code and Codex sessions exist on this machine,
+which are still alive, and which one you actually meant.**
 
 `claude --resume` will reopen a session if you can produce its id. banto is
-the part that finds it — a fuzzy-searchable ledger of every session under
-`~/.claude`, with your own pinning, grouping and archiving layered on top —
-and the part that refuses to open one twice, because resuming a session that
-is already running forks its history.
+the part that finds it — a fuzzy-searchable ledger of every session on disk
+(Claude Code's under `~/.claude`, Codex's under `~/.codex`), with your own
+pinning, grouping and archiving layered on top — and the part that refuses
+to open one twice, because resuming a session that is already running forks
+its history.
 
 In its **emporium mode** (大店, *oodana*) it goes further: sessions become
 live embedded panes that keep running while you switch between them, and can
@@ -19,8 +20,8 @@ be wired into Director/Worker cells that talk to each other through banto.
 
 Claude Desktop makes multi-session work feel like a workspace — sessions
 side by side, their state legible at a glance, panes you arrange to suit the
-job. banto is an attempt to have that against the real `claude` CLI sessions
-already on disk, without leaving the terminal to get it.
+job. banto is an attempt to have that against the real `claude`/`codex` CLI
+sessions already on disk, without leaving the terminal to get it.
 
 *Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese
 merchant house, who stays on the premises and runs the shop.*
