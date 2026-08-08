@@ -252,9 +252,10 @@ pub fn run(
     // Uncached here and in [`reload`], unlike the emporium — not because the
     // chōba would not benefit (it reloads off the same `LiveWatch` and the
     // same debounce, so it re-parses the same unchanged files just as often),
-    // but because carrying parses between reloads is new capability, and the
-    // chōba takes bug fixes and platform parity only (docs/REQUIREMENTS.md,
-    // 2026-07-26 decision).
+    // but because a cache does not arrive here by sharing anything: it needs
+    // an owner living across this mode's own reloads, which is work aimed at
+    // the chōba, and that is what the freeze excludes (docs/REQUIREMENTS.md,
+    // 2026-07-26 decision, as clarified 2026-08-08).
     let metas = session::discover_all(claude_home, codex_home.as_ref(), &enabled_agents, None)?;
     let superseded_failed = RefCell::new(HashSet::new());
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
@@ -520,9 +521,10 @@ fn run_pending_inplace(
     //
     // The emporium's two equivalents no longer have this problem — their
     // host arrives through `Deps` and a mock can watch what they pass. The
-    // same could be done here and deliberately was not: this is the chōba,
-    // which takes bug fixes and platform parity only (docs/REQUIREMENTS.md,
-    // 2026-07-26), and a seam is neither. It is a live gap, not a solved one.
+    // same could be done here and deliberately was not: a seam threaded
+    // through this mode's own loop is work aimed at the chōba, which is what
+    // the freeze excludes (docs/REQUIREMENTS.md, 2026-07-26, as clarified
+    // 2026-08-08). It is a live gap, not a solved one.
     let result = SystemProcessRunner.run_in(&pending.argv, &pending.cwd, STRIPPED_CHILD_ENV_VARS);
     *terminal = setup_terminal()?;
     ctx.log(&format!("run_pending_inplace child result={result:?}"));
