@@ -1009,15 +1009,19 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let result = match target {
                 GroupJoinTargetData::Existing(group_id, name) => store
                     .set_session_group(&SessionId(session_id.clone()), group_id)
-                    .map(|()| (group_id, name))
+                    .map(|()| Some((group_id, name)))
                     .map_err(|err| err.to_string()),
                 GroupJoinTargetData::New(name) => match store.create_group(&name) {
                     Ok(group_id) => store
                         .set_session_group(&SessionId(session_id.clone()), group_id)
-                        .map(|()| (group_id, name.clone()))
+                        .map(|()| Some((group_id, name.clone())))
                         .map_err(|err| err.to_string()),
                     Err(err) => Err(format!("failed to create group \"{name}\": {err}")),
                 },
+                GroupJoinTargetData::Leave => store
+                    .clear_session_group(&SessionId(session_id.clone()))
+                    .map(|()| None)
+                    .map_err(|err| err.to_string()),
             };
             vec![Event::GroupJoinDone { session_id, result }]
         }
