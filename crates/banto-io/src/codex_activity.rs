@@ -60,6 +60,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::OptionalExtension;
 
@@ -86,6 +87,19 @@ enum TurnMarker {
     TaskComplete,
 }
 
+/// Where [`is_thread_idle`]'s own cost actually goes — the sqlite lookup
+/// ([`rollout_path_for`]: stat, open, one `SELECT`) and the rollout tail
+/// read ([`tail_turn_marker`]: open plus a growing 8KiB-to-4MiB read) have
+/// nothing in common and completely different fixes if either turns out
+/// slow, so a caller bracketing the whole call from outside cannot tell
+/// which one to chase. Measured unconditionally, same discretion as
+/// `banto::embedded::emporium`'s own `StageTimings`: durations only.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CodexActivityTiming {
+    pub sqlite: Duration,
+    pub rollout: Duration,
+}
+
 /// Whether `session_id`'s Codex session looks idle right now, read from its
 /// rollout file's most recent turn marker. `None` when nothing can be
 /// determined: `state_5.sqlite` missing/unopenable, no `threads` row for
@@ -93,9 +107,37 @@ enum TurnMarker {
 /// marker in it at all (e.g. a brand-new session that hasn't sent a first
 /// message yet). Never guesses toward "idle" on missing data — see this
 /// module's doc for why a false idle is the one outcome to avoid.
-pub fn is_thread_idle(codex_home: &CodexHome, session_id: &str) -> Option<bool> {
-    let rollout_path = rollout_path_for(codex_home, session_id)?;
-    let marker = tail_turn_marker(&rollout_path)?;
+///
+/// `timing`, when given, is filled in regardless of the answer — an
+/// out-parameter rather than a second return value, deliberately, so the
+/// four call sites (three tests, one real) that do not care about it stay
+/// exactly as clean as the result alone would leave them, and so this
+/// matches the shape `banto::embedded::emporium`'s own
+/// `gather_fork_observations`/`gather_relay_observations`/
+/// `gather_goinkyo_observation` already use for the identical concern:
+/// `Option<&mut Timings>`, accumulated into by the callee, not returned —
+/// one shape for "does anyone want to know how long this took" across the
+/// whole change, rather than a different one just because this function
+/// happens to sit in a different crate.
+pub fn is_thread_idle(
+    codex_home: &CodexHome,
+    session_id: &str,
+    mut timing: Option<&mut CodexActivityTiming>,
+) -> Option<bool> {
+    let sqlite_start = Instant::now();
+    let rollout_path = rollout_path_for(codex_home, session_id);
+    if let Some(t) = timing.as_deref_mut() {
+        t.sqlite = sqlite_start.elapsed();
+    }
+    let rollout_path = rollout_path?;
+
+    let rollout_start = Instant::now();
+    let marker = tail_turn_marker(&rollout_path);
+    if let Some(t) = timing {
+        t.rollout = rollout_start.elapsed();
+    }
+    let marker = marker?;
+
     Some(marker == TurnMarker::TaskComplete)
 }
 
@@ -374,7 +416,7 @@ mod tests {
                 [rollout.to_string_lossy().to_string()],
             )
             .unwrap();
-        assert_eq!(is_thread_idle(&home, "t1"), Some(false));
+        assert_eq!(is_thread_idle(&home, "t1", None), Some(false));
 
         std::fs::write(
             &rollout,
@@ -386,13 +428,29 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(is_thread_idle(&home, "t1"), Some(true));
+        assert_eq!(is_thread_idle(&home, "t1", None), Some(true));
     }
 
     #[test]
     fn is_thread_idle_is_none_for_an_unknown_session() {
         let dir = TempDir::new().unwrap();
         let home = threads_db(&dir);
-        assert_eq!(is_thread_idle(&home, "nope"), None);
+        assert_eq!(is_thread_idle(&home, "nope", None), None);
+    }
+
+    #[test]
+    fn is_thread_idle_reports_sqlite_time_but_no_rollout_time_when_the_thread_is_unknown() {
+        // The rollout lookup never runs at all when the sqlite step already
+        // came up empty — `rollout` should read as the zero default, not
+        // some incidental non-zero value. Not asserting `sqlite` is
+        // non-zero: a real read can land at 0us on a fast machine with a
+        // warm page cache, and this test must not become flaky by
+        // demanding otherwise — the shape this proves is that `rollout`
+        // specifically is skipped, not that either duration is large.
+        let dir = TempDir::new().unwrap();
+        let home = threads_db(&dir);
+        let mut timing = CodexActivityTiming::default();
+        is_thread_idle(&home, "nope", Some(&mut timing));
+        assert_eq!(timing.rollout, Duration::ZERO);
     }
 }
