@@ -66,8 +66,8 @@ use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
-    LIVE_STATUS_BUSY, LIVE_STATUS_WAITING, LiveSession, ProcessProbe, SysinfoProbe,
-    ancestry_reaches, read_live_sessions,
+    LIVE_STATUS_BUSY, LIVE_STATUS_WAITING, LiveSession, SysinfoProbe, ancestry_reaches,
+    read_live_sessions,
 };
 use banto_io::store::Store;
 use banto_tui::paint;
@@ -1685,6 +1685,25 @@ fn gather_relay_observations(
     if let Some(t) = timings.as_deref_mut() {
         t.relay_live_scan += live_scan_start.elapsed();
     }
+    // One shared process-table refresh for every Claude member this tick,
+    // not one per member: `SysinfoProbe::is_alive` was costing a full
+    // `CreateToolhelp32Snapshot`-and-walk-every-process pass PER CALL on
+    // Windows (sysinfo 0.39.6 — `ProcessesToUpdate::Some` still enumerates
+    // the whole table before filtering), so a brigade with several Claude
+    // members paid that multiple times a second. `alive_claude` is a plain
+    // local, scoped to this one call of this function and never stored
+    // anywhere with a longer lifetime (not in `EmporiumState`, not in
+    // `TickTimings`, not returned) — it cannot outlive this tick, and
+    // `gather_relay_observations` runs fresh every `TICK_INTERVAL`, so a
+    // member's liveness answer is never more than one tick stale, same as
+    // before this change (this function was already only checked once a
+    // tick; batching how the OS is asked doesn't change how often the
+    // answer itself is asked for).
+    let claude_snapshot_start = Instant::now();
+    let alive_claude = SysinfoProbe::alive_pids(live.iter().map(|entry| entry.pid));
+    if let Some(t) = timings.as_deref_mut() {
+        t.relay_claude_snapshot += claude_snapshot_start.elapsed();
+    }
     let mut observations = Vec::new();
     for member in &members {
         let Some(session_id) = member.session_id.as_ref() else {
@@ -1709,7 +1728,7 @@ fn gather_relay_observations(
                     .iter()
                     .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
                     .map(|entry| {
-                        SysinfoProbe.is_alive(entry.pid)
+                        alive_claude.contains(&entry.pid)
                             && !matches!(
                                 entry.status.as_deref(),
                                 Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
@@ -2491,6 +2510,14 @@ struct TickTimings {
     fork_per_member: Duration,
     relay_roster: Duration,
     relay_live_scan: Duration,
+    /// The one shared `SysinfoProbe::alive_pids` refresh every Claude
+    /// member's activity check now reads from, instead of each paying its
+    /// own — see that call site's own comment. Kept as its own field
+    /// rather than folded into `relay_activity_claude` so this cost stays
+    /// visible under its own name if it ever grows again, instead of
+    /// silently vanishing into a line that got faster for an unrelated
+    /// reason.
+    relay_claude_snapshot: Duration,
     relay_unseen: Duration,
     relay_activity_claude: Duration,
     relay_activity_codex_sqlite: Duration,
@@ -2553,13 +2580,15 @@ fn log_slow_iteration(
         let _ = writeln!(
             file,
             "{ms} emporium: slow tick fork_roster={}us fork_live_scan={}us fork_per_member={}us \
-             relay_roster={}us relay_live_scan={}us relay_unseen={}us relay_activity_claude={}us \
-             relay_activity_codex_sqlite={}us relay_activity_codex_rollout={}us goinkyo_roster={}us",
+             relay_roster={}us relay_live_scan={}us relay_claude_snapshot={}us relay_unseen={}us \
+             relay_activity_claude={}us relay_activity_codex_sqlite={}us \
+             relay_activity_codex_rollout={}us goinkyo_roster={}us",
             tick_timings.fork_roster.as_micros(),
             tick_timings.fork_live_scan.as_micros(),
             tick_timings.fork_per_member.as_micros(),
             tick_timings.relay_roster.as_micros(),
             tick_timings.relay_live_scan.as_micros(),
+            tick_timings.relay_claude_snapshot.as_micros(),
             tick_timings.relay_unseen.as_micros(),
             tick_timings.relay_activity_claude.as_micros(),
             tick_timings.relay_activity_codex_sqlite.as_micros(),
@@ -2750,6 +2779,7 @@ mod tests {
     use banto_core::model::{Activity, AgentKind, SessionRow};
     use banto_io::input::mock::MockInputReader;
     use banto_io::pty::mock::MockPtyHost;
+    use banto_io::status::ProcessProbe;
 
     use super::*;
 
