@@ -194,6 +194,67 @@ pub fn discover_all(
     Ok(metas)
 }
 
+/// `BANTO_SKIP_PROCESS_ENUM` — a one-session A/B diagnostic switch, not a
+/// mode anyone should run in. Presence alone is what's checked (any value,
+/// including empty); absence leaves this byte-for-byte what
+/// `SysinfoProbe::alive_pids` itself returns.
+///
+/// When set, every requested pid is reported alive WITHOUT constructing a
+/// `sysinfo::System` at all — no `refresh_processes_specifics` call, so on
+/// Windows the `CreateToolhelp32Snapshot`-and-walk-the-whole-table pass
+/// `SysinfoProbe::alive_pids` otherwise pays never happens. Exists to
+/// isolate whether that enumeration — which runs once per tick from the
+/// emporium's relay activity check and once per reload from
+/// [`rows_from_metas`] — is the cause of a reported video-playback stutter,
+/// by letting the operator run one session with it fully skipped rather
+/// than merely measured, and see whether the stutter goes. A version that
+/// still built the snapshot and only ignored the answer would prove
+/// nothing; this skips the syscalls themselves.
+///
+/// Deliberately narrow: this function is called from exactly the two
+/// activity/display sites that decide which dot to show (Busy/Waiting/
+/// Alive/Idle) — [`rows_from_metas`] below, and
+/// `banto::embedded::emporium::gather_relay_observations`'s equivalent
+/// check. It is never read by the no-double-resume guard:
+/// `opener::is_live`/`opener::open_session` call
+/// `ProcessProbe::is_alive`/`is_alive_matching` directly on `SysinfoProbe`,
+/// not through this function, and never touch this env var — that guard's
+/// liveness check runs a real, unmodified enumeration every time, this
+/// switch on or off, exactly as it always has. Confirmed by reading every
+/// caller of `alive_pids`/`is_alive` in the repo before writing this:
+/// `SysinfoProbe::is_alive` is implemented in terms of `alive_pids`
+/// (`banto-io/src/status/probe.rs:76-78`), so gating `alive_pids` itself
+/// would have silently reached the guard too — this function exists
+/// specifically so the switch sits above that shared implementation, at
+/// the display-only call sites, instead of inside it.
+pub(crate) fn alive_claude_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<u32> {
+    alive_claude_pids_with(pids, |key| std::env::var(key).ok())
+}
+
+/// The decision half of [`alive_claude_pids`], pure over an injected env
+/// getter — the same pattern `banto_io::opener::detect_backend`/
+/// `detect_backend_from_env` already use, and for the same reason:
+/// `BANTO_VERIFY_CACHE` already taught this codebase that an operator
+/// dogfooding a diagnostic switch exports it for their whole shell, and
+/// `cargo test` inherits it (see `banto_io::provider::cache::MetaCache::
+/// quiet_for_test`'s doc — "every 'this must not parse again' assertion in
+/// this crate fired at once the first time that happened"). A test that
+/// called `std::env::set_var`/`remove_var` on the real
+/// `BANTO_SKIP_PROCESS_ENUM` would pass or fail depending on what the
+/// operator happened to have set that day, not on what it's testing — so
+/// this takes the getter as a parameter instead, and a test supplies a
+/// fake one with no such risk.
+fn alive_claude_pids_with(
+    pids: impl IntoIterator<Item = u32>,
+    var: impl Fn(&str) -> Option<String>,
+) -> HashSet<u32> {
+    let pids: Vec<u32> = pids.into_iter().collect();
+    if var("BANTO_SKIP_PROCESS_ENUM").is_some() {
+        return pids.into_iter().collect();
+    }
+    SysinfoProbe::alive_pids(pids)
+}
+
 /// The conversion half of [`load_rows`] — classify and sort already-
 /// discovered `metas` into [`SessionRow`]s — extracted so a caller that has
 /// its own discover() pass to feed elsewhere too (e.g. lineage resolution —
@@ -227,7 +288,7 @@ pub fn rows_from_metas(
                 .map(|meta| meta.id.0.clone()),
         )
     });
-    let live_claude = SysinfoProbe::alive_pids(live.iter().map(|entry| entry.pid));
+    let live_claude = alive_claude_pids(live.iter().map(|entry| entry.pid));
     let now = SystemTime::now();
 
     metas
@@ -656,6 +717,69 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Title new"));
         assert_eq!(rows[0].agent, AgentKind::ClaudeCode);
         assert_eq!(rows[0].size, 42);
+    }
+
+    // --- alive_claude_pids_with: BANTO_SKIP_PROCESS_ENUM -------------------
+
+    #[test]
+    fn the_switch_off_leaves_behaviour_byte_for_byte_the_real_answer() {
+        // A genuinely alive pid (this test process's own) alongside a pid
+        // that can never be real — the same pairing
+        // `SysinfoProbe`'s own `batched_probe_sees_current_process` test
+        // uses to prove the real enumeration filters correctly. With the
+        // switch off, this function must answer exactly what
+        // `SysinfoProbe::alive_pids` would.
+        let real_pid = std::process::id();
+        let fake_pid = u32::MAX;
+        let alive = alive_claude_pids_with([real_pid, fake_pid], |_| None);
+        assert!(
+            alive.contains(&real_pid),
+            "the real process must read alive"
+        );
+        assert!(
+            !alive.contains(&fake_pid),
+            "a pid that can never be real must not read alive"
+        );
+    }
+
+    #[test]
+    fn the_switch_on_reports_every_pid_alive_without_a_real_enumeration() {
+        // `fake_pid` can never correspond to a real process, so the only
+        // way it comes back "alive" is if the real enumeration was never
+        // run at all — this is what proves the syscalls are skipped, not
+        // just that the answer happens to look the same. What this test
+        // does NOT prove: that `sysinfo::System::new()` itself is never
+        // constructed — there is no hook in this crate to observe that
+        // directly, so "reports every requested pid alive, including ones
+        // that cannot be real" is the strongest claim available from the
+        // outside, and it is what's asserted here.
+        let fake_pid = u32::MAX;
+        let another_fake_pid = u32::MAX - 1;
+        let alive = alive_claude_pids_with([fake_pid, another_fake_pid], |_| Some("1".to_string()));
+        assert!(alive.contains(&fake_pid));
+        assert!(alive.contains(&another_fake_pid));
+    }
+
+    #[test]
+    fn the_switch_is_presence_only_an_empty_value_still_counts_as_on() {
+        let fake_pid = u32::MAX;
+        let alive = alive_claude_pids_with([fake_pid], |_| Some(String::new()));
+        assert!(
+            alive.contains(&fake_pid),
+            "any value, including empty, must count as the switch being set"
+        );
+    }
+
+    #[test]
+    fn the_switch_only_checks_its_own_variable_name() {
+        let fake_pid = u32::MAX;
+        let alive = alive_claude_pids_with([fake_pid], |key| {
+            (key != "BANTO_SKIP_PROCESS_ENUM").then(|| "1".to_string())
+        });
+        assert!(
+            !alive.contains(&fake_pid),
+            "a different variable being set must not trip the switch"
+        );
     }
 
     #[test]
