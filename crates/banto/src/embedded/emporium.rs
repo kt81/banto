@@ -75,7 +75,7 @@ use banto_tui::view::{self, WAITING_ACTIVITY_COLOR};
 
 use crate::opener;
 use crate::session;
-use crate::tui::LiveWatch;
+use crate::tui::{LiveWatch, ReadyRoot};
 
 use super::convert;
 use super::paste_accum::{PasteAccumulator, is_in_scope};
@@ -452,10 +452,26 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         let discovery_dur = discovery_start.elapsed();
 
         let reload_start = Instant::now();
-        if watch.poll_ready(SystemTime::now()) {
+        let ready_roots = watch.poll_ready(SystemTime::now());
+        // Unchanged behavior: any non-empty set still runs the same full
+        // reload, exactly as the old `if poll_ready(now) { .. }` bool did —
+        // this errand is measurement only, no discrimination by root yet.
+        if !ready_roots.is_empty() {
             events.extend(gather_reload(deps));
         }
         let reload_dur = reload_start.elapsed();
+        // Unconditional on firing, not gated by `SLOW_ITERATION_THRESHOLD`
+        // like `log_slow_iteration` below: `gather_reload`'s own mean cost
+        // (13.1ms, measured) sits close enough to that 15ms threshold that
+        // a cheap firing could fall under it and never appear there, which
+        // would undercount exactly the cheap-firing case this measurement
+        // exists to see. Firings themselves are already rate-limited by
+        // `DEBOUNCE_QUIET` (250ms) regardless of loop/tick cadence, so
+        // writing one line per firing — not per iteration, not per key —
+        // cannot approach `log_input`'s per-key write rate; it is bounded
+        // by real filesystem activity, the same ceiling `poll_ready` itself
+        // is already under.
+        log_reload_fired(&mut stage_log, &ready_roots);
 
         // ~1s: relay observations for the staged brigade, gathered here
         // (store + live-session reads) and decided in `update` — plus the
@@ -2601,6 +2617,35 @@ fn log_slow_iteration(
             tick_timings.goinkyo_roster.as_micros(),
         );
     }
+}
+
+/// One line per non-empty `poll_ready` result — every actual reload
+/// firing, regardless of how long the iteration around it took. Deliberately
+/// NOT gated by [`SLOW_ITERATION_THRESHOLD`] the way [`log_slow_iteration`]
+/// is: the question this answers (what fraction of firings are `Sessions`
+/// alone, how often firings happen at all) needs every firing counted, and
+/// gating on iteration slowness would systematically miss the cheap ones —
+/// exactly the case a future per-root discrimination would create more of.
+/// Root name and a raw-change count only, same discretion as every other
+/// diagnostic in this file: no paths, no session content.
+fn log_reload_fired(file: &mut Option<std::fs::File>, ready_roots: &[ReadyRoot]) {
+    use std::io::Write as _;
+    if ready_roots.is_empty() {
+        return;
+    }
+    let Some(file) = file else {
+        return;
+    };
+    let ms = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let roots: String = ready_roots
+        .iter()
+        .map(|r| format!("{:?}={}", r.root, r.raw_changes))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let _ = writeln!(file, "{ms} emporium: reload fired {roots}");
 }
 
 /// Env-gated recorder for `docs/DISCIPLINE.md` §8's record/replay stream:

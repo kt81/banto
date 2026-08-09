@@ -7,7 +7,7 @@
 //! is cross-platform — crossterm handles the Windows specifics.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -45,7 +45,7 @@ use banto_io::process::{ProcessRunner, SystemProcessRunner};
 use banto_io::pty::STRIPPED_CHILD_ENV_VARS;
 use banto_io::status::{SysinfoProbe, read_live_sessions};
 use banto_io::store::Store;
-use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource};
+use banto_io::watch::{ChangeSource, Debouncer, NotifyChangeSource, RawChange, WatchRoot};
 use banto_tui::render_modal::{render_modal, windowed_view};
 use banto_tui::text::truncate_to_width;
 use banto_tui::view;
@@ -207,6 +207,20 @@ fn open_input_log() -> Option<std::fs::File> {
         .ok()
 }
 
+/// A [`WatchRoot`] `LiveWatch::poll_ready` reported ready, with how many raw
+/// filesystem changes were recorded for it since it last fired — one write
+/// vs. a burst that merged, the same distinction `Debouncer::record`
+/// already collapses away for its own purpose. Tracked here rather than in
+/// `Debouncer` itself: that module is pure and already fully tested against
+/// synthetic timestamps for exactly the job it has (which roots are ready),
+/// and giving it a second responsibility it has no other use for would
+/// widen a deliberately small unit for one caller's diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadyRoot {
+    pub(crate) root: WatchRoot,
+    pub(crate) raw_changes: u32,
+}
+
 /// Watches `claude_home` for changes and debounces them into a "reload now"
 /// signal. Construction failures (e.g. an exotic filesystem `notify` can't
 /// watch) degrade to "no live updates" rather than blocking the TUI from
@@ -214,6 +228,13 @@ fn open_input_log() -> Option<std::fs::File> {
 pub(crate) struct LiveWatch {
     source: Option<NotifyChangeSource>,
     debouncer: Debouncer,
+    /// Raw changes seen per root since it last fired (or since startup),
+    /// reset to zero the instant `poll_ready` reports that root ready — see
+    /// [`ReadyRoot`]'s own doc for why this lives here and not in
+    /// `Debouncer`. A `BTreeMap`, not a `HashMap`, matching `Debouncer`'s
+    /// own choice for the same key type: `WatchRoot` derives `Ord` but not
+    /// `Hash`, and there is no reason to widen it just for this.
+    pending_raw_changes: BTreeMap<WatchRoot, u32>,
 }
 
 impl LiveWatch {
@@ -221,20 +242,62 @@ impl LiveWatch {
         Self {
             source: NotifyChangeSource::new(claude_home, codex_home).ok(),
             debouncer: Debouncer::new(DEBOUNCE_QUIET),
+            pending_raw_changes: BTreeMap::new(),
         }
     }
 
-    /// Drain any pending filesystem changes and report whether their quiet
-    /// period has elapsed as of `now`, i.e. whether a reload is due.
-    pub(crate) fn poll_ready(&mut self, now: SystemTime) -> bool {
+    /// Drain any pending filesystem changes and report which roots' quiet
+    /// period has elapsed as of `now`, i.e. which are due a reload. Empty
+    /// means none are — the caller's existing `if !poll_ready(now).is_empty()`
+    /// shape (both call sites, today) is unaffected by this change; only a
+    /// caller that wants to know *which* root gains anything new.
+    ///
+    /// The actual record/count/poll logic is [`ready_roots`] below, taking
+    /// an owned `Vec` rather than reading `source` directly, specifically so
+    /// it can be driven by a test with hand-built [`RawChange`]s and no real
+    /// `notify` watcher — the same reason `Debouncer` itself takes `now` as
+    /// a parameter instead of reading a clock.
+    pub(crate) fn poll_ready(&mut self, now: SystemTime) -> Vec<ReadyRoot> {
         let Some(source) = &self.source else {
-            return false;
+            return Vec::new();
         };
-        for change in source.drain() {
-            self.debouncer.record(change.root, change.at);
-        }
-        !self.debouncer.poll(now).is_empty()
+        let changes = source.drain();
+        ready_roots(
+            changes,
+            &mut self.debouncer,
+            &mut self.pending_raw_changes,
+            now,
+        )
     }
+}
+
+/// Records `changes` into `debouncer` and `pending_raw_changes`, then polls
+/// for ready roots — pulled out of [`LiveWatch::poll_ready`] so it's
+/// testable the same way `Debouncer::poll` already is: synthetic input,
+/// synthetic `now`, no real filesystem or watcher involved.
+fn ready_roots(
+    changes: impl IntoIterator<Item = RawChange>,
+    debouncer: &mut Debouncer,
+    pending_raw_changes: &mut BTreeMap<WatchRoot, u32>,
+    now: SystemTime,
+) -> Vec<ReadyRoot> {
+    for change in changes {
+        debouncer.record(change.root, change.at);
+        *pending_raw_changes.entry(change.root).or_insert(0) += 1;
+    }
+    debouncer
+        .poll(now)
+        .into_iter()
+        .map(|root| ReadyRoot {
+            root,
+            // A root Debouncer just reported ready was, by construction,
+            // recorded at least once since the last time it fired (that
+            // is what put it in `pending` at all) — `unwrap_or(1)` is a
+            // floor for a state this map should never actually be in,
+            // not a value expected to be read in practice.
+            raw_changes: pending_raw_changes.remove(&root).unwrap_or(1),
+        })
+        .collect()
 }
 
 pub fn run(
@@ -728,7 +791,11 @@ fn event_loop(terminal: &mut Tui, app: &mut App, ctx: &Context) -> Result<()> {
             run_pending_inplace(terminal, app, ctx, pending)?;
         }
 
-        if watch.poll_ready(SystemTime::now()) {
+        // Deliberately undiscriminated: the chōba reloads on any ready root,
+        // same as before `poll_ready` started reporting which ones — this
+        // mode is scoped out of the per-root measurement/discrimination
+        // work happening on the emporium side, not overlooked.
+        if !watch.poll_ready(SystemTime::now()).is_empty() {
             reload(app, ctx);
         }
 
@@ -2007,6 +2074,140 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use std::path::PathBuf;
+
+    // --- ready_roots: raw-change counting per firing, no real watcher ----
+    //
+    // Same style `Debouncer`'s own tests already use: synthetic timestamps,
+    // no real clock, no real filesystem.
+
+    fn t(ms: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    fn raw(root: WatchRoot, ms: u64) -> RawChange {
+        RawChange { root, at: t(ms) }
+    }
+
+    #[test]
+    fn a_single_change_fires_with_a_raw_change_count_of_one() {
+        let mut debouncer = Debouncer::new(Duration::from_millis(100));
+        let mut pending = BTreeMap::new();
+        ready_roots(
+            [raw(WatchRoot::Sessions, 0)],
+            &mut debouncer,
+            &mut pending,
+            t(50),
+        );
+        let ready = ready_roots([], &mut debouncer, &mut pending, t(100));
+        assert_eq!(
+            ready,
+            vec![ReadyRoot {
+                root: WatchRoot::Sessions,
+                raw_changes: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn a_burst_for_one_root_reports_how_many_changes_coalesced() {
+        let mut debouncer = Debouncer::new(Duration::from_millis(100));
+        let mut pending = BTreeMap::new();
+        ready_roots(
+            [
+                raw(WatchRoot::Sessions, 0),
+                raw(WatchRoot::Sessions, 10),
+                raw(WatchRoot::Sessions, 20),
+            ],
+            &mut debouncer,
+            &mut pending,
+            t(20),
+        );
+        let ready = ready_roots([], &mut debouncer, &mut pending, t(120));
+        assert_eq!(
+            ready,
+            vec![ReadyRoot {
+                root: WatchRoot::Sessions,
+                raw_changes: 3
+            }],
+            "one write vs. a storm that merged — this is the distinction worker-2 asked for"
+        );
+    }
+
+    #[test]
+    fn the_count_resets_after_firing_so_the_next_burst_starts_fresh() {
+        let mut debouncer = Debouncer::new(Duration::from_millis(100));
+        let mut pending = BTreeMap::new();
+        ready_roots(
+            [raw(WatchRoot::Sessions, 0), raw(WatchRoot::Sessions, 10)],
+            &mut debouncer,
+            &mut pending,
+            t(10),
+        );
+        let first = ready_roots([], &mut debouncer, &mut pending, t(110));
+        assert_eq!(
+            first,
+            vec![ReadyRoot {
+                root: WatchRoot::Sessions,
+                raw_changes: 2
+            }]
+        );
+
+        ready_roots(
+            [raw(WatchRoot::Sessions, 200)],
+            &mut debouncer,
+            &mut pending,
+            t(200),
+        );
+        let second = ready_roots([], &mut debouncer, &mut pending, t(300));
+        assert_eq!(
+            second,
+            vec![ReadyRoot {
+                root: WatchRoot::Sessions,
+                raw_changes: 1
+            }],
+            "must not carry the prior burst's count forward into the next one"
+        );
+    }
+
+    #[test]
+    fn multiple_roots_fire_independently_with_their_own_counts() {
+        let mut debouncer = Debouncer::new(Duration::from_millis(50));
+        let mut pending = BTreeMap::new();
+        ready_roots(
+            [
+                raw(WatchRoot::Projects, 0),
+                raw(WatchRoot::Sessions, 0),
+                raw(WatchRoot::Sessions, 10),
+            ],
+            &mut debouncer,
+            &mut pending,
+            t(10),
+        );
+        let ready = ready_roots([], &mut debouncer, &mut pending, t(60));
+        assert_eq!(
+            ready,
+            vec![
+                ReadyRoot {
+                    root: WatchRoot::Projects,
+                    raw_changes: 1
+                },
+                ReadyRoot {
+                    root: WatchRoot::Sessions,
+                    raw_changes: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_pending_changes_yields_an_empty_result() {
+        let mut debouncer = Debouncer::new(Duration::from_millis(100));
+        let mut pending = BTreeMap::new();
+        assert_eq!(
+            ready_roots([], &mut debouncer, &mut pending, t(1_000_000)),
+            Vec::new()
+        );
+    }
 
     fn row(id: &str, title: &str, cwd: &str, activity: Activity) -> SessionRow {
         SessionRow {
