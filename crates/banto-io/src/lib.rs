@@ -11,6 +11,7 @@
 //! - [`codex_trust`] advisory-only read of whether Codex has trusted banto's own SessionStart hook
 //! - [`config`]  loading `banto_core::config`'s types from disk
 //! - [`directory_trust`] advisory-only read of whether Codex/Claude Code has trusted a given cwd
+//! - [`input`] raw terminal events, read and timestamped off their own thread
 //! - [`lineage`] resolving auto-compaction parent links (beside the provider)
 //! - [`opener`]  opening/focusing sessions in a real terminal (psmux, WT)
 //! - [`process`] spawning the resumed session's process
@@ -29,6 +30,7 @@ pub mod codex_liveness;
 pub mod codex_trust;
 pub mod config;
 pub mod directory_trust;
+pub mod input;
 pub mod lineage;
 pub mod opener;
 pub mod process;

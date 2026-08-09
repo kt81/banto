@@ -9,6 +9,7 @@ description = "banto's outside world: session discovery, sqlite store, PTY hosti
 [dependencies]
 anyhow = "1.0.104"
 banto-core = { version = "0.1.0", path = "../banto-core" }
+crossterm = "0.29.0"
 dirs = "6.0.0"
 notify = "8.2.0"
 portable-pty = { version = "0.9.6", package = "portable-pty-psmux" }

@@ -22,11 +22,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
@@ -59,6 +60,7 @@ use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
+use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
 use banto_io::provider::SessionProvider;
 use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
@@ -205,6 +207,7 @@ pub fn run(
         superseded_failed: &superseded_failed,
         meta_cache: &meta_cache,
         pty_host: &PortablePtyHost,
+        input_reader: &CrosstermInputReader,
         brigade,
         agent_binaries,
         enabled_agents,
@@ -284,6 +287,11 @@ struct Deps<'a> {
     /// produces, from any of its producers, funnels through one of those
     /// calls.
     pty_host: &'a dyn PtyHost,
+    /// What actually reads terminal input, off its own thread — see
+    /// [`banto_io::input`]'s module doc for why that thread exists.
+    /// `&CrosstermInputReader` in a real run; a mock in a test, same role
+    /// [`Self::pty_host`] plays for spawning.
+    input_reader: &'a dyn InputReader,
     /// `[brigade]` from config.toml. Lives here rather than as its own
     /// `event_loop` parameter because `execute_cmd` needs it too now (a
     /// member's launch argv carries its role briefing — see
@@ -303,7 +311,14 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let mut watch = LiveWatch::new(deps.claude_home, deps.codex_home);
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
+    // Opened once, off this thread — see `banto_io::input`'s module doc for
+    // why the read no longer happens inline here: a slow iteration
+    // (rendering, a reload pass, ...) between this loop getting back around
+    // to receiving and an event's true arrival must never inflate
+    // `paste_acc`'s gap timing.
+    let input_rx = deps.input_reader.open();
     let mut input_log = open_input_log();
+    let mut stage_log = open_stage_log();
     let mut paste_acc = PasteAccumulator::new();
     let run_start = Instant::now();
     let mut event_recorder = open_event_recorder(run_start);
@@ -329,6 +344,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         // `PtyPoll::Disconnected` is only ever reached once a handle's every
         // last chunk has been drained (see `PtyHandle::poll`'s doc), so a
         // handle reports it once, right here, then gets dropped below.
+        let pty_pump_start = Instant::now();
         for (key, handle) in &mut handles {
             loop {
                 match handle.poll() {
@@ -347,13 +363,14 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 }
             }
         }
+        let pty_pump_dur = pty_pump_start.elapsed();
 
-        // One real input event, non-blocking with a short poll window (the
-        // pacing knob for the whole loop, matching the pre-migration cadence)
-        // — dropped from 50ms to 10ms while `paste_acc` holds buffered keys,
-        // so a lone buffered key still flushes within one `PASTE_GAP` of
-        // arriving instead of waiting on the ordinary idle cadence (see
-        // `paste_accum`'s module doc).
+        // One real input event, waited for on the reader thread's channel
+        // with a short timeout (the pacing knob for the whole loop, matching
+        // the pre-migration cadence) — dropped from 50ms to 10ms while
+        // `paste_acc` holds buffered keys, so a lone buffered key still
+        // flushes within one `PASTE_GAP` of arriving instead of waiting on
+        // the ordinary idle cadence (see `paste_accum`'s module doc).
         // Converted from crossterm at this boundary (`convert::from_crossterm`)
         // — `None` for an event kind banto ignores (a key release, ...),
         // which simply contributes nothing to this tick.
@@ -362,54 +379,54 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         } else {
             Duration::from_millis(50)
         };
-        if event::poll(poll_timeout)? {
-            // Timestamped separately from the loop's own `now` (above):
-            // `paste_acc`'s gap timing must track real inter-keystroke
-            // spacing, not spacing inflated by whatever PTY-pump/discovery
-            // work this iteration happened to do before reaching the poll.
-            let event_now = Instant::now();
-            let raw = event::read()?;
-            log_input(&mut input_log, &describe_raw_event(&raw));
-            // Intercepted before `convert::from_crossterm`, not routed
-            // through it: banto's own OS focus is not the same thing as
-            // which pane holds focus inside it (`engine::Focus`), but a
-            // child that asked for DECSET 1004 cannot tell those apart —
-            // which is exactly why both have to resolve through one path
-            // (`Event::WindowFocusChanged`'s own doc). Neither is a key, so
-            // neither may reach `is_in_scope`'s paste-accumulation gate.
-            if let Some(ev) = window_focus_event(&raw) {
-                events.push_back(ev);
-            } else if let Some(input) = convert::from_crossterm(raw) {
-                log_input(&mut input_log, &describe_converted_event(&input));
-                if is_in_scope(&state, app, &input) {
-                    // A stale buffer (idle past `PASTE_GAP` before this key
-                    // arrived) flushes first, so it never silently merges
-                    // into this key's run.
-                    if let Some(flushed) = paste_acc.tick(event_now) {
-                        emit_flushed(&mut events, &mut input_log, flushed);
+        match read_or_idle_tick(&input_rx, poll_timeout, &mut paste_acc)? {
+            InputStep::Received(StampedEvent {
+                event: raw,
+                at: event_now,
+            }) => {
+                log_input(&mut input_log, &describe_raw_event(&raw));
+                // Intercepted before `convert::from_crossterm`, not routed
+                // through it: banto's own OS focus is not the same thing as
+                // which pane holds focus inside it (`engine::Focus`), but a
+                // child that asked for DECSET 1004 cannot tell those apart —
+                // which is exactly why both have to resolve through one path
+                // (`Event::WindowFocusChanged`'s own doc). Neither is a key, so
+                // neither may reach `is_in_scope`'s paste-accumulation gate.
+                if let Some(ev) = window_focus_event(&raw) {
+                    events.push_back(ev);
+                } else if let Some(input) = convert::from_crossterm(raw) {
+                    log_input(&mut input_log, &describe_converted_event(&input));
+                    if is_in_scope(&state, app, &input) {
+                        // A stale buffer (idle past `PASTE_GAP` before this key
+                        // arrived) flushes first, so it never silently merges
+                        // into this key's run.
+                        if let Some(flushed) = paste_acc.tick(event_now) {
+                            emit_flushed(&mut events, &mut input_log, flushed);
+                        }
+                        let InputEvent::Key(key) = input else {
+                            unreachable!("is_in_scope only admits InputEvent::Key")
+                        };
+                        if let Some(flushed) = paste_acc.accept(key, event_now) {
+                            emit_flushed(&mut events, &mut input_log, flushed);
+                        }
+                    } else {
+                        // Out of scope for accumulation: flush whatever is
+                        // buffered first (preserving key order), except a mouse
+                        // event, which passes through with the buffer left
+                        // untouched (see `paste_accum::PasteAccumulator::bypass`).
+                        let is_mouse = matches!(input, InputEvent::Mouse(_));
+                        if let Some(flushed) = paste_acc.bypass(is_mouse) {
+                            emit_flushed(&mut events, &mut input_log, flushed);
+                        }
+                        events.push_back(Event::Input(input));
                     }
-                    let InputEvent::Key(key) = input else {
-                        unreachable!("is_in_scope only admits InputEvent::Key")
-                    };
-                    if let Some(flushed) = paste_acc.accept(key, event_now) {
-                        emit_flushed(&mut events, &mut input_log, flushed);
-                    }
-                } else {
-                    // Out of scope for accumulation: flush whatever is
-                    // buffered first (preserving key order), except a mouse
-                    // event, which passes through with the buffer left
-                    // untouched (see `paste_accum::PasteAccumulator::bypass`).
-                    let is_mouse = matches!(input, InputEvent::Mouse(_));
-                    if let Some(flushed) = paste_acc.bypass(is_mouse) {
-                        emit_flushed(&mut events, &mut input_log, flushed);
-                    }
-                    events.push_back(Event::Input(input));
                 }
             }
-        } else if paste_acc.is_pending()
-            && let Some(flushed) = paste_acc.tick(Instant::now())
-        {
-            emit_flushed(&mut events, &mut input_log, flushed);
+            InputStep::Idle(flushed) => {
+                if let Some(flushed) = flushed {
+                    emit_flushed(&mut events, &mut input_log, flushed);
+                }
+            }
         }
 
         // Discovery: poll for the ids Claude assigns to freshly-launched
@@ -418,6 +435,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         // `Cmd::RekeyPty` renames a handle the moment its id is discovered:
         // without that, a resolved id stays invisible here and the next
         // pending tracker resolves onto it a second time.
+        let discovery_start = Instant::now();
         if !discovery.is_empty() {
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
@@ -431,15 +449,19 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 deps.claude_home,
             ));
         }
+        let discovery_dur = discovery_start.elapsed();
 
+        let reload_start = Instant::now();
         if watch.poll_ready(SystemTime::now()) {
             events.extend(gather_reload(deps));
         }
+        let reload_dur = reload_start.elapsed();
 
         // ~1s: relay observations for the staged brigade, gathered here
         // (store + live-session reads) and decided in `update` — plus the
         // trigger for the pending-submit flush and status expiry bundled
         // into the same tick (see `engine::update_tick`'s doc).
+        let tick_start = Instant::now();
         if last_tick.is_none_or(|tick| now.duration_since(tick) >= TICK_INTERVAL) {
             last_tick = Some(now);
             events.extend(gather_fork_observations(
@@ -459,12 +481,14 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             let observation = gather_goinkyo_observation(&state, deps.store, app);
             events.push_back(Event::GoinkyoAwaitingSpawn { observation });
         }
+        let tick_dur = tick_start.elapsed();
 
         // Drain the event queue through `update`, executing the `Cmd`s it
         // returns and feeding any follow-up fact back onto the same queue —
         // the synchronous relaxation (DISCIPLINE §6.1) generalized from just
         // the store to every shell-executed `Cmd` (spawning a PTY child is
         // just as synchronous a call as a store write).
+        let dispatch_start = Instant::now();
         while let Some(ev) = events.pop_front() {
             if let Some(recorder) = &mut event_recorder {
                 recorder.record(&ev, now);
@@ -474,6 +498,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 events.extend(execute_cmd(cmd, deps, &mut handles, &mut discovery));
             }
         }
+        let dispatch_dur = dispatch_start.elapsed();
 
         // A `PtyExited` handler drops the session's `Screen`; the handle
         // itself (now pointing at a dead reader thread) is reaped here.
@@ -499,6 +524,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
             std::thread::spawn(move || drop(reaped));
         }
 
+        let draw_start = Instant::now();
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -509,6 +535,19 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 &mut pane_render_cache,
             )
         })?;
+        let draw_dur = draw_start.elapsed();
+
+        log_slow_iteration(
+            &mut stage_log,
+            &StageTimings {
+                pty_pump: pty_pump_dur,
+                discovery: discovery_dur,
+                reload: reload_dur,
+                tick: tick_dur,
+                dispatch: dispatch_dur,
+                draw: draw_dur,
+            },
+        );
 
         if app.should_quit() {
             break;
@@ -516,6 +555,49 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     }
     shutdown_handles(&mut handles, SHUTDOWN_GRACE, SHUTDOWN_POLL_INTERVAL);
     Ok(())
+}
+
+/// One iteration's read step, off the reader thread's channel.
+#[derive(Debug)]
+enum InputStep {
+    /// A real event arrived — carries the reader thread's own stamp.
+    Received(StampedEvent),
+    /// The channel genuinely went quiet for the whole `poll_timeout`
+    /// window; `Some` if that was long enough to flush a buffered run.
+    Idle(Option<InputEvent>),
+}
+
+/// The channel wait plus the one wall-clock staleness check it gates,
+/// pulled out of [`event_loop`] so a test can drive it against a real
+/// `mpsc` channel with controlled stamps — no thread, no real waiting. See
+/// the tests below for the property this exists to prove: `recv_timeout`
+/// always gets first look at the channel, so a buffer is never judged stale
+/// by wall clock while a fresher event is already sitting there unread
+/// (drain-before-tick — the same call-order hazard `PasteAccumulator::
+/// accept`'s own doc names for tick-before-accept, `paste_accum.rs`).
+/// `Err(RecvTimeoutError::Timeout)` is trustworthy evidence of idleness
+/// specifically *because* the channel is the drain: reaching it means
+/// `recv_timeout` waited out the whole window with nothing arriving, not
+/// merely "nothing seen recently."
+fn read_or_idle_tick(
+    input_rx: &mpsc::Receiver<StampedEvent>,
+    poll_timeout: Duration,
+    paste_acc: &mut PasteAccumulator,
+) -> Result<InputStep> {
+    match input_rx.recv_timeout(poll_timeout) {
+        Ok(stamped) => Ok(InputStep::Received(stamped)),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let flushed = if paste_acc.is_pending() {
+                paste_acc.tick(Instant::now())
+            } else {
+                None
+            };
+            Ok(InputStep::Idle(flushed))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("input reader thread ended unexpectedly")
+        }
+    }
 }
 
 /// Windows gives a console-closing child ~5s (`CTRL_CLOSE_EVENT`) before it
@@ -2157,9 +2239,19 @@ fn border_style(focused: bool, waiting: bool) -> Style {
     })
 }
 
-/// Enables bracketed paste on the HOST terminal (in addition to mouse
-/// capture) so a multiline paste arrives as one `Event::Paste` instead of a
-/// stream of individual key events. The chōba list TUI (`crate::tui`) is
+/// Enables bracketed paste (and mouse capture) on the HOST terminal. On
+/// Unix backends this is what makes a multiline paste arrive as one
+/// `Event::Paste` instead of a stream of individual key events. **On
+/// Windows it has no such effect**: crossterm 0.29's Windows input backend
+/// never constructs `Event::Paste` regardless of this call — `ReadConsoleInput`
+/// maps every key press to one `Event::Key`, one at a time, with no code
+/// path that ever batches a paste (source-confirmed; see `paste_accum`'s
+/// module doc). `PasteAccumulator` exists to make up the difference: on
+/// Windows a real paste, a drag-and-drop path, and an IME commit all arrive
+/// here as an ordinary machine-pace key burst, and it re-derives "that was a
+/// paste" from inter-key timing alone. This call is kept regardless — it
+/// costs nothing on the platform where it doesn't help, and is what makes
+/// Unix backends behave correctly. The chōba list TUI (`crate::tui`) is
 /// untouched: it has its own, separate `setup_terminal`.
 fn setup_terminal() -> Result<Tui> {
     install_panic_hook();
@@ -2212,6 +2304,78 @@ fn log_input(file: &mut Option<std::fs::File>, message: &str) {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let _ = writeln!(file, "{ms} emporium: {message}");
+    }
+}
+
+/// An iteration's non-poll work is logged when its total exceeds this —
+/// loose enough to skip the loop's own ordinary per-iteration cost, tight
+/// enough to catch a stall well short of a `PASTE_GAP` (25ms).
+const SLOW_ITERATION_THRESHOLD: Duration = Duration::from_millis(15);
+
+/// Open the diagnostic stage-timing log when `BANTO_STAGE_LOG` is set — same
+/// house pattern as [`open_input_log`] (and `BANTO_VERIFY_CACHE`,
+/// `provider::cache`): env var names the file, append mode, best-effort
+/// open. Unlike `BANTO_INPUT_LOG`, this one is never written to per key —
+/// only per iteration whose stages summed past [`SLOW_ITERATION_THRESHOLD`]
+/// — precisely so this instrument does not become a second version of the
+/// self-reference risk `log_input` already carries (unbuffered synchronous
+/// `File` I/O on this same thread, twice a key): logging only above
+/// threshold means it cannot fire at burst rates the way `log_input` does.
+fn open_stage_log() -> Option<std::fs::File> {
+    let path = std::env::var_os("BANTO_STAGE_LOG")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// One iteration's non-poll stage durations — the measuring (`Instant::now()`
+/// deltas around each stage) is unconditional and negligible, no different
+/// in cost from the loop's own existing per-iteration clock reads; only the
+/// logging below is gated, both by `BANTO_STAGE_LOG` being set at all and by
+/// the total exceeding [`SLOW_ITERATION_THRESHOLD`].
+struct StageTimings {
+    pty_pump: Duration,
+    discovery: Duration,
+    reload: Duration,
+    tick: Duration,
+    dispatch: Duration,
+    draw: Duration,
+}
+
+impl StageTimings {
+    fn total(&self) -> Duration {
+        self.pty_pump + self.discovery + self.reload + self.tick + self.dispatch + self.draw
+    }
+}
+
+/// Stage name and duration only — no keystroke content, no paths, no
+/// payload, the same discretion `banto_io::provider::cache`'s own
+/// verification log already exercises (path-only on divergence, never
+/// parsed content).
+fn log_slow_iteration(file: &mut Option<std::fs::File>, timings: &StageTimings) {
+    use std::io::Write as _;
+    let total = timings.total();
+    if total < SLOW_ITERATION_THRESHOLD {
+        return;
+    }
+    if let Some(file) = file {
+        let ms = std::time::UNIX_EPOCH
+            .elapsed()
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(
+            file,
+            "{ms} emporium: slow iter total={}us pty_pump={}us discovery={}us reload={}us tick={}us dispatch={}us draw={}us",
+            total.as_micros(),
+            timings.pty_pump.as_micros(),
+            timings.discovery.as_micros(),
+            timings.reload.as_micros(),
+            timings.tick.as_micros(),
+            timings.dispatch.as_micros(),
+            timings.draw.as_micros(),
+        );
     }
 }
 
@@ -2394,6 +2558,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use banto_core::model::{Activity, AgentKind, SessionRow};
+    use banto_io::input::mock::MockInputReader;
     use banto_io::pty::mock::MockPtyHost;
 
     use super::*;
@@ -2726,6 +2891,7 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2739,6 +2905,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
+            input_reader: &input_reader,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2791,6 +2958,7 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2804,6 +2972,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
+            input_reader: &input_reader,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2842,6 +3011,7 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2855,6 +3025,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
+            input_reader: &input_reader,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -2889,6 +3060,7 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
         let thresholds = AgeThresholds::default();
         let brigade = BrigadeConfig::default();
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
@@ -2902,6 +3074,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
+            input_reader: &input_reader,
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4290,6 +4463,7 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
         let thresholds = AgeThresholds::default();
         let config = BrigadeConfig {
             director_prompt: "I am {token}; my team is {peers}".to_string(),
@@ -4311,6 +4485,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
+            input_reader: &input_reader,
             brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4359,6 +4534,7 @@ mod tests {
         let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
         let thresholds = AgeThresholds::default();
         let config = BrigadeConfig {
             // The Director's own template happens to contain the literal
@@ -4379,6 +4555,7 @@ mod tests {
             superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
+            input_reader: &input_reader,
             brigade: &config,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
@@ -4854,6 +5031,103 @@ mod tests {
         );
     }
 
+    // --- read_or_idle_tick: drain-before-tick --------------------------
+
+    fn stamped_key(c: char, at: Instant) -> StampedEvent {
+        StampedEvent {
+            event: crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            at,
+        }
+    }
+
+    fn key(c: char) -> banto_core::input::KeyEvent {
+        banto_core::input::KeyEvent::new(
+            banto_core::input::KeyCode::Char(c),
+            banto_core::input::Modifiers::NONE,
+        )
+    }
+
+    #[test]
+    fn a_queued_event_is_returned_with_the_reader_threads_own_stamp() {
+        let (tx, rx) = mpsc::channel();
+        let mut acc = PasteAccumulator::new();
+        let t0 = Instant::now();
+        // Mirrors mid-burst state: a first key already buffered.
+        acc.accept(key('a'), t0);
+        // A second key, queued with its own close stamp — independent of
+        // whatever this test does before calling `read_or_idle_tick`.
+        tx.send(stamped_key('b', t0 + Duration::from_millis(2)))
+            .unwrap();
+
+        let step = read_or_idle_tick(&rx, Duration::from_millis(10), &mut acc).unwrap();
+        match step {
+            InputStep::Received(stamped) => {
+                assert_eq!(stamped.at, t0 + Duration::from_millis(2));
+            }
+            InputStep::Idle(_) => panic!("expected the queued event, not an idle tick"),
+        }
+        assert!(
+            acc.is_pending(),
+            "the first key must still be buffered, not flushed by a spurious tick"
+        );
+    }
+
+    #[test]
+    fn a_queued_event_wins_over_a_buffer_that_only_looks_stale_by_wall_clock() {
+        // The hazard this function exists to close: judging staleness by
+        // elapsed wall time *before* checking the channel would wrongly
+        // flush here, splitting a run that the reader thread's own stamps
+        // show was never actually slow.
+        let (tx, rx) = mpsc::channel();
+        let mut acc = PasteAccumulator::new();
+        let long_ago = Instant::now() - Duration::from_millis(200);
+        acc.accept(key('a'), long_ago);
+        tx.send(stamped_key('b', long_ago + Duration::from_millis(2)))
+            .unwrap();
+
+        let step = read_or_idle_tick(&rx, Duration::from_millis(10), &mut acc).unwrap();
+        assert!(
+            matches!(step, InputStep::Received(_)),
+            "a queued event must win over a wall-clock staleness check every time"
+        );
+        assert!(acc.is_pending(), "must not have been flushed");
+    }
+
+    #[test]
+    fn a_genuinely_empty_channel_flushes_a_stale_buffer() {
+        let (_tx, rx) = mpsc::channel::<StampedEvent>();
+        let mut acc = PasteAccumulator::new();
+        acc.accept(key('a'), Instant::now() - Duration::from_millis(200));
+
+        let step = read_or_idle_tick(&rx, Duration::from_millis(1), &mut acc).unwrap();
+        match step {
+            InputStep::Idle(Some(InputEvent::Key(k))) => assert_eq!(k, key('a')),
+            other => panic!("expected a flush of the stale buffer, got {other:?}"),
+        }
+        assert!(!acc.is_pending());
+    }
+
+    #[test]
+    fn an_empty_channel_with_nothing_buffered_is_idle_with_no_flush() {
+        let (_tx, rx) = mpsc::channel::<StampedEvent>();
+        let mut acc = PasteAccumulator::new();
+
+        let step = read_or_idle_tick(&rx, Duration::from_millis(1), &mut acc).unwrap();
+        assert!(matches!(step, InputStep::Idle(None)));
+    }
+
+    #[test]
+    fn a_disconnected_reader_thread_is_reported_as_an_error() {
+        let (tx, rx) = mpsc::channel::<StampedEvent>();
+        drop(tx);
+        let mut acc = PasteAccumulator::new();
+
+        assert!(read_or_idle_tick(&rx, Duration::from_millis(1), &mut acc).is_err());
+    }
+
     // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------
 
     #[test]
@@ -5141,6 +5415,7 @@ mod tests {
         superseded_failed: RefCell<HashSet<SessionId>>,
         meta_cache: MetaCache,
         pty_host: MockPtyHost,
+        input_reader: MockInputReader,
         thresholds: AgeThresholds,
         brigade: BrigadeConfig,
         claude_home: ClaudeHome,
@@ -5155,6 +5430,7 @@ mod tests {
                 superseded_failed: RefCell::new(HashSet::new()),
                 meta_cache: MetaCache::new(),
                 pty_host: MockPtyHost::default(),
+                input_reader: MockInputReader::default(),
                 thresholds: AgeThresholds::default(),
                 brigade: BrigadeConfig::default(),
                 claude_home: ClaudeHome::new(claude_home),
@@ -5172,6 +5448,7 @@ mod tests {
                 superseded_failed: &self.superseded_failed,
                 meta_cache: &self.meta_cache,
                 pty_host: &self.pty_host,
+                input_reader: &self.input_reader,
                 brigade: &self.brigade,
                 agent_binaries: &self.agent_binaries,
                 enabled_agents: &self.enabled_agents,
