@@ -248,10 +248,7 @@ fn row_line(
     show_pin_slot: bool,
     label: Option<&str>,
 ) -> Line<'static> {
-    let dot = Span::styled(
-        "\u{25cf} ",
-        Style::default().fg(activity_color(visible.row.activity)),
-    );
+    let dot = activity_dot(visible.row.activity);
     // Archived outranks the rest: it is the only class here the operator put
     // on the row themselves, and the only one a key (`D`) acts on. Rows at
     // `Reveal::Archived` sit mixed in among ordinary ones, so without this
@@ -517,6 +514,23 @@ fn activity_color(activity: Activity) -> Color {
         Activity::Idle(AgeBucket::Today) => Color::Yellow,
         Activity::Idle(AgeBucket::ThisWeek) => Color::Gray,
         Activity::Idle(AgeBucket::Older) => Color::DarkGray,
+    }
+}
+
+/// The list row's leading activity marker — [`row_line`]'s own dot slot,
+/// [`fixed_prefix_width`]'s "dot(2)". A live process's state
+/// (Busy/Waiting/Alive) is a categorical hue; staleness (`Idle(_)`) is a
+/// brightness ramp — two different scales that used to share one glyph,
+/// which meant a reader could not tell from colour alone whether Cyan was
+/// newer than Yellow. Staleness is already stated in words by the age
+/// column at the row's own right edge (`3m`, `2w`, `1d`), so an idle row
+/// gets no dot at all here — two blank columns, the same width
+/// [`marker_slot`]'s own empty case holds, so the title never shifts
+/// whether or not a session is live.
+fn activity_dot(activity: Activity) -> Span<'static> {
+    match activity {
+        Activity::Idle(_) => Span::raw("  "),
+        live => Span::styled("\u{25cf} ", Style::default().fg(activity_color(live))),
     }
 }
 
@@ -901,6 +915,42 @@ mod tests {
         assert!(
             text.contains("superseded"),
             "expected \"superseded\" in the meta line:\n{text}"
+        );
+    }
+
+    // --- activity dot ----------------------------------------------------
+
+    #[test]
+    fn idle_row_has_no_activity_dot_but_a_live_row_does() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let idle = row("idle", "Idle Row", "", now); // default: Idle(Older)
+        let busy = SessionRow {
+            activity: Activity::Busy,
+            ..row("busy", "Busy Row", "", now)
+        };
+        let mut app = App::new(vec![idle, busy]);
+        app.set_viewport_height(10);
+
+        let text = draw_list(&app, 60, 10, now);
+        let idle_line = text.lines().find(|l| l.contains("Idle Row")).unwrap();
+        let busy_line = text.lines().find(|l| l.contains("Busy Row")).unwrap();
+
+        assert!(
+            !idle_line.contains('\u{25cf}'),
+            "idle row should not draw a dot:\n{idle_line}"
+        );
+        assert!(
+            busy_line.contains('\u{25cf}'),
+            "busy row should draw a dot:\n{busy_line}"
+        );
+
+        // The blank slot occupies the same width as the glyph, so the
+        // title starts at the same column whether or not the row is live.
+        let idle_col = title_start_col(&app, 60, 10, now, "Idle Row");
+        let busy_col = title_start_col(&app, 60, 10, now, "Busy Row");
+        assert_eq!(
+            idle_col, busy_col,
+            "dot presence should not shift the title column"
         );
     }
 
