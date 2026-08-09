@@ -2247,7 +2247,7 @@ fn draw(
     let tiles = stage_tiles(areas.pane, &state.stage);
     if tiles.is_empty() {
         let block = Block::bordered()
-            .title("session")
+            .title(pane_title("session", false))
             .border_style(border_style(false, false));
         let content = block.inner(areas.pane);
         frame.render_widget(block, areas.pane);
@@ -2267,7 +2267,7 @@ fn draw(
             let focused_tile = focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let waiting = state.attention_panes().contains(key);
             let block = Block::bordered()
-                .title(tile_title(state, key))
+                .title(pane_title(&tile_title(state, key), focused_tile))
                 .border_style(border_style(focused_tile, waiting));
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
@@ -2402,6 +2402,29 @@ fn border_style(focused: bool, waiting: bool) -> Style {
     } else {
         Color::DarkGray
     })
+}
+
+/// A pane's title, padded so it sits in the border's own gap
+/// (`┌ title ┐`) instead of colliding with it (`┌title┐`). The focused
+/// pane's title is reversed video — `Modifier::REVERSED` swaps the pane's
+/// own background in under the focus colour — so focus reads as a tab even
+/// when the operator is looking at the middle of the screen, not the
+/// border; an unfocused title stays plain text, dimmed. Named colours only
+/// (see `border_style`, whose focus colour this reuses): the reversal
+/// resolves through the user's own terminal theme rather than a hard-coded
+/// truecolor pair.
+fn pane_title(text: &str, focused: bool) -> Span<'static> {
+    let padded = format!(" {text} ");
+    if focused {
+        Span::styled(
+            padded,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED),
+        )
+    } else {
+        Span::styled(padded, Style::default().add_modifier(Modifier::DIM))
+    }
 }
 
 /// Enables bracketed paste (and mouse capture) on the HOST terminal. On
@@ -4064,6 +4087,30 @@ mod tests {
         assert_eq!(
             border_style(false, true),
             Style::default().fg(WAITING_ACTIVITY_COLOR)
+        );
+    }
+
+    #[test]
+    fn pane_title_pads_the_text_on_both_sides_whether_focused_or_not() {
+        assert_eq!(pane_title("director", false).content, " director ");
+        assert_eq!(pane_title("director", true).content, " director ");
+    }
+
+    #[test]
+    fn focused_pane_title_is_reversed_video_in_the_focus_colour() {
+        assert_eq!(
+            pane_title("director", true).style,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn unfocused_pane_title_is_plain_and_dimmed() {
+        assert_eq!(
+            pane_title("director", false).style,
+            Style::default().add_modifier(Modifier::DIM)
         );
     }
 
