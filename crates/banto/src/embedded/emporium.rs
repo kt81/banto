@@ -537,6 +537,40 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         })?;
         let draw_dur = draw_start.elapsed();
 
+        // Unconditional, once per frame, after `terminal.draw` returns —
+        // not inside the buffer `draw` builds (a close written into a
+        // cell's own symbol would just be another cell subject to the same
+        // diff that causes this), and not per pane (one close at the frame
+        // boundary is the whole point; `paint.rs`'s per-row open/close
+        // logic inside the buffer is untouched and still correct on its
+        // own terms).
+        //
+        // `ratatui-crossterm` 0.1.2's `Backend::draw` ends every single
+        // frame with an unconditional SGR reset (lib.rs:277-291) — no
+        // bold/italic/underline/etc. can survive past the frame that set
+        // it. But that reset is SGR 0, and OSC 8 hyperlink state is a
+        // separate mechanism ratatui has no concept of at all; nothing in
+        // `Backend::draw` ever emits a hyperlink close. `ratatui-core`
+        // 0.1.2's `diff.rs` skips a cell — even a `ForcedWidth` one, which
+        // every cell `paint.rs` paints is — whenever it is unchanged from
+        // the previous frame, deciding this per cell, independently, with
+        // no notion that an open-carrying cell and its paired close-carrying
+        // cell belong together. So a frame can transmit a well-formed,
+        // properly-terminated OSC 8 open whose paired close gets silently
+        // skipped (unchanged since the prior frame) — nothing malformed
+        // reaches the host, it is simply never told the link closed. Every
+        // cell painted after that, in any pane, on any later frame, reads
+        // to the host as still inside that link, until some later frame
+        // happens to transmit a close for unrelated reasons — indistinguishable
+        // on screen from ordinary prose being underlined.
+        //
+        // Closing here every frame gives OSC 8 the same per-frame guarantee
+        // `ratatui-crossterm` already gives SGR. Safe unconditionally
+        // because closing a hyperlink that isn't open is a documented
+        // terminal no-op — the same property that makes ratatui's own
+        // unconditional SGR reset safe.
+        let _ = close_any_open_hyperlink(&mut io::stdout());
+
         log_slow_iteration(
             &mut stage_log,
             &StageTimings {
@@ -749,6 +783,16 @@ fn execute_cmd(
             Vec::new()
         }
     }
+}
+
+/// Writes a bare OSC 8 close (`ESC ] 8 ; ; ESC \`) and flushes — called
+/// unconditionally once per frame from `event_loop`, after `terminal.draw`
+/// returns; see that call site's own comment for why this exists and why
+/// it runs where it does. Split out from the call site only so the exact
+/// bytes and the flush are independently testable without a real terminal.
+fn close_any_open_hyperlink<W: io::Write>(w: &mut W) -> io::Result<()> {
+    w.write_all(b"\x1b]8;;\x1b\\")?;
+    w.flush()
 }
 
 /// Read whether banto's `SessionStart` hook looks trusted right now —
@@ -5126,6 +5170,21 @@ mod tests {
         let mut acc = PasteAccumulator::new();
 
         assert!(read_or_idle_tick(&rx, Duration::from_millis(1), &mut acc).is_err());
+    }
+
+    // --- close_any_open_hyperlink: the per-frame OSC 8 close -------------
+    //
+    // Proves the bytes and the flush call are right; it cannot exercise
+    // "runs once per frame after terminal.draw" — that's `event_loop`
+    // itself, which takes a real `Terminal<CrosstermBackend<Stdout>>` and
+    // has no test anywhere in this file driving it directly (a barrier
+    // that predates this change).
+
+    #[test]
+    fn close_any_open_hyperlink_writes_the_bare_osc_8_close_and_flushes() {
+        let mut sink = Vec::new();
+        close_any_open_hyperlink(&mut sink).unwrap();
+        assert_eq!(sink, b"\x1b]8;;\x1b\\");
     }
 
     // --- BANTO_INPUT_LOG: paste payloads never reach the log line --------

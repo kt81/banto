@@ -392,4 +392,142 @@ mod tests {
         assert!(screen.take_audible_bell());
         assert!(!screen.take_audible_bell());
     }
+
+    // --- OSC 8 hyperlink close forms: does the pen state actually clear? ---
+    //
+    // Hand-made synthetic bytes only (repo invariant 2) — no captured session
+    // data. Probes which `OSC 8` close spellings the pinned vt100-psmux
+    // (github.com/kt81/psmux, `banto/vt100-patches`,
+    // `perform.rs:244`'s `[b"8", id_params, uri_rest @ ..]` arm) actually
+    // recognizes as "close the current hyperlink" — a form the pattern does
+    // not match falls through to `unhandled_osc` and leaves `attrs.link`
+    // (the running pen) non-zero, so every later-written cell keeps
+    // inheriting the id. Column 0 is always the link's own first character
+    // ("L"); the id checked afterward ("P") is one cell past whatever close
+    // form was sent.
+    //
+    // The "leaves the link stuck" tests below assert a KNOWN, CURRENTLY
+    // UNFIXED gap in the vendored parser — a bare `OSC 8 ST`/`OSC 8 BEL`
+    // close (no semicolons) never reaches `set_hyperlink` at all. That is a
+    // bug being documented, not a contract this crate is protecting: the
+    // operator has deliberately chosen a different fix (a frame-boundary
+    // OSC 8 close in `banto/src/embedded/emporium.rs`, addressing a
+    // separate mechanism — the cell diff can transmit an open with its
+    // paired close skipped) over patching this parser gap, so the parser
+    // gap itself is still open. If this ever gets fixed upstream in the
+    // fork, these two assertions should flip to `assert_eq!(.., 0)` along
+    // with it — do not "fix" the test to match the bug going forward.
+
+    fn hyperlink_id_at(screen: &Screen, col: u16) -> u32 {
+        screen
+            .screen()
+            .cell(0, col)
+            .expect("cell in bounds")
+            .hyperlink_id()
+    }
+
+    #[test]
+    fn standard_two_semicolon_close_terminated_by_st_clears_the_link() {
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L\x1b]8;;\x1b\\P");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        assert_eq!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "P after a standard ';;' ST-terminated close must not be linked"
+        );
+    }
+
+    #[test]
+    fn standard_two_semicolon_close_terminated_by_bel_clears_the_link() {
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L\x1b]8;;\x07P");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        assert_eq!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "P after a standard ';;' BEL-terminated close must not be linked"
+        );
+    }
+
+    #[test]
+    fn bare_close_with_no_semicolons_terminated_by_st_leaves_the_link_stuck() {
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L\x1b]8\x1b\\P");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        // Documents the gap named in perform.rs:244's own doc comment: the
+        // match arm requires at least two params ("8" plus id_params), so a
+        // one-param OSC 8 falls to `unhandled_osc` and never reaches
+        // `set_hyperlink`. If this ever starts passing, the gap has closed
+        // and this assertion should flip along with it — see the comment
+        // above the test group.
+        assert_ne!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "a bare 'OSC 8 ST' close (no semicolons) does not match perform.rs:244's pattern \
+             and never reaches set_hyperlink — P stays linked"
+        );
+    }
+
+    #[test]
+    fn bare_close_with_no_semicolons_terminated_by_bel_leaves_the_link_stuck() {
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L\x1b]8\x07P");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        assert_ne!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "a bare 'OSC 8 BEL' close (no semicolons) does not match perform.rs:244's pattern \
+             and never reaches set_hyperlink — P stays linked"
+        );
+    }
+
+    #[test]
+    fn a_close_with_a_populated_id_param_and_empty_uri_still_clears() {
+        // OSC 8 ; id=foo ; ST — id_params non-empty, uri empty. The match
+        // arm only inspects the joined uri, not id_params, so this should
+        // clear same as the standard close.
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L\x1b]8;id=foo;\x1b\\P");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        assert_eq!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "a populated id_params field must not by itself prevent an empty-uri close"
+        );
+    }
+
+    #[test]
+    fn a_close_split_across_two_process_calls_at_an_awkward_byte_boundary_still_clears() {
+        // The close's own bytes (`\x1b]8;;\x1b\\`) are split mid-sequence,
+        // as an OS-buffered PTY read could split it. `vte`'s own state
+        // machine is what has to reassemble this, not banto or the fork —
+        // this documents that the reassembly does happen, not that this
+        // repo built it.
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L");
+        screen.process(b"\x1b]8;"); // split mid-OSC-8, before the second ';'
+        screen.process(b";\x1b\\P");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        assert_eq!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "a close split across two process() calls must still clear the link"
+        );
+    }
+
+    #[test]
+    fn an_sgr_reset_between_open_and_close_clears_the_link_even_with_no_close_at_all() {
+        // No OSC 8 close is ever sent here — only a plain SGR reset
+        // (`ESC[0m`), which `Screen::sgr`'s `[0] =>` arm replaces the whole
+        // `Attrs` struct with `Attrs::default()`, `link` included.
+        let mut screen = Screen::new(1, 20);
+        screen.process(b"\x1b]8;;http://example.com\x1b\\L\x1b[0mP");
+        assert_ne!(hyperlink_id_at(&screen, 0), 0, "L must be linked");
+        assert_eq!(
+            hyperlink_id_at(&screen, 1),
+            0,
+            "a plain SGR reset must clear a stuck link even with no OSC 8 close at all"
+        );
+    }
 }
