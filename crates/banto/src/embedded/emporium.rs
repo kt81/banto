@@ -470,6 +470,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 deps.store,
                 deps.claude_home,
                 &handles,
+                app,
                 Some(&mut tick_timings),
             ));
             let relay = gather_relay_observations(
@@ -1834,18 +1835,21 @@ const FORK_ANCESTRY_DEPTH: u32 = 5;
 /// the process itself running (manual `/compact` does not) — the same
 /// `sessions/<pid>.json` live-state file the process has always published
 /// simply starts reporting a different `sessionId`. One
-/// `Event::MemberSessionForked` per staged member whose recorded id no
-/// longer matches what its own pane's process is actually reporting; the
+/// `Event::MemberSessionForked` per staged Claude member whose recorded id
+/// no longer matches what its own pane's process is actually reporting; the
 /// pid match tries the pane's direct child first, falling back to an
 /// ancestry walk for the cmd/npm-shim case (see [`FORK_ANCESTRY_DEPTH`]).
 /// Repeats every tick until the store row (and the core's rename it
 /// triggers) catch up — `engine::update_member_session_forked` is written
-/// to tolerate that.
+/// to tolerate that. A non-Claude member (resolved via `app`) never reaches
+/// any of this — see the per-member gate's own comment for why the
+/// mechanism cannot apply to one at all, not just why skipping it is fast.
 fn gather_fork_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
     claude_home: &ClaudeHome,
     handles: &HashMap<SessionKey, PtyHandle>,
+    app: &App,
     mut timings: Option<&mut TickTimings>,
 ) -> Vec<Event> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
@@ -1872,6 +1876,21 @@ fn gather_fork_observations(
         let Some(session_id) = member.session_id.as_ref() else {
             continue;
         };
+        // Auto-compaction — the only thing this function ever detects — is
+        // a Claude Code behavior: `sessions/<pid>.json` (what `live` reads)
+        // is Claude's own live-state file, and a Codex member's session id
+        // is never in it. Without this gate, that permanent absence read
+        // every tick as "the id vanished," this function's own fork
+        // signal, so a Codex member fell through to the ancestry walk
+        // below on a mechanism that can never apply to it — not a slow
+        // path for it, a meaningless one. Unresolved (`None`, discovery
+        // hasn't caught up to this session yet) is treated the same as
+        // Codex: skip rather than guess: the next tick's re-check catches
+        // it once the product is known, the same tolerance this function's
+        // own doc already claims for the fork signal itself.
+        if app.row_for_id(&session_id.0).map(|row| row.agent) != Some(AgentKind::ClaudeCode) {
+            continue;
+        }
         let old_key = SessionKey::from_id(&session_id.0);
         if !panes.contains(&old_key) {
             continue;
@@ -3768,46 +3787,10 @@ mod tests {
 
     // --- compact-fork tracking: gather_fork_observations ------------------
 
-    /// A staged brigade of a Director plus one Worker, and a matching store
-    /// row for the Worker holding `worker_session_id` — the shape
-    /// `gather_fork_observations` reads.
-    fn store_with_staged_worker(worker_session_id: &str) -> (RefCell<Store>, EmporiumState) {
-        let mut store = Store::open_in_memory().unwrap();
-        let brigade_id = store.create_brigade("cell").unwrap();
-        store
-            .add_brigade_member(
-                brigade_id,
-                "director",
-                BrigadeRole::Director,
-                Some(&SessionId("dir".to_string())),
-            )
-            .unwrap();
-        store
-            .add_brigade_member(
-                brigade_id,
-                "worker-1",
-                BrigadeRole::Worker,
-                Some(&SessionId(worker_session_id.to_string())),
-            )
-            .unwrap();
-
-        let mut state = EmporiumState::new(PrefixKey::default());
-        state.stage = Stage::Brigade {
-            id: brigade_id,
-            director: Some(SessionKey::from_id("dir")),
-            panes: vec![
-                SessionKey::from_id("dir"),
-                SessionKey::from_id(worker_session_id),
-            ],
-            focused: 0,
-        };
-        (RefCell::new(store), state)
-    }
-
     #[test]
     fn gather_fork_observations_detects_a_forked_worker_by_exact_pid_match() {
         let claude_home = tempfile::tempdir().unwrap();
-        let (store, state) = store_with_staged_worker("w1-old");
+        let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
         write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
 
         let mut handles = HashMap::new();
@@ -3822,6 +3805,7 @@ mod tests {
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             &handles,
+            &app,
             None,
         );
 
@@ -3838,7 +3822,7 @@ mod tests {
     #[test]
     fn gather_fork_observations_is_silent_when_the_live_entry_still_reports_the_recorded_id() {
         let claude_home = tempfile::tempdir().unwrap();
-        let (store, state) = store_with_staged_worker("w1");
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         write_live_state(claude_home.path(), 4242, "w1", Path::new("/work/alpha"));
 
         let mut handles = HashMap::new();
@@ -3853,6 +3837,7 @@ mod tests {
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             &handles,
+            &app,
             None,
         );
 
@@ -3860,9 +3845,45 @@ mod tests {
     }
 
     #[test]
+    fn gather_fork_observations_never_enters_the_ancestry_path_for_a_codex_member() {
+        // Same exact-pid-match setup as
+        // `gather_fork_observations_detects_a_forked_worker_by_exact_pid_match`
+        // — `entry.pid == pid` would trip `ancestry_reaches` at depth 0
+        // with no real OS lookup at all, so if the Claude-only gate above
+        // this test's own body ever regressed, this would reliably produce
+        // a (wrong) fork observation for a Codex member instead of quietly
+        // doing nothing. The only difference from the Claude test is the
+        // agent tag `staged_worker` puts in `App`'s row.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1-old", Some(AgentKind::Codex));
+        write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
+
+        let mut handles = HashMap::new();
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+
+        let events = gather_fork_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+            &app,
+            None,
+        );
+
+        assert!(
+            events.is_empty(),
+            "a Codex member must never produce a fork observation: {events:?}"
+        );
+    }
+
+    #[test]
     fn gather_fork_observations_ignores_a_pane_with_no_known_child_pid() {
         let claude_home = tempfile::tempdir().unwrap();
-        let (store, state) = store_with_staged_worker("w1-old");
+        let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
         write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
 
         // No handle registered at all for the pane's key, so its pid can
@@ -3874,6 +3895,7 @@ mod tests {
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             &handles,
+            &app,
             None,
         );
 
