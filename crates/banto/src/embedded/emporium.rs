@@ -462,6 +462,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         // trigger for the pending-submit flush and status expiry bundled
         // into the same tick (see `engine::update_tick`'s doc).
         let tick_start = Instant::now();
+        let mut tick_timings = TickTimings::default();
         if last_tick.is_none_or(|tick| now.duration_since(tick) >= TICK_INTERVAL) {
             last_tick = Some(now);
             events.extend(gather_fork_observations(
@@ -469,6 +470,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 deps.store,
                 deps.claude_home,
                 &handles,
+                Some(&mut tick_timings),
             ));
             let relay = gather_relay_observations(
                 &state,
@@ -476,9 +478,11 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 deps.claude_home,
                 deps.codex_home,
                 app,
+                Some(&mut tick_timings),
             );
             events.push_back(Event::Tick { relay });
-            let observation = gather_goinkyo_observation(&state, deps.store, app);
+            let observation =
+                gather_goinkyo_observation(&state, deps.store, app, Some(&mut tick_timings));
             events.push_back(Event::GoinkyoAwaitingSpawn { observation });
         }
         let tick_dur = tick_start.elapsed();
@@ -581,6 +585,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 dispatch: dispatch_dur,
                 draw: draw_dur,
             },
+            &tick_timings,
         );
 
         if app.should_quit() {
@@ -1660,16 +1665,25 @@ fn gather_relay_observations(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
     app: &App,
+    mut timings: Option<&mut TickTimings>,
 ) -> Vec<RelayObservation> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         return Vec::new();
     };
     let brigade_id = *id;
+    let roster_start = Instant::now();
     let members = match store.borrow().brigade_members(brigade_id) {
         Ok(members) => members,
         Err(_) => return Vec::new(),
     };
+    if let Some(t) = timings.as_deref_mut() {
+        t.relay_roster += roster_start.elapsed();
+    }
+    let live_scan_start = Instant::now();
     let live = read_live_sessions(&claude_home.sessions_dir());
+    if let Some(t) = timings.as_deref_mut() {
+        t.relay_live_scan += live_scan_start.elapsed();
+    }
     let mut observations = Vec::new();
     for member in &members {
         let Some(session_id) = member.session_id.as_ref() else {
@@ -1679,24 +1693,48 @@ fn gather_relay_observations(
         if !panes.contains(&key) {
             continue;
         }
+        let unseen_start = Instant::now();
         let has_unseen = store
             .borrow()
             .has_unseen_brigade_messages(brigade_id, &member.token, member.role)
             .unwrap_or(false);
+        if let Some(t) = timings.as_deref_mut() {
+            t.relay_unseen += unseen_start.elapsed();
+        }
         let is_idle_this_tick = match app.row_for_id(&session_id.0).map(|row| row.agent) {
-            Some(AgentKind::ClaudeCode) => live
-                .iter()
-                .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
-                .map(|entry| {
-                    SysinfoProbe.is_alive(entry.pid)
-                        && !matches!(
-                            entry.status.as_deref(),
-                            Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
-                        )
-                }),
-            Some(AgentKind::Codex) => {
-                codex_home.and_then(|home| codex_activity::is_thread_idle(home, &session_id.0))
+            Some(AgentKind::ClaudeCode) => {
+                let claude_start = Instant::now();
+                let idle = live
+                    .iter()
+                    .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+                    .map(|entry| {
+                        SysinfoProbe.is_alive(entry.pid)
+                            && !matches!(
+                                entry.status.as_deref(),
+                                Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
+                            )
+                    });
+                if let Some(t) = timings.as_deref_mut() {
+                    t.relay_activity_claude += claude_start.elapsed();
+                }
+                idle
             }
+            Some(AgentKind::Codex) => match codex_home {
+                Some(home) => {
+                    let mut codex_timing = codex_activity::CodexActivityTiming::default();
+                    let idle = codex_activity::is_thread_idle(
+                        home,
+                        &session_id.0,
+                        Some(&mut codex_timing),
+                    );
+                    if let Some(t) = timings.as_deref_mut() {
+                        t.relay_activity_codex_sqlite += codex_timing.sqlite;
+                        t.relay_activity_codex_rollout += codex_timing.rollout;
+                    }
+                    idle
+                }
+                None => None,
+            },
             None => None,
         };
         observations.push(RelayObservation {
@@ -1731,6 +1769,7 @@ fn gather_goinkyo_observation(
     state: &EmporiumState,
     store: &RefCell<Store>,
     app: &App,
+    mut timings: Option<&mut TickTimings>,
 ) -> GoinkyoObservation {
     // A consultation that ended, first and independently of the stage: the
     // Director's session can call `dismiss_goinkyo` while the operator is
@@ -1739,7 +1778,12 @@ fn gather_goinkyo_observation(
     // a Goinkyo pane recorded for, so this is one roster read for the one
     // entry that normally exists, not a scan of the store.
     for brigade_id in state.goinkyo_brigades() {
-        let Ok(members) = store.borrow().brigade_members(brigade_id) else {
+        let roster_start = Instant::now();
+        let members = store.borrow().brigade_members(brigade_id);
+        if let Some(t) = timings.as_deref_mut() {
+            t.goinkyo_roster += roster_start.elapsed();
+        }
+        let Ok(members) = members else {
             continue;
         };
         if !members.iter().any(|m| m.role == BrigadeRole::Goinkyo) {
@@ -1750,7 +1794,12 @@ fn gather_goinkyo_observation(
         return GoinkyoObservation::Unchanged;
     };
     let brigade_id = *id;
-    let Ok(members) = store.borrow().brigade_members(brigade_id) else {
+    let roster_start = Instant::now();
+    let members = store.borrow().brigade_members(brigade_id);
+    if let Some(t) = timings {
+        t.goinkyo_roster += roster_start.elapsed();
+    }
+    let Ok(members) = members else {
         return GoinkyoObservation::Unchanged;
     };
     let Some(goinkyo) = members.iter().find(|m| m.role == BrigadeRole::Goinkyo) else {
@@ -1797,18 +1846,28 @@ fn gather_fork_observations(
     store: &RefCell<Store>,
     claude_home: &ClaudeHome,
     handles: &HashMap<SessionKey, PtyHandle>,
+    mut timings: Option<&mut TickTimings>,
 ) -> Vec<Event> {
     let Stage::Brigade { id, panes, .. } = &state.stage else {
         return Vec::new();
     };
     let brigade_id = *id;
+    let roster_start = Instant::now();
     let members = match store.borrow().brigade_members(brigade_id) {
         Ok(members) => members,
         Err(_) => return Vec::new(),
     };
+    if let Some(t) = timings.as_deref_mut() {
+        t.fork_roster += roster_start.elapsed();
+    }
+    let live_scan_start = Instant::now();
     let live = read_live_sessions(&claude_home.sessions_dir());
+    if let Some(t) = timings.as_deref_mut() {
+        t.fork_live_scan += live_scan_start.elapsed();
+    }
     let probe = SysinfoProbe;
     let mut events = Vec::new();
+    let per_member_start = Instant::now();
     for member in &members {
         let Some(session_id) = member.session_id.as_ref() else {
             continue;
@@ -1849,6 +1908,9 @@ fn gather_fork_observations(
                 new_id,
             });
         }
+    }
+    if let Some(t) = timings {
+        t.fork_per_member += per_member_start.elapsed();
     }
     events
 }
@@ -2394,31 +2456,96 @@ impl StageTimings {
     }
 }
 
+/// Sub-stage durations inside the ~1s tick block — filled in by
+/// `gather_fork_observations`/`gather_relay_observations`/
+/// `gather_goinkyo_observation` as they run, so `tick`'s own cost in
+/// [`StageTimings`] is attributed rather than guessed at. Same measurement
+/// discipline as [`StageTimings`]: accumulation is unconditional and cheap
+/// (`Instant::now()` deltas), only the eventual log write is gated. Per-member
+/// work inside each function's own loop accumulates into these fields as it
+/// goes rather than logging per member — one line at the end either way,
+/// same as everything else this file measures.
+#[derive(Default)]
+struct TickTimings {
+    fork_roster: Duration,
+    fork_live_scan: Duration,
+    fork_per_member: Duration,
+    relay_roster: Duration,
+    relay_live_scan: Duration,
+    relay_unseen: Duration,
+    relay_activity_claude: Duration,
+    relay_activity_codex_sqlite: Duration,
+    relay_activity_codex_rollout: Duration,
+    goinkyo_roster: Duration,
+}
+
 /// Stage name and duration only — no keystroke content, no paths, no
 /// payload, the same discretion `banto_io::provider::cache`'s own
 /// verification log already exercises (path-only on divergence, never
 /// parsed content).
-fn log_slow_iteration(file: &mut Option<std::fs::File>, timings: &StageTimings) {
+///
+/// A second line, breaking `tick` down into `TickTimings`' fields, is
+/// emitted only when `tick` is the largest of the six `StageTimings`
+/// stages this iteration — not unconditionally alongside the first line.
+/// `tick` only ever fires ~once a second (`TICK_INTERVAL`), so on most
+/// slow iterations it is near zero and a breakdown of it would be pure
+/// noise crowding out whichever stage actually was slow; folding the ten
+/// extra fields into the first line unconditionally would do the same
+/// thing to every line, including the ones where `reload` or `draw` is the
+/// story. A second, conditional line keeps both readable.
+fn log_slow_iteration(
+    file: &mut Option<std::fs::File>,
+    timings: &StageTimings,
+    tick_timings: &TickTimings,
+) {
     use std::io::Write as _;
     let total = timings.total();
     if total < SLOW_ITERATION_THRESHOLD {
         return;
     }
-    if let Some(file) = file {
-        let ms = std::time::UNIX_EPOCH
-            .elapsed()
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+    let Some(file) = file else {
+        return;
+    };
+    let ms = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(
+        file,
+        "{ms} emporium: slow iter total={}us pty_pump={}us discovery={}us reload={}us tick={}us dispatch={}us draw={}us",
+        total.as_micros(),
+        timings.pty_pump.as_micros(),
+        timings.discovery.as_micros(),
+        timings.reload.as_micros(),
+        timings.tick.as_micros(),
+        timings.dispatch.as_micros(),
+        timings.draw.as_micros(),
+    );
+    let tick_is_dominant = [
+        timings.pty_pump,
+        timings.discovery,
+        timings.reload,
+        timings.dispatch,
+        timings.draw,
+    ]
+    .into_iter()
+    .all(|other| timings.tick >= other);
+    if tick_is_dominant {
         let _ = writeln!(
             file,
-            "{ms} emporium: slow iter total={}us pty_pump={}us discovery={}us reload={}us tick={}us dispatch={}us draw={}us",
-            total.as_micros(),
-            timings.pty_pump.as_micros(),
-            timings.discovery.as_micros(),
-            timings.reload.as_micros(),
-            timings.tick.as_micros(),
-            timings.dispatch.as_micros(),
-            timings.draw.as_micros(),
+            "{ms} emporium: slow tick fork_roster={}us fork_live_scan={}us fork_per_member={}us \
+             relay_roster={}us relay_live_scan={}us relay_unseen={}us relay_activity_claude={}us \
+             relay_activity_codex_sqlite={}us relay_activity_codex_rollout={}us goinkyo_roster={}us",
+            tick_timings.fork_roster.as_micros(),
+            tick_timings.fork_live_scan.as_micros(),
+            tick_timings.fork_per_member.as_micros(),
+            tick_timings.relay_roster.as_micros(),
+            tick_timings.relay_live_scan.as_micros(),
+            tick_timings.relay_unseen.as_micros(),
+            tick_timings.relay_activity_claude.as_micros(),
+            tick_timings.relay_activity_codex_sqlite.as_micros(),
+            tick_timings.relay_activity_codex_rollout.as_micros(),
+            tick_timings.goinkyo_roster.as_micros(),
         );
     }
 }
@@ -3695,6 +3822,7 @@ mod tests {
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             &handles,
+            None,
         );
 
         assert!(
@@ -3725,6 +3853,7 @@ mod tests {
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             &handles,
+            None,
         );
 
         assert!(events.is_empty(), "no fork happened: {events:?}");
@@ -3745,6 +3874,7 @@ mod tests {
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             &handles,
+            None,
         );
 
         assert!(events.is_empty());
@@ -3926,6 +4056,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             Some(&CodexHome::new(codex_home.path().to_path_buf())),
             &app,
+            None,
         );
 
         let worker = observations
@@ -3948,6 +4079,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             Some(&CodexHome::new(codex_home.path().to_path_buf())),
             &app,
+            None,
         );
 
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
@@ -3975,6 +4107,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             None,
             &app,
+            None,
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(
@@ -4002,6 +4135,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             None,
             &app,
+            None,
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(false));
@@ -4030,6 +4164,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             None,
             &app,
+            None,
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(false));
@@ -4047,6 +4182,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             None,
             &app,
+            None,
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, None);
@@ -4076,6 +4212,7 @@ mod tests {
             &ClaudeHome::new(claude_home.path().to_path_buf()),
             Some(&CodexHome::new(codex_home.path().to_path_buf())),
             &app,
+            None,
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, None);
@@ -4705,7 +4842,7 @@ mod tests {
 
         // Record the pane the ordinary way: gather says "awaiting spawn",
         // the fold opens it and remembers which brigade it belongs to.
-        let observation = gather_goinkyo_observation(&state, &store, &app);
+        let observation = gather_goinkyo_observation(&state, &store, &app, None);
         assert!(matches!(observation, GoinkyoObservation::AwaitingSpawn(_)));
         engine::update(
             &mut state,
@@ -4724,7 +4861,7 @@ mod tests {
 
         assert!(
             matches!(
-                gather_goinkyo_observation(&state, &store, &app),
+                gather_goinkyo_observation(&state, &store, &app, None),
                 GoinkyoObservation::NoGoinkyo { brigade_id: id } if id == brigade_id
             ),
             "the ended consultation must be reported whatever is on stage"
@@ -4745,7 +4882,7 @@ mod tests {
         state.stage = Stage::Empty;
 
         assert!(matches!(
-            gather_goinkyo_observation(&state, &store, &app),
+            gather_goinkyo_observation(&state, &store, &app, None),
             GoinkyoObservation::Unchanged
         ));
     }
@@ -4754,7 +4891,7 @@ mod tests {
     fn a_goinkyo_row_with_no_session_id_is_a_spawn_candidate_in_the_directors_cwd() {
         let (store, state, app) = staged_goinkyo(None);
         let GoinkyoObservation::AwaitingSpawn(candidate) =
-            gather_goinkyo_observation(&state, &store, &app)
+            gather_goinkyo_observation(&state, &store, &app, None)
         else {
             panic!("a Goinkyo row with no session id must be reported as awaiting spawn");
         };
@@ -4780,7 +4917,7 @@ mod tests {
         let app = App::new(vec![worker_row, dir_row]);
 
         let GoinkyoObservation::AwaitingSpawn(candidate) =
-            gather_goinkyo_observation(&state, &store, &app)
+            gather_goinkyo_observation(&state, &store, &app, None)
         else {
             panic!("a Goinkyo row with no session id must be reported as awaiting spawn");
         };
@@ -4795,7 +4932,7 @@ mod tests {
         // released.
         let (store, state, app) = staged_goinkyo(Some("g1"));
         assert_eq!(
-            gather_goinkyo_observation(&state, &store, &app),
+            gather_goinkyo_observation(&state, &store, &app, None),
             GoinkyoObservation::Unchanged
         );
     }
@@ -4828,7 +4965,7 @@ mod tests {
         let app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
 
         assert_eq!(
-            gather_goinkyo_observation(&state, &RefCell::new(store), &app),
+            gather_goinkyo_observation(&state, &RefCell::new(store), &app, None),
             GoinkyoObservation::NoGoinkyo { brigade_id }
         );
     }
@@ -4839,7 +4976,7 @@ mod tests {
         let state = EmporiumState::new(PrefixKey::default());
         let app = App::new(vec![]);
         assert_eq!(
-            gather_goinkyo_observation(&state, &store, &app),
+            gather_goinkyo_observation(&state, &store, &app, None),
             GoinkyoObservation::Unchanged
         );
     }
@@ -4875,7 +5012,7 @@ mod tests {
         ));
 
         // Next tick: the same consultation is spawnable again.
-        let observation = gather_goinkyo_observation(&state, &store, &app);
+        let observation = gather_goinkyo_observation(&state, &store, &app, None);
         let GoinkyoObservation::AwaitingSpawn(candidate) = &observation else {
             panic!("expected AwaitingSpawn once session_id cleared, got {observation:?}");
         };
@@ -4904,7 +5041,7 @@ mod tests {
         // (`EmporiumState::goinkyo_pane`, armed by the first spawn above)
         // that has to be the thing stopping a second one — the guard this
         // whole fix has to respect, not bypass.
-        let observation_again = gather_goinkyo_observation(&state, &store, &app);
+        let observation_again = gather_goinkyo_observation(&state, &store, &app, None);
         assert!(
             matches!(observation_again, GoinkyoObservation::AwaitingSpawn(_)),
             "the store genuinely hasn't changed yet, so the shell's own \
