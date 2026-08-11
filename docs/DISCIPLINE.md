@@ -70,8 +70,12 @@ notes from the migration worth keeping:
   banto-tui turns the feature off. The `cargo tree` acceptance check is what
   caught this; keep running it.
 - The chōba's `tui.rs` remains an un-migrated app-layer monolith by design
-  (only the shared `render_modal` was extracted). Its future migration — or
-  retirement — is a separate decision.
+  (only the shared `render_modal` was extracted). It searches sessions and
+  hands them to an in-place child or an external terminal; the emporium hosts
+  sessions in embedded PTYs. The unflagged default is the chōba. Whether to
+  migrate its app-layer monolith is a separate decision. Retirement is not:
+  it would remove the default mode's in-place and external-terminal hand-off
+  paths, which embedded PTYs do not provide.
 
 The `vt100::Parser` is itself a sans-IO state machine (bytes in, screen
 state out); it lives in core as `State` (`banto_core::screen`), fed by
