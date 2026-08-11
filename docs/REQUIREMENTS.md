@@ -581,8 +581,8 @@ id is never staged (and so never observed) again. **Reopening a
 brigade around an already-discovered Goinkyo (one that already has a
 session id, resolvable to a real row) already works**, for free, through
 the same resumed-member path a Director's or Worker's own closed pane
-reopens through (`stage_brigade`) — a resume never carries `--model`
-(unlike a fresh spawn), but does carry `--permission-mode`, since that flag
+reopens through (`stage_brigade`) — both `--model` and `--permission-mode`
+carry on a resume as on a fresh spawn; `--permission-mode` does so because it
 answers "who's here to click 'allow'", not "what should this session think
 with" — unrelated to fresh-vs-resumed. A Goinkyo that was never discovered
 (its pane died before it had a session id) does *not* reopen through that
