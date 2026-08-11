@@ -1,8 +1,8 @@
 # banto — Architecture Discipline (TEA / sans-IO)
 
 Status: **adopted 2026-07-24**. Supersedes the conversational draft this grew
-from. The feature set is frozen while the codebase migrates to this shape
-(see §10); new work lands inside the discipline, not around it.
+from. The migration described in §10 is complete; new work lands inside the
+discipline, not around it.
 
 ## 0. Purpose
 
