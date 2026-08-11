@@ -33,6 +33,11 @@ crossterm = { git = "https://github.com/kt81/crossterm", branch = "banto/0.29-em
 # lands one cell off, leaving the skipped cell holding the previous frame
 # (measured 2026-08-03 on Claude Code's status line: a ten-cell bar drawn as
 # eleven). Upstream doy/vt100-rust has been unmaintained since 2025-07 and
-# the fix has sat in its PR #32 since 2026-05; psmux carries the patches we
-# need in every other respect, so banto rides a two-commit fork of it.
+# the fix has sat in its PR #32 since 2026-05. The pinned commit also fixes
+# an orphaned-wide-cell panic in Row::erase/resize; this fork exists
+# solely for those two. crates.io's newest publish, 0.16.9 (2026-07-20),
+# predates both, and the pinned commit never bumps its own version past
+# 0.16.9 — dropping this patch swaps in an unfixed build under the same
+# version number, silently. Fold back only once a published source
+# actually contains both fixes.
 vt100-psmux = { git = "https://github.com/kt81/psmux", branch = "banto/vt100-patches" }
