@@ -634,7 +634,7 @@ them:
    argv, so a pane opened before formation can't carry it.
    `Modal::ConfirmDirectorReopen` — Enter kills that pane and re-issues
    formation only once `Event::PtyExited` confirms it actually exited (any
-   sooner risks `opener::decide_inplace_resume` seeing the not-yet-dead
+   sooner risks `banto::opener::decide_inplace_resume` seeing the not-yet-dead
    session as still live and refusing the reopen); Esc cancels the whole
    attempt. Placed first, ahead of the other two, because it is both the
    most disruptive of the three (running work in that pane is lost) and the

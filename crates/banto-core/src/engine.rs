@@ -761,8 +761,8 @@ pub struct EmporiumState {
     /// The session id of a Director-to-be whose already-open pane was just
     /// killed (`confirm_director_reopen_modal`), waiting on its
     /// `Event::PtyExited` before formation can continue — reopening any
-    /// sooner would resume a session `opener::decide_inplace_resume` still
-    /// sees as live and refuse. `update_pty_exited` takes it once the exit
+    /// sooner would resume a session `banto::opener::decide_inplace_resume`
+    /// still sees as live and refuse. `update_pty_exited` takes it once the exit
     /// for this exact key lands. Unlike `pending_brigade_formation`/
     /// `pending_codex_trust_formation`, not cleared on every Esc: by the
     /// time this is set, `Modal::ConfirmDirectorReopen` is already closed
@@ -1444,7 +1444,7 @@ pub enum Cmd {
     /// original launch). `effort` is `--effort <level>`, so far only ever
     /// set for a freshly-spawned Goinkyo (`BrigadeConfig::goinkyo_effort`)
     /// — the shell drops it for a Codex target, which has no such flag; see
-    /// `opener::AgentLaunch::Claude`'s own `effort` field. `permission_mode`
+    /// `banto::opener::AgentLaunch::Claude`'s own `effort` field. `permission_mode`
     /// (`--permission-mode <mode>`, `BrigadeConfig::goinkyo_permission_mode`)
     /// and `disallowed_tools` (`--disallowedTools <tools>`,
     /// `BrigadeConfig::goinkyo_disallowed_tools`) both diverge from `effort`
@@ -1453,7 +1453,7 @@ pub enum Cmd {
     /// properties of the *role*, not of whether this particular launch
     /// happens to be fresh or a resume — so both are set for a Goinkyo
     /// either way, never for a Worker or Director, and never for Codex
-    /// (Claude-only flags; `opener::AgentLaunch::Codex` carries neither
+    /// (Claude-only flags; `banto::opener::AgentLaunch::Codex` carries neither
     /// field at all). The shell answers with `Event::Spawned`/`SpawnFailed`.
     OpenEmbedded {
         key: SessionKey,
@@ -2703,7 +2703,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
 /// is the lower-stakes case, and by the time one exists to add to, any
 /// Codex member already spawned would already have gone through this same
 /// gate if one was ever needed (the hook's trust key is one fixed string
-/// per install, not per-member — see `opener::session_start_hook_override`'s
+/// per install, not per-member — see `banto::opener::session_start_hook_override`'s
 /// doc).
 fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let Some(Modal::WorkerAgentPicker(picker)) = app.modal() else {
