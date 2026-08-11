@@ -246,6 +246,10 @@ const MIGRATIONS: &[&str] = &[
     // session clearly started is the only signal that happened.
     "ALTER TABLE brigade_members ADD COLUMN briefed_at_ms INTEGER;
     ALTER TABLE brigade_members ADD COLUMN briefed_session_id TEXT;",
+    // v14: banto chooses a fresh member's product before that product has
+    // necessarily written a discoverable session transcript. Keep old rows
+    // NULL so they retain the historical App-row fallback.
+    "ALTER TABLE brigade_members ADD COLUMN agent TEXT;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -986,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn v12_to_v13_upgrade_adds_briefed_columns_and_preserves_existing_rows() {
+    fn v12_to_v14_upgrade_keeps_existing_brigade_member_fields_null() {
         use super::super::BrigadeRole;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1015,11 +1019,12 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
 
-        // The pre-migration row survives, with both new columns defaulting
-        // to NULL ("never briefed").
+        // The pre-migration row survives, with every later optional column
+        // defaulting to NULL (including the v14 agent kind).
         let director = store.brigade_member(1, "director").unwrap().unwrap();
         assert_eq!(director.role, BrigadeRole::Director);
         assert_eq!(director.session_id, Some(SessionId("dir".to_string())));
+        assert_eq!(director.agent, None);
         assert_eq!(director.briefed_at, None);
         assert_eq!(director.briefed_session_id, None);
 

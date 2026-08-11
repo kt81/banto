@@ -1096,6 +1096,15 @@ fn execute_open_embedded(
     ) {
         Ok(handle) => {
             let pid = handle.pid();
+            if let Some((brigade_id, token, _)) = brigade.as_ref() {
+                // The pane and its member survive a missed ledger update; a
+                // later open retries it, and until then relay falls back to
+                // the App row exactly as it did before durable agent kinds.
+                let _ = deps
+                    .store
+                    .borrow_mut()
+                    .set_member_agent(*brigade_id, token, target.agent);
+            }
             handles.insert(key.clone(), handle);
             if key.is_synthetic() {
                 discovery.push(DiscoveryTracker {
@@ -1223,13 +1232,21 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
         }
         StoreIntent::FormBrigade {
             director_row_id,
+            director_agent,
             name,
             cwd,
             worker_count,
             worker_agent,
             worker_model,
         } => {
-            let result = form_brigade_store(store, &director_row_id, &name, worker_count);
+            let result = form_brigade_store(
+                store,
+                &director_row_id,
+                director_agent,
+                &name,
+                worker_count,
+                worker_agent,
+            );
             vec![Event::BrigadeFormed {
                 director_row_id,
                 name,
@@ -1245,7 +1262,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             worker_agent,
             worker_model,
         } => {
-            let result = add_worker_store(store, brigade_id);
+            let result = add_worker_store(store, brigade_id, worker_agent);
             vec![Event::WorkerAdded {
                 brigade_id,
                 cwd,
@@ -1345,24 +1362,33 @@ fn heal_member_session(
 fn form_brigade_store(
     store: &RefCell<Store>,
     director_row_id: &str,
+    director_agent: AgentKind,
     name: &str,
     worker_count: usize,
+    worker_agent: AgentKind,
 ) -> Result<(BrigadeId, Vec<MemberToken>), String> {
     let mut store = store.borrow_mut();
     let brigade_id = store.create_brigade(name).map_err(|err| err.to_string())?;
     store
-        .add_brigade_member(
+        .add_brigade_member_with_agent(
             brigade_id,
             DIRECTOR_TOKEN,
             BrigadeRole::Director,
             Some(&SessionId(director_row_id.to_string())),
+            Some(director_agent),
         )
         .map_err(|err| err.to_string())?;
     let mut tokens = Vec::new();
     for n in 1..=worker_count {
         let token = format!("worker-{n}");
         store
-            .add_brigade_member(brigade_id, &token, BrigadeRole::Worker, None)
+            .add_brigade_member_with_agent(
+                brigade_id,
+                &token,
+                BrigadeRole::Worker,
+                None,
+                Some(worker_agent),
+            )
             .map_err(|err| err.to_string())?;
         tokens.push(token);
     }
@@ -1375,7 +1401,11 @@ fn form_brigade_store(
 /// dismissed while worker-2 survives), and counting would then mint
 /// worker-2 again, colliding with the survivor and letting the newcomer
 /// inherit its predecessor's stale store row.
-fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<MemberToken, String> {
+fn add_worker_store(
+    store: &RefCell<Store>,
+    brigade_id: BrigadeId,
+    worker_agent: AgentKind,
+) -> Result<MemberToken, String> {
     let mut store = store.borrow_mut();
     let members = store
         .brigade_members(brigade_id)
@@ -1390,7 +1420,13 @@ fn add_worker_store(store: &RefCell<Store>, brigade_id: BrigadeId) -> Result<Mem
         + 1;
     let token = format!("worker-{next_n}");
     store
-        .add_brigade_member(brigade_id, &token, BrigadeRole::Worker, None)
+        .add_brigade_member_with_agent(
+            brigade_id,
+            &token,
+            BrigadeRole::Worker,
+            None,
+            Some(worker_agent),
+        )
         .map_err(|err| err.to_string())?;
     Ok(token)
 }
@@ -1721,7 +1757,13 @@ fn gather_relay_observations(
         if let Some(t) = timings.as_deref_mut() {
             t.relay_unseen += unseen_start.elapsed();
         }
-        let is_idle_this_tick = match app.row_for_id(&session_id.0).map(|row| row.agent) {
+        // A fresh Claude Worker publishes live state before its first turn
+        // writes the JSONL that would create an App row. Use banto's recorded
+        // choice first so unread mail can break that otherwise closed loop.
+        let agent = member
+            .agent
+            .or_else(|| app.row_for_id(&session_id.0).map(|row| row.agent));
+        let is_idle_this_tick = match agent {
             Some(AgentKind::ClaudeCode) => {
                 let claude_start = Instant::now();
                 let idle = live
@@ -3102,7 +3144,7 @@ mod tests {
         store.dismiss_worker(brigade_id, "worker-1").unwrap();
         let store = RefCell::new(store);
 
-        let token = add_worker_store(&store, brigade_id).unwrap();
+        let token = add_worker_store(&store, brigade_id, AgentKind::ClaudeCode).unwrap();
 
         assert_eq!(token, "worker-3");
         assert!(
@@ -4214,6 +4256,33 @@ mod tests {
             Some(true),
             "this process's own pid is alive and the live file reports no busy status"
         );
+    }
+
+    #[test]
+    fn stored_claude_agent_keeps_an_unlisted_worker_relay_eligible() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", None);
+        store
+            .borrow_mut()
+            .set_member_agent(1, "worker-1", AgentKind::ClaudeCode)
+            .unwrap();
+        write_live_state(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+        );
+
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+            None,
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, Some(true));
     }
 
     #[test]

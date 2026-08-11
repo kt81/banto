@@ -35,7 +35,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use banto_core::model::{
-    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken, SessionId,
+    AgentKind, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken,
+    SessionId,
 };
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
@@ -877,10 +878,13 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         Err(err) => return tool_error(&format!("failed to file the consultation: {err}")),
     };
 
-    match ctx
-        .store
-        .add_brigade_member(brigade, GOINKYO_TOKEN, BrigadeRole::Goinkyo, None)
-    {
+    match ctx.store.add_brigade_member_with_agent(
+        brigade,
+        GOINKYO_TOKEN,
+        BrigadeRole::Goinkyo,
+        None,
+        Some(AgentKind::ClaudeCode),
+    ) {
         Ok(()) => tool_text(
             format!(
                 "Consultation filed at {}. A Goinkyo member row now exists for this brigade \

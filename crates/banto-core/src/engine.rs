@@ -664,6 +664,7 @@ enum PendingMembership {
 /// accident.
 struct PendingBrigadeFormation {
     director_row_id: String,
+    director_agent: AgentKind,
     name: String,
     cwd: PathBuf,
     worker_count: usize,
@@ -694,6 +695,7 @@ struct PendingWorkerAddition {
 /// the check comes out.
 struct PendingCodexTrustFormation {
     director_row_id: String,
+    director_agent: AgentKind,
     name: String,
     cwd: PathBuf,
     worker_count: usize,
@@ -1334,6 +1336,7 @@ pub enum StoreIntent {
     },
     FormBrigade {
         director_row_id: String,
+        director_agent: AgentKind,
         name: String,
         cwd: PathBuf,
         worker_count: usize,
@@ -2728,6 +2731,7 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
     if worker_agent == AgentKind::Codex {
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
             director_row_id: formation.director_row_id,
+            director_agent: formation.director_agent,
             name: formation.name,
             cwd: formation.cwd,
             worker_count: formation.worker_count,
@@ -2738,6 +2742,7 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
     }
     vec![Cmd::Store(StoreIntent::FormBrigade {
         director_row_id: formation.director_row_id,
+        director_agent: formation.director_agent,
         name: formation.name,
         cwd: formation.cwd,
         worker_count: formation.worker_count,
@@ -3058,6 +3063,7 @@ fn begin_brigade_formation(
     if brigade.worker_agent == WorkerAgentSetting::Select {
         state.pending_brigade_formation = Some(PendingBrigadeFormation {
             director_row_id: row.id.clone(),
+            director_agent: row.agent,
             name: row.display_title().to_string(),
             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             worker_count: brigade.worker_count(),
@@ -3077,6 +3083,7 @@ fn begin_brigade_formation(
     if worker_agent == AgentKind::Codex {
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
             director_row_id: row.id.clone(),
+            director_agent: row.agent,
             name: row.display_title().to_string(),
             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             worker_count: brigade.worker_count(),
@@ -3087,6 +3094,7 @@ fn begin_brigade_formation(
     }
     vec![Cmd::Store(StoreIntent::FormBrigade {
         director_row_id: row.id.clone(),
+        director_agent: row.agent,
         name: row.display_title().to_string(),
         cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
         worker_count: brigade.worker_count(),
@@ -3138,6 +3146,7 @@ fn update_codex_trust_checked(
         );
         return vec![Cmd::Store(StoreIntent::FormBrigade {
             director_row_id: formation.director_row_id,
+            director_agent: formation.director_agent,
             name: formation.name,
             cwd: formation.cwd,
             worker_count: formation.worker_count,
@@ -3148,6 +3157,7 @@ fn update_codex_trust_checked(
     if primed {
         return vec![Cmd::Store(StoreIntent::FormBrigade {
             director_row_id: formation.director_row_id,
+            director_agent: formation.director_agent,
             name: formation.name,
             cwd: formation.cwd,
             worker_count: formation.worker_count,
@@ -7180,6 +7190,7 @@ mod tests {
         let mut app = app_with(vec![]);
         state.pending_brigade_formation = Some(PendingBrigadeFormation {
             director_row_id: "dir".to_string(),
+            director_agent: AgentKind::ClaudeCode,
             name: "cell".to_string(),
             cwd: PathBuf::from("/work"),
             worker_count: 2,
@@ -7204,6 +7215,7 @@ mod tests {
                     worker_count: 2,
                     worker_agent: AgentKind::ClaudeCode,
                     worker_model,
+                    ..
                 })] if director_row_id == "dir"
                     && name == "cell"
                     && cwd == &PathBuf::from("/work")
@@ -7225,6 +7237,7 @@ mod tests {
         let mut app = app_with(vec![]);
         state.pending_brigade_formation = Some(PendingBrigadeFormation {
             director_row_id: "dir".to_string(),
+            director_agent: AgentKind::ClaudeCode,
             name: "cell".to_string(),
             cwd: PathBuf::from("/work"),
             worker_count: 2,
@@ -7247,6 +7260,7 @@ mod tests {
     fn pending_codex_trust_formation() -> PendingCodexTrustFormation {
         PendingCodexTrustFormation {
             director_row_id: "dir".to_string(),
+            director_agent: AgentKind::ClaudeCode,
             name: "cell".to_string(),
             cwd: PathBuf::from("/work"),
             worker_count: 2,
@@ -7362,6 +7376,7 @@ mod tests {
         let mut app = app_with(vec![]);
         state.pending_brigade_formation = Some(PendingBrigadeFormation {
             director_row_id: "dir".to_string(),
+            director_agent: AgentKind::ClaudeCode,
             name: "cell".to_string(),
             cwd: PathBuf::from("/work"),
             worker_count: 1,

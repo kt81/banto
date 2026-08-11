@@ -26,7 +26,8 @@ use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, params};
 
 use banto_core::model::{
-    Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken, SessionId,
+    AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
+    SessionId,
 };
 
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
@@ -82,15 +83,29 @@ impl Store {
         role: BrigadeRole,
         session_id: Option<&SessionId>,
     ) -> Result<(), StoreError> {
+        self.add_brigade_member_with_agent(brigade_id, token, role, session_id, None)
+    }
+
+    /// Adds a member while recording the product banto selected for it, when
+    /// that fact is available at creation time.
+    pub fn add_brigade_member_with_agent(
+        &mut self,
+        brigade_id: BrigadeId,
+        token: &str,
+        role: BrigadeRole,
+        session_id: Option<&SessionId>,
+        agent: Option<AgentKind>,
+    ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO brigade_members (brigade_id, member_token, role, session_id, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 brigade_id,
                 token,
                 role.as_token(),
-                session_id.map(|s| s.0.as_str())
+                session_id.map(|s| s.0.as_str()),
+                agent.map(AgentKind::as_token),
             ],
         )?;
         tx.execute(
@@ -132,6 +147,24 @@ impl Store {
             params![session_id.0, brigade_id, token],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Records the product used to open a member pane. This is independent
+    /// of session discovery: Claude can publish live state before it writes
+    /// the transcript that creates an App row, and relay must not deadlock on
+    /// that missing row.
+    pub fn set_member_agent(
+        &mut self,
+        brigade_id: BrigadeId,
+        token: &str,
+        agent: AgentKind,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE brigade_members SET agent = ?1
+             WHERE brigade_id = ?2 AND member_token = ?3",
+            params![agent.as_token(), brigade_id, token],
+        )?;
         Ok(())
     }
 
@@ -224,7 +257,7 @@ impl Store {
     /// its worker count to 1..=8.
     pub fn brigade_members(&self, brigade_id: BrigadeId) -> Result<Vec<BrigadeMember>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT member_token, role, session_id, briefed_at_ms, briefed_session_id
+            "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id
              FROM brigade_members
              WHERE brigade_id = ?1
              ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, member_token",
@@ -241,7 +274,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT member_token, role, session_id, briefed_at_ms, briefed_session_id
+                "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id
                  FROM brigade_members
                  WHERE brigade_id = ?1 AND member_token = ?2",
                 params![brigade_id, token],
@@ -525,19 +558,21 @@ fn unrecognized_role_error(column: usize, token: &str) -> rusqlite::Error {
 }
 
 /// Shared row mapping for [`Store::brigade_members`]/[`Store::brigade_member`]
-/// — both `SELECT`s name the same five columns in the same order.
+/// — both `SELECT`s name the same six columns in the same order.
 fn brigade_member_from_row(row: &rusqlite::Row) -> rusqlite::Result<BrigadeMember> {
     let token: String = row.get(0)?;
     let role_token: String = row.get(1)?;
     let session_id: Option<String> = row.get(2)?;
-    let briefed_at_ms: Option<i64> = row.get(3)?;
-    let briefed_session_id: Option<String> = row.get(4)?;
+    let agent: Option<String> = row.get(3)?;
+    let briefed_at_ms: Option<i64> = row.get(4)?;
+    let briefed_session_id: Option<String> = row.get(5)?;
     let role = BrigadeRole::from_token(&role_token)
         .ok_or_else(|| unrecognized_role_error(1, &role_token))?;
     Ok(BrigadeMember {
         token,
         role,
         session_id: session_id.map(SessionId),
+        agent: agent.as_deref().and_then(AgentKind::from_token),
         briefed_at: briefed_at_ms.map(unix_ms_to_system_time),
         briefed_session_id: briefed_session_id.map(SessionId),
     })
@@ -599,6 +634,7 @@ mod tests {
                     token: "director".to_string(),
                     role: BrigadeRole::Director,
                     session_id: Some(sid("dir")),
+                    agent: None,
                     briefed_at: None,
                     briefed_session_id: None,
                 },
@@ -606,6 +642,7 @@ mod tests {
                     token: "worker-1".to_string(),
                     role: BrigadeRole::Worker,
                     session_id: Some(sid("w1")),
+                    agent: None,
                     briefed_at: None,
                     briefed_session_id: None,
                 },
@@ -613,6 +650,7 @@ mod tests {
                     token: "worker-2".to_string(),
                     role: BrigadeRole::Worker,
                     session_id: Some(sid("w2")),
+                    agent: None,
                     briefed_at: None,
                     briefed_session_id: None,
                 },
@@ -636,6 +674,45 @@ mod tests {
             .unwrap();
         let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
         assert_eq!(member.session_id, Some(sid("w1")));
+    }
+
+    #[test]
+    fn member_agent_round_trips_and_unknown_token_is_absent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member_with_agent(
+                brigade,
+                "worker-1",
+                BrigadeRole::Worker,
+                None,
+                Some(AgentKind::ClaudeCode),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .brigade_member(brigade, "worker-1")
+                .unwrap()
+                .unwrap()
+                .agent,
+            Some(AgentKind::ClaudeCode)
+        );
+
+        store
+            .conn
+            .execute(
+                "UPDATE brigade_members SET agent = 'future-agent' WHERE brigade_id = ?1",
+                [brigade],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .brigade_member(brigade, "worker-1")
+                .unwrap()
+                .unwrap()
+                .agent,
+            None
+        );
     }
 
     #[test]
@@ -1008,6 +1085,7 @@ mod tests {
                 token: "director".to_string(),
                 role: BrigadeRole::Director,
                 session_id: Some(sid("dir")),
+                agent: None,
                 briefed_at: None,
                 briefed_session_id: None,
             }]

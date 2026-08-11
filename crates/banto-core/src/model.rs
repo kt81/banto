@@ -46,6 +46,26 @@ impl AgentKind {
         }
     }
 
+    /// Stable, storage-facing product token. This deliberately does not use
+    /// `label` or serde's enum spelling: changing either presentation or a
+    /// Rust variant must not rewrite the durable brigade database format.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
+
+    /// Parse a durable product token. Unknown values are intentionally not an
+    /// error: a newer banto may have written one that this build cannot use.
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "claude" => Some(AgentKind::ClaudeCode),
+            "codex" => Some(AgentKind::Codex),
+            _ => None,
+        }
+    }
+
     /// The other product — the new-session modal's only choice, since there
     /// are exactly two.
     pub fn toggle(self) -> Self {
@@ -53,6 +73,19 @@ impl AgentKind {
             AgentKind::ClaudeCode => AgentKind::Codex,
             AgentKind::Codex => AgentKind::ClaudeCode,
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_kind_tests {
+    use super::AgentKind;
+
+    #[test]
+    fn durable_agent_tokens_round_trip_and_reject_unknown_values() {
+        for agent in AgentKind::ALL {
+            assert_eq!(AgentKind::from_token(agent.as_token()), Some(agent));
+        }
+        assert_eq!(AgentKind::from_token("future-agent"), None);
     }
 }
 
@@ -422,6 +455,10 @@ pub struct BrigadeMember {
     pub token: MemberToken,
     pub role: BrigadeRole,
     pub session_id: Option<SessionId>,
+    /// The agent banto selected when this member's pane was opened. `None`
+    /// preserves older rows, whose product must still be inferred from a
+    /// discovered session row when one exists.
+    pub agent: Option<AgentKind>,
     /// When `banto _hook` last delivered this member its role briefing —
     /// `None` until the first time it fires (Claude never sets this at all,
     /// it takes its briefing on launch argv instead; see
