@@ -1715,11 +1715,6 @@ fn gather_relay_observations(
     // before this change (this function was already only checked once a
     // tick; batching how the OS is asked doesn't change how often the
     // answer itself is asked for).
-    // `session::alive_claude_pids` — not `SysinfoProbe::alive_pids`
-    // directly — so `BANTO_SKIP_PROCESS_ENUM` (see that function's own
-    // doc) can skip the enumeration here for the A/B measurement without
-    // going anywhere near `opener`'s resume guard, which never calls this
-    // function at all.
     let claude_snapshot_start = Instant::now();
     let alive_claude = session::alive_claude_pids(live.iter().map(|entry| entry.pid));
     if let Some(t) = timings.as_deref_mut() {

@@ -49,6 +49,9 @@ impl SysinfoProbe {
     /// refresh.  This belongs outside [`ProcessProbe`]: it serves a list
     /// pass that already knows every PID, while the trait deliberately stays
     /// a small mockable point-query interface for open/resume and ancestry.
+    /// Because [`ProcessProbe::is_alive`] calls this helper, the `banto` binary
+    /// crate's `opener::is_live` and `opener::open_session` reach it for their
+    /// no-double-resume guard; display-only policy must stay above this helper.
     pub fn alive_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<u32> {
         let pids = pids
             .into_iter()
