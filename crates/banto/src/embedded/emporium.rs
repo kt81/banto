@@ -4720,6 +4720,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_open_launch_drops_permission_mode_for_a_codex_target_even_when_some() {
+        // Unlike the Goinkyo (always Claude), a Worker can resolve to either
+        // product — `worker_permission_mode` reaches this function as `Some`
+        // for a Codex Worker too (`engine::RoleLaunch::of` doesn't gate it by
+        // agent), so this is no longer only ever structurally `None` here by
+        // construction. `AgentLaunch::Codex` still has no field for it.
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let mut target = open_target("codex-uuid-1");
+        target.agent = AgentKind::Codex;
+        let binaries = AgentBinaries::default();
+        let launch = build_open_launch(
+            &target,
+            Some("o3"),
+            None,
+            Some("auto"),
+            None,
+            None,
+            &test_ctx(&probe, &[], &binaries),
+        )
+        .unwrap();
+        assert!(
+            !launch
+                .argv("codex")
+                .contains(&"--permission-mode".to_string()),
+            "Codex has no --permission-mode equivalent to carry this into"
+        );
+    }
+
     // --- role briefings (--append-system-prompt) -------------------------
 
     #[test]

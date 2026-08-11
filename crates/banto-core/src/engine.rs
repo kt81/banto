@@ -1856,7 +1856,7 @@ pub fn update(
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
-        Event::Spawned { key } => update_spawned(state, key, now),
+        Event::Spawned { key } => update_spawned(state, brigade, key, now),
         Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
             rows,
@@ -2004,10 +2004,13 @@ pub fn update(
             result,
         } => update_worker_added(
             state,
-            brigade_id,
-            cwd,
-            worker_agent,
-            worker_model,
+            brigade,
+            AddedWorker {
+                brigade_id,
+                cwd,
+                worker_agent,
+                worker_model,
+            },
             result,
             now,
         ),
@@ -3260,12 +3263,16 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
 /// missing case went unnoticed for two days — the value happened to already
 /// be right.
 ///
-/// `permission_mode` and `disallowed_tools` answer "who's here to click
-/// 'allow'" and "what may this role even attempt", not "what should this
-/// session think with". Closing a consultation's pane mid-conversation and
-/// re-staging the brigade brings the Goinkyo right back to an unattended
-/// prompt (or an editable working tree) if one comes up, same as a fresh
-/// spawn.
+/// `permission_mode` answers "who's here to click 'allow'", not "what
+/// should this session think with" — a Worker's own operator is no more
+/// watching every pane than the Goinkyo's, so it gets the same non-default.
+/// `disallowed_tools` stays Goinkyo-only: it answers "what may this role
+/// even attempt", which only needs guarding for a role meant to be called
+/// holding nothing of its own — a Worker's whole job is the editing that
+/// setting exists to deter (see `BrigadeConfig::goinkyo_disallowed_tools`'s
+/// own doc). Closing a consultation's pane mid-conversation and re-staging
+/// the brigade brings the Goinkyo right back to an unattended prompt (or an
+/// editable working tree) if one comes up, same as a fresh spawn.
 ///
 /// The Director gets none of them: `BrigadeConfig` has no `director_model`
 /// or `director_effort` field at all — that session is the operator's own,
@@ -3290,10 +3297,12 @@ impl RoleLaunch {
                 .then(|| brigade.goinkyo_effort())
                 .flatten()
                 .map(str::to_string),
-            permission_mode: (role == BrigadeRole::Goinkyo)
-                .then(|| brigade.goinkyo_permission_mode())
-                .flatten()
-                .map(str::to_string),
+            permission_mode: match role {
+                BrigadeRole::Worker => brigade.worker_permission_mode(),
+                BrigadeRole::Goinkyo => brigade.goinkyo_permission_mode(),
+                BrigadeRole::Director => None,
+            }
+            .map(str::to_string),
             disallowed_tools: (role == BrigadeRole::Goinkyo)
                 .then(|| brigade.goinkyo_disallowed_tools())
                 .flatten()
@@ -3412,6 +3421,7 @@ fn stage_brigade(
                         token,
                         &cwd,
                         model,
+                        brigade.worker_permission_mode(),
                         fresh_worker_agent,
                     ));
                 }
@@ -3747,7 +3757,12 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
     Vec::new()
 }
 
-fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> Vec<Cmd> {
+fn update_spawned(
+    state: &mut EmporiumState,
+    brigade: &BrigadeConfig,
+    key: SessionKey,
+    now: Instant,
+) -> Vec<Cmd> {
     // A kill that never produced an exit — the child was already gone — would
     // otherwise leave its record behind to suppress the first genuine crash
     // of whatever opens under this key next.
@@ -3784,7 +3799,15 @@ fn update_spawned(state: &mut EmporiumState, key: SessionKey, now: Instant) -> V
             worker_tokens
                 .into_iter()
                 .flat_map(|token| {
-                    open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
+                    open_worker(
+                        state,
+                        brigade_id,
+                        &token,
+                        &cwd,
+                        &worker_model,
+                        brigade.worker_permission_mode(),
+                        worker_agent,
+                    )
                 })
                 .collect()
         }
@@ -3862,6 +3885,7 @@ fn open_worker(
     token: &str,
     cwd: &std::path::Path,
     worker_model: &str,
+    permission_mode: Option<&str>,
     agent: AgentKind,
 ) -> Vec<Cmd> {
     let key = SessionKey::new_worker(brigade_id, token);
@@ -3885,7 +3909,7 @@ fn open_worker(
         brigade: Some((brigade_id, token.to_string(), BrigadeRole::Worker)),
         model: (!worker_model.is_empty()).then(|| worker_model.to_string()),
         effort: None,
-        permission_mode: None,
+        permission_mode: permission_mode.map(str::to_string),
         disallowed_tools: None,
     }]
 }
@@ -4510,19 +4534,42 @@ fn open_director_with_wiring(
     }]
 }
 
-fn update_worker_added(
-    state: &mut EmporiumState,
+/// `Event::WorkerAdded`'s successful-addition payload, bundled so
+/// [`update_worker_added`] doesn't tip into clippy's too-many-arguments —
+/// these four always travel together anyway, all the way from
+/// `StoreIntent::AddWorker`.
+struct AddedWorker {
     brigade_id: BrigadeId,
     cwd: PathBuf,
     worker_agent: AgentKind,
     worker_model: String,
+}
+
+fn update_worker_added(
+    state: &mut EmporiumState,
+    brigade: &BrigadeConfig,
+    added: AddedWorker,
     result: Result<MemberToken, String>,
     now: Instant,
 ) -> Vec<Cmd> {
+    let AddedWorker {
+        brigade_id,
+        cwd,
+        worker_agent,
+        worker_model,
+    } = added;
     match result {
         Ok(token) => {
             state.set_status(format!("{token} added"), now);
-            open_worker(state, brigade_id, &token, &cwd, &worker_model, worker_agent)
+            open_worker(
+                state,
+                brigade_id,
+                &token,
+                &cwd,
+                &worker_model,
+                brigade.worker_permission_mode(),
+                worker_agent,
+            )
         }
         Err(err) => {
             state.set_status(format!("failed to add worker: {err}"), now);
@@ -6206,16 +6253,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stage_brigade_passes_the_configured_permission_mode_and_disallowed_tools_to_a_resumed_goinkyo_but_never_to_worker_or_director()
-     {
+    /// Shared by the `permission_mode`/`disallowed_tools` resume tests below:
+    /// stage a Director/Worker/Goinkyo trio, each already resolved to a row,
+    /// under `brigade`, and return `(id, permission_mode, disallowed_tools)`
+    /// for every `Cmd::OpenEmbedded` the stage produced.
+    fn staged_trio_launch_modes(
+        brigade: &BrigadeConfig,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
-        let brigade = BrigadeConfig {
-            goinkyo_permission_mode: "bypassPermissions".to_string(),
-            goinkyo_disallowed_tools: "Bash".to_string(),
-            ..BrigadeConfig::default()
-        };
         let now = test_instant();
         state.pending_membership = Some(PendingMembership::Activate);
 
@@ -6239,7 +6285,7 @@ mod tests {
         let cmds = update(
             &mut state,
             &mut app,
-            &brigade,
+            brigade,
             Event::MembershipResolved {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
@@ -6248,8 +6294,7 @@ mod tests {
             now,
         );
 
-        let modes: Vec<(String, Option<String>, Option<String>)> = cmds
-            .iter()
+        cmds.iter()
             .filter_map(|cmd| match cmd {
                 Cmd::OpenEmbedded {
                     target,
@@ -6263,24 +6308,65 @@ mod tests {
                 )),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn stage_brigade_passes_the_configured_permission_mode_to_a_resumed_worker_and_goinkyo_but_never_to_director()
+     {
+        let brigade = BrigadeConfig {
+            worker_permission_mode: "acceptEdits".to_string(),
+            goinkyo_permission_mode: "bypassPermissions".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let modes = staged_trio_launch_modes(&brigade);
+
         assert!(
             modes
                 .iter()
-                .any(|(id, mode, tools)| id == "dir" && mode.is_none() && tools.is_none()),
-            "the Director must never carry --permission-mode or --disallowedTools: {modes:?}"
+                .any(|(id, mode, _)| id == "dir" && mode.is_none()),
+            "the Director must never carry --permission-mode: {modes:?}"
         );
         assert!(
             modes
                 .iter()
-                .any(|(id, mode, tools)| id == "w1" && mode.is_none() && tools.is_none()),
-            "a resumed Worker must never carry --permission-mode or --disallowedTools: {modes:?}"
+                .any(|(id, mode, _)| id == "w1" && mode.as_deref() == Some("acceptEdits")),
+            "a resumed Worker must carry the configured worker_permission_mode: {modes:?}"
         );
         assert!(
-            modes.iter().any(|(id, mode, tools)| id == "g1"
-                && mode.as_deref() == Some("bypassPermissions")
-                && tools.as_deref() == Some("Bash")),
-            "a resumed Goinkyo must carry both configured values: {modes:?}"
+            modes
+                .iter()
+                .any(|(id, mode, _)| id == "g1" && mode.as_deref() == Some("bypassPermissions")),
+            "a resumed Goinkyo must carry the configured goinkyo_permission_mode: {modes:?}"
+        );
+    }
+
+    #[test]
+    fn stage_brigade_passes_the_configured_disallowed_tools_to_a_resumed_goinkyo_but_never_to_worker_or_director()
+     {
+        let brigade = BrigadeConfig {
+            goinkyo_disallowed_tools: "Bash".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let modes = staged_trio_launch_modes(&brigade);
+
+        assert!(
+            modes
+                .iter()
+                .any(|(id, _, tools)| id == "dir" && tools.is_none()),
+            "the Director must never carry --disallowedTools: {modes:?}"
+        );
+        assert!(
+            modes
+                .iter()
+                .any(|(id, _, tools)| id == "w1" && tools.is_none()),
+            "a resumed Worker must never carry --disallowedTools: {modes:?}"
+        );
+        assert!(
+            modes
+                .iter()
+                .any(|(id, _, tools)| id == "g1" && tools.as_deref() == Some("Bash")),
+            "a resumed Goinkyo must carry the configured goinkyo_disallowed_tools: {modes:?}"
         );
     }
 
@@ -6760,16 +6846,16 @@ mod tests {
     }
 
     #[test]
-    fn neither_the_director_nor_a_worker_spawn_ever_carries_a_permission_mode() {
-        // `permission_mode` is scoped to a freshly-spawned Goinkyo only
-        // (`Cmd::OpenEmbedded`'s own doc) — proven here with a deliberately
-        // non-default `goinkyo_permission_mode`, so a leak into either
-        // launch would show up as `Some("bypassPermissions")`, not just an
-        // unexercised `None`.
+    fn the_director_never_carries_a_permission_mode() {
+        // `permission_mode` never reaches the Director (`RoleLaunch::of`) —
+        // proven here with deliberately non-default `worker_permission_mode`/
+        // `goinkyo_permission_mode`, so a leak from either sibling role would
+        // show up as `Some(...)`, not just an unexercised `None`.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
         let brigade = BrigadeConfig {
             worker_agent: WorkerAgentSetting::Codex,
+            worker_permission_mode: "acceptEdits".to_string(),
             goinkyo_permission_mode: "bypassPermissions".to_string(),
             ..BrigadeConfig::default()
         };
@@ -6797,7 +6883,40 @@ mod tests {
             panic!("expected exactly one OpenEmbedded, got {director_cmds:?}");
         };
         assert_eq!(permission_mode, &None, "the Director's own launch");
+    }
 
+    #[test]
+    fn a_freshly_spawned_worker_carries_the_configured_permission_mode() {
+        // Unlike the Director (see `the_director_never_carries_a_permission_
+        // mode`), a fresh Worker spawn carries `worker_permission_mode` on
+        // `Cmd::OpenEmbedded` regardless of which product it resolves to —
+        // the Claude/Codex split (and the fact that Codex has no
+        // `--permission-mode` equivalent to carry it into) happens
+        // downstream, in `crate::embedded::emporium::build_open_launch`, not
+        // here. This brigade's Worker is deliberately Codex to pin exactly
+        // that.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = BrigadeConfig {
+            worker_agent: WorkerAgentSetting::Codex,
+            worker_permission_mode: "acceptEdits".to_string(),
+            ..BrigadeConfig::default()
+        };
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::Codex,
+                worker_model: "gpt-5.6-terra".to_string(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
         let worker_cmds = update(
             &mut state,
             &mut app,
@@ -6817,7 +6936,7 @@ mod tests {
         });
         assert_eq!(
             worker_permission_mode,
-            Some(None),
+            Some(Some("acceptEdits".to_string())),
             "the Worker's own launch"
         );
     }
@@ -8558,6 +8677,7 @@ mod tests {
             "worker-1",
             std::path::Path::new("/work"),
             "",
+            None,
             AgentKind::Codex,
         );
         let key = SessionKey::new_worker(1, "worker-1");
@@ -8579,6 +8699,7 @@ mod tests {
             "worker-1",
             std::path::Path::new("/work"),
             "",
+            None,
             AgentKind::ClaudeCode,
         );
         let key = SessionKey::new_worker(1, "worker-1");
@@ -10051,6 +10172,7 @@ mod tests {
             "worker-1",
             &PathBuf::from("/work"),
             "",
+            None,
             AgentKind::ClaudeCode,
         );
 
@@ -12674,6 +12796,33 @@ mod tests {
             "its screen is gone until the spawn lands"
         );
         assert!(state.status.unwrap().contains("restarting"));
+    }
+
+    #[test]
+    fn a_restarted_worker_carries_the_same_configured_permission_mode_as_a_fresh_spawn() {
+        // `relaunch_member` is a separate code path from `stage_brigade`'s own
+        // resume arm (see `stage_brigade_passes_the_configured_permission_
+        // mode_to_a_resumed_worker_and_goinkyo_but_never_to_director`) — both
+        // go through `RoleLaunch::of`, but a crash-triggered restart is
+        // reachable only through here.
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = BrigadeConfig {
+            worker_permission_mode: "acceptEdits".to_string(),
+            ..BrigadeConfig::default()
+        };
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        match &cmds[..] {
+            [
+                Cmd::OpenEmbedded {
+                    permission_mode, ..
+                },
+            ] => {
+                assert_eq!(permission_mode.as_deref(), Some("acceptEdits"));
+            }
+            other => panic!("expected one OpenEmbedded, got {other:?}"),
+        }
     }
 
     #[test]

@@ -711,6 +711,7 @@ pub struct BrigadeConfig {
     pub worker_model: String,       // --model for an auto-spawned Claude Worker; "" = inherit; default "sonnet"
     pub worker_model_codex: String, // --model for an auto-spawned Codex Worker; independent default and escape hatch
     pub worker_agent: WorkerAgentSetting, // Inherit (default) | Select | Claude | Codex — see below
+    pub worker_permission_mode: String, // --permission-mode for an auto-spawned Worker; "" = no flag; default "auto"; Claude only
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub director_prompt: String,    // role briefing template for the Director
     pub worker_prompt: String,      // role briefing template for each Worker
@@ -728,6 +729,18 @@ of the Director's own product: `Inherit` (default) matches the Director's;
 gate 2 above. `worker_model`/`worker_model_codex` are two independent
 `--model` overrides, since the two products don't share a model namespace —
 one shared field could never default sensibly for both at once.
+
+`worker_permission_mode` defaults to `"auto"`, same flag and same rationale
+as `goinkyo_permission_mode` above — a Worker's own operator is no more
+watching every pane than an unattended Goinkyo's — carried on a resume too,
+not just a fresh spawn, for the same reason. Unlike the Goinkyo, a Worker has
+no `worker_disallowed_tools` counterpart: editing the working tree is what a
+Worker is for, so there is nothing here for a denylist to guard against.
+Codex has no `--permission-mode` equivalent, so this only ever reaches a
+Claude Worker's argv — a Codex Worker's `worker_permission_mode` is computed
+the same as any other Worker's (`RoleLaunch::of` does not gate it by
+product) but is dropped downstream, in `build_open_launch`, the same place
+that already drops `effort`/`disallowed_tools` for Codex.
 
 **Role briefing delivery differs by product.** `director_prompt`,
 `worker_prompt`, and `goinkyo_prompt` all render the same template,

@@ -174,6 +174,16 @@ pub struct BrigadeConfig {
     pub worker_model_codex: String,
     /// See [`WorkerAgentSetting`].
     pub worker_agent: WorkerAgentSetting,
+    /// `--permission-mode <mode>` an auto-spawned Worker launches with,
+    /// default `"auto"` — same flag, same accepted values, and the same
+    /// unattended-operator rationale as [`Self::goinkyo_permission_mode`].
+    /// Same empty-string escape hatch as [`Self::worker_model`].
+    ///
+    /// Unlike the Goinkyo, a Worker carries no accompanying tool denylist
+    /// alongside this: editing the working tree is what a Worker is for, so
+    /// nothing here pairs with it the way [`Self::goinkyo_disallowed_tools`]
+    /// pairs with the Goinkyo's.
+    pub worker_permission_mode: String,
     /// See [`RelayMode`].
     pub relay: RelayMode,
     /// Role briefing appended to a Director's system prompt at launch
@@ -386,6 +396,7 @@ impl Default for BrigadeConfig {
             worker_model: "sonnet".to_string(),
             worker_model_codex: "gpt-5.6-terra".to_string(),
             worker_agent: WorkerAgentSetting::default(),
+            worker_permission_mode: "auto".to_string(),
             relay: RelayMode::Auto,
             director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
             worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
@@ -417,18 +428,25 @@ impl BrigadeConfig {
 
     /// The `--model` value an auto-spawned Worker running `agent` should
     /// launch with, or `None` for "pass no `--model` flag at all" (either
-    /// product's own empty-string escape hatch). Not called anywhere yet —
-    /// `crate::engine`'s `spawn_worker` still reads [`Self::worker_model`]
-    /// directly, unconditionally, until the Worker-agent-selection feature
-    /// lands there; this exists so that wiring has one obvious, already-
-    /// tested place for the per-product choice instead of reinventing it
-    /// inline.
+    /// product's own empty-string escape hatch). Read by `crate::engine`'s
+    /// `RoleLaunch::of` (fresh spawn and resume alike) and by
+    /// `stage_brigade`'s fresh-Worker branch, which passes the same string
+    /// on to `open_worker`.
     pub fn worker_model_for(&self, agent: AgentKind) -> Option<&str> {
         let raw = match agent {
             AgentKind::ClaudeCode => &self.worker_model,
             AgentKind::Codex => &self.worker_model_codex,
         };
         (!raw.is_empty()).then_some(raw.as_str())
+    }
+
+    /// [`Self::worker_permission_mode`], or `None` for the empty-string
+    /// escape hatch. No `agent` parameter, unlike [`Self::worker_model_for`]:
+    /// Codex has no `--permission-mode` counterpart (`opener::AgentLaunch::
+    /// Codex` carries no such field), so a Codex Worker simply never reaches
+    /// anywhere this value would apply.
+    pub fn worker_permission_mode(&self) -> Option<&str> {
+        (!self.worker_permission_mode.is_empty()).then_some(self.worker_permission_mode.as_str())
     }
 
     /// [`Self::goinkyo_model`], or `None` for the empty-string escape hatch.
@@ -864,6 +882,28 @@ mod tests {
             config.brigade.goinkyo_disallowed_tools(),
             Some("Edit,Write,NotebookEdit")
         );
+    }
+
+    #[test]
+    fn brigade_worker_permission_mode_defaults_to_auto_and_has_its_own_empty_escape_hatch() {
+        let config = Config::default();
+        assert_eq!(config.brigade.worker_permission_mode(), Some("auto"));
+
+        let cleared = parse("[brigade]\nworker_permission_mode = \"\"\n");
+        assert_eq!(cleared.brigade.worker_permission_mode(), None);
+
+        let overridden = parse("[brigade]\nworker_permission_mode = \"plan\"\n");
+        assert_eq!(overridden.brigade.worker_permission_mode(), Some("plan"));
+    }
+
+    #[test]
+    fn an_existing_config_toml_without_worker_permission_mode_gets_the_default() {
+        // Same reasoning as `an_existing_config_toml_without_goinkyo_model_
+        // effort_permission_mode_or_disallowed_tools_gets_the_defaults`: a
+        // file written before this field existed must keep loading with its
+        // own default, not an empty value.
+        let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
+        assert_eq!(config.brigade.worker_permission_mode(), Some("auto"));
     }
 
     #[test]
