@@ -540,7 +540,8 @@ prompt until it receives one, so once the Goinkyo's own pane goes quiet
 (`GOINKYO_KICKOFF_QUIET_PERIOD`), banto checks whether Claude has been told
 to trust its cwd (`Cmd::CheckGoinkyoDirectoryTrust` — a different trust
 registry from Codex's own directory-trust check, re-asked every tick until
-trusted) and types a fixed kickoff line into it — the same bootstrap
+trusted, with periodic qualified status reminders) and types a fixed kickoff
+line into it — the same bootstrap
 problem, and the same shape of fix, `CODEX_WORKER_KICKOFF_LINE` solves for
 a freshly-spawned Codex Worker. A Worker never needs this: the operator
 gives it its own first turn by typing into its pane themselves, which
@@ -694,8 +695,16 @@ carries the real session id, which `banto _hook` records
 (`store::record_briefing`) for `poll_discovery`'s `codex_briefed_session_id`
 to pick up. If the cwd isn't trusted yet, banto keeps re-checking every tick
 rather than typing blind or giving up — answering the prompt in the pane
-directly lets the kickoff resume on its own next tick, with a status-line
-notice posted once in the meantime.
+directly lets the kickoff resume on its own next tick, with a qualified
+status reminder repeated while it remains blocked. After each typed line and
+its delayed Enter, banto waits 15 seconds for acknowledgement (a discovered
+Codex session, or a Goinkyo row after its send) before retrying, at most three
+times. It rechecks trust before every retry and never writes while banto has
+seen unsent operator input in that pane. The Enter transition has not been
+measured, so the interval is deliberately generous: banto cannot inspect the
+terminal's input line, and a dropped Enter with text still present could make
+a retry duplicate the bootstrap sentence. Exhaustion remains visible as a
+periodic qualified status reminder rather than silently looping.
 
 **Lifecycle.** Killing a Worker's pane (prefix-`x`) lets it respawn fresh under
 the same token next time its brigade is staged; *dismissing* one (a separate

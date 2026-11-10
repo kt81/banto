@@ -588,6 +588,8 @@ struct PendingKickoff {
     /// status line states it once instead of restamping the same notice
     /// every tick while banto keeps quietly re-checking.
     notified_untrusted: bool,
+    sent_at: Option<Instant>,
+    attempts: u32,
 }
 
 /// How long a freshly-spawned Goinkyo pane's own output must have been
@@ -608,6 +610,13 @@ struct PendingKickoff {
 /// no reason to expect it settles slower, but this has not been separately
 /// measured the way [`CODEX_KICKOFF_QUIET_PERIOD`] was.
 const GOINKYO_KICKOFF_QUIET_PERIOD: Duration = Duration::from_millis(700);
+/// Claude's post-Enter transition was not measured, so a retry waits far
+/// longer than boot quiet before risking another bootstrap turn.
+const KICKOFF_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+/// After this many tries, report the failure rather than silently repeating.
+/// Banto cannot read the input line to distinguish a lost Enter from text
+/// still present there, which can duplicate the kickoff sentence.
+const KICKOFF_MAX_ATTEMPTS: u32 = 3;
 
 /// The fixed, ASCII-only line banto types into a freshly-spawned Goinkyo's
 /// stdin once its boot output goes quiet (see [`GOINKYO_KICKOFF_QUIET_PERIOD`])
@@ -653,6 +662,8 @@ struct PendingGoinkyoKickoff {
     /// the operator this pane is waiting on an unanswered trust prompt —
     /// same reasoning as [`PendingKickoff::notified_untrusted`].
     notified_untrusted: bool,
+    sent_at: Option<Instant>,
+    attempts: u32,
 }
 
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
@@ -824,6 +835,8 @@ pub struct EmporiumState {
     /// Announces on the status line that a nudge is being held back by
     /// [`Self::unsent_operator_input`]; see [`update_tick`].
     draft_hold_reminder: StatusReminder,
+    kickoff_trust_reminder: StatusReminder,
+    kickoff_failed_reminder: StatusReminder,
     /// When a pane's child last produced *any* output, keyed by its own
     /// [`SessionKey`] — the baseline [`update_tick`]'s kickoff-readiness
     /// check measures quiet time against (see
@@ -1036,6 +1049,8 @@ impl EmporiumState {
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
+            kickoff_trust_reminder: StatusReminder::default(),
+            kickoff_failed_reminder: StatusReminder::default(),
             last_output_at: HashMap::new(),
             pending_kickoffs: Vec::new(),
             pending_goinkyo_kickoffs: Vec::new(),
@@ -1095,6 +1110,99 @@ impl EmporiumState {
         SessionKey::new_plain(cwd, discriminator)
     }
 
+    /// Move every pane-owned fact as one transaction when discovery or
+    /// compaction replaces its key. Keeping this list here makes a new
+    /// `SessionKey`-indexed field reviewable at its only migration point.
+    fn rekey_pane_state(&mut self, old_key: &SessionKey, new_key: &SessionKey) -> bool {
+        let had_screen = if let Some(screen) = self.screens.remove(old_key) {
+            self.screens.insert(new_key.clone(), screen);
+            true
+        } else {
+            false
+        };
+        match &mut self.stage {
+            Stage::Solo(key) if key == old_key => *key = new_key.clone(),
+            Stage::Brigade {
+                director, panes, ..
+            } => {
+                if director.as_ref() == Some(old_key) {
+                    *director = Some(new_key.clone());
+                }
+                for key in panes {
+                    if key == old_key {
+                        *key = new_key.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(value) = self.last_forwarded_input.remove(old_key) {
+            self.last_forwarded_input.insert(new_key.clone(), value);
+        }
+        if self.unsent_operator_input.remove(old_key) {
+            self.unsent_operator_input.insert(new_key.clone());
+        }
+        if let Some(value) = self.last_output_at.remove(old_key) {
+            self.last_output_at.insert(new_key.clone(), value);
+        }
+        if let Some(value) = self.pending_opens.remove(old_key) {
+            self.pending_opens.insert(new_key.clone(), value);
+        }
+        if self.attention_panes.remove(old_key) {
+            self.attention_panes.insert(new_key.clone());
+        }
+        if self.latched_attention_panes.remove(old_key) {
+            self.latched_attention_panes.insert(new_key.clone());
+        }
+        if self.ring_list_waiting.remove(old_key) {
+            self.ring_list_waiting.insert(new_key.clone());
+        }
+        if let Some(previous) = &mut self.previous_ring_set
+            && previous.remove(old_key)
+        {
+            previous.insert(new_key.clone());
+        }
+        if self.expected_exits.remove(old_key) {
+            self.expected_exits.insert(new_key.clone());
+        }
+        if let Some(value) = self.last_relaunch.remove(old_key) {
+            self.last_relaunch.insert(new_key.clone(), value);
+        }
+        if self.pending_dismiss.as_ref() == Some(old_key) {
+            self.pending_dismiss = Some(new_key.clone());
+        }
+        if self.last_focus_notified.as_ref() == Some(old_key) {
+            self.last_focus_notified = Some(new_key.clone());
+        }
+        if let Some(value) = self.member_tokens.remove(old_key) {
+            self.member_tokens.insert(new_key.clone(), value);
+        }
+        if let Some(value) = self.member_brigades.remove(old_key) {
+            self.member_brigades.insert(new_key.clone(), value);
+        }
+        for key in self.goinkyo_pane.values_mut() {
+            if key == old_key {
+                *key = new_key.clone();
+            }
+        }
+        for pending in &mut self.pending_submits {
+            if pending.key == *old_key {
+                pending.key = new_key.clone();
+            }
+        }
+        for pending in &mut self.pending_kickoffs {
+            if pending.key == *old_key {
+                pending.key = new_key.clone();
+            }
+        }
+        for pending in &mut self.pending_goinkyo_kickoffs {
+            if pending.key == *old_key {
+                pending.key = new_key.clone();
+            }
+        }
+        had_screen
+    }
+
     /// Drop `key` from the stage, keeping [`Self::focus`] pointing at
     /// something that exists.
     ///
@@ -1139,6 +1247,19 @@ impl EmporiumState {
     /// (see [`Self::unsent_operator_input`] for what clears it).
     pub fn has_unsent_operator_input(&self, key: &SessionKey) -> bool {
         self.unsent_operator_input.contains(key)
+    }
+
+    fn kickoff_label(&self, key: &SessionKey) -> String {
+        let token = self
+            .member_tokens
+            .get(key)
+            .cloned()
+            .or_else(|| key.worker_identity().map(|(_, token)| token))
+            .unwrap_or_else(|| key.as_str().to_string());
+        match self.member_brigades.get(key) {
+            Some(brigade_id) => format!("brigade {brigade_id} {token}"),
+            None => format!("member {token}"),
+        }
     }
 
     /// Record what forwarding `input` to `key`'s pane means for
@@ -2157,7 +2278,7 @@ pub fn update(
             old_id,
             new_id,
         } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
-        Event::Tick { relay } => update_tick(state, brigade, relay, now),
+        Event::Tick { relay } => update_tick(state, app, brigade, relay, now),
         Event::GoinkyoAwaitingSpawn { observation } => {
             update_goinkyo_awaiting_spawn(state, brigade, observation, now)
         }
@@ -3975,6 +4096,8 @@ fn update_spawned(
                     spawned_at: now,
                     cwd,
                     notified_untrusted: false,
+                    sent_at: None,
+                    attempts: 0,
                 });
             }
             Vec::new()
@@ -4329,108 +4452,26 @@ fn update_discovery_result(
         return Vec::new();
     }
     let mut cmds = Vec::new();
-    if let Some(screen) = state.screens.remove(&old_key) {
-        state.screens.insert(new_key.clone(), screen);
+    if state.rekey_pane_state(&old_key, &new_key) {
         cmds.push(Cmd::RekeyPty {
             from: old_key.clone(),
             to: new_key.clone(),
         });
     }
-    match &mut state.stage {
-        Stage::Solo(k) if *k == old_key => *k = new_key.clone(),
-        Stage::Brigade {
-            director, panes, ..
-        } => {
-            // Defensive, not believed reachable today: `old_key` here is
-            // always a synthetic key (`poll_discovery` only tracks those —
-            // `key.is_synthetic()`), and the Director's own key never is
-            // one (always built from an already-known real id, at
-            // formation or resume). Kept anyway for the same reason
-            // `goinkyo_pane`'s own follow below is — cheap, and correct if
-            // that assumption is ever wrong.
-            if director.as_ref() == Some(&old_key) {
-                *director = Some(new_key.clone());
-            }
-            for pane in panes.iter_mut() {
-                if *pane == old_key {
-                    *pane = new_key.clone();
-                }
-            }
-        }
-        _ => {}
-    }
-    if let Some(token) = state.member_tokens.remove(&old_key) {
-        state.member_tokens.insert(new_key.clone(), token);
-    }
-    if let Some(brigade_id) = state.member_brigades.remove(&old_key) {
-        state.member_brigades.insert(new_key.clone(), brigade_id);
-    }
-    // A queued `PendingSubmit` (the delayed `\r` for a relay nudge or
-    // either kickoff's phase two) names a pane the same way `screens`/
-    // `Stage` do, and needs the same follow: left on `old_key`, the write
-    // it stands for lands on a `Cmd::WritePty { key: old_key, .. }` with no
-    // live handle behind it, same silently-dropped-until-now shape
-    // `pending_goinkyo_kickoffs`'s own follow below fixes. Unconditional on
-    // `member` (unlike the block below) because a nudge/kickoff's own
-    // producer never distinguishes Goinkyo from anything else this way —
-    // there is exactly one `pending_submits`, shared by every role.
-    for pending in state.pending_submits.iter_mut() {
-        if pending.key == old_key {
-            pending.key = new_key.clone();
-        }
-    }
-    // The mark follows the pane for the same reason: a draft typed into a
-    // fresh Worker before its session is discovered must still hold back
-    // the nudge once the pane has its real key, and the mark is asked for by
-    // that key.
-    if state.unsent_operator_input.remove(&old_key) {
-        state.unsent_operator_input.insert(new_key.clone());
-    }
+    // A discovered Codex Worker session is the acknowledgement that its
+    // first turn started. It must win over a timeout retry in a later tick.
+    state
+        .pending_kickoffs
+        .retain(|pending| pending.key != new_key);
     if let Some((brigade_id, token)) = member {
         state
             .member_tokens
             .entry(new_key.clone())
             .or_insert_with(|| token.clone());
-        // Keep `goinkyo_pane` and any queued `PendingGoinkyoKickoff` pointed
-        // at the pane they actually name: both were recorded under the
-        // *synthetic* key at spawn time (`update_goinkyo_awaiting_spawn`'s
-        // `AwaitingSpawn` branch), and this is the discovery that resolves
-        // that synthetic key to a real session id — both entries have to
-        // follow, or `goinkyo_pane`'s eventual `NoGoinkyo` would try to
-        // close a pane under a key nothing is staged at anymore, and the
-        // kickoff would keep addressing a key nothing is listening on
-        // either. The kickoff side of this is not a rare corner: unlike an
-        // ordinary Worker (which never has a `PendingGoinkyoKickoff` at
-        // all — the operator gives it its own first turn), a Goinkyo's
-        // kickoff is queued the moment it's spawned, and Claude Code writes
-        // `sessions/<pid>.json` — what resolves this synthetic key — within
-        // the first couple hundred milliseconds of boot, well inside
-        // `GOINKYO_KICKOFF_QUIET_PERIOD`. So discovery routinely resolves
-        // before the kickoff's own quiet-period even elapses, let alone
-        // before the trust check and write that follow it; left un-renamed,
-        // every later step (`update_tick`'s quiet-period check, the trust
-        // round trip, the final `Cmd::WritePty`) keeps addressing the dead
-        // synthetic key, and a `Cmd::WritePty` against a key with no live
-        // handle is a silent no-op (`emporium.rs`'s own `execute_cmd`) — the
-        // kickoff simply never lands, with nothing to say why. Measured
-        // live 2026-08-05: a Goinkyo's `sessions/<pid>.json` updated once,
-        // 123ms after spawn, and never again — this rename is what that
-        // traced back to. `get_mut`/`find` rather than an unconditional
-        // insert for either: only follows an entry
-        // `update_goinkyo_awaiting_spawn` already created, never invents
-        // one for a brigade it never attempted.
-        if token == GOINKYO_TOKEN {
-            if let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id) {
-                *pane = new_key.clone();
-            }
-            if let Some(pending) = state
-                .pending_goinkyo_kickoffs
-                .iter_mut()
-                .find(|p| p.key == old_key)
-            {
-                pending.key = new_key.clone();
-            }
-        }
+        state
+            .member_brigades
+            .entry(new_key.clone())
+            .or_insert(brigade_id);
         cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
             brigade_id,
             token,
@@ -4476,75 +4517,15 @@ fn update_member_session_forked(
                 now,
             );
         } else {
-            if let Some(screen) = state.screens.remove(&old_key) {
-                state.screens.insert(new_key.clone(), screen);
-            }
-            if let Stage::Brigade {
-                director, panes, ..
-            } = &mut state.stage
-            {
-                // Unlike `update_discovery_result`'s own version of this,
-                // genuinely reachable: an auto-compaction fork can happen
-                // to any already-running Claude session, the Director's own
-                // included, not just a freshly-discovered member's.
-                if director.as_ref() == Some(&old_key) {
-                    *director = Some(new_key.clone());
-                }
-                for pane in panes.iter_mut() {
-                    if *pane == old_key {
-                        *pane = new_key.clone();
-                    }
-                }
-            }
-            if let Some(member_token) = state.member_tokens.remove(&old_key) {
-                state.member_tokens.insert(new_key.clone(), member_token);
-            }
-            if let Some(member_brigade) = state.member_brigades.remove(&old_key) {
-                state
-                    .member_brigades
-                    .insert(new_key.clone(), member_brigade);
-            }
+            state.rekey_pane_state(&old_key, &new_key);
             state
                 .member_tokens
                 .entry(new_key.clone())
                 .or_insert_with(|| token.clone());
-            // Same reasoning, and same unconditional-on-`token` scope, as
-            // `update_discovery_result`'s own version of this: a queued
-            // `PendingSubmit` names a pane the same way `screens`/`Stage`
-            // do, and needs the same follow regardless of role.
-            for pending in state.pending_submits.iter_mut() {
-                if pending.key == old_key {
-                    pending.key = new_key.clone();
-                }
-            }
-            // An auto-compaction fork renames the pane under a draft just as
-            // discovery does; see `update_discovery_result`.
-            if state.unsent_operator_input.remove(&old_key) {
-                state.unsent_operator_input.insert(new_key.clone());
-            }
-            // Same reasoning as `update_discovery_result`'s own version of
-            // this: `goinkyo_pane` and any queued `PendingGoinkyoKickoff`
-            // both have to follow a fork's rename too, or a later
-            // `NoGoinkyo` would try to close a pane under a key nothing is
-            // staged at anymore, and a still-pending kickoff would keep
-            // addressing a key nothing is listening on. Less routinely hit
-            // than `update_discovery_result`'s own version (a fork this
-            // early, before the kickoff even fires, needs Claude's
-            // auto-compaction to land inside the first ~700ms of a fresh
-            // Goinkyo's life), but the same silent-`Cmd::WritePty`-to-a-dead-
-            // key failure if it ever does.
-            if token.as_str() == GOINKYO_TOKEN {
-                if let Some(pane) = state.goinkyo_pane.get_mut(&brigade_id) {
-                    *pane = new_key.clone();
-                }
-                if let Some(pending) = state
-                    .pending_goinkyo_kickoffs
-                    .iter_mut()
-                    .find(|p| p.key == old_key)
-                {
-                    pending.key = new_key.clone();
-                }
-            }
+            state
+                .member_brigades
+                .entry(new_key.clone())
+                .or_insert(brigade_id);
             cmds.push(Cmd::RekeyPty {
                 from: old_key,
                 to: new_key,
@@ -4837,6 +4818,7 @@ fn update_worker_dismissed(
 
 fn update_tick(
     state: &mut EmporiumState,
+    app: &App,
     brigade: &BrigadeConfig,
     relay: Vec<RelayObservation>,
     now: Instant,
@@ -4866,6 +4848,12 @@ fn update_tick(
         }
     }
 
+    // A Goinkyo can have been discovered before its first turn starts. Only
+    // a row that appears after a write acknowledges that write.
+    state.pending_goinkyo_kickoffs.retain(|pending| {
+        pending.sent_at.is_none() || app.row_for_id(pending.key.as_str()).is_none()
+    });
+
     // Codex Worker kickoff: once a pending pane's own output has been quiet
     // for CODEX_KICKOFF_QUIET_PERIOD, ask the shell whether Codex has been
     // told to trust this pane's cwd (`Cmd::CheckWorkerDirectoryTrust`) —
@@ -4880,7 +4868,14 @@ fn update_tick(
             .get(&pending.key)
             .copied()
             .unwrap_or(pending.spawned_at);
-        if now.saturating_duration_since(quiet_since) >= CODEX_KICKOFF_QUIET_PERIOD {
+        let due = match pending.sent_at {
+            Some(sent_at) => now.saturating_duration_since(sent_at) >= KICKOFF_ACK_TIMEOUT,
+            None => now.saturating_duration_since(quiet_since) >= CODEX_KICKOFF_QUIET_PERIOD,
+        };
+        if due
+            && pending.attempts < KICKOFF_MAX_ATTEMPTS
+            && !state.has_unsent_operator_input(&pending.key)
+        {
             cmds.push(Cmd::CheckWorkerDirectoryTrust {
                 key: pending.key.clone(),
                 cwd: pending.cwd.clone(),
@@ -4898,7 +4893,14 @@ fn update_tick(
             .get(&pending.key)
             .copied()
             .unwrap_or(pending.spawned_at);
-        if now.saturating_duration_since(quiet_since) >= GOINKYO_KICKOFF_QUIET_PERIOD {
+        let due = match pending.sent_at {
+            Some(sent_at) => now.saturating_duration_since(sent_at) >= KICKOFF_ACK_TIMEOUT,
+            None => now.saturating_duration_since(quiet_since) >= GOINKYO_KICKOFF_QUIET_PERIOD,
+        };
+        if due
+            && pending.attempts < KICKOFF_MAX_ATTEMPTS
+            && !state.has_unsent_operator_input(&pending.key)
+        {
             cmds.push(Cmd::CheckGoinkyoDirectoryTrust {
                 key: pending.key.clone(),
                 cwd: pending.cwd.clone(),
@@ -4978,6 +4980,58 @@ fn update_tick(
             format!(
                 "relay: holding the nudge to {} — unsent input in the pane",
                 held_by_draft.join(", ")
+            ),
+            now,
+        );
+    }
+
+    let mut trust_waiting: Vec<String> = state
+        .pending_kickoffs
+        .iter()
+        .filter(|pending| pending.notified_untrusted)
+        .map(|pending| state.kickoff_label(&pending.key))
+        .collect();
+    trust_waiting.extend(
+        state
+            .pending_goinkyo_kickoffs
+            .iter()
+            .filter(|pending| pending.notified_untrusted)
+            .map(|pending| state.kickoff_label(&pending.key)),
+    );
+    if state
+        .kickoff_trust_reminder
+        .due(!trust_waiting.is_empty(), state.status.is_none(), now)
+    {
+        state.set_status(
+            format!(
+                "kickoff: waiting for directory trust in {}",
+                trust_waiting.join(", ")
+            ),
+            now,
+        );
+    }
+
+    let mut failures: Vec<String> = state
+        .pending_kickoffs
+        .iter()
+        .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS)
+        .map(|pending| state.kickoff_label(&pending.key))
+        .collect();
+    failures.extend(
+        state
+            .pending_goinkyo_kickoffs
+            .iter()
+            .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS)
+            .map(|pending| state.kickoff_label(&pending.key)),
+    );
+    if state
+        .kickoff_failed_reminder
+        .due(!failures.is_empty(), state.status.is_none(), now)
+    {
+        state.set_status(
+            format!(
+                "kickoff: no acknowledgement after {KICKOFF_MAX_ATTEMPTS} attempts — {}",
+                failures.join(", ")
             ),
             now,
         );
@@ -5147,6 +5201,8 @@ fn update_goinkyo_awaiting_spawn(
         spawned_at: now,
         cwd: candidate.cwd.clone(),
         notified_untrusted: false,
+        sent_at: None,
+        attempts: 0,
     });
     vec![Cmd::OpenEmbedded {
         key,
@@ -5192,10 +5248,7 @@ fn update_worker_directory_trust_checked(
     if !trusted {
         if !state.pending_kickoffs[pos].notified_untrusted {
             state.pending_kickoffs[pos].notified_untrusted = true;
-            let name = key
-                .worker_identity()
-                .map(|(_, token)| token)
-                .unwrap_or_else(|| key.as_str().to_string());
+            let name = state.kickoff_label(&key);
             state.set_status(
                 format!(
                     "{name}: Codex hasn't been told to trust this directory yet — \
@@ -5206,13 +5259,23 @@ fn update_worker_directory_trust_checked(
         }
         return Vec::new();
     }
-    let entry = state.pending_kickoffs.remove(pos);
+    if state.has_unsent_operator_input(&key)
+        || state.pending_kickoffs[pos].attempts >= KICKOFF_MAX_ATTEMPTS
+        || state.pending_kickoffs[pos]
+            .sent_at
+            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) < KICKOFF_ACK_TIMEOUT)
+    {
+        return Vec::new();
+    }
+    let entry = &mut state.pending_kickoffs[pos];
+    entry.sent_at = Some(now);
+    entry.attempts += 1;
     let cmds = vec![Cmd::WritePty {
         key: entry.key.clone(),
         bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
     }];
     state.pending_submits.push(PendingSubmit {
-        key: entry.key,
+        key: entry.key.clone(),
         nudged_at: now,
     });
     cmds
@@ -5239,9 +5302,10 @@ fn update_goinkyo_directory_trust_checked(
     if !trusted {
         if !state.pending_goinkyo_kickoffs[pos].notified_untrusted {
             state.pending_goinkyo_kickoffs[pos].notified_untrusted = true;
+            let name = state.kickoff_label(&key);
             state.set_status(
                 format!(
-                    "{GOINKYO_TOKEN}: Claude hasn't been told to trust this directory yet — \
+                    "{name}: Claude hasn't been told to trust this directory yet — \
                      answer its prompt in the pane and it will pick up its first turn"
                 ),
                 now,
@@ -5249,13 +5313,23 @@ fn update_goinkyo_directory_trust_checked(
         }
         return Vec::new();
     }
-    let entry = state.pending_goinkyo_kickoffs.remove(pos);
+    if state.has_unsent_operator_input(&key)
+        || state.pending_goinkyo_kickoffs[pos].attempts >= KICKOFF_MAX_ATTEMPTS
+        || state.pending_goinkyo_kickoffs[pos]
+            .sent_at
+            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) < KICKOFF_ACK_TIMEOUT)
+    {
+        return Vec::new();
+    }
+    let entry = &mut state.pending_goinkyo_kickoffs[pos];
+    entry.sent_at = Some(now);
+    entry.attempts += 1;
     let cmds = vec![Cmd::WritePty {
         key: entry.key.clone(),
         bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
     }];
     state.pending_submits.push(PendingSubmit {
-        key: entry.key,
+        key: entry.key.clone(),
         nudged_at: now,
     });
     cmds
@@ -9131,6 +9205,8 @@ mod tests {
             spawned_at,
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -9174,6 +9250,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -9194,9 +9272,204 @@ mod tests {
                 bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
             }]
         );
-        assert!(state.pending_kickoffs.is_empty());
+        assert_eq!(state.pending_kickoffs[0].attempts, 1);
+        assert!(state.pending_kickoffs[0].sent_at.is_some());
         assert_eq!(state.pending_submits.len(), 1);
         assert_eq!(state.pending_submits[0].key, key);
+    }
+
+    #[test]
+    fn kickoff_retries_only_after_timeout_and_stops_at_the_cap() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        let t0 = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: t0,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+
+        for attempt in 1..=KICKOFF_MAX_ATTEMPTS {
+            let at = t0 + KICKOFF_ACK_TIMEOUT * (attempt - 1);
+            if attempt > 1 {
+                let cmds = update(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    Event::Tick { relay: vec![] },
+                    at,
+                );
+                assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::CheckWorkerDirectoryTrust { key: checked, .. } if checked == &key)));
+            }
+            let cmds = update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::WorkerDirectoryTrustChecked {
+                    key: key.clone(),
+                    trusted: true,
+                },
+                at,
+            );
+            assert!(matches!(cmds.as_slice(), [Cmd::WritePty { .. }]));
+        }
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + KICKOFF_ACK_TIMEOUT * KICKOFF_MAX_ATTEMPTS,
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::CheckWorkerDirectoryTrust { .. }))
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("no acknowledgement"))
+        );
+    }
+
+    #[test]
+    fn kickoff_never_overwrites_unsent_operator_input() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(1, "worker-1");
+        let t0 = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: t0,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+        state.unsent_operator_input.insert(key.clone());
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert!(cmds.is_empty());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked { key, trusted: true },
+            t0,
+        );
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn rekeyed_output_keeps_the_kickoff_quiet_window() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let old = SessionKey::new_worker(1, "worker-1");
+        let new = SessionKey::from_id("worker-real");
+        let t0 = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: old.clone(),
+            spawned_at: t0 - Duration::from_secs(1),
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+        state.last_output_at.insert(old.clone(), t0);
+        state.rekey_pane_state(&old, &new);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
+        );
+        assert!(
+            cmds.is_empty(),
+            "the old output must still delay the renamed pane"
+        );
+    }
+
+    #[test]
+    fn a_sent_goinkyo_is_acknowledged_by_its_new_row_without_retrying() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("goinkyo-real")]);
+        let brigade = brigade_config();
+        let key = SessionKey::from_id("goinkyo-real");
+        let now = test_instant();
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key,
+            spawned_at: now,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: Some(now),
+            attempts: 1,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now + KICKOFF_ACK_TIMEOUT,
+        );
+        assert!(cmds.is_empty());
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn trust_waiting_kickoff_reminds_again_after_the_status_expires() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::new_worker(3, "worker-1");
+        let t0 = test_instant();
+        state.pending_kickoffs.push(PendingKickoff {
+            key: key.clone(),
+            spawned_at: t0,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key,
+                trusted: false,
+            },
+            t0,
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            t0 + STATUS_TIMEOUT,
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("waiting for directory trust"))
+        );
     }
 
     #[test]
@@ -9210,6 +9483,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -9290,6 +9565,8 @@ mod tests {
             spawned_at,
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let output_at = spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(50);
@@ -9337,6 +9614,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -9369,6 +9648,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
         state.last_output_at.insert(key.clone(), test_instant());
         let mut app = app_with(vec![row("sess-1")]);
@@ -11281,6 +11562,8 @@ mod tests {
             spawned_at,
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -11324,6 +11607,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -11344,13 +11629,12 @@ mod tests {
                 bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
             }]
         );
-        assert!(state.pending_goinkyo_kickoffs.is_empty());
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
         assert_eq!(state.pending_submits.len(), 1);
         assert_eq!(state.pending_submits[0].key, key);
 
-        // Re-answering trusted for the same (now-gone) entry is a no-op —
-        // "only once" for the same reason the spawn itself only happens
-        // once: nothing left in `pending_goinkyo_kickoffs` to act on.
+        // A stale answer before the acknowledgement timeout cannot create a
+        // duplicate turn.
         let cmds = update(
             &mut state,
             &mut app,
@@ -11372,6 +11656,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let cmds = update(
@@ -11421,6 +11707,8 @@ mod tests {
             spawned_at: test_instant(),
             cwd: PathBuf::from("/work"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         state.unstage(&key);
@@ -11547,6 +11835,8 @@ mod tests {
             spawned_at: t0,
             cwd: PathBuf::from("/work/alpha"),
             notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
         });
 
         let new_key = SessionKey::from_id("goinkyo-forked-id");
@@ -11589,6 +11879,89 @@ mod tests {
         assert!(
             state.screens.contains_key(write_key),
             "the key the kickoff is written to must still be a live pane"
+        );
+    }
+
+    #[test]
+    fn pane_rekey_moves_every_session_key_indexed_fact() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let old = SessionKey::new_worker(7, "worker-1");
+        let new = SessionKey::from_id("worker-real");
+        let now = test_instant();
+        state.screens.insert(old.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(old.clone());
+        state.last_forwarded_input.insert(old.clone(), now);
+        state.unsent_operator_input.insert(old.clone());
+        state.last_output_at.insert(old.clone(), now);
+        state.pending_opens.insert(old.clone(), PendingOpen::Solo);
+        state.attention_panes.insert(old.clone());
+        state.latched_attention_panes.insert(old.clone());
+        state.ring_list_waiting.insert(old.clone());
+        state.previous_ring_set = Some([old.clone()].into_iter().collect());
+        state.expected_exits.insert(old.clone());
+        state.last_relaunch.insert(old.clone(), now);
+        state.pending_dismiss = Some(old.clone());
+        state.last_focus_notified = Some(old.clone());
+        state
+            .member_tokens
+            .insert(old.clone(), "worker-1".to_string());
+        state.member_brigades.insert(old.clone(), 7);
+        state.goinkyo_pane.insert(7, old.clone());
+        state.pending_submits.push(PendingSubmit {
+            key: old.clone(),
+            nudged_at: now,
+        });
+        state.pending_kickoffs.push(PendingKickoff {
+            key: old.clone(),
+            spawned_at: now,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: old.clone(),
+            spawned_at: now,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+
+        assert!(state.rekey_pane_state(&old, &new));
+        assert!(!state.screens.contains_key(&old));
+        assert!(!state.last_forwarded_input.contains_key(&old));
+        assert!(!state.unsent_operator_input.contains(&old));
+        assert!(!state.last_output_at.contains_key(&old));
+        assert!(!state.pending_opens.contains_key(&old));
+        assert!(!state.attention_panes.contains(&old));
+        assert!(!state.latched_attention_panes.contains(&old));
+        assert!(!state.ring_list_waiting.contains(&old));
+        assert!(!state.previous_ring_set.as_ref().unwrap().contains(&old));
+        assert!(!state.expected_exits.contains(&old));
+        assert!(!state.last_relaunch.contains_key(&old));
+        assert_ne!(state.pending_dismiss.as_ref(), Some(&old));
+        assert_ne!(state.last_focus_notified.as_ref(), Some(&old));
+        assert!(!state.member_tokens.contains_key(&old));
+        assert!(!state.member_brigades.contains_key(&old));
+        assert!(state.goinkyo_pane.values().all(|key| key != &old));
+        assert!(
+            state
+                .pending_submits
+                .iter()
+                .all(|pending| pending.key != old)
+        );
+        assert!(
+            state
+                .pending_kickoffs
+                .iter()
+                .all(|pending| pending.key != old)
+        );
+        assert!(
+            state
+                .pending_goinkyo_kickoffs
+                .iter()
+                .all(|pending| pending.key != old)
         );
     }
 
