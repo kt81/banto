@@ -2767,10 +2767,15 @@ fn border_style(focused: bool, waiting: bool) -> Style {
 /// pane's title is reversed video — `Modifier::REVERSED` swaps the pane's
 /// own background in under the focus colour — so focus reads as a tab even
 /// when the operator is looking at the middle of the screen, not the
-/// border; an unfocused title stays plain text, dimmed. Named colours only
-/// (see `border_style`, whose focus colour this reuses): the reversal
-/// resolves through the user's own terminal theme rather than a hard-coded
-/// truecolor pair.
+/// border. An unfocused title names the terminal's default foreground
+/// (`Color::Reset`) and is not dimmed: it is drawn over the border row, so a
+/// title with no foreground of its own inherited the unfocused border's
+/// `DarkGray`, and the dimming on top made it close to invisible on a dark
+/// terminal theme (operator report, 2026-11-10). The default foreground is
+/// readable on both dark and light themes, where any fixed grey is not. Named
+/// colours only (see `border_style`, whose focus colour this reuses): the
+/// reversal and the default resolve through the user's own terminal theme
+/// rather than a hard-coded truecolor pair.
 fn pane_title(text: &str, focused: bool) -> Span<'static> {
     let padded = format!(" {text} ");
     if focused {
@@ -2781,7 +2786,7 @@ fn pane_title(text: &str, focused: bool) -> Span<'static> {
                 .add_modifier(Modifier::REVERSED),
         )
     } else {
-        Span::styled(padded, Style::default().add_modifier(Modifier::DIM))
+        Span::styled(padded, Style::default().fg(Color::Reset))
     }
 }
 
@@ -4828,11 +4833,52 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_pane_title_is_plain_and_dimmed() {
+    fn unfocused_pane_title_names_the_terminals_default_foreground_and_is_not_dimmed() {
         assert_eq!(
             pane_title("director", false).style,
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default().fg(Color::Reset)
         );
+    }
+
+    /// Draw a bordered block carrying `title` the way the pane frame does and
+    /// return the cell holding the title's first letter. The title is written
+    /// over the border row, so whatever its own style leaves unset is
+    /// inherited from the border's.
+    fn drawn_title_cell(focused: bool) -> ratatui::buffer::Cell {
+        use ratatui::widgets::Widget as _;
+        let area = Rect::new(0, 0, 30, 5);
+        let mut buf = Buffer::empty(area);
+        Block::bordered()
+            .title(pane_title("director", focused))
+            .border_style(border_style(focused, false))
+            .render(area, &mut buf);
+        // Row 0: the corner, then ` director ` — the `d` is at column 2.
+        let cell = buf[(2, 0)].clone();
+        assert_eq!(cell.symbol(), "d", "fixture check: found the title text");
+        cell
+    }
+
+    #[test]
+    fn an_unfocused_title_drawn_on_the_dark_gray_border_is_not_dark_gray_or_dim() {
+        // The bug: a title with no foreground of its own kept the border's
+        // `DarkGray` and was then dimmed, which is near black on a dark
+        // terminal theme (operator report, 2026-11-10).
+        assert_eq!(
+            border_style(false, false),
+            Style::default().fg(Color::DarkGray),
+            "fixture check: the unfocused border really is DarkGray"
+        );
+        let cell = drawn_title_cell(false);
+        assert_ne!(cell.fg, Color::DarkGray);
+        assert_eq!(cell.fg, Color::Reset);
+        assert!(!cell.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn a_focused_title_drawn_on_the_border_is_still_reversed_cyan() {
+        let cell = drawn_title_cell(true);
+        assert_eq!(cell.fg, Color::Cyan);
+        assert!(cell.modifier.contains(Modifier::REVERSED));
     }
 
     /// A staged Director ("dir", Claude) plus one Worker at
