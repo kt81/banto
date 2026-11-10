@@ -103,6 +103,17 @@ like an input but is actually derived from internal state — e.g. estimating
 a session's last-update time from "when I last read it" instead of the
 jsonl mtime. When enumerating `Event`s, hunt for these specifically.
 
+**Reading the painted screen is allowed in one narrow form.** A hosted
+pane's screen may be read for a fact the agent publishes nowhere else, only at
+the moment a decision needs it, and only so that it closes when unsure: a
+shape it does not recognise answers `Unrecognized`, and the caller does what
+it did before it could read. It is never used to estimate or keep track of
+state — that is the disguised input above in a new coat. The one instance so
+far is whether a Claude pane's input line holds text (`banto_core::
+input_line`), asked when relay decides to nudge. Reading sends nothing;
+the operator approved the principle on 2026-11-10. The next shortcut that
+wants the screen cites this paragraph's conditions, not the instance.
+
 ## 4. The core signature
 
 ```rust

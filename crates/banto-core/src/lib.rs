@@ -19,6 +19,7 @@ pub mod app;
 pub mod config;
 pub mod engine;
 pub mod input;
+pub mod input_line;
 pub mod key_encode;
 pub mod model;
 pub mod replay;

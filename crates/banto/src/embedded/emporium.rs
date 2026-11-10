@@ -1810,6 +1810,7 @@ fn gather_relay_observations(
                 key,
                 has_unseen,
                 is_idle_this_tick,
+                agent,
             });
         }
     }

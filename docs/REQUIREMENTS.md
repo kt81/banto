@@ -883,19 +883,40 @@ tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
 pane is marked when banto forwards something that may add text to its input
 line — a printable key, a paste, Tab, Shift+Enter (sent as a line feed,
 Claude's newline) — and unmarked only when an Enter that reaches the child
-as a `\r` (plain, Alt, Ctrl) is forwarded or the pane goes away. While a pane is marked, a nudge to it is suppressed
-whatever the focus and however long ago the operator last typed, a nudge's
-own delayed Enter is dropped if the mark appeared before it was due, and the
-status line says the nudge is being held (re-shown every 30s, never over
-another message).
+as a `\r` (plain, Alt, Ctrl) is forwarded, the pane goes away, or — for a
+Claude pane — its screen shows an empty input line (below). While a pane is
+marked, a nudge to it is suppressed whatever the focus and however long ago
+the operator last typed, a nudge's own delayed Enter is dropped if the mark
+appeared before it was due, and the status line says the nudge is being held
+(re-shown every 30s, never over another message).
 
-This mark is a stand-in, kept deliberately blunt until the input line is read
-off the pane's screen: banto cannot see the child's input line and does not
-model which keys an agent binds to clearing it. Its known weakness is a mark
-left standing over an empty line — after answering a permission dialog with
-`1`, after Ctrl+C clears the line, after Shift+Tab switches mode — which
-holds the nudge until the operator presses Enter in that pane (an Enter on
-the empty line is enough).
+The mark is blunt on purpose — it does not model which keys an agent binds to
+clearing its line — so for a Claude pane it is backed by reading the input
+line off the pane's own screen (`banto_core::input_line`), at the moment relay
+decides and never otherwise, under the fence in `docs/DISCIPLINE.md` §3. The
+reader recognises Claude's framed input block (a full-width rule above and
+below, `❯` and a no-break space on the first row) and answers `Empty`,
+`HasText` or `Unrecognized`. `HasText` holds the nudge even with no mark
+(recalled history is text no keystroke announced); `Empty` clears the mark,
+but only `INPUT_ECHO_SETTLE` (3s) after banto last forwarded input to the
+pane, because a pane's screen lags its keys (36–108ms measured on 2026-11-10)
+and an `Empty` read inside that window is not yet true; `Unrecognized` — and
+every Codex pane, whose screen is not read — leaves the mark in charge. The
+delayed Enter never reads the screen: by then the line holds banto's own
+nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
+`INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
+Claude's layout can change without notice and a reader that stopped
+recognising it would look like one that works; waiting (a permission dialog)
+is not counted. The same reading lets a retried Goinkyo kickoff press Enter
+alone when the line still holds exactly its sentence.
+
+What this does not fix: a mark left standing over an empty line — after
+answering a permission dialog with `1`, after Ctrl+C clears the line, after
+Shift+Tab switches mode — now resolves itself only where the line is read. On
+**Codex panes**, and on a Claude pane whose screen is not the recognised shape,
+it still holds the nudge until the operator presses Enter in that pane (an
+Enter on the empty line is enough). So the requirement that a nudge wait only
+for a draft that is really there is **not met for Codex**.
 
 `[brigade].relay` in config.toml (`RelayMode`, default `Auto`) toggles this
 off (`Manual`) for an operator who would rather prompt `check_messages`

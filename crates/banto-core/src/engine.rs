@@ -30,6 +30,7 @@ use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use crate::input_line::{InputLine, read_input_line, typed_text_without_whitespace};
 use crate::key_encode::{
     ForwardedInput, InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings,
     wrap_bracketed_paste,
@@ -286,6 +287,24 @@ const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
 /// pane also holds an unsent draft, the held nudge is announced on the
 /// status line (see [`StatusReminder`]).
 const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(30);
+/// How long after banto last forwarded operator input to a pane an `Empty`
+/// reading of its input line is not believed. A pane's screen lags its
+/// keystrokes: on a throwaway Claude Code session hosted by banto
+/// (2026-11-10, 19 keystrokes) the echo that shows a typed character reached
+/// the screen 36–108ms after the key, and for that long the screen still
+/// shows the empty prompt of a line that is no longer empty. Believing that
+/// frame would clear the draft mark and let a nudge land on the draft. Three
+/// seconds is a margin of about thirty times the slowest echo measured, not a
+/// measured threshold.
+const INPUT_ECHO_SETTLE: Duration = Duration::from_secs(3);
+/// How long an idle Claude pane may stay unreadable (its input line not the
+/// recognised shape, see [`crate::input_line`]) before the operator is told
+/// once that draft detection has fallen back to keystroke tracking. Claude
+/// Code's screen layout changes without notice, and a reader that quietly
+/// stopped recognising it would look exactly like one that works. A minute
+/// outlasts the menus and pickers that legitimately replace the input block
+/// for a while; nothing measured it.
+const INPUT_LINE_UNREADABLE_AFTER: Duration = Duration::from_secs(60);
 /// Minimum gap between nudges to the same member.
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Give up nudging a member after this many attempts on one unseen batch.
@@ -410,6 +429,34 @@ pub fn should_nudge(
     true
 }
 
+/// What the screen and the keystroke mark together say about one pane:
+/// whether unsent operator text is there, and whether the mark should be
+/// dropped.
+///
+/// The screen only ever adds information it can be believed about. `HasText`
+/// holds the nudge whether or not banto saw the typing (recalled history is
+/// text no keystroke announced). `Empty` clears the mark, but only once
+/// [`INPUT_ECHO_SETTLE`] has passed since banto last forwarded input to the
+/// pane, because until then the screen has not caught up with the keys.
+/// `Unrecognized` — and any `Empty` that is not yet believed — leaves the
+/// keystroke mark in charge, as it was before the screen was read.
+///
+/// `since_last_forwarded` is `None` when banto never forwarded input to the
+/// pane.
+fn unsent_verdict(
+    reading: InputLine,
+    marked: bool,
+    since_last_forwarded: Option<Duration>,
+) -> (bool, bool) {
+    match reading {
+        InputLine::HasText => (true, false),
+        InputLine::Empty if since_last_forwarded.is_none_or(|d| d >= INPUT_ECHO_SETTLE) => {
+            (false, true)
+        }
+        InputLine::Empty | InputLine::Unrecognized => (marked, false),
+    }
+}
+
 pub fn tick_relay_decision(
     states: &mut HashMap<(BrigadeId, MemberToken), RelayState>,
     brigade_id: BrigadeId,
@@ -448,6 +495,12 @@ pub struct RelayObservation {
     pub key: SessionKey,
     pub has_unseen: bool,
     pub is_idle_this_tick: Option<bool>,
+    /// Which product hosts this member, as the shell knows it (the store's
+    /// recorded choice, else the member's row). Only a Claude pane has an
+    /// input line this build can read. `None` in a stream recorded before
+    /// this field existed, which reads as "not Claude".
+    #[serde(default)]
+    pub agent: Option<AgentKind>,
 }
 
 /// A brigade's Goinkyo member row that exists but has neither a session id
@@ -837,6 +890,13 @@ pub struct EmporiumState {
     draft_hold_reminder: StatusReminder,
     kickoff_trust_reminder: StatusReminder,
     kickoff_failed_reminder: StatusReminder,
+    /// Since when each idle Claude member's input line has read as
+    /// [`InputLine::Unrecognized`], unbroken. Keyed by member rather than by
+    /// pane so a rename of the pane's key does not restart the count.
+    unreadable_since: HashMap<(BrigadeId, MemberToken), Instant>,
+    /// Members already told about an unreadable input line, so the status
+    /// line says it once, not every [`INPUT_LINE_UNREADABLE_AFTER`].
+    unreadable_noticed: HashSet<(BrigadeId, MemberToken)>,
     /// When a pane's child last produced *any* output, keyed by its own
     /// [`SessionKey`] — the baseline [`update_tick`]'s kickoff-readiness
     /// check measures quiet time against (see
@@ -1051,6 +1111,8 @@ impl EmporiumState {
             draft_hold_reminder: StatusReminder::default(),
             kickoff_trust_reminder: StatusReminder::default(),
             kickoff_failed_reminder: StatusReminder::default(),
+            unreadable_since: HashMap::new(),
+            unreadable_noticed: HashSet::new(),
             last_output_at: HashMap::new(),
             pending_kickoffs: Vec::new(),
             pending_goinkyo_kickoffs: Vec::new(),
@@ -4910,13 +4972,45 @@ fn update_tick(
 
     // Members whose nudge only an unsent draft is holding back.
     let mut held_by_draft: Vec<String> = Vec::new();
+    // Idle Claude members whose input line has been unreadable long enough
+    // to say so.
+    let mut unreadable_due: Vec<(BrigadeId, MemberToken)> = Vec::new();
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
+            // Read at the moment of the decision and nowhere else: only a
+            // Claude pane has a line this build can read, and a pane with no
+            // screen yet reads as nothing.
+            let reading = match (obs.agent, state.screens.get(&obs.key)) {
+                (Some(AgentKind::ClaudeCode), Some(pane)) => Some(read_input_line(pane)),
+                _ => None,
+            };
+            let last_forwarded = state.last_forwarded_input.get(&obs.key).copied();
+            let (has_unsent, clear_mark) = unsent_verdict(
+                reading.unwrap_or(InputLine::Unrecognized),
+                state.has_unsent_operator_input(&obs.key),
+                last_forwarded.map(|at| now.saturating_duration_since(at)),
+            );
+            if clear_mark {
+                state.unsent_operator_input.remove(&obs.key);
+            }
+            // Waiting (a permission dialog) and busy are not idle, so an
+            // unreadable screen there is ordinary and is not counted.
+            let member = (obs.brigade_id, obs.token.clone());
+            if reading == Some(InputLine::Unrecognized) && obs.is_idle_this_tick == Some(true) {
+                let since = *state.unreadable_since.entry(member.clone()).or_insert(now);
+                if now.saturating_duration_since(since) >= INPUT_LINE_UNREADABLE_AFTER
+                    && !state.unreadable_noticed.contains(&member)
+                {
+                    unreadable_due.push(member);
+                }
+            } else {
+                state.unreadable_since.remove(&member);
+            }
             let input = PaneInput {
                 is_focused: state.focus == Focus::Pane && focused.as_ref() == Some(&obs.key),
-                last_forwarded: state.last_forwarded_input.get(&obs.key).copied(),
-                has_unsent: state.has_unsent_operator_input(&obs.key),
+                last_forwarded,
+                has_unsent,
             };
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
@@ -4983,6 +5077,24 @@ fn update_tick(
             ),
             now,
         );
+    }
+
+    // Said once per member, and only into a free status line: a member left
+    // due stays due until it fits.
+    if !unreadable_due.is_empty() && state.status.is_none() {
+        let labels: Vec<String> = unreadable_due
+            .iter()
+            .map(|(brigade_id, token)| format!("brigade {brigade_id} {token}"))
+            .collect();
+        state.set_status(
+            format!(
+                "relay: cannot read the input line of {} — unsent-draft detection is back to \
+                 keystroke tracking",
+                labels.join(", ")
+            ),
+            now,
+        );
+        state.unreadable_noticed.extend(unreadable_due);
     }
 
     let mut trust_waiting: Vec<String> = state
@@ -5321,9 +5433,26 @@ fn update_goinkyo_directory_trust_checked(
     {
         return Vec::new();
     }
+    // A retry means the sentence was typed once and no turn followed. If the
+    // input line still holds exactly that sentence — and, by the check above,
+    // the operator typed nothing — the Enter is what was lost, and typing the
+    // sentence again would send it twice. Compared by text, not just "there
+    // is some text": the line could hold something else.
+    let sentence_still_typed = state.pending_goinkyo_kickoffs[pos].sent_at.is_some()
+        && state.screens.get(&key).is_some_and(|pane| {
+            read_input_line(pane) == InputLine::HasText
+                && typed_text_without_whitespace(pane).as_deref()
+                    == Some(&*GOINKYO_KICKOFF_LINE.replace(char::is_whitespace, ""))
+        });
     let entry = &mut state.pending_goinkyo_kickoffs[pos];
     entry.sent_at = Some(now);
     entry.attempts += 1;
+    if sentence_still_typed {
+        return vec![Cmd::WritePty {
+            key: entry.key.clone(),
+            bytes: b"\r".to_vec(),
+        }];
+    }
     let cmds = vec![Cmd::WritePty {
         key: entry.key.clone(),
         bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
@@ -8962,6 +9091,7 @@ mod tests {
             key: worker.clone(),
             has_unseen: true,
             is_idle_this_tick: Some(true),
+            agent: None,
         };
         // Isolates the WritePty cmds from any incidental ResizePty (the
         // fresh 24x80 `Screen`s almost certainly don't match the pane
@@ -9059,6 +9189,7 @@ mod tests {
             key: offstage.clone(),
             has_unseen: true,
             is_idle_this_tick: Some(true),
+            agent: None,
         };
         let now = test_instant();
 
@@ -9743,6 +9874,7 @@ mod tests {
             key: worker.clone(),
             has_unseen: true,
             is_idle_this_tick: Some(true),
+            agent: None,
         };
         now += Duration::from_millis(10);
         update(
@@ -9797,6 +9929,7 @@ mod tests {
             key: worker.clone(),
             has_unseen: true,
             is_idle_this_tick: Some(true),
+            agent: None,
         };
         now += Duration::from_millis(10);
         update(
@@ -9868,12 +10001,21 @@ mod tests {
                         key: key.clone(),
                         has_unseen: true,
                         is_idle_this_tick: Some(true),
+                        agent: None,
                     }],
                 },
                 *now,
             );
             writes.extend(writes_of(&cmds));
         }
+        writes
+    }
+
+    /// The nudge, and the Enter the second tick of a call that began with the
+    /// idle streak already built up flushes behind it.
+    fn nudge_then_enter_for(key: &SessionKey) -> Vec<(SessionKey, Vec<u8>)> {
+        let mut writes = nudge_for(key);
+        writes.push((key.clone(), b"\r".to_vec()));
         writes
     }
 
@@ -10294,6 +10436,7 @@ mod tests {
                     key: key.clone(),
                     has_unseen,
                     is_idle_this_tick: Some(true),
+                    agent: None,
                 }],
             },
             now,
@@ -10564,6 +10707,556 @@ mod tests {
         );
     }
 
+    // --- reading the input line off the pane's screen ---------------------
+
+    /// Draw a Claude-shaped prompt block at the bottom of `screen`: a
+    /// full-width rule, `❯` + no-break space + either `typed` (normal
+    /// attributes) or a dim placeholder, a rule, a footer row, and the cursor
+    /// after what is on the prompt row. The shape `crate::input_line` reads;
+    /// hand-made, nothing recorded.
+    fn draw_prompt_on(screen: &mut Screen, typed: Option<&str>) {
+        let (rows, cols) = screen.screen().size();
+        let rule = "\u{2500}".repeat(cols as usize);
+        let p = rows - 3; // 1-based prompt row; the footer is the last row but one
+        let body = match typed {
+            Some(text) => text.to_string(),
+            None => "\x1b[2mTry something\x1b[0m".to_string(),
+        };
+        let cursor_col = 3 + typed.map_or(0, |text| text.chars().count());
+        let bytes = format!(
+            "\x1b[2J\x1b[{};1H{rule}\x1b[{p};1H\u{276f}\u{a0}{body}\x1b[{};1H{rule}\x1b[{};1H  footer\x1b[{p};{cursor_col}H",
+            p - 1,
+            p + 1,
+            p + 2,
+        );
+        screen.process(bytes.as_bytes());
+    }
+
+    fn draw_prompt(state: &mut EmporiumState, key: &SessionKey, typed: Option<&str>) {
+        draw_prompt_on(state.screens.get_mut(key).unwrap(), typed);
+    }
+
+    /// The Director pane's screen is laid out for real (a 160x50 terminal)
+    /// so the prompt drawn on it is the size the pane has, and focus is on
+    /// the Worker so the 30s typing quiet period does not apply to the
+    /// Director — leaving the draft rules as the only thing under test.
+    fn reading_fixture() -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
+        let (mut state, app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+        state.size = (160, 50);
+        resize_staged_tiles(&mut state);
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        (state, app, brigade, director, now)
+    }
+
+    /// What the shell reports about one member for a tick, beyond its key.
+    #[derive(Clone, Copy)]
+    struct Seen {
+        agent: Option<AgentKind>,
+        idle: Option<bool>,
+        has_unseen: bool,
+    }
+
+    /// One relay tick for `key` with the given observations.
+    fn tick_obs(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        seen: Seen,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: vec![RelayObservation {
+                    brigade_id: 1,
+                    token: "director".to_string(),
+                    key: key.clone(),
+                    has_unseen: seen.has_unseen,
+                    is_idle_this_tick: seen.idle,
+                    agent: seen.agent,
+                }],
+            },
+            now,
+        )
+    }
+
+    /// Two idle ticks a second apart (the debounce) for `key` as `agent`,
+    /// advancing `now`; every PTY write they produced.
+    fn two_ticks_as(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        agent: Option<AgentKind>,
+        now: &mut Instant,
+    ) -> Vec<(SessionKey, Vec<u8>)> {
+        let mut writes = Vec::new();
+        for _ in 0..2 {
+            *now += Duration::from_secs(1);
+            let cmds = tick_obs(
+                state,
+                app,
+                brigade,
+                key,
+                Seen {
+                    agent,
+                    idle: Some(true),
+                    has_unseen: true,
+                },
+                *now,
+            );
+            writes.extend(writes_of(&cmds));
+        }
+        writes
+    }
+
+    const CLAUDE: Option<AgentKind> = Some(AgentKind::ClaudeCode);
+
+    #[test]
+    fn text_on_the_screen_holds_the_nudge_even_though_banto_saw_no_typing() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        draw_prompt(&mut state, &director, Some("recalled"));
+        assert!(!state.has_unsent_operator_input(&director), "no keystroke");
+
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+
+        assert!(writes.is_empty(), "{writes:?}");
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("holding the nudge")),
+            "the hold is announced like any other: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn an_empty_screen_drops_a_stale_mark_and_lets_the_nudge_through() {
+        // The mark is the stand-in for exactly this: the operator typed, then
+        // cleared the line by a route banto does not model (Ctrl+C here).
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        // The operator's focus was the Director when they typed; it has since
+        // moved to the Worker (see the fixture).
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        // (the key above went to the Director pane only if focus was there)
+        state.unsent_operator_input.insert(director.clone());
+        draw_prompt(&mut state, &director, None);
+        now += INPUT_ECHO_SETTLE + Duration::from_secs(1);
+
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+
+        assert_eq!(writes, nudge_for(&director));
+        assert!(
+            !state.has_unsent_operator_input(&director),
+            "the mark is gone"
+        );
+    }
+
+    #[test]
+    fn an_empty_screen_just_after_a_keystroke_is_not_believed() {
+        // Measured: the echo of a key reaches the screen 36-108ms later, and
+        // until then the screen still shows the empty prompt.
+        let (mut state, mut app, brigade, director, _) = reading_fixture();
+        let typed_at = test_instant();
+        state.unsent_operator_input.insert(director.clone());
+        state
+            .last_forwarded_input
+            .insert(director.clone(), typed_at);
+        draw_prompt(&mut state, &director, None);
+        let mut now = typed_at;
+
+        let early = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert!(early.is_empty(), "inside the settle window: {early:?}");
+        assert!(state.has_unsent_operator_input(&director));
+
+        now = typed_at + INPUT_ECHO_SETTLE;
+        let later = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert_eq!(
+            later,
+            nudge_then_enter_for(&director),
+            "past it, the empty screen is believed"
+        );
+        assert!(!state.has_unsent_operator_input(&director));
+    }
+
+    #[test]
+    fn an_unreadable_screen_leaves_the_keystroke_mark_in_charge() {
+        // A blank screen: no prompt block to read.
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.unsent_operator_input.insert(director.clone());
+        let held = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert!(held.is_empty(), "marked: {held:?}");
+
+        state.unsent_operator_input.remove(&director);
+        let sent = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert_eq!(sent, nudge_then_enter_for(&director), "unmarked");
+    }
+
+    #[test]
+    fn a_codex_pane_is_always_judged_by_the_mark_alone() {
+        let codex = Some(AgentKind::Codex);
+        // Text drawn like Claude's, no mark: the screen is not read, so the
+        // nudge goes.
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        draw_prompt(&mut state, &director, Some("text"));
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
+        assert_eq!(writes, nudge_for(&director));
+
+        // A mark and an empty-looking screen: the mark stands.
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.unsent_operator_input.insert(director.clone());
+        draw_prompt(&mut state, &director, None);
+        now += INPUT_ECHO_SETTLE + Duration::from_secs(1);
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
+        assert!(writes.is_empty(), "{writes:?}");
+        assert!(state.has_unsent_operator_input(&director));
+    }
+
+    #[test]
+    fn a_member_with_no_recorded_product_is_judged_by_the_mark_alone() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        draw_prompt(&mut state, &director, Some("text"));
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, None, &mut now);
+        assert_eq!(writes, nudge_for(&director));
+    }
+
+    #[test]
+    fn a_pending_enter_still_trusts_only_the_mark_not_the_screen() {
+        // By the time the delayed Enter is due, the line holds banto's own
+        // nudge sentence, which reads as text; that must not stop the Enter.
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert_eq!(writes, nudge_for(&director));
+        draw_prompt(&mut state, &director, Some("[banto relay] nudge text"));
+        assert!(!state.has_unsent_operator_input(&director));
+
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CLAUDE,
+                idle: Some(false),
+                has_unseen: true,
+            },
+            now,
+        );
+
+        assert_eq!(writes_of(&cmds), vec![(director.clone(), b"\r".to_vec())]);
+    }
+
+    #[test]
+    fn an_idle_claude_pane_that_stays_unreadable_is_reported_once() {
+        let (mut state, mut app, brigade, director, start) = reading_fixture();
+        let tick = |state: &mut EmporiumState, app: &mut App, idle: Option<bool>, at: Duration| {
+            tick_obs(
+                state,
+                app,
+                &brigade,
+                &director,
+                Seen {
+                    agent: CLAUDE,
+                    idle,
+                    has_unseen: false,
+                },
+                start + at,
+            );
+        };
+
+        tick(&mut state, &mut app, Some(true), Duration::ZERO);
+        tick(
+            &mut state,
+            &mut app,
+            Some(true),
+            INPUT_LINE_UNREADABLE_AFTER - Duration::from_secs(1),
+        );
+        assert!(
+            !state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("cannot read")),
+            "not yet: {:?}",
+            state.status
+        );
+
+        tick(
+            &mut state,
+            &mut app,
+            Some(true),
+            INPUT_LINE_UNREADABLE_AFTER,
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("cannot read")),
+            "{:?}",
+            state.status
+        );
+
+        // The status runs out and nothing says it again.
+        for extra in [5, 40, 400] {
+            tick(
+                &mut state,
+                &mut app,
+                Some(true),
+                INPUT_LINE_UNREADABLE_AFTER + Duration::from_secs(extra),
+            );
+        }
+        assert!(
+            !state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("cannot read")),
+            "said once: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn an_unreadable_screen_while_waiting_or_busy_is_not_reported() {
+        // A permission dialog replaces the input block; that is normal.
+        for idle in [Some(false), None] {
+            let (mut state, mut app, brigade, director, start) = reading_fixture();
+            for secs in [0, 30, 60, 120, 600] {
+                tick_obs(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    &director,
+                    Seen {
+                        agent: CLAUDE,
+                        idle,
+                        has_unseen: false,
+                    },
+                    start + Duration::from_secs(secs),
+                );
+                assert!(
+                    !state
+                        .status
+                        .as_deref()
+                        .is_some_and(|s| s.contains("cannot read")),
+                    "idle={idle:?} at +{secs}s: {:?}",
+                    state.status
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_readable_screen_resets_the_unreadable_clock() {
+        let (mut state, mut app, brigade, director, start) = reading_fixture();
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CLAUDE,
+                idle: Some(true),
+                has_unseen: false,
+            },
+            start,
+        );
+        draw_prompt(&mut state, &director, None);
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CLAUDE,
+                idle: Some(true),
+                has_unseen: false,
+            },
+            start + INPUT_LINE_UNREADABLE_AFTER - Duration::from_secs(1),
+        );
+        // Unreadable again from here; the minute starts over.
+        state
+            .screens
+            .get_mut(&director)
+            .unwrap()
+            .process(b"\x1b[2J");
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CLAUDE,
+                idle: Some(true),
+                has_unseen: false,
+            },
+            start + INPUT_LINE_UNREADABLE_AFTER,
+        );
+        assert!(
+            !state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("cannot read")),
+            "{:?}",
+            state.status
+        );
+    }
+
+    // --- Goinkyo kickoff retry: Enter alone when the sentence is still typed -
+
+    fn goinkyo_kickoff_retry_state(
+        screen_setup: impl FnOnce(&mut Screen),
+        sent: bool,
+    ) -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::from_id("goinkyo-real");
+        let t0 = test_instant();
+        let mut screen = Screen::new(24, 80);
+        screen_setup(&mut screen);
+        state.screens.insert(key.clone(), screen);
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: key.clone(),
+            spawned_at: t0,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: sent.then_some(t0),
+            attempts: u32::from(sent),
+        });
+        (state, app, brigade, key, t0)
+    }
+
+    fn goinkyo_trust_answer(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        at: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key: key.clone(),
+                trusted: true,
+            },
+            at,
+        )
+    }
+
+    #[test]
+    fn a_retried_goinkyo_kickoff_presses_enter_alone_when_its_sentence_is_still_typed() {
+        let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
+            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            true,
+        );
+
+        let cmds = goinkyo_trust_answer(
+            &mut state,
+            &mut app,
+            &brigade,
+            &key,
+            t0 + KICKOFF_ACK_TIMEOUT,
+        );
+
+        assert_eq!(
+            cmds.len(),
+            1,
+            "just the Enter, not the sentence again: {cmds:?}"
+        );
+        assert_eq!(writes_of(&cmds), vec![(key.clone(), b"\r".to_vec())]);
+        assert!(state.pending_submits.is_empty(), "no delayed Enter queued");
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 2);
+    }
+
+    #[test]
+    fn a_retried_goinkyo_kickoff_types_the_sentence_again_when_it_is_not_on_the_line() {
+        let sentence = GOINKYO_KICKOFF_LINE.as_bytes().to_vec();
+        for (name, screen_setup) in [
+            (
+                "empty line",
+                Box::new(|screen: &mut Screen| draw_prompt_on(screen, None))
+                    as Box<dyn FnOnce(&mut Screen)>,
+            ),
+            (
+                "unreadable screen",
+                Box::new(|_: &mut Screen| {}) as Box<dyn FnOnce(&mut Screen)>,
+            ),
+            (
+                "some other text",
+                Box::new(|screen: &mut Screen| draw_prompt_on(screen, Some("something else")))
+                    as Box<dyn FnOnce(&mut Screen)>,
+            ),
+        ] {
+            let (mut state, mut app, brigade, key, t0) =
+                goinkyo_kickoff_retry_state(screen_setup, true);
+            let cmds = goinkyo_trust_answer(
+                &mut state,
+                &mut app,
+                &brigade,
+                &key,
+                t0 + KICKOFF_ACK_TIMEOUT,
+            );
+            assert_eq!(
+                writes_of(&cmds),
+                vec![(key.clone(), sentence.clone())],
+                "{name}"
+            );
+            assert_eq!(state.pending_submits.len(), 1, "{name}: its Enter follows");
+        }
+    }
+
+    #[test]
+    fn a_first_goinkyo_kickoff_is_not_shortened_by_what_the_screen_shows() {
+        let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
+            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            false,
+        );
+
+        let cmds = goinkyo_trust_answer(&mut state, &mut app, &brigade, &key, t0);
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_retried_goinkyo_kickoff_does_nothing_over_the_operators_own_draft() {
+        let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
+            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            true,
+        );
+        state.unsent_operator_input.insert(key.clone());
+
+        let cmds = goinkyo_trust_answer(
+            &mut state,
+            &mut app,
+            &brigade,
+            &key,
+            t0 + KICKOFF_ACK_TIMEOUT,
+        );
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+    }
+
     #[test]
     fn unstaging_a_pane_clears_its_unsent_mark() {
         let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
@@ -10665,6 +11358,7 @@ mod tests {
             key: worker.clone(),
             has_unseen: true,
             is_idle_this_tick: Some(true),
+            agent: None,
         };
 
         update(
