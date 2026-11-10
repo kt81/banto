@@ -30,7 +30,10 @@ use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crate::key_encode::{key_to_bytes, normalize_paste_line_endings, wrap_bracketed_paste};
+use crate::key_encode::{
+    ForwardedInput, InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings,
+    wrap_bracketed_paste,
+};
 use crate::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberToken, PtyExitReason,
     SessionRow, SessionToOpen,
@@ -276,11 +279,12 @@ const RELAY_IDLE_STREAK_REQUIRED: u32 = 2;
 /// the mixed result before he could stop it — see [`update_key`]'s
 /// `cancel_pending_submit_on_input` call for the other half of that fix).
 /// 30s is chosen for the cost asymmetry, not a measured pause length: a
-/// nudge arriving late only delays how soon the Worker notices unread mail
-/// (and the operator can still see the unread marker in the sidebar in the
-/// meantime), while a nudge arriving mid-composition can destroy what the
-/// operator was actually typing — a much more expensive failure to guard a
-/// few extra seconds against.
+/// nudge arriving late only delays how soon the Worker notices unread mail,
+/// while a nudge arriving mid-composition can destroy what the operator was
+/// actually typing — a much more expensive failure to guard a few extra
+/// seconds against. Nothing marks unread mail anywhere on screen; once the
+/// pane also holds an unsent draft, the held nudge is announced on the
+/// status line (see [`StatusReminder`]).
 const RELAY_INPUT_QUIET_PERIOD: Duration = Duration::from_secs(30);
 /// Minimum gap between nudges to the same member.
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -294,6 +298,13 @@ const RELAY_NUDGE_LINE: &str =
 const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the status line stays clear — showing the key guidance — between
+/// one showing of a recurring notice and the next (see [`StatusReminder`]).
+/// With [`STATUS_TIMEOUT`] that makes a 30s cycle, five seconds of notice and
+/// twenty-five of guidance. The operator asked for exactly that rhythm: a
+/// notice that stays up, or returns the instant it clears, would hide the
+/// key guidance for as long as the condition lasts.
+const STATUS_REMINDER_GAP: Duration = Duration::from_secs(25);
 /// Minimum gap between host bells for newly visible attention marks. This is
 /// a policy throttle, not a measured terminal limit: an arrival remains
 /// prompt, while a burst of panes cannot turn into an alarm.
@@ -354,19 +365,36 @@ pub struct RelayState {
     nudge: NudgeState,
 }
 
+/// What banto knows about the operator's input to one pane when deciding
+/// whether to nudge it. Bundled so [`tick_relay_decision`] stays under
+/// clippy's too-many-arguments.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PaneInput {
+    /// The pane is the one the operator's keystrokes would reach right now.
+    pub is_focused: bool,
+    /// When banto last forwarded operator input to this pane.
+    pub last_forwarded: Option<Instant>,
+    /// [`EmporiumState::has_unsent_operator_input`] for this pane.
+    pub has_unsent: bool,
+}
+
 pub fn should_nudge(
     now: Instant,
     idle_streak: u32,
-    is_focused: bool,
-    last_forwarded_input: Option<Instant>,
+    input: PaneInput,
     has_unseen: bool,
     state: &NudgeState,
 ) -> bool {
     if !has_unseen || idle_streak < RELAY_IDLE_STREAK_REQUIRED {
         return false;
     }
-    if is_focused
-        && let Some(last_input) = last_forwarded_input
+    // Neither focus nor elapsed time is consulted: an unsent draft does not
+    // age out and does not move with the operator's attention.
+    if input.has_unsent {
+        return false;
+    }
+    if input.is_focused
+        && let Some(last_input) = input.last_forwarded
         && now.saturating_duration_since(last_input) < RELAY_INPUT_QUIET_PERIOD
     {
         return false;
@@ -387,8 +415,7 @@ pub fn tick_relay_decision(
     token: &MemberToken,
     now: Instant,
     is_idle_this_tick: Option<bool>,
-    is_focused: bool,
-    last_forwarded_input: Option<Instant>,
+    input: PaneInput,
     has_unseen: bool,
 ) -> bool {
     if !has_unseen {
@@ -401,14 +428,7 @@ pub fn tick_relay_decision(
     } else {
         0
     };
-    let nudge = should_nudge(
-        now,
-        state.idle_streak,
-        is_focused,
-        last_forwarded_input,
-        has_unseen,
-        &state.nudge,
-    );
+    let nudge = should_nudge(now, state.idle_streak, input, has_unseen, &state.nudge);
     if nudge {
         state.nudge.last_nudge = Some(now);
         state.nudge.attempts += 1;
@@ -470,6 +490,45 @@ pub enum GoinkyoObservation {
     NoGoinkyo { brigade_id: BrigadeId },
     /// A member row exists with no session id yet.
     AwaitingSpawn(GoinkyoSpawnCandidate),
+}
+
+/// Shows a status message again and again for as long as a condition holds,
+/// without ever covering another message or leaving the key guidance hidden:
+/// one showing, then [`STATUS_TIMEOUT`] of notice, then
+/// [`STATUS_REMINDER_GAP`] of ordinary status line, then the next showing.
+///
+/// One instance per condition, kept in [`EmporiumState`]. Each tick the owner
+/// asks [`Self::due`] with whether the condition still holds; on `true` it
+/// calls `set_status` itself, because the message text is the owner's and the
+/// reminder holds no state beyond when it last spoke.
+#[derive(Debug, Default)]
+pub struct StatusReminder {
+    last_shown: Option<Instant>,
+}
+
+impl StatusReminder {
+    /// Whether the message should go up now. `status_free` is whether the
+    /// status line is empty: while something else is showing — an error, say
+    /// — this stays pending rather than skipping the showing, so the notice
+    /// appears as soon as the line clears. A `true` is taken as shown, so the
+    /// caller must show it. Once `active` goes false the cycle resets, and a
+    /// condition that returns shows immediately.
+    pub fn due(&mut self, active: bool, status_free: bool, now: Instant) -> bool {
+        if !active {
+            self.last_shown = None;
+            return false;
+        }
+        if !status_free {
+            return false;
+        }
+        let due = self.last_shown.is_none_or(|shown| {
+            now.saturating_duration_since(shown) >= STATUS_TIMEOUT + STATUS_REMINDER_GAP
+        });
+        if due {
+            self.last_shown = Some(now);
+        }
+        due
+    }
 }
 
 /// A nudge awaiting its phase-two Enter (see [`update_tick`]).
@@ -738,6 +797,26 @@ pub struct EmporiumState {
     /// else's keystrokes. An entry is dropped when its pane unstages (see
     /// [`Self::unstage`]) so a closed pane's key never accumulates here.
     pub last_forwarded_input: HashMap<SessionKey, Instant>,
+    /// Panes the operator has put text into that banto has not seen them
+    /// send — see [`Self::has_unsent_operator_input`], the one way to read
+    /// it. A pane enters when a forwarded key or paste may have added text
+    /// ([`InputEffect::AddsText`]) and leaves when a plain Enter is forwarded
+    /// ([`InputEffect::Submits`]) or the pane unstages; nothing else clears
+    /// it, deliberately, because which keys empty an agent's input line is
+    /// the agent's business and changes between versions.
+    ///
+    /// Exists because elapsed time cannot measure a draft: the first nudge
+    /// that corrupted a message was cured by widening a quiet period
+    /// ([`RELAY_INPUT_QUIET_PERIOD`]), and the second — a draft left in the
+    /// Director's input line while the operator worked elsewhere — got past
+    /// that same period twice over, by moving focus off the pane (the
+    /// period only applies to the focused one) and by simply outlasting 30s.
+    /// A draft is a fact about what was typed and not yet sent, so it is
+    /// recorded as that.
+    unsent_operator_input: HashSet<SessionKey>,
+    /// Announces on the status line that a nudge is being held back by
+    /// [`Self::unsent_operator_input`]; see [`update_tick`].
+    draft_hold_reminder: StatusReminder,
     /// When a pane's child last produced *any* output, keyed by its own
     /// [`SessionKey`] — the baseline [`update_tick`]'s kickoff-readiness
     /// check measures quiet time against (see
@@ -944,6 +1023,8 @@ impl EmporiumState {
             status_set_at: None,
             relay_states: HashMap::new(),
             last_forwarded_input: HashMap::new(),
+            unsent_operator_input: HashSet::new(),
+            draft_hold_reminder: StatusReminder::default(),
             last_output_at: HashMap::new(),
             pending_kickoffs: Vec::new(),
             pending_goinkyo_kickoffs: Vec::new(),
@@ -1021,6 +1102,7 @@ impl EmporiumState {
         self.stage.remove(key);
         self.member_tokens.remove(key);
         self.last_forwarded_input.remove(key);
+        self.unsent_operator_input.remove(key);
         self.last_output_at.remove(key);
         self.latched_attention_panes.remove(key);
         self.pending_kickoffs.retain(|pending| &pending.key != key);
@@ -1028,6 +1110,34 @@ impl EmporiumState {
             .retain(|pending| &pending.key != key);
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
+        }
+    }
+
+    /// Whether the operator has typed or pasted text into `key`'s pane that
+    /// banto has not seen them send. The question every automated write into
+    /// a pane has to ask first: such a write lands after the draft, and a
+    /// following `\r` sends the two together.
+    ///
+    /// Knows only what banto forwarded — text the operator put there some
+    /// other way, or keys an agent binds to clearing its line, are invisible
+    /// (see [`Self::unsent_operator_input`] for what clears it).
+    pub fn has_unsent_operator_input(&self, key: &SessionKey) -> bool {
+        self.unsent_operator_input.contains(key)
+    }
+
+    /// Record what forwarding `input` to `key`'s pane means for
+    /// [`Self::has_unsent_operator_input`]. The only writer of the mark apart
+    /// from [`Self::unstage`] and the rekeys; the rule itself lives in
+    /// [`input_effect`].
+    fn note_forwarded_input(&mut self, key: &SessionKey, input: ForwardedInput<'_>) {
+        match input_effect(input) {
+            InputEffect::AddsText => {
+                self.unsent_operator_input.insert(key.clone());
+            }
+            InputEffect::Submits => {
+                self.unsent_operator_input.remove(key);
+            }
+            InputEffect::Neutral => {}
         }
     }
 
@@ -2375,6 +2485,7 @@ fn update_key(
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
+                    state.note_forwarded_input(&target, ForwardedInput::Key(&key));
                     cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                     vec![Cmd::WritePty { key: target, bytes }]
                 }
@@ -2475,11 +2586,13 @@ fn resolve_armed_prefix(
             let Some(target) = state.stage.focused_key().cloned() else {
                 return Vec::new();
             };
-            let bytes = key_to_bytes(&state.prefix.as_key_event());
+            let literal = state.prefix.as_key_event();
+            let bytes = key_to_bytes(&literal);
             state.last_forwarded_input.insert(target.clone(), now);
             if bytes.is_empty() {
                 Vec::new()
             } else {
+                state.note_forwarded_input(&target, ForwardedInput::Key(&literal));
                 cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                 vec![Cmd::WritePty { key: target, bytes }]
             }
@@ -3751,6 +3864,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
             normalized.into_bytes()
         };
         state.last_forwarded_input.insert(key.clone(), now);
+        state.note_forwarded_input(&key, ForwardedInput::Paste(&text));
         cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
     }
@@ -4003,6 +4117,9 @@ fn relaunch_member(
     }
     state.last_relaunch.insert(key.clone(), now);
     state.screens.remove(key);
+    // The process that held any draft is gone; the restarted one starts with
+    // an empty input line.
+    state.unsent_operator_input.remove(key);
     let cwd = row.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
     state.pending_opens.insert(
         key.clone(),
@@ -4244,6 +4361,13 @@ fn update_discovery_result(
             pending.key = new_key.clone();
         }
     }
+    // The mark follows the pane for the same reason: a draft typed into a
+    // fresh Worker before its session is discovered must still hold back
+    // the nudge once the pane has its real key, and the mark is asked for by
+    // that key.
+    if state.unsent_operator_input.remove(&old_key) {
+        state.unsent_operator_input.insert(new_key.clone());
+    }
     if let Some((brigade_id, token)) = member {
         state
             .member_tokens
@@ -4373,6 +4497,11 @@ fn update_member_session_forked(
                 if pending.key == old_key {
                     pending.key = new_key.clone();
                 }
+            }
+            // An auto-compaction fork renames the pane under a draft just as
+            // discovery does; see `update_discovery_result`.
+            if state.unsent_operator_input.remove(&old_key) {
+                state.unsent_operator_input.insert(new_key.clone());
             }
             // Same reasoning as `update_discovery_result`'s own version of
             // this: `goinkyo_pane` and any queued `PendingGoinkyoKickoff`
@@ -4703,10 +4832,16 @@ fn update_tick(
     while i < state.pending_submits.len() {
         if now.saturating_duration_since(state.pending_submits[i].nudged_at) >= RELAY_SUBMIT_DELAY {
             let entry = state.pending_submits.swap_remove(i);
-            cmds.push(Cmd::WritePty {
-                key: entry.key,
-                bytes: b"\r".to_vec(),
-            });
+            // A draft here sends together with the line just written. Input
+            // typed after the nudge already cancels the submit
+            // ([`cancel_pending_submit_on_input`]); this is for a draft that
+            // was already there.
+            if !state.has_unsent_operator_input(&entry.key) {
+                cmds.push(Cmd::WritePty {
+                    key: entry.key,
+                    bytes: b"\r".to_vec(),
+                });
+            }
         } else {
             i += 1;
         }
@@ -4752,17 +4887,22 @@ fn update_tick(
         }
     }
 
+    // Members whose nudge only an unsent draft is holding back.
+    let mut held_by_draft: Vec<MemberToken> = Vec::new();
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
-            let is_focused = state.focus == Focus::Pane && focused.as_ref() == Some(&obs.key);
+            let input = PaneInput {
+                is_focused: state.focus == Focus::Pane && focused.as_ref() == Some(&obs.key),
+                last_forwarded: state.last_forwarded_input.get(&obs.key).copied(),
+                has_unsent: state.has_unsent_operator_input(&obs.key),
+            };
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
                 &obs.token,
                 now,
                 obs.is_idle_this_tick,
-                is_focused,
-                state.last_forwarded_input.get(&obs.key).copied(),
+                input,
                 obs.has_unseen,
             );
             if nudge {
@@ -4775,6 +4915,25 @@ fn update_tick(
                     nudged_at: now,
                 });
                 state.set_status(format!("relay: nudged {}", obs.token), now);
+            } else if input.has_unsent
+                && state
+                    .relay_states
+                    .get(&obs.token)
+                    .is_some_and(|relay_state| {
+                        should_nudge(
+                            now,
+                            relay_state.idle_streak,
+                            PaneInput {
+                                has_unsent: false,
+                                ..input
+                            },
+                            obs.has_unseen,
+                            &relay_state.nudge,
+                        )
+                    })
+            {
+                // Every other condition says nudge; the draft alone says no.
+                held_by_draft.push(obs.token);
             }
         }
     }
@@ -4784,6 +4943,21 @@ fn update_tick(
     {
         state.status = None;
         state.status_set_at = None;
+    }
+
+    // After the expiry above, so a showing that just ran out can be followed
+    // by the cycle's own gap rather than waiting out another tick.
+    if state
+        .draft_hold_reminder
+        .due(!held_by_draft.is_empty(), state.status.is_none(), now)
+    {
+        state.set_status(
+            format!(
+                "relay: holding the nudge to {} — unsent input in the pane",
+                held_by_draft.join(", ")
+            ),
+            now,
+        );
     }
 
     if let Some(armed_at) = state.prefix_armed
@@ -5339,8 +5513,7 @@ mod tests {
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &NudgeState::default(),
         ));
@@ -5352,8 +5525,7 @@ mod tests {
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            None,
+            PaneInput::default(),
             false,
             &NudgeState::default(),
         ));
@@ -5365,8 +5537,7 @@ mod tests {
         assert!(!should_nudge(
             now,
             0,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &NudgeState::default(),
         ));
@@ -5378,8 +5549,7 @@ mod tests {
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED - 1,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &NudgeState::default(),
         ));
@@ -5392,8 +5562,11 @@ mod tests {
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            true,
-            Some(last_input),
+            PaneInput {
+                is_focused: true,
+                last_forwarded: Some(last_input),
+                has_unsent: false,
+            },
             true,
             &NudgeState::default(),
         ));
@@ -5406,8 +5579,11 @@ mod tests {
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            true,
-            Some(last_input),
+            PaneInput {
+                is_focused: true,
+                last_forwarded: Some(last_input),
+                has_unsent: false,
+            },
             true,
             &NudgeState::default(),
         ));
@@ -5420,8 +5596,11 @@ mod tests {
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            Some(last_input),
+            PaneInput {
+                is_focused: false,
+                last_forwarded: Some(last_input),
+                has_unsent: false,
+            },
             true,
             &NudgeState::default(),
         ));
@@ -5437,8 +5616,7 @@ mod tests {
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &state,
         ));
@@ -5454,8 +5632,7 @@ mod tests {
         assert!(!should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &state,
         ));
@@ -5471,8 +5648,7 @@ mod tests {
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &state,
         ));
@@ -5484,8 +5660,7 @@ mod tests {
         assert!(should_nudge(
             now,
             RELAY_IDLE_STREAK_REQUIRED,
-            false,
-            None,
+            PaneInput::default(),
             true,
             &NudgeState {
                 last_nudge: None,
@@ -5505,8 +5680,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
         assert!(tick_relay_decision(
@@ -5514,8 +5688,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
     }
@@ -5531,8 +5704,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
         assert!(!tick_relay_decision(
@@ -5540,8 +5712,7 @@ mod tests {
             &token,
             now,
             Some(false),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
         assert!(!tick_relay_decision(
@@ -5549,8 +5720,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
     }
@@ -5567,8 +5737,7 @@ mod tests {
                 &token,
                 now,
                 None,
-                false,
-                None,
+                PaneInput::default(),
                 true,
             ));
         }
@@ -5580,14 +5749,20 @@ mod tests {
         let token = "worker-1".to_string();
         let now = test_instant();
 
-        tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
+        tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            PaneInput::default(),
+            true,
+        );
         assert!(tick_relay_decision(
             &mut states,
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
         assert_eq!(states.get(&token).unwrap().nudge.attempts, 1);
@@ -5597,8 +5772,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             false,
         ));
         assert!(!states.contains_key(&token));
@@ -5608,8 +5782,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
         assert_eq!(states.get(&token).unwrap().idle_streak, 1);
@@ -5622,7 +5795,14 @@ mod tests {
         let token = "worker-1".to_string();
         let mut now = test_instant();
 
-        tick_relay_decision(&mut states, &token, now, Some(true), false, None, true);
+        tick_relay_decision(
+            &mut states,
+            &token,
+            now,
+            Some(true),
+            PaneInput::default(),
+            true,
+        );
         for _ in 0..RELAY_MAX_ATTEMPTS {
             now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
             assert!(tick_relay_decision(
@@ -5630,8 +5810,7 @@ mod tests {
                 &token,
                 now,
                 Some(true),
-                false,
-                None,
+                PaneInput::default(),
                 true,
             ));
         }
@@ -5646,8 +5825,7 @@ mod tests {
             &token,
             now,
             Some(true),
-            false,
-            None,
+            PaneInput::default(),
             true,
         ));
     }
@@ -9189,62 +9367,743 @@ mod tests {
         );
     }
 
+    /// Forward one key press to whichever pane `state` has focused.
+    fn forward_key(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        code: KeyCode,
+        modifiers: Modifiers,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(code, modifiers))),
+            now,
+        )
+    }
+
+    /// Two consecutive idle ticks a second apart with unread mail for
+    /// `key` (the debounce a nudge needs), advancing `now` past both.
+    /// Returns every PTY write the two ticks produced.
+    fn nudge_ticks(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        token: &str,
+        key: &SessionKey,
+        now: &mut Instant,
+    ) -> Vec<(SessionKey, Vec<u8>)> {
+        let mut writes = Vec::new();
+        for _ in 0..2 {
+            *now += Duration::from_secs(1);
+            let cmds = update(
+                state,
+                app,
+                brigade,
+                Event::Tick {
+                    relay: vec![RelayObservation {
+                        token: token.to_string(),
+                        key: key.clone(),
+                        has_unseen: true,
+                        is_idle_this_tick: Some(true),
+                    }],
+                },
+                *now,
+            );
+            writes.extend(writes_of(&cmds));
+        }
+        writes
+    }
+
+    fn nudge_for(key: &SessionKey) -> Vec<(SessionKey, Vec<u8>)> {
+        vec![(key.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())]
+    }
+
     #[test]
-    fn a_pane_no_longer_focused_is_not_suppressed_by_its_own_earlier_input() {
-        // `is_focused` already gates the quiet-period check, but this proves
-        // it holds through the per-pane storage change too: the Director
-        // pane keeps a very recent `last_forwarded_input` entry, yet once
-        // focus has moved off it, its own nudge is not suppressed by it.
+    fn a_pane_no_longer_focused_is_not_suppressed_by_the_time_of_its_own_earlier_keystroke() {
+        // `is_focused` gates the quiet-period check, and this proves it holds
+        // through the per-pane storage change too: the Director pane keeps a
+        // very recent `last_forwarded_input` entry, yet once focus has moved
+        // off it, that timestamp alone does not hold its nudge back. The
+        // keystroke is an arrow, which leaves no draft behind — a typed
+        // character would (see the draft tests below), and the timestamp is
+        // not what stops that one.
         let (mut state, mut app, brigade, director, _worker, mut now) =
             two_pane_brigade_focused_on(0); // Director focused first
 
-        update(
+        forward_key(
             &mut state,
             &mut app,
             &brigade,
-            Event::Input(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char('a'),
-                Modifiers::NONE,
-            ))),
+            KeyCode::Left,
+            Modifiers::NONE,
             now,
         );
         assert!(state.last_forwarded_input.contains_key(&director));
+        assert!(!state.has_unsent_operator_input(&director));
 
         if let Stage::Brigade { focused, .. } = &mut state.stage {
             *focused = 1; // focus moves to the Worker; Director is no longer focused
         }
-        let observation = || RelayObservation {
-            token: "director".to_string(),
-            key: director.clone(),
-            has_unseen: true,
-            is_idle_this_tick: Some(true),
-        };
-        now += Duration::from_millis(10);
+        let writes = nudge_ticks(
+            &mut state, &mut app, &brigade, "director", &director, &mut now,
+        );
+
+        assert_eq!(
+            writes,
+            nudge_for(&director),
+            "the Director pane is no longer focused, so the time of its own \
+             earlier keystroke must not suppress its nudge"
+        );
+    }
+
+    #[test]
+    fn a_pane_the_operator_typed_into_is_not_nudged_after_focus_moves_off_it() {
+        // The second reported corruption: a draft left in the Director's input
+        // line while the operator went elsewhere in banto. The quiet period
+        // never applied once focus left the pane.
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        assert!(state.has_unsent_operator_input(&director));
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+
+        let mut writes = nudge_ticks(
+            &mut state, &mut app, &brigade, "director", &director, &mut now,
+        );
+        now += Duration::from_secs(600);
+        writes.extend(nudge_ticks(
+            &mut state, &mut app, &brigade, "director", &director, &mut now,
+        ));
+
+        assert!(
+            writes.is_empty(),
+            "an unfocused pane with an unsent draft must not be written to: {writes:?}"
+        );
+        assert!(state.pending_submits.is_empty());
+    }
+
+    #[test]
+    fn a_pane_the_operator_typed_into_is_not_nudged_however_long_it_stays_focused() {
+        // The same corruption by the other route: focus stays on the pane and
+        // the operator simply stops typing for longer than the quiet period.
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        now += Duration::from_secs(3600);
+
+        let writes = nudge_ticks(
+            &mut state, &mut app, &brigade, "director", &director, &mut now,
+        );
+
+        assert!(
+            writes.is_empty(),
+            "an hour of silence is not a sent message: {writes:?}"
+        );
+    }
+
+    #[test]
+    fn sending_with_a_plain_enter_releases_the_hold() {
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+
+        for (code, modifiers) in [
+            (KeyCode::Char('a'), Modifiers::NONE),
+            (KeyCode::Enter, Modifiers::NONE),
+        ] {
+            forward_key(&mut state, &mut app, &brigade, code, modifiers, now);
+        }
+        assert!(!state.has_unsent_operator_input(&director));
+        // Still the focused pane, so the quiet period (which is about
+        // typing, not drafts) has to elapse as well.
+        now += RELAY_INPUT_QUIET_PERIOD + Duration::from_secs(1);
+
+        let writes = nudge_ticks(
+            &mut state, &mut app, &brigade, "director", &director, &mut now,
+        );
+
+        assert_eq!(writes, nudge_for(&director));
+    }
+
+    #[test]
+    fn every_enter_releases_the_hold_because_the_child_receives_the_same_carriage_return() {
+        // Shift, Alt and Ctrl+Enter reach the child as the same bytes as a
+        // plain Enter (`key_encode::key_to_bytes`), so each one sends whatever
+        // was typed; a mark that survived them would outlive an empty line.
+        for modifiers in [
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::CONTROL,
+        ] {
+            let (mut state, mut app, brigade, director, _worker, mut now) =
+                two_pane_brigade_focused_on(0);
+            for (code, modifiers) in [
+                (KeyCode::Char('a'), Modifiers::NONE),
+                (KeyCode::Enter, modifiers),
+            ] {
+                forward_key(&mut state, &mut app, &brigade, code, modifiers, now);
+            }
+            assert!(
+                !state.has_unsent_operator_input(&director),
+                "{modifiers:?}+Enter sends, so nothing is left unsent"
+            );
+            now += RELAY_INPUT_QUIET_PERIOD + Duration::from_secs(1);
+
+            let writes = nudge_ticks(
+                &mut state, &mut app, &brigade, "director", &director, &mut now,
+            );
+            assert_eq!(writes, nudge_for(&director), "{modifiers:?}+Enter");
+        }
+    }
+
+    #[test]
+    fn a_paste_marks_the_pane() {
+        let (mut state, mut app, brigade, director, worker, now) = two_pane_brigade_focused_on(0);
+
         update(
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick {
-                relay: vec![observation()],
-            },
+            Event::Input(InputEvent::Paste("some text".to_string())),
             now,
         );
-        now += Duration::from_secs(1);
+
+        assert!(state.has_unsent_operator_input(&director));
+        assert!(
+            !state.has_unsent_operator_input(&worker),
+            "only the pane the paste went to"
+        );
+    }
+
+    #[test]
+    fn a_paste_with_nothing_in_it_does_not_mark_the_pane() {
+        let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Input(InputEvent::Paste(String::new())),
+            now,
+        );
+
+        assert!(!state.has_unsent_operator_input(&director));
+    }
+
+    #[test]
+    fn keys_that_add_no_text_neither_mark_nor_unmark_a_pane() {
+        let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+        let neutral = [
+            (KeyCode::Left, Modifiers::NONE),
+            (KeyCode::Up, Modifiers::NONE),
+            (KeyCode::Backspace, Modifiers::NONE),
+            (KeyCode::Esc, Modifiers::NONE),
+            (KeyCode::F(5), Modifiers::NONE),
+            (KeyCode::Char('c'), Modifiers::CONTROL),
+        ];
+
+        for (code, modifiers) in neutral {
+            forward_key(&mut state, &mut app, &brigade, code, modifiers, now);
+        }
+        assert!(
+            !state.has_unsent_operator_input(&director),
+            "arrows, Backspace, Esc and Ctrl+C alone leave nothing to protect"
+        );
+
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        for (code, modifiers) in neutral {
+            forward_key(&mut state, &mut app, &brigade, code, modifiers, now);
+        }
+        assert!(
+            state.has_unsent_operator_input(&director),
+            "and none of them clears a draft: which keys empty an agent's input \
+             line is the agent's business"
+        );
+    }
+
+    #[test]
+    fn the_relays_own_writes_do_not_mark_the_pane() {
+        let (state, _app, _brigade, worker, _now) = nudged_focused_pane_awaiting_submit();
+        assert!(
+            !state.has_unsent_operator_input(&worker),
+            "the nudge line is banto's own write, not the operator's draft"
+        );
+    }
+
+    #[test]
+    fn the_focus_report_banto_writes_does_not_mark_the_pane() {
+        let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+        // A child that asked for DECSET 1004 is told when it gains focus.
+        state
+            .screens
+            .get_mut(&director)
+            .unwrap()
+            .process(b"\x1b[?1004h");
+
         let cmds = update(
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick {
-                relay: vec![observation()],
-            },
+            Event::Tick { relay: vec![] },
             now,
         );
 
         assert_eq!(
             writes_of(&cmds),
-            vec![(director.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())],
-            "the Director pane is no longer focused, so its own earlier \
-             keystroke must not suppress its nudge"
+            vec![(director.clone(), b"\x1b[I".to_vec())],
+            "fixture check: the focus report really was written"
+        );
+        assert!(!state.has_unsent_operator_input(&director));
+    }
+
+    #[test]
+    fn an_unsent_draft_survives_discovery_renaming_the_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let old_key = SessionKey::new_worker(1, "worker-1");
+        state.screens.insert(old_key.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(old_key.clone());
+        state.focus = Focus::Pane;
+        let mut now = test_instant();
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+
+        let new_key = SessionKey::from_id("w1-real");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: old_key.clone(),
+                session_id: "w1-real".to_string(),
+                member: None,
+            },
+            now,
+        );
+
+        assert!(state.has_unsent_operator_input(&new_key));
+        assert!(!state.has_unsent_operator_input(&old_key));
+        now += Duration::from_secs(3600);
+        let writes = nudge_ticks(
+            &mut state, &mut app, &brigade, "worker-1", &new_key, &mut now,
+        );
+        assert!(writes.is_empty(), "{writes:?}");
+    }
+
+    #[test]
+    fn an_unsent_draft_survives_a_compaction_fork_renaming_the_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir");
+        let old = SessionKey::from_id("w1-old");
+        let other = SessionKey::from_id("w2");
+        staged_brigade(&mut state, &director, &[old.clone(), other]);
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                old_id: "w1-old".to_string(),
+                new_id: "w1-new".to_string(),
+            },
+            now,
+        );
+
+        assert!(state.has_unsent_operator_input(&SessionKey::from_id("w1-new")));
+        assert!(!state.has_unsent_operator_input(&old));
+    }
+
+    /// One relay tick at `now` with `key` idle, carrying (or not) unread mail.
+    fn tick_for(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        token: &str,
+        key: &SessionKey,
+        has_unseen: bool,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: vec![RelayObservation {
+                    token: token.to_string(),
+                    key: key.clone(),
+                    has_unseen,
+                    is_idle_this_tick: Some(true),
+                }],
+            },
+            now,
+        )
+    }
+
+    /// A Director holding a draft while the operator is on the Worker pane,
+    /// with mail waiting for it, ticked until the hold is announced.
+    /// Returns the state and the instant of the showing.
+    fn announced_hold() -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        for _ in 0..2 {
+            now += Duration::from_secs(1);
+            tick_for(
+                &mut state, &mut app, &brigade, "director", &director, true, now,
+            );
+        }
+        (state, app, brigade, director, now)
+    }
+
+    #[test]
+    fn a_nudge_held_back_by_a_draft_is_announced_on_the_status_line() {
+        let (state, _app, _brigade, _director, _now) = announced_hold();
+
+        let status = state.status.as_deref().expect("the hold is announced");
+        assert!(status.contains("director"), "{status}");
+        assert!(status.contains("unsent input"), "{status}");
+    }
+
+    #[test]
+    fn the_announcement_clears_after_the_status_timeout_and_returns_after_the_gap() {
+        let (mut state, mut app, brigade, director, shown) = announced_hold();
+        let tick = |state: &mut EmporiumState, app: &mut App, at: Duration| {
+            tick_for(
+                state,
+                app,
+                &brigade,
+                "director",
+                &director,
+                true,
+                shown + at,
+            );
+        };
+
+        tick(&mut state, &mut app, STATUS_TIMEOUT);
+        assert_eq!(state.status, None, "back to the key guidance");
+
+        tick(
+            &mut state,
+            &mut app,
+            STATUS_TIMEOUT + STATUS_REMINDER_GAP - Duration::from_secs(1),
+        );
+        assert_eq!(state.status, None, "the gap is for the guidance");
+
+        tick(&mut state, &mut app, STATUS_TIMEOUT + STATUS_REMINDER_GAP);
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("director")),
+            "announced again: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn a_draft_with_no_mail_waiting_announces_nothing() {
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+
+        for _ in 0..120 {
+            now += Duration::from_secs(1);
+            tick_for(
+                &mut state, &mut app, &brigade, "director", &director, false, now,
+            );
+            assert_eq!(state.status, None);
+        }
+    }
+
+    #[test]
+    fn an_announcement_never_covers_another_status_and_waits_for_the_line_to_clear() {
+        let (mut state, mut app, brigade, director, shown) = announced_hold();
+        let before_due = shown + STATUS_TIMEOUT + STATUS_REMINDER_GAP - Duration::from_secs(1);
+        state.set_status("failed to open: boom", before_due);
+
+        let due = shown + STATUS_TIMEOUT + STATUS_REMINDER_GAP;
+        tick_for(
+            &mut state, &mut app, &brigade, "director", &director, true, due,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("failed to open: boom"),
+            "due, but the line is taken"
+        );
+
+        tick_for(
+            &mut state,
+            &mut app,
+            &brigade,
+            "director",
+            &director,
+            true,
+            before_due + STATUS_TIMEOUT,
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("director")),
+            "the error expired, so the announcement follows at once: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn the_announcement_stops_when_the_mail_is_gone() {
+        let (mut state, mut app, brigade, director, shown) = announced_hold();
+
+        let mut at = shown;
+        for _ in 0..90 {
+            at += Duration::from_secs(1);
+            tick_for(
+                &mut state, &mut app, &brigade, "director", &director, false, at,
+            );
+            // The showing already up runs out on its own; none follows it.
+            if at - shown >= STATUS_TIMEOUT {
+                assert_eq!(state.status, None, "at +{:?}", at - shown);
+            }
+        }
+    }
+
+    #[test]
+    fn the_announcement_stops_when_the_pane_is_gone() {
+        let (mut state, mut app, brigade, _director, shown) = announced_hold();
+
+        let mut at = shown;
+        for _ in 0..90 {
+            at += Duration::from_secs(1);
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Tick { relay: vec![] },
+                at,
+            );
+            if at - shown >= STATUS_TIMEOUT {
+                assert_ne!(
+                    state.status.as_deref().map(|s| s.contains("holding")),
+                    Some(true),
+                    "at +{:?}",
+                    at - shown
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sending_the_draft_ends_the_announcements() {
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        // Still focused, so the quiet period has to pass before the draft is
+        // the only thing holding the nudge.
+        now += RELAY_INPUT_QUIET_PERIOD + Duration::from_secs(1);
+        for _ in 0..2 {
+            now += Duration::from_secs(1);
+            tick_for(
+                &mut state, &mut app, &brigade, "director", &director, true, now,
+            );
+        }
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("holding")),
+            "fixture check: announced while held: {:?}",
+            state.status
+        );
+
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Enter,
+            Modifiers::NONE,
+            now,
+        );
+        now += RELAY_INPUT_QUIET_PERIOD + Duration::from_secs(1);
+        let mut wrote_nudge = false;
+        for _ in 0..180 {
+            now += Duration::from_secs(1);
+            let cmds = tick_for(
+                &mut state, &mut app, &brigade, "director", &director, true, now,
+            );
+            wrote_nudge |= writes_of(&cmds)
+                .contains(&(director.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec()));
+            assert!(
+                !state
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("holding")),
+                "no announcement once the draft is sent: {:?}",
+                state.status
+            );
+        }
+        assert!(wrote_nudge, "and the nudge itself went out");
+    }
+
+    #[test]
+    fn a_status_reminder_waits_for_a_free_line_without_skipping_its_showing() {
+        let mut reminder = StatusReminder::default();
+        let t0 = test_instant();
+
+        assert!(
+            !reminder.due(false, true, t0),
+            "no condition, nothing to say"
+        );
+        assert!(!reminder.due(true, false, t0), "line taken");
+        assert!(reminder.due(true, true, t0), "first showing is immediate");
+        assert!(
+            !reminder.due(true, true, t0 + STATUS_TIMEOUT),
+            "inside the cycle"
+        );
+        let next = t0 + STATUS_TIMEOUT + STATUS_REMINDER_GAP;
+        assert!(
+            !reminder.due(true, false, next),
+            "due, but the line is taken"
+        );
+        assert!(
+            reminder.due(true, true, next + Duration::from_secs(3)),
+            "pending until free"
+        );
+
+        assert!(!reminder.due(false, true, next + Duration::from_secs(4)));
+        assert!(
+            reminder.due(true, true, next + Duration::from_secs(5)),
+            "a condition that returns shows at once"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_pane_clears_its_unsent_mark() {
+        let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        assert!(state.has_unsent_operator_input(&director));
+
+        state.unstage(&director);
+
+        assert!(!state.has_unsent_operator_input(&director));
+    }
+
+    #[test]
+    fn a_pending_submit_is_not_flushed_while_the_pane_holds_a_draft() {
+        // Input typed after a nudge already cancels its `\r`; this is the
+        // draft that was there before the nudge was written.
+        let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            now,
+        );
+        state.pending_submits.push(PendingSubmit {
+            key: director.clone(),
+            nudged_at: now,
+        });
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now + RELAY_SUBMIT_DELAY,
+        );
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(
+            state.pending_submits.is_empty(),
+            "the entry is spent, not retried every tick"
         );
     }
 
@@ -12823,6 +13682,32 @@ mod tests {
             }
             other => panic!("expected one OpenEmbedded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_restarted_worker_starts_with_no_unsent_draft() {
+        // The process that held the draft is gone.
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let worker = SessionKey::from_id("w1");
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 1;
+        }
+        state.focus = Focus::Pane;
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('a'),
+            Modifiers::NONE,
+            test_instant(),
+        );
+        assert!(state.has_unsent_operator_input(&worker));
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        assert!(matches!(&cmds[..], [Cmd::OpenEmbedded { .. }]), "{cmds:?}");
+        assert!(!state.has_unsent_operator_input(&worker));
     }
 
     #[test]

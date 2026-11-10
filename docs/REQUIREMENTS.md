@@ -863,10 +863,29 @@ check_messages tool now."` — followed by a submitting Enter roughly 300ms
 later (`RELAY_SUBMIT_DELAY`; the delay exists because a chunk boundary can
 carry meaning for the embedded PTY — see "Emporium mode" above). A nudge is
 suppressed while the member's pane is focused and has just received forwarded
-keystrokes (so the operator's own typing is never interrupted), is subject to
+keystrokes (`RELAY_INPUT_QUIET_PERIOD`), is subject to
 a cooldown between repeat nudges to the same member, and gives up after a
 capped number of attempts on one unseen batch
 (`crates/banto-core/src/engine.rs` relay constants).
+
+A time window cannot protect a draft, so the operator's unsent text is
+tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
+pane is marked when banto forwards something that may add text to its input
+line — a printable key, a paste, Tab — and unmarked only when an Enter
+(whatever its modifiers: all reach the child as the same `\r`) is forwarded
+or the pane goes away. While a pane is marked, a nudge to it is suppressed
+whatever the focus and however long ago the operator last typed, a nudge's
+own delayed Enter is dropped if the mark appeared before it was due, and the
+status line says the nudge is being held (re-shown every 30s, never over
+another message).
+
+This mark is a stand-in, kept deliberately blunt until the input line is read
+off the pane's screen: banto cannot see the child's input line and does not
+model which keys an agent binds to clearing it. Its known weakness is a mark
+left standing over an empty line — after answering a permission dialog with
+`1`, after Ctrl+C clears the line, after Shift+Tab switches mode — which
+holds the nudge until the operator presses Enter in that pane (an Enter on
+the empty line is enough).
 
 `[brigade].relay` in config.toml (`RelayMode`, default `Auto`) toggles this
 off (`Manual`) for an operator who would rather prompt `check_messages`
