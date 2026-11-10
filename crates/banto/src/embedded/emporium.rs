@@ -457,7 +457,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         }
         let reload_dur = reload_start.elapsed();
 
-        // ~1s: relay observations for the staged brigade, gathered here
+        // ~1s: relay observations for every live brigade pane, gathered here
         // (store + live-session reads) and decided in `update` — plus the
         // trigger for the pending-submit flush and status expiry bundled
         // into the same tick (see `engine::update_tick`'s doc).
@@ -1663,7 +1663,7 @@ fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String>
         .and_then(|entry| entry.session_id.clone())
 }
 
-/// Gather this tick's relay observations for the staged brigade's members
+/// Gather this tick's relay observations for every live brigade member
 /// (unseen messages, live idle/busy status) — the store + live-session reads
 /// `engine::update_tick`'s decision logic needs, per member with a known
 /// session id and an open pane among the currently-staged ones.
@@ -1704,13 +1704,9 @@ fn gather_relay_observations(
     app: &App,
     mut timings: Option<&mut TickTimings>,
 ) -> Vec<RelayObservation> {
-    let Stage::Brigade { id, panes, .. } = &state.stage else {
-        return Vec::new();
-    };
-    let brigade_id = *id;
     let roster_start = Instant::now();
-    let members = match store.borrow().brigade_members(brigade_id) {
-        Ok(members) => members,
+    let brigades = match store.borrow().list_brigades() {
+        Ok(brigades) => brigades,
         Err(_) => return Vec::new(),
     };
     if let Some(t) = timings.as_deref_mut() {
@@ -1741,70 +1737,81 @@ fn gather_relay_observations(
         t.relay_claude_snapshot += claude_snapshot_start.elapsed();
     }
     let mut observations = Vec::new();
-    for member in &members {
-        let Some(session_id) = member.session_id.as_ref() else {
-            continue;
+    for brigade in brigades {
+        let roster_start = Instant::now();
+        let members = match store.borrow().brigade_members(brigade.id) {
+            Ok(members) => members,
+            Err(_) => continue,
         };
-        let key = SessionKey::from_id(&session_id.0);
-        if !panes.contains(&key) {
-            continue;
-        }
-        let unseen_start = Instant::now();
-        let has_unseen = store
-            .borrow()
-            .has_unseen_brigade_messages(brigade_id, &member.token, member.role)
-            .unwrap_or(false);
         if let Some(t) = timings.as_deref_mut() {
-            t.relay_unseen += unseen_start.elapsed();
+            t.relay_roster += roster_start.elapsed();
         }
-        // A fresh Claude Worker publishes live state before its first turn
-        // writes the JSONL that would create an App row. Use banto's recorded
-        // choice first so unread mail can break that otherwise closed loop.
-        let agent = member
-            .agent
-            .or_else(|| app.row_for_id(&session_id.0).map(|row| row.agent));
-        let is_idle_this_tick = match agent {
-            Some(AgentKind::ClaudeCode) => {
-                let claude_start = Instant::now();
-                let idle = live
-                    .iter()
-                    .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
-                    .map(|entry| {
-                        alive_claude.contains(&entry.pid)
-                            && !matches!(
-                                entry.status.as_deref(),
-                                Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
-                            )
-                    });
-                if let Some(t) = timings.as_deref_mut() {
-                    t.relay_activity_claude += claude_start.elapsed();
-                }
-                idle
+        for member in &members {
+            let Some(session_id) = member.session_id.as_ref() else {
+                continue;
+            };
+            let key = SessionKey::from_id(&session_id.0);
+            if !state.screens.contains_key(&key) {
+                continue;
             }
-            Some(AgentKind::Codex) => match codex_home {
-                Some(home) => {
-                    let mut codex_timing = codex_activity::CodexActivityTiming::default();
-                    let idle = codex_activity::is_thread_idle(
-                        home,
-                        &session_id.0,
-                        Some(&mut codex_timing),
-                    );
+            let unseen_start = Instant::now();
+            let has_unseen = store
+                .borrow()
+                .has_unseen_brigade_messages(brigade.id, &member.token, member.role)
+                .unwrap_or(false);
+            if let Some(t) = timings.as_deref_mut() {
+                t.relay_unseen += unseen_start.elapsed();
+            }
+            // A fresh Claude Worker publishes live state before its first turn
+            // writes the JSONL that would create an App row. Use banto's recorded
+            // choice first so unread mail can break that otherwise closed loop.
+            let agent = member
+                .agent
+                .or_else(|| app.row_for_id(&session_id.0).map(|row| row.agent));
+            let is_idle_this_tick = match agent {
+                Some(AgentKind::ClaudeCode) => {
+                    let claude_start = Instant::now();
+                    let idle = live
+                        .iter()
+                        .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+                        .map(|entry| {
+                            alive_claude.contains(&entry.pid)
+                                && !matches!(
+                                    entry.status.as_deref(),
+                                    Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
+                                )
+                        });
                     if let Some(t) = timings.as_deref_mut() {
-                        t.relay_activity_codex_sqlite += codex_timing.sqlite;
-                        t.relay_activity_codex_rollout += codex_timing.rollout;
+                        t.relay_activity_claude += claude_start.elapsed();
                     }
                     idle
                 }
+                Some(AgentKind::Codex) => match codex_home {
+                    Some(home) => {
+                        let mut codex_timing = codex_activity::CodexActivityTiming::default();
+                        let idle = codex_activity::is_thread_idle(
+                            home,
+                            &session_id.0,
+                            Some(&mut codex_timing),
+                        );
+                        if let Some(t) = timings.as_deref_mut() {
+                            t.relay_activity_codex_sqlite += codex_timing.sqlite;
+                            t.relay_activity_codex_rollout += codex_timing.rollout;
+                        }
+                        idle
+                    }
+                    None => None,
+                },
                 None => None,
-            },
-            None => None,
-        };
-        observations.push(RelayObservation {
-            token: member.token.clone(),
-            key,
-            has_unseen,
-            is_idle_this_tick,
-        });
+            };
+            observations.push(RelayObservation {
+                brigade_id: brigade.id,
+                token: member.token.clone(),
+                key,
+                has_unseen,
+                is_idle_this_tick,
+            });
+        }
     }
     observations
 }
@@ -1890,7 +1897,7 @@ fn gather_goinkyo_observation(
 /// spare, without letting a pathological chain spin forever.
 const FORK_ANCESTRY_DEPTH: u32 = 5;
 
-/// Detect a staged brigade member's Claude session having forked in place.
+/// Detect a live brigade member's Claude session having forked in place.
 ///
 /// Claude Code's AUTO-compaction assigns a session a *new* id while leaving
 /// the process itself running (manual `/compact` does not) — the same
@@ -1913,13 +1920,9 @@ fn gather_fork_observations(
     app: &App,
     mut timings: Option<&mut TickTimings>,
 ) -> Vec<Event> {
-    let Stage::Brigade { id, panes, .. } = &state.stage else {
-        return Vec::new();
-    };
-    let brigade_id = *id;
     let roster_start = Instant::now();
-    let members = match store.borrow().brigade_members(brigade_id) {
-        Ok(members) => members,
+    let brigades = match store.borrow().list_brigades() {
+        Ok(brigades) => brigades,
         Err(_) => return Vec::new(),
     };
     if let Some(t) = timings.as_deref_mut() {
@@ -1933,60 +1936,70 @@ fn gather_fork_observations(
     let probe = SysinfoProbe;
     let mut events = Vec::new();
     let per_member_start = Instant::now();
-    for member in &members {
-        let Some(session_id) = member.session_id.as_ref() else {
-            continue;
+    for brigade in brigades {
+        let roster_start = Instant::now();
+        let members = match store.borrow().brigade_members(brigade.id) {
+            Ok(members) => members,
+            Err(_) => continue,
         };
-        // Auto-compaction — the only thing this function ever detects — is
-        // a Claude Code behavior: `sessions/<pid>.json` (what `live` reads)
-        // is Claude's own live-state file, and a Codex member's session id
-        // is never in it. Without this gate, that permanent absence read
-        // every tick as "the id vanished," this function's own fork
-        // signal, so a Codex member fell through to the ancestry walk
-        // below on a mechanism that can never apply to it — not a slow
-        // path for it, a meaningless one. Unresolved (`None`, discovery
-        // hasn't caught up to this session yet) is treated the same as
-        // Codex: skip rather than guess: the next tick's re-check catches
-        // it once the product is known, the same tolerance this function's
-        // own doc already claims for the fork signal itself.
-        if app.row_for_id(&session_id.0).map(|row| row.agent) != Some(AgentKind::ClaudeCode) {
-            continue;
+        if let Some(t) = timings.as_deref_mut() {
+            t.fork_roster += roster_start.elapsed();
         }
-        let old_key = SessionKey::from_id(&session_id.0);
-        if !panes.contains(&old_key) {
-            continue;
-        }
-        let Some(pid) = handles.get(&old_key).and_then(PtyHandle::pid) else {
-            continue;
-        };
-        // Steady-state short-circuit: as long as *some* live entry still
-        // reports the recorded id, no fork has happened to this member — a
-        // process can't report the old and the new id at once, and a fork
-        // flips its one `sessions/<pid>.json` in place, so the recorded id
-        // vanishing from the live set is a precondition of a fork. Checking
-        // that first keeps the (sysinfo-backed) ancestry walks below off
-        // the every-second tick path entirely until something actually
-        // changed.
-        if live
-            .iter()
-            .any(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
-        {
-            continue;
-        }
-        let forked = live.iter().find(|entry| {
-            entry
-                .session_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty() && id != session_id.0)
-                && ancestry_reaches(entry.pid, pid, &probe, FORK_ANCESTRY_DEPTH)
-        });
-        if let Some(new_id) = forked.and_then(|entry| entry.session_id.clone()) {
-            events.push(Event::MemberSessionForked {
-                brigade_id,
-                token: member.token.clone(),
-                old_id: session_id.0.clone(),
-                new_id,
+        for member in &members {
+            let Some(session_id) = member.session_id.as_ref() else {
+                continue;
+            };
+            // Auto-compaction — the only thing this function ever detects — is
+            // a Claude Code behavior: `sessions/<pid>.json` (what `live` reads)
+            // is Claude's own live-state file, and a Codex member's session id
+            // is never in it. Without this gate, that permanent absence read
+            // every tick as "the id vanished," this function's own fork
+            // signal, so a Codex member fell through to the ancestry walk
+            // below on a mechanism that can never apply to it — not a slow
+            // path for it, a meaningless one. Unresolved (`None`, discovery
+            // hasn't caught up to this session yet) is treated the same as
+            // Codex: skip rather than guess: the next tick's re-check catches
+            // it once the product is known, the same tolerance this function's
+            // own doc already claims for the fork signal itself.
+            if app.row_for_id(&session_id.0).map(|row| row.agent) != Some(AgentKind::ClaudeCode) {
+                continue;
+            }
+            let old_key = SessionKey::from_id(&session_id.0);
+            if !state.screens.contains_key(&old_key) {
+                continue;
+            }
+            let Some(pid) = handles.get(&old_key).and_then(PtyHandle::pid) else {
+                continue;
+            };
+            // Steady-state short-circuit: as long as *some* live entry still
+            // reports the recorded id, no fork has happened to this member — a
+            // process can't report the old and the new id at once, and a fork
+            // flips its one `sessions/<pid>.json` in place, so the recorded id
+            // vanishing from the live set is a precondition of a fork. Checking
+            // that first keeps the (sysinfo-backed) ancestry walks below off
+            // the every-second tick path entirely until something actually
+            // changed.
+            if live
+                .iter()
+                .any(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+            {
+                continue;
+            }
+            let forked = live.iter().find(|entry| {
+                entry
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty() && id != session_id.0)
+                    && ancestry_reaches(entry.pid, pid, &probe, FORK_ANCESTRY_DEPTH)
             });
+            if let Some(new_id) = forked.and_then(|entry| entry.session_id.clone()) {
+                events.push(Event::MemberSessionForked {
+                    brigade_id: brigade.id,
+                    token: member.token.clone(),
+                    old_id: session_id.0.clone(),
+                    new_id,
+                });
+            }
         }
     }
     if let Some(t) = timings {
@@ -3915,6 +3928,59 @@ mod tests {
     }
 
     #[test]
+    fn gather_fork_observations_detects_an_offstage_members_compaction_fork() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, mut state, _app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        let offstage_brigade = store.borrow_mut().create_brigade("offstage").unwrap();
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                offstage_brigade,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w2-old".to_string())),
+            )
+            .unwrap();
+        let old_key = SessionKey::from_id("w2-old");
+        state.screens.insert(old_key.clone(), Screen::new(24, 80));
+        let app = App::new(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1", AgentKind::ClaudeCode),
+            test_row("w2-old", AgentKind::ClaudeCode),
+        ]);
+        write_live_state(claude_home.path(), 4242, "w2-new", Path::new("/work/alpha"));
+
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(old_key, open(&host));
+
+        let events = gather_fork_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+            &app,
+            None,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::MemberSessionForked {
+                brigade_id,
+                token,
+                old_id,
+                new_id,
+            }] if *brigade_id == offstage_brigade
+                && token == "worker-1"
+                && old_id == "w2-old"
+                && new_id == "w2-new"
+        ));
+    }
+
+    #[test]
     fn gather_fork_observations_is_silent_when_the_live_entry_still_reports_the_recorded_id() {
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
@@ -4139,6 +4205,12 @@ mod tests {
             .unwrap();
 
         let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+        state
+            .screens
+            .insert(SessionKey::from_id(worker_session_id), Screen::new(24, 80));
         state.stage = Stage::Brigade {
             id: brigade_id,
             director: Some(SessionKey::from_id("dir")),
@@ -4256,6 +4328,87 @@ mod tests {
             Some(true),
             "this process's own pid is alive and the live file reports no busy status"
         );
+    }
+
+    #[test]
+    fn relay_nudges_an_idle_member_of_an_offstage_brigade() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, mut state, _) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        let offstage_brigade = store.borrow_mut().create_brigade("offstage").unwrap();
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                offstage_brigade,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("offstage-director".to_string())),
+            )
+            .unwrap();
+        store
+            .borrow()
+            .enqueue_brigade_message(
+                offstage_brigade,
+                "director",
+                BrigadeRole::Director,
+                None,
+                "mail",
+            )
+            .unwrap();
+        let offstage_key = SessionKey::from_id("offstage-director");
+        state
+            .screens
+            .insert(offstage_key.clone(), Screen::new(24, 80));
+        let mut app = App::new(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1", AgentKind::ClaudeCode),
+            test_row("offstage-director", AgentKind::ClaudeCode),
+        ]);
+        write_live_state(
+            claude_home.path(),
+            std::process::id(),
+            "offstage-director",
+            Path::new("/work"),
+        );
+
+        let relay = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+            None,
+        );
+        assert!(relay.iter().any(|observation| {
+            observation.brigade_id == offstage_brigade
+                && observation.key == offstage_key
+                && observation.has_unseen
+                && observation.is_idle_this_tick == Some(true)
+        }));
+
+        let now = Instant::now();
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::Tick {
+                relay: relay.clone(),
+            },
+            now,
+        );
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::Tick { relay },
+            now + Duration::from_secs(1),
+        );
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::WritePty { key, bytes }
+                if key == &offstage_key
+                    && bytes
+                        == b"[banto relay] Your brigade peer sent you a message. Call the check_messages tool now."
+        )));
     }
 
     #[test]

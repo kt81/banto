@@ -411,18 +411,20 @@ pub fn should_nudge(
 }
 
 pub fn tick_relay_decision(
-    states: &mut HashMap<MemberToken, RelayState>,
+    states: &mut HashMap<(BrigadeId, MemberToken), RelayState>,
+    brigade_id: BrigadeId,
     token: &MemberToken,
     now: Instant,
     is_idle_this_tick: Option<bool>,
     input: PaneInput,
     has_unseen: bool,
 ) -> bool {
+    let identity = (brigade_id, token.clone());
     if !has_unseen {
-        states.remove(token);
+        states.remove(&identity);
         return false;
     }
-    let state = states.entry(token.clone()).or_default();
+    let state = states.entry(identity).or_default();
     state.idle_streak = if is_idle_this_tick == Some(true) {
         state.idle_streak + 1
     } else {
@@ -436,11 +438,12 @@ pub fn tick_relay_decision(
     nudge
 }
 
-/// One relay-eligible staged member's freshly-gathered observations for this
+/// One relay-eligible live member's freshly-gathered observations for this
 /// tick — gathered shell-side (store + live-session reads), decided
 /// core-side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayObservation {
+    pub brigade_id: BrigadeId,
     pub token: MemberToken,
     pub key: SessionKey,
     pub has_unseen: bool,
@@ -785,7 +788,11 @@ pub struct EmporiumState {
     pub focus: Focus,
     pub status: Option<String>,
     status_set_at: Option<Instant>,
-    pub relay_states: HashMap<MemberToken, RelayState>,
+    /// Relay state belongs to the store's unread-cursor identity, not to a
+    /// display name. Two live brigades both call their leader `director`, and
+    /// the first off-stage Director left with unread mail exposed that sharing
+    /// a cooldown or attempt count across those cells is wrong.
+    pub relay_states: HashMap<(BrigadeId, MemberToken), RelayState>,
     /// When real operator input was last forwarded to each pane, keyed by
     /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
     /// only ever suppresses a nudge for the pane the operator is actually
@@ -950,6 +957,10 @@ pub struct EmporiumState {
     /// rather than deriving a member name from a tile position. Rekey paths
     /// keep the token attached when a live key changes.
     member_tokens: HashMap<SessionKey, MemberToken>,
+    /// Brigade ownership travels with a pane even while another brigade is
+    /// displayed. The exit handler needs it to reopen a Worker whose cell is
+    /// off-stage; `Stage` only describes the one currently visible cell.
+    member_brigades: HashMap<SessionKey, BrigadeId>,
     /// The staged panes with an on-screen attention mark: loaded Claude
     /// Waiting rows plus BEL latches. This is the one authoritative tile
     /// display set; rendering reads it for magenta borders while the same
@@ -1045,6 +1056,7 @@ impl EmporiumState {
             last_focus_notified: None,
             goinkyo_pane: HashMap::new(),
             member_tokens: HashMap::new(),
+            member_brigades: HashMap::new(),
             attention_panes: HashSet::new(),
             visible_waiting_count: 0,
             latched_attention_panes: HashSet::new(),
@@ -1100,7 +1112,11 @@ impl EmporiumState {
     /// step it has no reason to know about.
     fn unstage(&mut self, key: &SessionKey) {
         self.stage.remove(key);
-        self.member_tokens.remove(key);
+        let token = self.member_tokens.remove(key);
+        let brigade_id = self.member_brigades.remove(key);
+        if let (Some(token), Some(brigade_id)) = (token, brigade_id) {
+            self.relay_states.remove(&(brigade_id, token));
+        }
         self.last_forwarded_input.remove(key);
         self.unsent_operator_input.remove(key);
         self.last_output_at.remove(key);
@@ -1873,14 +1889,14 @@ pub enum Event {
         hidden: HashSet<String>,
         directors: HashSet<String>,
     },
-    /// A staged member's Claude session forked in place: AUTO-compaction
+    /// A live member's Claude session forked in place: AUTO-compaction
     /// assigns a *new* session id to the same live process (manual
     /// `/compact` does not) — the process's own `sessions/<pid>.json` live
     /// file simply starts reporting a different `sessionId`, still under
     /// the same pid. `old_id` is what the store/pane still know the member
     /// by; `new_id` is what the process now reports. Gathered shell-side
     /// (`emporium::gather_fork_observations`) alongside the relay tick, one
-    /// per tick a staged member's recorded id disagrees with its own live
+    /// per tick a live member's recorded id disagrees with its own live
     /// process — so this may repeat for the same fork until the store row
     /// (and the pane it keys) actually catch up; the handler must tolerate
     /// that.
@@ -1890,7 +1906,7 @@ pub enum Event {
         old_id: String,
         new_id: String,
     },
-    /// ~1/s: relay observations for the staged brigade's members (gathered
+    /// ~1/s: relay observations for every live brigade member (gathered
     /// shell-side — store + live-session reads), plus the trigger to flush
     /// any due phase-two nudge submit and expire the status message.
     Tick {
@@ -3467,6 +3483,7 @@ fn stage_brigade(
             Some(row) => {
                 let key = SessionKey::from_id(&row.id);
                 state.member_tokens.insert(key.clone(), token.clone());
+                state.member_brigades.insert(key.clone(), brigade_id);
                 // Seeded here, ahead of the resume's own success or failure:
                 // this is the one-shot spawn guard `update_goinkyo_awaiting_
                 // spawn` checks (and, from here, the record that lets a
@@ -3524,6 +3541,7 @@ fn stage_brigade(
                 // the pane would blink back to an empty prompt.
                 let key = SessionKey::new_worker(brigade_id, token);
                 state.member_tokens.insert(key.clone(), token.clone());
+                state.member_brigades.insert(key.clone(), brigade_id);
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
@@ -3554,6 +3572,7 @@ fn stage_brigade(
             None if *role == BrigadeRole::Goinkyo && session_id.is_some() => {
                 let key = SessionKey::from_id(session_id.as_deref().unwrap());
                 state.member_tokens.insert(key.clone(), token.clone());
+                state.member_brigades.insert(key.clone(), brigade_id);
                 if state.screens.contains_key(&key) {
                     // The discovery window: `Cmd::RekeyPty` already renamed
                     // this pane's key to the real id (`update_discovery_
@@ -3903,6 +3922,7 @@ fn update_spawned(
             state
                 .member_tokens
                 .insert(key.clone(), DIRECTOR_TOKEN.to_string());
+            state.member_brigades.insert(key.clone(), brigade_id);
             state.stage = Stage::Brigade {
                 id: brigade_id,
                 director: Some(key.clone()),
@@ -4004,6 +4024,7 @@ fn open_worker(
 ) -> Vec<Cmd> {
     let key = SessionKey::new_worker(brigade_id, token);
     state.member_tokens.insert(key.clone(), token.to_string());
+    state.member_brigades.insert(key.clone(), brigade_id);
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
@@ -4051,7 +4072,7 @@ enum ExitHandling {
     GaveUp,
 }
 
-/// A staged Worker's pane ended without banto asking, so put it back.
+/// A living Worker's pane ended without banto asking, so put it back.
 ///
 /// The case this exists for: an agent CLI updates itself, its process is
 /// replaced, and the pane goes with it. Everything banto persists about the
@@ -4090,23 +4111,17 @@ fn relaunch_member(
     if banto_asked {
         return None;
     }
-    let Stage::Brigade {
-        id,
-        director,
-        panes,
-        ..
-    } = &state.stage
-    else {
-        return None;
-    };
-    if !panes.contains(key) || director.as_ref() == Some(key) {
+    if !state.screens.contains_key(key) {
         return None;
     }
-    if state.goinkyo_pane.values().any(|pane| pane == key) {
-        return None;
-    }
-    let brigade_id = *id;
+    let brigade_id = *state.member_brigades.get(key)?;
     let token = state.member_tokens.get(key)?.clone();
+    if token == DIRECTOR_TOKEN
+        || token == GOINKYO_TOKEN
+        || state.goinkyo_pane.values().any(|pane| pane == key)
+    {
+        return None;
+    }
     let row = app.row_for_id(key.as_str())?;
     if state
         .last_relaunch
@@ -4347,6 +4362,9 @@ fn update_discovery_result(
     if let Some(token) = state.member_tokens.remove(&old_key) {
         state.member_tokens.insert(new_key.clone(), token);
     }
+    if let Some(brigade_id) = state.member_brigades.remove(&old_key) {
+        state.member_brigades.insert(new_key.clone(), brigade_id);
+    }
     // A queued `PendingSubmit` (the delayed `\r` for a relay nudge or
     // either kickoff's phase two) names a pane the same way `screens`/
     // `Stage` do, and needs the same follow: left on `old_key`, the write
@@ -4422,13 +4440,13 @@ fn update_discovery_result(
     cmds
 }
 
-/// A staged member's Claude session forked in place (see
+/// A live member's Claude session forked in place (see
 /// [`Event::MemberSessionForked`]'s doc for why). The store write always
 /// happens — the fork is real regardless of what the emporium's own panes
-/// look like right now — but the pane/screen rename only applies if the
-/// brigade is still staged with `old_id`'s pane present; `focused` needs no
-/// fixing of its own, since renaming `panes[i]`'s *value* in place never
-/// moves what index it lives at. Idempotent under a repeated fact (the
+/// look like right now — but the pane/screen rename applies whenever the
+/// pane is still alive, including while another brigade is displayed.
+/// `focused` needs no fixing of its own, since renaming `panes[i]`'s *value*
+/// in place never moves what index it lives at. Idempotent under a repeated fact (the
 /// observation that produces this repeats until the store row changes):
 /// once `old_id`'s pane has already been renamed to `new_id`, `old_id` is no
 /// longer in `panes` and this becomes a store-only no-op, same as the
@@ -4444,11 +4462,7 @@ fn update_member_session_forked(
     let old_key = SessionKey::from_id(&old_id);
     let new_key = SessionKey::from_id(&new_id);
     let mut cmds = Vec::new();
-    let staged = matches!(
-        &state.stage,
-        Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&old_key)
-    );
-    if staged {
+    if state.screens.contains_key(&old_key) {
         // Same refusal precedent as `update_discovery_result`'s collision
         // guard just above: if `new_key` is already a live pane (the
         // operator opened the continuation separately as a solo session,
@@ -4484,6 +4498,11 @@ fn update_member_session_forked(
             }
             if let Some(member_token) = state.member_tokens.remove(&old_key) {
                 state.member_tokens.insert(new_key.clone(), member_token);
+            }
+            if let Some(member_brigade) = state.member_brigades.remove(&old_key) {
+                state
+                    .member_brigades
+                    .insert(new_key.clone(), member_brigade);
             }
             state
                 .member_tokens
@@ -4888,7 +4907,7 @@ fn update_tick(
     }
 
     // Members whose nudge only an unsent draft is holding back.
-    let mut held_by_draft: Vec<MemberToken> = Vec::new();
+    let mut held_by_draft: Vec<String> = Vec::new();
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
@@ -4899,6 +4918,7 @@ fn update_tick(
             };
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
+                obs.brigade_id,
                 &obs.token,
                 now,
                 obs.is_idle_this_tick,
@@ -4914,11 +4934,14 @@ fn update_tick(
                     key: obs.key,
                     nudged_at: now,
                 });
-                state.set_status(format!("relay: nudged {}", obs.token), now);
+                state.set_status(
+                    format!("relay: nudged brigade {} {}", obs.brigade_id, obs.token),
+                    now,
+                );
             } else if input.has_unsent
                 && state
                     .relay_states
-                    .get(&obs.token)
+                    .get(&(obs.brigade_id, obs.token.clone()))
                     .is_some_and(|relay_state| {
                         should_nudge(
                             now,
@@ -4933,7 +4956,7 @@ fn update_tick(
                     })
             {
                 // Every other condition says nudge; the draft alone says no.
-                held_by_draft.push(obs.token);
+                held_by_draft.push(format!("brigade {} {}", obs.brigade_id, obs.token));
             }
         }
     }
@@ -5672,11 +5695,13 @@ mod tests {
     #[test]
     fn tick_relay_decision_requires_two_consecutive_idle_ticks() {
         let mut states = HashMap::new();
+        let brigade_id = 1;
         let token = "worker-1".to_string();
         let now = test_instant();
 
         assert!(!tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
@@ -5685,6 +5710,7 @@ mod tests {
         ));
         assert!(tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
@@ -5694,13 +5720,23 @@ mod tests {
     }
 
     #[test]
-    fn tick_relay_decision_busy_tick_resets_the_idle_streak() {
+    fn tick_relay_decision_keeps_same_named_members_in_different_brigades_separate() {
         let mut states = HashMap::new();
-        let token = "worker-1".to_string();
+        let token = DIRECTOR_TOKEN.to_string();
         let now = test_instant();
 
         assert!(!tick_relay_decision(
             &mut states,
+            1,
+            &token,
+            now,
+            Some(true),
+            PaneInput::default(),
+            true,
+        ));
+        assert!(tick_relay_decision(
+            &mut states,
+            1,
             &token,
             now,
             Some(true),
@@ -5709,6 +5745,46 @@ mod tests {
         ));
         assert!(!tick_relay_decision(
             &mut states,
+            2,
+            &token,
+            now,
+            Some(true),
+            PaneInput::default(),
+            true,
+        ));
+        assert!(tick_relay_decision(
+            &mut states,
+            2,
+            &token,
+            now,
+            Some(true),
+            PaneInput::default(),
+            true,
+        ));
+
+        assert_eq!(states.get(&(1, token.clone())).unwrap().nudge.attempts, 1);
+        assert_eq!(states.get(&(2, token)).unwrap().nudge.attempts, 1);
+    }
+
+    #[test]
+    fn tick_relay_decision_busy_tick_resets_the_idle_streak() {
+        let mut states = HashMap::new();
+        let brigade_id = 1;
+        let token = "worker-1".to_string();
+        let now = test_instant();
+
+        assert!(!tick_relay_decision(
+            &mut states,
+            brigade_id,
+            &token,
+            now,
+            Some(true),
+            PaneInput::default(),
+            true,
+        ));
+        assert!(!tick_relay_decision(
+            &mut states,
+            brigade_id,
             &token,
             now,
             Some(false),
@@ -5717,6 +5793,7 @@ mod tests {
         ));
         assert!(!tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
@@ -5728,12 +5805,14 @@ mod tests {
     #[test]
     fn tick_relay_decision_unknown_live_entry_never_counts_as_idle() {
         let mut states = HashMap::new();
+        let brigade_id = 1;
         let token = "worker-1".to_string();
         let now = test_instant();
 
         for _ in 0..5 {
             assert!(!tick_relay_decision(
                 &mut states,
+                brigade_id,
                 &token,
                 now,
                 None,
@@ -5746,11 +5825,13 @@ mod tests {
     #[test]
     fn tick_relay_decision_resets_on_drain_so_the_next_batch_starts_fresh() {
         let mut states = HashMap::new();
+        let brigade_id = 1;
         let token = "worker-1".to_string();
         let now = test_instant();
 
         tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
@@ -5759,44 +5840,69 @@ mod tests {
         );
         assert!(tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
             PaneInput::default(),
             true,
         ));
-        assert_eq!(states.get(&token).unwrap().nudge.attempts, 1);
+        assert_eq!(
+            states
+                .get(&(brigade_id, token.clone()))
+                .unwrap()
+                .nudge
+                .attempts,
+            1
+        );
 
         assert!(!tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
             PaneInput::default(),
             false,
         ));
-        assert!(!states.contains_key(&token));
+        assert!(!states.contains_key(&(brigade_id, token.clone())));
 
         assert!(!tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
             PaneInput::default(),
             true,
         ));
-        assert_eq!(states.get(&token).unwrap().idle_streak, 1);
-        assert_eq!(states.get(&token).unwrap().nudge.attempts, 0);
+        assert_eq!(
+            states
+                .get(&(brigade_id, token.clone()))
+                .unwrap()
+                .idle_streak,
+            1
+        );
+        assert_eq!(
+            states
+                .get(&(brigade_id, token.clone()))
+                .unwrap()
+                .nudge
+                .attempts,
+            0
+        );
     }
 
     #[test]
     fn tick_relay_decision_stops_after_the_attempt_cap_even_past_cooldown() {
         let mut states = HashMap::new();
+        let brigade_id = 1;
         let token = "worker-1".to_string();
         let mut now = test_instant();
 
         tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
@@ -5807,6 +5913,7 @@ mod tests {
             now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
             assert!(tick_relay_decision(
                 &mut states,
+                brigade_id,
                 &token,
                 now,
                 Some(true),
@@ -5815,13 +5922,18 @@ mod tests {
             ));
         }
         assert_eq!(
-            states.get(&token).unwrap().nudge.attempts,
+            states
+                .get(&(brigade_id, token.clone()))
+                .unwrap()
+                .nudge
+                .attempts,
             RELAY_MAX_ATTEMPTS
         );
 
         now += RELAY_NUDGE_COOLDOWN + Duration::from_secs(1);
         assert!(!tick_relay_decision(
             &mut states,
+            brigade_id,
             &token,
             now,
             Some(true),
@@ -8771,6 +8883,7 @@ mod tests {
         let mut now = test_instant();
 
         let observation = || RelayObservation {
+            brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
             has_unseen: true,
@@ -8817,7 +8930,13 @@ mod tests {
             writes(&cmds),
             vec![(worker.clone(), RELAY_NUDGE_LINE.as_bytes().to_vec())]
         );
-        assert!(state.status.as_deref().unwrap().contains("nudged worker-1"));
+        assert!(
+            state
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("nudged brigade 1 worker-1")
+        );
 
         // A tick before the submit delay has elapsed: nothing flushed yet.
         now += Duration::from_millis(50);
@@ -8842,6 +8961,62 @@ mod tests {
             now,
         );
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
+    }
+
+    #[test]
+    fn a_draft_in_an_offstage_brigade_holds_its_nudge_with_a_qualified_notice() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let visible = SessionKey::from_id("visible-director");
+        let offstage = SessionKey::from_id("offstage-director");
+        state.screens.insert(visible.clone(), Screen::new(24, 80));
+        state.screens.insert(offstage.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(visible.clone()),
+            panes: vec![visible],
+            focused: 0,
+        };
+        state.unsent_operator_input.insert(offstage.clone());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let observation = || RelayObservation {
+            brigade_id: 2,
+            token: DIRECTOR_TOKEN.to_string(),
+            key: offstage.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+        };
+        let now = test_instant();
+
+        let first = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now,
+        );
+        let second = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation()],
+            },
+            now + Duration::from_secs(1),
+        );
+
+        assert!(writes_of(&first).is_empty());
+        assert!(writes_of(&second).is_empty());
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("brigade 2 director")),
+            "the notice must distinguish the off-stage director: {:?}",
+            state.status
+        );
     }
 
     // --- Codex Worker kickoff: open_worker / update_spawned / update_tick --
@@ -9282,6 +9457,7 @@ mod tests {
             *focused = 1;
         }
         let observation = || RelayObservation {
+            brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
             has_unseen: true,
@@ -9335,6 +9511,7 @@ mod tests {
         );
 
         let observation = || RelayObservation {
+            brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
             has_unseen: true,
@@ -9405,6 +9582,7 @@ mod tests {
                 brigade,
                 Event::Tick {
                     relay: vec![RelayObservation {
+                        brigade_id: 1,
                         token: token.to_string(),
                         key: key.clone(),
                         has_unseen: true,
@@ -9830,6 +10008,7 @@ mod tests {
             brigade,
             Event::Tick {
                 relay: vec![RelayObservation {
+                    brigade_id: 1,
                     token: token.to_string(),
                     key: key.clone(),
                     has_unseen,
@@ -10200,6 +10379,7 @@ mod tests {
         let mut now = test_instant();
 
         let observation = || RelayObservation {
+            brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
             has_unseen: true,
@@ -13633,6 +13813,8 @@ mod tests {
         state
             .member_tokens
             .insert(worker.clone(), "worker-1".to_string());
+        state.member_brigades.insert(director.clone(), 1);
+        state.member_brigades.insert(worker.clone(), 1);
         state.stage = Stage::Brigade {
             id: 1,
             director: Some(director.clone()),
@@ -13703,6 +13885,67 @@ mod tests {
             "its screen is gone until the spawn lands"
         );
         assert!(state.status.unwrap().contains("restarting"));
+    }
+
+    #[test]
+    fn an_offstage_worker_that_dies_is_restarted_in_its_own_brigade() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let visible = SessionKey::from_id("other-director");
+        state.screens.insert(visible.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 2,
+            director: Some(visible.clone()),
+            panes: vec![visible],
+            focused: 0,
+        };
+
+        let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
+
+        assert!(matches!(
+            &cmds[..],
+            [Cmd::OpenEmbedded {
+                brigade: Some((1, token, BrigadeRole::Worker)),
+                ..
+            }] if token == "worker-1"
+        ));
+    }
+
+    #[test]
+    fn an_offstage_members_compaction_fork_rekeys_its_live_pane() {
+        let (mut state, mut app) = staged_brigade_with_worker();
+        let brigade = brigade_config();
+        let visible = SessionKey::from_id("other-director");
+        state.screens.insert(visible.clone(), Screen::new(24, 80));
+        state.stage = Stage::Brigade {
+            id: 2,
+            director: Some(visible.clone()),
+            panes: vec![visible],
+            focused: 0,
+        };
+        let old_key = SessionKey::from_id("w1");
+        let new_key = SessionKey::from_id("w1-new");
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MemberSessionForked {
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                old_id: "w1".to_string(),
+                new_id: "w1-new".to_string(),
+            },
+            test_instant(),
+        );
+
+        assert!(state.screens.contains_key(&new_key));
+        assert!(!state.screens.contains_key(&old_key));
+        assert_eq!(state.member_brigades.get(&new_key), Some(&1));
+        assert!(matches!(
+            cmds.first(),
+            Some(Cmd::RekeyPty { from, to }) if from == &old_key && to == &new_key
+        ));
     }
 
     #[test]

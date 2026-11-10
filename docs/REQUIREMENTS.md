@@ -854,7 +854,8 @@ existed in its own context at all — an information gap, not a reliability one.
 A Director↔Worker exchange over the MCP tools above is pull-based by design
 (see above), which means a member sitting idle with unread mail will never
 notice unless something nudges it. The auto-relay closes that loop: it
-observes each staged brigade member's idle/busy status (the same
+observes every live brigade pane's idle/busy status, including panes behind
+the currently displayed brigade (the same
 `sessions/<pid>.json` live-state read the Activity indicator uses) and unseen
 message count, and once a member has been idle for `RELAY_IDLE_STREAK_REQUIRED`
 consecutive observation ticks with mail waiting, types a fixed line into its
