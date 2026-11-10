@@ -19,9 +19,11 @@
 //! into [`engine::update`] as a `docs/DISCIPLINE.md` §8 replay stream.
 
 use std::cell::RefCell;
+use std::cell::RefCell as CellRef;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout, Write as _};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,7 +37,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -81,7 +83,161 @@ use super::convert;
 use super::paste_accum::{PasteAccumulator, is_in_scope};
 use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
-type Tui = Terminal<CrosstermBackend<Stdout>>;
+type Tui = Terminal<TimedBackend<CrosstermBackend<CountingWriter<Stdout>>>>;
+
+#[derive(Clone, Copy, Default)]
+struct MethodTimings {
+    calls: u64,
+    elapsed: Duration,
+}
+
+impl MethodTimings {
+    fn record(&mut self, elapsed: Duration) {
+        self.calls += 1;
+        self.elapsed += elapsed;
+    }
+}
+
+#[derive(Default)]
+struct BackendTimings {
+    draw: MethodTimings,
+    append_lines: MethodTimings,
+    hide_cursor: MethodTimings,
+    show_cursor: MethodTimings,
+    get_cursor_position: MethodTimings,
+    set_cursor_position: MethodTimings,
+    clear: MethodTimings,
+    clear_region: MethodTimings,
+    size: MethodTimings,
+    window_size: MethodTimings,
+    flush: MethodTimings,
+    bytes_written: u64,
+}
+
+/// A `Write` shim that records only successful byte writes. It deliberately
+/// does not buffer, split, or flush: terminal traffic must remain byte-for-byte
+/// and call-for-call identical while diagnostics are enabled.
+struct CountingWriter<W> {
+    inner: W,
+    timings: Rc<CellRef<BackendTimings>>,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, timings: Rc<CellRef<BackendTimings>>) -> Self {
+        Self { inner, timings }
+    }
+}
+
+impl<W: io::Write> io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.timings.borrow_mut().bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Counts a one-off write without changing its buffering or flush behavior.
+struct ByteCountingWriter<'a, W> {
+    inner: W,
+    bytes_written: &'a mut u64,
+}
+
+impl<W: io::Write> io::Write for ByteCountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        *self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Pass-through ratatui backend which times every trait call. Its shared
+/// counters let `size(&self)` participate without changing the backend API.
+struct TimedBackend<B> {
+    inner: B,
+    timings: Rc<CellRef<BackendTimings>>,
+}
+
+impl<B> TimedBackend<B> {
+    fn new(inner: B, timings: Rc<CellRef<BackendTimings>>) -> Self {
+        Self { inner, timings }
+    }
+
+    fn take_timings(&self) -> BackendTimings {
+        std::mem::take(&mut *self.timings.borrow_mut())
+    }
+}
+
+macro_rules! timed_backend_call {
+    ($self:ident, $field:ident, $call:expr) => {{
+        let started = Instant::now();
+        let result = $call;
+        $self.timings.borrow_mut().$field.record(started.elapsed());
+        result
+    }};
+}
+
+impl<B: Backend> Backend for TimedBackend<B> {
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        timed_backend_call!(self, draw, self.inner.draw(content))
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+        timed_backend_call!(self, append_lines, self.inner.append_lines(n))
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        timed_backend_call!(self, hide_cursor, self.inner.hide_cursor())
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        timed_backend_call!(self, show_cursor, self.inner.show_cursor())
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        timed_backend_call!(self, get_cursor_position, self.inner.get_cursor_position())
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+        timed_backend_call!(
+            self,
+            set_cursor_position,
+            self.inner.set_cursor_position(position)
+        )
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        timed_backend_call!(self, clear, self.inner.clear())
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+        timed_backend_call!(self, clear_region, self.inner.clear_region(clear_type))
+    }
+
+    fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+        timed_backend_call!(self, size, self.inner.size())
+    }
+
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+        timed_backend_call!(self, window_size, self.inner.window_size())
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        timed_backend_call!(self, flush, self.inner.flush())
+    }
+}
 
 /// The `config.toml`-derived settings [`run`] needs, bundled into one
 /// parameter once a fourth one (`enabled_agents`) pushed the plain arg list
@@ -325,6 +481,9 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let mut pane_render_cache: HashMap<SessionKey, PaneRenderCache> = HashMap::new();
 
     loop {
+        // Start a new diagnostic sample before even the size query; taking
+        // instead of clearing preserves the exact terminal operation order.
+        let _ = terminal.backend().take_timings();
         let now = Instant::now();
         let mut events: VecDeque<Event> = VecDeque::new();
 
@@ -530,7 +689,9 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         }
 
         let draw_start = Instant::now();
+        let mut draw_timings = DrawTimings::default();
         terminal.draw(|frame| {
+            let assemble_start = Instant::now();
             draw(
                 frame,
                 app,
@@ -538,9 +699,11 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 SystemTime::now(),
                 now,
                 &mut pane_render_cache,
-            )
+            );
+            draw_timings.assemble += assemble_start.elapsed();
         })?;
         let draw_dur = draw_start.elapsed();
+        draw_timings.backend = terminal.backend().take_timings();
 
         // Unconditional, once per frame, after `terminal.draw` returns —
         // not inside the buffer `draw` builds (a close written into a
@@ -574,7 +737,13 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         // because closing a hyperlink that isn't open is a documented
         // terminal no-op — the same property that makes ratatui's own
         // unconditional SGR reset safe.
-        let _ = close_any_open_hyperlink(&mut io::stdout());
+        let hyperlink_start = Instant::now();
+        let mut hyperlink_writer = ByteCountingWriter {
+            inner: io::stdout(),
+            bytes_written: &mut draw_timings.hyperlink_bytes,
+        };
+        let _ = close_any_open_hyperlink(&mut hyperlink_writer);
+        draw_timings.hyperlink_close = hyperlink_start.elapsed();
 
         log_slow_iteration(
             &mut stage_log,
@@ -587,6 +756,7 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 draw: draw_dur,
             },
             &tick_timings,
+            &draw_timings,
         );
 
         if app.should_quit() {
@@ -2487,7 +2657,12 @@ fn setup_terminal() -> Result<Tui> {
         EnableBracketedPaste,
         EnableFocusChange
     )?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    let timings = Rc::new(CellRef::new(BackendTimings::default()));
+    let writer = CountingWriter::new(stdout, timings.clone());
+    Ok(Terminal::new(TimedBackend::new(
+        CrosstermBackend::new(writer),
+        timings,
+    ))?)
 }
 
 fn restore_terminal() -> Result<()> {
@@ -2604,6 +2779,14 @@ struct TickTimings {
     goinkyo_roster: Duration,
 }
 
+#[derive(Default)]
+struct DrawTimings {
+    assemble: Duration,
+    hyperlink_close: Duration,
+    hyperlink_bytes: u64,
+    backend: BackendTimings,
+}
+
 /// Stage name and duration only — no keystroke content, no paths, no
 /// payload, the same discretion `banto_io::provider::cache`'s own
 /// verification log already exercises (path-only on divergence, never
@@ -2622,6 +2805,7 @@ fn log_slow_iteration(
     file: &mut Option<std::fs::File>,
     timings: &StageTimings,
     tick_timings: &TickTimings,
+    draw_timings: &DrawTimings,
 ) {
     use std::io::Write as _;
     let total = timings.total();
@@ -2673,6 +2857,52 @@ fn log_slow_iteration(
             tick_timings.relay_activity_codex_sqlite.as_micros(),
             tick_timings.relay_activity_codex_rollout.as_micros(),
             tick_timings.goinkyo_roster.as_micros(),
+        );
+    }
+    let draw_is_dominant = [
+        timings.pty_pump,
+        timings.discovery,
+        timings.reload,
+        timings.tick,
+        timings.dispatch,
+    ]
+    .into_iter()
+    .all(|other| timings.draw >= other);
+    if draw_is_dominant {
+        let backend = &draw_timings.backend;
+        let bytes = backend.bytes_written + draw_timings.hyperlink_bytes;
+        let _ = writeln!(
+            file,
+            "{ms} emporium: slow draw assemble={}us hyperlink_close={}us hyperlink_bytes={} \
+             bytes={} backend_draw={}us/{} append_lines={}us/{} hide_cursor={}us/{} \
+             show_cursor={}us/{} get_cursor_position={}us/{} set_cursor_position={}us/{} \
+             clear={}us/{} clear_region={}us/{} size={}us/{} window_size={}us/{} flush={}us/{}",
+            draw_timings.assemble.as_micros(),
+            draw_timings.hyperlink_close.as_micros(),
+            draw_timings.hyperlink_bytes,
+            bytes,
+            backend.draw.elapsed.as_micros(),
+            backend.draw.calls,
+            backend.append_lines.elapsed.as_micros(),
+            backend.append_lines.calls,
+            backend.hide_cursor.elapsed.as_micros(),
+            backend.hide_cursor.calls,
+            backend.show_cursor.elapsed.as_micros(),
+            backend.show_cursor.calls,
+            backend.get_cursor_position.elapsed.as_micros(),
+            backend.get_cursor_position.calls,
+            backend.set_cursor_position.elapsed.as_micros(),
+            backend.set_cursor_position.calls,
+            backend.clear.elapsed.as_micros(),
+            backend.clear.calls,
+            backend.clear_region.elapsed.as_micros(),
+            backend.clear_region.calls,
+            backend.size.elapsed.as_micros(),
+            backend.size.calls,
+            backend.window_size.elapsed.as_micros(),
+            backend.window_size.calls,
+            backend.flush.elapsed.as_micros(),
+            backend.flush.calls,
         );
     }
 }
@@ -2853,6 +3083,7 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::{Arc, Mutex};
 
     use banto_core::model::{Activity, AgentKind, SessionRow};
@@ -2861,6 +3092,185 @@ mod tests {
     use banto_io::status::ProcessProbe;
 
     use super::*;
+
+    #[derive(Default)]
+    struct ProbeBackend {
+        calls: CellRef<Vec<&'static str>>,
+    }
+
+    impl ProbeBackend {
+        fn call(&self, name: &'static str) {
+            self.calls.borrow_mut().push(name);
+        }
+    }
+
+    impl Backend for ProbeBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.call("draw");
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(())
+        }
+
+        fn append_lines(&mut self, _n: u16) -> Result<(), Self::Error> {
+            self.call("append_lines");
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.call("hide_cursor");
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.call("show_cursor");
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.call("get_cursor_position");
+            Ok(Position::new(3, 4))
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            _position: P,
+        ) -> Result<(), Self::Error> {
+            self.call("set_cursor_position");
+            Ok(())
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.call("clear");
+            Ok(())
+        }
+
+        fn clear_region(&mut self, _clear_type: ClearType) -> Result<(), Self::Error> {
+            self.call("clear_region");
+            Ok(())
+        }
+
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            self.call("size");
+            Ok(ratatui::layout::Size::new(80, 24))
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.call("window_size");
+            Ok(WindowSize {
+                columns_rows: ratatui::layout::Size::new(80, 24),
+                pixels: ratatui::layout::Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.call("flush");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn timed_backend_passes_every_backend_call_through_and_resets_per_sample() {
+        let timings = Rc::new(CellRef::new(BackendTimings::default()));
+        let mut backend = TimedBackend::new(ProbeBackend::default(), timings);
+        backend
+            .draw(std::iter::empty::<(u16, u16, &ratatui::buffer::Cell)>())
+            .unwrap();
+        backend.append_lines(1).unwrap();
+        backend.hide_cursor().unwrap();
+        backend.show_cursor().unwrap();
+        assert_eq!(backend.get_cursor_position().unwrap(), Position::new(3, 4));
+        backend.set_cursor_position(Position::new(5, 6)).unwrap();
+        backend.clear().unwrap();
+        backend.clear_region(ClearType::CurrentLine).unwrap();
+        assert_eq!(backend.size().unwrap(), ratatui::layout::Size::new(80, 24));
+        assert_eq!(backend.window_size().unwrap().columns_rows.width, 80);
+        backend.flush().unwrap();
+
+        let sample = backend.take_timings();
+        assert!(sample.draw.elapsed >= Duration::from_millis(1));
+        assert_eq!(sample.draw.calls, 1);
+        assert_eq!(sample.append_lines.calls, 1);
+        assert_eq!(sample.hide_cursor.calls, 1);
+        assert_eq!(sample.show_cursor.calls, 1);
+        assert_eq!(sample.get_cursor_position.calls, 1);
+        assert_eq!(sample.set_cursor_position.calls, 1);
+        assert_eq!(sample.clear.calls, 1);
+        assert_eq!(sample.clear_region.calls, 1);
+        assert_eq!(sample.size.calls, 1);
+        assert_eq!(sample.window_size.calls, 1);
+        assert_eq!(sample.flush.calls, 1);
+        assert_eq!(
+            backend.inner.calls.borrow().clone(),
+            vec![
+                "draw",
+                "append_lines",
+                "hide_cursor",
+                "show_cursor",
+                "get_cursor_position",
+                "set_cursor_position",
+                "clear",
+                "clear_region",
+                "size",
+                "window_size",
+                "flush",
+            ]
+        );
+        let reset = backend.take_timings();
+        assert_eq!(reset.draw.calls, 0);
+        assert_eq!(reset.draw.elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn counting_writer_preserves_writes_and_counts_successful_bytes() {
+        let timings = Rc::new(CellRef::new(BackendTimings::default()));
+        let mut writer = CountingWriter::new(Vec::new(), timings.clone());
+        writer.write_all(b"abc").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.inner, b"abc");
+        assert_eq!(timings.borrow().bytes_written, 3);
+    }
+
+    #[test]
+    fn a_draw_dominant_slow_iteration_logs_backend_breakdown() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut file = Some(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap(),
+        );
+        let timings = StageTimings {
+            pty_pump: Duration::ZERO,
+            discovery: Duration::ZERO,
+            reload: Duration::ZERO,
+            tick: Duration::ZERO,
+            dispatch: Duration::ZERO,
+            draw: Duration::from_millis(20),
+        };
+        let draw = DrawTimings {
+            assemble: Duration::from_millis(3),
+            hyperlink_close: Duration::from_micros(7),
+            hyperlink_bytes: 7,
+            backend: BackendTimings {
+                draw: MethodTimings {
+                    calls: 1,
+                    elapsed: Duration::from_millis(16),
+                },
+                bytes_written: 123,
+                ..BackendTimings::default()
+            },
+        };
+        log_slow_iteration(&mut file, &timings, &TickTimings::default(), &draw);
+        drop(file);
+        let logged = std::fs::read_to_string(temp.path()).unwrap();
+        assert!(logged.contains("emporium: slow draw assemble=3000us hyperlink_close=7us hyperlink_bytes=7 bytes=130 backend_draw=16000us/1"));
+        assert!(logged.contains("size=0us/0 window_size=0us/0 flush=0us/0"));
+    }
 
     fn open(host: &MockPtyHost) -> PtyHandle {
         PtyHandle::open(host, &["child".to_string()], None, &[], &[], 24, 80).unwrap()
