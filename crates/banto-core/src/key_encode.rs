@@ -23,6 +23,14 @@ pub fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
                 push_utf8(&mut out, c);
             }
         }
+        // Shift alone sends LF, the byte Ctrl+J sends: Claude Code documents
+        // Ctrl+J as its newline key on every terminal, and a Claude pane in
+        // banto was confirmed on the operator's machine (2026-11-10) to take
+        // a Ctrl+J LF as a newline. Shift+Enter used to send CR like any
+        // Enter, so what the operator meant as a newline sent the message.
+        // Alt and Ctrl+Enter stay CR: Ctrl+Enter is send-now to Claude, and
+        // Alt+Enter rarely reaches banto at all (Windows Terminal takes it).
+        KeyCode::Enter if key.modifiers.shift && !ctrl && !alt => out.push(b'\n'),
         KeyCode::Enter => out.push(b'\r'),
         KeyCode::Tab => out.push(b'\t'),
         KeyCode::BackTab => out.extend_from_slice(b"\x1b[Z"),
@@ -75,10 +83,10 @@ pub enum ForwardedInput<'a> {
 /// change without touching them.
 ///
 /// Enter is classified by the bytes [`key_to_bytes`] actually sends, not by
-/// which key was pressed: the child sees only bytes, and today every Enter —
-/// Shift, Alt and Ctrl included — is the same `\r`, so every Enter sends.
-/// An Enter that is ever encoded as something else stops counting as a send
-/// here by itself, with no change to this function.
+/// which key was pressed: the child sees only bytes. A `\r` sends; any other
+/// Enter encoding (Shift+Enter is a `\n`, a newline) puts text into the line
+/// instead. A change to the encoding changes the classification by itself,
+/// with no change to this function.
 pub fn input_effect(input: ForwardedInput<'_>) -> InputEffect {
     let key = match input {
         ForwardedInput::Key(key) => key,
@@ -254,37 +262,52 @@ mod tests {
 
     #[test]
     fn an_enter_submits_exactly_when_it_is_sent_as_a_carriage_return() {
-        for mods in [
-            Modifiers::NONE,
-            Modifiers::SHIFT,
-            Modifiers::ALT,
-            Modifiers::CONTROL,
+        let both = Modifiers {
+            ctrl: true,
+            alt: false,
+            shift: true,
+        };
+        for (mods, submits) in [
+            (Modifiers::NONE, true),
+            (Modifiers::SHIFT, false),
+            (Modifiers::ALT, true),
+            (Modifiers::CONTROL, true),
+            (both, true),
         ] {
             let key = KeyEvent::new(KeyCode::Enter, mods);
+            let effect = input_effect(ForwardedInput::Key(&key));
             assert_eq!(
-                input_effect(ForwardedInput::Key(&key)) == InputEffect::Submits,
+                effect == InputEffect::Submits,
                 key_to_bytes(&key) == b"\r",
                 "{mods:?}: the classification follows the bytes"
             );
-            // And today that means every one of them.
-            assert_eq!(
-                input_effect(ForwardedInput::Key(&key)),
-                InputEffect::Submits,
-                "{mods:?}"
-            );
+            assert_eq!(effect == InputEffect::Submits, submits, "{mods:?}");
         }
     }
 
     #[test]
-    fn a_modified_enter_is_the_same_bytes_as_a_plain_one() {
-        // What `input_effect` relies on for Enter: nothing downstream of the
-        // encoding can tell these apart, so none of them can be a draft.
-        for mods in [
-            Modifiers::NONE,
-            Modifiers::SHIFT,
-            Modifiers::ALT,
-            Modifiers::CONTROL,
-        ] {
+    fn shift_enter_sends_a_line_feed_and_so_adds_text() {
+        let key = KeyEvent::new(KeyCode::Enter, Modifiers::SHIFT);
+        assert_eq!(key_to_bytes(&key), b"\n");
+        assert_eq!(
+            input_effect(ForwardedInput::Key(&key)),
+            InputEffect::AddsText
+        );
+    }
+
+    #[test]
+    fn shift_enter_sends_the_byte_ctrl_j_sends() {
+        // The claim the encoding rests on: Claude's documented newline key.
+        assert_eq!(
+            bytes(KeyCode::Enter, Modifiers::SHIFT),
+            bytes(KeyCode::Char('j'), Modifiers::CONTROL)
+        );
+    }
+
+    #[test]
+    fn an_alt_or_ctrl_enter_is_the_same_bytes_as_a_plain_one() {
+        // Only Shift alone is told apart; anything else is a plain send.
+        for mods in [Modifiers::NONE, Modifiers::ALT, Modifiers::CONTROL] {
             assert_eq!(bytes(KeyCode::Enter, mods), b"\r", "{mods:?}");
         }
     }

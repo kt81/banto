@@ -9547,16 +9547,11 @@ mod tests {
     }
 
     #[test]
-    fn every_enter_releases_the_hold_because_the_child_receives_the_same_carriage_return() {
-        // Shift, Alt and Ctrl+Enter reach the child as the same bytes as a
-        // plain Enter (`key_encode::key_to_bytes`), so each one sends whatever
-        // was typed; a mark that survived them would outlive an empty line.
-        for modifiers in [
-            Modifiers::NONE,
-            Modifiers::SHIFT,
-            Modifiers::ALT,
-            Modifiers::CONTROL,
-        ] {
+    fn an_enter_the_child_receives_as_a_carriage_return_releases_the_hold() {
+        // Alt and Ctrl+Enter reach the child as the same bytes as a plain
+        // Enter (`key_encode::key_to_bytes`), so each one sends whatever was
+        // typed; a mark that survived them would outlive an empty line.
+        for modifiers in [Modifiers::NONE, Modifiers::ALT, Modifiers::CONTROL] {
             let (mut state, mut app, brigade, director, _worker, mut now) =
                 two_pane_brigade_focused_on(0);
             for (code, modifiers) in [
@@ -9576,6 +9571,59 @@ mod tests {
             );
             assert_eq!(writes, nudge_for(&director), "{modifiers:?}+Enter");
         }
+    }
+
+    #[test]
+    fn shift_enter_is_a_newline_so_it_marks_the_pane_and_holds_the_nudge() {
+        // It reaches the child as a line feed, not a send, so a line the
+        // operator is still composing is exactly what it leaves behind.
+        let (mut state, mut app, brigade, director, _worker, mut now) =
+            two_pane_brigade_focused_on(0);
+
+        let cmds = forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Enter,
+            Modifiers::SHIFT,
+            now,
+        );
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(director.clone(), vec![10])],
+            "a line feed, not a carriage return"
+        );
+        assert!(state.has_unsent_operator_input(&director));
+        now += Duration::from_secs(3600);
+        let writes = nudge_ticks(
+            &mut state, &mut app, &brigade, "director", &director, &mut now,
+        );
+        assert!(writes.is_empty(), "{writes:?}");
+    }
+
+    #[test]
+    fn a_plain_enter_after_a_shift_enter_releases_the_hold() {
+        let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
+        for (code, modifiers) in [
+            (KeyCode::Char('a'), Modifiers::NONE),
+            (KeyCode::Enter, Modifiers::SHIFT),
+            (KeyCode::Char('b'), Modifiers::NONE),
+        ] {
+            forward_key(&mut state, &mut app, &brigade, code, modifiers, now);
+        }
+        assert!(state.has_unsent_operator_input(&director));
+
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Enter,
+            Modifiers::NONE,
+            now,
+        );
+
+        assert!(!state.has_unsent_operator_input(&director));
     }
 
     #[test]

@@ -871,9 +871,9 @@ capped number of attempts on one unseen batch
 A time window cannot protect a draft, so the operator's unsent text is
 tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
 pane is marked when banto forwards something that may add text to its input
-line — a printable key, a paste, Tab — and unmarked only when an Enter
-(whatever its modifiers: all reach the child as the same `\r`) is forwarded
-or the pane goes away. While a pane is marked, a nudge to it is suppressed
+line — a printable key, a paste, Tab, Shift+Enter (sent as a line feed,
+Claude's newline) — and unmarked only when an Enter that reaches the child
+as a `\r` (plain, Alt, Ctrl) is forwarded or the pane goes away. While a pane is marked, a nudge to it is suppressed
 whatever the focus and however long ago the operator last typed, a nudge's
 own delayed Enter is dropped if the mark appeared before it was due, and the
 status line says the nudge is being held (re-shown every 30s, never over
