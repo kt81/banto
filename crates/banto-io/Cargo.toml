@@ -26,5 +26,10 @@ toml = "0.9.8"
 # guarantee (see that trait's doc).
 libc = "0.2.186"
 
+[target.'cfg(windows)'.dependencies]
+# Direct per-PID liveness avoids sysinfo's Windows process-table snapshot;
+# `status::probe` owns the narrowly-scoped handles and closes each one.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = "3.24.0"

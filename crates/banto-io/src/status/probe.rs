@@ -45,23 +45,41 @@ pub trait ProcessProbe {
 pub struct SysinfoProbe;
 
 impl SysinfoProbe {
-    /// Snapshot which of `pids` are alive through one `sysinfo::System`
-    /// refresh.  This belongs outside [`ProcessProbe`]: it serves a list
-    /// pass that already knows every PID, while the trait deliberately stays
-    /// a small mockable point-query interface for open/resume and ancestry.
-    /// Because [`ProcessProbe::is_alive`] calls this helper, the `banto` binary
-    /// crate's `opener::is_live` and `opener::open_session` reach it for their
-    /// no-double-resume guard; display-only policy must stay above this helper.
+    /// Snapshot which of `pids` are alive. This belongs outside
+    /// [`ProcessProbe`]: it serves a list pass that already knows every PID,
+    /// while the trait deliberately stays a small mockable point-query
+    /// interface for open/resume and ancestry. Because [`ProcessProbe::is_alive`]
+    /// calls this helper, the `banto` binary crate's `opener::is_live` and
+    /// `opener::open_session` reach it for their no-double-resume guard;
+    /// display-only policy must stay above this helper.
+    ///
+    /// Windows deliberately opens each requested PID instead of asking
+    /// `sysinfo` for `ProcessesToUpdate::Some`: measured on the operator's
+    /// machine on 2026-11-10, sysinfo still enumerated the full process table
+    /// for that subset, making the emporium's one-second relay tick spend
+    /// about 12ms in this operation. The Windows branch preserves the exact
+    /// liveness meaning and its fail-safe direction; see `windows_pid_state`.
     pub fn alive_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<u32> {
-        let pids = pids
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .map(Pid::from_u32)
-            .collect::<Vec<_>>();
+        let pids = pids.into_iter().collect::<HashSet<_>>();
         if pids.is_empty() {
             return HashSet::new();
         }
+        alive_pids(&pids)
+    }
+}
+
+fn alive_pids(pids: &HashSet<u32>) -> HashSet<u32> {
+    #[cfg(windows)]
+    {
+        pids.iter()
+            .copied()
+            .filter(|&pid| windows_pid_state(pid).is_alive())
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    {
+        let pids = pids.iter().copied().map(Pid::from_u32).collect::<Vec<_>>();
         let mut system = System::new();
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&pids),
@@ -91,7 +109,7 @@ impl ProcessProbe for SysinfoProbe {
         system.process(pid)?.parent().map(Pid::as_u32)
     }
 
-    /// Verified only on Linux (which WSL2 counts as: it has a real kernel
+    /// Verified on Linux (which WSL2 counts as: it has a real kernel
     /// `/proc`), by comparing `proc_start` against the kernel's own
     /// `starttime` field for `pid` (`/proc/<pid>/stat`, field 22 — clock
     /// ticks since boot, per `man 5 proc`). This is the exact quantity
@@ -111,17 +129,159 @@ impl ProcessProbe for SysinfoProbe {
     /// guess. Reading the raw ticks directly instead needs no such
     /// assumption: both sides are the same unconverted integer.
     ///
-    /// On any other platform, or if `pid`'s `/proc/<pid>/stat` can't be
-    /// read/parsed, or `proc_start` itself doesn't parse, falls back to
-    /// [`Self::is_alive`] — see the trait doc comment for why that fallback
-    /// is the safe direction to fail in.
+    /// Windows compares the raw unsigned FILETIME from `GetProcessTimes`.
+    /// This was checked directly on the operator's machine on 2026-11-10:
+    /// the three live Claude `sessions/<pid>.json` `procStart` values were
+    /// bit-for-bit equal to their processes' creation FILETIMEs. Elsewhere,
+    /// or when either platform cannot obtain a comparable value, this falls
+    /// back to [`Self::is_alive`] — see the trait doc for why that is safe.
     fn is_alive_matching(&self, pid: u32, proc_start: &str) -> bool {
         let Ok(expected) = proc_start.parse::<u64>() else {
             return self.is_alive(pid);
         };
-        match read_proc_start_ticks(pid) {
-            Some(actual) => actual == expected,
+        match process_start(pid) {
+            Some(Some(actual)) => actual == expected,
+            Some(None) => false,
             None => self.is_alive(pid),
+        }
+    }
+}
+
+/// `Some(Some(start))` identifies a live process and its comparable creation
+/// value; `Some(None)` proves no live process owns that PID; `None` means the
+/// platform/API could not establish identity and must use the safe liveness
+/// fallback instead.
+fn process_start(pid: u32) -> Option<Option<u64>> {
+    #[cfg(windows)]
+    {
+        windows_process_start(pid)
+    }
+
+    #[cfg(not(windows))]
+    {
+        read_proc_start_ticks(pid).map(Some)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsPidState {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+#[cfg(windows)]
+impl WindowsPidState {
+    fn is_alive(self) -> bool {
+        // `Unknown` is deliberately live. This reaches opener's double-resume
+        // guard, where a mistaken `false` forks session history; a conservative
+        // refusal is the only safe outcome when Windows cannot answer.
+        !matches!(self, Self::Dead)
+    }
+}
+
+/// Inspect one PID without enumerating Windows' process table.
+///
+/// `OpenProcess` success is not enough: a process object remains while some
+/// caller (including banto's own `Child`) still holds a handle after exit.
+/// `GetExitCodeProcess` distinguishes that retained, already-dead object from
+/// `STILL_ACTIVE`, matching what a process-table snapshot means. Access
+/// denied proves that the process exists and therefore counts as live. Missing
+/// PIDs (`ERROR_INVALID_PARAMETER`) are dead. Every other API failure is
+/// unknown and intentionally maps to live through [`WindowsPidState::is_alive`]
+/// to protect AGENTS.md invariant 4's no-double-resume guarantee.
+#[cfg(windows)]
+fn windows_pid_state(pid: u32) -> WindowsPidState {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess returns either null or an owned process HANDLE. It
+    // is closed exactly once below before this function returns.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return match GetLastError() {
+                ERROR_ACCESS_DENIED => WindowsPidState::Alive,
+                ERROR_INVALID_PARAMETER => WindowsPidState::Dead,
+                _ => WindowsPidState::Unknown,
+            };
+        }
+        let mut exit_code = 0;
+        let got_exit_code = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        let _ = CloseHandle(handle);
+        if !got_exit_code {
+            WindowsPidState::Unknown
+        } else if exit_code == STILL_ACTIVE as u32 {
+            WindowsPidState::Alive
+        } else {
+            WindowsPidState::Dead
+        }
+    }
+}
+
+/// Return a live process's raw creation FILETIME. See [`windows_pid_state`]
+/// for why an exited process object that remains handle-referenced is `Dead`,
+/// not an identity-bearing live process.
+#[cfg(windows)]
+fn windows_process_start(pid: u32) -> Option<Option<u64>> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, GetLastError,
+        STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: the handle returned by OpenProcess is owned here and closed
+    // exactly once. FILETIME output pointers all point at initialized locals.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return match GetLastError() {
+                ERROR_INVALID_PARAMETER => Some(None),
+                // Access denied establishes liveness but not the creation
+                // time, so let the caller safely fall back to bare liveness.
+                ERROR_ACCESS_DENIED => None,
+                _ => None,
+            };
+        }
+
+        let mut exit_code = 0;
+        if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+        if exit_code != STILL_ACTIVE as u32 {
+            let _ = CloseHandle(handle);
+            return Some(None);
+        }
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let got_times =
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        // A handle keeps an exited process object queryable, so check again
+        // after obtaining its creation time. This is the closest equivalent
+        // to a process-table snapshot's single "still present" observation.
+        let mut final_exit_code = 0;
+        let still_running = GetExitCodeProcess(handle, &mut final_exit_code) != 0
+            && final_exit_code == STILL_ACTIVE as u32;
+        let _ = CloseHandle(handle);
+        if !got_times {
+            None
+        } else if !still_running {
+            Some(None)
+        } else {
+            Some(Some(
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+            ))
         }
     }
 }
@@ -137,6 +297,7 @@ impl ProcessProbe for SysinfoProbe {
 /// [`SysinfoProbe::is_alive_matching`]'s doc comment for why that matters
 /// here). Field indices below were cross-checked against a real
 /// `/proc/<pid>/stat` line on-device, not derived from documentation alone.
+#[cfg(any(not(windows), test))]
 fn parse_starttime_ticks(stat: &str) -> Option<u64> {
     let after_comm = stat.rsplit_once(')')?.1;
     // state(0) ppid(1) pgrp(2) session(3) tty(4) tpgid(5) flags(6) minflt(7)
@@ -151,13 +312,11 @@ fn parse_starttime_ticks(stat: &str) -> Option<u64> {
 /// exist, the file can't be read, or its contents don't parse — all treated
 /// identically by [`SysinfoProbe::is_alive_matching`]'s caller.
 ///
-/// Only the *read* below is platform-split, and deliberately so: this
-/// function stays on every platform's compile path, which is what keeps
-/// [`parse_starttime_ticks`] reachable — and therefore compiled and tested —
-/// on Windows too. Gating the parse instead makes it dead code there, which
-/// is precisely what the Windows CI job caught and what a `clippy` run on
-/// Linux structurally cannot see: `-D warnings` can only judge the code its
-/// own `cfg`s left standing.
+/// Only this filesystem read is platform-split. The parser is still compiled
+/// by its platform-neutral unit tests on Windows, so Windows CI continues to
+/// type-check the pure parsing logic while avoiding an uncallable `/proc`
+/// read in its non-test build.
+#[cfg(not(windows))]
 fn read_proc_start_ticks(pid: u32) -> Option<u64> {
     parse_starttime_ticks(&proc_stat(pid)?)
 }
@@ -168,11 +327,11 @@ fn proc_stat(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()
 }
 
-/// No `/proc` on this platform to read a start time from at all — always
-/// declines, deferring identity verification to [`SysinfoProbe::is_alive`]'s
-/// bare liveness check (see that method's doc comment for why that fallback
-/// direction is the safe one).
-#[cfg(not(target_os = "linux"))]
+/// No `/proc` on this non-Windows platform to read a start time from at all
+/// — always declines, deferring identity verification to
+/// [`SysinfoProbe::is_alive`]'s bare liveness check (see that method's doc
+/// comment for why that fallback direction is the safe one).
+#[cfg(all(not(target_os = "linux"), not(windows)))]
 fn proc_stat(_pid: u32) -> Option<String> {
     None
 }
@@ -220,6 +379,43 @@ mod tests {
         let alive = SysinfoProbe::alive_pids([std::process::id(), u32::MAX]);
         assert!(alive.contains(&std::process::id()));
         assert!(!alive.contains(&u32::MAX));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_sees_self_and_rejects_an_impossible_pid() {
+        let probe = SysinfoProbe;
+        assert!(probe.is_alive(std::process::id()));
+        assert!(!probe.is_alive(u32::MAX));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_marks_an_exited_child_dead_while_its_handle_is_held() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait().unwrap();
+
+        // `child` remains in scope and still owns its process HANDLE. A
+        // snapshot would omit this exited process; GetExitCodeProcess must
+        // make our direct check agree rather than mistaking the object for a
+        // live PID.
+        assert!(!SysinfoProbe.is_alive(pid));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_check_matches_our_filetime_and_rejects_a_different_one() {
+        let pid = std::process::id();
+        let creation = windows_process_start(pid)
+            .expect("the current process query must not be indeterminate")
+            .expect("the current process must be alive");
+        let probe = SysinfoProbe;
+        assert!(probe.is_alive_matching(pid, &creation.to_string()));
+        assert!(!probe.is_alive_matching(pid, &creation.saturating_add(1).to_string()));
     }
 
     /// A probe whose parentage is an explicit `child -> parent` map — no
