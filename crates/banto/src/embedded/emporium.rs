@@ -39,7 +39,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Paragraph};
@@ -83,7 +83,7 @@ use super::convert;
 use super::paste_accum::{PasteAccumulator, is_in_scope};
 use super::session::{PtyHandle, PtyPoll, wait_for_exit_or_deadline};
 
-type Tui = Terminal<TimedBackend<CrosstermBackend<CountingWriter<Stdout>>>>;
+type Tui = Terminal<TimedBackend<CrosstermBackend<FrameWriter<Stdout>>>>;
 
 #[derive(Clone, Copy, Default)]
 struct MethodTimings {
@@ -111,50 +111,110 @@ struct BackendTimings {
     size: MethodTimings,
     window_size: MethodTimings,
     flush: MethodTimings,
+    present_write: MethodTimings,
+    present_flush: MethodTimings,
     bytes_written: u64,
 }
 
-/// A `Write` shim that records only successful byte writes. It deliberately
-/// does not buffer, split, or flush: terminal traffic must remain byte-for-byte
-/// and call-for-call identical while diagnostics are enabled.
-struct CountingWriter<W> {
-    inner: W,
+/// Accumulates one presentation so the screen diff, cursor update, and OSC 8
+/// close reach the host in their required order with one real write/flush.
+///
+/// `ratatui-crossterm` writes each cursor command through `execute!`, which
+/// flushes its writer. On a Windows console that made a small cursor update as
+/// expensive as the whole frame. Backend `flush` is therefore only a frame
+/// boundary here; [`FrameWriter::present`] is the sole host flush.
+struct FrameWriter<W> {
+    output: Rc<CellRef<FrameOutput<W>>>,
     timings: Rc<CellRef<BackendTimings>>,
 }
 
-impl<W> CountingWriter<W> {
-    fn new(inner: W, timings: Rc<CellRef<BackendTimings>>) -> Self {
-        Self { inner, timings }
-    }
-}
-
-impl<W: io::Write> io::Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        self.timings.borrow_mut().bytes_written += written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Counts a one-off write without changing its buffering or flush behavior.
-struct ByteCountingWriter<'a, W> {
+struct FrameOutput<W> {
     inner: W,
-    bytes_written: &'a mut u64,
+    pending: Vec<u8>,
 }
 
-impl<W: io::Write> io::Write for ByteCountingWriter<'_, W> {
+/// The shell-side half of [`FrameWriter`]. Crossterm intentionally keeps its
+/// writer private, so this shared handle is how the frame boundary appends
+/// OSC 8 after Ratatui's cursor commands without opening a second stdout.
+struct FrameOutputHandle<W> {
+    output: Rc<CellRef<FrameOutput<W>>>,
+    timings: Rc<CellRef<BackendTimings>>,
+}
+
+impl<W> FrameWriter<W> {
+    fn new(inner: W, timings: Rc<CellRef<BackendTimings>>) -> (Self, FrameOutputHandle<W>) {
+        let output = Rc::new(CellRef::new(FrameOutput {
+            inner,
+            pending: Vec::new(),
+        }));
+        (
+            Self {
+                output: output.clone(),
+                timings: timings.clone(),
+            },
+            FrameOutputHandle { output, timings },
+        )
+    }
+}
+
+impl<W: io::Write> FrameOutputHandle<W> {
+    fn has_pending(&self) -> bool {
+        !self.output.borrow().pending.is_empty()
+    }
+
+    fn present(&mut self) -> io::Result<()> {
+        let mut output = self.output.borrow_mut();
+        if !output.pending.is_empty() {
+            let pending = std::mem::take(&mut output.pending);
+            let started = Instant::now();
+            let result = output.inner.write_all(&pending);
+            self.timings
+                .borrow_mut()
+                .present_write
+                .record(started.elapsed());
+            if let Err(error) = result {
+                // Keep the queued bytes observable to the caller; the event
+                // loop exits on this error rather than silently discarding a
+                // half-presented frame.
+                output.pending = pending;
+                return Err(error);
+            }
+        }
+        let started = Instant::now();
+        let result = output.inner.flush();
+        self.timings
+            .borrow_mut()
+            .present_flush
+            .record(started.elapsed());
+        result
+    }
+
+    fn write_hyperlink_close(&mut self) -> io::Result<()> {
+        close_any_open_hyperlink(self)
+    }
+}
+
+impl<W: io::Write> io::Write for FrameWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        *self.bytes_written += written as u64;
-        Ok(written)
+        self.output.borrow_mut().pending.extend_from_slice(buf);
+        self.timings.borrow_mut().bytes_written += buf.len() as u64;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        Ok(())
+    }
+}
+
+impl<W: io::Write> io::Write for FrameOutputHandle<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.output.borrow_mut().pending.extend_from_slice(buf);
+        self.timings.borrow_mut().bytes_written += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -163,15 +223,40 @@ impl<W: io::Write> io::Write for ByteCountingWriter<'_, W> {
 struct TimedBackend<B> {
     inner: B,
     timings: Rc<CellRef<BackendTimings>>,
+    size: CellRef<Size>,
 }
 
-impl<B> TimedBackend<B> {
-    fn new(inner: B, timings: Rc<CellRef<BackendTimings>>) -> Self {
-        Self { inner, timings }
+impl<B: Backend> TimedBackend<B> {
+    fn new(inner: B, timings: Rc<CellRef<BackendTimings>>) -> Result<Self, B::Error> {
+        let started = Instant::now();
+        let size = inner.size();
+        timings.borrow_mut().size.record(started.elapsed());
+        Ok(Self {
+            inner,
+            timings,
+            size: CellRef::new(size?),
+        })
     }
 
     fn take_timings(&self) -> BackendTimings {
         std::mem::take(&mut *self.timings.borrow_mut())
+    }
+
+    fn cached_size(&self) -> Size {
+        *self.size.borrow()
+    }
+
+    fn set_cached_size(&self, size: Size) {
+        *self.size.borrow_mut() = size;
+    }
+
+    fn refresh_size(&mut self) -> Result<Size, B::Error> {
+        let started = Instant::now();
+        let size = self.inner.size();
+        self.timings.borrow_mut().size.record(started.elapsed());
+        let size = size?;
+        self.set_cached_size(size);
+        Ok(size)
     }
 }
 
@@ -227,7 +312,10 @@ impl<B: Backend> Backend for TimedBackend<B> {
     }
 
     fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
-        timed_backend_call!(self, size, self.inner.size())
+        let started = Instant::now();
+        let size = self.cached_size();
+        self.timings.borrow_mut().size.record(started.elapsed());
+        Ok(size)
     }
 
     fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
@@ -368,8 +456,8 @@ pub fn run(
         agent_binaries,
         enabled_agents,
     };
-    let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut app, &deps, keys);
+    let (mut terminal, mut frame_output) = setup_terminal()?;
+    let result = event_loop(&mut terminal, &mut frame_output, &mut app, &deps, keys);
     let restored = restore_terminal();
     result.and(restored)
 }
@@ -459,7 +547,13 @@ struct Deps<'a> {
     enabled_agents: &'a BTreeSet<AgentKind>,
 }
 
-fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig) -> Result<()> {
+fn event_loop(
+    terminal: &mut Tui,
+    frame_output: &mut FrameOutputHandle<Stdout>,
+    app: &mut App,
+    deps: &Deps,
+    keys: &KeysConfig,
+) -> Result<()> {
     let brigade = deps.brigade;
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
@@ -479,18 +573,19 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
     let run_start = Instant::now();
     let mut event_recorder = open_event_recorder(run_start);
     let mut pane_render_cache: HashMap<SessionKey, PaneRenderCache> = HashMap::new();
+    let mut terminal_size = terminal.backend().cached_size();
+    let mut presented: Option<PresentedFrame> = None;
 
     loop {
-        // Start a new diagnostic sample before even the size query; taking
-        // instead of clearing preserves the exact terminal operation order.
+        // Start a new diagnostic sample before this iteration's work.
         let _ = terminal.backend().take_timings();
         let now = Instant::now();
         let mut events: VecDeque<Event> = VecDeque::new();
 
-        // Terminal geometry: only fed when it actually changed (`update`'s
-        // handling is idempotent either way, but there's no reason to spam
-        // it every ~50ms).
-        let size = terminal.size()?;
+        // Geometry is cached from startup, native resize input, and the
+        // once-a-second fallback below. `Terminal::draw` used to perform a
+        // second actual console-size query after this one every iteration.
+        let size = terminal.backend().cached_size();
         if (size.width, size.height) != state.size {
             events.push_back(Event::Resized {
                 width: size.width,
@@ -551,7 +646,17 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
                 // which is exactly why both have to resolve through one path
                 // (`Event::WindowFocusChanged`'s own doc). Neither is a key, so
                 // neither may reach `is_in_scope`'s paste-accumulation gate.
-                if let Some(ev) = window_focus_event(&raw) {
+                if let crossterm::event::Event::Resize(width, height) = raw {
+                    terminal.backend().set_cached_size(Size::new(width, height));
+                    // The former per-frame size query put resize ahead of
+                    // PTY/input events; retain that ordering now that the
+                    // input thread supplies the prompt notification. Replace
+                    // the loop's older cached observation too: startup can
+                    // otherwise queue 80x24, receive 120x40 before dispatch,
+                    // and incorrectly apply the stale size last.
+                    events.retain(|event| !matches!(event, Event::Resized { .. }));
+                    events.push_front(Event::Resized { width, height });
+                } else if let Some(ev) = window_focus_event(&raw) {
                     events.push_back(ev);
                 } else if let Some(input) = convert::from_crossterm(raw) {
                     log_input(&mut input_log, &describe_converted_event(&input));
@@ -623,7 +728,21 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
         let tick_start = Instant::now();
         let mut tick_timings = TickTimings::default();
         if last_tick.is_none_or(|tick| now.duration_since(tick) >= TICK_INTERVAL) {
+            let first_tick = last_tick.is_none();
             last_tick = Some(now);
+            // Startup already made the one authoritative query that seeded
+            // the cache. The initial application tick still runs at once,
+            // but the fallback poll begins a full interval later.
+            if !first_tick {
+                let size = terminal.backend_mut().refresh_size()?;
+                if (size.width, size.height) != state.size {
+                    events.retain(|event| !matches!(event, Event::Resized { .. }));
+                    events.push_front(Event::Resized {
+                        width: size.width,
+                        height: size.height,
+                    });
+                }
+            }
             events.extend(gather_fork_observations(
                 &state,
                 deps.store,
@@ -690,60 +809,90 @@ fn event_loop(terminal: &mut Tui, app: &mut App, deps: &Deps, keys: &KeysConfig)
 
         let draw_start = Instant::now();
         let mut draw_timings = DrawTimings::default();
-        terminal.draw(|frame| {
+        let cached_size = terminal.backend().cached_size();
+        if cached_size != terminal_size {
+            terminal.resize(Rect::new(0, 0, cached_size.width, cached_size.height))?;
+            terminal_size = cached_size;
+        }
+        if app.modal().is_some() {
+            // `Frame` does not expose the cursor a modal requests. Its text
+            // entry is uncommon and must remain exact, so retain Ratatui's
+            // normal application path while still batching its host output.
             let assemble_start = Instant::now();
-            draw(
-                frame,
-                app,
-                &state,
-                SystemTime::now(),
-                now,
-                &mut pane_render_cache,
-            );
+            let drawn = terminal
+                .draw(|frame| {
+                    let _ = draw(
+                        frame,
+                        app,
+                        &state,
+                        SystemTime::now(),
+                        now,
+                        &mut pane_render_cache,
+                    );
+                })
+                .map(|_| ());
             draw_timings.assemble += assemble_start.elapsed();
-        })?;
+            if frame_output.has_pending() {
+                let hyperlink_start = Instant::now();
+                frame_output.write_hyperlink_close()?;
+                draw_timings.hyperlink_close = hyperlink_start.elapsed();
+                draw_timings.hyperlink_bytes = b"\x1b]8;;\x1b\\".len() as u64;
+            }
+            let present_result = frame_output.present();
+            drawn?;
+            present_result?;
+            // The modal's private cursor request cannot be represented in
+            // `PresentedFrame`; force one normal comparison after it closes.
+            presented = None;
+        } else {
+            let (buffer, cursor) = {
+                let frame = &mut terminal.get_frame();
+                let assemble_start = Instant::now();
+                let cursor = draw(
+                    frame,
+                    app,
+                    &state,
+                    SystemTime::now(),
+                    now,
+                    &mut pane_render_cache,
+                );
+                draw_timings.assemble += assemble_start.elapsed();
+                (frame.buffer_mut().clone(), cursor)
+            };
+            let changed = should_present(presented.as_ref(), &buffer, cursor);
+            if changed {
+                // The writer below absorbs ratatui's backend flush. That lets
+                // us append the OSC 8 close after cursor placement, then do
+                // exactly one real host write and flush for the presentation.
+                let applied = terminal.apply_buffer_with_cursor(cursor).map(|_| ());
+                if frame_output.has_pending() {
+                    // Ratatui resets SGR after a frame but knows nothing of
+                    // OSC 8. Its cell diff can transmit an unchanged link
+                    // opener while skipping its separately painted close,
+                    // leaving later prose linked. A bare close after every
+                    // frame that actually wrote cells gives OSC 8 the same
+                    // boundary guarantee as Ratatui's SGR reset. Skipped
+                    // frames wrote no opener, so they must emit nothing.
+                    let hyperlink_start = Instant::now();
+                    frame_output.write_hyperlink_close()?;
+                    draw_timings.hyperlink_close = hyperlink_start.elapsed();
+                    draw_timings.hyperlink_bytes = b"\x1b]8;;\x1b\\".len() as u64;
+                }
+                // Present even if Ratatui reported an operation error, so
+                // queued output is never left dangling in the frame writer.
+                let present_result = frame_output.present();
+                applied?;
+                present_result?;
+                presented = Some(PresentedFrame { buffer, cursor });
+            } else {
+                // Keep Ratatui's previous buffer as the next diff baseline
+                // while clearing this unpresented work buffer for next time.
+                terminal.current_buffer_mut().reset();
+                draw_timings.skipped = true;
+            }
+        }
         let draw_dur = draw_start.elapsed();
         draw_timings.backend = terminal.backend().take_timings();
-
-        // Unconditional, once per frame, after `terminal.draw` returns —
-        // not inside the buffer `draw` builds (a close written into a
-        // cell's own symbol would just be another cell subject to the same
-        // diff that causes this), and not per pane (one close at the frame
-        // boundary is the whole point; `paint.rs`'s per-row open/close
-        // logic inside the buffer is untouched and still correct on its
-        // own terms).
-        //
-        // `ratatui-crossterm` 0.1.2's `Backend::draw` ends every single
-        // frame with an unconditional SGR reset (lib.rs:277-291) — no
-        // bold/italic/underline/etc. can survive past the frame that set
-        // it. But that reset is SGR 0, and OSC 8 hyperlink state is a
-        // separate mechanism ratatui has no concept of at all; nothing in
-        // `Backend::draw` ever emits a hyperlink close. `ratatui-core`
-        // 0.1.2's `diff.rs` skips a cell — even a `ForcedWidth` one, which
-        // every cell `paint.rs` paints is — whenever it is unchanged from
-        // the previous frame, deciding this per cell, independently, with
-        // no notion that an open-carrying cell and its paired close-carrying
-        // cell belong together. So a frame can transmit a well-formed,
-        // properly-terminated OSC 8 open whose paired close gets silently
-        // skipped (unchanged since the prior frame) — nothing malformed
-        // reaches the host, it is simply never told the link closed. Every
-        // cell painted after that, in any pane, on any later frame, reads
-        // to the host as still inside that link, until some later frame
-        // happens to transmit a close for unrelated reasons — indistinguishable
-        // on screen from ordinary prose being underlined.
-        //
-        // Closing here every frame gives OSC 8 the same per-frame guarantee
-        // `ratatui-crossterm` already gives SGR. Safe unconditionally
-        // because closing a hyperlink that isn't open is a documented
-        // terminal no-op — the same property that makes ratatui's own
-        // unconditional SGR reset safe.
-        let hyperlink_start = Instant::now();
-        let mut hyperlink_writer = ByteCountingWriter {
-            inner: io::stdout(),
-            bytes_written: &mut draw_timings.hyperlink_bytes,
-        };
-        let _ = close_any_open_hyperlink(&mut hyperlink_writer);
-        draw_timings.hyperlink_close = hyperlink_start.elapsed();
 
         log_slow_iteration(
             &mut stage_log,
@@ -938,12 +1087,12 @@ fn execute_cmd(
             // ratatui's model of the screen the way a cursor-positioning
             // sequence would, which is the property an innocent edit could
             // break by writing something else this way. `execute_cmd` runs
-            // before this iteration's `terminal.draw`, which flushes its
-            // own output at the end, so there is never a half-written
-            // escape sequence on the wire for this to land inside; `stdout()`
-            // is the same global buffered handle the backend itself writes
-            // through, so the two stay serialized rather than interleaved.
-            // Flushed explicitly rather than left for the next draw's flush
+            // before this iteration's frame presentation, so there is never
+            // a half-written escape sequence on the wire for this to land
+            // inside; `stdout()` is the same global buffered handle the
+            // backend itself writes through, so the two stay serialized
+            // rather than interleaved. Flushed explicitly rather than left
+            // for the next presentation's flush
             // — a copy landing a frame late for no reason defeats a feature
             // whose whole point is that the operator feels it arrive.
             let mut stdout = std::io::stdout();
@@ -961,11 +1110,10 @@ fn execute_cmd(
     }
 }
 
-/// Writes a bare OSC 8 close (`ESC ] 8 ; ; ESC \`) and flushes — called
-/// unconditionally once per frame from `event_loop`, after `terminal.draw`
-/// returns; see that call site's own comment for why this exists and why
-/// it runs where it does. Split out from the call site only so the exact
-/// bytes and the flush are independently testable without a real terminal.
+/// Writes a bare OSC 8 close (`ESC ] 8 ; ; ESC \`) into the current frame
+/// output. It is emitted only after a presentation that queued screen bytes;
+/// a skipped frame sends nothing at all. Split out so its exact bytes and the
+/// flush boundary are independently testable without a real terminal.
 fn close_any_open_hyperlink<W: io::Write>(w: &mut W) -> io::Result<()> {
     w.write_all(b"\x1b]8;;\x1b\\")?;
     w.flush()
@@ -2430,7 +2578,8 @@ fn draw(
     now: SystemTime,
     tick: Instant,
     pane_render_cache: &mut HashMap<SessionKey, PaneRenderCache>,
-) {
+) -> Option<Position> {
+    let mut frame_cursor = None;
     let full_area = frame.area();
     let focus = state.focus;
     let areas = layout(full_area);
@@ -2495,7 +2644,9 @@ fn draw(
                 && screen.scrollback() == 0
                 && let Some((x, y)) = cursor
             {
-                frame.set_cursor_position(Position::new(x, y));
+                let position = Position::new(x, y);
+                frame.set_cursor_position(position);
+                frame_cursor = Some(position);
             }
         }
     }
@@ -2517,6 +2668,8 @@ fn draw(
         // (see `engine::update_modal_key`) — see `render_modal`'s doc.
         banto_tui::render_modal::render_modal(frame, modal, full_area, true);
     }
+
+    frame_cursor
 }
 
 /// Role, not position: `director` (`Stage::Brigade`'s own field) answers
@@ -2646,7 +2799,7 @@ fn pane_title(text: &str, focused: bool) -> Span<'static> {
 /// costs nothing on the platform where it doesn't help, and is what makes
 /// Unix backends behave correctly. The chōba list TUI (`crate::tui`) is
 /// untouched: it has its own, separate `setup_terminal`.
-fn setup_terminal() -> Result<Tui> {
+fn setup_terminal() -> Result<(Tui, FrameOutputHandle<Stdout>)> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2658,11 +2811,11 @@ fn setup_terminal() -> Result<Tui> {
         EnableFocusChange
     )?;
     let timings = Rc::new(CellRef::new(BackendTimings::default()));
-    let writer = CountingWriter::new(stdout, timings.clone());
-    Ok(Terminal::new(TimedBackend::new(
-        CrosstermBackend::new(writer),
-        timings,
-    ))?)
+    let (writer, frame_output) = FrameWriter::new(stdout, timings.clone());
+    Ok((
+        Terminal::new(TimedBackend::new(CrosstermBackend::new(writer), timings)?)?,
+        frame_output,
+    ))
 }
 
 fn restore_terminal() -> Result<()> {
@@ -2784,7 +2937,24 @@ struct DrawTimings {
     assemble: Duration,
     hyperlink_close: Duration,
     hyperlink_bytes: u64,
+    skipped: bool,
     backend: BackendTimings,
+}
+
+/// The last output sent to the host, including the cursor request which is
+/// intentionally outside ratatui's public `Buffer` API. A matching frame can
+/// therefore avoid every backend operation, not merely an empty cell diff.
+struct PresentedFrame {
+    buffer: Buffer,
+    cursor: Option<Position>,
+}
+
+fn should_present(
+    presented: Option<&PresentedFrame>,
+    buffer: &Buffer,
+    cursor: Option<Position>,
+) -> bool {
+    presented.is_none_or(|previous| previous.buffer != *buffer || previous.cursor != cursor)
 }
 
 /// Stage name and duration only — no keystroke content, no paths, no
@@ -2870,13 +3040,18 @@ fn log_slow_iteration(
     .all(|other| timings.draw >= other);
     if draw_is_dominant {
         let backend = &draw_timings.backend;
-        let bytes = backend.bytes_written + draw_timings.hyperlink_bytes;
+        // The OSC 8 close now travels through the same frame writer, so its
+        // bytes are already included in the backend total (unlike the old
+        // direct stdout close, which needed adding separately).
+        let bytes = backend.bytes_written;
         let _ = writeln!(
             file,
-            "{ms} emporium: slow draw assemble={}us hyperlink_close={}us hyperlink_bytes={} \
+            "{ms} emporium: slow draw skipped={} assemble={}us hyperlink_close={}us hyperlink_bytes={} \
              bytes={} backend_draw={}us/{} append_lines={}us/{} hide_cursor={}us/{} \
              show_cursor={}us/{} get_cursor_position={}us/{} set_cursor_position={}us/{} \
-             clear={}us/{} clear_region={}us/{} size={}us/{} window_size={}us/{} flush={}us/{}",
+             clear={}us/{} clear_region={}us/{} size={}us/{} window_size={}us/{} flush={}us/{} \
+             present_write={}us/{} present_flush={}us/{}",
+            draw_timings.skipped,
             draw_timings.assemble.as_micros(),
             draw_timings.hyperlink_close.as_micros(),
             draw_timings.hyperlink_bytes,
@@ -2903,6 +3078,10 @@ fn log_slow_iteration(
             backend.window_size.calls,
             backend.flush.elapsed.as_micros(),
             backend.flush.calls,
+            backend.present_write.elapsed.as_micros(),
+            backend.present_write.calls,
+            backend.present_flush.elapsed.as_micros(),
+            backend.present_flush.calls,
         );
     }
 }
@@ -3176,7 +3355,8 @@ mod tests {
     #[test]
     fn timed_backend_passes_every_backend_call_through_and_resets_per_sample() {
         let timings = Rc::new(CellRef::new(BackendTimings::default()));
-        let mut backend = TimedBackend::new(ProbeBackend::default(), timings);
+        let mut backend = TimedBackend::new(ProbeBackend::default(), timings).unwrap();
+        let _ = backend.take_timings();
         backend
             .draw(std::iter::empty::<(u16, u16, &ratatui::buffer::Cell)>())
             .unwrap();
@@ -3207,6 +3387,7 @@ mod tests {
         assert_eq!(
             backend.inner.calls.borrow().clone(),
             vec![
+                "size",
                 "draw",
                 "append_lines",
                 "hide_cursor",
@@ -3215,7 +3396,6 @@ mod tests {
                 "set_cursor_position",
                 "clear",
                 "clear_region",
-                "size",
                 "window_size",
                 "flush",
             ]
@@ -3226,13 +3406,84 @@ mod tests {
     }
 
     #[test]
-    fn counting_writer_preserves_writes_and_counts_successful_bytes() {
+    fn frame_writer_batches_writes_and_counts_successful_bytes() {
         let timings = Rc::new(CellRef::new(BackendTimings::default()));
-        let mut writer = CountingWriter::new(Vec::new(), timings.clone());
+        let (mut writer, mut output) = FrameWriter::new(Vec::new(), timings.clone());
         writer.write_all(b"abc").unwrap();
         writer.flush().unwrap();
-        assert_eq!(writer.inner, b"abc");
+        assert!(output.has_pending());
+        output.present().unwrap();
+        assert_eq!(output.output.borrow().inner, b"abc");
         assert_eq!(timings.borrow().bytes_written, 3);
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_writer_presents_screen_cursor_and_hyperlink_close_in_one_write() {
+        let timings = Rc::new(CellRef::new(BackendTimings::default()));
+        let (mut writer, mut output) = FrameWriter::new(RecordingWriter::default(), timings);
+        writer.write_all(b"screen").unwrap();
+        writer.write_all(b"cursor").unwrap();
+        output.write_hyperlink_close().unwrap();
+        output.present().unwrap();
+
+        let output = output.output.borrow();
+        assert_eq!(
+            output.inner.writes,
+            vec![b"screencursor\x1b]8;;\x1b\\".to_vec()]
+        );
+        assert_eq!(output.inner.flushes, 1);
+    }
+
+    #[test]
+    fn cached_size_avoids_per_frame_console_queries_and_refreshes_on_demand() {
+        let timings = Rc::new(CellRef::new(BackendTimings::default()));
+        let mut backend = TimedBackend::new(ProbeBackend::default(), timings).unwrap();
+        assert_eq!(backend.inner.calls.borrow().as_slice(), ["size"]);
+
+        assert_eq!(backend.size().unwrap(), Size::new(80, 24));
+        backend.set_cached_size(Size::new(120, 40));
+        assert_eq!(backend.size().unwrap(), Size::new(120, 40));
+        assert_eq!(backend.inner.calls.borrow().as_slice(), ["size"]);
+
+        assert_eq!(backend.refresh_size().unwrap(), Size::new(80, 24));
+        assert_eq!(backend.inner.calls.borrow().as_slice(), ["size", "size"]);
+    }
+
+    #[test]
+    fn identical_frame_skips_but_a_cell_or_cursor_change_presents() {
+        let buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let presented = PresentedFrame {
+            buffer: buffer.clone(),
+            cursor: None,
+        };
+        assert!(!should_present(Some(&presented), &buffer, None));
+
+        let mut changed_cell = buffer.clone();
+        changed_cell[(0, 0)].set_symbol("x");
+        assert!(should_present(Some(&presented), &changed_cell, None));
+        assert!(should_present(
+            Some(&presented),
+            &buffer,
+            Some(Position::new(1, 0))
+        ));
     }
 
     #[test]
@@ -3256,6 +3507,7 @@ mod tests {
             assemble: Duration::from_millis(3),
             hyperlink_close: Duration::from_micros(7),
             hyperlink_bytes: 7,
+            skipped: false,
             backend: BackendTimings {
                 draw: MethodTimings {
                     calls: 1,
@@ -3268,7 +3520,7 @@ mod tests {
         log_slow_iteration(&mut file, &timings, &TickTimings::default(), &draw);
         drop(file);
         let logged = std::fs::read_to_string(temp.path()).unwrap();
-        assert!(logged.contains("emporium: slow draw assemble=3000us hyperlink_close=7us hyperlink_bytes=7 bytes=130 backend_draw=16000us/1"));
+        assert!(logged.contains("emporium: slow draw skipped=false assemble=3000us hyperlink_close=7us hyperlink_bytes=7 bytes=123 backend_draw=16000us/1"));
         assert!(logged.contains("size=0us/0 window_size=0us/0 flush=0us/0"));
     }
 
