@@ -433,7 +433,25 @@ committed.
 
 **Layout.** A solo session fills the whole pane. A staged brigade (see
 "Brigade" below) tiles Director left / Workers stacked down the right —
-"master + stack".
+"master + stack". The proportions are the operator's to move with the left
+mouse button, in three places: the sidebar's right edge (one width for the whole
+emporium, 36 columns until moved), the edge between the Director and the stack
+(per brigade, half the pane area until moved), and the bottom edge of a
+stacked Worker's tile (per brigade, equal heights until moved). The stack's edge
+is the two rows between neighbouring tiles — the upper tile's bottom border and
+the lower tile's top border — except the cells the lower tile's title label is
+drawn on, which stay the tile's own (a click there focuses it). Pressing on an
+edge starts a drag; a yellow line previews where it would land, following the
+pointer by the distance it has moved since the press (wherever on the edge it
+was grabbed), and nothing is resized until the button is released, so a child
+sees one new size per gesture, not one per mouse cell. `Esc`, another press, a window focus loss, a modal, or
+a terminal resize cancels the drag and changes nothing. Each side keeps a
+minimum (sidebar 16 columns, pane area 20, Director and stack 20 each, a
+stacked tile 4 rows); a drag stops there, and a terminal too small for the
+minimums gives up the preference rather than refusing to draw.
+The preferences live in memory only for now — they last as long as the
+emporium process, per brigade (`BrigadeId` and member token), and a Worker
+added later gets the mean of the others' height.
 
 **Keys** (emporium; everything the chōba has except split, plus):
 

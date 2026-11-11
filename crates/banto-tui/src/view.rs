@@ -104,7 +104,7 @@ const LABEL_GAP: usize = 2;
 /// accounted for.
 const MIN_CWD_WIDTH: usize = 8;
 /// cwd is never shown below this render width, regardless of how much room
-/// the title leaves — at sidebar widths (e.g. the emporium's 34-col list),
+/// the title leaves — at sidebar widths (e.g. the emporium's default 34-col list),
 /// a short title's leftover space isn't a genuine invitation to show cwd,
 /// it just produces a cramped, barely-readable fragment. Wide areas keep
 /// the existing [`MIN_CWD_WIDTH`]-based rule unchanged.
@@ -1197,8 +1197,9 @@ mod tests {
         .with_lines_per_row(2);
         app.set_viewport_height(10);
 
-        // 34 columns: the emporium sidebar's own inner width (36-column
-        // SIDEBAR_WIDTH minus its 2-column border).
+        // 34 columns: the emporium sidebar's inner width at its default
+        // (36 columns, `banto_core::layout::SIDEBAR_WIDTH`, minus its 2-column
+        // border). The operator can drag it wider or narrower.
         let text = draw_list(&app, 34, 10, now);
         let lines: Vec<&str> = text.lines().collect();
 

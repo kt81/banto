@@ -47,11 +47,11 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
-    self, Cmd, EmporiumState, Event, Focus, GoinkyoObservation, GoinkyoSpawnCandidate,
-    GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage, StoreIntent, layout,
-    stage_tiles,
+    self, Axis, Cmd, EmporiumState, Event, Focus, GoinkyoObservation, GoinkyoSpawnCandidate,
+    GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage, StoreIntent,
 };
 use banto_core::input::InputEvent;
+use banto_core::layout::title_text;
 use banto_core::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberToken, SessionId, SessionToOpen,
 };
@@ -2582,7 +2582,9 @@ fn draw(
     let mut frame_cursor = None;
     let full_area = frame.area();
     let focus = state.focus;
-    let areas = layout(full_area);
+    // The same geometry the core sizes the PTYs and hit-tests the mouse with.
+    let geometry = state.geometry(full_area);
+    let areas = geometry.areas;
 
     let sidebar_title = if app.mode() == Mode::Search {
         format!("/ {}", app.query())
@@ -2598,7 +2600,7 @@ fn draw(
 
     view::render_summary(frame, app, areas.summary, now);
 
-    let tiles = stage_tiles(areas.pane, &state.stage);
+    let tiles = &geometry.tiles;
     if tiles.is_empty() {
         let block = Block::bordered()
             .title(pane_title("session", false))
@@ -2614,14 +2616,14 @@ fn draw(
         );
     } else {
         let focused_key = state.stage.focused_key().cloned();
-        for (key, rect) in &tiles {
+        for (key, rect) in tiles {
             let Some(screen) = state.screens.get(key) else {
                 continue;
             };
             let focused_tile = focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let waiting = state.attention_panes().contains(key);
             let block = Block::bordered()
-                .title(pane_title(&tile_title(state, key), focused_tile))
+                .title(pane_title(&state.tile_label(key), focused_tile))
                 .border_style(border_style(focused_tile, waiting));
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
@@ -2655,10 +2657,17 @@ fn draw(
     // a `SessionKey` entry on its own.
     pane_render_cache.retain(|key, _| state.screens.contains_key(key));
 
+    // A boundary being dragged is previewed by a line over the finished
+    // frame; the geometry underneath does not move until the release. Drawn
+    // into the composed buffer, so the frame-skip sees it appear and go.
+    if let Some((line, axis)) = state.drag_overlay(full_area) {
+        paint_drag_line(frame.buffer_mut(), line, axis);
+    }
+
     render_status_bar(
         frame,
         app,
-        state.status.as_deref(),
+        state.displayed_status(),
         state.prefix_armed.is_some(),
         areas.status,
     );
@@ -2672,27 +2681,26 @@ fn draw(
     frame_cursor
 }
 
-/// Role, not position: `director` (`Stage::Brigade`'s own field) answers
-/// the Director case directly, and `goinkyo_pane_for` — already tracking
-/// the Goinkyo's current pane through every rename, built for the one-shot
-/// spawn guard — answers the Goinkyo one. Workers read their durable member
-/// token from core state, so the title agrees with the token accepted by the
-/// brigade tools even when pane geometry changes.
-fn tile_title(state: &EmporiumState, key: &SessionKey) -> String {
-    match &state.stage {
-        Stage::Brigade { id, director, .. } => {
-            if director.as_ref() == Some(key) {
-                "director".to_string()
-            } else if state.goinkyo_pane_for(*id) == Some(key) {
-                "goinkyo".to_string()
-            } else {
-                state
-                    .member_token_for(key)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "session".to_string())
-            }
+/// The colour of the line previewing a boundary drag. Neither the focus cyan
+/// nor the waiting magenta (`border_style`), so it cannot be mistaken for
+/// either.
+const DRAG_LINE_COLOR: Color = Color::Yellow;
+
+/// Paint the drag preview: a heavy line over `line`'s cells, replacing
+/// whatever the frame had there (a border, or a child's text).
+fn paint_drag_line(buffer: &mut Buffer, line: Rect, axis: Axis) {
+    let symbol = match axis {
+        Axis::Vertical => "\u{2503}",
+        Axis::Horizontal => "\u{2501}",
+    };
+    let area = line.intersection(buffer.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            cell.reset();
+            cell.set_symbol(symbol);
+            cell.set_style(Style::default().fg(DRAG_LINE_COLOR));
         }
-        _ => "session".to_string(),
     }
 }
 
@@ -2777,7 +2785,7 @@ fn border_style(focused: bool, waiting: bool) -> Style {
 /// reversal and the default resolve through the user's own terminal theme
 /// rather than a hard-coded truecolor pair.
 fn pane_title(text: &str, focused: bool) -> Span<'static> {
-    let padded = format!(" {text} ");
+    let padded = title_text(text);
     if focused {
         Span::styled(
             padded,
@@ -3275,7 +3283,80 @@ mod tests {
     use banto_io::pty::mock::MockPtyHost;
     use banto_io::status::ProcessProbe;
 
+    use ratatui::widgets::Widget as _;
+
     use super::*;
+
+    #[test]
+    fn the_drag_line_replaces_what_the_frame_had_under_it_and_nothing_beside_it() {
+        let area = Rect::new(0, 0, 6, 4);
+        let mut buffer = Buffer::empty(area);
+        for y in 0..4 {
+            for x in 0..6 {
+                buffer[(x, y)].set_symbol("x").set_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+
+        paint_drag_line(&mut buffer, Rect::new(2, 0, 1, 4), Axis::Vertical);
+        paint_drag_line(&mut buffer, Rect::new(0, 3, 6, 1), Axis::Horizontal);
+
+        for y in 0..3 {
+            let cell = &buffer[(2, y)];
+            assert_eq!(cell.symbol(), "\u{2503}");
+            assert_eq!(cell.fg, DRAG_LINE_COLOR);
+            assert!(
+                cell.modifier.is_empty(),
+                "the border's bold does not leak in"
+            );
+            assert_eq!(buffer[(3, y)].symbol(), "x");
+        }
+        // The horizontal line wins where the two cross: drawn last.
+        assert_eq!(buffer[(2, 3)].symbol(), "\u{2501}");
+        assert_eq!(buffer[(0, 3)].symbol(), "\u{2501}");
+    }
+
+    #[test]
+    fn the_cells_core_calls_the_label_are_the_cells_the_block_draws_it_on() {
+        // `banto_core::layout::title_columns` decides which top-row cells the
+        // stack boundary's handle keeps off; this renders the real title and
+        // finds where it actually landed, for short, exact-fit and clipped
+        // labels and a tile too narrow for any.
+        for (width, label) in [
+            (40u16, "worker-2"),
+            (20, "worker-2"),
+            (20, "an-extremely-long-member-label"),
+            (12, "director"),
+            (3, "x"),
+            (2, "x"),
+        ] {
+            let tile = Rect::new(5, 2, width, 4);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 8));
+            Block::bordered()
+                .title(pane_title(label, false))
+                .render(tile, &mut buffer);
+            let (start, end) = banto_core::layout::title_columns(tile, label);
+            for x in tile.x + 1..tile.x + width.saturating_sub(1) {
+                let is_border = buffer[(x, tile.y)].symbol() == "\u{2500}";
+                assert_eq!(
+                    !is_border,
+                    (start..end).contains(&x),
+                    "width {width}, {label:?}, column {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_drag_line_reaching_past_the_buffer_is_cut_to_it() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
+        paint_drag_line(&mut buffer, Rect::new(3, 0, 1, 20), Axis::Vertical);
+        paint_drag_line(&mut buffer, Rect::new(9, 9, 1, 5), Axis::Vertical);
+        assert_eq!(buffer[(3, 2)].symbol(), "\u{2503}");
+    }
 
     #[derive(Default)]
     struct ProbeBackend {
@@ -6182,8 +6263,8 @@ mod tests {
             panic!("expected a staged brigade");
         };
         *panes = vec![worker.clone(), director.clone()];
-        assert_eq!(tile_title(&state, &director), "director");
-        assert_eq!(tile_title(&state, &worker), "worker-1");
+        assert_eq!(state.tile_label(&director), "director");
+        assert_eq!(state.tile_label(&worker), "worker-1");
     }
 
     #[test]
@@ -6232,7 +6313,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(tile_title(&state, &goinkyo_key), "goinkyo");
+        assert_eq!(state.tile_label(&goinkyo_key), "goinkyo");
     }
 
     // --- window_focus_event: the main loop's FocusGained/FocusLost translation --

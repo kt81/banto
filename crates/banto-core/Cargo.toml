@@ -18,6 +18,8 @@ nucleo = "0.5.0"
 ratatui-core = "0.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
+# The width ratatui clips a tile's title by (`title_columns`). Pure.
+unicode-width = "0.2.2"
 vt100 = { version = "0.16.9", package = "vt100-psmux" }
 
 [dev-dependencies]

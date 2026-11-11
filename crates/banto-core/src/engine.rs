@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ratatui_core::layout::{Constraint, Layout, Position, Rect};
+use ratatui_core::layout::{Position, Rect};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, ClickOutcome, GroupId, GroupJoinTarget, KillChoice, Modal, Mode};
@@ -40,13 +40,13 @@ use crate::model::{
     SessionRow, SessionToOpen,
 };
 
-/// Fixed width of the left sidebar (the session list), in columns.
-pub const SIDEBAR_WIDTH: u16 = 36;
-/// Details panel height: one border row plus its content rows.
-pub const SUMMARY_HEIGHT: u16 = 5;
-/// Below this left-column height the details panel is dropped so the list keeps
-/// the room.
-pub const MIN_HEIGHT_FOR_SUMMARY: u16 = 12;
+use crate::layout::master_permille_for;
+pub use crate::layout::{
+    Areas, Axis, Boundary, BrigadeLayout, DEFAULT_MASTER_PERMILLE, Geometry, Handle,
+    MIN_HEIGHT_FOR_SUMMARY, MIN_MASTER_WIDTH, MIN_PANE_AREA_WIDTH, MIN_SIDEBAR_WIDTH,
+    MIN_STACK_TILE_HEIGHT, MIN_STACK_WIDTH, SIDEBAR_WIDTH, SUMMARY_HEIGHT, layout, master_width,
+    pane_content, stack_heights, stage_tiles,
+};
 
 /// Stable identity for a kept-alive embedded session: the real Claude
 /// session id once known, or a synthetic placeholder for a freshly-launched
@@ -190,78 +190,6 @@ impl Stage {
             _ => {}
         }
     }
-}
-
-/// The outer (bordered) tile rects for the currently-staged sessions, each
-/// paired with its key. A solo session fills the whole pane; a brigade puts
-/// its first pane on the left as the master tile and stacks the rest down
-/// the right — geometry only, keyed by position in `panes`
-/// (`Stage::Brigade::panes`'s own doc), independent of which pane actually
-/// holds the Director.
-pub fn stage_tiles(pane_area: Rect, stage: &Stage) -> Vec<(SessionKey, Rect)> {
-    match stage {
-        Stage::Empty => Vec::new(),
-        Stage::Solo(key) => vec![(key.clone(), pane_area)],
-        Stage::Brigade { panes, .. } => match panes.split_first() {
-            None => Vec::new(),
-            Some((director, [])) => vec![(director.clone(), pane_area)],
-            Some((director, workers)) => {
-                let [master, stack] =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .areas(pane_area);
-                let rows = Layout::vertical(vec![
-                    Constraint::Ratio(1, workers.len() as u32);
-                    workers.len()
-                ])
-                .split(stack);
-                let mut tiles = vec![(director.clone(), master)];
-                for (worker, row) in workers.iter().zip(rows.iter()) {
-                    tiles.push((worker.clone(), *row));
-                }
-                tiles
-            }
-        },
-    }
-}
-
-/// The inner content rect of the right pane (inside its border).
-pub fn pane_content(pane_area: Rect) -> Rect {
-    Rect {
-        x: pane_area.x + 1,
-        y: pane_area.y + 1,
-        width: pane_area.width.saturating_sub(2).max(1),
-        height: pane_area.height.saturating_sub(2).max(1),
-    }
-}
-
-/// Compute the layout: a bottom status bar, and above it a left column
-/// (sidebar list + details panel) beside the session pane.
-pub fn layout(area: Rect) -> Areas {
-    let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-    let [left, pane] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
-    let summary_h = if left.height < MIN_HEIGHT_FOR_SUMMARY {
-        0
-    } else {
-        SUMMARY_HEIGHT
-    };
-    let [sidebar, summary] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(summary_h)]).areas(left);
-    Areas {
-        sidebar,
-        summary,
-        pane,
-        status,
-    }
-}
-
-/// The regions of the emporium layout.
-#[derive(Clone, Copy)]
-pub struct Areas {
-    pub sidebar: Rect,
-    pub summary: Rect,
-    pub pane: Rect,
-    pub status: Rect,
 }
 
 // --- Relay engine (unchanged from the pre-migration code — already pure) ---
@@ -846,6 +774,25 @@ struct PendingDirectorWiring {
     worker_model: String,
 }
 
+/// A boundary drag in progress: which boundary, where the pointer took hold
+/// of it, and where it is previewed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Drag {
+    boundary: Boundary,
+    /// How far the boundary's position was from the pointer when the press
+    /// landed (a press can land on either border column of a vertical
+    /// boundary, or on either of the two rows of the stack's), kept for the
+    /// whole gesture: the preview is the boundary where it was grabbed plus
+    /// how far the pointer has moved since, so the line neither jumps on the
+    /// press nor on the release.
+    grab_offset: i32,
+    /// The previewed position of the boundary, already clamped.
+    preview: u16,
+}
+
+/// What the status line says while a boundary is being dragged.
+const DRAG_HINT: &str = "resize: release to apply · Esc cancels";
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -946,7 +893,32 @@ pub struct EmporiumState {
     /// `Event::WorkerDismissed` lands, so a failed or foreign dismissal
     /// never leaves it stale for a later, unrelated one.
     pending_dismiss: Option<SessionKey>,
+    /// The `(brigade, token)` that dismissal will remove from the store,
+    /// stashed beside [`Self::pending_dismiss`] where the intent is built.
+    /// `WorkerDismissed` carries only the brigade, and a pane that already
+    /// exited has lost its `member_tokens` entry, so the token cannot be
+    /// recovered from the key by then. Needed because tokens are reused —
+    /// add-worker takes the highest existing number plus one, so a dismissed
+    /// last Worker's token comes back for the next one — and a row weight
+    /// still filed under it would be inherited.
+    pending_dismiss_member: Option<(BrigadeId, MemberToken)>,
     pub size: (u16, u16),
+    /// The sidebar's width in columns, as the operator last dragged it
+    /// (default [`SIDEBAR_WIDTH`]). A preference: clamped wherever it is
+    /// used and never rewritten to fit a small terminal, so widening the
+    /// terminal restores it.
+    sidebar_width: u16,
+    /// Layout preferences per brigade, keyed by [`BrigadeId`] and — inside —
+    /// by member token, so a brigade that goes off-stage and is staged again
+    /// in the same run gets its split back, and a pane's key changing
+    /// (discovery, a compaction fork) loses nothing. Dropped only when the
+    /// brigade is disbanded.
+    brigade_layouts: HashMap<BrigadeId, BrigadeLayout>,
+    /// The boundary drag in progress, if any. While it is `Some` the real
+    /// geometry does not change: it holds only the previewed position, and
+    /// the layout moves once, when the button is released
+    /// ([`update_drag_mouse`]).
+    drag: Option<Drag>,
     /// The configured prefix chord (`[keys] prefix`), fixed for the run.
     prefix: PrefixKey,
     /// When the prefix was last armed (see [`update_key`]'s prefix handling
@@ -1125,7 +1097,11 @@ impl EmporiumState {
             pending_director_reopen: None,
             pending_director_wiring: None,
             pending_dismiss: None,
+            pending_dismiss_member: None,
             size: (0, 0),
+            sidebar_width: SIDEBAR_WIDTH,
+            brigade_layouts: HashMap::new(),
+            drag: None,
             prefix,
             prefix_armed: None,
             next_plain_id: 0,
@@ -1353,6 +1329,109 @@ impl EmporiumState {
     /// from a pane's geometry position.
     pub fn member_token_for(&self, key: &SessionKey) -> Option<&str> {
         self.member_tokens.get(key).map(String::as_str)
+    }
+
+    /// One weight per stack tile of the staged brigade, in `panes` order.
+    /// A member with no stored weight gets the mean of the stored weights of
+    /// the stack's members (1 when there are none), so a Worker added later
+    /// lands at an average height rather than a sliver or a slab.
+    fn stack_weights(&self) -> Vec<u16> {
+        let Stage::Brigade { id, panes, .. } = &self.stage else {
+            return Vec::new();
+        };
+        let stored = self.brigade_layouts.get(id);
+        let known: Vec<Option<u16>> = panes
+            .iter()
+            .skip(1)
+            .map(|key| {
+                let token = self.member_tokens.get(key)?;
+                stored?.row_weights.get(token).copied()
+            })
+            .collect();
+        let (sum, count) = known
+            .iter()
+            .flatten()
+            .fold((0u32, 0u32), |(sum, count), w| {
+                (sum + u32::from(*w), count + 1)
+            });
+        let mean = (sum + count / 2)
+            .checked_div(count)
+            .map_or(1, |mean| mean.max(1) as u16);
+        known
+            .into_iter()
+            .map(|weight| weight.unwrap_or(mean).max(1))
+            .collect()
+    }
+
+    /// The whole screen geometry for a terminal `area`. The one place the
+    /// emporium's rectangles come from: drawing, mouse hit-testing and PTY
+    /// sizing all call this, so they cannot disagree, and a caller cannot
+    /// forget one of the layout preferences it takes.
+    pub fn geometry(&self, area: Rect) -> Geometry {
+        let master_permille = match &self.stage {
+            Stage::Brigade { id, .. } => self
+                .brigade_layouts
+                .get(id)
+                .map_or(DEFAULT_MASTER_PERMILLE, |layout| layout.master_permille),
+            _ => DEFAULT_MASTER_PERMILLE,
+        };
+        crate::layout::geometry(
+            area,
+            &self.stage,
+            self.sidebar_width,
+            master_permille,
+            &self.stack_weights(),
+            &|key| self.tile_label(key),
+        )
+    }
+
+    /// The label a tile's title shows — role, not position: `director`
+    /// (`Stage::Brigade`'s own field) answers the Director case directly, and
+    /// `goinkyo_pane_for` — already tracking the Goinkyo's current pane
+    /// through every rename, built for the one-shot spawn guard — answers the
+    /// Goinkyo one. Workers read their durable member token from core state,
+    /// so the title agrees with the token accepted by the brigade tools even
+    /// when pane geometry changes.
+    ///
+    /// In core, beside the geometry, because the stack boundary's hit area
+    /// has to stay off exactly the cells this text is drawn on
+    /// ([`crate::layout::title_columns`]).
+    pub fn tile_label(&self, key: &SessionKey) -> String {
+        match &self.stage {
+            Stage::Brigade { id, director, .. } => {
+                if director.as_ref() == Some(key) {
+                    "director".to_string()
+                } else if self.goinkyo_pane_for(*id) == Some(key) {
+                    "goinkyo".to_string()
+                } else {
+                    self.member_token_for(key)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "session".to_string())
+                }
+            }
+            _ => "session".to_string(),
+        }
+    }
+
+    /// The line to draw over the screen while a boundary is being dragged:
+    /// its cells, and which way it runs. `None` when nothing is being dragged.
+    pub fn drag_overlay(&self, area: Rect) -> Option<(Rect, Axis)> {
+        let drag = self.drag.as_ref()?;
+        let geometry = self.geometry(area);
+        let handle = geometry.handle_for(&drag.boundary)?;
+        Some((handle.line_at(drag.preview), handle.axis))
+    }
+
+    /// The status line's text: the drag hint for as long as a drag is in
+    /// progress, otherwise the transient status. Derived rather than set, so
+    /// it cannot outlast the gesture or expire under it (a status times out
+    /// after [`STATUS_TIMEOUT`], a held button does not).
+    pub fn displayed_status(&self) -> Option<&str> {
+        if self.drag.is_some() {
+            Some(DRAG_HINT)
+        } else {
+            self.status.as_deref()
+        }
     }
 
     /// The derived staged panes currently marked as needing operator attention.
@@ -2346,9 +2425,15 @@ pub fn update(
         }
         Event::WindowFocusChanged { focused } => {
             state.window_focused = focused;
+            // Focus leaving the window is the one way a release can be lost
+            // without a `Moved` ever arriving: the terminal stops reporting.
+            if !focused {
+                state.drag = None;
+            }
             Vec::new()
         }
     };
+    validate_drag(state, app);
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
@@ -2455,9 +2540,11 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
 /// (a HashMap lookup per staged tile) and correct without needing every
 /// stage-mutating branch to remember to call it.
 fn resize_staged_tiles(state: &mut EmporiumState) -> Vec<Cmd> {
-    let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+    let tiles = state
+        .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+        .tiles;
     let mut cmds = Vec::new();
-    for (key, rect) in stage_tiles(areas.pane, &state.stage) {
+    for (key, rect) in tiles {
         let content = pane_content(rect);
         if let Some(screen) = state.screens.get_mut(&key)
             && screen.resize(content.height, content.width)
@@ -2603,7 +2690,10 @@ fn build_clipboard_forward(selection: &[u8], data: &[u8]) -> Option<Vec<u8>> {
 
 fn update_resized(state: &mut EmporiumState, app: &mut App, width: u16, height: u16) -> Vec<Cmd> {
     state.size = (width, height);
-    let areas = layout(Rect::new(0, 0, width, height));
+    // The terminal changed under the gesture: whatever the drag was holding
+    // was measured against geometry that no longer exists.
+    state.drag = None;
+    let areas = state.geometry(Rect::new(0, 0, width, height)).areas;
     app.set_viewport_height(areas.sidebar.height.saturating_sub(2) as usize);
     Vec::new()
 }
@@ -2637,6 +2727,13 @@ fn update_key(
     now: Instant,
 ) -> Vec<Cmd> {
     let code = key.code;
+
+    // Esc cancels a boundary drag and goes no further: it must not reach the
+    // child or the sidebar.
+    if state.drag.is_some() && code == KeyCode::Esc {
+        state.drag = None;
+        return Vec::new();
+    }
 
     if app.modal().is_some() {
         return update_modal_key(state, app, code, key.modifiers);
@@ -3228,8 +3325,10 @@ fn confirm_kill_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         return vec![kill_pane(state, key)];
     }
     state.pending_dismiss = Some(key.clone());
+    state.pending_dismiss_member = None;
     match key.worker_identity() {
         Some((brigade_id, token)) => {
+            state.pending_dismiss_member = Some((brigade_id, token.clone()));
             vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
         }
         None => {
@@ -3293,10 +3392,12 @@ fn update_membership_resolved(
         // "guess".
         return match membership {
             Some((brigade_id, token, BrigadeRole::Worker | BrigadeRole::Goinkyo)) => {
+                state.pending_dismiss_member = Some((brigade_id, token.clone()));
                 vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
             }
             Some((_, _, BrigadeRole::Director)) | None => {
                 state.pending_dismiss = None;
+                state.pending_dismiss_member = None;
                 Vec::new()
             }
         };
@@ -3921,11 +4022,35 @@ fn update_mouse(
         return Vec::new();
     }
     let _ = brigade;
+    // A drag in progress owns every mouse event until it ends: nothing is
+    // forwarded to a child, focused or scrolled, however many panes the
+    // pointer crosses.
+    if state.drag.is_some() {
+        return update_drag_mouse(state, mouse);
+    }
     let pos = Position::new(mouse.column, mouse.row);
-    let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+    let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
+    let areas = geometry.areas;
+
+    // A left press on a boundary picks it up — and does nothing else: no
+    // focus change, no report to a child, no scrolling.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(handle) = geometry.handle_at(mouse.column, mouse.row)
+    {
+        let along = match handle.axis {
+            Axis::Vertical => mouse.column,
+            Axis::Horizontal => mouse.row,
+        };
+        state.drag = Some(Drag {
+            boundary: handle.boundary.clone(),
+            grab_offset: i32::from(handle.position) - i32::from(along),
+            preview: handle.position,
+        });
+        return Vec::new();
+    }
 
     if areas.pane.contains(pos) {
-        let tiles = stage_tiles(areas.pane, &state.stage);
+        let tiles = &geometry.tiles;
         let hit = tiles.iter().find(|(_, rect)| rect.contains(pos)).cloned();
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             state.focus = Focus::Pane;
@@ -3990,6 +4115,128 @@ fn update_mouse(
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// The boundary position a pointer at `mouse` previews, clamped to what that
+/// boundary may take. `None` when the boundary no longer exists.
+fn dragged_position(state: &EmporiumState, drag: &Drag, mouse: &MouseEvent) -> Option<u16> {
+    let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
+    let handle = geometry.handle_for(&drag.boundary)?;
+    let along = match handle.axis {
+        Axis::Vertical => mouse.column,
+        Axis::Horizontal => mouse.row,
+    };
+    Some(handle.clamp(i32::from(along) + drag.grab_offset))
+}
+
+/// One mouse event while a boundary drag is in progress.
+///
+/// The real geometry does not move during the drag — only `Drag::preview`
+/// does — and the layout changes once, on release. Every layout change is a
+/// `Cmd::ResizePty` per tile whose size changed, executed immediately and
+/// without debounce by the shell, and each makes the child repaint its whole
+/// screen; resize under stress is on the embedded-pty spike's own
+/// not-yet-verified list (`docs/notes/embedded-pty-spike.md`). One resize
+/// per gesture is the path a window resize already exercises; one per
+/// dragged cell is the untested one.
+///
+/// A press of any button, or a `Moved` (which can only mean no button is held
+/// any more: the release happened outside the window), ends the gesture
+/// without applying it. Everything else that is not the left button's drag or
+/// release — the wheel, the other buttons — is swallowed.
+fn update_drag_mouse(state: &mut EmporiumState, mouse: MouseEvent) -> Vec<Cmd> {
+    let Some(drag) = state.drag.clone() else {
+        return Vec::new();
+    };
+    match mouse.kind {
+        MouseEventKind::Down(_) | MouseEventKind::Moved => state.drag = None,
+        MouseEventKind::Drag(MouseButton::Left) => match dragged_position(state, &drag, &mouse) {
+            Some(preview) => state.drag = Some(Drag { preview, ..drag }),
+            None => state.drag = None,
+        },
+        MouseEventKind::Up(MouseButton::Left) => {
+            state.drag = None;
+            if let Some(position) = dragged_position(state, &drag, &mouse) {
+                commit_drag(state, &drag.boundary, position);
+            }
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Apply a finished drag: store the new preference for `boundary`. The tiles
+/// whose content size changed are resized by the `resize_staged_tiles` at the
+/// end of this same `update`.
+///
+/// A release where the boundary already was stores nothing: a click on a
+/// handle must not turn a proportional layout into frozen row counts.
+fn commit_drag(state: &mut EmporiumState, boundary: &Boundary, position: u16) {
+    let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
+    let Some(handle) = geometry.handle_for(boundary) else {
+        return;
+    };
+    if position == handle.position {
+        return;
+    }
+    match boundary {
+        // The sidebar starts at column 0, so its width is where the pane
+        // area now begins.
+        Boundary::Sidebar => state.sidebar_width = position,
+        Boundary::Master { brigade } => {
+            let pane = geometry.areas.pane;
+            state
+                .brigade_layouts
+                .entry(*brigade)
+                .or_default()
+                .master_permille = master_permille_for(position - pane.x, pane.width);
+        }
+        Boundary::Stack {
+            brigade,
+            above,
+            below,
+        } => {
+            // Every stack member's weight becomes the height it ends up with,
+            // so a later window resize scales the whole stack as dragged
+            // rather than only the two tiles that moved.
+            let mut heights: Vec<(SessionKey, u16)> = geometry
+                .tiles
+                .iter()
+                .skip(1)
+                .map(|(key, rect)| (key.clone(), rect.height))
+                .collect();
+            let moved = heights.iter().position(|(key, _)| key == above);
+            if let Some(i) = moved
+                && heights.get(i + 1).is_some_and(|(key, _)| key == below)
+                && let Some(above_tile) = geometry.tiles.iter().find(|(key, _)| key == above)
+            {
+                let together = heights[i].1 + heights[i + 1].1;
+                let upper = position.saturating_sub(above_tile.1.y);
+                heights[i].1 = upper;
+                heights[i + 1].1 = together.saturating_sub(upper);
+            }
+            let layout = state.brigade_layouts.entry(*brigade).or_default();
+            for (key, height) in heights {
+                if let Some(token) = state.member_tokens.get(&key) {
+                    layout.row_weights.insert(token.clone(), height.max(1));
+                }
+            }
+        }
+    }
+}
+
+/// Drop a drag whose gesture can no longer be completed: a modal opened over
+/// it, or the boundary it holds is not in the current geometry (the stage
+/// changed — a pane closed, another brigade staged). Run at the end of every
+/// `update`, so no event handler has to remember to cancel it.
+fn validate_drag(state: &mut EmporiumState, app: &App) {
+    let Some(drag) = &state.drag else {
+        return;
+    };
+    let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
+    if app.modal().is_some() || geometry.handle_for(&drag.boundary).is_none() {
+        state.drag = None;
     }
 }
 
@@ -4817,6 +5064,7 @@ fn update_disbanded(
                 Some(key) => Stage::Solo(key.clone()),
                 None => Stage::Empty,
             };
+            state.brigade_layouts.remove(&brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
                 .into_iter()
@@ -4851,10 +5099,28 @@ fn update_worker_dismissed(
     let Some(key) = state.pending_dismiss.take() else {
         return Vec::new();
     };
+    // Only a result for the brigade the dismissal was captured in may spend
+    // the captured member. Another brigade's result touches neither the
+    // entry nor that brigade's weights: its token can be spelled the same
+    // (`worker-2` exists in every brigade).
+    let member = match &state.pending_dismiss_member {
+        Some((captured, _)) if *captured == brigade_id => {
+            state.pending_dismiss_member.take().map(|(_, token)| token)
+        }
+        _ => None,
+    };
     match result {
         Ok((hidden, directors)) => {
             app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
+            // Forget the dismissed member's row weight. Only a dismissal does
+            // this — a pane exiting, being relaunched or leaving the stage
+            // keeps the member, and its weight with it.
+            if let (Some(token), Some(layout)) =
+                (member, state.brigade_layouts.get_mut(&brigade_id))
+            {
+                layout.row_weights.remove(&token);
+            }
             let staged = matches!(
                 &state.stage,
                 Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&key)
@@ -5508,7 +5774,7 @@ mod tests {
 
     #[test]
     fn layout_reserves_sidebar_status_bar_and_details_panel() {
-        let areas = layout(Rect::new(0, 0, 120, 40));
+        let areas = layout(Rect::new(0, 0, 120, 40), SIDEBAR_WIDTH);
         assert_eq!(areas.status.height, 1);
         assert_eq!(areas.status.y, 39);
         assert_eq!(areas.sidebar.width, SIDEBAR_WIDTH);
@@ -5520,7 +5786,7 @@ mod tests {
 
     #[test]
     fn layout_drops_the_details_panel_when_short() {
-        let areas = layout(Rect::new(0, 0, 120, MIN_HEIGHT_FOR_SUMMARY));
+        let areas = layout(Rect::new(0, 0, 120, MIN_HEIGHT_FOR_SUMMARY), SIDEBAR_WIDTH);
         assert_eq!(areas.summary.height, 0);
     }
 
@@ -5538,7 +5804,12 @@ mod tests {
         let area = Rect::new(36, 0, 84, 39);
         let key = SessionKey::from_id("a");
         assert_eq!(
-            stage_tiles(area, &Stage::Solo(key.clone())),
+            stage_tiles(
+                area,
+                &Stage::Solo(key.clone()),
+                DEFAULT_MASTER_PERMILLE,
+                &[]
+            ),
             vec![(key, area)]
         );
     }
@@ -5546,7 +5817,7 @@ mod tests {
     #[test]
     fn empty_stage_has_no_tiles() {
         let area = Rect::new(36, 0, 84, 39);
-        assert!(stage_tiles(area, &Stage::Empty).is_empty());
+        assert!(stage_tiles(area, &Stage::Empty, DEFAULT_MASTER_PERMILLE, &[]).is_empty());
     }
 
     #[test]
@@ -5559,7 +5830,10 @@ mod tests {
             panes: vec![director.clone()],
             focused: 0,
         };
-        assert_eq!(stage_tiles(area, &stage), vec![(director, area)]);
+        assert_eq!(
+            stage_tiles(area, &stage, DEFAULT_MASTER_PERMILLE, &[1, 1]),
+            vec![(director, area)]
+        );
     }
 
     #[test]
@@ -5574,7 +5848,7 @@ mod tests {
             panes: vec![director.clone(), w0.clone(), w1.clone()],
             focused: 0,
         };
-        let tiles = stage_tiles(area, &stage);
+        let tiles = stage_tiles(area, &stage, DEFAULT_MASTER_PERMILLE, &[1, 1]);
         assert_eq!(tiles.len(), 3);
 
         let (director_key, director_rect) = &tiles[0];
@@ -8153,7 +8427,9 @@ mod tests {
     /// area — assumes a `Solo` (or single-member `Brigade`) stage, whose one
     /// tile fills the whole pane area, so this always lands inside it.
     fn click_inside_pane(state: &EmporiumState) -> MouseEvent {
-        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let areas = state
+            .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+            .areas;
         let content = pane_content(areas.pane);
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -8168,7 +8444,9 @@ mod tests {
     /// has nothing to correct and doesn't add an incidental `Cmd::ResizePty`
     /// these tests aren't about.
     fn screen_sized_for_pane(state: &EmporiumState) -> Screen {
-        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let areas = state
+            .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+            .areas;
         let content = pane_content(areas.pane);
         Screen::new(content.height, content.width)
     }
@@ -8370,13 +8648,16 @@ mod tests {
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
 
-        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
-        let tiles = stage_tiles(areas.pane, &state.stage);
+        let tiles = state
+            .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+            .tiles;
         let (_, worker_rect) = tiles.iter().find(|(key, _)| *key == worker).unwrap();
+        // Inside the tile: its left border column is the master/stack
+        // boundary's handle now, and a press there picks the boundary up.
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: worker_rect.x,
-            row: worker_rect.y,
+            column: worker_rect.x + 2,
+            row: worker_rect.y + 2,
         };
 
         update(
@@ -8408,7 +8689,9 @@ mod tests {
         let mut app = app_with(vec![row("sess-1")]);
         let brigade = brigade_config();
 
-        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let areas = state
+            .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+            .areas;
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: areas.sidebar.x + 1,
@@ -8440,7 +8723,9 @@ mod tests {
         let brigade = brigade_config();
         let before = app.selected_in_viewport();
 
-        let areas = layout(Rect::new(0, 0, state.size.0, state.size.1));
+        let areas = state
+            .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+            .areas;
         let mouse = MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column: areas.sidebar.x,
@@ -11257,6 +11542,1230 @@ mod tests {
         assert!(cmds.is_empty(), "{cmds:?}");
     }
 
+    // --- dragging a boundary --------------------------------------------------
+
+    const DRAG_AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 40,
+    };
+
+    /// A 120x40 terminal showing brigade 1: the Director plus `workers`
+    /// Workers, every pane with a screen and a member token, focus on the
+    /// Director's pane. Sizes settled with one `Resized`.
+    fn drag_fixture(workers: usize) -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut panes = vec![SessionKey::from_id("dir")];
+        state
+            .member_tokens
+            .insert(panes[0].clone(), DIRECTOR_TOKEN.to_string());
+        for i in 1..=workers {
+            let key = SessionKey::from_id(&format!("w{i}"));
+            state
+                .member_tokens
+                .insert(key.clone(), format!("worker-{i}"));
+            panes.push(key);
+        }
+        for key in &panes {
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+        }
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(panes[0].clone()),
+            panes,
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 120,
+                height: 40,
+            },
+            now,
+        );
+        (state, app, brigade, now)
+    }
+
+    fn mouse_event(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Input(InputEvent::Mouse(MouseEvent { kind, column, row })),
+            now,
+        )
+    }
+
+    fn handle_of(state: &EmporiumState, wanted: &Boundary) -> Handle {
+        state
+            .geometry(DRAG_AREA)
+            .handle_for(wanted)
+            .expect("the boundary exists")
+            .clone()
+    }
+
+    /// A cell on `handle` that starts a drag, and the position along its axis.
+    fn grab_point(handle: &Handle) -> (u16, u16) {
+        match handle.axis {
+            Axis::Vertical => (handle.position, 20),
+            Axis::Horizontal => (handle.hits()[0].x + 2, handle.position - 1),
+        }
+    }
+
+    /// Press on `boundary`, drag (left button) to `to` along its axis and
+    /// leave the button down. Returns the cmds of every event.
+    fn drag_to(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        boundary: &Boundary,
+        to: u16,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let handle = handle_of(state, boundary);
+        let (column, row) = grab_point(&handle);
+        let mut cmds = mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+        let (c, r) = match handle.axis {
+            Axis::Vertical => (
+                to.saturating_sub(handle.position.saturating_sub(column)),
+                row,
+            ),
+            Axis::Horizontal => (
+                column,
+                to.saturating_sub(handle.position.saturating_sub(row)),
+            ),
+        };
+        cmds.extend(mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            c,
+            r,
+            now,
+        ));
+        cmds
+    }
+
+    fn release_at(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        boundary: &Boundary,
+        to: u16,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let handle = handle_of(state, boundary);
+        let (column, row) = grab_point(&handle);
+        let (c, r) = match handle.axis {
+            Axis::Vertical => (
+                to.saturating_sub(handle.position.saturating_sub(column)),
+                row,
+            ),
+            Axis::Horizontal => (
+                column,
+                to.saturating_sub(handle.position.saturating_sub(row)),
+            ),
+        };
+        mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            c,
+            r,
+            now,
+        )
+    }
+
+    fn resizes(cmds: &[Cmd]) -> Vec<(SessionKey, u16, u16)> {
+        let mut resized: Vec<_> = cmds
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::ResizePty { key, rows, cols } => Some((key.clone(), *rows, *cols)),
+                _ => None,
+            })
+            .collect();
+        resized.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        resized
+    }
+
+    fn sizes(state: &EmporiumState) -> Vec<(String, (u16, u16))> {
+        let mut sizes: Vec<_> = state
+            .screens
+            .iter()
+            .map(|(key, screen)| (key.as_str().to_string(), screen.screen().size()))
+            .collect();
+        sizes.sort();
+        sizes
+    }
+
+    fn stack_height_sum(state: &EmporiumState) -> u16 {
+        state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .skip(1)
+            .map(|(_, rect)| rect.height)
+            .sum()
+    }
+
+    #[test]
+    fn the_default_geometry_is_the_old_one_for_one_to_four_panes() {
+        for workers in 0..=3 {
+            let (state, _, _, _) = drag_fixture(workers);
+            let geometry = state.geometry(DRAG_AREA);
+            assert_eq!(geometry.areas.sidebar.width, 36, "{workers} workers");
+            let (panes, total) = (geometry.areas.pane, 1 + workers);
+            let [master, stack] = ratatui_core::layout::Layout::horizontal([
+                ratatui_core::layout::Constraint::Percentage(50),
+                ratatui_core::layout::Constraint::Percentage(50),
+            ])
+            .areas(panes);
+            if total == 1 {
+                assert_eq!(geometry.tiles[0].1, panes);
+                continue;
+            }
+            assert_eq!(geometry.tiles[0].1, master);
+            let rows = ratatui_core::layout::Layout::vertical(vec![
+                ratatui_core::layout::Constraint::Ratio(1, workers as u32);
+                workers
+            ])
+            .split(stack);
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(geometry.tiles[1 + i].1, *row, "{workers} workers, tile {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_on_each_handle_starts_a_drag_and_nothing_else_does() {
+        let (state, _, _, _) = drag_fixture(3);
+        let boundaries: Vec<Boundary> = state
+            .geometry(DRAG_AREA)
+            .handles()
+            .iter()
+            .map(|h| h.boundary.clone())
+            .collect();
+        assert_eq!(boundaries.len(), 4);
+        for boundary in boundaries {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            let handle = handle_of(&state, &boundary);
+            let (column, row) = grab_point(&handle);
+            mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                now,
+            );
+            assert_eq!(
+                state.drag.as_ref().map(|d| d.boundary.clone()),
+                Some(boundary),
+            );
+        }
+
+        let geometry = state.geometry(DRAG_AREA);
+        let lower = geometry.tiles[2].1;
+        let not_handles = [
+            ("a stack tile's title row", lower.x + 5, lower.y),
+            ("a tile's interior", lower.x + 5, lower.y + 1),
+            ("the master's title row", geometry.tiles[0].1.x + 5, 0),
+            ("the sidebar's interior", 10, 10),
+        ];
+        for (what, column, row) in not_handles {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                now,
+            );
+            assert!(state.drag.is_none(), "{what}");
+        }
+        // Only the left button picks a boundary up.
+        let handle = geometry.handles()[0].clone();
+        let (column, row) = grab_point(&handle);
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                MouseEventKind::Down(button),
+                column,
+                row,
+                now,
+            );
+            assert!(state.drag.is_none(), "{button:?}");
+        }
+    }
+
+    fn w1_over_w2() -> Boundary {
+        Boundary::Stack {
+            brigade: 1,
+            above: SessionKey::from_id("w1"),
+            below: SessionKey::from_id("w2"),
+        }
+    }
+
+    /// Every cell a press can pick `boundary` up at that is worth trying: for
+    /// a vertical handle both border columns, for the stack boundary both rows.
+    fn presses_on(state: &EmporiumState, boundary: &Boundary) -> Vec<(u16, u16)> {
+        let handle = handle_of(state, boundary);
+        match handle.axis {
+            Axis::Vertical => vec![(handle.position - 1, 20), (handle.position, 20)],
+            Axis::Horizontal => handle.hits().iter().map(|hit| (hit.x + 2, hit.y)).collect(),
+        }
+    }
+
+    /// Press at `at`, drag by (`dx`, `dy`) from there, release there; the
+    /// tiles that result.
+    fn press_drag_release(
+        at: (u16, u16),
+        by: (i32, i32),
+        boundary: &Boundary,
+        workers: usize,
+    ) -> (EmporiumState, Vec<(SessionKey, Rect)>) {
+        let (mut state, mut app, brigade, now) = drag_fixture(workers);
+        let to = (
+            (i32::from(at.0) + by.0) as u16,
+            (i32::from(at.1) + by.1) as u16,
+        );
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            at.0,
+            at.1,
+            now,
+        );
+        assert!(
+            state.drag.is_some(),
+            "a press at {at:?} picks {boundary:?} up"
+        );
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            to.0,
+            to.1,
+            now,
+        );
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            to.0,
+            to.1,
+            now,
+        );
+        let tiles = state.geometry(DRAG_AREA).tiles;
+        (state, tiles)
+    }
+
+    #[test]
+    fn grabbing_the_stack_boundary_on_either_row_commits_the_same_geometry() {
+        let (probe, _, _, _) = drag_fixture(3);
+        let boundary = w1_over_w2();
+        let presses = presses_on(&probe, &boundary);
+        assert_eq!(presses.len(), 2, "the upper row and the lower row");
+        assert_eq!(presses[1].1, presses[0].1 + 1, "adjacent rows");
+
+        let before = probe.geometry(DRAG_AREA).tiles;
+        for dy in [-3, 4] {
+            let committed: Vec<_> = presses
+                .iter()
+                .map(|press| press_drag_release(*press, (0, dy), &boundary, 3).1)
+                .collect();
+            assert_eq!(
+                committed[0], committed[1],
+                "same movement, same result (dy {dy})"
+            );
+            let moved_by = i32::from(committed[0][1].1.height) - i32::from(before[1].1.height);
+            assert_eq!(
+                moved_by, dy,
+                "the boundary moved exactly as far as the pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn grabbing_any_handle_on_any_of_its_cells_does_not_move_the_preview() {
+        let (probe, _, _, _) = drag_fixture(3);
+        for boundary in [
+            Boundary::Sidebar,
+            Boundary::Master { brigade: 1 },
+            w1_over_w2(),
+        ] {
+            let handle = handle_of(&probe, &boundary);
+            for press in presses_on(&probe, &boundary) {
+                let (mut state, mut app, brigade, now) = drag_fixture(3);
+                mouse_event(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    MouseEventKind::Down(MouseButton::Left),
+                    press.0,
+                    press.1,
+                    now,
+                );
+                assert_eq!(
+                    state.drag.as_ref().unwrap().preview,
+                    handle.position,
+                    "{boundary:?} pressed at {press:?}: the line is where the boundary is"
+                );
+                // A drag event on the press cell: still no jump.
+                mouse_event(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    press.0,
+                    press.1,
+                    now,
+                );
+                assert_eq!(state.drag.as_ref().unwrap().preview, handle.position);
+                // And movement is relative to the press, along the axis.
+                let step = |dx: i32, dy: i32| {
+                    (
+                        (i32::from(press.0) + dx) as u16,
+                        (i32::from(press.1) + dy) as u16,
+                    )
+                };
+                let target = match handle.axis {
+                    Axis::Vertical => step(2, 0),
+                    Axis::Horizontal => step(0, 2),
+                };
+                mouse_event(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    target.0,
+                    target.1,
+                    now,
+                );
+                assert_eq!(
+                    state.drag.as_ref().unwrap().preview,
+                    handle.position + 2,
+                    "{boundary:?} pressed at {press:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_and_release_on_the_same_cell_of_either_row_stores_nothing() {
+        let (probe, _, _, _) = drag_fixture(3);
+        for press in presses_on(&probe, &w1_over_w2()) {
+            let (state, tiles) = press_drag_release(press, (0, 0), &w1_over_w2(), 3);
+            assert!(state.brigade_layouts.is_empty(), "{press:?}");
+            assert_eq!(tiles, probe.geometry(DRAG_AREA).tiles);
+        }
+    }
+
+    #[test]
+    fn a_press_on_a_tiles_title_label_starts_no_drag_and_focuses_the_tile() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let lower = state.geometry(DRAG_AREA).tiles[2].1;
+        assert_eq!(state.tile_label(&SessionKey::from_id("w2")), "worker-2");
+        state.focus = Focus::Sidebar;
+
+        // " worker-2 " is ten cells after the left corner.
+        for column in [lower.x + 1, lower.x + 5, lower.x + 10] {
+            mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                lower.y,
+                now,
+            );
+            assert!(state.drag.is_none(), "column {column} is the label's");
+            assert_eq!(state.focus, Focus::Pane);
+            assert!(
+                matches!(&state.stage, Stage::Brigade { focused: 2, .. }),
+                "focuses w2"
+            );
+            state.focus = Focus::Sidebar;
+            if let Stage::Brigade { focused, .. } = &mut state.stage {
+                *focused = 0;
+            }
+        }
+        // The first cell past the label is the boundary's again.
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            lower.x + 11,
+            lower.y,
+            now,
+        );
+        assert!(state.drag.is_some());
+    }
+
+    #[test]
+    fn the_label_cells_follow_the_drawn_label_for_a_goinkyo_and_a_director_too() {
+        let (mut state, _, _, _) = drag_fixture(2);
+        // A Goinkyo in the lower slot reads "goinkyo", not its token.
+        state.goinkyo_pane.insert(1, SessionKey::from_id("w2"));
+        let label = state.tile_label(&SessionKey::from_id("w2"));
+        assert_eq!(label, "goinkyo");
+        let lower = state.geometry(DRAG_AREA).tiles[2].1;
+        let handle = handle_of(
+            &state,
+            &Boundary::Stack {
+                brigade: 1,
+                above: SessionKey::from_id("w1"),
+                below: SessionKey::from_id("w2"),
+            },
+        );
+        assert_eq!(
+            handle.hits()[1].x,
+            lower.x + 1 + crate::layout::title_text("goinkyo").len() as u16,
+            "the lower row's handle starts where the drawn title ends"
+        );
+        assert_eq!(state.tile_label(&SessionKey::from_id("dir")), "director");
+    }
+
+    #[test]
+    fn a_press_on_a_handle_changes_no_focus_forwards_nothing_and_scrolls_nothing() {
+        for boundary in [
+            Boundary::Sidebar,
+            Boundary::Master { brigade: 1 },
+            Boundary::Stack {
+                brigade: 1,
+                above: SessionKey::from_id("w1"),
+                below: SessionKey::from_id("w2"),
+            },
+        ] {
+            let (mut state, mut app, brigade, now) = drag_fixture(2);
+            // The pane under the pointer asks for mouse reports, so a stray
+            // press would be forwarded to it.
+            for key in ["dir", "w1", "w2"] {
+                state
+                    .screens
+                    .get_mut(&SessionKey::from_id(key))
+                    .unwrap()
+                    .process(b"\x1b[?1000h\x1b[?1006h");
+            }
+            state.focus = Focus::Sidebar;
+            let handle = handle_of(&state, &boundary);
+            let (column, row) = grab_point(&handle);
+
+            let cmds = mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                now,
+            );
+
+            assert!(state.drag.is_some());
+            assert_eq!(state.focus, Focus::Sidebar, "{boundary:?}");
+            assert!(matches!(&state.stage, Stage::Brigade { focused: 0, .. }));
+            assert!(writes_of(&cmds).is_empty(), "{boundary:?}: {cmds:?}");
+        }
+    }
+
+    #[test]
+    fn dragging_moves_only_the_preview_and_resizes_nothing() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let before = state.geometry(DRAG_AREA).tiles;
+        let sizes_before = sizes(&state);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+
+        let cmds = drag_to(&mut state, &mut app, &brigade, &master, start + 10, now);
+
+        assert!(resizes(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(state.drag.as_ref().unwrap().preview, start + 10);
+        assert_eq!(
+            state.geometry(DRAG_AREA).tiles,
+            before,
+            "the real geometry holds still"
+        );
+        assert_eq!(state.sidebar_width, SIDEBAR_WIDTH);
+        assert!(state.brigade_layouts.is_empty());
+        let sizes_after: Vec<_> = sizes(&state);
+        assert_eq!(sizes_after, sizes_before, "no screen was resized");
+    }
+
+    #[test]
+    fn releasing_commits_each_boundary_and_resizes_exactly_the_tiles_that_changed() {
+        // Master boundary: the master's width and every stack tile's width
+        // change; no height does.
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start + 8, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &master, start + 8, now);
+        assert!(state.drag.is_none());
+        let tiles = state.geometry(DRAG_AREA).tiles;
+        assert_eq!(tiles[0].1.width, 42 + 8);
+        let keys: Vec<_> = resizes(&cmds)
+            .into_iter()
+            .map(|(k, _, _)| k.as_str().to_string())
+            .collect();
+        assert_eq!(keys, vec!["dir", "w1", "w2"]);
+
+        // Stack boundary: only the two tiles either side of it change.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let stack = Boundary::Stack {
+            brigade: 1,
+            above: SessionKey::from_id("w1"),
+            below: SessionKey::from_id("w2"),
+        };
+        let start = handle_of(&state, &stack).position;
+        drag_to(&mut state, &mut app, &brigade, &stack, start + 3, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &stack, start + 3, now);
+        let keys: Vec<_> = resizes(&cmds)
+            .into_iter()
+            .map(|(k, _, _)| k.as_str().to_string())
+            .collect();
+        assert_eq!(keys, vec!["w1", "w2"]);
+
+        // Sidebar boundary: every tile's width changes.
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        drag_to(&mut state, &mut app, &brigade, &Boundary::Sidebar, 50, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &Boundary::Sidebar, 50, now);
+        assert_eq!(state.sidebar_width, 50);
+        assert_eq!(state.geometry(DRAG_AREA).areas.pane.x, 50);
+        let keys: Vec<_> = resizes(&cmds)
+            .into_iter()
+            .map(|(k, _, _)| k.as_str().to_string())
+            .collect();
+        assert_eq!(keys, vec!["dir", "w1", "w2"]);
+    }
+
+    #[test]
+    fn a_stack_drag_rewrites_every_staged_members_weight_to_its_new_height() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let stack = Boundary::Stack {
+            brigade: 1,
+            above: SessionKey::from_id("w1"),
+            below: SessionKey::from_id("w2"),
+        };
+        let start = handle_of(&state, &stack).position;
+        let before: Vec<u16> = state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .skip(1)
+            .map(|(_, r)| r.height)
+            .collect();
+        drag_to(&mut state, &mut app, &brigade, &stack, start + 2, now);
+        release_at(&mut state, &mut app, &brigade, &stack, start + 2, now);
+
+        let after: Vec<u16> = state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .skip(1)
+            .map(|(_, r)| r.height)
+            .collect();
+        assert_eq!(after, vec![before[0] + 2, before[1] - 2, before[2]]);
+        let weights = &state.brigade_layouts[&1].row_weights;
+        assert_eq!(weights["worker-1"], after[0]);
+        assert_eq!(weights["worker-2"], after[1]);
+        assert_eq!(
+            weights["worker-3"], after[2],
+            "even the tile that did not move"
+        );
+        assert_eq!(stack_height_sum(&state), 39);
+    }
+
+    #[test]
+    fn a_press_and_release_on_the_same_cell_stores_nothing() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let stack = Boundary::Stack {
+            brigade: 1,
+            above: SessionKey::from_id("w1"),
+            below: SessionKey::from_id("w2"),
+        };
+        let handle = handle_of(&state, &stack);
+        let (column, row) = grab_point(&handle);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+        let cmds = mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+
+        assert!(state.drag.is_none());
+        assert!(
+            state.brigade_layouts.is_empty(),
+            "a click must not freeze row counts"
+        );
+        assert!(resizes(&cmds).is_empty());
+    }
+
+    #[test]
+    fn a_drag_is_clamped_to_each_minimum() {
+        // Sidebar: both ends.
+        let (mut state, mut app, brigade, now) = drag_fixture(1);
+        drag_to(&mut state, &mut app, &brigade, &Boundary::Sidebar, 0, now);
+        assert_eq!(state.drag.as_ref().unwrap().preview, MIN_SIDEBAR_WIDTH);
+        // A second press would cancel the first drag, so the far end gets a
+        // fresh gesture.
+        let (mut state, mut app, brigade, now) = drag_fixture(1);
+        drag_to(&mut state, &mut app, &brigade, &Boundary::Sidebar, 119, now);
+        assert_eq!(
+            state.drag.as_ref().unwrap().preview,
+            120 - MIN_PANE_AREA_WIDTH
+        );
+        release_at(&mut state, &mut app, &brigade, &Boundary::Sidebar, 119, now);
+        assert_eq!(state.sidebar_width, 100);
+        assert_eq!(
+            state.geometry(DRAG_AREA).areas.pane.width,
+            MIN_PANE_AREA_WIDTH
+        );
+
+        // Master boundary: master and stack each keep their minimum.
+        for (target, expect_master) in [(0u16, MIN_MASTER_WIDTH), (119, 84 - MIN_STACK_WIDTH)] {
+            let (mut state, mut app, brigade, now) = drag_fixture(1);
+            let master = Boundary::Master { brigade: 1 };
+            drag_to(&mut state, &mut app, &brigade, &master, target, now);
+            release_at(&mut state, &mut app, &brigade, &master, target, now);
+            let tiles = state.geometry(DRAG_AREA).tiles;
+            assert_eq!(tiles[0].1.width, expect_master, "toward {target}");
+            assert_eq!(tiles[1].1.width, 84 - expect_master);
+        }
+
+        // Stack boundary: each tile keeps MIN_STACK_TILE_HEIGHT rows.
+        for target in [0u16, 39] {
+            let (mut state, mut app, brigade, now) = drag_fixture(2);
+            let stack = Boundary::Stack {
+                brigade: 1,
+                above: SessionKey::from_id("w1"),
+                below: SessionKey::from_id("w2"),
+            };
+            drag_to(&mut state, &mut app, &brigade, &stack, target, now);
+            release_at(&mut state, &mut app, &brigade, &stack, target, now);
+            let heights: Vec<u16> = state
+                .geometry(DRAG_AREA)
+                .tiles
+                .iter()
+                .skip(1)
+                .map(|(_, r)| r.height)
+                .collect();
+            assert!(
+                heights.iter().all(|h| *h >= MIN_STACK_TILE_HEIGHT),
+                "{heights:?}"
+            );
+            assert_eq!(heights.iter().sum::<u16>(), 39);
+            assert!(
+                heights.contains(&MIN_STACK_TILE_HEIGHT),
+                "{heights:?}: dragged all the way"
+            );
+        }
+    }
+
+    /// Start a drag on the master boundary and move it, leaving the button
+    /// down: the state every cancel test starts from.
+    fn dragging_master() -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start + 9, now);
+        assert!(state.drag.is_some());
+        (state, app, brigade, now)
+    }
+
+    /// What every cancel must leave alone.
+    fn layout_facts(state: &EmporiumState) -> (Vec<(SessionKey, Rect)>, u16, usize, Focus, usize) {
+        let focused = match &state.stage {
+            Stage::Brigade { focused, .. } => *focused,
+            _ => 0,
+        };
+        (
+            state.geometry(DRAG_AREA).tiles,
+            state.sidebar_width,
+            state.brigade_layouts.len(),
+            state.focus,
+            focused,
+        )
+    }
+
+    #[test]
+    fn every_cancel_leaves_the_geometry_and_focus_untouched() {
+        type Cancel = Box<dyn Fn(&mut EmporiumState, &mut App, &BrigadeConfig, Instant)>;
+        let cancels: Vec<(&str, Cancel)> = vec![
+            (
+                "Esc",
+                Box::new(|state, app, brigade, now| {
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::Input(InputEvent::Key(KeyEvent::new(
+                            KeyCode::Esc,
+                            Modifiers::NONE,
+                        ))),
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a press of the left button",
+                Box::new(|state, app, brigade, now| {
+                    mouse_event(
+                        state,
+                        app,
+                        brigade,
+                        MouseEventKind::Down(MouseButton::Left),
+                        60,
+                        20,
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a press of another button",
+                Box::new(|state, app, brigade, now| {
+                    mouse_event(
+                        state,
+                        app,
+                        brigade,
+                        MouseEventKind::Down(MouseButton::Right),
+                        60,
+                        20,
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a move with no button held",
+                Box::new(|state, app, brigade, now| {
+                    mouse_event(state, app, brigade, MouseEventKind::Moved, 60, 20, now);
+                }),
+            ),
+            (
+                "the window losing focus",
+                Box::new(|state, app, brigade, now| {
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::WindowFocusChanged { focused: false },
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a modal opening",
+                Box::new(|state, app, brigade, now| {
+                    app.open_new_session_modal();
+                    update(state, app, brigade, Event::Tick { relay: vec![] }, now);
+                }),
+            ),
+            (
+                "a terminal resize",
+                Box::new(|state, app, brigade, now| {
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::Resized {
+                            width: 120,
+                            height: 40,
+                        },
+                        now,
+                    );
+                }),
+            ),
+        ];
+        for (what, cancel) in cancels {
+            let (mut state, mut app, brigade, now) = dragging_master();
+            let before = layout_facts(&state);
+
+            cancel(&mut state, &mut app, &brigade, now);
+
+            assert!(state.drag.is_none(), "{what} cancels");
+            assert_eq!(layout_facts(&state), before, "{what} changes nothing");
+            assert_eq!(state.displayed_status(), None, "{what}: the hint is gone");
+        }
+    }
+
+    #[test]
+    fn a_drag_whose_boundary_stops_existing_is_dropped() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let stack = Boundary::Stack {
+            brigade: 1,
+            above: SessionKey::from_id("w1"),
+            below: SessionKey::from_id("w2"),
+        };
+        let start = handle_of(&state, &stack).position;
+        drag_to(&mut state, &mut app, &brigade, &stack, start + 2, now);
+
+        // A pane closes: the stack has one tile left and no boundary.
+        state.unstage(&SessionKey::from_id("w2"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        assert!(state.drag.is_none());
+        assert!(state.brigade_layouts.is_empty());
+    }
+
+    #[test]
+    fn a_drag_survives_events_that_do_not_touch_its_boundary() {
+        let (mut state, mut app, brigade, now) = dragging_master();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: true },
+            now,
+        );
+        assert!(state.drag.is_some());
+    }
+
+    #[test]
+    fn while_dragging_every_mouse_event_belongs_to_the_drag() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        for key in ["dir", "w1", "w2"] {
+            state
+                .screens
+                .get_mut(&SessionKey::from_id(key))
+                .unwrap()
+                .process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        let geometry = state.geometry(DRAG_AREA);
+        let over_a_worker = (geometry.tiles[1].1.x + 6, geometry.tiles[1].1.y + 3);
+        drag_to(&mut state, &mut app, &brigade, &master, start + 5, now);
+
+        // The pointer crosses an SGR-mouse pane while the button is held.
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            let cmds = mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                kind,
+                over_a_worker.0,
+                over_a_worker.1,
+                now,
+            );
+            assert!(cmds.is_empty(), "{kind:?}: {cmds:?}");
+            assert!(state.drag.is_some(), "{kind:?} does not end the drag");
+        }
+        assert!(matches!(&state.stage, Stage::Brigade { focused: 0, .. }));
+        assert_eq!(state.focus, Focus::Pane);
+
+        // And the cancelling press is swallowed too, not delivered.
+        let cmds = mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            over_a_worker.0,
+            over_a_worker.1,
+            now,
+        );
+        assert!(writes_of(&cmds).is_empty());
+        assert!(state.drag.is_none());
+    }
+
+    #[test]
+    fn esc_during_a_drag_is_consumed_and_esc_otherwise_still_reaches_the_child() {
+        let (mut state, mut app, brigade, now) = dragging_master();
+        let cmds = forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(state.drag.is_none());
+
+        let cmds = forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(SessionKey::from_id("dir"), vec![0x1b])],
+            "with no drag the key goes to the focused pane as before"
+        );
+    }
+
+    #[test]
+    fn the_hint_and_the_preview_line_exist_exactly_as_long_as_the_drag() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        assert_eq!(state.displayed_status(), None);
+        assert_eq!(state.drag_overlay(DRAG_AREA), None);
+
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start + 6, now);
+        assert_eq!(
+            state.displayed_status(),
+            Some("resize: release to apply · Esc cancels")
+        );
+        let (line, axis) = state.drag_overlay(DRAG_AREA).unwrap();
+        assert_eq!(axis, Axis::Vertical);
+        assert_eq!(
+            line.x,
+            start + 6 - 1,
+            "on the last column before the boundary"
+        );
+        assert_eq!(line.height, 39);
+
+        // It does not expire like a transient status, and a status set in the
+        // meantime does not replace it.
+        state.set_status("something else", now);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now + Duration::from_secs(60),
+        );
+        assert_eq!(
+            state.displayed_status(),
+            Some("resize: release to apply · Esc cancels")
+        );
+
+        release_at(&mut state, &mut app, &brigade, &master, start + 6, now);
+        assert_eq!(state.drag_overlay(DRAG_AREA), None);
+        assert_ne!(
+            state.displayed_status(),
+            Some("resize: release to apply · Esc cancels")
+        );
+    }
+
+    #[test]
+    fn layout_preferences_come_back_when_the_same_brigade_is_staged_again() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let stack = Boundary::Stack {
+            brigade: 1,
+            above: SessionKey::from_id("w1"),
+            below: SessionKey::from_id("w2"),
+        };
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &stack).position;
+        drag_to(&mut state, &mut app, &brigade, &stack, start + 3, now);
+        release_at(&mut state, &mut app, &brigade, &stack, start + 3, now);
+        let mstart = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, mstart - 7, now);
+        release_at(&mut state, &mut app, &brigade, &master, mstart - 7, now);
+        let committed = state.geometry(DRAG_AREA).tiles;
+
+        // Another session takes the stage, then the brigade is staged again
+        // with the same members (new key objects, same tokens).
+        let panes = match &state.stage {
+            Stage::Brigade { panes, .. } => panes.clone(),
+            _ => unreachable!(),
+        };
+        state.stage = Stage::Solo(SessionKey::from_id("elsewhere"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(panes[0].clone()),
+            panes,
+            focused: 0,
+        };
+
+        assert_eq!(state.geometry(DRAG_AREA).tiles, committed);
+    }
+
+    #[test]
+    fn a_member_with_no_weight_gets_the_mean_of_the_weights_present() {
+        let (mut state, _, _, _) = drag_fixture(3);
+        assert_eq!(
+            state.stack_weights(),
+            vec![1, 1, 1],
+            "nothing stored: equal"
+        );
+
+        let mut layout = BrigadeLayout::default();
+        layout.row_weights.insert("worker-1".to_string(), 10);
+        layout.row_weights.insert("worker-2".to_string(), 20);
+        state.brigade_layouts.insert(1, layout);
+        assert_eq!(
+            state.stack_weights(),
+            vec![10, 20, 15],
+            "a Worker added later is average"
+        );
+
+        // The unweighted member lands at an average height.
+        let heights: Vec<u16> = state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .skip(1)
+            .map(|(_, r)| r.height)
+            .collect();
+        assert_eq!(heights.iter().sum::<u16>(), 39);
+        assert!(
+            heights[2] > heights[0] && heights[2] < heights[1],
+            "{heights:?}"
+        );
+    }
+
+    #[test]
+    fn a_tiny_terminal_never_panics_through_a_whole_gesture() {
+        for (width, height) in [(0u16, 0u16), (1, 1), (10, 5), (30, 8), (36, 12), (60, 10)] {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Resized { width, height },
+                now,
+            );
+            let area = Rect::new(0, 0, width, height);
+            let handles: Vec<Handle> = state.geometry(area).handles().to_vec();
+            for handle in handles {
+                let (column, row) = match handle.axis {
+                    Axis::Vertical => (handle.position, height / 2),
+                    Axis::Horizontal => (
+                        (handle.position.min(width.saturating_sub(1))).max(1),
+                        handle.position.saturating_sub(1),
+                    ),
+                };
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Drag(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    mouse_event(&mut state, &mut app, &brigade, kind, column, row, now);
+                }
+                assert!(state.drag.is_none());
+            }
+            let _ = state.drag_overlay(area);
+        }
+    }
+
+    #[test]
+    fn the_stack_heights_always_sum_to_the_stack_height_after_any_commit() {
+        for workers in 1..=4 {
+            for target in [0u16, 7, 15, 25, 39] {
+                let (mut state, mut app, brigade, now) = drag_fixture(workers);
+                let boundaries: Vec<Boundary> = state
+                    .geometry(DRAG_AREA)
+                    .handles()
+                    .iter()
+                    .map(|h| h.boundary.clone())
+                    .collect();
+                for boundary in boundaries {
+                    if boundary == Boundary::Sidebar {
+                        continue;
+                    }
+                    drag_to(&mut state, &mut app, &brigade, &boundary, target, now);
+                    release_at(&mut state, &mut app, &brigade, &boundary, target, now);
+                    assert_eq!(
+                        stack_height_sum(&state),
+                        39,
+                        "{workers} workers, {boundary:?} to {target}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disbanding_drops_the_brigades_layout_preferences() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start + 4, now);
+        release_at(&mut state, &mut app, &brigade, &master, start + 4, now);
+        assert!(state.brigade_layouts.contains_key(&1));
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+
+        assert!(!state.brigade_layouts.contains_key(&1));
+    }
+
     #[test]
     fn unstaging_a_pane_clears_its_unsent_mark() {
         let (mut state, mut app, brigade, director, _worker, now) = two_pane_brigade_focused_on(0);
@@ -13515,6 +15024,272 @@ mod tests {
     }
 
     // --- dismiss a Worker ----------------------------------------------------
+
+    /// A brigade 1 stage (Director + `worker-1..=3`) whose stored layout
+    /// gives every Worker a weight and the master edge a non-default place.
+    fn weighted_three_worker_brigade() -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, app, brigade, now) = drag_fixture(3);
+        let mut layout = BrigadeLayout {
+            master_permille: 620,
+            ..BrigadeLayout::default()
+        };
+        layout.row_weights.insert("worker-1".to_string(), 8);
+        layout.row_weights.insert("worker-2".to_string(), 12);
+        layout.row_weights.insert("worker-3".to_string(), 16);
+        state.brigade_layouts.insert(1, layout);
+        (state, app, brigade, now)
+    }
+
+    fn dismissed(brigade_id: BrigadeId) -> Event {
+        Event::WorkerDismissed {
+            brigade_id,
+            result: Ok((HashSet::new(), HashSet::new())),
+        }
+    }
+
+    #[test]
+    fn dismissing_a_worker_forgets_its_row_weight_and_only_that() {
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        // The way the confirm dialog leaves things for a staged Worker.
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+
+        let layout = &state.brigade_layouts[&1];
+        assert_eq!(
+            layout
+                .row_weights
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["worker-1".to_string(), "worker-2".to_string()]),
+        );
+        assert_eq!(
+            layout.master_permille, 620,
+            "the brigade's other prefs stay"
+        );
+    }
+
+    #[test]
+    fn a_reused_token_does_not_inherit_the_dismissed_workers_height() {
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+        assert_eq!(state.stack_weights(), vec![8, 12], "w3 left the stage");
+
+        // add-worker numbers max + 1, so the next Worker is `worker-3` again.
+        let again = SessionKey::from_id("w3-again");
+        state.screens.insert(again.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(again.clone(), "worker-3".to_string());
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.push(again);
+        }
+
+        assert_eq!(
+            state.stack_weights(),
+            vec![8, 12, 10],
+            "the mean of the others, not the 16 the dismissed one had"
+        );
+    }
+
+    #[test]
+    fn dismissing_a_worker_whose_pane_is_already_gone_still_forgets_its_weight() {
+        // The pane exited earlier, so `member_tokens` has already lost it:
+        // the token can only come from what the dismissal itself recorded.
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        let gone = SessionKey::from_id("w2");
+        state.unstage(&gone);
+        assert!(state.member_token_for(&gone).is_none());
+        state.pending_dismiss = Some(gone);
+        state.pending_dismiss_member = Some((1, "worker-2".to_string()));
+
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+
+        let weights = &state.brigade_layouts[&1].row_weights;
+        assert!(!weights.contains_key("worker-2"));
+        assert!(weights.contains_key("worker-1") && weights.contains_key("worker-3"));
+    }
+
+    /// Brigade 1 staged with weights, brigade 2's preferences stored too, both
+    /// with a `worker-3`.
+    fn two_brigades_with_a_worker_3_each() -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, app, brigade, now) = weighted_three_worker_brigade();
+        let mut other = BrigadeLayout::default();
+        other.row_weights.insert("worker-3".to_string(), 99);
+        state.brigade_layouts.insert(2, other);
+        (state, app, brigade, now)
+    }
+
+    #[test]
+    fn another_brigades_dismissal_result_forgets_nothing_and_keeps_the_pending_member() {
+        // Brigade 1's dismissal is pending; brigade 2's result arrives first.
+        let (mut state, mut app, brigade, now) = two_brigades_with_a_worker_3_each();
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+
+        update(&mut state, &mut app, &brigade, dismissed(2), now);
+
+        assert_eq!(
+            state.brigade_layouts[&2].row_weights["worker-3"], 99,
+            "brigade 2's same-named token is not touched"
+        );
+        assert_eq!(state.brigade_layouts[&1].row_weights.len(), 3);
+        assert_eq!(
+            state.pending_dismiss_member,
+            Some((1, "worker-3".to_string())),
+            "the entry belongs to brigade 1 and stays"
+        );
+    }
+
+    #[test]
+    fn the_right_brigades_result_after_a_foreign_one_forgets_once_and_only_in_its_brigade() {
+        // The other order: brigade 1's result lands with the member still
+        // captured for it, whatever arrived before.
+        let (mut state, mut app, brigade, now) = two_brigades_with_a_worker_3_each();
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        update(&mut state, &mut app, &brigade, dismissed(2), now);
+        // `pending_dismiss` is spent by any result (see the function's own
+        // doc); the member is not, so restate the pending dismissal the way
+        // the confirm dialog would, as a second dismissal in brigade 1.
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+
+        assert!(
+            !state.brigade_layouts[&1]
+                .row_weights
+                .contains_key("worker-3")
+        );
+        assert_eq!(state.brigade_layouts[&1].row_weights.len(), 2);
+        assert_eq!(state.brigade_layouts[&2].row_weights["worker-3"], 99);
+        assert_eq!(state.pending_dismiss_member, None);
+    }
+
+    #[test]
+    fn a_dismissal_for_brigade_2_then_a_result_for_brigade_1_forgets_nothing_in_either() {
+        let (mut state, mut app, brigade, now) = two_brigades_with_a_worker_3_each();
+        state.pending_dismiss = Some(SessionKey::from_id("x"));
+        state.pending_dismiss_member = Some((2, "worker-3".to_string()));
+
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+
+        assert_eq!(state.brigade_layouts[&1].row_weights.len(), 3);
+        assert_eq!(state.brigade_layouts[&2].row_weights["worker-3"], 99);
+        assert_eq!(
+            state.pending_dismiss_member,
+            Some((2, "worker-3".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_failed_dismissal_keeps_the_row_weight() {
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDismissed {
+                brigade_id: 1,
+                result: Err("store is locked".to_string()),
+            },
+            now,
+        );
+
+        assert_eq!(state.brigade_layouts[&1].row_weights.len(), 3);
+        assert!(state.pending_dismiss_member.is_none(), "nothing left stale");
+    }
+
+    #[test]
+    fn the_confirm_dialog_records_which_member_a_dismissal_removes() {
+        // Synthetic key (token in the key) and resolved key (token from the
+        // membership round trip): both leave the member for `WorkerDismissed`.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let key = SessionKey::new_worker(1, "worker-4");
+        app.open_confirm_kill_modal(key.as_str().to_string(), "worker-4".to_string(), true);
+        app.modal_select_next();
+        let brigade = brigade_config();
+        let now = test_instant();
+        let enter = || {
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            )))
+        };
+        update(&mut state, &mut app, &brigade, enter(), now);
+        assert_eq!(
+            state.pending_dismiss_member,
+            Some((1, "worker-4".to_string()))
+        );
+
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("w5")]);
+        app.open_confirm_kill_modal("w5".to_string(), "w5".to_string(), true);
+        app.modal_select_next();
+        update(&mut state, &mut app, &brigade, enter(), now);
+        assert_eq!(state.pending_dismiss_member, None, "unknown until resolved");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "w5".to_string(),
+                membership: Some((1, "worker-5".to_string(), BrigadeRole::Worker)),
+                members: None,
+            },
+            now,
+        );
+        assert_eq!(
+            state.pending_dismiss_member,
+            Some((1, "worker-5".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_pane_exiting_keeps_its_row_weight() {
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        let before = state.brigade_layouts[&1].row_weights.clone();
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("w2"),
+                reason: None,
+            },
+            now,
+        );
+
+        assert_eq!(state.brigade_layouts[&1].row_weights, before);
+    }
+
+    #[test]
+    fn a_member_leaving_the_stage_and_coming_back_keeps_its_row_weight() {
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        let before = state.brigade_layouts[&1].row_weights.clone();
+
+        state.stage = Stage::Empty;
+        state.unstage(&SessionKey::from_id("w1"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        assert_eq!(state.brigade_layouts[&1].row_weights, before);
+        assert_eq!(state.brigade_layouts[&1].master_permille, 620);
+    }
 
     #[test]
     fn kill_confirm_dismiss_on_a_synthetic_worker_key_emits_dismiss_worker_directly() {

@@ -60,7 +60,7 @@ line.
 **Status: DONE (Phase 3, 2026-07-25).** The split is physical. `banto-core`
 kept its name and purified in place (model, input, config types, age
 bucketing, search, `App`, the emporium engine + `Screen`, key/paste
-encoders — deps: serde, vt100, nucleo, ratatui-core);
+encoders — deps: serde, vt100, nucleo, ratatui-core, unicode-width);
 `banto-io` and `banto-tui` are real crates; the bin package `banto` carries
 the app role (the table's "banto-app" is that role, not a rename). Two
 notes from the migration worth keeping:
