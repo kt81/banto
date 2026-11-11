@@ -476,6 +476,12 @@ pub struct BrigadeMember {
     /// momentarily). An observation, not an identity: nothing is
     /// unique-indexed on it the way `session_id` is.
     pub briefed_session_id: Option<SessionId>,
+    /// What this member's Director calls it, if it has named it
+    /// (`banto_core::member_name`). Only what a reader may show: the store
+    /// applies the rule when it reads the roster, so a stored value that fails
+    /// it, repeats another member's, or is a token arrives here as `None`. The
+    /// token stays the identifier; this is a label.
+    pub display_name: Option<String>,
 }
 
 /// A queued message from one brigade member to the peer role, or to one

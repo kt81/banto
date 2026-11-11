@@ -42,7 +42,7 @@ use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
 use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
-use banto_io::store::{Store, StoreError};
+use banto_io::store::{MemberNaming, Store, StoreError};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
 /// launch (the "register the pair at launch" hook). `brigade` + `member`
@@ -185,9 +185,11 @@ fn tools_list_result() -> Value {
                                             target any Worker or Goinkyo token in this brigade \
                                             (e.g. \"worker-2\"); a Worker or a Goinkyo may only \
                                             target \"director\" (the sole Director), which is \
-                                            the same as omitting `to` for either of them. Omit \
-                                            for the default: every Worker receives it (never a \
-                                            Goinkyo, which a broadcast never reaches)."
+                                            the same as omitting `to` for either of them. A \
+                                            member's display name is not an address: `to` takes \
+                                            tokens only. Omit for the default: every Worker \
+                                            receives it (never a Goinkyo, which a broadcast \
+                                            never reaches)."
                         }
                     },
                     "required": ["text"],
@@ -305,6 +307,35 @@ fn tools_list_result() -> Value {
                                 this brigade.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
+            {
+                "name": "name_member",
+                "description": "Director only. Give a Worker a display name, or change or clear \
+                                it, whenever you like. Worth doing when you give a Worker a \
+                                standing role (\"reviewer\", \"docs\", \"tests\") so that you, \
+                                your Workers and the operator can tell them apart: the name \
+                                shows beside its token in brigade_status, in message headers and \
+                                on the operator's screen. A name is only a label — its token \
+                                (worker-2, …) stays what identifies it, and send_to_peer's `to` \
+                                still takes the token. At most 24 columns, no double quote, \
+                                unique among this brigade's members, and not a token or \
+                                something that looks like one. Only Workers can be named, not \
+                                the Director or the Goinkyo.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "member": {
+                            "type": "string",
+                            "description": "The Worker's token, e.g. \"worker-2\"."
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "The display name. An empty string clears the name."
+                        }
+                    },
+                    "required": ["member", "name"],
+                    "additionalProperties": false,
+                },
+            },
         ],
     })
 }
@@ -320,6 +351,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "brigade_status" => tool_brigade_status(ctx),
         "consult_goinkyo" => tool_consult_goinkyo(ctx, msg),
         "dismiss_goinkyo" => tool_dismiss_goinkyo(ctx),
+        "name_member" => tool_name_member(ctx, msg),
         other => tool_error(&format!("unknown tool: {other}")),
     }
 }
@@ -349,8 +381,13 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
     };
     let live = read_live_sessions(&ctx.claude_home.sessions_dir());
 
+    let own_name = members
+        .iter()
+        .find(|member| member.token == token)
+        .and_then(|member| member.display_name.as_deref());
     let mut out = format!(
-        "You are {token} ({}) in banto brigade {brigade}.\n",
+        "You are {} ({}) in banto brigade {brigade}.\n",
+        labelled(&token, own_name),
         role_label(role)
     );
     let unread_for_me = ctx
@@ -389,9 +426,14 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
                 .store
                 .has_unseen_brigade_messages(brigade, &peer.token, peer.role)
                 .unwrap_or(false);
+            // The token first, then what a Director gave it to call it by and the
+            // product it runs: additions to the line that was there before.
             out.push_str(&format!(
-                "  {} — {activity}{}{}\n",
-                peer.token,
+                "  {}{} — {activity}{}{}\n",
+                labelled(&peer.token, peer.display_name.as_deref()),
+                peer.agent
+                    .map(|agent| format!(" ({})", agent.label()))
+                    .unwrap_or_default(),
                 if waiting {
                     " — has unread mail from you"
                 } else {
@@ -562,7 +604,17 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
     ) {
         Ok(_) => tool_text(
             match &target {
-                Some((member, _)) => format!("Delivered to {member}."),
+                Some((member, _)) => {
+                    // Looked up now, not remembered: a rename lands on the very
+                    // next call. A failed read costs the name, not the delivery.
+                    let name = ctx
+                        .store
+                        .brigade_member(brigade, member)
+                        .ok()
+                        .flatten()
+                        .and_then(|row| row.display_name);
+                    format!("Delivered to {}.", labelled(member, name.as_deref()))
+                }
                 None => format!("Delivered to your {}.", role_label(to_role)),
             },
             false,
@@ -668,6 +720,9 @@ fn validate_target(
         members.iter().filter(|m| role.can_reach(m.role)).collect();
     if let Some(member) = addressable.iter().find(|m| m.token == to) {
         return Ok(Some((member.token.clone(), member.role)));
+    }
+    if named_member(&members, to).is_some() {
+        return Err(names_are_not_addresses(to, &members));
     }
     let target_kinds = role
         .addressability()
@@ -1129,12 +1184,137 @@ fn format_inbox(messages: &[BrigadeMessage], members: &[BrigadeMember]) -> Strin
         } else {
             "broadcast"
         };
+        let sender_name = members
+            .iter()
+            .find(|member| member.token == message.from_token)
+            .and_then(|member| member.display_name.as_deref());
         out.push_str(&format!(
             "\n[from {} — {addressing}]\n{}\n",
-            message.from_token, message.body
+            labelled(&message.from_token, sender_name),
+            message.body
         ));
     }
     out
+}
+
+/// `worker-3 "impl"` for a named member, `worker-3` for one that is not: the
+/// token always comes first, because it is the address, and the name is in
+/// ASCII quotes because a name is a label (and cannot contain one).
+fn labelled(token: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{token} \"{name}\""),
+        None => token.to_string(),
+    }
+}
+
+/// The member whose display name is `text`, in any case.
+fn named_member<'a>(members: &'a [BrigadeMember], text: &str) -> Option<&'a BrigadeMember> {
+    let wanted = text.to_lowercase();
+    members.iter().find(|member| {
+        member
+            .display_name
+            .as_deref()
+            .is_some_and(|name| name.to_lowercase() == wanted)
+    })
+}
+
+/// The refusal for a display name passed where a token is required, with
+/// every token-and-name pair so the caller can pick the address it meant.
+fn names_are_not_addresses(given: &str, members: &[BrigadeMember]) -> String {
+    let pairs: Vec<String> = members
+        .iter()
+        .filter(|member| member.display_name.is_some())
+        .map(|member| labelled(&member.token, member.display_name.as_deref()))
+        .collect();
+    format!(
+        "\"{given}\" is a display name, and names are not addresses — use the token. \
+         Named members: {}.",
+        pairs.join(", ")
+    )
+}
+
+/// `name_member`: set, change or clear a Worker's display name. Director-only.
+///
+/// The caller's role is checked here, first; everything about the *member* — it
+/// exists, it is a Worker, the name meets the rule (`banto_core::member_name`)
+/// and is not taken — is decided by `Store::name_member` inside one
+/// transaction, so nothing can change between the check and the write. The
+/// emporium learns of the name from the store on its next tick; this process
+/// does not tell it anything, and keeps nothing between calls.
+///
+/// A name cannot land on a replacement Worker: a Worker's token is never reused
+/// in its brigade, so `worker-2` is the same member for as long as it exists.
+/// Addressing by token is the Director's only handle, as with `send_to_peer`.
+fn tool_name_member(ctx: &mut ServerContext, msg: &Value) -> Value {
+    let (brigade, _, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Director {
+        return tool_error("name_member may only be called by a Director.");
+    }
+    let member = match require_string_arg(msg, "member") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    // Present but possibly empty: an empty string is how a name is cleared, so
+    // this is not `require_string_arg`.
+    let name = match msg.pointer("/params/arguments/name") {
+        Some(Value::String(name)) => name.as_str(),
+        None | Some(Value::Null) => {
+            return tool_error("`name` is required (pass an empty string to clear the name).");
+        }
+        Some(_) => return tool_error("`name` must be a string."),
+    };
+    match ctx.store.name_member(brigade, member, name) {
+        Ok(MemberNaming::Set {
+            name: new,
+            previous,
+        }) => tool_text(
+            match (new, previous) {
+                (Some(new), Some(old)) if new == old => {
+                    format!("{member} is already named \"{new}\".")
+                }
+                (Some(new), _) => format!(
+                    "Named {member} \"{new}\". It shows beside its token in brigade_status, in message headers and on the operator's screen; send_to_peer still addresses it as {member}."
+                ),
+                (None, Some(old)) => format!("Cleared the name of {member} (it was \"{old}\")."),
+                (None, None) => format!("{member} has no name; nothing to clear."),
+            },
+            false,
+        ),
+        Ok(MemberNaming::Refused(rejection)) => tool_error(&format!("Name refused: {rejection}")),
+        Ok(MemberNaming::NotAWorker(role)) => tool_error(&format!(
+            "{} cannot be given a name — only a Worker can.",
+            match role {
+                BrigadeRole::Director => "The Director",
+                BrigadeRole::Goinkyo => "The Goinkyo",
+                BrigadeRole::Worker => "A Worker",
+            }
+        )),
+        Ok(MemberNaming::NoSuchMember) => {
+            // Only worded here, from a fresh read; the decision was the store's.
+            let members = ctx.store.brigade_members(brigade).unwrap_or_default();
+            if named_member(&members, member).is_some() {
+                return tool_error(&names_are_not_addresses(member, &members));
+            }
+            let workers: Vec<&str> = members
+                .iter()
+                .filter(|candidate| candidate.role == BrigadeRole::Worker)
+                .map(|candidate| candidate.token.as_str())
+                .collect();
+            tool_error(&format!(
+                "\"{member}\" is not a member of this brigade. Workers you can name: {}.",
+                if workers.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    workers.join(", ")
+                }
+            ))
+        }
+        Err(err) => tool_error(&format!("failed to set the name: {err}")),
+    }
 }
 
 fn tool_text(text: String, is_error: bool) -> Value {
@@ -1269,6 +1449,7 @@ mod tests {
         assert!(names.contains(&"check_messages"));
         assert!(names.contains(&"brigade_status"));
         assert!(names.contains(&"consult_goinkyo"));
+        assert!(names.contains(&"name_member"));
     }
 
     /// `brigade_status` on a caller banto never registered: it can only
@@ -1323,6 +1504,495 @@ mod tests {
             "the unaddressed Worker is not, got {text:?}"
         );
         assert!(text.contains("send_to_peer"), "got {text:?}");
+    }
+
+    // --- display names (name_member and what shows them) -----------------------
+
+    /// A Director with two Workers and a Goinkyo, as the store has them.
+    fn named_ctx() -> ServerContext {
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member_with_agent(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                None,
+                Some(AgentKind::ClaudeCode),
+            )
+            .unwrap();
+        ctx.store
+            .add_brigade_member_with_agent(
+                1,
+                "worker-2",
+                BrigadeRole::Worker,
+                None,
+                Some(AgentKind::Codex),
+            )
+            .unwrap();
+        ctx.store
+            .add_brigade_member(1, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+        ctx
+    }
+
+    /// Name a member the way the `name_member` tool does.
+    fn name_it(store: &mut Store, br: BrigadeId, token: &str, name: &str) -> MemberNaming {
+        store.name_member(br, token, name).unwrap()
+    }
+
+    fn name_member_call(member: &str, name: &str) -> String {
+        json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": { "name": "name_member",
+                        "arguments": { "member": member, "name": name } }
+        })
+        .to_string()
+    }
+
+    fn result_text(response: &Value) -> String {
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn is_error(response: &Value) -> bool {
+        response["result"]["isError"].as_bool().unwrap()
+    }
+
+    /// The Worker's own context, sharing the Director's store: the store is the
+    /// one thing the two MCP servers share, so the tests move it across.
+    fn worker_ctx_of(director: ServerContext, token: &str) -> ServerContext {
+        ServerContext {
+            identity: Identity {
+                session: Some(format!("{token}-session")),
+                brigade: Some(1),
+                member: Some(token.to_string()),
+                role: Some(BrigadeRole::Worker),
+            },
+            ..director
+        }
+    }
+
+    #[test]
+    fn a_director_names_a_worker_and_it_is_stored() {
+        let mut ctx = named_ctx();
+        let response = call(&mut ctx, &name_member_call("worker-1", "  impl "));
+        assert!(!is_error(&response), "{response}");
+        let text = result_text(&response);
+        assert!(text.contains("Named worker-1 \"impl\""), "{text}");
+        assert!(
+            text.contains("send_to_peer still addresses it as worker-1"),
+            "{text}"
+        );
+        assert_eq!(
+            ctx.store
+                .brigade_member(1, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            Some("impl".to_string())
+        );
+    }
+
+    #[test]
+    fn naming_twice_changes_it_and_an_empty_name_clears_it() {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+        let again = call(&mut ctx, &name_member_call("worker-1", "impl"));
+        assert!(result_text(&again).contains("already named \"impl\""));
+        let changed = call(&mut ctx, &name_member_call("worker-1", "review"));
+        assert!(result_text(&changed).contains("Named worker-1 \"review\""));
+
+        let cleared = call(&mut ctx, &name_member_call("worker-1", ""));
+        assert!(!is_error(&cleared), "{cleared}");
+        assert!(
+            result_text(&cleared).contains("Cleared the name of worker-1 (it was \"review\")"),
+            "{}",
+            result_text(&cleared)
+        );
+        assert_eq!(
+            ctx.store
+                .brigade_member(1, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+        let nothing = call(&mut ctx, &name_member_call("worker-1", ""));
+        assert!(result_text(&nothing).contains("nothing to clear"));
+        assert!(!is_error(&nothing));
+    }
+
+    #[test]
+    fn only_a_director_can_name_a_member() {
+        let mut worker = worker_ctx_of(named_ctx(), "worker-1");
+        let response = call(&mut worker, &name_member_call("worker-2", "spy"));
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("only be called by a Director"));
+        assert_eq!(
+            worker
+                .store
+                .brigade_member(1, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+        // Nor can it name itself.
+        let own = call(&mut worker, &name_member_call("worker-1", "me"));
+        assert!(is_error(&own));
+    }
+
+    #[test]
+    fn the_director_and_the_goinkyo_cannot_be_named_and_a_stranger_gets_the_worker_list() {
+        let mut ctx = named_ctx();
+        let director = call(&mut ctx, &name_member_call("director", "boss"));
+        assert!(is_error(&director));
+        assert!(result_text(&director).contains("The Director cannot be given a name"));
+        let goinkyo = call(&mut ctx, &name_member_call("goinkyo", "elder"));
+        assert!(is_error(&goinkyo));
+        assert!(result_text(&goinkyo).contains("The Goinkyo cannot be given a name"));
+        let stranger = call(&mut ctx, &name_member_call("worker-9", "ghost"));
+        assert!(is_error(&stranger));
+        let text = result_text(&stranger);
+        assert!(text.contains("worker-1, worker-2"), "{text}");
+        for token in ["director", "goinkyo", "worker-9"] {
+            assert_eq!(
+                ctx.store
+                    .brigade_member(1, token)
+                    .unwrap()
+                    .map(|m| m.display_name)
+                    .unwrap_or(None),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_name_says_why_and_is_not_stored() {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+        for (name, reason) in [
+            ("Impl", "already named that (worker-1)"),
+            ("worker-5", "not an address"),
+            ("Director", "not an address"),
+            ("goinkyo", "not an address"),
+            ("say \"hi\"", "double quote"),
+            ("a] — to you", "[ or ]"),
+            (&"x".repeat(30), "30 columns wide; the limit is 24"),
+            ("\u{1b}\u{200b}", "nothing visible"),
+        ] {
+            let response = call(&mut ctx, &name_member_call("worker-2", name));
+            assert!(is_error(&response), "{name:?}: {response}");
+            let text = result_text(&response);
+            assert!(text.starts_with("Name refused:"), "{text}");
+            assert!(text.contains(reason), "{name:?}: {text}");
+        }
+        assert_eq!(
+            ctx.store
+                .brigade_member(1, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+        // Wide characters count two columns each: 12 fit, 13 do not.
+        let twelve = call(
+            &mut ctx,
+            &name_member_call("worker-2", &"\u{30c6}".repeat(12)),
+        );
+        assert!(!is_error(&twelve), "{twelve}");
+        let thirteen = call(
+            &mut ctx,
+            &name_member_call("worker-1", &"\u{30c6}".repeat(13)),
+        );
+        assert!(is_error(&thirteen));
+    }
+
+    #[test]
+    fn the_arguments_are_checked() {
+        let mut ctx = named_ctx();
+        let missing_name = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"name_member","arguments":{"member":"worker-1"}}}"#,
+        );
+        assert!(is_error(&missing_name));
+        assert!(result_text(&missing_name).contains("`name` is required"));
+        let wrong_type = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"name_member","arguments":{"member":"worker-1","name":3}}}"#,
+        );
+        assert!(is_error(&wrong_type));
+        let missing_member = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"name_member","arguments":{"name":"x"}}}"#,
+        );
+        assert!(result_text(&missing_member).contains("`member` is required"));
+    }
+
+    #[test]
+    fn a_display_name_given_as_the_member_is_told_names_are_not_addresses() {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+        let response = call(&mut ctx, &name_member_call("impl", "other"));
+        assert!(is_error(&response));
+        let text = result_text(&response);
+        assert!(text.contains("names are not addresses"), "{text}");
+        assert!(text.contains("worker-1 \"impl\""), "{text}");
+    }
+
+    fn send_call(text: &str, to: Option<&str>) -> String {
+        let mut arguments = json!({ "text": text });
+        if let Some(to) = to {
+            arguments["to"] = json!(to);
+        }
+        json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "send_to_peer", "arguments": arguments }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_name_passed_as_to_gets_the_explanatory_error_with_token_and_name_pairs() {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+        call(&mut ctx, &name_member_call("worker-2", "docs"));
+        let response = call(&mut ctx, &send_call("hi", Some("Impl")));
+        assert!(is_error(&response));
+        let text = result_text(&response);
+        assert!(text.contains("names are not addresses"), "{text}");
+        assert!(
+            text.contains("worker-1 \"impl\", worker-2 \"docs\""),
+            "{text}"
+        );
+        // Nothing was queued.
+        assert!(
+            !ctx.store
+                .has_unseen_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+        // A token still works, and the delivery says the name.
+        let sent = call(&mut ctx, &send_call("hi", Some("worker-1")));
+        assert!(!is_error(&sent), "{sent}");
+        assert_eq!(result_text(&sent), "Delivered to worker-1 \"impl\".");
+        // A member with no name reads as before.
+        let sent = call(&mut ctx, &send_call("hi", Some("goinkyo")));
+        assert_eq!(result_text(&sent), "Delivered to goinkyo.");
+        // A broadcast has no member to name.
+        let sent = call(&mut ctx, &send_call("all", None));
+        assert_eq!(result_text(&sent), "Delivered to your Worker.");
+    }
+
+    #[test]
+    fn an_unknown_to_still_gets_the_old_error() {
+        let mut ctx = named_ctx();
+        let response = call(&mut ctx, &send_call("hi", Some("nobody")));
+        assert!(is_error(&response));
+        let text = result_text(&response);
+        assert!(
+            text.contains("Valid targets: goinkyo, worker-1, worker-2"),
+            "{text}"
+        );
+        assert!(!text.contains("names are not addresses"), "{text}");
+    }
+
+    #[test]
+    fn brigade_status_shows_names_and_products_and_the_callers_own_name() {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+
+        let text = result_text(&call(&mut ctx, &status_call()));
+        assert!(
+            text.contains("  worker-1 \"impl\" (Claude) — starting up (no session id yet)\n"),
+            "{text}"
+        );
+        // Unnamed, product known; and no product known.
+        assert!(
+            text.contains("  worker-2 (Codex) — starting up (no session id yet)\n"),
+            "{text}"
+        );
+        assert!(text.contains("  goinkyo — "), "{text}");
+        // The director has no name to show.
+        assert!(
+            text.starts_with("You are director (Director) in banto brigade 1.\n"),
+            "{text}"
+        );
+
+        // The named Worker's own status line names it.
+        let mut worker = worker_ctx_of(ctx, "worker-1");
+        let own = result_text(&call(&mut worker, &status_call()));
+        assert!(
+            own.starts_with("You are worker-1 \"impl\" (Worker) in banto brigade 1.\n"),
+            "{own}"
+        );
+    }
+
+    #[test]
+    fn check_messages_headers_name_a_sender_that_has_a_name() {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+        ctx.store
+            .enqueue_brigade_message(1, "worker-1", BrigadeRole::Director, None, "done")
+            .unwrap();
+        ctx.store
+            .enqueue_brigade_message(1, "worker-2", BrigadeRole::Director, None, "also")
+            .unwrap();
+
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call",
+                "params":{"name":"check_messages","arguments":{}}}"#,
+        );
+        let text = result_text(&response);
+        assert!(
+            text.contains("[from worker-1 \"impl\" — broadcast]\ndone"),
+            "{text}"
+        );
+        assert!(text.contains("[from worker-2 — broadcast]\nalso"), "{text}");
+    }
+
+    #[test]
+    fn a_rename_is_visible_to_the_next_call_without_restarting_the_server() {
+        // One server process throughout: nothing is cached between calls.
+        let mut ctx = named_ctx();
+        let first = result_text(&call(&mut ctx, &status_call()));
+        assert!(!first.contains("\"impl\""), "{first}");
+        call(&mut ctx, &name_member_call("worker-1", "impl"));
+        let second = result_text(&call(&mut ctx, &status_call()));
+        assert!(second.contains("worker-1 \"impl\""), "{second}");
+        call(&mut ctx, &name_member_call("worker-1", "review"));
+        let third = result_text(&call(&mut ctx, &status_call()));
+        assert!(
+            third.contains("worker-1 \"review\"") && !third.contains("\"impl\""),
+            "{third}"
+        );
+        // And a name written by another process (straight into the store, as the
+        // emporium or another server would see it) shows on the next call too.
+        name_it(&mut ctx.store, 1, "worker-2", "docs");
+        let fourth = result_text(&call(&mut ctx, &status_call()));
+        assert!(fourth.contains("worker-2 \"docs\""), "{fourth}");
+        call(&mut ctx, &name_member_call("worker-1", ""));
+        let fifth = result_text(&call(&mut ctx, &status_call()));
+        assert!(!fifth.contains("worker-1 \""), "{fifth}");
+    }
+
+    /// A Director context over a file-backed store, and a second connection to
+    /// the same file standing for the emporium.
+    fn file_backed_ctx() -> (tempfile::TempDir, ServerContext, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let mut store = Store::open(&path).unwrap();
+        for (token, role) in [
+            ("director", BrigadeRole::Director),
+            ("worker-1", BrigadeRole::Worker),
+            ("worker-2", BrigadeRole::Worker),
+        ] {
+            store.add_brigade_member(1, token, role, None).unwrap();
+        }
+        let emporium = Store::open(&path).unwrap();
+        let ctx = ServerContext {
+            identity: Identity {
+                session: None,
+                brigade: Some(1),
+                member: Some("director".to_string()),
+                role: Some(BrigadeRole::Director),
+            },
+            store,
+            claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
+            codex_home: None,
+            goinkyo_dir: None,
+        };
+        (dir, ctx, emporium)
+    }
+
+    #[test]
+    fn the_name_goes_to_whoever_holds_the_token_when_the_call_runs() {
+        // The one thing no transaction fixes (see `tool_name_member`): the Director
+        // addresses by token. worker-2 was replaced before the call ran, so the
+        // call names the newcomer — as a `send_to_peer` to worker-2 would reach it.
+        let (_dir, mut ctx, mut emporium) = file_backed_ctx();
+        emporium.dismiss_worker(1, "worker-2").unwrap();
+        emporium
+            .add_brigade_member(1, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+        let response = call(&mut ctx, &name_member_call("worker-2", "reviewer"));
+        assert!(!is_error(&response), "{response}");
+        assert_eq!(
+            emporium
+                .brigade_member(1, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            Some("reviewer".to_string())
+        );
+    }
+
+    #[test]
+    fn the_delivery_acknowledgement_shows_the_name_the_roster_shows() {
+        // Hand-edited rows: two Workers holding one name. brigade_status and a
+        // header suppress the later joiner's duplicate; so must "Delivered to".
+        let (dir, mut ctx, _emporium) = file_backed_ctx();
+        ctx.store.name_member(1, "worker-1", "impl").unwrap();
+        let raw = rusqlite::Connection::open(dir.path().join("banto.db")).unwrap();
+        raw.execute(
+            "UPDATE brigade_members SET display_name = 'Impl' WHERE member_token = 'worker-2'",
+            [],
+        )
+        .unwrap();
+
+        let status = result_text(&call(&mut ctx, &status_call()));
+        assert!(status.contains("worker-1 \"impl\""), "{status}");
+        assert!(!status.contains("worker-2 \""), "{status}");
+        let sent = call(&mut ctx, &send_call("hi", Some("worker-2")));
+        assert_eq!(result_text(&sent), "Delivered to worker-2.");
+        let sent = call(&mut ctx, &send_call("hi", Some("worker-1")));
+        assert_eq!(result_text(&sent), "Delivered to worker-1 \"impl\".");
+    }
+
+    #[test]
+    fn a_name_with_a_bracket_is_refused_so_the_header_stays_a_header() {
+        let mut ctx = named_ctx();
+        let response = call(
+            &mut ctx,
+            &name_member_call("worker-1", "x] — to you\n[from"),
+        );
+        assert!(is_error(&response));
+        let text = result_text(&response);
+        assert!(text.contains("[ or ]"), "{text}");
+        assert_eq!(
+            ctx.store
+                .brigade_member(1, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+    }
+
+    #[test]
+    fn a_dismissed_workers_name_goes_with_it_and_a_member_under_the_same_token_by_hand_is_unnamed()
+    {
+        let mut ctx = named_ctx();
+        call(&mut ctx, &name_member_call("worker-2", "docs"));
+        ctx.store.dismiss_worker(1, "worker-2").unwrap();
+        ctx.store
+            .add_brigade_member(1, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+        let text = result_text(&call(&mut ctx, &status_call()));
+        assert!(!text.contains("docs"), "{text}");
+        // The name is free to give to someone else.
+        let again = call(&mut ctx, &name_member_call("worker-1", "docs"));
+        assert!(!is_error(&again), "{again}");
     }
 
     #[test]

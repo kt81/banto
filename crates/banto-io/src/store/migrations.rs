@@ -255,9 +255,10 @@ const MIGRATIONS: &[&str] = &[
     // Per-member values (stack position, row weight, collapsed) are columns on
     // `brigade_members`, not a side table keyed by token, because a member row
     // is deleted on dismissal and with its brigade on disband: forgetting a
-    // dismissed Worker's arrangement, and a reused token starting fresh, come
-    // with the row for nothing. (Tokens are reused: add-worker picks the
-    // highest number plus one.) Brigade-level values are columns on `brigades`
+    // dismissed member's arrangement, and a reused token starting fresh, come
+    // with the row for nothing. (A Worker's token is not reused within its
+    // brigade — v16's counter — but the Goinkyo's is, by every consultation.)
+    // Brigade-level values are columns on `brigades`
     // for the same reason. NULL means "no preference, use the default"; the
     // `minimized` flag has no NULL because "not collapsed" is its default.
     //
@@ -273,6 +274,35 @@ const MIGRATIONS: &[&str] = &[
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );",
+    // v16: a member's display name, given by its Director (`name_member`), and
+    // the per-brigade Worker counter.
+    //
+    // `display_name`: nullable text on the member's own row for the usual
+    // reason: a dismissed member's row is deleted, so its name goes with it. The
+    // token stays the identifier; nothing is keyed on this.
+    //
+    // `brigades.worker_seq`: the highest Worker number ever issued in the
+    // brigade, so a Worker token is never reused within a brigade (what
+    // AUTOINCREMENT does for a rowid): the next Worker is
+    // `max(worker_seq, highest current worker-<n>) + 1` (`Store::add_worker`),
+    // and dismissing the highest, or every, Worker no longer hands its number
+    // back. Backfilled with the highest `worker-<n>` among the brigade's
+    // *current* members, the best that can be known: the numbers of Workers
+    // dismissed before this migration were never recorded and cannot be
+    // recovered, so such a brigade may still hand one of those out once (only
+    // numbers above the highest current Worker, never one a live Worker holds).
+    // Only tokens that are exactly `worker-` and up to nine digits count; any
+    // other token (hand-edited data) is ignored.
+    "ALTER TABLE brigade_members ADD COLUMN display_name TEXT;
+    ALTER TABLE brigades ADD COLUMN worker_seq INTEGER NOT NULL DEFAULT 0;
+    UPDATE brigades SET worker_seq = COALESCE((
+        SELECT MAX(CAST(substr(member_token, 8) AS INTEGER))
+        FROM brigade_members
+        WHERE brigade_members.brigade_id = brigades.id
+          AND member_token GLOB 'worker-[0-9]*'
+          AND substr(member_token, 8) NOT GLOB '*[^0-9]*'
+          AND length(substr(member_token, 8)) <= 9
+    ), 0);",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -1117,10 +1147,9 @@ mod tests {
     #[test]
     fn v14_to_v15_upgrade_keeps_the_rows_and_reads_the_new_columns_as_no_preference() {
         use banto_core::model::BrigadeRole;
-        assert_eq!(
-            MIGRATIONS.len(),
-            15,
-            "this test is about the last migration"
+        assert!(
+            MIGRATIONS.len() >= 15,
+            "v15 is one of the migrations it runs"
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -1189,6 +1218,110 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
+    #[test]
+    fn v15_to_v16_upgrade_keeps_the_rows_and_reads_no_display_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        // A v15 database: v14's rows, then the v15 script.
+        v14_database(&db);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(MIGRATIONS[14]).unwrap();
+            conn.pragma_update(None, "user_version", 15).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let members = store.brigade_members(1).unwrap();
+        let tokens: Vec<&str> = members.iter().map(|m| m.token.as_str()).collect();
+        assert_eq!(tokens, ["director", "worker-1"], "the rows survived");
+        assert!(members.iter().all(|m| m.display_name.is_none()));
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // And the upgraded store takes a name.
+        assert!(matches!(
+            name_it(&mut store, 1, "worker-1", "impl"),
+            super::super::MemberNaming::Set { .. }
+        ));
+        assert_eq!(
+            store
+                .brigade_member(1, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            Some("impl".to_string())
+        );
+    }
+
+    #[test]
+    fn v15_to_v16_backfills_each_brigades_worker_counter_from_its_current_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..15] {
+                conn.execute_batch(script).unwrap();
+            }
+            for (id, name) in [(1, "gaps"), (2, "odd"), (3, "none"), (4, "wide")] {
+                conn.execute(
+                    "INSERT INTO brigades (id, name, created_at_ms) VALUES (?1, ?2, 1000)",
+                    rusqlite::params![id, name],
+                )
+                .unwrap();
+            }
+            let members = [
+                // Gaps, out of order: the highest current number is 7.
+                (1, "director", "director"),
+                (1, "worker-3", "worker"),
+                (1, "worker-7", "worker"),
+                (1, "worker-1", "worker"),
+                // Non-numeric and near-miss tokens are ignored; 12 is the highest.
+                (2, "worker-x", "worker"),
+                (2, "worker-3a", "worker"),
+                (2, "scout", "worker"),
+                (2, "worker-", "worker"),
+                (2, "Worker-99", "worker"),
+                (2, "worker-12", "worker"),
+                // No Workers at all.
+                (3, "director", "director"),
+                (3, "goinkyo", "goinkyo"),
+                // Too long to be a number banto issued.
+                (4, "worker-12345678901", "worker"),
+                (4, "worker-2", "worker"),
+            ];
+            for (brigade, token, role) in members {
+                conn.execute(
+                    "INSERT INTO brigade_members (brigade_id, member_token, role)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![brigade, token, role],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 15).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let counters: Vec<(i64, i64)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT id, worker_seq FROM brigades ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(counters, [(1, 7), (2, 12), (3, 0), (4, 2)]);
+        // And the numbering goes on from there.
+        assert_eq!(store.add_worker(1, None).unwrap(), "worker-8");
+        assert_eq!(store.add_worker(2, None).unwrap(), "worker-13");
+        assert_eq!(store.add_worker(3, None).unwrap(), "worker-1");
+        assert_eq!(store.add_worker(4, None).unwrap(), "worker-3");
+    }
+
     /// A file-backed database exactly as v14 code left it: a brigade with a
     /// Director and a Worker.
     fn v14_database(path: &std::path::Path) {
@@ -1208,6 +1341,15 @@ mod tests {
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 14).unwrap();
+    }
+
+    fn name_it(
+        store: &mut Store,
+        br: banto_core::model::BrigadeId,
+        token: &str,
+        name: &str,
+    ) -> super::super::MemberNaming {
+        store.name_member(br, token, name).unwrap()
     }
 
     fn open_with_timeout(path: &std::path::Path) -> rusqlite::Connection {

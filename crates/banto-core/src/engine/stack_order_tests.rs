@@ -24,7 +24,7 @@ use crate::model::{
 
 use super::*;
 
-fn row(id: &str) -> SessionRow {
+pub(super) fn row(id: &str) -> SessionRow {
     SessionRow {
         id: id.to_string(),
         agent: AgentKind::ClaudeCode,
@@ -41,20 +41,20 @@ fn row(id: &str) -> SessionRow {
 }
 
 /// A roster entry as the shell hands it over: `(token, role, session id)`.
-type Member = (&'static str, BrigadeRole, Option<&'static str>);
+pub(super) type Member = (&'static str, BrigadeRole, Option<&'static str>);
 
-const DIRECTOR: Member = ("director", BrigadeRole::Director, Some("dir"));
-const WORKER_1: Member = ("worker-1", BrigadeRole::Worker, Some("w1"));
-const WORKER_2: Member = ("worker-2", BrigadeRole::Worker, Some("w2"));
-const WORKER_3: Member = ("worker-3", BrigadeRole::Worker, Some("w3"));
-const WORKER_4: Member = ("worker-4", BrigadeRole::Worker, Some("w4"));
-const GOINKYO: Member = ("goinkyo", BrigadeRole::Goinkyo, Some("g1"));
+pub(super) const DIRECTOR: Member = ("director", BrigadeRole::Director, Some("dir"));
+pub(super) const WORKER_1: Member = ("worker-1", BrigadeRole::Worker, Some("w1"));
+pub(super) const WORKER_2: Member = ("worker-2", BrigadeRole::Worker, Some("w2"));
+pub(super) const WORKER_3: Member = ("worker-3", BrigadeRole::Worker, Some("w3"));
+pub(super) const WORKER_4: Member = ("worker-4", BrigadeRole::Worker, Some("w4"));
+pub(super) const GOINKYO: Member = ("goinkyo", BrigadeRole::Goinkyo, Some("g1"));
 
 /// Whether a freshly opened pane announces itself in roster order or the other
 /// way round: which of several concurrent spawns lands first is not something
 /// the core controls.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Arrival {
+pub(super) enum Arrival {
     InOrder,
     Reversed,
 }
@@ -62,21 +62,23 @@ enum Arrival {
 /// The emporium plus what the shell and the store would hold around it: the
 /// last layout snapshot saved for each brigade (what the next staging reads
 /// back) and each brigade's members in the order they joined.
-struct Scene {
-    state: EmporiumState,
-    app: App,
-    brigade: BrigadeConfig,
-    now: Instant,
-    saved: HashMap<BrigadeId, StoredLayout>,
-    joined: HashMap<BrigadeId, Vec<Member>>,
+pub(super) struct Scene {
+    pub(super) state: EmporiumState,
+    pub(super) app: App,
+    pub(super) brigade: BrigadeConfig,
+    pub(super) now: Instant,
+    pub(super) saved: HashMap<BrigadeId, StoredLayout>,
+    pub(super) joined: HashMap<BrigadeId, Vec<Member>>,
     /// Every step's name and the order it left, for the report.
-    trace: Vec<(String, Vec<String>)>,
+    pub(super) trace: Vec<(String, Vec<String>)>,
+    /// The display names the store holds, per `(brigade, token)`.
+    pub(super) names: HashMap<(BrigadeId, String), String>,
 }
 
 impl Scene {
     /// Rows `dir`, `w1`..`w4`, `dir2` and `x1` exist; the Goinkyo's `g1` only
     /// when `goinkyo_transcript` (Claude writes none until its first turn).
-    fn new(goinkyo_transcript: bool) -> Self {
+    pub(super) fn new(goinkyo_transcript: bool) -> Self {
         let mut ids = vec!["dir", "w1", "w2", "w3", "w4", "dir2", "x1"];
         if goinkyo_transcript {
             ids.push("g1");
@@ -90,6 +92,7 @@ impl Scene {
             saved: HashMap::new(),
             joined: HashMap::new(),
             trace: Vec::new(),
+            names: HashMap::new(),
         };
         scene.resize();
         scene
@@ -97,7 +100,7 @@ impl Scene {
 
     /// Brigade 1 with a Director and two Workers, brigade 2 with a Director and
     /// one Worker.
-    fn two_brigades(goinkyo_transcript: bool) -> Self {
+    pub(super) fn two_brigades(goinkyo_transcript: bool) -> Self {
         let mut scene = Scene::new(goinkyo_transcript);
         for member in [DIRECTOR, WORKER_1, WORKER_2] {
             scene.join(1, member);
@@ -107,14 +110,14 @@ impl Scene {
         scene
     }
 
-    fn resize(&mut self) {
+    pub(super) fn resize(&mut self) {
         self.feed(Event::Resized {
             width: 120,
             height: 40,
         });
     }
 
-    fn feed(&mut self, event: Event) -> Vec<Cmd> {
+    pub(super) fn feed(&mut self, event: Event) -> Vec<Cmd> {
         let cmds = update(
             &mut self.state,
             &mut self.app,
@@ -131,7 +134,7 @@ impl Scene {
     }
 
     /// Answer every `OpenEmbedded` in `cmds` with its `Spawned`.
-    fn settle(&mut self, cmds: Vec<Cmd>, arrival: Arrival) {
+    pub(super) fn settle(&mut self, cmds: Vec<Cmd>, arrival: Arrival) {
         let mut keys: Vec<SessionKey> = cmds
             .into_iter()
             .filter_map(|cmd| match cmd {
@@ -148,8 +151,65 @@ impl Scene {
         }
     }
 
+    /// The named members of `brigade_id` as the store hands them over.
+    pub(super) fn names_of(&self, brigade_id: BrigadeId) -> Vec<(MemberToken, String)> {
+        let mut names: Vec<(MemberToken, String)> = self
+            .names
+            .iter()
+            .filter(|((id, _), _)| *id == brigade_id)
+            .map(|((_, token), name)| (token.clone(), name.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The Director names (or, with `None`, un-names) a member: a store write,
+    /// which the core learns of at the next tick or staging.
+    pub(super) fn set_name(&mut self, brigade_id: BrigadeId, token: &str, name: Option<&str>) {
+        let key = (brigade_id, token.to_string());
+        match name {
+            Some(name) => self.names.insert(key, name.to_string()),
+            None => self.names.remove(&key),
+        };
+    }
+
+    /// A tick whose observations cover every staged pane of the staged brigade
+    /// and whose brigade facts carry the names the store has for its members —
+    /// what the shell's gather sends each second.
+    pub(super) fn tick_with_names(&mut self) -> Vec<Cmd> {
+        let Stage::Brigade { id, panes, .. } = &self.state.stage else {
+            return Vec::new();
+        };
+        let brigade_id = *id;
+        let relay: Vec<RelayObservation> = panes
+            .iter()
+            .filter_map(|key| {
+                let token = self.state.member_tokens.get(key)?.clone();
+                Some(RelayObservation {
+                    brigade_id,
+                    token,
+                    key: key.clone(),
+                    has_unseen: false,
+                    is_idle_this_tick: None,
+                    agent: None,
+                    glance: None,
+                })
+            })
+            .collect();
+        let facts = BrigadeNameFacts {
+            brigade_id,
+            name: "cell".to_string(),
+            director_session: Some("dir".to_string()),
+            member_names: self.names_of(brigade_id),
+        };
+        self.feed(Event::Tick {
+            relay,
+            brigades: vec![facts],
+        })
+    }
+
     /// A member joined the brigade in the store, after the ones already there.
-    fn join(&mut self, brigade_id: BrigadeId, member: Member) {
+    pub(super) fn join(&mut self, brigade_id: BrigadeId, member: Member) {
         self.joined.entry(brigade_id).or_default().push(member);
     }
 
@@ -158,7 +218,10 @@ impl Scene {
     /// (`Store::brigade_members_in_join_order`). Before that query the roster
     /// was ordered by token, which put `goinkyo` ahead of `worker-1` — the
     /// defect the operator saw.
-    fn roster(&self, brigade_id: BrigadeId) -> Vec<(MemberToken, BrigadeRole, Option<String>)> {
+    pub(super) fn roster(
+        &self,
+        brigade_id: BrigadeId,
+    ) -> Vec<(MemberToken, BrigadeRole, Option<String>)> {
         let mut members = self.joined.get(&brigade_id).cloned().unwrap_or_default();
         members.sort_by_key(|(_, role, _)| *role != BrigadeRole::Director);
         members
@@ -170,7 +233,12 @@ impl Scene {
     /// Activate the Director of `brigade_id` (session `dir_session`) with the
     /// roster the store has for it now, and let every open that asks for land.
     /// Returns what the update asked of the shell.
-    fn stage(&mut self, brigade_id: BrigadeId, dir_session: &str, arrival: Arrival) -> Vec<Cmd> {
+    pub(super) fn stage(
+        &mut self,
+        brigade_id: BrigadeId,
+        dir_session: &str,
+        arrival: Arrival,
+    ) -> Vec<Cmd> {
         self.state.pending_membership = Some(PendingMembership::Activate);
         let cmds = self.feed(Event::MembershipResolved {
             session_id: dir_session.to_string(),
@@ -181,29 +249,30 @@ impl Scene {
             )),
             members: Some(self.roster(brigade_id)),
             layout: self.saved.get(&brigade_id).cloned(),
+            names: self.names_of(brigade_id),
         });
         self.settle(cmds.clone(), arrival);
         cmds
     }
 
-    fn stage_one(&mut self) {
+    pub(super) fn stage_one(&mut self) {
         self.stage(1, "dir", Arrival::InOrder);
     }
 
-    fn stage_two(&mut self) {
+    pub(super) fn stage_two(&mut self) {
         self.stage(2, "dir2", Arrival::InOrder);
     }
 
     /// The Director asks for a consultation: the shell sees a Goinkyo row with
     /// no session id, the core spawns it, and discovery then names it `g1`.
-    fn consult_goinkyo(&mut self, brigade_id: BrigadeId) {
+    pub(super) fn consult_goinkyo(&mut self, brigade_id: BrigadeId) {
         self.join(brigade_id, GOINKYO);
         self.spawn_goinkyo(brigade_id);
     }
 
     /// The tick finds the Goinkyo row without a session id and reports it,
     /// with the brigade's roster as the store has it now.
-    fn awaiting_spawn(&mut self, brigade_id: BrigadeId) -> Vec<Cmd> {
+    pub(super) fn awaiting_spawn(&mut self, brigade_id: BrigadeId) -> Vec<Cmd> {
         let roster = self
             .roster(brigade_id)
             .into_iter()
@@ -220,7 +289,7 @@ impl Scene {
 
     /// The core spawns the Goinkyo whose row has no session id, and discovery
     /// then names it `g1`.
-    fn spawn_goinkyo(&mut self, brigade_id: BrigadeId) {
+    pub(super) fn spawn_goinkyo(&mut self, brigade_id: BrigadeId) {
         let cmds = self.awaiting_spawn(brigade_id);
         self.settle(cmds, Arrival::InOrder);
         self.feed(Event::DiscoveryResult {
@@ -232,7 +301,7 @@ impl Scene {
 
     /// The Director dismissed the consultation: the row is gone, the next tick
     /// sees it.
-    fn end_consultation(&mut self, brigade_id: BrigadeId) {
+    pub(super) fn end_consultation(&mut self, brigade_id: BrigadeId) {
         self.joined
             .entry(brigade_id)
             .or_default()
@@ -244,7 +313,7 @@ impl Scene {
 
     /// The operator adds a Worker (`b`): the store numbers it and the core
     /// opens it under a placeholder key. Returns the open, not yet landed.
-    fn worker_added(&mut self, brigade_id: BrigadeId, member: Member) -> Vec<Cmd> {
+    pub(super) fn worker_added(&mut self, brigade_id: BrigadeId, member: Member) -> Vec<Cmd> {
         self.join(brigade_id, member);
         self.feed(Event::WorkerAdded {
             brigade_id,
@@ -256,7 +325,7 @@ impl Scene {
     }
 
     /// Discovery gives a placeholder-keyed Worker its session.
-    fn discover(&mut self, brigade_id: BrigadeId, member: Member) {
+    pub(super) fn discover(&mut self, brigade_id: BrigadeId, member: Member) {
         self.feed(Event::DiscoveryResult {
             key: SessionKey::new_worker(brigade_id, member.0),
             session_id: member.2.unwrap().to_string(),
@@ -265,17 +334,18 @@ impl Scene {
     }
 
     /// A Worker added and everything about it landed.
-    fn add_worker(&mut self, brigade_id: BrigadeId, member: Member) {
+    pub(super) fn add_worker(&mut self, brigade_id: BrigadeId, member: Member) {
         let cmds = self.worker_added(brigade_id, member);
         self.settle(cmds, Arrival::InOrder);
         self.discover(brigade_id, member);
     }
 
     /// The operator dismisses a staged Worker.
-    fn dismiss(&mut self, brigade_id: BrigadeId, token: &str) {
+    pub(super) fn dismiss(&mut self, brigade_id: BrigadeId, token: &str) {
         let key = self.key_of(token);
         self.state.pending_dismiss = Some(key);
         self.state.pending_dismiss_member = Some((brigade_id, token.to_string()));
+        self.names.remove(&(brigade_id, token.to_string()));
         self.joined
             .entry(brigade_id)
             .or_default()
@@ -288,7 +358,7 @@ impl Scene {
 
     /// A member's process ends without banto asking, and whatever the core
     /// answers by opening is let land.
-    fn exit(&mut self, token: &str) -> Vec<Cmd> {
+    pub(super) fn exit(&mut self, token: &str) -> Vec<Cmd> {
         let key = self.key_of(token);
         let cmds = self.feed(Event::PtyExited { key, reason: None });
         self.settle(cmds.clone(), Arrival::InOrder);
@@ -296,14 +366,14 @@ impl Scene {
     }
 
     /// The operator drags the member's tile to slot `to` of the stack.
-    fn move_tile(&mut self, token: &str, to: usize) {
+    pub(super) fn move_tile(&mut self, token: &str, to: usize) {
         let key = self.key_of(token);
         move_tile(&mut self.state, &key, to);
         // The end of the next `update` applies and saves it.
         self.tick();
     }
 
-    fn tick(&mut self) -> Vec<Cmd> {
+    pub(super) fn tick(&mut self) -> Vec<Cmd> {
         self.feed(Event::Tick {
             relay: Vec::new(),
             brigades: Vec::new(),
@@ -311,7 +381,7 @@ impl Scene {
     }
 
     /// Press the member's solo button.
-    fn press_solo(&mut self, token: &str) {
+    pub(super) fn press_solo(&mut self, token: &str) {
         let key = self.key_of(token);
         let button = self
             .state
@@ -328,7 +398,7 @@ impl Scene {
         })));
     }
 
-    fn key_of(&self, token: &str) -> SessionKey {
+    pub(super) fn key_of(&self, token: &str) -> SessionKey {
         let Stage::Brigade { panes, .. } = &self.state.stage else {
             panic!("a brigade is staged");
         };
@@ -341,7 +411,7 @@ impl Scene {
 
     /// The staged brigade's tiles, top to bottom (the master first), by member
     /// token — what the operator reads off the screen.
-    fn order(&self) -> Vec<String> {
+    pub(super) fn order(&self) -> Vec<String> {
         match &self.state.stage {
             Stage::Brigade { panes, .. } => panes
                 .iter()
@@ -358,7 +428,7 @@ impl Scene {
     }
 
     /// Note the order now, under `step`.
-    fn note(&mut self, step: &str) -> Vec<String> {
+    pub(super) fn note(&mut self, step: &str) -> Vec<String> {
         let order = self.order();
         self.trace.push((step.to_string(), order.clone()));
         order
@@ -366,14 +436,14 @@ impl Scene {
 
     /// The store and the shell both stay; the banto process starts over: no
     /// panes, no state, the same rows and the same saved layouts.
-    fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         self.state = EmporiumState::new(PrefixKey::default());
         self.resize();
     }
 }
 
 /// Leave brigade 1, show brigade 2, and come back to brigade 1.
-fn off_stage_and_back(scene: &mut Scene) {
+pub(super) fn off_stage_and_back(scene: &mut Scene) {
     scene.stage_two();
     scene.stage_one();
 }
@@ -565,13 +635,16 @@ fn a_member_that_joins_after_a_move_goes_below_the_moved_tiles() {
 }
 
 #[test]
-fn a_dismissed_workers_token_reused_joins_last() {
+fn a_token_reused_by_hand_joins_last() {
+    // banto's own add-worker never reuses a Worker's token; the Goinkyo's is
+    // reused, and a hand-edited store could reuse any. Whoever holds it joins
+    // last.
     let mut scene = Scene::two_brigades(true);
     scene.stage_one();
     scene.consult_goinkyo(1);
     scene.dismiss(1, "worker-2");
     assert_order(&scene, &["director", "worker-1", "goinkyo"]);
-    // The next Worker is numbered worker-2 again, after the Goinkyo.
+    // A member under worker-2 again (by hand), after the Goinkyo.
     scene.add_worker(1, WORKER_2);
     let expected = ["director", "worker-1", "goinkyo", "worker-2"];
     assert_order(&scene, &expected);

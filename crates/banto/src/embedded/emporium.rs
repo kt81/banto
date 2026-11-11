@@ -1546,22 +1546,35 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .flatten();
             // In the order they joined: it is what the tiles of a brigade the
             // operator never rearranged are stacked in.
-            let members = membership.as_ref().map(|(brigade_id, _, _)| {
+            let roster = membership.as_ref().map(|(brigade_id, _, _)| {
                 store
                     .brigade_members_in_join_order(*brigade_id)
                     .unwrap_or_default()
-                    .into_iter()
-                    .map(|member| {
-                        let healed_id = heal_member_session(
-                            &mut store,
-                            *brigade_id,
-                            &member.token,
-                            member.session_id,
-                        );
-                        (member.token, member.role, healed_id)
-                    })
-                    .collect()
             });
+            // The members' display names (only the named ones, as the store
+            // reads them) ride the same roster, so a staging shows them at once.
+            let names: Vec<(MemberToken, String)> = roster
+                .iter()
+                .flatten()
+                .filter_map(|member| Some((member.token.clone(), member.display_name.clone()?)))
+                .collect();
+            let members = membership
+                .as_ref()
+                .zip(roster)
+                .map(|((brigade_id, _, _), roster)| {
+                    roster
+                        .into_iter()
+                        .map(|member| {
+                            let healed_id = heal_member_session(
+                                &mut store,
+                                *brigade_id,
+                                &member.token,
+                                member.session_id,
+                            );
+                            (member.token, member.role, healed_id)
+                        })
+                        .collect()
+                });
             // The brigade's stored arrangement rides the same round trip, so
             // it is in core state before the stage (and its first PTY sizes)
             // is built. A failed read is no arrangement, not a failed resolve.
@@ -1573,6 +1586,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 membership,
                 members,
                 layout,
+                names,
             }]
         }
         // Preferences are written the way a pin is: fire and forget, nothing
@@ -1735,57 +1749,33 @@ fn form_brigade_store(
             Some(director_agent),
         )
         .map_err(|err| err.to_string())?;
+    // Numbered by the brigade's own counter, like every later Worker: N at
+    // formation leaves it at N.
     let mut tokens = Vec::new();
-    for n in 1..=worker_count {
-        let token = format!("worker-{n}");
-        store
-            .add_brigade_member_with_agent(
-                brigade_id,
-                &token,
-                BrigadeRole::Worker,
-                None,
-                Some(worker_agent),
-            )
+    for _ in 0..worker_count {
+        let token = store
+            .add_worker(brigade_id, Some(worker_agent))
             .map_err(|err| err.to_string())?;
         tokens.push(token);
     }
     Ok((brigade_id, tokens))
 }
 
-/// Add one more Worker to an already-formed brigade, under the next
-/// `worker-N` token. `N` is the highest existing Worker number plus one, NOT
-/// a count of current Workers — dismissal can leave a gap (e.g. worker-1
-/// dismissed while worker-2 survives), and counting would then mint
-/// worker-2 again, colliding with the survivor and letting the newcomer
-/// inherit its predecessor's stale store row.
+/// Add one more Worker to an already-formed brigade, under the next `worker-N`
+/// token: the store numbers it (`Store::add_worker`, one transaction), from a
+/// per-brigade counter of the highest number ever issued. Never a count of
+/// current Workers and never "highest current + 1" computed here: a Worker
+/// token is not reused within a brigade, so dismissing the highest-numbered
+/// Worker (or all of them) does not hand its number to the next one.
 fn add_worker_store(
     store: &RefCell<Store>,
     brigade_id: BrigadeId,
     worker_agent: AgentKind,
 ) -> Result<MemberToken, String> {
-    let mut store = store.borrow_mut();
-    let members = store
-        .brigade_members(brigade_id)
-        .map_err(|err| err.to_string())?;
-    let next_n = members
-        .iter()
-        .filter(|member| member.role == BrigadeRole::Worker)
-        .filter_map(|member| member.token.strip_prefix("worker-"))
-        .filter_map(|n| n.parse::<u32>().ok())
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let token = format!("worker-{next_n}");
     store
-        .add_brigade_member_with_agent(
-            brigade_id,
-            &token,
-            BrigadeRole::Worker,
-            None,
-            Some(worker_agent),
-        )
-        .map_err(|err| err.to_string())?;
-    Ok(token)
+        .borrow_mut()
+        .add_worker(brigade_id, Some(worker_agent))
+        .map_err(|err| err.to_string())
 }
 
 /// Reload the session list from disk. A read failure is tolerated (yields no
@@ -2118,7 +2108,10 @@ fn gather_relay_observations(
         }
         // What names this brigade to the operator, from the roster just read:
         // no further query. A brigade whose roster could not be read is not
-        // listed (core keeps what it had).
+        // listed (core keeps what it had). The members' display names are the
+        // whole roster's — a Worker with no session id yet has no observation
+        // below, but its tile is on screen and its Director may already have
+        // named it.
         glance_gate.brigades.push(BrigadeNameFacts {
             brigade_id: brigade.id,
             name: brigade.name.clone(),
@@ -2127,6 +2120,10 @@ fn gather_relay_observations(
                 .find(|member| member.role == BrigadeRole::Director)
                 .and_then(|member| member.session_id.as_ref())
                 .map(|session| session.0.clone()),
+            member_names: members
+                .iter()
+                .filter_map(|member| Some((member.token.clone(), member.display_name.clone()?)))
+                .collect(),
         });
         for member in &members {
             let Some(session_id) = member.session_id.as_ref() else {
@@ -3181,9 +3178,10 @@ struct TickTimings {
 /// second. The gate is one 40 us rowid lookup.
 #[derive(Default)]
 struct GlanceGate {
-    /// Per member: what was read for it last. A token is reused after a
-    /// dismissal, so the session is part of the identity: a new Worker under
-    /// an old token is a new member.
+    /// Per member: what was read for it last. The session is part of the
+    /// identity: the Goinkyo's token is reused by each new consultation (a
+    /// Worker's never is within its brigade, but a hand-edited store could), and
+    /// a new member under an old token is a new member.
     read_at: HashMap<(BrigadeId, MemberToken), GlanceRead>,
     /// The members [`Self::read`] was asked about since [`Self::begin_tick`].
     visited: HashSet<(BrigadeId, MemberToken)>,
@@ -4073,8 +4071,10 @@ mod tests {
         assert!(blind(&mut gate).is_some());
         assert!(blind(&mut gate).is_some());
 
-        // A new Worker under a reused token is read afresh even though no
-        // message has been appended since the old one was.
+        // A new member under a reused token (the Goinkyo's is reused by each
+        // consultation; a Worker's never is in its brigade, but a hand-edited
+        // store could) is read afresh even though no message has been appended
+        // since the old one was.
         let _ = read(&mut gate, &store, "worker-1");
         assert_eq!(read(&mut gate, &store, "worker-1"), None);
         let newest = store.max_brigade_message_id().ok();
@@ -4246,6 +4246,7 @@ mod tests {
                 brigade_id: 1,
                 name: "cell".to_string(),
                 director_session: Some("dir".to_string()),
+                member_names: Vec::new(),
             })
         );
         assert_eq!(
@@ -4254,6 +4255,7 @@ mod tests {
                 brigade_id: 2,
                 name: "Second task".to_string(),
                 director_session: None,
+                member_names: Vec::new(),
             })
         );
         assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
@@ -5346,6 +5348,152 @@ mod tests {
         );
     }
 
+    /// Name a member the way the Director's `name_member` tool does.
+    fn name_it(
+        store: &mut Store,
+        br: BrigadeId,
+        token: &str,
+        name: &str,
+    ) -> banto_io::store::MemberNaming {
+        store.name_member(br, token, name).unwrap()
+    }
+
+    #[test]
+    fn a_name_the_director_gives_reaches_the_tile_through_the_store_and_a_tick() {
+        a_name_reaches_the_tile_through_the_store(true);
+    }
+
+    #[test]
+    fn a_name_reaches_the_tile_of_a_worker_that_has_no_session_id_yet() {
+        // The common moment to name a Worker: freshly spawned, no transcript, so
+        // the roster has no session id for it and the gather makes no observation
+        // of it — while its tile is on screen under the synthetic key.
+        a_name_reaches_the_tile_through_the_store(false);
+    }
+
+    fn a_name_reaches_the_tile_through_the_store(workers_have_a_session: bool) {
+        // Two connections to one file, as the emporium and a Director's MCP
+        // server are: the name is written by the one and read by the other.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        let mut mcp_side = Store::open(&db).unwrap();
+        let brigade_id = mcp_side.create_brigade("cell").unwrap();
+        // The staged brigade's panes are keyed `new-worker::1::worker-N` until
+        // discovery; a member whose recorded session is that key is the pane.
+        mcp_side
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let token = mcp_side
+                .add_worker(brigade_id, Some(AgentKind::ClaudeCode))
+                .unwrap();
+            if workers_have_a_session {
+                mcp_side
+                    .set_member_session(
+                        brigade_id,
+                        &token,
+                        &SessionId(format!("new-worker::1::{token}")),
+                    )
+                    .unwrap();
+            }
+        }
+        let store = RefCell::new(Store::open(&db).unwrap());
+        assert_eq!(brigade_id, 1);
+
+        let (mut state, mut app, _) = staged_brigade_of_two_workers();
+        let config = BrigadeConfig::default();
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut gate = GlanceGate::default();
+        let worker = SessionKey::from_id("new-worker::1::worker-1");
+        let tick = |state: &mut EmporiumState, app: &mut App, gate: &mut GlanceGate| {
+            let relay = gather_relay_observations(state, &store, &home, None, app, None, gate);
+            // Whether the worker has an observation at all depends on its session.
+            assert_eq!(
+                relay.iter().any(|o| o.token == "worker-1"),
+                workers_have_a_session
+            );
+            let brigades = std::mem::take(&mut gate.brigades);
+            let named = brigades
+                .iter()
+                .flat_map(|facts| facts.member_names.iter())
+                .find(|(token, _)| token == "worker-1")
+                .map(|(_, name)| name.clone());
+            let cmds = engine::update(
+                state,
+                app,
+                &config,
+                Event::Tick { relay, brigades },
+                Instant::now(),
+            );
+            (named, cmds)
+        };
+
+        let (named, _) = tick(&mut state, &mut app, &mut gate);
+        assert_eq!(named, None);
+        assert_eq!(state.tile_label(&worker), "worker-1");
+
+        // The Director's `name_member` writes through its own connection.
+        assert!(matches!(
+            name_it(&mut mcp_side, brigade_id, "worker-1", "impl"),
+            banto_io::store::MemberNaming::Set { .. }
+        ));
+        let (named, cmds) = tick(&mut state, &mut app, &mut gate);
+        assert_eq!(named.as_deref(), Some("impl"), "the gather read it");
+        assert_eq!(state.tile_label(&worker), "impl (worker-1)");
+        assert!(
+            !cmds.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::ResizePty { .. } | Cmd::Store(StoreIntent::SaveBrigadeLayout { .. })
+            )),
+            "a rename is no resize and no layout write: {cmds:?}"
+        );
+
+        // Taken back: the tile follows within a tick.
+        name_it(&mut mcp_side, brigade_id, "worker-1", "");
+        tick(&mut state, &mut app, &mut gate);
+        assert_eq!(state.tile_label(&worker), "worker-1");
+    }
+
+    #[test]
+    fn resolve_membership_carries_the_named_members_only() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        for (token, role, session) in [
+            ("director", BrigadeRole::Director, "dir"),
+            ("worker-1", BrigadeRole::Worker, "w1"),
+            ("worker-2", BrigadeRole::Worker, "w2"),
+        ] {
+            store
+                .add_brigade_member(
+                    brigade_id,
+                    token,
+                    role,
+                    Some(&SessionId(session.to_string())),
+                )
+                .unwrap();
+        }
+        name_it(&mut store, brigade_id, "worker-2", "docs");
+        let store = RefCell::new(store);
+
+        let events = execute_store_intent(
+            StoreIntent::ResolveMembership {
+                session_id: "dir".to_string(),
+            },
+            &store,
+        );
+        let [Event::MembershipResolved { names, members, .. }] = events.as_slice() else {
+            panic!("a resolved membership: {events:?}");
+        };
+        assert_eq!(names, &[("worker-2".to_string(), "docs".to_string())]);
+        assert_eq!(members.as_ref().map(Vec::len), Some(3));
+    }
+
     #[test]
     fn resolve_membership_hands_the_roster_over_in_the_order_the_members_joined() {
         let mut store = Store::open_in_memory().unwrap();
@@ -5518,6 +5666,76 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn formation_and_add_worker_share_one_counter_and_a_dismissed_number_is_not_handed_back() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let (brigade_id, tokens) = form_brigade_store(
+            &store,
+            "dir",
+            AgentKind::ClaudeCode,
+            "cell",
+            2,
+            AgentKind::ClaudeCode,
+        )
+        .unwrap();
+        assert_eq!(tokens, ["worker-1", "worker-2"]);
+
+        // The highest is dismissed: the next Worker is not worker-2 again.
+        store
+            .borrow_mut()
+            .dismiss_worker(brigade_id, "worker-2")
+            .unwrap();
+        assert_eq!(
+            add_worker_store(&store, brigade_id, AgentKind::ClaudeCode).unwrap(),
+            "worker-3"
+        );
+        // Every Worker dismissed: numbering goes on, it does not restart at 1.
+        for token in ["worker-1", "worker-3"] {
+            store
+                .borrow_mut()
+                .dismiss_worker(brigade_id, token)
+                .unwrap();
+        }
+        assert_eq!(
+            add_worker_store(&store, brigade_id, AgentKind::Codex).unwrap(),
+            "worker-4"
+        );
+        // The product recorded for the new row is the one asked for.
+        assert_eq!(
+            store
+                .borrow()
+                .brigade_member(brigade_id, "worker-4")
+                .unwrap()
+                .unwrap()
+                .agent,
+            Some(AgentKind::Codex)
+        );
+        // A second brigade formed afterwards starts at 1.
+        let (other, tokens) = form_brigade_store(
+            &store,
+            "dir2",
+            AgentKind::ClaudeCode,
+            "other",
+            1,
+            AgentKind::ClaudeCode,
+        )
+        .unwrap();
+        assert_ne!(other, brigade_id);
+        assert_eq!(tokens, ["worker-1"]);
+    }
+
+    #[test]
+    fn add_worker_reports_a_brigade_that_has_run_out_of_numbers() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-999999999", BrigadeRole::Worker, None)
+            .unwrap();
+        let store = RefCell::new(store);
+        let err = add_worker_store(&store, brigade_id, AgentKind::ClaudeCode).unwrap_err();
+        assert_eq!(err, "this brigade has run out of Worker numbers");
     }
 
     #[test]

@@ -451,6 +451,28 @@ a terminal resize cancels the drag and changes nothing. Each side keeps a
 minimum (sidebar 16 columns, pane area 20, Director and stack 20 each, a
 stacked tile 4 rows); a drag stops there, and a terminal too small for the
 minimums gives up the preference rather than refusing to draw.
+A Worker tile's title is its token, or `{name} ({token})` when its Director has
+named it, e.g. ` impl (worker-2) ` (the token stays visible: the Director will
+still sometimes say "worker-3" to the operator; a name may itself contain
+parentheses — `impl (UI) (worker-2)` — the last parenthesised group is always the
+token). The title goes through the one label function the
+geometry uses, so the title's cells — the move handle, the resize exclusion, the
+room the title-row buttons need — follow it by themselves: a long name takes the
+buttons' room by the usual rule and a narrow tile clips the title as it always
+did. The name reaches the emporium on the roster read at staging and on the
+brigade facts the one-second tick carries (the brigade's list of named members,
+every roster member whether or not it has a session id yet — a freshly spawned
+Worker, the most common moment to name one, has no observation of its own, yet its
+tile is on screen), so a name given from the Director's MCP process appears within
+a tick with no restart; a brigade listed with no names clears them, one the tick
+does not list keeps what the core holds. It is a label only: a
+rename moves, resizes and collapses nothing and writes no layout — order, solo,
+collapse and weights stay keyed by token. Statuses that name a member say its name
+alone when it has one, in ASCII double quotes, else its bare token — quoted is a
+name someone gave, unquoted a token (a name cannot contain `"`, so the quotes
+cannot be broken): `relay: nudged "impl" of "banto開発" ← "docs": stage 2 is done`,
+`worker "impl" exited — restarting`, `"impl", worker-3 of "A" and "docs" of "B"`.
+One helper decides it, so no status can forget.
 Worker tiles can be reordered within the stack (the master stays first): drag a
 tile by its title label. From the press the tile's border and title are drawn
 in yellow; once the pointer moves, its label follows the pointer (reversed
@@ -477,8 +499,10 @@ roster, so a Worker added in the gap cannot take its place) — seeds it from th
 roster at every staging and, at formation, from the Workers' numbering. A tile
 whose pane appears for a member none of these told the core about is learned on
 sight, last. Dismissing a Worker, or the Director ending a consultation, forgets
-the member's place, so a reused token is a new member and joins last. Nothing is
-stored for a brigade whose order is only its join order.
+the member's place: a Worker's token is never reused, so for a Worker this only
+bounds what is kept, but the Goinkyo's token is (each consultation is a new member
+under it), and that member joins last. Nothing is stored for a brigade whose order
+is only its join order.
 Two boundaries on "the order they joined". It holds for a database only banto
 has written to: the table's rowids are the hidden kind SQLite may renumber on
 `VACUUM` or a table rebuild, which banto never does (an external one may). And a
@@ -534,9 +558,10 @@ share, the collapsed stack width and the soloed member (columns on `brigades`);
 per member, its place in the stack order, its row weight and its collapsed flag
 (columns on `brigade_members`). NULL means "no preference, use the default".
 The per-member values live on the member's own row on purpose: a dismissed
-Worker's row is deleted, so its arrangement goes with it and a reused token
-(add-worker numbers the highest plus one) starts fresh; disbanding the brigade
-deletes the rest. A brigade's arrangement is read together with its roster when
+member's row is deleted, so its arrangement goes with it, which bounds what is
+kept and keeps a later member under the same token (only the Goinkyo's is reused,
+by its next consultation) from inheriting it; disbanding the brigade deletes the
+rest. A brigade's arrangement is read together with its roster when
 it is staged, so the first PTY sizes are already the stored ones; it is written
 (the whole snapshot, one transaction) at the moment it actually changes — a
 committed resize or move, a collapse, a solo, restore-all — and never for a
@@ -629,6 +654,59 @@ attempted at most once per consultation (`EmporiumState::goinkyo_pane`, one
 guard per brigade, mapped
 to the `SessionKey` that spawn used): a failed attempt is not retried
 automatically.
+
+**Worker tokens.** A Worker's token (`worker-N`) is its identifier — what every
+address, preference and store row is keyed by — and is never reused within a
+brigade, in the manner of `AUTOINCREMENT`: the brigade remembers the highest Worker
+number ever issued (`brigades.worker_seq`, schema v16), and the next Worker is
+`max(that, the highest `worker-<n>` among its current members) + 1`, chosen and
+inserted by `Store::add_worker` in one `BEGIN IMMEDIATE` transaction (two processes
+adding at once get different numbers). Formation goes through the same counter (N
+Workers leave it at N), as does the emporium's add-worker, and numbers stop at nine
+digits — the largest the parser reads back — after which adding is refused ("this
+brigade has run out of Worker numbers"), a stored counter outside the range being
+clamped to it (negative reads as 0, above reads as the bound); they are the only paths
+that create a Worker row. So dismissing the highest-numbered Worker, or every
+Worker, does not hand a number back, and a dismissed middle Worker leaves a gap that
+stays. A brigade older than the counter has it backfilled with the highest
+`worker-<n>` among its current members; the numbers of Workers dismissed before
+that were never recorded, so such a brigade can hand one of those out once. A
+disbanded brigade's counter goes with it; a new brigade has a new id and starts at
+1. The Goinkyo's token is the fixed `goinkyo` and *is* reused, by each consultation
+(`dismiss_goinkyo`, then consult again, is a new member under the same token), so
+everything filed under a dismissed member's token — layout, order, names, mail — is
+still forgotten on dismissal: that bounds what is kept and keeps the next
+`goinkyo` from inheriting it.
+
+**Display names.** A member's token is its identifier and never changes. On top of it a Worker can have a *display name*, given by the
+Director whenever it likes and changeable at any time (`name_member`, below), so
+that the Director, its Workers and the operator can keep track of what a Worker
+is for. Only a Worker can be named. The name lives in
+`brigade_members.display_name` (schema v16, nullable, on the member's own row, so
+a dismissed member's name goes with it). The
+write is one store operation (`Store::name_member`): a single `BEGIN IMMEDIATE`
+transaction reads the roster, finds the member by token, checks it is a Worker,
+applies the rule and writes — so while it holds the write lock no other process can
+dismiss or add a member between the read and the write, and two namings to one name
+cannot both win (the second is refused it as taken). A name cannot land on a
+replacement Worker, since a Worker's token is never reused; addressing by token is
+the Director's only handle, as in `send_to_peer`. One
+rule decides what a name may be (`banto_core::member_name`): reduced like any
+text someone else wrote (`display_text`: one line, control and format characters
+dropped), trimmed, at most 24 display columns, not empty (empty input clears the
+name), no ASCII double quote (a name is shown inside quotes), no square bracket
+(`[`, `]` delimit the message header `[from worker-3 "impl" — to you]`, which is
+provenance an agent reads, so a name can never close it), not equal — in any
+case — to another member's name in the same brigade, and not a token or
+anything that looks like one (`director`, `goinkyo`, `worker-<digits>`, or any
+member's token). The tool refuses a name that breaks it, with the reason; every
+reader applies the rule again — the store's roster reads and its single-member read
+alike, and the core on everything it is told by an event (a brigade's names are
+resolved as a roster before they are installed, join order deciding) — so a stored
+or stated value that fails it, old data or a hand-edited row, reads as no name, and
+of two members holding the same name only the one that joined first does. The
+characters a name may not contain, and why each, are listed in the
+`banto_core::member_name` module doc.
 
 `goinkyo_permission_mode` defaults to `"auto"`, not Claude's own default of
 `"manual"`: nobody is at an unattended Goinkyo's keyboard to answer a
@@ -898,8 +976,11 @@ how the rendered text reaches the member differs by product:
 
 The shipped defaults tell a Director to delegate independent, parallelizable
 work to its Workers via `send_to_peer` and keep genuinely sequential work
-itself; that policy is intentionally a setting the operator can change, not a
-fixed behavior.
+itself, and that it can name a Worker with `name_member` when it gives it a
+standing role; that policy is intentionally a setting the operator can change,
+not a fixed behavior. (No placeholder was added for names: the template still
+substitutes only `{brigade}`, `{token}`, `{peers}` and, for a Goinkyo,
+`{request}`.)
 
 ## MCP mediation server
 
@@ -931,7 +1012,7 @@ tool approval and hook trust are Codex's own two separate mechanisms, solved
 two separate ways here.
 
 The server shares banto's own sqlite store with the TUI process and exposes
-five tools:
+six tools:
 - `send_to_peer(text[, to])` — enqueues a message: a Director broadcasts to
   every Worker by default, or a Worker/Goinkyo sends to the Director;
   `to` names one specific member instead — the only way a Director reaches
@@ -955,6 +1036,22 @@ five tools:
   consultation by removing the Goinkyo's member row (see "Brigade" above for
   what that triggers). Refuses if no Goinkyo is currently part of the
   brigade.
+- `name_member(member, name)` — Director-only: sets, changes or clears (empty
+  `name`) a Worker's display name (see "Display names" in "Brigade" above for
+  the rule). `member` is the Worker's token; the Director and the Goinkyo
+  cannot be named. The result says what it did or why it refused. The tool's
+  description tells a Director when it is worth doing — when it gives a Worker
+  a standing role — and that the token stays the address: `send_to_peer`'s `to`
+  takes tokens only, and a display name given there is refused with the list of
+  token-and-name pairs.
+
+What the other tools show of a name, looked up live on every call and never
+cached in the server process (so a rename is visible to the very next call):
+`brigade_status` adds, per peer, the name in quotes after the token and the
+peer's agent product when the store knows it (`worker-3 "impl" (Claude) — idle`),
+and the caller's own name to its `You are …` line; `check_messages` headers and
+`send_to_peer`'s `Delivered to …` add the name in quotes after the token
+(`[from worker-3 "impl" — to you]`).
 
 Delivery is a pull, never a stdin injection: even though the embedded banto is
 the sole writer to a child's stdin, injecting a peer's message there would

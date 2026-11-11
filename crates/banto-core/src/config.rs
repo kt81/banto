@@ -312,7 +312,10 @@ context and say what you want back. Set `to` to address one Worker; omit it \
 to broadcast. Call check_messages when banto nudges you, and at natural \
 checkpoints while waiting on a Worker. The Workers named above were \
 the roster when you started, and it does not change afterwards — one \
-added later will not appear in it. `brigade_status` has the live one.
+added later will not appear in it. `brigade_status` has the live one. \
+When you give a Worker a standing role, name_member gives it a display \
+name, so that you, your Workers and the operator can tell them apart; \
+its token stays its address.
 
 When you say why something is the way it is — a cause, a mechanism, what \
 broke — the ground for it is a Worker's report or something already \
@@ -812,6 +815,13 @@ mod tests {
         let director = config.brigade.prompt_for(BrigadeRole::Director).unwrap();
         assert!(director.contains("{brigade}") && director.contains("{peers}"));
         assert!(director.contains("send_to_peer") && director.contains("check_messages"));
+        // The tool that names a Worker is mentioned, and the placeholders the
+        // renderer substitutes are the same two as before: no new one.
+        assert!(director.contains("name_member"));
+        assert!(director.starts_with("You are the Director of banto brigade {brigade}."));
+        assert_eq!(director.matches("{brigade}").count(), 1);
+        assert_eq!(director.matches("{peers}").count(), 1);
+        assert!(!director.contains("{token}") && !director.contains("{name}"));
 
         let worker = config.brigade.prompt_for(BrigadeRole::Worker).unwrap();
         assert!(worker.contains("{brigade}") && worker.contains("{token}"));

@@ -26,6 +26,7 @@ use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, params};
 
 use banto_core::display_text::display_safe;
+use banto_core::member_name;
 use banto_core::model::{
     AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
     MessageGlance, SessionId, StoredLayout, StoredMemberLayout,
@@ -89,6 +90,11 @@ impl Store {
 
     /// Adds a member while recording the product banto selected for it, when
     /// that fact is available at creation time.
+    ///
+    /// Not how a Worker is added: a Worker's token is numbered by the brigade's
+    /// counter, which only [`Self::add_worker`] advances. This is for the
+    /// Director (formation), the Goinkyo (whose token is the fixed `goinkyo`,
+    /// legitimately reused by the next consultation) and fixtures.
     pub fn add_brigade_member_with_agent(
         &mut self,
         brigade_id: BrigadeId,
@@ -98,24 +104,80 @@ impl Store {
         agent: Option<AgentKind>,
     ) -> Result<(), StoreError> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO brigade_members (brigade_id, member_token, role, session_id, agent)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                brigade_id,
-                token,
-                role.as_token(),
-                session_id.map(|s| s.0.as_str()),
-                agent.map(AgentKind::as_token),
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id)
-             VALUES (?1, ?2, COALESCE((SELECT MAX(id) FROM brigade_messages), 0))",
-            params![brigade_id, token],
-        )?;
+        insert_member(&tx, brigade_id, token, role, session_id, agent)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Adds the brigade's next Worker and returns its token (`worker-<n>`), one
+    /// `BEGIN IMMEDIATE` transaction: `n` is `max(the brigade's counter, the
+    /// highest `worker-<n>` among its current members) + 1`, the row is
+    /// inserted under that token and the counter is set to `n`. The write lock
+    /// is held from the read of the counter to its update, so two processes
+    /// adding at once get different numbers.
+    ///
+    /// A Worker token is therefore never reused within a brigade: dismissing the
+    /// highest-numbered Worker, or every one, does not hand its number back (the
+    /// counter remembers the highest ever issued — what `AUTOINCREMENT` does for
+    /// a rowid), and a gap left by dismissing a middle one stays a gap. The
+    /// `max` with the current members covers a counter that is behind them
+    /// (a hand-edited store; a brigade older than the counter, see the v16
+    /// migration). A brigade has its own counter, and a disbanded brigade's is
+    /// deleted with it — a new brigade has a new id and starts at 1. Fails if
+    /// the brigade does not exist, and with
+    /// [`StoreError::WorkerNumbersExhausted`] (nothing created) when the next
+    /// number would pass [`MAX_WORKER_NUMBER`], the largest `worker_number`
+    /// reads back: issuing a token the parser would not recognise would end the
+    /// protection the `max` with the current members gives.
+    ///
+    /// The one way banto creates a Worker row: formation and the emporium's
+    /// add-worker both come through here.
+    pub fn add_worker(
+        &mut self,
+        brigade_id: BrigadeId,
+        agent: Option<AgentKind>,
+    ) -> Result<MemberToken, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // CAST so that whatever a hand-edited column holds (text, a real, a huge
+        // value) reads as an integer instead of failing; then clamped to the range
+        // numbers are issued in. A counter above the bound is as good as the bound
+        // (every number is issued: exhausted), and a negative one is as good as 0
+        // (the members decide); either way nothing below overflows.
+        let issued: i64 = tx
+            .query_row(
+                "SELECT CAST(worker_seq AS INTEGER) FROM brigades WHERE id = ?1",
+                [brigade_id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .clamp(0, MAX_WORKER_NUMBER);
+        let highest_member = {
+            let mut stmt =
+                tx.prepare("SELECT member_token FROM brigade_members WHERE brigade_id = ?1")?;
+            let tokens = stmt.query_map([brigade_id], |row| row.get::<_, String>(0))?;
+            let mut highest = 0;
+            for token in tokens {
+                if let Some(n) = worker_number(&token?) {
+                    highest = highest.max(n);
+                }
+            }
+            highest
+        };
+        // Both are at most the bound, so this cannot overflow; past the bound there
+        // is no number the parser would still recognise, so none is issued.
+        let next = issued.max(highest_member) + 1;
+        if next > MAX_WORKER_NUMBER {
+            return Err(StoreError::WorkerNumbersExhausted);
+        }
+        let token = format!("worker-{next}");
+        insert_member(&tx, brigade_id, &token, BrigadeRole::Worker, None, agent)?;
+        tx.execute(
+            "UPDATE brigades SET worker_seq = ?2 WHERE id = ?1",
+            params![brigade_id, next],
+        )?;
+        tx.commit()?;
+        Ok(token)
     }
 
     /// Records the session id a member's agent product assigned to a member
@@ -226,10 +288,11 @@ impl Store {
     /// does not reuse, since that one is used elsewhere to tidy up a
     /// resolved fork/collision and must leave mail alone — any message
     /// addressed specifically to it (`to_member = token`). The mail purge is
-    /// load-bearing, not tidiness: `token` numbers get reused (a future
-    /// Worker can mint the same `worker-N` this one had), so leaving its
-    /// addressed-but-unread mail behind would hand it straight to whichever
-    /// stranger inherits the token next. Broadcasts (`to_member IS NULL`)
+    /// load-bearing, not tidiness: a token can come to denote a different
+    /// member (the Goinkyo's is the fixed `goinkyo`, reused by every
+    /// consultation; a Worker's `worker-N` never is within its brigade, but a
+    /// hand-edited store could), so leaving its addressed-but-unread mail behind
+    /// would hand it straight to whichever stranger inherits the token next. Broadcasts (`to_member IS NULL`)
     /// are untouched — they belong to the role, not this one member, and
     /// every other member's own cursor still governs what they've seen of
     /// them. Dismissing a non-member is a no-op.
@@ -249,8 +312,8 @@ impl Store {
         )?;
         // The member's own arrangement (rank, weight, collapsed) went with its
         // row. The soloed member is a brigade-level column naming a token, so
-        // it needs clearing by hand: tokens are reused, and a new Worker must
-        // not inherit a dismissed one's solo.
+        // it needs clearing by hand: the Goinkyo's token is reused by the next
+        // consultation, which must not inherit a dismissed one's solo.
         tx.execute(
             "UPDATE brigades SET solo_member = NULL WHERE id = ?1 AND solo_member = ?2",
             params![brigade_id, token],
@@ -260,19 +323,16 @@ impl Store {
     }
 
     /// Returns a brigade's members: the Director first, then every other role
-    /// ordered by token. This puts `goinkyo` before `worker-1`; Worker tokens
-    /// remain lexicographically ordered (`worker-1`, `worker-2`, ...), which
-    /// is numerically correct up to single digits because the emporium clamps
-    /// its worker count to 1..=8.
+    /// ordered by token. This puts `goinkyo` before `worker-1`, and Worker
+    /// tokens sort as text (`worker-10` before `worker-2`: a brigade's Worker
+    /// counter only grows, so numbers pass 9 easily). Readers that need the
+    /// order members joined use [`Self::brigade_members_in_join_order`].
     pub fn brigade_members(&self, brigade_id: BrigadeId) -> Result<Vec<BrigadeMember>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id
-             FROM brigade_members
-             WHERE brigade_id = ?1
-             ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, member_token",
-        )?;
-        let rows = stmt.query_map([brigade_id], brigade_member_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        read_roster(
+            &self.conn,
+            brigade_id,
+            "CASE role WHEN 'director' THEN 0 ELSE 1 END, member_token",
+        )
     }
 
     /// The same members as [`Self::brigade_members`], in the order they joined
@@ -283,9 +343,11 @@ impl Store {
     ///
     /// The join order is the table's `rowid`, which SQLite assigns in
     /// insertion order, so it needs no column of its own: a member added
-    /// later has a larger one; a dismissed member's row is deleted, so a Worker
-    /// that reuses its token is a new row and joins last; updating a row (its
-    /// session id, its briefing) never moves it.
+    /// later has a larger one; a dismissed member's row is deleted, so a member
+    /// added under the same token afterwards (only the Goinkyo's `goinkyo`, by
+    /// each new consultation, or a hand-edited store — a Worker's number is
+    /// never reissued, [`Self::add_worker`]) is a new row and joins last;
+    /// updating a row (its session id, its briefing) never moves it.
     ///
     /// What this does and does not promise. The table has a composite primary
     /// key and no `INTEGER PRIMARY KEY`, so its rowids are the hidden kind that
@@ -310,31 +372,99 @@ impl Store {
         &self,
         brigade_id: BrigadeId,
     ) -> Result<Vec<BrigadeMember>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id
-             FROM brigade_members
-             WHERE brigade_id = ?1
-             ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, rowid",
-        )?;
-        let rows = stmt.query_map([brigade_id], brigade_member_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        read_roster(
+            &self.conn,
+            brigade_id,
+            "CASE role WHEN 'director' THEN 0 ELSE 1 END, rowid",
+        )
     }
 
+    /// One member of a brigade, as the roster reads present it — a roster read
+    /// and a pick, not a query of its own, so this can never disagree with
+    /// [`Self::brigade_members`] about what the member is called (whether
+    /// another member holds the same name is a fact about the whole roster, and
+    /// a single row cannot answer it).
     pub fn brigade_member(
         &self,
         brigade_id: BrigadeId,
         token: &str,
     ) -> Result<Option<BrigadeMember>, StoreError> {
         Ok(self
+            .brigade_members(brigade_id)?
+            .into_iter()
+            .find(|member| member.token == token))
+    }
+
+    /// Sets, changes or (with an empty `input`) clears the display name of
+    /// `token`'s member, deciding everything inside one `BEGIN IMMEDIATE`
+    /// transaction: it reads the roster, finds the member by its token, checks it
+    /// is a Worker, applies the rule (`banto_core::member_name::validate`,
+    /// uniqueness against the roster as read *there*) and writes. While that
+    /// transaction holds the write lock no other process can dismiss or add a
+    /// member, so nothing the decision rests on can change before it is made —
+    /// the window a read-then-write split would leave. Two callers cannot both
+    /// claim a name either: the second waits for the first's commit and is then
+    /// refused it as taken. A refusal changes nothing.
+    ///
+    /// A name can therefore never land on a replacement Worker: a Worker's token
+    /// is never reused in its brigade ([`Self::add_worker`]), so `worker-2` is the
+    /// same member for as long as it exists. (The Goinkyo's `goinkyo` is reused by
+    /// each consultation, but it cannot be named.) Addressing by token is the
+    /// caller's only handle, as with `send_to_peer`.
+    ///
+    /// Touches nothing but the one column, so the member's place in the join
+    /// order and every other preference are unchanged.
+    pub fn name_member(
+        &mut self,
+        brigade_id: BrigadeId,
+        token: &str,
+        input: &str,
+    ) -> Result<MemberNaming, StoreError> {
+        self.name_member_with(brigade_id, token, input, || {})
+    }
+
+    /// [`Self::name_member`] with a hook that runs right after the roster has
+    /// been read and before anything is decided or written — the point a test
+    /// uses to show that the write lock is already held, i.e. that nothing can
+    /// change between the read and the write.
+    fn name_member_with(
+        &mut self,
+        brigade_id: BrigadeId,
+        token: &str,
+        input: &str,
+        after_read: impl FnOnce(),
+    ) -> Result<MemberNaming, StoreError> {
+        let tx = self
             .conn
-            .query_row(
-                "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id
-                 FROM brigade_members
-                 WHERE brigade_id = ?1 AND member_token = ?2",
-                params![brigade_id, token],
-                brigade_member_from_row,
-            )
-            .optional()?)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let roster = read_roster(
+            &tx,
+            brigade_id,
+            "CASE role WHEN 'director' THEN 0 ELSE 1 END, rowid",
+        )?;
+        after_read();
+        let Some(target) = roster.iter().find(|member| member.token == token) else {
+            return Ok(MemberNaming::NoSuchMember);
+        };
+        if target.role != BrigadeRole::Worker {
+            return Ok(MemberNaming::NotAWorker(target.role));
+        }
+        let names: Vec<(&str, Option<&str>)> = roster
+            .iter()
+            .map(|member| (member.token.as_str(), member.display_name.as_deref()))
+            .collect();
+        let name = match member_name::validate(input, token, &names) {
+            Ok(name) => name,
+            Err(rejection) => return Ok(MemberNaming::Refused(rejection)),
+        };
+        tx.execute(
+            "UPDATE brigade_members SET display_name = ?3
+             WHERE brigade_id = ?1 AND member_token = ?2",
+            params![brigade_id, token, name],
+        )?;
+        let previous = target.display_name.clone();
+        tx.commit()?;
+        Ok(MemberNaming::Set { name, previous })
     }
 
     /// Records that `banto _hook` reached this member during `session_id` —
@@ -668,7 +798,8 @@ impl Store {
         // *now*. A snapshot can be older than a dismissal that happened in
         // another process (the emporium, an agent's MCP server): without the
         // check the late save would put a dismissed member's token back, and
-        // the next Worker to reuse that token would inherit the solo.
+        // a later member under that token (the Goinkyo's is reused) would
+        // inherit the solo.
         tx.execute(
             "UPDATE brigades
              SET master_permille = ?2,
@@ -871,9 +1002,93 @@ fn unrecognized_role_error(column: usize, token: &str) -> rusqlite::Error {
     )
 }
 
-/// Shared row mapping for [`Store::brigade_members`]/[`Store::brigade_member`]
-/// — both `SELECT`s name the same six columns in the same order.
+/// The largest Worker number: nine digits, what [`worker_number`] and the v16
+/// backfill read back. A brigade that has issued it has run out.
+pub const MAX_WORKER_NUMBER: i64 = 999_999_999;
+
+/// The number in a Worker token: `Some(3)` for `worker-3`, `None` for anything
+/// else (`worker-`, `worker-3a`, `worker-007x`, `scout`, a number of more than
+/// nine digits, which banto never issues — see [`MAX_WORKER_NUMBER`]). Leading
+/// zeros parse (`worker-007` is 7).
+fn worker_number(token: &str) -> Option<i64> {
+    let digits = token.strip_prefix("worker-")?;
+    if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The two inserts that make a member: its row and its read cursor, seeded to
+/// "now" so it sees only mail enqueued after it joined.
+fn insert_member(
+    tx: &rusqlite::Transaction,
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+    session_id: Option<&SessionId>,
+    agent: Option<AgentKind>,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO brigade_members (brigade_id, member_token, role, session_id, agent)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            brigade_id,
+            token,
+            role.as_token(),
+            session_id.map(|s| s.0.as_str()),
+            agent.map(AgentKind::as_token),
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO brigade_cursors (brigade_id, member_token, last_seen_id)
+         VALUES (?1, ?2, COALESCE((SELECT MAX(id) FROM brigade_messages), 0))",
+        params![brigade_id, token],
+    )?;
+    Ok(())
+}
+
+/// What [`Store::name_member`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberNaming {
+    /// Written: `name` is the canonical name now stored (`None` when the name
+    /// was cleared) and `previous` what readers saw before.
+    Set {
+        name: Option<String>,
+        previous: Option<String>,
+    },
+    /// The rule refused it; nothing was written.
+    Refused(member_name::NameRejection),
+    /// No member of the brigade has that token (any more); nothing was written.
+    NoSuchMember,
+    /// The member is not a Worker, and only a Worker can be named; nothing was
+    /// written.
+    NotAWorker(BrigadeRole),
+}
+
+/// The roster `SELECT`: the member columns [`brigade_member_from_row`] maps,
+/// ordered by `order_by`, with the names resolved as readers see them
+/// ([`readable_roster`]). Takes a bare connection so a transaction can read it
+/// too.
+fn read_roster(
+    conn: &rusqlite::Connection,
+    brigade_id: BrigadeId,
+    order_by: &str,
+) -> Result<Vec<BrigadeMember>, StoreError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id,
+                display_name, rowid
+         FROM brigade_members
+         WHERE brigade_id = ?1
+         ORDER BY {order_by}"
+    ))?;
+    let rows = stmt.query_map([brigade_id], brigade_member_with_rowid)?;
+    Ok(readable_roster(rows.collect::<Result<Vec<_>, _>>()?))
+}
+
+/// Shared row mapping for the roster `SELECT` ([`read_roster`]): the six member
+/// columns, then the display name.
 fn brigade_member_from_row(row: &rusqlite::Row) -> rusqlite::Result<BrigadeMember> {
+    let display_name: Option<String> = row.get(6)?;
     let token: String = row.get(0)?;
     let role_token: String = row.get(1)?;
     let session_id: Option<String> = row.get(2)?;
@@ -889,7 +1104,43 @@ fn brigade_member_from_row(row: &rusqlite::Row) -> rusqlite::Result<BrigadeMembe
         agent: agent.as_deref().and_then(AgentKind::from_token),
         briefed_at: briefed_at_ms.map(unix_ms_to_system_time),
         briefed_session_id: briefed_session_id.map(SessionId),
+        display_name,
     })
+}
+
+/// [`brigade_member_from_row`] plus the row's `rowid` (column 7), which orders a
+/// roster by when its members joined.
+fn brigade_member_with_rowid(row: &rusqlite::Row) -> rusqlite::Result<(i64, BrigadeMember)> {
+    Ok((row.get(7)?, brigade_member_from_row(row)?))
+}
+
+/// A roster as readers may show it: each stored display name goes through the
+/// rule (`banto_core::member_name`), and a name that fails it, equals a
+/// token, or repeats an earlier member's reads as `None`. "Earlier" is by join
+/// order (`rowid`), whatever order `members` came in, so the member that held a
+/// name first keeps it and both roster queries agree on who that is.
+fn readable_roster(rows: Vec<(i64, BrigadeMember)>) -> Vec<BrigadeMember> {
+    let mut by_join: Vec<usize> = (0..rows.len()).collect();
+    by_join.sort_by_key(|&index| rows[index].0);
+    let stored: Vec<(&str, Option<&str>)> = by_join
+        .iter()
+        .map(|&index| {
+            let member = &rows[index].1;
+            (member.token.as_str(), member.display_name.as_deref())
+        })
+        .collect();
+    let names = member_name::dedupe_roster(&stored);
+    let mut resolved: Vec<Option<String>> = vec![None; rows.len()];
+    for (&index, name) in by_join.iter().zip(names) {
+        resolved[index] = name;
+    }
+    rows.into_iter()
+        .zip(resolved)
+        .map(|((_, mut member), name)| {
+            member.display_name = name;
+            member
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -898,6 +1149,14 @@ mod tests {
 
     fn sid(s: &str) -> SessionId {
         SessionId(s.to_string())
+    }
+
+    /// Name a member the way a caller that has just read its roster does.
+    fn name_it(store: &mut Store, br: BrigadeId, token: &str, name: &str) -> MemberNaming {
+        match store.brigade_member(br, token).unwrap() {
+            Some(_) => store.name_member(br, token, name).unwrap(),
+            None => MemberNaming::NoSuchMember,
+        }
     }
 
     #[test]
@@ -951,6 +1210,7 @@ mod tests {
                     agent: None,
                     briefed_at: None,
                     briefed_session_id: None,
+                    display_name: None,
                 },
                 BrigadeMember {
                     token: "worker-1".to_string(),
@@ -959,6 +1219,7 @@ mod tests {
                     agent: None,
                     briefed_at: None,
                     briefed_session_id: None,
+                    display_name: None,
                 },
                 BrigadeMember {
                     token: "worker-2".to_string(),
@@ -967,6 +1228,7 @@ mod tests {
                     agent: None,
                     briefed_at: None,
                     briefed_session_id: None,
+                    display_name: None,
                 },
             ]
         );
@@ -1402,6 +1664,7 @@ mod tests {
                 agent: None,
                 briefed_at: None,
                 briefed_session_id: None,
+                display_name: None,
             }]
         );
         // See remove_brigade_member's doc: a non-member is a no-op.
@@ -1489,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn updating_a_member_never_moves_it_and_a_reused_token_joins_last() {
+    fn updating_a_member_never_moves_it_and_a_token_reused_by_hand_joins_last() {
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         for (token, role) in [
@@ -1550,6 +1813,784 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(join_order(&store, 1), expected);
+    }
+
+    fn named_brigade() -> (Store, BrigadeId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        for (token, role) in [
+            ("director", BrigadeRole::Director),
+            ("worker-1", BrigadeRole::Worker),
+            ("worker-2", BrigadeRole::Worker),
+            ("goinkyo", BrigadeRole::Goinkyo),
+        ] {
+            store.add_brigade_member(br, token, role, None).unwrap();
+        }
+        (store, br)
+    }
+
+    fn names(store: &Store, br: BrigadeId) -> Vec<(String, Option<String>)> {
+        store
+            .brigade_members(br)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.token, m.display_name))
+            .collect()
+    }
+
+    #[test]
+    fn a_display_name_is_set_cleared_and_a_missing_member_is_a_no_op() {
+        let (mut store, br) = named_brigade();
+        assert!(names(&store, br).iter().all(|(_, name)| name.is_none()));
+
+        assert!(matches!(
+            name_it(&mut store, br, "worker-1", "impl"),
+            MemberNaming::Set { .. }
+        ));
+        assert_eq!(
+            names(&store, br),
+            [
+                ("director".to_string(), None),
+                ("goinkyo".to_string(), None),
+                ("worker-1".to_string(), Some("impl".to_string())),
+                ("worker-2".to_string(), None),
+            ]
+        );
+        // Both roster queries and the single read carry it.
+        let join: Vec<_> = store
+            .brigade_members_in_join_order(br)
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| m.display_name)
+            .collect();
+        assert_eq!(join, ["impl"]);
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            Some("impl".to_string())
+        );
+
+        // Changed, then cleared.
+        name_it(&mut store, br, "worker-1", "review");
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            Some("review".to_string())
+        );
+        assert!(matches!(
+            name_it(&mut store, br, "worker-1", ""),
+            MemberNaming::Set { .. }
+        ));
+        assert!(names(&store, br).iter().all(|(_, name)| name.is_none()));
+
+        // A member that is not there, in a brigade that is not there: nothing
+        // happens, and nothing is created.
+        assert_eq!(
+            name_it(&mut store, br, "worker-9", "ghost"),
+            MemberNaming::NoSuchMember
+        );
+        assert_eq!(
+            name_it(&mut store, br + 1, "worker-1", "ghost"),
+            MemberNaming::NoSuchMember
+        );
+        assert_eq!(names(&store, br).len(), 4);
+    }
+
+    #[test]
+    fn a_name_belongs_to_its_brigade_and_does_not_move_the_member() {
+        let (mut store, br) = named_brigade();
+        let other = store.create_brigade("other").unwrap();
+        store
+            .add_brigade_member(other, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let before = join_order(&store, br);
+
+        name_it(&mut store, br, "worker-2", "impl");
+        // The same token in another brigade is another member; and the same
+        // name may be used there.
+        assert_eq!(
+            store
+                .brigade_member(other, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+        name_it(&mut store, other, "worker-1", "impl");
+        assert_eq!(join_order(&store, br), before, "naming never reorders");
+    }
+
+    #[test]
+    fn dismissal_takes_the_name_and_a_member_under_the_same_token_by_hand_starts_unnamed() {
+        let (mut store, br) = named_brigade();
+        name_it(&mut store, br, "worker-2", "impl");
+        store.dismiss_worker(br, "worker-2").unwrap();
+        assert!(store.brigade_member(br, "worker-2").unwrap().is_none());
+
+        store
+            .add_brigade_member(br, "worker-2", BrigadeRole::Worker, None)
+            .unwrap();
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+        // And the name is free to give again.
+        assert!(matches!(
+            name_it(&mut store, br, "worker-1", "impl"),
+            MemberNaming::Set { .. }
+        ));
+    }
+
+    #[test]
+    fn stored_values_that_fail_the_rule_read_as_no_name() {
+        let (store, br) = named_brigade();
+        // Written behind the tool's back: old or hand-edited data.
+        let write = |token: &str, value: &str| {
+            store
+                .conn
+                .execute(
+                    "UPDATE brigade_members SET display_name = ?3
+                     WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token, value],
+                )
+                .unwrap();
+        };
+        for garbage in [
+            "",
+            "  padded  ",
+            "esc\u{1b}[31m",
+            "bidi\u{202e}x",
+            "quote\"d",
+            "worker-3",
+            "Goinkyo",
+            &"w".repeat(25),
+            "two\nlines",
+        ] {
+            write("worker-1", garbage);
+            assert_eq!(
+                store
+                    .brigade_member(br, "worker-1")
+                    .unwrap()
+                    .unwrap()
+                    .display_name,
+                None,
+                "{garbage:?}"
+            );
+            assert!(
+                names(&store, br).iter().all(|(_, name)| name.is_none()),
+                "{garbage:?}"
+            );
+        }
+        // A good value still reads.
+        write("worker-1", "impl");
+        assert_eq!(names(&store, br)[2].1.as_deref(), Some("impl"));
+    }
+
+    #[test]
+    fn a_name_two_members_hold_is_read_only_for_the_one_that_joined_first() {
+        let (store, br) = named_brigade();
+        for token in ["worker-1", "worker-2"] {
+            store
+                .conn
+                .execute(
+                    "UPDATE brigade_members SET display_name = 'Impl'
+                     WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token],
+                )
+                .unwrap();
+        }
+        // A name equal to a token is no name either.
+        store
+            .conn
+            .execute(
+                "UPDATE brigade_members SET display_name = 'worker-2'
+                 WHERE member_token = 'goinkyo'",
+                [],
+            )
+            .unwrap();
+        // worker-1 joined before worker-2 (and the two queries agree on that,
+        // though they list the roster in different orders).
+        for roster in [
+            store.brigade_members(br).unwrap(),
+            store.brigade_members_in_join_order(br).unwrap(),
+        ] {
+            let named: Vec<(&str, Option<&str>)> = roster
+                .iter()
+                .map(|m| (m.token.as_str(), m.display_name.as_deref()))
+                .collect();
+            assert!(named.contains(&("worker-1", Some("Impl"))), "{named:?}");
+            assert!(named.contains(&("worker-2", None)), "{named:?}");
+            assert!(named.contains(&("goinkyo", None)), "{named:?}");
+        }
+    }
+
+    #[test]
+    fn naming_applies_the_rule_in_the_store_and_reports_what_it_did() {
+        let (mut store, br) = named_brigade();
+        assert_eq!(
+            store.name_member(br, "worker-1", " impl ").unwrap(),
+            MemberNaming::Set {
+                name: Some("impl".to_string()),
+                previous: None
+            }
+        );
+        // Taken, token-like, quote, bracket, too wide: refused, nothing written.
+        for (input, rejection) in [
+            (
+                "IMPL",
+                member_name::NameRejection::Taken {
+                    by: "worker-1".to_string(),
+                },
+            ),
+            ("worker-9", member_name::NameRejection::LooksLikeToken),
+            ("a\"b", member_name::NameRejection::HasQuote),
+            ("a]b", member_name::NameRejection::HasBracket),
+            (
+                &"x".repeat(25),
+                member_name::NameRejection::TooWide { columns: 25 },
+            ),
+        ] {
+            assert_eq!(
+                store.name_member(br, "worker-2", input).unwrap(),
+                MemberNaming::Refused(rejection),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+        // Its own name again, then cleared with the previous one reported.
+        assert_eq!(
+            store.name_member(br, "worker-1", "impl").unwrap(),
+            MemberNaming::Set {
+                name: Some("impl".to_string()),
+                previous: Some("impl".to_string())
+            }
+        );
+        assert_eq!(
+            store.name_member(br, "worker-1", "").unwrap(),
+            MemberNaming::Set {
+                name: None,
+                previous: Some("impl".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn a_missing_token_and_a_member_that_is_not_a_worker_are_distinct_outcomes() {
+        let (mut store, br) = named_brigade();
+        assert_eq!(
+            store.name_member(br, "worker-9", "impl").unwrap(),
+            MemberNaming::NoSuchMember
+        );
+        // A token of another brigade is no member of this one.
+        assert_eq!(
+            store.name_member(br + 1, "worker-1", "impl").unwrap(),
+            MemberNaming::NoSuchMember
+        );
+        assert_eq!(
+            store.name_member(br, "director", "boss").unwrap(),
+            MemberNaming::NotAWorker(BrigadeRole::Director)
+        );
+        assert_eq!(
+            store.name_member(br, "goinkyo", "elder").unwrap(),
+            MemberNaming::NotAWorker(BrigadeRole::Goinkyo)
+        );
+        // Nothing was written, not even a clear.
+        assert!(names(&store, br).iter().all(|(_, name)| name.is_none()));
+    }
+
+    /// Two connections to one file, as the emporium and a Director's MCP server are.
+    fn naming_connections() -> (tempfile::TempDir, std::path::PathBuf, Store, BrigadeId) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let mut store = Store::open(&path).unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        for (token, role) in [
+            ("director", BrigadeRole::Director),
+            ("worker-1", BrigadeRole::Worker),
+            ("worker-2", BrigadeRole::Worker),
+        ] {
+            store.add_brigade_member(br, token, role, None).unwrap();
+        }
+        (dir, path, store, br)
+    }
+
+    #[test]
+    fn another_connection_cannot_dismiss_and_re_add_while_the_naming_transaction_holds_the_lock() {
+        let (_dir, path, mut director_side, br) = naming_connections();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut rival: Option<std::thread::JoinHandle<()>> = None;
+
+        let outcome = director_side
+            .name_member_with(br, "worker-2", "reviewer", || {
+                // The roster has been read, nothing decided or written yet: the
+                // emporium tries to dismiss worker-2 and add a Worker under the
+                // same token.
+                rival = Some(std::thread::spawn(move || {
+                    let mut emporium = Store::open(&path).unwrap();
+                    emporium.dismiss_worker(br, "worker-2").unwrap();
+                    emporium
+                        .add_brigade_member(br, "worker-2", BrigadeRole::Worker, None)
+                        .unwrap();
+                    done_tx.send(()).unwrap();
+                }));
+                // It is held at the write lock, not racing past it.
+                assert!(
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_millis(300))
+                        .is_err(),
+                    "the other connection got in while the naming transaction was open"
+                );
+            })
+            .unwrap();
+        // The name landed on the member that was there when the transaction began.
+        assert_eq!(
+            outcome,
+            MemberNaming::Set {
+                name: Some("reviewer".to_string()),
+                previous: None
+            }
+        );
+        // Only now does the dismissal run: it takes the name away with the row, and
+        // the newcomer under the token starts unnamed.
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the dismissal ran after the commit");
+        rival.unwrap().join().unwrap();
+        assert_eq!(
+            director_side
+                .brigade_member(br, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None,
+            "the newcomer is unnamed"
+        );
+        assert!(
+            names(&director_side, br)
+                .iter()
+                .all(|(_, name)| name.is_none())
+        );
+    }
+
+    #[test]
+    fn two_connections_naming_to_the_same_name_at_once_exactly_one_wins() {
+        for _ in 0..8 {
+            let (_dir, path, store, br) = naming_connections();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = ["worker-1", "worker-2"]
+                .into_iter()
+                .map(|token| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut mine = Store::open(&path).unwrap();
+                        barrier.wait();
+                        mine.name_member(br, token, "impl").unwrap()
+                    })
+                })
+                .collect();
+            let outcomes: Vec<MemberNaming> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let wins = outcomes
+                .iter()
+                .filter(|o| matches!(o, MemberNaming::Set { .. }))
+                .count();
+            let taken = outcomes
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        MemberNaming::Refused(member_name::NameRejection::Taken { .. })
+                    )
+                })
+                .count();
+            assert_eq!((wins, taken), (1, 1), "{outcomes:?}");
+            let named = store
+                .brigade_members(br)
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.display_name.is_some())
+                .count();
+            assert_eq!(named, 1);
+        }
+    }
+
+    #[test]
+    fn the_single_member_read_agrees_with_the_roster_on_a_name_two_members_hold() {
+        let (store, br) = named_brigade();
+        for token in ["worker-1", "worker-2"] {
+            store
+                .conn
+                .execute(
+                    "UPDATE brigade_members SET display_name = 'Impl'
+                     WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token],
+                )
+                .unwrap();
+        }
+        for member in store.brigade_members(br).unwrap() {
+            assert_eq!(
+                store.brigade_member(br, &member.token).unwrap().as_ref(),
+                Some(&member),
+                "{}",
+                member.token
+            );
+        }
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            Some("Impl".to_string())
+        );
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-2")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None,
+            "the later joiner's duplicate is not shown by any read"
+        );
+    }
+
+    #[test]
+    fn a_stored_name_with_a_bracket_reads_as_no_name() {
+        let (store, br) = named_brigade();
+        store
+            .conn
+            .execute(
+                "UPDATE brigade_members SET display_name = 'a] — to you'
+                 WHERE member_token = 'worker-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .brigade_member(br, "worker-1")
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
+    }
+
+    // --- Worker numbering: a Worker token is never reused within a brigade ----
+
+    fn tokens_of(store: &Store, br: BrigadeId) -> Vec<String> {
+        let mut tokens: Vec<String> = store
+            .brigade_members(br)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == BrigadeRole::Worker)
+            .map(|m| m.token)
+            .collect();
+        tokens.sort_by_key(|t| worker_number(t));
+        tokens
+    }
+
+    fn worker_seq(store: &Store, br: BrigadeId) -> i64 {
+        store
+            .conn
+            .query_row("SELECT worker_seq FROM brigades WHERE id = ?1", [br], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn brigade_with_director() -> (Store, BrigadeId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, None)
+            .unwrap();
+        (store, br)
+    }
+
+    #[test]
+    fn workers_are_numbered_one_after_another_and_formation_leaves_the_counter_at_n() {
+        let (mut store, br) = brigade_with_director();
+        for n in 1..=3 {
+            assert_eq!(
+                store.add_worker(br, Some(AgentKind::ClaudeCode)).unwrap(),
+                format!("worker-{n}")
+            );
+        }
+        assert_eq!(worker_seq(&store, br), 3);
+        // Then one more, as the emporium's add-worker does.
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-4");
+        assert_eq!(worker_seq(&store, br), 4);
+        // The row is a Worker with its agent, no session yet, and a read cursor.
+        let member = store.brigade_member(br, "worker-1").unwrap().unwrap();
+        assert_eq!(member.role, BrigadeRole::Worker);
+        assert_eq!(member.agent, Some(AgentKind::ClaudeCode));
+        assert_eq!(member.session_id, None);
+        assert!(
+            !store
+                .has_unseen_brigade_messages(br, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dismissing_the_highest_worker_does_not_hand_its_number_to_the_next() {
+        let (mut store, br) = brigade_with_director();
+        for _ in 0..3 {
+            store.add_worker(br, None).unwrap();
+        }
+        store.dismiss_worker(br, "worker-3").unwrap();
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-4");
+        assert_eq!(tokens_of(&store, br), ["worker-1", "worker-2", "worker-4"]);
+    }
+
+    #[test]
+    fn dismissing_every_worker_does_not_restart_the_numbering() {
+        let (mut store, br) = brigade_with_director();
+        for _ in 0..2 {
+            store.add_worker(br, None).unwrap();
+        }
+        store.dismiss_worker(br, "worker-1").unwrap();
+        store.dismiss_worker(br, "worker-2").unwrap();
+        assert!(tokens_of(&store, br).is_empty());
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-3");
+    }
+
+    #[test]
+    fn dismissing_a_middle_worker_leaves_a_gap_and_numbering_goes_on_past_the_highest() {
+        let (mut store, br) = brigade_with_director();
+        for _ in 0..3 {
+            store.add_worker(br, None).unwrap();
+        }
+        store.dismiss_worker(br, "worker-2").unwrap();
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-4");
+        assert_eq!(tokens_of(&store, br), ["worker-1", "worker-3", "worker-4"]);
+    }
+
+    #[test]
+    fn a_counter_behind_the_members_still_issues_above_the_highest_member() {
+        // Hand-edited, or a brigade older than the counter that the backfill missed.
+        let (mut store, br) = brigade_with_director();
+        for token in ["worker-2", "worker-5"] {
+            store
+                .add_brigade_member(br, token, BrigadeRole::Worker, None)
+                .unwrap();
+        }
+        assert_eq!(worker_seq(&store, br), 0);
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-6");
+        // A counter ahead of the members wins, too (the dismissed ones' numbers).
+        store
+            .conn
+            .execute("UPDATE brigades SET worker_seq = 10 WHERE id = ?1", [br])
+            .unwrap();
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-11");
+        assert_eq!(worker_seq(&store, br), 11);
+    }
+
+    #[test]
+    fn only_exact_worker_numbers_count_toward_the_next_number() {
+        let (mut store, br) = brigade_with_director();
+        for token in [
+            "worker-x",
+            "worker-3a",
+            "scout",
+            "worker-",
+            "Worker-9",
+            "worker-4",
+        ] {
+            store
+                .add_brigade_member(br, token, BrigadeRole::Worker, None)
+                .unwrap();
+        }
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-5");
+        for (token, n) in [
+            ("worker-1", Some(1)),
+            ("worker-007", Some(7)),
+            ("worker-123456789", Some(123_456_789)),
+            ("worker-1234567890", None),
+            ("worker-", None),
+            ("worker-3a", None),
+            ("worker--3", None),
+            ("goinkyo", None),
+            ("director", None),
+            ("Worker-3", None),
+        ] {
+            assert_eq!(worker_number(token), n, "{token}");
+        }
+    }
+
+    fn set_counter(store: &Store, br: BrigadeId, value: &str) {
+        store
+            .conn
+            .execute(
+                &format!("UPDATE brigades SET worker_seq = {value} WHERE id = ?1"),
+                [br],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn numbers_are_issued_up_to_the_largest_the_parser_reads_and_no_further() {
+        assert_eq!(MAX_WORKER_NUMBER, 999_999_999);
+        assert_eq!(
+            worker_number(&format!("worker-{MAX_WORKER_NUMBER}")),
+            Some(MAX_WORKER_NUMBER)
+        );
+        assert_eq!(
+            worker_number(&format!("worker-{}", MAX_WORKER_NUMBER + 1)),
+            None
+        );
+
+        let (mut store, br) = brigade_with_director();
+        // One below the last: the last is issued, and recognised afterwards.
+        set_counter(&store, br, "999999997");
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-999999998");
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-999999999");
+        assert_eq!(worker_seq(&store, br), MAX_WORKER_NUMBER);
+        // Past it: refused, with the reason, and nothing changes.
+        let members = store.brigade_members(br).unwrap().len();
+        let err = store.add_worker(br, None).unwrap_err();
+        assert!(matches!(err, StoreError::WorkerNumbersExhausted), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "this brigade has run out of Worker numbers"
+        );
+        assert_eq!(store.brigade_members(br).unwrap().len(), members);
+        assert_eq!(worker_seq(&store, br), MAX_WORKER_NUMBER);
+        // Dismissing the last does not make it available again.
+        store
+            .dismiss_worker(br, &format!("worker-{MAX_WORKER_NUMBER}"))
+            .unwrap();
+        assert!(store.add_worker(br, None).is_err());
+    }
+
+    #[test]
+    fn a_member_at_the_bound_exhausts_a_counter_that_is_behind_it() {
+        let (mut store, br) = brigade_with_director();
+        store
+            .add_brigade_member(br, "worker-999999999", BrigadeRole::Worker, None)
+            .unwrap();
+        assert_eq!(worker_seq(&store, br), 0);
+        assert!(matches!(
+            store.add_worker(br, None),
+            Err(StoreError::WorkerNumbersExhausted)
+        ));
+        // A longer number is not one banto issued: it does not count.
+        let (mut store, br) = brigade_with_director();
+        store
+            .add_brigade_member(br, "worker-1000000000", BrigadeRole::Worker, None)
+            .unwrap();
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-1");
+    }
+
+    #[test]
+    fn an_absurd_stored_counter_neither_overflows_nor_goes_backwards() {
+        // Above the range: read as the bound, so the brigade is exhausted.
+        for value in ["9223372036854775807", "1000000000", "999999999", "1e30"] {
+            let (mut store, br) = brigade_with_director();
+            set_counter(&store, br, value);
+            assert!(
+                matches!(
+                    store.add_worker(br, None),
+                    Err(StoreError::WorkerNumbersExhausted)
+                ),
+                "{value}"
+            );
+            assert!(tokens_of(&store, br).is_empty(), "{value}: nothing created");
+        }
+        // Below the range: read as 0, and the members decide.
+        for value in ["-1", "-9223372036854775808", "'not a number'", "'-5'"] {
+            let (mut store, br) = brigade_with_director();
+            store
+                .add_brigade_member(br, "worker-4", BrigadeRole::Worker, None)
+                .unwrap();
+            set_counter(&store, br, value);
+            assert_eq!(store.add_worker(br, None).unwrap(), "worker-5", "{value}");
+            assert_eq!(worker_seq(&store, br), 5, "{value}");
+        }
+        // One step short of the bound works too.
+        let (mut store, br) = brigade_with_director();
+        set_counter(&store, br, "999999998");
+        assert_eq!(store.add_worker(br, None).unwrap(), "worker-999999999");
+    }
+
+    #[test]
+    fn a_disbanded_brigades_numbering_does_not_carry_over() {
+        let (mut store, br) = brigade_with_director();
+        for _ in 0..3 {
+            store.add_worker(br, None).unwrap();
+        }
+        store.delete_brigade(br).unwrap();
+        let next = store.create_brigade("next").unwrap();
+        assert_ne!(next, br, "a new brigade has a new id");
+        store
+            .add_brigade_member(next, "director", BrigadeRole::Director, None)
+            .unwrap();
+        assert_eq!(store.add_worker(next, None).unwrap(), "worker-1");
+        assert_eq!(worker_seq(&store, next), 1);
+    }
+
+    #[test]
+    fn each_brigade_counts_for_itself_and_a_missing_brigade_is_an_error() {
+        let (mut store, one) = brigade_with_director();
+        let two = store.create_brigade("two").unwrap();
+        store.add_worker(one, None).unwrap();
+        store.add_worker(one, None).unwrap();
+        assert_eq!(store.add_worker(two, None).unwrap(), "worker-1");
+        assert_eq!(store.add_worker(one, None).unwrap(), "worker-3");
+        assert!(store.add_worker(two + 1, None).is_err());
+        // And nothing was created for it.
+        assert!(store.brigade_members(two + 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_connections_adding_workers_at_once_get_different_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let mut first = Store::open(&path).unwrap();
+        let br = first.create_brigade("cell").unwrap();
+        first
+            .add_brigade_member(br, "director", BrigadeRole::Director, None)
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut mine = Store::open(&path).unwrap();
+                    barrier.wait();
+                    (0..10)
+                        .map(|_| mine.add_worker(br, None).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        all.sort_by_key(|token| worker_number(token));
+        let expected: Vec<String> = (1..=20).map(|n| format!("worker-{n}")).collect();
+        assert_eq!(all, expected, "twenty adds, twenty distinct numbers");
+        assert_eq!(worker_seq(&first, br), 20);
     }
 
     #[test]
@@ -2458,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dismissed_member_forgets_its_arrangement_and_a_reused_token_starts_fresh() {
+    fn a_dismissed_member_forgets_its_arrangement_and_a_token_reused_by_hand_starts_fresh() {
         let mut store = Store::open_in_memory().unwrap();
         let br = brigade_with(&mut store, &["worker-1", "worker-2"]);
         store
@@ -2483,7 +3524,9 @@ mod tests {
             "a solo naming a gone member reads as none"
         );
 
-        // add-worker numbers max + 1, so the token comes back for a new Worker.
+        // A member under the same token again — by hand: add_worker never
+        // reuses a Worker's, but the Goinkyo's is reused and a hand-edited store
+        // could.
         store
             .add_brigade_member(br, "worker-2", BrigadeRole::Worker, Some(&sid("fresh")))
             .unwrap();
@@ -2534,8 +3577,8 @@ mod tests {
             Some(600),
             "the rest of the snapshot still lands"
         );
-        // add-worker numbers max + 1: the token comes back for a new Worker,
-        // which must not inherit the solo.
+        // A member under the same token (by hand, as above) must not inherit
+        // the solo.
         b.add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("fresh")))
             .unwrap();
         let again = a.brigade_layout(br).unwrap();

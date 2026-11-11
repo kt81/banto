@@ -36,6 +36,7 @@ use crate::key_encode::{
     ForwardedInput, InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings,
     wrap_bracketed_paste,
 };
+use crate::member_name;
 use crate::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
     MessageGlance, PtyExitReason, SessionRow, SessionToOpen, StoredLayout,
@@ -421,13 +422,26 @@ pub fn tick_relay_decision(
 
 /// What the relay gather read about one brigade, enough to name it to the
 /// operator: the title frozen at formation (`brigades.name`) and the session
-/// id the roster records for its Director (`None` until one is recorded).
-/// Replaced each tick it arrives, dropped on disband.
+/// id the roster records for its Director (`None` until one is recorded) — and
+/// the display names its members have. Replaced each tick it arrives, dropped
+/// on disband.
+///
+/// The member names ride here, not on a member's relay observation, because a
+/// name is a fact about the roster, not about a live session: a Worker that has
+/// no session id yet (a fresh spawn, named by its Director before it has written
+/// a transcript) has no observation at all, yet its tile is on screen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrigadeNameFacts {
     pub brigade_id: BrigadeId,
     pub name: String,
     pub director_session: Option<String>,
+    /// The brigade's named members, `(token, name)`, every roster member with a
+    /// name whether or not it has a session id. The full list: an empty one says
+    /// nobody is named (and clears what the core held), and a brigade the tick
+    /// does not list keeps what it had. Empty in a stream recorded before names
+    /// existed, which reads as "nobody is named".
+    #[serde(default)]
+    pub member_names: Vec<(MemberToken, String)>,
 }
 
 /// One relay-eligible live member's freshly-gathered observations for this
@@ -921,9 +935,25 @@ pub struct EmporiumState {
     /// at `WorkerAdded` (`record_join`), and the Goinkyo's place comes from the
     /// roster its spawn candidate carries. A member the core still meets in a
     /// stack unlisted is appended on sight, as a last resort. A dismissed member is
-    /// dropped, so a reused token is new and goes to the bottom; disbanding
-    /// drops the brigade's list.
+    /// dropped: a Worker's token is never reused in its brigade, so this only
+    /// bounds the list, but the Goinkyo's token is (each consultation is a new
+    /// member under it), and that one must join afresh, after whoever joined
+    /// meanwhile. Disbanding drops the brigade's list.
     member_order: HashMap<BrigadeId, Vec<MemberToken>>,
+    /// What each named member's Director calls it, per `(brigade, token)`, as
+    /// readers may show it: [`Self::stated_names`] resolved as a roster
+    /// ([`Self::resolve_member_names`]), so a name two members state is shown
+    /// for the first to have joined, and a name that is a member's token for
+    /// no one. A label only: layout, order, solo and every other preference stay
+    /// keyed by the token, so a rename moves, resizes and collapses nothing.
+    member_names: HashMap<(BrigadeId, MemberToken), String>,
+    /// What events say each member is named, before the roster rule is applied
+    /// (each already through the per-name rule): the roster at staging and each
+    /// member's relay observation. The event boundary is not trusted — a stream
+    /// recorded elsewhere, or by hand, can state anything — so nothing reads
+    /// this but [`Self::resolve_member_names`]. Dropped with a dismissed member
+    /// and a disbanded brigade.
+    stated_names: HashMap<(BrigadeId, MemberToken), String>,
     /// The same for the sidebar width.
     persisted_sidebar_width: u16,
     /// When real operator input was last forwarded to each pane, keyed by
@@ -1019,10 +1049,11 @@ pub struct EmporiumState {
     /// stashed beside [`Self::pending_dismiss`] where the intent is built.
     /// `WorkerDismissed` carries only the brigade, and a pane that already
     /// exited has lost its `member_tokens` entry, so the token cannot be
-    /// recovered from the key by then. Needed because tokens are reused —
-    /// add-worker takes the highest existing number plus one, so a dismissed
-    /// last Worker's token comes back for the next one — and a row weight
-    /// still filed under it would be inherited.
+    /// recovered from the key by then. Needed because what is filed under a
+    /// dismissed member's token has to be forgotten: it would otherwise grow
+    /// without bound (a Worker's token is never reused in its brigade, so
+    /// nothing would overwrite it) and, for the Goinkyo, whose token the next
+    /// consultation reuses, be inherited by a different member.
     pending_dismiss_member: Option<(BrigadeId, MemberToken)>,
     pub size: (u16, u16),
     /// The sidebar's width in columns, as the operator last dragged it
@@ -1206,6 +1237,8 @@ impl EmporiumState {
             persisted_layouts: HashMap::new(),
             brigade_names: HashMap::new(),
             member_order: HashMap::new(),
+            member_names: HashMap::new(),
+            stated_names: HashMap::new(),
             persisted_sidebar_width: SIDEBAR_WIDTH,
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
@@ -1424,6 +1457,100 @@ impl EmporiumState {
         self.members_phrase(app, &[self.kickoff_member(key)])
     }
 
+    /// The display name `token` has in `brigade_id`, if its Director gave it one.
+    pub fn member_display_name(&self, brigade_id: BrigadeId, token: &str) -> Option<&str> {
+        self.member_names
+            .get(&(brigade_id, token.to_string()))
+            .map(String::as_str)
+    }
+
+    /// What the operator calls this member in a status: its display name in
+    /// ASCII double quotes when it has one (`"impl"`), else its bare token
+    /// (`worker-2`) — so quoted means a name someone gave, unquoted a token. A
+    /// name cannot contain a `"`, so the quotes cannot be closed from inside.
+    /// The one place that decides, so every message that names a member agrees.
+    /// (A tile's title is its own format, the token kept beside the name in
+    /// parentheses — see [`Self::tile_label`].)
+    fn member_call(&self, brigade_id: Option<BrigadeId>, token: &str) -> String {
+        match brigade_id.and_then(|id| self.member_display_name(id, token)) {
+            Some(name) => format!("\"{name}\""),
+            None => token.to_string(),
+        }
+    }
+
+    /// Replace what events have stated about `brigade_id`'s member names with
+    /// `names`, and resolve the brigade's roster.
+    fn replace_member_names(&mut self, brigade_id: BrigadeId, names: Vec<(MemberToken, String)>) {
+        self.stated_names.retain(|(id, _), _| *id != brigade_id);
+        for (token, name) in names {
+            self.state_member_name(brigade_id, &token, Some(&name));
+        }
+        self.resolve_member_names(brigade_id);
+    }
+
+    /// Record what an event states one member is named (`None`: not named).
+    /// Only the per-name rule applies here; the roster rule needs the whole
+    /// brigade, so the caller resolves it ([`Self::resolve_member_names`]) once
+    /// it has stated everything a batch says.
+    fn state_member_name(&mut self, brigade_id: BrigadeId, token: &str, name: Option<&str>) {
+        let key = (brigade_id, token.to_string());
+        match name.and_then(member_name::readable) {
+            Some(name) => {
+                self.stated_names.insert(key, name);
+            }
+            None => {
+                self.stated_names.remove(&key);
+            }
+        }
+    }
+
+    /// Recompute what `brigade_id`'s members are shown as called from what has
+    /// been stated, by the same rule the store applies to a roster
+    /// (`member_name::dedupe_roster`): a name is shown for the first member to
+    /// have joined that states it, and for no one if it is any member's token.
+    /// The join order is `member_order`'s; a member it does not list (nor the
+    /// stage) follows in token order.
+    fn resolve_member_names(&mut self, brigade_id: BrigadeId) {
+        let mut tokens: Vec<MemberToken> = self
+            .member_order
+            .get(&brigade_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut others: Vec<MemberToken> = self
+            .member_tokens
+            .iter()
+            .filter(|(key, _)| self.member_brigades.get(*key) == Some(&brigade_id))
+            .map(|(_, token)| token.clone())
+            .chain(
+                self.stated_names
+                    .keys()
+                    .filter(|(id, _)| *id == brigade_id)
+                    .map(|(_, token)| token.clone()),
+            )
+            .filter(|token| !tokens.contains(token))
+            .collect();
+        others.sort();
+        others.dedup();
+        tokens.extend(others);
+        let stated: Vec<(&str, Option<&str>)> = tokens
+            .iter()
+            .map(|token| {
+                let name = self
+                    .stated_names
+                    .get(&(brigade_id, token.clone()))
+                    .map(String::as_str);
+                (token.as_str(), name)
+            })
+            .collect();
+        let resolved = member_name::dedupe_roster(&stated);
+        self.member_names.retain(|(id, _), _| *id != brigade_id);
+        for (token, name) in tokens.iter().zip(resolved) {
+            if let Some(name) = name {
+                self.member_names.insert((brigade_id, token.clone()), name);
+            }
+        }
+    }
+
     /// The `(brigade, token)` a kickoff status names a pane by.
     fn kickoff_member(&self, key: &SessionKey) -> (Option<BrigadeId>, MemberToken) {
         let token = self
@@ -1514,7 +1641,11 @@ impl EmporiumState {
             .map(|group| match group {
                 Group::Lone(token) => format!("member {token}"),
                 Group::Brigade(id, tokens) => {
-                    format!("{} of {}", tokens.join(", "), self.brigade_name(app, id))
+                    let calls: Vec<String> = tokens
+                        .iter()
+                        .map(|token| self.member_call(Some(id), token))
+                        .collect();
+                    format!("{} of {}", calls.join(", "), self.brigade_name(app, id))
                 }
             })
             .collect();
@@ -1685,7 +1816,9 @@ impl EmporiumState {
         flags
     }
 
-    /// The label a tile's title shows — role, not position: `director`
+    /// The label a tile's title shows — role, not position, and for a named
+    /// Worker `{name} ({token})` (the token kept visible, in the last
+    /// parenthesised group, whatever parentheses the name itself has): `director`
     /// (`Stage::Brigade`'s own field) answers the Director case directly, and
     /// `goinkyo_pane_for` — already tracking the Goinkyo's current pane
     /// through every rename, built for the one-shot spawn guard — answers the
@@ -1704,9 +1837,15 @@ impl EmporiumState {
                 } else if self.goinkyo_pane_for(*id) == Some(key) {
                     "goinkyo".to_string()
                 } else {
-                    self.member_token_for(key)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "session".to_string())
+                    match self.member_token_for(key) {
+                        // The token stays visible: the Director will still say
+                        // "worker-3" to the operator.
+                        Some(token) => match self.member_display_name(*id, token) {
+                            Some(name) => format!("{name} ({token})"),
+                            None => token.to_string(),
+                        },
+                        None => "session".to_string(),
+                    }
                 }
             }
             _ => "session".to_string(),
@@ -2510,6 +2649,12 @@ pub enum Event {
         /// read, or a capture recorded before this field existed.
         #[serde(default)]
         layout: Option<StoredLayout>,
+        /// The display names the roster's members have (only the named ones),
+        /// as the store reads them. Replaces what the core held for the
+        /// brigade, so a staging shows the names as they are now. Empty for a
+        /// capture recorded before names existed.
+        #[serde(default)]
+        names: Vec<(MemberToken, String)>,
     },
     /// The sidebar width the store held at startup, if it held one. Fed once,
     /// ahead of the first resize, as an `Event` rather than constructor
@@ -2704,13 +2849,21 @@ pub fn update(
         } => update_discovery_result(state, key, session_id, member, now),
         Event::CodexWorkerDiscoveryTimedOut { key, token } => {
             state.pending_kickoffs.retain(|pending| pending.key != key);
-            state.set_status(format!("{token}: Codex briefing wasn't confirmed"), now);
+            let call = state.member_call(state.member_brigades.get(&key).copied(), &token);
+            state.set_status(format!("{call}: Codex briefing wasn't confirmed"), now);
             Vec::new()
         }
         Event::ClaudeWorkerDirectoryUntrusted { token } => {
+            // Only the token travels with this event: the staged brigade is the
+            // one the operator is looking at when it is raised.
+            let staged = match &state.stage {
+                Stage::Brigade { id, .. } => Some(*id),
+                _ => None,
+            };
+            let call = state.member_call(staged, &token);
             state.set_status(
                 format!(
-                    "{token}: Claude hasn't been told to trust this directory yet — \
+                    "{call}: Claude hasn't been told to trust this directory yet — \
                      answer its prompt in the pane"
                 ),
                 now,
@@ -2793,7 +2946,19 @@ pub fn update(
             membership,
             members,
             layout,
+            names,
         } => {
+            // The roster's names are the truth about the brigade as of this
+            // read, whatever the resolution is for; they replace what is held.
+            if let (Some((brigade_id, _, _)), Some(roster)) = (&membership, &members) {
+                // The roster is in the order the members joined, which decides
+                // who keeps a name two members state.
+                state.member_order.insert(
+                    *brigade_id,
+                    roster.iter().map(|(token, _, _)| token.clone()).collect(),
+                );
+                state.replace_member_names(*brigade_id, names);
+            }
             update_membership_resolved(state, app, brigade, session_id, membership, members, layout)
         }
         Event::SidebarWidthLoaded { width } => {
@@ -5539,7 +5704,8 @@ fn relaunch_member(
         },
     );
     let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
-    state.set_status(format!("worker {token} exited — restarting"), now);
+    let call = state.member_call(Some(brigade_id), &token);
+    state.set_status(format!("worker {call} exited — restarting"), now);
     Some(ExitHandling::Relaunch(Box::new(Cmd::OpenEmbedded {
         key: key.clone(),
         target: SessionToOpen {
@@ -5858,6 +6024,7 @@ fn update_brigade_formed(
             brigade_id,
             name: name.clone(),
             director_session: Some(director_row_id.clone()),
+            member_names: Vec::new(),
         },
     );
     let wiring = PendingDirectorWiring {
@@ -5986,7 +6153,10 @@ fn update_worker_added(
     } = added;
     match result {
         Ok(token) => {
-            state.set_status(format!("{token} added"), now);
+            state.set_status(
+                format!("{} added", state.member_call(Some(brigade_id), &token)),
+                now,
+            );
             record_join(state, brigade_id, &token);
             open_worker(
                 state,
@@ -6057,6 +6227,8 @@ fn update_disbanded(
             state.persisted_layouts.remove(&brigade_id);
             state.brigade_names.remove(&brigade_id);
             state.member_order.remove(&brigade_id);
+            state.member_names.retain(|(id, _), _| *id != brigade_id);
+            state.stated_names.retain(|(id, _), _| *id != brigade_id);
             state.member_facts.retain(|(id, _), _| *id != brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
@@ -6109,13 +6281,18 @@ fn update_worker_dismissed(
             // Forget everything kept under the dismissed member's token: its
             // layout preferences and what its tile shows. Only a dismissal
             // does this — a pane exiting, being relaunched or leaving the
-            // stage keeps the member, and what is kept for it. (Tokens are
-            // reused, so anything left would be inherited by the next Worker.)
+            // stage keeps the member, and what is kept for it. (A Worker's token
+            // is never reused in its brigade, so anything left would only pile up;
+            // the Goinkyo's is reused by its next consultation, which would inherit
+            // it.)
             if let Some(token) = member {
                 state.member_facts.remove(&(brigade_id, token.clone()));
+                state.stated_names.remove(&(brigade_id, token.clone()));
                 if let Some(joined) = state.member_order.get_mut(&brigade_id) {
                     joined.retain(|listed| *listed != token);
                 }
+                // Its name is free again for another member.
+                state.resolve_member_names(brigade_id);
                 // The store forgets the member's row with its arrangement
                 // (and the solo naming it), so the persisted copy forgets it
                 // too: nothing is written for a dismissal.
@@ -6162,15 +6339,19 @@ fn update_worker_dismissed(
 const NUDGE_PROMPT_COLUMNS: usize = 60;
 
 /// ` ← worker-3: first line of the message` for the nudge status — the sender
-/// when it is known, the line cut by display width. Empty when the message has
-/// no line to quote: never an arrow with nothing after it.
-fn nudge_prompt(message: &MessageGlance) -> String {
+/// (by the name its Director gave it, when it has one) when it is known, the
+/// line cut by display width. Empty when the message has no line to quote:
+/// never an arrow with nothing after it.
+fn nudge_prompt(state: &EmporiumState, brigade_id: BrigadeId, message: &MessageGlance) -> String {
     let Some(line) = display_name(&message.line) else {
         return String::new();
     };
     let line = shorten_to_columns(&line, NUDGE_PROMPT_COLUMNS);
     match &message.from_token {
-        Some(sender) => format!(" \u{2190} {sender}: {line}"),
+        Some(sender) => format!(
+            " \u{2190} {}: {line}",
+            state.member_call(Some(brigade_id), sender)
+        ),
         None => format!(" \u{2190} {line}"),
     }
 }
@@ -6192,7 +6373,12 @@ fn update_tick(
     // First, so the statuses below name each brigade by what this very tick
     // read. A brigade the tick does not list keeps its last facts (a failed
     // gather reads nothing and must not blank every name).
-    for facts in brigades {
+    for mut facts in brigades {
+        // The member names are the roster's truth as of this read: they replace
+        // what events have stated for the brigade and are resolved as a roster
+        // (first joiner keeps a duplicated name). Nothing is written back.
+        let names = std::mem::take(&mut facts.member_names);
+        state.replace_member_names(facts.brigade_id, names);
         state.brigade_names.insert(facts.brigade_id, facts);
     }
 
@@ -6364,7 +6550,7 @@ fn update_tick(
                     .member_facts
                     .get(&(obs.brigade_id, obs.token.clone()))
                     .and_then(|facts| facts.inbound.as_ref())
-                    .map(nudge_prompt)
+                    .map(|inbound| nudge_prompt(state, obs.brigade_id, inbound))
                     .unwrap_or_default();
                 state.set_status(format!("relay: nudged {member}{prompt}"), now);
             } else if input.has_unsent
@@ -6811,6 +6997,9 @@ fn update_goinkyo_directory_trust_checked(
     });
     cmds
 }
+
+#[cfg(test)]
+mod display_name_tests;
 
 #[cfg(test)]
 mod stack_order_tests;
@@ -7546,6 +7735,7 @@ mod tests {
                 membership: None,
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -7806,6 +7996,7 @@ mod tests {
                     membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                     members: Some(roster.clone()),
                     layout: None,
+                    names: Vec::new(),
                 },
                 now,
             )
@@ -8077,6 +8268,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -8146,6 +8338,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -8264,6 +8457,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -8335,6 +8529,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -8388,6 +8583,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -8458,6 +8654,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -8535,6 +8732,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -8573,6 +8771,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -8918,6 +9117,7 @@ mod tests {
                 membership: None,
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -8954,6 +9154,7 @@ mod tests {
                 membership: None,
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -9070,6 +9271,7 @@ mod tests {
                 membership: None,
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -9130,6 +9332,7 @@ mod tests {
                 membership: None,
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -9162,6 +9365,7 @@ mod tests {
                 membership: None,
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -15853,6 +16057,7 @@ mod tests {
                     ),
                 ]),
                 layout: stored,
+                names: Vec::new(),
             },
             now,
         )
@@ -16150,6 +16355,7 @@ mod tests {
             brigade_id: id,
             name: name.to_string(),
             director_session: director.map(str::to_string),
+            member_names: Vec::new(),
         }
     }
 
@@ -16456,6 +16662,109 @@ mod tests {
         );
         assert!(!state.brigade_names.contains_key(&1));
         assert!(state.brigade_names.contains_key(&2));
+    }
+
+    /// State a member's name the way an event does, and resolve the roster.
+    fn set_name(state: &mut EmporiumState, brigade: BrigadeId, token: &str, name: Option<&str>) {
+        state.state_member_name(brigade, token, name);
+        state.resolve_member_names(brigade);
+    }
+
+    /// What a status calls the members of two brigades once some are named.
+    #[test]
+    fn a_status_calls_a_named_member_by_its_name_alone_and_an_unnamed_one_by_its_token() {
+        let mut state = state_with_facts(vec![
+            name_facts(1, "Alpha", None),
+            name_facts(2, "Beta", None),
+        ]);
+        set_name(&mut state, 1, "worker-1", Some("impl"));
+        set_name(&mut state, 2, "worker-1", Some("docs"));
+        let app = app_with(vec![]);
+        let m = |id: Option<BrigadeId>, token: &str| (id, token.to_string());
+
+        assert_eq!(state.member_call(Some(1), "worker-1"), "\"impl\"");
+        assert_eq!(state.member_call(Some(1), "worker-2"), "worker-2");
+        // The same token is another member in another brigade; a member with no
+        // brigade known has only its token.
+        assert_eq!(state.member_call(Some(2), "worker-1"), "\"docs\"");
+        assert_eq!(state.member_call(None, "worker-1"), "worker-1");
+        assert_eq!(
+            state.members_phrase(
+                &app,
+                &[
+                    m(Some(1), "worker-1"),
+                    m(Some(1), "worker-2"),
+                    m(Some(2), "worker-1")
+                ]
+            ),
+            "\"impl\", worker-2 of \"Alpha\" and \"docs\" of \"Beta\""
+        );
+        assert_eq!(
+            state.members_phrase(&app, &[m(None, "worker-1")]),
+            "member worker-1"
+        );
+
+        // A pane's kickoff status names its member the same way.
+        let key = SessionKey::from_id("w1");
+        state
+            .member_tokens
+            .insert(key.clone(), "worker-1".to_string());
+        state.member_brigades.insert(key.clone(), 1);
+        assert_eq!(state.kickoff_label(&app, &key), "\"impl\" of \"Alpha\"");
+        set_name(&mut state, 1, "worker-1", None);
+        assert_eq!(state.kickoff_label(&app, &key), "worker-1 of \"Alpha\"");
+    }
+
+    #[test]
+    fn the_nudge_status_names_the_nudged_member_and_the_sender_by_their_names() {
+        let (mut state, _, brigade, director, start) = reading_fixture();
+        state
+            .brigade_names
+            .insert(1, name_facts(1, "Frozen", Some("a-dir")));
+        let mut app = app_with(vec![titled("a-dir", Some("Fix the relay draft guard"))]);
+        let tick = |state: &mut EmporiumState, app: &mut App, at: Duration| {
+            update(
+                state,
+                app,
+                &brigade,
+                Event::Tick {
+                    relay: vec![RelayObservation {
+                        brigade_id: 1,
+                        token: "director".to_string(),
+                        key: director.clone(),
+                        has_unseen: true,
+                        is_idle_this_tick: Some(true),
+                        agent: CLAUDE,
+                        glance: Some(said_by(Some("worker-3"), "stage 2 is done")),
+                    }],
+                    // The roster's names, as the gather sends them: the sender's,
+                    // and the nudged member's (a stand-in for a Worker: the core
+                    // does not care which member it is).
+                    brigades: vec![BrigadeNameFacts {
+                        member_names: vec![
+                            ("director".to_string(), "lead".to_string()),
+                            ("worker-3".to_string(), "impl".to_string()),
+                        ],
+                        ..name_facts(1, "Frozen", Some("a-dir"))
+                    }],
+                },
+                start + at,
+            );
+        };
+        tick(&mut state, &mut app, Duration::ZERO);
+        tick(&mut state, &mut app, Duration::from_secs(1));
+        assert_eq!(
+            state.status.as_deref(),
+            Some(
+                "relay: nudged \"lead\" of \"Fix the relay draft guard\" \u{2190} \"impl\": stage 2 is done"
+            )
+        );
+
+        // Unnamed on both ends: tokens, as before.
+        assert_eq!(
+            nudge_status_with(Some(said_by(Some("worker-3"), "stage 2 is done"))),
+            "relay: nudged director of \"Fix the relay draft guard\" \u{2190} worker-3: stage 2 is done"
+        );
     }
 
     #[test]
@@ -17022,6 +17331,7 @@ mod tests {
             membership: Some((1, "director".to_string(), BrigadeRole::Director)),
             members: Some(vec![]),
             layout: Some(stored_arrangement()),
+            names: Vec::new(),
         };
         let json = serde_json::to_string(&resolved).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), resolved);
@@ -18066,7 +18376,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissing_a_worker_forgets_its_slot_and_a_reused_token_does_not_inherit_it() {
+    fn dismissing_a_worker_forgets_its_slot_and_a_token_reused_by_hand_does_not_inherit_it() {
         let (mut state, mut app, brigade, now) = drag_fixture(3);
         move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
         assert_eq!(
@@ -18083,7 +18393,9 @@ mod tests {
         );
         assert_eq!(order_of(&state), ["dir", "w1", "w2"]);
 
-        // add-worker numbers max + 1, so the next Worker is `worker-3` again;
+        // A token reused by hand — banto's own add-worker never reuses a
+        // Worker's token, but the Goinkyo's is reused and a hand-edited store
+        // could: put the newcomer at the front of the panes to see where it ends up;
         // put it at the front of the panes to see where it ends up.
         let again = SessionKey::from_id("w3-again");
         state.screens.insert(again.clone(), Screen::new(24, 80));
@@ -20080,6 +20392,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
                 layout: None,
+                names: Vec::new(),
             },
             test_instant(),
         );
@@ -21506,14 +21819,15 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_token_does_not_inherit_the_dismissed_workers_height() {
+    fn a_token_reused_by_hand_does_not_inherit_the_dismissed_workers_height() {
         let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
         state.pending_dismiss = Some(SessionKey::from_id("w3"));
         state.pending_dismiss_member = Some((1, "worker-3".to_string()));
         update(&mut state, &mut app, &brigade, dismissed(1), now);
         assert_eq!(state.stack_weights(), vec![8, 12], "w3 left the stage");
 
-        // add-worker numbers max + 1, so the next Worker is `worker-3` again.
+        // A token reused by hand (see the stack-order test above for why this
+        // is still worth guarding): the next member is `worker-3` again.
         let again = SessionKey::from_id("w3-again");
         state.screens.insert(again.clone(), Screen::new(24, 80));
         state
@@ -21679,6 +21993,7 @@ mod tests {
                 membership: Some((1, "worker-5".to_string(), BrigadeRole::Worker)),
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -21840,6 +22155,7 @@ mod tests {
                 membership: Some((1, "worker-1".to_string(), BrigadeRole::Worker)),
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -21887,6 +22203,7 @@ mod tests {
                 membership: Some((1, "goinkyo".to_string(), BrigadeRole::Goinkyo)),
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );
@@ -21924,6 +22241,7 @@ mod tests {
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: None,
                 layout: None,
+                names: Vec::new(),
             },
             now,
         );

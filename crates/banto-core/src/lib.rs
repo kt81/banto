@@ -23,6 +23,7 @@ pub mod input;
 pub mod input_line;
 pub mod key_encode;
 pub mod layout;
+pub mod member_name;
 pub mod model;
 pub mod replay;
 pub mod screen;

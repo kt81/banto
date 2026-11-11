@@ -83,7 +83,10 @@ channel between them over MCP: it wires every member back to `banto _mcp` on
 its own launch — Claude Code via `--mcp-config`, Codex via `-c
 mcp_servers.banto.*` overrides — so members get `send_to_peer` /
 `check_messages` / `brigade_status` tools backed by banto's own sqlite
-queue. Each member is also handed a role briefing naming its brigade, its
+queue (plus Director-only `consult_goinkyo` / `dismiss_goinkyo`, and
+`name_member`, which gives a Worker a display name for the standing role the
+Director has given it — shown beside its token in the tile title, in
+`brigade_status` and in message headers; the token stays the address). Each member is also handed a role briefing naming its brigade, its
 token, and its peers — appended to the system prompt on launch for Claude
 Code, delivered by banto's own `SessionStart` hook for Codex, which has no
 `--append-system-prompt` of its own — without one a cell exists only in
@@ -259,8 +262,9 @@ worker_model = "sonnet"   # --model for spawned Workers ("" = inherit)
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
 # Role briefings appended to each member's system prompt at launch.
 # {brigade} / {token} / {peers} are substituted; "" launches with no
-# briefing. The defaults tell a Director to delegate — that policy is
-# yours to set, which is why it is a setting.
+# briefing. The defaults tell a Director to delegate (and that it can name a
+# Worker with name_member) — that policy is yours to set, which is why it
+# is a setting.
 director_prompt = "..."
 worker_prompt = "..."
 

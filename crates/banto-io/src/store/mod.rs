@@ -24,7 +24,7 @@ mod ui_prefs;
 pub use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
 };
-pub use brigades::glance_line;
+pub use brigades::{MemberNaming, glance_line};
 pub use groups::{Group, GroupId};
 pub use panes::PaneRecord;
 
@@ -59,6 +59,10 @@ pub enum StoreError {
     /// corrupting a newer schema.
     #[error("unsupported database schema version {0}")]
     UnsupportedSchemaVersion(i64),
+    /// The brigade has issued every Worker number there is
+    /// (nine digits); nothing was created.
+    #[error("this brigade has run out of Worker numbers")]
+    WorkerNumbersExhausted,
 }
 
 /// Handle to banto's own sqlite database.
