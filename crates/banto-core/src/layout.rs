@@ -76,7 +76,10 @@ pub struct BrigadeLayout {
     /// The operator's preferred order of the stack's tiles, top to bottom,
     /// by member token. `Stage::Brigade::panes` is what is on screen; this is
     /// what puts it back after something rebuilds `panes` (staging the
-    /// brigade again, a Worker arriving). Empty until a tile has been moved.
+    /// brigade again, a Worker arriving). Empty until a tile has been moved;
+    /// members it does not list follow the listed ones in the order they
+    /// joined the brigade (`EmporiumState::member_order`), never in the order
+    /// their panes happened to arrive.
     pub stack_order: Vec<MemberToken>,
     /// The members the operator collapsed one by one.
     pub minimized: HashSet<MemberToken>,
@@ -718,28 +721,37 @@ impl Geometry {
     }
 }
 
-/// Put the stack in the preferred order: `panes[1..]` stably sorted by each
-/// member's rank in `order`, members with no rank after the ranked ones in
-/// their current relative order. `panes[0]` (the master) is never touched,
-/// and `focused` keeps pointing at the same key. Returns whether anything
-/// moved.
+/// Put the stack in the order the operator expects: `panes[1..]` stably sorted
+/// first by each member's rank in `order` (the places he gave tiles by moving
+/// them), then — for members he never placed — by their position in `joined`
+/// (the order they joined the brigade), then, for anything in neither, by
+/// where they are now. So a tile that was never moved sits where it joined,
+/// below everything that joined before it, however its pane happened to
+/// arrive; and a member in neither list (one the engine has not learned yet)
+/// goes to the bottom. `panes[0]` (the master) is never touched, and `focused`
+/// keeps pointing at the same key. Returns whether anything moved.
 ///
-/// The one function that applies the preference; the engine calls it once,
-/// at the end of every `update`, so no branch that rebuilds `panes` has to
-/// remember to.
+/// The one function that decides the order; the engine calls it once, at the
+/// end of every `update`, so no branch that rebuilds or extends `panes` has to
+/// remember to, and no arrival order, restart or re-staging can change what it
+/// answers.
 pub fn sort_stack<'a>(
     panes: &mut [SessionKey],
     focused: &mut usize,
     order: &[MemberToken],
+    joined: &[MemberToken],
     token_of: impl Fn(&SessionKey) -> Option<&'a str>,
 ) -> bool {
     let Some((_, stack)) = panes.split_first_mut() else {
         return false;
     };
     let rank = |key: &SessionKey| {
-        token_of(key)
-            .and_then(|token| order.iter().position(|ranked| ranked == token))
-            .unwrap_or(usize::MAX)
+        let position = |list: &[MemberToken]| {
+            token_of(key)
+                .and_then(|token| list.iter().position(|listed| listed == token))
+                .unwrap_or(usize::MAX)
+        };
+        (position(order), position(joined))
     };
     if stack.is_sorted_by_key(rank) {
         return false;
@@ -2143,6 +2155,7 @@ mod tests {
             &mut panes,
             &mut focused,
             &ranked(&["worker-3", "worker-1", "worker-2"]),
+            &[],
             tokens_of,
         );
         assert!(moved);
@@ -2157,14 +2170,56 @@ mod tests {
             &mut panes,
             &mut focused,
             &ranked(&["worker-2", "worker-1"]),
+            &[],
             tokens_of,
         );
         // w2, w1 ranked; w4 and w3 are not, and keep the order they had.
         assert_eq!(names(&panes), ["d", "w2", "w1", "w4", "w3"]);
         // A key with no token at all is unranked too.
         let mut panes = vec![key("d"), key("ghost"), key("w1")];
-        sort_stack(&mut panes, &mut focused, &ranked(&["worker-1"]), tokens_of);
+        sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-1"]),
+            &[],
+            tokens_of,
+        );
         assert_eq!(names(&panes), ["d", "w1", "ghost"]);
+    }
+
+    #[test]
+    fn sort_stack_places_unranked_members_by_join_order_then_by_where_they_are() {
+        let joined = ranked(&["director", "worker-1", "worker-2", "worker-3"]);
+        // Nothing ranked: the join order, whatever order the panes arrived in.
+        let mut panes = vec![key("d"), key("w3"), key("w1"), key("w2")];
+        let mut focused = 0;
+        assert!(sort_stack(
+            &mut panes,
+            &mut focused,
+            &[],
+            &joined,
+            tokens_of
+        ));
+        assert_eq!(names(&panes), ["d", "w1", "w2", "w3"]);
+        // Ranked first, the rest by join order after them.
+        let mut panes = vec![key("d"), key("w1"), key("w2"), key("w3"), key("w4")];
+        sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-3"]),
+            &joined,
+            tokens_of,
+        );
+        // w4 is in neither list: it goes below everything the engine knows.
+        assert_eq!(names(&panes), ["d", "w3", "w1", "w2", "w4"]);
+        // Already in order: reported as no change.
+        assert!(!sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-3"]),
+            &joined,
+            tokens_of
+        ));
     }
 
     #[test]
@@ -2175,6 +2230,7 @@ mod tests {
             &mut panes,
             &mut focused,
             &ranked(&["worker-3", "worker-2", "worker-1"]),
+            &[],
             tokens_of,
         );
         assert_eq!(names(&panes), ["d", "w3", "w2", "w1"]);
@@ -2183,13 +2239,20 @@ mod tests {
             &mut panes,
             &mut focused,
             &ranked(&["worker-3", "worker-2", "worker-1"]),
+            &[],
             tokens_of
         ));
         assert_eq!(focused, 3);
         // The master focused stays at 0.
         let mut panes = vec![key("d"), key("w1"), key("w2")];
         let mut focused = 0;
-        sort_stack(&mut panes, &mut focused, &ranked(&["worker-2"]), tokens_of);
+        sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-2"]),
+            &[],
+            tokens_of,
+        );
         assert_eq!((names(&panes), focused), (vec!["d", "w2", "w1"], 0));
     }
 
@@ -2203,6 +2266,7 @@ mod tests {
             &mut panes,
             &mut focused,
             &ranked(&["worker-3", "worker-2", "worker-1"]),
+            &[],
             tokens_of,
         );
         assert_eq!(names(&panes), ["w1", "w3", "w2"]);
@@ -2211,6 +2275,7 @@ mod tests {
             &mut none,
             &mut focused,
             &ranked(&["worker-1"]),
+            &[],
             tokens_of
         ));
     }

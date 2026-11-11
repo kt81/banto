@@ -140,8 +140,9 @@ pub enum Stage {
         /// `BrigadeMember` arm still inserts the Director's own key at the
         /// front when it recognizes it, everyone else appended in arrival
         /// order), never a source of role truth. Past `panes[0]`, the
-        /// operator's preferred order (`BrigadeLayout::stack_order`) is
-        /// re-applied at the end of every `update`, so whatever rebuilt or
+        /// operator's preferred order (`BrigadeLayout::stack_order`), then the
+        /// order the members joined the brigade (`EmporiumState::member_order`),
+        /// is re-applied at the end of every `update`, so whatever rebuilt or
         /// appended to this list is put back in it. Nothing here still infers
         /// a role — or, since `EmporiumState::member_tokens` landed, a
         /// member's identity at all — from where a key sits; `director`
@@ -478,6 +479,15 @@ pub struct MemberFacts {
 pub struct GoinkyoSpawnCandidate {
     pub brigade_id: BrigadeId,
     pub cwd: PathBuf,
+    /// The brigade's members' tokens in the order they joined, as the store
+    /// has them now — the Goinkyo among them, since its row exists. This is the
+    /// earliest the core can learn where the consultation joined: its row is
+    /// written by the Director's own MCP process, which no event reports, so
+    /// the first the core hears is the tick that finds the row without a
+    /// session. A Worker added in the instant between the two would otherwise be
+    /// recorded first. Empty in a capture recorded before this field existed.
+    #[serde(default)]
+    pub roster: Vec<MemberToken>,
 }
 
 /// What the shell observed about the staged brigade's Goinkyo this tick —
@@ -903,6 +913,17 @@ pub struct EmporiumState {
     /// operator-facing statuses (see [`Self::brigade_name`]). Seeded at
     /// formation, replaced each tick, dropped on disband.
     brigade_names: HashMap<BrigadeId, BrigadeNameFacts>,
+    /// The order each brigade's members joined it, by token: what places a
+    /// tile the operator never moved (`layout::sort_stack`). Seeded from the
+    /// store's roster whenever a brigade is staged — the store is the one
+    /// place that remembers join order across a restart — and at formation
+    /// from the order the Workers were numbered; a Worker added is appended
+    /// at `WorkerAdded` (`record_join`), and the Goinkyo's place comes from the
+    /// roster its spawn candidate carries. A member the core still meets in a
+    /// stack unlisted is appended on sight, as a last resort. A dismissed member is
+    /// dropped, so a reused token is new and goes to the bottom; disbanding
+    /// drops the brigade's list.
+    member_order: HashMap<BrigadeId, Vec<MemberToken>>,
     /// The same for the sidebar width.
     persisted_sidebar_width: u16,
     /// When real operator input was last forwarded to each pane, keyed by
@@ -1184,6 +1205,7 @@ impl EmporiumState {
             member_facts: HashMap::new(),
             persisted_layouts: HashMap::new(),
             brigade_names: HashMap::new(),
+            member_order: HashMap::new(),
             persisted_sidebar_width: SIDEBAR_WIDTH,
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
@@ -1745,8 +1767,20 @@ impl EmporiumState {
         self.move_drag = None;
     }
 
-    /// Put the stack in each brigade's preferred order (see
-    /// [`layout::sort_stack`]). Run at the end of every `update`.
+    /// Put the staged brigade's stack in the order its operator expects (see
+    /// [`layout::sort_stack`]): the places he gave tiles, then the order the
+    /// members joined. Run at the end of every `update`, whatever the update
+    /// was, so every path that builds or extends `panes` — staging, a pane
+    /// arriving, a relaunch, a late Director — is covered by this one place.
+    ///
+    /// A member whose token is not in the brigade's join order yet is
+    /// appended to it first, in the order it appears in `panes`. That is the
+    /// last resort, not the mechanism: a membership is recorded when it is
+    /// created ([`record_join`] at `WorkerAdded`, the roster at staging and at
+    /// the Goinkyo's spawn), and a token only gets here if a pane showed up for
+    /// a member none of those told the core about. Learned this way it joins
+    /// last, and where its pane appeared among others unlisted at the same time
+    /// is arrival order — the thing everything else exists to avoid.
     fn apply_stack_order(&mut self) {
         let Stage::Brigade {
             id, panes, focused, ..
@@ -1754,14 +1788,20 @@ impl EmporiumState {
         else {
             return;
         };
-        let Some(layout) = self.brigade_layouts.get(id) else {
-            return;
-        };
-        if layout.stack_order.is_empty() {
-            return;
-        }
         let tokens = &self.member_tokens;
-        sort_stack(panes, focused, &layout.stack_order, |key| {
+        let joined = self.member_order.entry(*id).or_default();
+        for key in panes.iter() {
+            if let Some(token) = tokens.get(key)
+                && !joined.contains(token)
+            {
+                joined.push(token.clone());
+            }
+        }
+        let ranked: &[MemberToken] = self
+            .brigade_layouts
+            .get(id)
+            .map_or(&[], |layout| layout.stack_order.as_slice());
+        sort_stack(panes, focused, ranked, joined, |key| {
             tokens.get(key).map(String::as_str)
         });
     }
@@ -4220,6 +4260,14 @@ fn stage_brigade(
     let director_agent = director_row.map_or(AgentKind::ClaudeCode, |row| row.agent);
     let fresh_worker_agent = resolve_worker_agent(brigade.worker_agent, director_agent);
 
+    // The store's roster is in the order the members joined: the one record of
+    // it that survives a restart. It replaces what this run learned, so the
+    // order a brigade shows never depends on which pane happened to arrive
+    // first or on how long the brigade was off the stage.
+    state.member_order.insert(
+        brigade_id,
+        members.iter().map(|(token, _, _)| token.clone()).collect(),
+    );
     let mut panes = Vec::new();
     let mut cmds = Vec::new();
     let mut missing = 0;
@@ -5301,7 +5349,9 @@ fn update_spawned(
                 // Best-effort Director-first ordering (display only — see
                 // `Stage::Brigade::panes`'s own doc): if this arrival is
                 // the Director's own key, put it back at the front rather
-                // than wherever it landed in arrival order.
+                // than wherever it landed in arrival order. Where everyone
+                // else belongs is not decided here: `apply_stack_order`
+                // places them at the end of this same `update`.
                 if director.as_ref() == Some(&key) {
                     panes.insert(0, key.clone());
                 } else {
@@ -5793,6 +5843,13 @@ fn update_brigade_formed(
     };
     let director_key = SessionKey::from_id(&director_row_id);
     let worker_count = worker_tokens.len();
+    // Joined in the order they were numbered, whichever pane spawns first.
+    state.member_order.insert(
+        brigade_id,
+        std::iter::once(DIRECTOR_TOKEN.to_string())
+            .chain(worker_tokens.iter().cloned())
+            .collect(),
+    );
     // The brigade is named from this moment, not from its first tick: the
     // Director is the row the operator pressed B on, and `name` is its title.
     state.brigade_names.insert(
@@ -5891,6 +5948,18 @@ fn open_director_with_wiring(
     }]
 }
 
+/// Note that `token` joined `brigade_id` now, after everyone already listed in
+/// its join order. Called where the membership is *created* as the core sees
+/// it, so where a member's tile goes never depends on when its pane happens to
+/// appear (`apply_stack_order` learns an unlisted token on sight only as a
+/// last resort).
+fn record_join(state: &mut EmporiumState, brigade_id: BrigadeId, token: &str) {
+    let joined = state.member_order.entry(brigade_id).or_default();
+    if !joined.iter().any(|listed| listed == token) {
+        joined.push(token.to_string());
+    }
+}
+
 /// `Event::WorkerAdded`'s successful-addition payload, bundled so
 /// [`update_worker_added`] doesn't tip into clippy's too-many-arguments —
 /// these four always travel together anyway, all the way from
@@ -5918,6 +5987,7 @@ fn update_worker_added(
     match result {
         Ok(token) => {
             state.set_status(format!("{token} added"), now);
+            record_join(state, brigade_id, &token);
             open_worker(
                 state,
                 brigade_id,
@@ -5986,6 +6056,7 @@ fn update_disbanded(
             state.brigade_layouts.remove(&brigade_id);
             state.persisted_layouts.remove(&brigade_id);
             state.brigade_names.remove(&brigade_id);
+            state.member_order.remove(&brigade_id);
             state.member_facts.retain(|(id, _), _| *id != brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
@@ -6042,6 +6113,9 @@ fn update_worker_dismissed(
             // reused, so anything left would be inherited by the next Worker.)
             if let Some(token) = member {
                 state.member_facts.remove(&(brigade_id, token.clone()));
+                if let Some(joined) = state.member_order.get_mut(&brigade_id) {
+                    joined.retain(|listed| *listed != token);
+                }
                 // The store forgets the member's row with its arrangement
                 // (and the solo naming it), so the persisted copy forgets it
                 // too: nothing is written for a dismissal.
@@ -6468,6 +6542,12 @@ fn update_goinkyo_awaiting_spawn(
         // is the other half of `goinkyo_pane`'s own doc: nothing else knows
         // which staged pane was the Goinkyo's once its row is gone.
         GoinkyoObservation::NoGoinkyo { brigade_id } => {
+            // Whether or not a pane is left to close, the consultation is over:
+            // the next one joins the brigade afresh, after whoever joined
+            // meanwhile.
+            if let Some(joined) = state.member_order.get_mut(&brigade_id) {
+                joined.retain(|listed| listed != GOINKYO_TOKEN);
+            }
             let Some(key) = state.goinkyo_pane.remove(&brigade_id) else {
                 return Vec::new();
             };
@@ -6488,6 +6568,17 @@ fn update_goinkyo_awaiting_spawn(
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
+    // The Goinkyo's row exists, so it has joined: the store's roster is the
+    // truth about where (it replaces what this run learned), and without one
+    // (an old capture) it joins at the end, which is where it is when nothing
+    // else joined in the gap.
+    if candidate.roster.is_empty() {
+        record_join(state, candidate.brigade_id, GOINKYO_TOKEN);
+    } else {
+        state
+            .member_order
+            .insert(candidate.brigade_id, candidate.roster.clone());
+    }
     if let Some(existing) = state.goinkyo_pane.get(&candidate.brigade_id).cloned() {
         if existing.is_synthetic() {
             // A spawn for the current consultation is already in flight, or
@@ -6720,6 +6811,9 @@ fn update_goinkyo_directory_trust_checked(
     });
     cmds
 }
+
+#[cfg(test)]
+mod stack_order_tests;
 
 #[cfg(test)]
 mod tests {
@@ -19329,6 +19423,7 @@ mod tests {
         GoinkyoSpawnCandidate {
             brigade_id,
             cwd: PathBuf::from("/work/alpha"),
+            roster: Vec::new(),
         }
     }
 

@@ -457,11 +457,35 @@ in yellow; once the pointer moves, its label follows the pointer (reversed
 yellow, cut to the screen) and a yellow line shows the edge where the tile would
 land, chosen by the pointer's row alone; the tile drops on release, and every
 cue disappears on release and on every cancel. Or use
-`Shift`+`Up`/`Down` after the prefix chord. The order is a per-brigade
-preference by member token, re-applied whenever the pane list is rebuilt, so a
-tile keeps its place (and its height) across re-staging and across Workers
-arriving in a different order; a member with no place in it goes after the
-ordered ones, and dismissing a Worker forgets its place.
+`Shift`+`Up`/`Down` after the prefix chord. The order of the tiles in a
+brigade's stack changes only when the operator moves a tile: not by the brigade
+leaving the stage and coming back, not by a restart, not by a pane exiting and
+being relaunched, not by which pane happens to arrive first. It is decided in one
+place, re-applied whenever the pane list is rebuilt or extended: first the
+places the operator gave (a per-brigade preference by member token), then, for
+members he never placed, the order they joined the brigade, then — for a member
+the engine has not learned yet — the bottom. So a brigade nobody has rearranged
+shows its Workers in the order they joined, the Goinkyo after whoever joined
+before it, and a member that joins later (a Worker added, a consultation
+started) goes to the bottom. The join order is the store's own: the roster is
+read in the order the member rows were added (the table's `rowid`; no column of
+its own), which is what survives a restart. Within a run the core records a
+join where the membership is created — a Worker at `WorkerAdded`, the Goinkyo
+when the tick that finds its row reports it (the row is written by the
+Director's own MCP process, which no event reports; that tick carries the
+roster, so a Worker added in the gap cannot take its place) — seeds it from the
+roster at every staging and, at formation, from the Workers' numbering. A tile
+whose pane appears for a member none of these told the core about is learned on
+sight, last. Dismissing a Worker, or the Director ending a consultation, forgets
+the member's place, so a reused token is a new member and joins last. Nothing is
+stored for a brigade whose order is only its join order.
+Two boundaries on "the order they joined". It holds for a database only banto
+has written to: the table's rowids are the hidden kind SQLite may renumber on
+`VACUUM` or a table rebuild, which banto never does (an external one may). And a
+brigade that predates schema v7 has the order that migration wrote — Director,
+then Workers numbered by their old session ids — because the order the members
+had joined was not kept when the table was rebuilt; the rows come out in that
+numbering order in the bundled SQLite, which SQLite does not promise.
 A stack tile can be collapsed to a five-row strip (border, three content
 rows, border) that shows status-like facts instead of the session's screen,
 which keeps running untouched: the `[_]` button in its title row (or `m`), `[+]`

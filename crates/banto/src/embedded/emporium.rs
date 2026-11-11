@@ -1544,9 +1544,11 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .brigade_of_session(&SessionId(session_id.clone()))
                 .ok()
                 .flatten();
+            // In the order they joined: it is what the tiles of a brigade the
+            // operator never rearranged are stacked in.
             let members = membership.as_ref().map(|(brigade_id, _, _)| {
                 store
-                    .brigade_members(*brigade_id)
+                    .brigade_members_in_join_order(*brigade_id)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|member| {
@@ -2262,7 +2264,7 @@ fn gather_goinkyo_observation(
     };
     let brigade_id = *id;
     let roster_start = Instant::now();
-    let members = store.borrow().brigade_members(brigade_id);
+    let members = store.borrow().brigade_members_in_join_order(brigade_id);
     if let Some(t) = timings {
         t.goinkyo_roster += roster_start.elapsed();
     }
@@ -2286,7 +2288,13 @@ fn gather_goinkyo_observation(
     let cwd = director_row
         .and_then(|row| row.cwd.clone())
         .unwrap_or_else(|| PathBuf::from("."));
-    GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate { brigade_id, cwd })
+    GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+        brigade_id,
+        cwd,
+        // Already in join order: what the core needs to place the
+        // consultation among the Workers (see the field's doc).
+        roster: members.iter().map(|m| m.token.clone()).collect(),
+    })
 }
 
 /// How many parent-pid hops [`gather_fork_observations`] walks looking for a
@@ -5339,6 +5347,48 @@ mod tests {
     }
 
     #[test]
+    fn resolve_membership_hands_the_roster_over_in_the_order_the_members_joined() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        // The Goinkyo joined after both Workers; by token it would sort first.
+        for (token, role, session) in [
+            ("director", BrigadeRole::Director, "dir"),
+            ("worker-1", BrigadeRole::Worker, "w1"),
+            ("worker-2", BrigadeRole::Worker, "w2"),
+            ("goinkyo", BrigadeRole::Goinkyo, "g1"),
+        ] {
+            store
+                .add_brigade_member(
+                    brigade_id,
+                    token,
+                    role,
+                    Some(&SessionId(session.to_string())),
+                )
+                .unwrap();
+        }
+        let store = RefCell::new(store);
+
+        let events = execute_store_intent(
+            StoreIntent::ResolveMembership {
+                session_id: "dir".to_string(),
+            },
+            &store,
+        );
+
+        let [
+            Event::MembershipResolved {
+                members: Some(members),
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected a resolved membership with a roster: {events:?}");
+        };
+        let tokens: Vec<&str> = members.iter().map(|(token, ..)| token.as_str()).collect();
+        assert_eq!(tokens, ["director", "worker-1", "worker-2", "goinkyo"]);
+    }
+
+    #[test]
     fn resolve_membership_leaves_an_up_to_date_session_id_untouched() {
         let mut store = Store::open_in_memory().unwrap();
         let brigade_id = store.create_brigade("cell").unwrap();
@@ -7564,6 +7614,24 @@ mod tests {
     }
 
     #[test]
+    fn the_spawn_candidate_carries_the_roster_in_the_order_the_members_joined() {
+        let (store, state, app) = staged_goinkyo(None);
+        // A Worker joins after the consultation: by token it would sort after
+        // `goinkyo` too, so give it a token that sorts before it.
+        store
+            .borrow_mut()
+            .add_brigade_member(1, "assistant", BrigadeRole::Worker, None)
+            .unwrap();
+
+        let GoinkyoObservation::AwaitingSpawn(candidate) =
+            gather_goinkyo_observation(&state, &store, &app, None)
+        else {
+            panic!("a Goinkyo row with no session is awaiting a spawn");
+        };
+        assert_eq!(candidate.roster, ["director", "goinkyo", "assistant"]);
+    }
+
+    #[test]
     fn a_consultation_that_ends_while_another_brigade_is_on_stage_is_still_noticed() {
         // `dismiss_goinkyo` is an MCP call the Director's own session makes,
         // so it lands whenever that session decides to — not when the
@@ -7889,6 +7957,7 @@ mod tests {
                 observation: GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
                     brigade_id: 1,
                     cwd: PathBuf::from("/work/alpha"),
+                    roster: Vec::new(),
                 }),
             },
             now,

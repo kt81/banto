@@ -275,6 +275,51 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// The same members as [`Self::brigade_members`], in the order they joined
+    /// the brigade: the Director first, then everyone else by when its row was
+    /// added. This is the order the emporium stacks the tiles of a brigade
+    /// nobody has rearranged, so that it is the same every time the brigade is
+    /// staged and across a restart.
+    ///
+    /// The join order is the table's `rowid`, which SQLite assigns in
+    /// insertion order, so it needs no column of its own: a member added
+    /// later has a larger one; a dismissed member's row is deleted, so a Worker
+    /// that reuses its token is a new row and joins last; updating a row (its
+    /// session id, its briefing) never moves it.
+    ///
+    /// What this does and does not promise. The table has a composite primary
+    /// key and no `INTEGER PRIMARY KEY`, so its rowids are the hidden kind that
+    /// SQLite may renumber on `VACUUM` or when a table is rebuilt. Nothing in
+    /// banto does either (it never runs `VACUUM`, and no migration after v7
+    /// rebuilds this table), so the order holds for a database only banto has
+    /// written to; an external `VACUUM` or rebuild may renumber it. A future
+    /// migration that rebuilds the table has to copy the rows `ORDER BY rowid`.
+    ///
+    /// A brigade that already existed when migration v7 rebuilt the table
+    /// (the one that introduced member tokens) has the order that migration
+    /// wrote, not the order its members originally joined — that was never
+    /// recorded anywhere the migration kept. The script inserted the
+    /// Directors, then the Workers numbered `worker-1`, `worker-2`, … by their
+    /// old session ids, with no `ORDER BY` on the `INSERT … SELECT`; with the
+    /// bundled SQLite (3.53) the rows land in that numbering order, which
+    /// SQLite does not guarantee. `brigade_members` itself
+    /// orders by token and is left alone — it puts `goinkyo` before `worker-1`
+    /// and `worker-10` before `worker-2`, and other readers (the MCP roster)
+    /// are used to it.
+    pub fn brigade_members_in_join_order(
+        &self,
+        brigade_id: BrigadeId,
+    ) -> Result<Vec<BrigadeMember>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_token, role, session_id, agent, briefed_at_ms, briefed_session_id
+             FROM brigade_members
+             WHERE brigade_id = ?1
+             ORDER BY CASE role WHEN 'director' THEN 0 ELSE 1 END, rowid",
+        )?;
+        let rows = stmt.query_map([brigade_id], brigade_member_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn brigade_member(
         &self,
         brigade_id: BrigadeId,
@@ -1365,6 +1410,146 @@ mod tests {
         store.delete_brigade(br).unwrap();
         assert!(store.brigade_members(br).unwrap().is_empty());
         assert_eq!(store.brigade_of_session(&sid("dir")).unwrap(), None);
+    }
+
+    fn join_order(store: &Store, br: BrigadeId) -> Vec<String> {
+        store
+            .brigade_members_in_join_order(br)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.token)
+            .collect()
+    }
+
+    #[test]
+    fn members_come_back_in_the_order_they_joined_the_director_first() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        // Another brigade's rows interleave with this one's.
+        let other = store.create_brigade("other").unwrap();
+        for (brigade, token, role) in [
+            (br, "director", BrigadeRole::Director),
+            (other, "director", BrigadeRole::Director),
+            (br, "worker-1", BrigadeRole::Worker),
+            (br, "worker-2", BrigadeRole::Worker),
+            (other, "worker-1", BrigadeRole::Worker),
+            // A Goinkyo, then a Worker added after it, and a double-digit one.
+            (br, "goinkyo", BrigadeRole::Goinkyo),
+            (br, "worker-3", BrigadeRole::Worker),
+            (br, "worker-10", BrigadeRole::Worker),
+        ] {
+            store
+                .add_brigade_member(brigade, token, role, None)
+                .unwrap();
+        }
+
+        assert_eq!(
+            join_order(&store, br),
+            [
+                "director",
+                "worker-1",
+                "worker-2",
+                "goinkyo",
+                "worker-3",
+                "worker-10"
+            ]
+        );
+        assert_eq!(join_order(&store, other), ["director", "worker-1"]);
+        // The token order other readers get is a different thing.
+        let by_token: Vec<String> = store
+            .brigade_members(br)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.token)
+            .collect();
+        assert_eq!(
+            by_token,
+            [
+                "director",
+                "goinkyo",
+                "worker-1",
+                "worker-10",
+                "worker-2",
+                "worker-3"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_director_leads_even_when_its_row_was_added_last() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, None)
+            .unwrap();
+        assert_eq!(join_order(&store, br), ["director", "worker-1"]);
+    }
+
+    #[test]
+    fn updating_a_member_never_moves_it_and_a_reused_token_joins_last() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        for (token, role) in [
+            ("director", BrigadeRole::Director),
+            ("worker-1", BrigadeRole::Worker),
+            ("worker-2", BrigadeRole::Worker),
+            ("goinkyo", BrigadeRole::Goinkyo),
+        ] {
+            store.add_brigade_member(br, token, role, None).unwrap();
+        }
+        let before = join_order(&store, br);
+
+        // Session ids set, healed to another id, cleared, briefing recorded.
+        store.set_member_session(br, "worker-1", &sid("a")).unwrap();
+        store.set_member_session(br, "worker-1", &sid("b")).unwrap();
+        store.set_member_session(br, "goinkyo", &sid("g")).unwrap();
+        store.clear_member_session(br, "goinkyo").unwrap();
+        assert_eq!(join_order(&store, br), before);
+
+        // Dismissed and numbered again: a new row, so the last.
+        store.dismiss_worker(br, "worker-1").unwrap();
+        assert_eq!(join_order(&store, br), ["director", "worker-2", "goinkyo"]);
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        assert_eq!(
+            join_order(&store, br),
+            ["director", "worker-2", "goinkyo", "worker-1"]
+        );
+        // The same after the last-joined row was the one removed and re-added
+        // (SQLite hands the freed rowid back; it is still the largest).
+        store.dismiss_worker(br, "worker-1").unwrap();
+        store
+            .add_brigade_member(br, "worker-3", BrigadeRole::Worker, None)
+            .unwrap();
+        assert_eq!(
+            join_order(&store, br),
+            ["director", "worker-2", "goinkyo", "worker-3"]
+        );
+    }
+
+    #[test]
+    fn the_join_order_survives_closing_and_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let expected = ["director", "worker-2", "worker-1", "goinkyo", "worker-3"];
+        {
+            let mut store = Store::open(&path).unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            for token in expected {
+                let role = match token {
+                    "director" => BrigadeRole::Director,
+                    "goinkyo" => BrigadeRole::Goinkyo,
+                    _ => BrigadeRole::Worker,
+                };
+                store.add_brigade_member(br, token, role, None).unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(join_order(&store, 1), expected);
     }
 
     #[test]
