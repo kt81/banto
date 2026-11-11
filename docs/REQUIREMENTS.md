@@ -981,6 +981,28 @@ the operator last typed, a nudge's own delayed Enter is dropped if the mark
 appeared before it was due, and the status line says the nudge is being held
 (re-shown every 30s, never over another message).
 
+Every status that names a brigade member — this one, the nudge notice, the
+unreadable-input notice and the kickoff notices — names the brigade the way the
+operator knows it, by its Director's *current* session title in quotes:
+`relay: nudged worker-2 of "Fix the relay draft guard"`. The title is reduced
+first — control characters, escape sequences and invisible format characters
+(bidi overrides, zero-width joiners) are dropped, an ASCII `"` inside it becomes
+`'`, and a title or name that reduces to nothing counts as absent — then cut to one
+line of at most 28 display columns (an ellipsis when cut, never between a letter
+and its combining mark or inside a flag); when the Director's
+session is not known or has no title, the title the brigade was formed under is
+used, and only when neither exists the number (`worker-2 of brigade 7`). Members
+of several brigades are grouped so each name is said once (`worker-1, worker-3 of
+"A" and worker-2 of "B"`). The brigade number is an identifier for agents and for
+banto's own plumbing; the operator is never shown it where a title is known.
+
+The nudge notice also says what prompted it — the sender and first line of the
+newest message addressed to the nudged member: `relay: nudged director of "Fix
+the relay draft guard" ← worker-3: stage 2 is done`. The line is cut to at most
+60 display columns (an ellipsis when cut); with no message to quote the notice is
+the short form, never an arrow with nothing after it. Only the nudge notice
+carries this; how often and how long a status shows is unchanged.
+
 The mark is blunt on purpose — it does not model which keys an agent binds to
 clearing its line — so for a Claude pane it is backed by reading the input
 line off the pane's own screen (`banto_core::input_line`), at the moment relay

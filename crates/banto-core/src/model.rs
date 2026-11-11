@@ -505,6 +505,11 @@ pub struct BrigadeMessage {
 pub struct MessageGlance {
     pub created_at_ms: i64,
     pub line: String,
+    /// The member token of whoever queued the message (`from_session` holds a
+    /// token despite its name). `None` in a capture recorded before this
+    /// field existed.
+    #[serde(default)]
+    pub from_token: Option<MemberToken>,
 }
 
 /// One member's arrangement preferences as the store keeps them (its columns

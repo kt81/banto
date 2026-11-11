@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{App, ClickOutcome, GroupId, GroupJoinTarget, KillChoice, Modal, Mode};
 use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
+use crate::display_text::{display_name, shorten_to_columns};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -415,6 +416,17 @@ pub fn tick_relay_decision(
         state.nudge.attempts += 1;
     }
     nudge
+}
+
+/// What the relay gather read about one brigade, enough to name it to the
+/// operator: the title frozen at formation (`brigades.name`) and the session
+/// id the roster records for its Director (`None` until one is recorded).
+/// Replaced each tick it arrives, dropped on disband.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrigadeNameFacts {
+    pub brigade_id: BrigadeId,
+    pub name: String,
+    pub director_session: Option<String>,
 }
 
 /// One relay-eligible live member's freshly-gathered observations for this
@@ -887,6 +899,10 @@ pub struct EmporiumState {
     /// layout whenever it differs from this, so a write follows exactly the
     /// changes that matter and nothing else.
     persisted_layouts: HashMap<BrigadeId, BrigadeLayout>,
+    /// What the relay gather last read about each brigade, to name it in the
+    /// operator-facing statuses (see [`Self::brigade_name`]). Seeded at
+    /// formation, replaced each tick, dropped on disband.
+    brigade_names: HashMap<BrigadeId, BrigadeNameFacts>,
     /// The same for the sidebar width.
     persisted_sidebar_width: u16,
     /// When real operator input was last forwarded to each pane, keyed by
@@ -1167,6 +1183,7 @@ impl EmporiumState {
             relay_states: HashMap::new(),
             member_facts: HashMap::new(),
             persisted_layouts: HashMap::new(),
+            brigade_names: HashMap::new(),
             persisted_sidebar_width: SIDEBAR_WIDTH,
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
@@ -1378,16 +1395,112 @@ impl EmporiumState {
         self.unsent_operator_input.contains(key)
     }
 
-    fn kickoff_label(&self, key: &SessionKey) -> String {
+    /// The pane's member as the operator is told about it in a kickoff
+    /// status: `worker-1 of "Fix the relay draft guard"`, or `member worker-1`
+    /// when no brigade is known for the pane.
+    fn kickoff_label(&self, app: &App, key: &SessionKey) -> String {
+        self.members_phrase(app, &[self.kickoff_member(key)])
+    }
+
+    /// The `(brigade, token)` a kickoff status names a pane by.
+    fn kickoff_member(&self, key: &SessionKey) -> (Option<BrigadeId>, MemberToken) {
         let token = self
             .member_tokens
             .get(key)
             .cloned()
             .or_else(|| key.worker_identity().map(|(_, token)| token))
             .unwrap_or_else(|| key.as_str().to_string());
-        match self.member_brigades.get(key) {
-            Some(brigade_id) => format!("brigade {brigade_id} {token}"),
-            None => format!("member {token}"),
+        (self.member_brigades.get(key).copied(), token)
+    }
+
+    /// How the operator is told which brigade is meant: the Director's
+    /// current session title in ASCII quotes, `"Fix the relay draft guard"`,
+    /// else the title frozen when the brigade was formed, else — only then —
+    /// `brigade 7`.
+    ///
+    /// The Director's session is looked for first in what the core already
+    /// holds (the staged brigade's `director`, then any pane whose member is
+    /// the Director of this brigade — kept through a compaction fork, which
+    /// re-keys them at once), and only then in the id the last tick read from
+    /// the store, which is the one source that still answers when the
+    /// Director's pane is closed. A title is used only if the row has one: a
+    /// row without a title would "name" the brigade by its session uuid.
+    ///
+    /// Shortened to [`BRIGADE_NAME_COLUMNS`] display columns on one line.
+    pub fn brigade_name(&self, app: &App, brigade_id: BrigadeId) -> String {
+        let mut sessions: Vec<&str> = Vec::new();
+        if let Stage::Brigade { id, director, .. } = &self.stage
+            && *id == brigade_id
+            && let Some(key) = director
+        {
+            sessions.push(key.as_str());
+        }
+        for (key, id) in &self.member_brigades {
+            if *id == brigade_id
+                && self.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+            {
+                sessions.push(key.as_str());
+            }
+        }
+        let facts = self.brigade_names.get(&brigade_id);
+        if let Some(session) = facts.and_then(|facts| facts.director_session.as_deref()) {
+            sessions.push(session);
+        }
+        let title = sessions.into_iter().find_map(|session| {
+            app.row_for_id(session)
+                .and_then(|row| row.title.as_deref())
+                .and_then(display_name)
+        });
+        match title.or_else(|| facts.and_then(|facts| display_name(&facts.name))) {
+            // An ASCII quote inside the name would end the outer quoting early.
+            Some(name) => format!(
+                "\"{}\"",
+                shorten_to_columns(&name.replace('"', "'"), BRIGADE_NAME_COLUMNS)
+            ),
+            None => format!("brigade {brigade_id}"),
+        }
+    }
+
+    /// Members as one phrase, grouped by brigade so each name is said once:
+    /// `worker-1, worker-3 of "A" and worker-2 of "B"`. Groups follow the
+    /// order their brigade first appears, members the order given; a member
+    /// with no brigade stands alone as `member {token}`. Three or more groups
+    /// are separated by `;` (a group's own members already use commas).
+    fn members_phrase(&self, app: &App, members: &[(Option<BrigadeId>, MemberToken)]) -> String {
+        enum Group<'a> {
+            Brigade(BrigadeId, Vec<&'a str>),
+            Lone(&'a str),
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        for (brigade_id, token) in members {
+            match brigade_id {
+                None => groups.push(Group::Lone(token)),
+                Some(id) => {
+                    let existing = groups.iter_mut().find_map(|group| match group {
+                        Group::Brigade(other, tokens) if other == id => Some(tokens),
+                        _ => None,
+                    });
+                    match existing {
+                        Some(tokens) => tokens.push(token),
+                        None => groups.push(Group::Brigade(*id, vec![token])),
+                    }
+                }
+            }
+        }
+        let phrases: Vec<String> = groups
+            .into_iter()
+            .map(|group| match group {
+                Group::Lone(token) => format!("member {token}"),
+                Group::Brigade(id, tokens) => {
+                    format!("{} of {}", tokens.join(", "), self.brigade_name(app, id))
+                }
+            })
+            .collect();
+        match phrases.as_slice() {
+            [] => String::new(),
+            [only] => only.clone(),
+            [rest @ .., last] if rest.len() == 1 => format!("{} and {last}", rest[0]),
+            [rest @ .., last] => format!("{} and {last}", rest.join("; ")),
         }
     }
 
@@ -2452,6 +2565,13 @@ pub enum Event {
     /// any due phase-two nudge submit and expire the status message.
     Tick {
         relay: Vec<RelayObservation>,
+        /// What the same gather read about each brigade it visited: its
+        /// stored name and its Director's session id. Names a brigade to the
+        /// operator in the statuses that mention one. Empty when the gather
+        /// reads nothing (a store error) and in captures recorded before
+        /// this field existed.
+        #[serde(default)]
+        brigades: Vec<BrigadeNameFacts>,
     },
     /// ~1/s: what the shell observed about the staged brigade's Goinkyo —
     /// gathered shell-side alongside `Tick`'s own observations, but its own
@@ -2650,10 +2770,10 @@ pub fn update(
             hook_launchable,
         } => update_codex_trust_checked(state, app, primed, hook_launchable, now),
         Event::WorkerDirectoryTrustChecked { key, trusted } => {
-            update_worker_directory_trust_checked(state, key, trusted, now)
+            update_worker_directory_trust_checked(state, app, key, trusted, now)
         }
         Event::GoinkyoDirectoryTrustChecked { key, trusted } => {
-            update_goinkyo_directory_trust_checked(state, key, trusted, now)
+            update_goinkyo_directory_trust_checked(state, app, key, trusted, now)
         }
         Event::BrigadeFormed {
             director_row_id,
@@ -2710,7 +2830,7 @@ pub fn update(
             old_id,
             new_id,
         } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
-        Event::Tick { relay } => update_tick(state, app, brigade, relay, now),
+        Event::Tick { relay, brigades } => update_tick(state, app, brigade, relay, brigades, now),
         Event::GoinkyoAwaitingSpawn { observation } => {
             update_goinkyo_awaiting_spawn(state, brigade, observation, now)
         }
@@ -5673,6 +5793,16 @@ fn update_brigade_formed(
     };
     let director_key = SessionKey::from_id(&director_row_id);
     let worker_count = worker_tokens.len();
+    // The brigade is named from this moment, not from its first tick: the
+    // Director is the row the operator pressed B on, and `name` is its title.
+    state.brigade_names.insert(
+        brigade_id,
+        BrigadeNameFacts {
+            brigade_id,
+            name: name.clone(),
+            director_session: Some(director_row_id.clone()),
+        },
+    );
     let wiring = PendingDirectorWiring {
         director_row_id,
         brigade_id,
@@ -5855,6 +5985,7 @@ fn update_disbanded(
             };
             state.brigade_layouts.remove(&brigade_id);
             state.persisted_layouts.remove(&brigade_id);
+            state.brigade_names.remove(&brigade_id);
             state.member_facts.retain(|(id, _), _| *id != brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
@@ -5952,14 +6083,44 @@ fn update_worker_dismissed(
     }
 }
 
+/// The widest the quoted first line of a message may be in a status, in
+/// display columns, ellipsis included.
+const NUDGE_PROMPT_COLUMNS: usize = 60;
+
+/// ` ← worker-3: first line of the message` for the nudge status — the sender
+/// when it is known, the line cut by display width. Empty when the message has
+/// no line to quote: never an arrow with nothing after it.
+fn nudge_prompt(message: &MessageGlance) -> String {
+    let Some(line) = display_name(&message.line) else {
+        return String::new();
+    };
+    let line = shorten_to_columns(&line, NUDGE_PROMPT_COLUMNS);
+    match &message.from_token {
+        Some(sender) => format!(" \u{2190} {sender}: {line}"),
+        None => format!(" \u{2190} {line}"),
+    }
+}
+
+/// The widest a brigade's name is allowed to be in a one-line status, in
+/// display columns, ellipsis included.
+const BRIGADE_NAME_COLUMNS: usize = 28;
+
 fn update_tick(
     state: &mut EmporiumState,
     app: &App,
     brigade: &BrigadeConfig,
     relay: Vec<RelayObservation>,
+    brigades: Vec<BrigadeNameFacts>,
     now: Instant,
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
+
+    // First, so the statuses below name each brigade by what this very tick
+    // read. A brigade the tick does not list keeps its last facts (a failed
+    // gather reads nothing and must not blank every name).
+    for facts in brigades {
+        state.brigade_names.insert(facts.brigade_id, facts);
+    }
 
     // What each observed member's collapsed tile shows. A member the shell did
     // not re-read (`glance: None`) keeps what it had; an agent the shell
@@ -6062,7 +6223,7 @@ fn update_tick(
     }
 
     // Members whose nudge only an unsent draft is holding back.
-    let mut held_by_draft: Vec<String> = Vec::new();
+    let mut held_by_draft: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
     // Idle Claude members whose input line has been unreadable long enough
     // to say so.
     let mut unreadable_due: Vec<(BrigadeId, MemberToken)> = Vec::new();
@@ -6121,10 +6282,17 @@ fn update_tick(
                     key: obs.key,
                     nudged_at: now,
                 });
-                state.set_status(
-                    format!("relay: nudged brigade {} {}", obs.brigade_id, obs.token),
-                    now,
-                );
+                let member =
+                    state.members_phrase(app, &[(Some(obs.brigade_id), obs.token.clone())]);
+                // What prompted it: the newest message to this member, as
+                // applied from this very tick's observation above.
+                let prompt = state
+                    .member_facts
+                    .get(&(obs.brigade_id, obs.token.clone()))
+                    .and_then(|facts| facts.inbound.as_ref())
+                    .map(nudge_prompt)
+                    .unwrap_or_default();
+                state.set_status(format!("relay: nudged {member}{prompt}"), now);
             } else if input.has_unsent
                 && state
                     .relay_states
@@ -6143,7 +6311,7 @@ fn update_tick(
                     })
             {
                 // Every other condition says nudge; the draft alone says no.
-                held_by_draft.push(format!("brigade {} {}", obs.brigade_id, obs.token));
+                held_by_draft.push((Some(obs.brigade_id), obs.token.clone()));
             }
         }
     }
@@ -6161,11 +6329,9 @@ fn update_tick(
         .draft_hold_reminder
         .due(!held_by_draft.is_empty(), state.status.is_none(), now)
     {
+        let members = state.members_phrase(app, &held_by_draft);
         state.set_status(
-            format!(
-                "relay: holding the nudge to {} — unsent input in the pane",
-                held_by_draft.join(", ")
-            ),
+            format!("relay: holding the nudge to {members} — unsent input in the pane"),
             now,
         );
     }
@@ -6173,68 +6339,66 @@ fn update_tick(
     // Said once per member, and only into a free status line: a member left
     // due stays due until it fits.
     if !unreadable_due.is_empty() && state.status.is_none() {
-        let labels: Vec<String> = unreadable_due
+        let members: Vec<(Option<BrigadeId>, MemberToken)> = unreadable_due
             .iter()
-            .map(|(brigade_id, token)| format!("brigade {brigade_id} {token}"))
+            .map(|(brigade_id, token)| (Some(*brigade_id), token.clone()))
             .collect();
+        let members = state.members_phrase(app, &members);
         state.set_status(
             format!(
-                "relay: cannot read the input line of {} — unsent-draft detection is back to \
-                 keystroke tracking",
-                labels.join(", ")
+                "relay: cannot read the input line of {members} — unsent-draft detection is back \
+                 to keystroke tracking"
             ),
             now,
         );
         state.unreadable_noticed.extend(unreadable_due);
     }
 
-    let mut trust_waiting: Vec<String> = state
+    let mut trust_waiting: Vec<(Option<BrigadeId>, MemberToken)> = state
         .pending_kickoffs
         .iter()
         .filter(|pending| pending.notified_untrusted)
-        .map(|pending| state.kickoff_label(&pending.key))
+        .map(|pending| state.kickoff_member(&pending.key))
         .collect();
     trust_waiting.extend(
         state
             .pending_goinkyo_kickoffs
             .iter()
             .filter(|pending| pending.notified_untrusted)
-            .map(|pending| state.kickoff_label(&pending.key)),
+            .map(|pending| state.kickoff_member(&pending.key)),
     );
     if state
         .kickoff_trust_reminder
         .due(!trust_waiting.is_empty(), state.status.is_none(), now)
     {
+        let members = state.members_phrase(app, &trust_waiting);
         state.set_status(
-            format!(
-                "kickoff: waiting for directory trust in {}",
-                trust_waiting.join(", ")
-            ),
+            format!("kickoff: waiting for directory trust in {members}"),
             now,
         );
     }
 
-    let mut failures: Vec<String> = state
+    let mut failures: Vec<(Option<BrigadeId>, MemberToken)> = state
         .pending_kickoffs
         .iter()
         .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS)
-        .map(|pending| state.kickoff_label(&pending.key))
+        .map(|pending| state.kickoff_member(&pending.key))
         .collect();
     failures.extend(
         state
             .pending_goinkyo_kickoffs
             .iter()
             .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS)
-            .map(|pending| state.kickoff_label(&pending.key)),
+            .map(|pending| state.kickoff_member(&pending.key)),
     );
     if state
         .kickoff_failed_reminder
         .due(!failures.is_empty(), state.status.is_none(), now)
     {
+        let members = state.members_phrase(app, &failures);
         state.set_status(
             format!(
-                "kickoff: no acknowledgement after {KICKOFF_MAX_ATTEMPTS} attempts — {}",
-                failures.join(", ")
+                "kickoff: no acknowledgement after {KICKOFF_MAX_ATTEMPTS} attempts — {members}"
             ),
             now,
         );
@@ -6441,6 +6605,7 @@ fn update_goinkyo_awaiting_spawn(
 /// answer landing) is a no-op.
 fn update_worker_directory_trust_checked(
     state: &mut EmporiumState,
+    app: &App,
     key: SessionKey,
     trusted: bool,
     now: Instant,
@@ -6451,7 +6616,7 @@ fn update_worker_directory_trust_checked(
     if !trusted {
         if !state.pending_kickoffs[pos].notified_untrusted {
             state.pending_kickoffs[pos].notified_untrusted = true;
-            let name = state.kickoff_label(&key);
+            let name = state.kickoff_label(app, &key);
             state.set_status(
                 format!(
                     "{name}: Codex hasn't been told to trust this directory yet — \
@@ -6491,6 +6656,7 @@ fn update_worker_directory_trust_checked(
 /// once trusted, and re-asked every tick while it isn't.
 fn update_goinkyo_directory_trust_checked(
     state: &mut EmporiumState,
+    app: &App,
     key: SessionKey,
     trusted: bool,
     now: Instant,
@@ -6505,7 +6671,7 @@ fn update_goinkyo_directory_trust_checked(
     if !trusted {
         if !state.pending_goinkyo_kickoffs[pos].notified_untrusted {
             state.pending_goinkyo_kickoffs[pos].notified_untrusted = true;
-            let name = state.kickoff_label(&key);
+            let name = state.kickoff_label(app, &key);
             state.set_status(
                 format!(
                     "{name}: Claude hasn't been told to trust this directory yet — \
@@ -10239,6 +10405,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -10253,6 +10420,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -10265,7 +10433,7 @@ mod tests {
                 .status
                 .as_deref()
                 .unwrap()
-                .contains("nudged brigade 1 worker-1")
+                .contains("nudged worker-1 of brigade 1")
         );
 
         // A tick before the submit delay has elapsed: nothing flushed yet.
@@ -10274,7 +10442,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(writes(&cmds).is_empty(), "submit not due yet");
@@ -10287,7 +10458,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert_eq!(writes(&cmds), vec![(worker.clone(), b"\r".to_vec())]);
@@ -10326,6 +10500,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -10335,6 +10510,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now + Duration::from_secs(1),
         );
@@ -10345,7 +10521,7 @@ mod tests {
             state
                 .status
                 .as_deref()
-                .is_some_and(|status| status.contains("brigade 2 director")),
+                .is_some_and(|status| status.contains("director of brigade 2")),
             "the notice must distinguish the off-stage director: {:?}",
             state.status
         );
@@ -10471,7 +10647,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
         );
         assert!(cmds.is_empty(), "not quiet long enough yet");
@@ -10481,7 +10660,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
         );
         assert_eq!(
@@ -10559,7 +10741,10 @@ mod tests {
                     &mut state,
                     &mut app,
                     &brigade,
-                    Event::Tick { relay: vec![] },
+                    Event::Tick {
+                        relay: vec![],
+                        brigades: Vec::new(),
+                    },
                     at,
                 );
                 assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::CheckWorkerDirectoryTrust { key: checked, .. } if checked == &key)));
@@ -10580,7 +10765,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + KICKOFF_ACK_TIMEOUT * KICKOFF_MAX_ATTEMPTS,
         );
         assert!(
@@ -10617,7 +10805,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + CODEX_KICKOFF_QUIET_PERIOD,
         );
         assert!(cmds.is_empty());
@@ -10654,7 +10845,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
         );
         assert!(
@@ -10683,7 +10877,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now + KICKOFF_ACK_TIMEOUT,
         );
         assert!(cmds.is_empty());
@@ -10719,7 +10916,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + STATUS_TIMEOUT,
         );
         assert!(
@@ -10843,7 +11043,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
         );
         assert!(
@@ -10855,7 +11058,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             output_at + CODEX_KICKOFF_QUIET_PERIOD,
         );
         assert!(!cmds.is_empty(), "quiet long enough since the last output");
@@ -11011,6 +11217,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -11021,6 +11228,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -11067,6 +11275,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -11077,6 +11286,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -11133,6 +11343,7 @@ mod tests {
                         is_idle_this_tick: Some(true),
                         agent: None,
                     }],
+                    brigades: Vec::new(),
                 },
                 *now,
             );
@@ -11452,7 +11663,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -11569,6 +11783,7 @@ mod tests {
                     is_idle_this_tick: Some(true),
                     agent: None,
                 }],
+                brigades: Vec::new(),
             },
             now,
         )
@@ -11733,7 +11948,10 @@ mod tests {
                 &mut state,
                 &mut app,
                 &brigade,
-                Event::Tick { relay: vec![] },
+                Event::Tick {
+                    relay: vec![],
+                    brigades: Vec::new(),
+                },
                 at,
             );
             if at - shown >= STATUS_TIMEOUT {
@@ -11912,6 +12130,7 @@ mod tests {
                     is_idle_this_tick: seen.idle,
                     agent: seen.agent,
                 }],
+                brigades: Vec::new(),
             },
             now,
         )
@@ -13588,7 +13807,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -13678,7 +13900,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         let boundary = Boundary::Stack {
@@ -13777,7 +14002,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         let strip = tile_of(&state, "w2");
@@ -13844,7 +14072,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -13969,7 +14200,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -14010,7 +14244,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(state.geometry(DRAG_AREA).all_collapsed);
@@ -14045,7 +14282,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         press_label(&mut state, &mut app, &brigade, "w1", now);
@@ -14094,7 +14334,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(!state.geometry(DRAG_AREA).all_collapsed);
@@ -14178,7 +14421,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         press_label(&mut state, &mut app, &brigade, "w1", now);
@@ -14209,7 +14455,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(state.geometry(DRAG_AREA).all_collapsed);
@@ -14281,7 +14530,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -14303,7 +14555,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(state.geometry(DRAG_AREA).all_collapsed);
@@ -14392,7 +14647,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         focus_stack_slot(&mut state, 3); // w3, the last open tile
@@ -14431,7 +14689,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(resizes(&cmds).is_empty());
@@ -14575,7 +14836,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         let start = handle_of(&state, &boundary).position;
@@ -15084,7 +15348,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert_eq!(state.soloed_key(), Some(&again));
@@ -15170,7 +15437,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         ));
         assert!(before.is_empty());
@@ -15278,7 +15548,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         let cmds = prefix_key(
@@ -15378,7 +15651,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         ));
         all.extend(update(
@@ -15421,7 +15697,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -15764,6 +16043,880 @@ mod tests {
         assert!(geometry.areas.pane.width >= MIN_PANE_AREA_WIDTH);
     }
 
+    // --- naming a brigade to the operator --------------------------------------------
+
+    fn titled(id: &str, title: Option<&str>) -> SessionRow {
+        let mut r = row(id);
+        r.title = title.map(str::to_string);
+        r
+    }
+
+    fn name_facts(id: BrigadeId, name: &str, director: Option<&str>) -> BrigadeNameFacts {
+        BrigadeNameFacts {
+            brigade_id: id,
+            name: name.to_string(),
+            director_session: director.map(str::to_string),
+        }
+    }
+
+    fn state_with_facts(facts: Vec<BrigadeNameFacts>) -> EmporiumState {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        for f in facts {
+            state.brigade_names.insert(f.brigade_id, f);
+        }
+        state
+    }
+
+    #[test]
+    fn a_brigade_is_named_by_its_directors_current_title_then_its_stored_name_then_its_number() {
+        let state = state_with_facts(vec![name_facts(1, "Frozen at formation", Some("dir"))]);
+
+        // The Director's row has a title: that wins over the frozen one.
+        let app = app_with(vec![titled("dir", Some("Fix the relay draft guard"))]);
+        assert_eq!(state.brigade_name(&app, 1), "\"Fix the relay draft guard\"");
+        // The title follows a rename: same state, a reloaded row.
+        let app = app_with(vec![titled("dir", Some("Renamed by the operator"))]);
+        assert_eq!(state.brigade_name(&app, 1), "\"Renamed by the operator\"");
+
+        // No row for the Director session: the stored name.
+        let app = app_with(vec![]);
+        assert_eq!(state.brigade_name(&app, 1), "\"Frozen at formation\"");
+        // A row without a title would name the brigade by a uuid: not used.
+        let app = app_with(vec![titled("dir", None)]);
+        assert_eq!(state.brigade_name(&app, 1), "\"Frozen at formation\"");
+        // No Director session recorded yet: the stored name.
+        let state = state_with_facts(vec![name_facts(1, "Frozen at formation", None)]);
+        assert_eq!(
+            state.brigade_name(&app_with(vec![]), 1),
+            "\"Frozen at formation\""
+        );
+
+        // Nothing known at all: the number, and only then.
+        let state = state_with_facts(vec![]);
+        assert_eq!(state.brigade_name(&app_with(vec![]), 7), "brigade 7");
+        // A stored name that is only whitespace is no name.
+        let state = state_with_facts(vec![name_facts(7, " \n\t ", None)]);
+        assert_eq!(state.brigade_name(&app_with(vec![]), 7), "brigade 7");
+    }
+
+    #[test]
+    fn a_title_is_one_line_and_cut_by_display_width_with_an_ellipsis() {
+        let name = |title: &str| {
+            let state = state_with_facts(vec![name_facts(1, "x", Some("dir"))]);
+            state.brigade_name(&app_with(vec![titled("dir", Some(title))]), 1)
+        };
+        let width = |text: &str| unicode_width::UnicodeWidthStr::width(text);
+
+        // 200 characters: at most 28 columns inside the quotes, ending in an ellipsis.
+        let long = name(&"a".repeat(200));
+        assert_eq!(long, format!("\"{}\u{2026}\"", "a".repeat(27)));
+        assert_eq!(width(long.trim_matches('"')), 28);
+        // Exactly 28 stays whole.
+        assert_eq!(name(&"b".repeat(28)), format!("\"{}\"", "b".repeat(28)));
+
+        // Wide characters take two columns and are not split: 13 fit (26
+        // columns) with the ellipsis making 27.
+        let wide = name(&"\u{30c6}".repeat(40));
+        let inner = wide.trim_matches('"');
+        assert!(width(inner) <= 28, "{inner:?}");
+        assert!(inner.ends_with('\u{2026}'));
+        assert_eq!(inner.chars().filter(|c| *c == '\u{30c6}').count(), 13);
+
+        // Newlines, tabs and runs of spaces collapse to single spaces.
+        assert_eq!(name("fix\n\n the\ttab  problem"), "\"fix the tab problem\"");
+    }
+
+    /// The name `brigade_name` gives a Director titled `title`, a brigade
+    /// stored as `stored`.
+    fn named(title: &str, stored: &str) -> String {
+        let state = state_with_facts(vec![name_facts(1, stored, Some("dir"))]);
+        state.brigade_name(&app_with(vec![titled("dir", Some(title))]), 1)
+    }
+
+    #[test]
+    fn a_title_and_a_stored_name_are_reduced_to_what_is_safe_to_print() {
+        // Neither the title nor the stored name may carry a byte that steers the terminal.
+        let hostile = "A\u{1b}[2Jb\u{1b}]0;x\u{7} c\u{9b}1m \u{202e}d\u{2066}\u{200b}e\u{200d}";
+        let reduced = "\"A[2Jb]0;x c1m de\"";
+        assert_eq!(named(hostile, "x"), reduced);
+        assert_eq!(named("", hostile), reduced);
+        let state = state_with_facts(vec![name_facts(1, hostile, None)]);
+        assert_eq!(state.brigade_name(&app_with(vec![]), 1), reduced);
+        for c in [
+            '\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\u{2066}', '\u{200b}', '\u{200d}',
+        ] {
+            assert!(!named(hostile, hostile).contains(c), "{c:?}");
+        }
+        // C0 and C1 controls on their own.
+        assert_eq!(named("a\u{0}b\u{8}c\u{7f}d\u{85}e", "x"), "\"abcd e\"");
+        // A joiner inside a word.
+        assert_eq!(named("re\u{200d}lay", "x"), "\"relay\"");
+    }
+
+    #[test]
+    fn a_name_that_reduces_to_nothing_falls_through_to_the_next_source() {
+        // A title of only invisible or control characters is no title.
+        assert_eq!(named("\u{1b}\u{200b}\u{202e}", "Frozen"), "\"Frozen\"");
+        assert_eq!(named("   \t\n", "Frozen"), "\"Frozen\"");
+        // A stored name that reduces to nothing too: the number.
+        let state = state_with_facts(vec![name_facts(4, "\u{1b}\u{2067}", Some("dir"))]);
+        assert_eq!(
+            state.brigade_name(&app_with(vec![titled("dir", Some(" \u{200b} "))]), 4),
+            "brigade 4"
+        );
+        // Of two candidate Director sessions the first with a usable title wins.
+        let mut state = state_with_facts(vec![name_facts(1, "Frozen", Some("old"))]);
+        let new = key_of("new");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(new.clone()),
+            panes: vec![new],
+            focused: 0,
+        };
+        let app = app_with(vec![
+            titled("new", Some("\u{1b}")),
+            titled("old", Some("Older but usable")),
+        ]);
+        assert_eq!(state.brigade_name(&app, 1), "\"Older but usable\"");
+    }
+
+    #[test]
+    fn an_ascii_double_quote_inside_a_name_becomes_an_apostrophe() {
+        assert_eq!(named(r#"say "hi" to it"#, "x"), "\"say 'hi' to it\"");
+        assert_eq!(named("", r#""quoted""#), "\"'quoted'\"");
+        // The outer quotes are the only double quotes left.
+        assert_eq!(named(r#"a"b"c"#, "x").matches('"').count(), 2);
+    }
+
+    #[test]
+    fn a_cut_name_never_strands_a_combining_mark_or_splits_a_flag_or_an_emoji() {
+        let width = |text: &str| unicode_width::UnicodeWidthStr::width(text);
+        // The 28th column is a letter with a mark after it: 27 letters fit
+        // before the ellipsis, and the mark is not left at the head of what was cut.
+        let marked = format!("{}e\u{301}tail", "a".repeat(26));
+        let cut = named(&marked, "x");
+        assert_eq!(cut, format!("\"{}e\u{301}\u{2026}\"", "a".repeat(26)));
+        // A joiner-held family is reduced to its parts first, so the cut falls
+        // between whole emoji, and the row never exceeds its columns.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".repeat(8);
+        let cut = named(&family, "x");
+        let inner = cut.trim_matches('"');
+        assert!(width(inner) <= 28, "{inner:?}");
+        assert!(inner.ends_with('\u{2026}'));
+        assert!(!inner.contains('\u{200d}'));
+        // Flags and heart + selector.
+        for text in [
+            "\u{1f1ef}\u{1f1f5}".repeat(20),
+            "\u{2764}\u{fe0f}".repeat(30),
+        ] {
+            let cut = named(&text, "x");
+            let inner = cut.trim_matches('"');
+            assert!(width(inner) <= 28, "{inner:?}");
+            let body = inner.strip_suffix('\u{2026}').unwrap();
+            if text.starts_with('\u{1f1ef}') {
+                assert_eq!(body.chars().count() % 2, 0, "{inner:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_quoted_message_line_is_reduced_the_same_way() {
+        // Defence in depth: a glance from an old capture was not reduced by the store.
+        let status = nudge_status_with(Some(said_by(
+            Some("worker-3"),
+            "do\u{1b}[2J \u{202e}it\u{200b} now",
+        )));
+        assert!(
+            status.ends_with("\u{2190} worker-3: do[2J it now"),
+            "{status}"
+        );
+        // A line of nothing but invisible characters is no line.
+        assert_eq!(
+            nudge_status_with(Some(said_by(Some("worker-3"), "\u{1b}\u{200b}"))),
+            "relay: nudged director of \"Fix the relay draft guard\""
+        );
+    }
+
+    #[test]
+    fn the_name_prefers_what_the_core_holds_about_the_director_over_a_stale_tick() {
+        // The store (and so the last tick) still says the Director is `old`;
+        // a compaction fork re-keyed the live pane to `new`, whose row has the
+        // current title. State-first is what covers the tick's one-second gap.
+        let mut state = state_with_facts(vec![name_facts(1, "Frozen", Some("old"))]);
+        let new = key_of("new");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(new.clone()),
+            panes: vec![new],
+            focused: 0,
+        };
+        let app = app_with(vec![
+            titled("old", Some("Old title")),
+            titled("new", Some("Current title")),
+        ]);
+        assert_eq!(state.brigade_name(&app, 1), "\"Current title\"");
+
+        // Off-stage with its panes alive: found through the member maps.
+        let mut state = state_with_facts(vec![]);
+        let director = key_of("offstage-dir");
+        state
+            .member_tokens
+            .insert(director.clone(), DIRECTOR_TOKEN.to_string());
+        state.member_brigades.insert(director, 2);
+        let app = app_with(vec![titled("offstage-dir", Some("Quiet brigade"))]);
+        assert_eq!(state.brigade_name(&app, 2), "\"Quiet brigade\"");
+        // ...and another brigade's Director is not this one's.
+        assert_eq!(state.brigade_name(&app, 3), "brigade 3");
+
+        // Director pane closed (no key anywhere in core): only the store's
+        // session id, from the tick, can say.
+        let state = state_with_facts(vec![name_facts(4, "Frozen", Some("closed-dir"))]);
+        let app = app_with(vec![titled("closed-dir", Some("Closed but known"))]);
+        assert_eq!(state.brigade_name(&app, 4), "\"Closed but known\"");
+    }
+
+    #[test]
+    fn a_brigade_formed_just_now_has_its_name_before_any_tick() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![titled("dir", Some("Ship the persistence stage"))]);
+        let brigade = brigade_config();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "Ship the persistence stage".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::ClaudeCode,
+                worker_model: String::new(),
+                result: Ok((9, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
+
+        assert_eq!(
+            state.brigade_name(&app, 9),
+            "\"Ship the persistence stage\""
+        );
+        // With the Director's row gone the frozen name still answers.
+        assert_eq!(
+            state.brigade_name(&app_with(vec![]), 9),
+            "\"Ship the persistence stage\""
+        );
+    }
+
+    #[test]
+    fn a_tick_replaces_a_brigades_facts_and_the_name_follows_a_director_session_change() {
+        let (mut state, _, brigade, now) = drag_fixture(1);
+        let tick = |state: &mut EmporiumState, app: &mut App, facts: Vec<BrigadeNameFacts>| {
+            update(
+                state,
+                app,
+                &brigade,
+                Event::Tick {
+                    relay: vec![],
+                    brigades: facts,
+                },
+                now,
+            );
+        };
+        // Brigade 5 has no pane in core at all: only the tick knows it.
+        let mut app = app_with(vec![
+            titled("first", Some("Before the fork")),
+            titled("second", Some("After the fork")),
+        ]);
+        tick(
+            &mut state,
+            &mut app,
+            vec![name_facts(5, "Frozen", Some("first"))],
+        );
+        assert_eq!(state.brigade_name(&app, 5), "\"Before the fork\"");
+        tick(
+            &mut state,
+            &mut app,
+            vec![name_facts(5, "Frozen", Some("second"))],
+        );
+        assert_eq!(state.brigade_name(&app, 5), "\"After the fork\"");
+        // A tick that lists nothing (a failed gather) keeps what was known.
+        tick(&mut state, &mut app, vec![]);
+        assert_eq!(state.brigade_name(&app, 5), "\"After the fork\"");
+    }
+
+    #[test]
+    fn disbanding_forgets_the_brigades_name_facts() {
+        let (mut state, mut app, brigade, now) = drag_fixture(1);
+        state
+            .brigade_names
+            .insert(1, name_facts(1, "Gone soon", Some("dir")));
+        state.brigade_names.insert(2, name_facts(2, "Stays", None));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+        assert!(!state.brigade_names.contains_key(&1));
+        assert!(state.brigade_names.contains_key(&2));
+    }
+
+    #[test]
+    fn members_are_grouped_by_brigade_so_each_name_is_said_once() {
+        let mut state = state_with_facts(vec![
+            name_facts(1, "Alpha", None),
+            name_facts(2, "Beta", None),
+            name_facts(3, "Gamma", None),
+        ]);
+        state.brigade_names.get_mut(&3).unwrap().name = "Gamma".to_string();
+        let app = app_with(vec![]);
+        let m = |id: Option<BrigadeId>, token: &str| (id, token.to_string());
+
+        // One member.
+        assert_eq!(
+            state.members_phrase(&app, &[m(Some(2), "worker-2")]),
+            "worker-2 of \"Beta\""
+        );
+        // The Director is a member like any other.
+        assert_eq!(
+            state.members_phrase(&app, &[m(Some(1), "director")]),
+            "director of \"Alpha\""
+        );
+        // Several of one brigade: in the order given.
+        assert_eq!(
+            state.members_phrase(&app, &[m(Some(1), "worker-3"), m(Some(1), "worker-1")]),
+            "worker-3, worker-1 of \"Alpha\""
+        );
+        // Two brigades: grouped by first appearance, members in order.
+        assert_eq!(
+            state.members_phrase(
+                &app,
+                &[
+                    m(Some(2), "worker-2"),
+                    m(Some(1), "worker-1"),
+                    m(Some(2), "worker-4")
+                ]
+            ),
+            "worker-2, worker-4 of \"Beta\" and worker-1 of \"Alpha\""
+        );
+        // Three: separated by ';' since a group's own members use commas.
+        assert_eq!(
+            state.members_phrase(
+                &app,
+                &[
+                    m(Some(1), "worker-1"),
+                    m(Some(1), "worker-2"),
+                    m(Some(2), "worker-1"),
+                    m(Some(3), "director")
+                ]
+            ),
+            "worker-1, worker-2 of \"Alpha\"; worker-1 of \"Beta\" and director of \"Gamma\""
+        );
+        // No brigade known for a pane: it stands alone, as before.
+        assert_eq!(
+            state.members_phrase(&app, &[m(None, "worker-1")]),
+            "member worker-1"
+        );
+        // Nothing known about a brigade: its number, said once.
+        let bare = state_with_facts(vec![]);
+        assert_eq!(
+            bare.members_phrase(&app, &[m(Some(8), "worker-1"), m(Some(8), "worker-2")]),
+            "worker-1, worker-2 of brigade 8"
+        );
+    }
+
+    #[test]
+    fn the_kickoff_statuses_name_the_brigade_by_its_directors_title() {
+        let mut state = state_with_facts(vec![
+            name_facts(1, "Frozen A", Some("dir-a")),
+            name_facts(2, "Frozen B", Some("dir-b")),
+        ]);
+        let mut app = app_with(vec![
+            titled("dir-a", Some("Fix the relay draft guard")),
+            titled("dir-b", Some("Second task")),
+        ]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        let member = |state: &mut EmporiumState, key: &str, token: &str, brigade: BrigadeId| {
+            let key = key_of(key);
+            state.member_tokens.insert(key.clone(), token.to_string());
+            state.member_brigades.insert(key.clone(), brigade);
+            key
+        };
+        let (w1, w3, b1) = (
+            member(&mut state, "w1", "worker-1", 1),
+            member(&mut state, "w3", "worker-3", 1),
+            member(&mut state, "b1", "worker-1", 2),
+        );
+        for key in [&w1, &b1, &w3] {
+            state.pending_kickoffs.push(PendingKickoff {
+                key: key.clone(),
+                spawned_at: now,
+                cwd: PathBuf::from("/work"),
+                notified_untrusted: true,
+                sent_at: None,
+                attempts: 0,
+            });
+        }
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![],
+                brigades: vec![],
+            },
+            now,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some(
+                "kickoff: waiting for directory trust in worker-1, worker-3 of \"Fix the relay draft guard\" \
+                 and worker-1 of \"Second task\""
+            )
+        );
+
+        // The acknowledgement family (the trust one is gone from the list).
+        state.status = None;
+        state.status_set_at = None;
+        for pending in &mut state.pending_kickoffs {
+            pending.notified_untrusted = false;
+            pending.attempts = KICKOFF_MAX_ATTEMPTS;
+        }
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![],
+                brigades: vec![],
+            },
+            now + Duration::from_secs(1),
+        );
+        let status = state.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("kickoff: no acknowledgement after 3 attempts — worker-1, worker-3 of \"Fix the relay"),
+            "{status}"
+        );
+        assert!(
+            status.ends_with("and worker-1 of \"Second task\""),
+            "{status}"
+        );
+
+        // A pane with no brigade keeps the old fallback.
+        let lone = key_of("lone");
+        state
+            .member_tokens
+            .insert(lone.clone(), "worker-9".to_string());
+        assert_eq!(state.kickoff_label(&app, &lone), "member worker-9");
+    }
+
+    #[test]
+    fn the_single_member_trust_notices_use_the_same_wording_for_codex_and_claude() {
+        let mut state = state_with_facts(vec![name_facts(1, "Frozen", Some("dir"))]);
+        let mut app = app_with(vec![titled("dir", Some("Fix the relay draft guard"))]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        let worker = key_of("w1");
+        state
+            .member_tokens
+            .insert(worker.clone(), "worker-1".to_string());
+        state.member_brigades.insert(worker.clone(), 1);
+        state.pending_kickoffs.push(PendingKickoff {
+            key: worker.clone(),
+            spawned_at: now,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WorkerDirectoryTrustChecked {
+                key: worker,
+                trusted: false,
+            },
+            now,
+        );
+        assert_eq!(
+            state
+                .status
+                .as_deref()
+                .map(|s| s.split(" — ").next().unwrap()),
+            Some(
+                "worker-1 of \"Fix the relay draft guard\": Codex hasn't been told to trust this directory yet"
+            )
+        );
+
+        let goinkyo = key_of("g1");
+        state
+            .member_tokens
+            .insert(goinkyo.clone(), "goinkyo".to_string());
+        state.member_brigades.insert(goinkyo.clone(), 1);
+        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
+            key: goinkyo.clone(),
+            spawned_at: now,
+            cwd: PathBuf::from("/work"),
+            notified_untrusted: false,
+            sent_at: None,
+            attempts: 0,
+        });
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoDirectoryTrustChecked {
+                key: goinkyo,
+                trusted: false,
+            },
+            now,
+        );
+        assert!(
+            state.status.as_deref().is_some_and(|s| s
+                .starts_with("goinkyo of \"Fix the relay draft guard\": Claude hasn't been told")),
+            "{:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn the_relay_statuses_name_the_brigade_one_family_at_a_time() {
+        // Nudge: the status right after a nudge is typed.
+        let (mut state, _, brigade, director, start) = reading_fixture();
+        state
+            .brigade_names
+            .insert(1, name_facts(1, "Frozen", Some("a-dir")));
+        let mut app = app_with(vec![titled("a-dir", Some("Fix the relay draft guard"))]);
+        let seen = Seen {
+            agent: CLAUDE,
+            idle: Some(true),
+            has_unseen: true,
+        };
+        tick_obs(&mut state, &mut app, &brigade, &director, seen, start);
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            seen,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("relay: nudged director of \"Fix the relay draft guard\"")
+        );
+
+        // Cannot read the input line.
+        let (mut state, _, brigade, director, start) = reading_fixture();
+        state
+            .brigade_names
+            .insert(1, name_facts(1, "Frozen", Some("a-dir")));
+        let mut app = app_with(vec![titled("a-dir", Some("Fix the relay draft guard"))]);
+        let idle = Seen {
+            agent: CLAUDE,
+            idle: Some(true),
+            has_unseen: false,
+        };
+        tick_obs(&mut state, &mut app, &brigade, &director, idle, start);
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            idle,
+            start + INPUT_LINE_UNREADABLE_AFTER,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some(
+                "relay: cannot read the input line of director of \"Fix the relay draft guard\" — \
+                 unsent-draft detection is back to keystroke tracking"
+            )
+        );
+    }
+
+    /// A tick for the fixture's Director carrying `glance`.
+    fn tick_with_glance(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        glance: Option<MemberGlance>,
+        now: Instant,
+    ) {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: vec![RelayObservation {
+                    glance,
+                    brigade_id: 1,
+                    token: "director".to_string(),
+                    key: key.clone(),
+                    has_unseen: true,
+                    is_idle_this_tick: Some(true),
+                    agent: CLAUDE,
+                }],
+                brigades: Vec::new(),
+            },
+            now,
+        );
+    }
+
+    fn said_by(sender: Option<&str>, line: &str) -> MemberGlance {
+        MemberGlance {
+            inbound: Some(MessageGlance {
+                created_at_ms: 1,
+                line: line.to_string(),
+                from_token: sender.map(str::to_string),
+            }),
+            sent: None,
+        }
+    }
+
+    /// The status the second of two idle ticks leaves, when that second
+    /// tick's observation carries `glance`.
+    fn nudge_status_with(glance: Option<MemberGlance>) -> String {
+        let (mut state, _, brigade, director, start) = reading_fixture();
+        state
+            .brigade_names
+            .insert(1, name_facts(1, "Frozen", Some("a-dir")));
+        let mut app = app_with(vec![titled("a-dir", Some("Fix the relay draft guard"))]);
+        tick_with_glance(&mut state, &mut app, &brigade, &director, None, start);
+        tick_with_glance(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            glance,
+            start + Duration::from_secs(1),
+        );
+        state.status.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn the_nudge_status_quotes_the_sender_and_first_line_of_the_message_that_prompted_it() {
+        let status = nudge_status_with(Some(said_by(
+            Some("worker-3"),
+            "stage 2 is done in the working tree",
+        )));
+        assert_eq!(
+            status,
+            "relay: nudged director of \"Fix the relay draft guard\" \u{2190} worker-3: stage 2 is done in the working tree"
+        );
+    }
+
+    #[test]
+    fn the_glance_of_the_very_tick_that_nudges_is_the_one_quoted() {
+        // The member's facts are filled at the top of `update_tick`, before the
+        // nudge decision: the first tick (idle streak 1) carried an older
+        // message, the second (the nudging one) a newer, and the status quotes
+        // the newer.
+        let (mut state, _, brigade, director, start) = reading_fixture();
+        let mut app = app_with(vec![]);
+        tick_with_glance(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(said_by(Some("worker-1"), "the old one")),
+            start,
+        );
+        tick_with_glance(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(said_by(Some("worker-2"), "the one that just arrived")),
+            start + Duration::from_secs(1),
+        );
+        let status = state.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("relay: nudged director of brigade 1"),
+            "{status}"
+        );
+        assert!(
+            status.ends_with("\u{2190} worker-2: the one that just arrived"),
+            "{status}"
+        );
+        // A tick that re-reads nothing (`glance: None`) quotes what the core held.
+        let (mut state, _, brigade, director, start) = reading_fixture();
+        let mut app = app_with(vec![]);
+        tick_with_glance(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(said_by(Some("worker-1"), "kept")),
+            start,
+        );
+        tick_with_glance(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            None,
+            start + Duration::from_secs(1),
+        );
+        assert!(
+            state
+                .status
+                .clone()
+                .unwrap_or_default()
+                .ends_with("\u{2190} worker-1: kept")
+        );
+    }
+
+    #[test]
+    fn the_nudge_status_is_the_short_form_when_there_is_nothing_to_quote() {
+        let short = "relay: nudged director of \"Fix the relay draft guard\"";
+        // No glance at all.
+        assert_eq!(nudge_status_with(None), short);
+        // A glance with no inbound half.
+        assert_eq!(nudge_status_with(Some(MemberGlance::default())), short);
+        // A message whose first line is empty: never an arrow with nothing after it.
+        assert_eq!(
+            nudge_status_with(Some(said_by(Some("worker-3"), ""))),
+            short
+        );
+        assert_eq!(
+            nudge_status_with(Some(said_by(Some("worker-3"), "  \t "))),
+            short
+        );
+        // A sender that is not recorded (older data): the line alone.
+        assert_eq!(
+            nudge_status_with(Some(said_by(None, "no sender here"))),
+            format!("{short} \u{2190} no sender here")
+        );
+    }
+
+    #[test]
+    fn the_quoted_line_is_cut_by_display_width_to_sixty_columns() {
+        let width = |text: &str| unicode_width::UnicodeWidthStr::width(text);
+        let quoted = |line: &str| {
+            let status = nudge_status_with(Some(said_by(Some("worker-3"), line)));
+            let (_, tail) = status.split_once(" \u{2190} worker-3: ").expect("an arrow");
+            tail.to_string()
+        };
+
+        let long = quoted(&"a".repeat(200));
+        assert_eq!(width(&long), 60);
+        assert_eq!(long, format!("{}\u{2026}", "a".repeat(59)));
+        // Exactly 60 stays whole.
+        assert_eq!(quoted(&"b".repeat(60)), "b".repeat(60));
+        // Wide characters: two columns each, never split, ellipsis included.
+        let wide = quoted(&"\u{30c6}".repeat(60));
+        assert!(width(&wide) <= 60, "{wide:?}");
+        assert!(wide.ends_with('\u{2026}'));
+        assert_eq!(wide.chars().filter(|c| *c == '\u{30c6}').count(), 29);
+    }
+
+    #[test]
+    fn a_glance_recorded_without_a_sender_still_parses() {
+        let old: MessageGlance =
+            serde_json::from_str(r#"{"created_at_ms":5,"line":"hello"}"#).unwrap();
+        assert_eq!(old.from_token, None);
+        let new = MessageGlance {
+            created_at_ms: 5,
+            line: "hi".to_string(),
+            from_token: Some("worker-2".to_string()),
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert_eq!(serde_json::from_str::<MessageGlance>(&json).unwrap(), new);
+    }
+
+    #[test]
+    fn the_holding_status_groups_members_of_two_brigades_in_the_order_first_seen() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let panes: Vec<(SessionKey, &str, BrigadeId)> = vec![
+            (key_of("a1"), "worker-1", 1),
+            (key_of("b2"), "worker-2", 2),
+            (key_of("a3"), "worker-3", 1),
+        ];
+        for (key, token, brigade_id) in &panes {
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+            state.member_tokens.insert(key.clone(), token.to_string());
+            state.member_brigades.insert(key.clone(), *brigade_id);
+            state.unsent_operator_input.insert(key.clone());
+        }
+        state
+            .brigade_names
+            .insert(1, name_facts(1, "Frozen", Some("dir-a")));
+        state
+            .brigade_names
+            .insert(2, name_facts(2, "Frozen", Some("dir-b")));
+        let mut app = app_with(vec![
+            titled("dir-a", Some("A task")),
+            titled("dir-b", Some("B task")),
+        ]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        let relay = |at: Duration| {
+            let obs: Vec<RelayObservation> = panes
+                .iter()
+                .map(|(key, token, brigade_id)| RelayObservation {
+                    glance: None,
+                    brigade_id: *brigade_id,
+                    token: token.to_string(),
+                    key: key.clone(),
+                    has_unseen: true,
+                    is_idle_this_tick: Some(true),
+                    agent: None,
+                })
+                .collect();
+            (obs, now + at)
+        };
+        for second in 0..2 {
+            let (obs, at) = relay(Duration::from_secs(second));
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Tick {
+                    relay: obs,
+                    brigades: vec![],
+                },
+                at,
+            );
+        }
+        assert_eq!(
+            state.status.as_deref(),
+            Some(
+                "relay: holding the nudge to worker-1, worker-3 of \"A task\" and worker-2 of \"B task\" \
+                 — unsent input in the pane"
+            )
+        );
+    }
+
+    #[test]
+    fn old_tick_captures_without_brigade_facts_still_parse_and_new_ones_round_trip() {
+        let old: Event = serde_json::from_str(r#"{"Tick":{"relay":[]}}"#).unwrap();
+        assert_eq!(
+            old,
+            Event::Tick {
+                relay: vec![],
+                brigades: vec![]
+            }
+        );
+
+        let new = Event::Tick {
+            relay: vec![],
+            brigades: vec![
+                name_facts(3, "A title", Some("dir")),
+                name_facts(4, "No director", None),
+            ],
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), new);
+    }
+
     #[test]
     fn the_new_event_fields_round_trip_and_older_captures_still_parse() {
         let loaded = Event::SidebarWidthLoaded { width: Some(44) };
@@ -15978,7 +17131,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -15993,6 +17149,7 @@ mod tests {
         MessageGlance {
             created_at_ms: at_ms,
             line: line.to_string(),
+            from_token: None,
         }
     }
 
@@ -16020,7 +17177,16 @@ mod tests {
         relay: Vec<RelayObservation>,
         now: Instant,
     ) {
-        update(state, app, brigade, Event::Tick { relay }, now);
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay,
+                brigades: Vec::new(),
+            },
+            now,
+        );
     }
 
     #[test]
@@ -16308,7 +17474,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         // Low enough to be over w3 both with two stack tiles and with three.
@@ -16437,7 +17606,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -16515,7 +17687,16 @@ mod tests {
                 "a modal opening",
                 Box::new(|state, app, brigade, now| {
                     app.open_new_session_modal();
-                    update(state, app, brigade, Event::Tick { relay: vec![] }, now);
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::Tick {
+                            relay: vec![],
+                            brigades: Vec::new(),
+                        },
+                        now,
+                    );
                 }),
             ),
             (
@@ -16537,7 +17718,16 @@ mod tests {
                 "the tile being moved going away",
                 Box::new(|state, app, brigade, now| {
                     state.unstage(&SessionKey::from_id("w2"));
-                    update(state, app, brigade, Event::Tick { relay: vec![] }, now);
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::Tick {
+                            relay: vec![],
+                            brigades: Vec::new(),
+                        },
+                        now,
+                    );
                 }),
             ),
         ];
@@ -16622,7 +17812,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -16645,7 +17838,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert_eq!(state.brigade_layouts[&1], layout_before);
@@ -16748,7 +17944,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -16804,7 +18003,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -17486,7 +18688,16 @@ mod tests {
                 "a modal opening",
                 Box::new(|state, app, brigade, now| {
                     app.open_new_session_modal();
-                    update(state, app, brigade, Event::Tick { relay: vec![] }, now);
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::Tick {
+                            relay: vec![],
+                            brigades: Vec::new(),
+                        },
+                        now,
+                    );
                 }),
             ),
             (
@@ -17534,7 +18745,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -17549,7 +18763,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         update(
@@ -17673,7 +18890,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now + Duration::from_secs(60),
         );
         assert_eq!(
@@ -17717,7 +18937,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         state.stage = Stage::Brigade {
@@ -17888,7 +19111,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now + RELAY_SUBMIT_DELAY,
         );
 
@@ -17959,6 +19185,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -17969,6 +19196,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation()],
+                brigades: Vec::new(),
             },
             now,
         );
@@ -18017,7 +19245,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert!(
@@ -18035,7 +19266,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
         assert_eq!(
@@ -18857,7 +20091,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             spawned_at + GOINKYO_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
         );
         assert!(cmds.is_empty(), "not quiet long enough yet");
@@ -18867,7 +20104,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             spawned_at + GOINKYO_KICKOFF_QUIET_PERIOD,
         );
         assert_eq!(
@@ -19064,7 +20304,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
         );
         assert_eq!(
@@ -19294,7 +20537,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + RELAY_SUBMIT_DELAY,
         );
         let [
@@ -19361,7 +20607,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             t0 + RELAY_SUBMIT_DELAY,
         );
         let [
@@ -19804,7 +21053,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             armed_at + PREFIX_ARM_TIMEOUT,
         );
 
@@ -19823,7 +21075,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             armed_at + Duration::from_secs(1),
         );
 
@@ -20368,7 +21623,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: vec![] },
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             now,
         );
 
@@ -21248,7 +22506,10 @@ mod tests {
             state,
             app,
             brigade,
-            Event::Tick { relay: Vec::new() },
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
             test_instant(),
         )
     }
@@ -21568,7 +22829,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: Vec::new() },
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
             now,
         );
         let cmds = update(
@@ -21607,7 +22871,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick { relay: Vec::new() },
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
             now,
         );
 

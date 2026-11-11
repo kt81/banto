@@ -203,7 +203,10 @@ mod tests {
             },
             TimedEvent {
                 offset_ms: 100,
-                event: Event::Tick { relay: vec![] },
+                event: Event::Tick {
+                    relay: vec![],
+                    brigades: Vec::new(),
+                },
             },
         ];
         let text = stream(&events);
@@ -280,7 +283,10 @@ mod tests {
         };
         let tick = |offset_ms| TimedEvent {
             offset_ms,
-            event: Event::Tick { relay: vec![] },
+            event: Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
         };
 
         // STATUS_TIMEOUT is exactly 5000ms: 1ms short of it, the status

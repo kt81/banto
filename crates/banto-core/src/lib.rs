@@ -17,6 +17,7 @@
 
 pub mod app;
 pub mod config;
+pub mod display_text;
 pub mod engine;
 pub mod input;
 pub mod input_line;

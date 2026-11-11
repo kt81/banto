@@ -20,6 +20,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 # The width ratatui clips a tile's title by (`title_columns`). Pure.
 unicode-width = "0.2.2"
+# Grapheme clusters, so a cut to width never separates a letter from its
+# combining mark or half a flag (`display_text::shorten_to_columns`). Pure.
+unicode-segmentation = "1.13.3"
 vt100 = { version = "0.16.9", package = "vt100-psmux" }
 
 [dev-dependencies]

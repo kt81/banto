@@ -25,6 +25,7 @@ use std::time::SystemTime;
 use rusqlite::types::Type;
 use rusqlite::{OptionalExtension, params};
 
+use banto_core::display_text::display_safe;
 use banto_core::model::{
     AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
     MessageGlance, SessionId, StoredLayout, StoredMemberLayout,
@@ -663,7 +664,15 @@ impl Store {
     /// The newest message in `brigade_id` that `member_token` (of
     /// `recipient_role`) can receive — addressed to its role and either a
     /// broadcast or to it by name, the same visibility rule as
-    /// [`Self::fetch_brigade_messages`] — reduced to a one-line glance.
+    /// [`Self::fetch_brigade_messages`] — reduced to a one-line glance, with
+    /// its sender's token.
+    ///
+    /// Not bounded by the read cursor, on purpose and without cost to the
+    /// nudge: whenever [`Self::has_unseen_brigade_messages`] is true some
+    /// matching message is past the cursor, and the newest matching message
+    /// has an id at least as large, so it is past the cursor too — it is
+    /// *the* newest unread one. Once everything is read this is the newest
+    /// read one, which is what the collapsed tile shows.
     ///
     /// Read-only and never touches the read cursor: what the operator glances
     /// at on a collapsed tile must not count as the member having read it.
@@ -674,7 +683,8 @@ impl Store {
         recipient_role: BrigadeRole,
     ) -> Result<Option<MessageGlance>, StoreError> {
         self.glance(
-            "SELECT substr(ltrim(body, char(9, 10, 11, 12, 13, 32)), 1, ?4), created_at_ms
+            "SELECT substr(ltrim(body, char(9, 10, 11, 12, 13, 32)), 1, ?4), created_at_ms,
+                    from_session
              FROM brigade_messages
              WHERE brigade_id = ?1 AND to_role = ?2
                AND (to_member IS NULL OR to_member = ?3)
@@ -696,7 +706,8 @@ impl Store {
         member_token: &str,
     ) -> Result<Option<MessageGlance>, StoreError> {
         self.glance(
-            "SELECT substr(ltrim(body, char(9, 10, 11, 12, 13, 32)), 1, ?3), created_at_ms
+            "SELECT substr(ltrim(body, char(9, 10, 11, 12, 13, 32)), 1, ?3), created_at_ms,
+                    from_session
              FROM brigade_messages
              WHERE brigade_id = ?1 AND from_session = ?2
              ORDER BY id DESC LIMIT 1",
@@ -725,12 +736,17 @@ impl Store {
         let row = self
             .conn
             .query_row(sql, params, |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .optional()?;
-        Ok(row.map(|(body, created_at_ms)| MessageGlance {
+        Ok(row.map(|(body, created_at_ms, from_token)| MessageGlance {
             created_at_ms,
             line: glance_line(&body),
+            from_token: Some(from_token),
         }))
     }
 
@@ -777,67 +793,17 @@ const GLANCE_READ_CHARS: i64 = 4096;
 /// display width on top of this.
 const GLANCE_LINE_CHARS: usize = 200;
 
-/// Whether `c` is a Unicode *format* character (general category Cf):
-/// invisible characters that change how neighbouring text is laid out or
-/// padded rather than drawing anything — bidirectional overrides and isolates
-/// that reorder what is shown, zero-width spaces and joiners, the BOM, soft
-/// hyphen, tag characters.
-///
-/// An explicit table rather than a classifier because nothing already in the
-/// dependency tree exposes general categories (`char` has `is_control`, which
-/// is Cc only; `unicode-width` and `unicode-segmentation` answer other
-/// questions), and a dependency for one table is not worth it. The ranges are
-/// the Cf entries of `UnicodeData.txt` as of Unicode 16.0. A later Unicode
-/// version can add a few; the failure is then one stray invisible character,
-/// not a way to steer the terminal (control characters are filtered by
-/// `char::is_control`, independently). Characters that are invisible but not
-/// Cf — the Hangul and braille blanks, for one — are deliberately left alone.
-fn is_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061C}'
-            | '\u{06DD}'
-            | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-    )
-}
-
 /// A message body reduced to one line for a collapsed tile: its first
 /// non-empty line, with control characters and Unicode format characters
 /// removed (a tab counts as a space) and surrounding whitespace trimmed, cut
 /// to [`GLANCE_LINE_CHARS`] characters. Done where the text leaves the store,
 /// so nothing a member wrote — an escape sequence, a stray newline, a bidi
 /// override that would reorder the row, zero-width padding — can steer how
-/// the strip is drawn.
+/// the strip is drawn. The reduction itself is `banto_core::display_text::display_safe`,
+/// the one policy for text someone else wrote.
 pub fn glance_line(body: &str) -> String {
     body.split('\n')
-        .map(|line| {
-            line.chars()
-                .filter_map(|c| match c {
-                    '\t' => Some(' '),
-                    c if c.is_control() || is_format_char(c) => None,
-                    c => Some(c),
-                })
-                .collect::<String>()
-        })
-        .map(|line| line.trim().to_string())
+        .map(|line| display_safe(line).trim().to_string())
         .find(|line| !line.is_empty())
         .map(|line| line.chars().take(GLANCE_LINE_CHARS).collect())
         .unwrap_or_default()
@@ -1698,6 +1664,150 @@ mod tests {
     }
 
     #[test]
+    fn the_inbound_glance_names_its_sender_and_the_sent_glance_the_member_itself() {
+        let store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("a").unwrap();
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "from the boss")
+            .unwrap();
+        store
+            .enqueue_brigade_message(
+                br,
+                "worker-2",
+                BrigadeRole::Worker,
+                Some("worker-1"),
+                "psst",
+            )
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "worker-1", BrigadeRole::Director, None, "done")
+            .unwrap();
+
+        let to_one = store
+            .latest_inbound_glance(br, "worker-1", BrigadeRole::Worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (to_one.line.as_str(), to_one.from_token.as_deref()),
+            ("psst", Some("worker-2"))
+        );
+        let to_two = store
+            .latest_inbound_glance(br, "worker-2", BrigadeRole::Worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            to_two.from_token.as_deref(),
+            Some("director"),
+            "the broadcast, from the director"
+        );
+        let to_director = store
+            .latest_inbound_glance(br, "director", BrigadeRole::Director)
+            .unwrap()
+            .unwrap();
+        assert_eq!(to_director.from_token.as_deref(), Some("worker-1"));
+        let sent = store.latest_sent_glance(br, "worker-1").unwrap().unwrap();
+        assert_eq!(sent.from_token.as_deref(), Some("worker-1"));
+    }
+
+    #[test]
+    fn whenever_a_member_has_unseen_mail_its_inbound_glance_is_the_newest_unread_message() {
+        // The nudge quotes the glance; the trigger is `has_unseen`. They use
+        // the same addressing, and the glance is unbounded by the cursor, so
+        // the newest matching message is unread whenever anything is.
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("a").unwrap();
+        let workers = ["worker-1", "worker-2", "worker-3"];
+        let mut n = 0;
+        // A deterministic mix of broadcasts, addressed sends to each worker,
+        // mail to the Director, and fetches in between.
+        for step in 0..60 {
+            n += 1;
+            let body = format!("message {n}");
+            match step % 7 {
+                0 | 3 => store
+                    .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, &body)
+                    .unwrap(),
+                1 | 4 => store
+                    .enqueue_brigade_message(
+                        br,
+                        "director",
+                        BrigadeRole::Worker,
+                        Some(workers[step % 3]),
+                        &body,
+                    )
+                    .unwrap(),
+                2 => store
+                    .enqueue_brigade_message(
+                        br,
+                        workers[step % 3],
+                        BrigadeRole::Director,
+                        None,
+                        &body,
+                    )
+                    .unwrap(),
+                _ => {
+                    store
+                        .fetch_brigade_messages(br, workers[step % 3], BrigadeRole::Worker)
+                        .unwrap();
+                    0
+                }
+            };
+            for token in workers {
+                let unseen = store
+                    .has_unseen_brigade_messages(br, token, BrigadeRole::Worker)
+                    .unwrap();
+                let glance = store
+                    .latest_inbound_glance(br, token, BrigadeRole::Worker)
+                    .unwrap();
+                if unseen {
+                    // What a fetch would hand over, newest last — without
+                    // consuming it: read it on a scratch copy of the cursor.
+                    let newest_unread = unread_newest(&mut store, br, token);
+                    assert_eq!(
+                        glance.map(|g| g.line),
+                        Some(newest_unread),
+                        "step {step}, {token}: the glance must be the newest unread message"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The newest message `token` has not read, found by fetching and then
+    /// restoring the cursor.
+    fn unread_newest(store: &mut Store, br: BrigadeId, token: &str) -> String {
+        let before: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT last_seen_id FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+                params![br, token],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let fetched = store
+            .fetch_brigade_messages(br, token, BrigadeRole::Worker)
+            .unwrap();
+        match before {
+            Some(id) => store
+                .conn
+                .execute(
+                    "UPDATE brigade_cursors SET last_seen_id = ?3 WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token, id],
+                )
+                .unwrap(),
+            None => store
+                .conn
+                .execute(
+                    "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token],
+                )
+                .unwrap(),
+        };
+        glance_line(&fetched.last().expect("something was unseen").body)
+    }
+
+    #[test]
     fn the_sent_glance_is_the_newest_message_that_member_sent_in_that_brigade() {
         let store = Store::open_in_memory().unwrap();
         let a = store.create_brigade("a").unwrap();
@@ -1889,34 +1999,6 @@ mod tests {
     }
 
     #[test]
-    fn the_format_character_table_covers_its_range_ends_and_nothing_just_outside() {
-        for (first, last) in [
-            ('\u{200B}', '\u{200F}'),
-            ('\u{202A}', '\u{202E}'),
-            ('\u{2060}', '\u{2064}'),
-            ('\u{2066}', '\u{206F}'),
-            ('\u{E0020}', '\u{E007F}'),
-        ] {
-            assert!(
-                is_format_char(first) && is_format_char(last),
-                "{first:?}..{last:?}"
-            );
-            let before = char::from_u32(first as u32 - 1).unwrap();
-            let after = char::from_u32(last as u32 + 1).unwrap();
-            assert!(!is_format_char(before), "{before:?}");
-            assert!(!is_format_char(after), "{after:?}");
-        }
-        for c in ['\u{AD}', '\u{FEFF}', '\u{180E}', '\u{61C}'] {
-            assert!(is_format_char(c), "{c:?}");
-        }
-        // Not format characters: letters, digits, a no-break space, the
-        // Hangul filler (Lo) and the braille blank (So) are left alone.
-        for c in ['a', '7', '\u{a0}', '\u{3164}', '\u{2800}', '\u{3042}'] {
-            assert!(!is_format_char(c), "{c:?}");
-        }
-    }
-
-    #[test]
     fn the_glance_finds_the_first_line_after_any_amount_of_leading_whitespace() {
         let store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("a").unwrap();
@@ -2013,6 +2095,15 @@ mod tests {
             }
         }
         let per_tick = start.elapsed() / ticks;
+        // What the relay adds per tick for a member with unseen mail: its
+        // inbound half only (the sent half is kept by the gate).
+        let start = std::time::Instant::now();
+        for _ in 0..ticks {
+            for (br, token, role) in members {
+                std::hint::black_box(store.latest_inbound_glance(br, token, role).unwrap());
+            }
+        }
+        let inbound_only = start.elapsed() / ticks;
         let start = std::time::Instant::now();
         for _ in 0..ticks {
             std::hint::black_box(store.max_brigade_message_id().unwrap());
@@ -2031,6 +2122,7 @@ mod tests {
         let never = start.elapsed() / ticks;
         println!(
             "glance reads, 6000 messages / 6 brigades: 3 members {per_tick:?} per tick; \
+             inbound half only, 3 members {inbound_only:?}; \
              one never-matching member {never:?}; MAX(id) gate {gate:?}"
         );
     }

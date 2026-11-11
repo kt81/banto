@@ -47,9 +47,9 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
-    self, Axis, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost, GoinkyoObservation,
-    GoinkyoSpawnCandidate, GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage,
-    StoreIntent,
+    self, Axis, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
+    GoinkyoObservation, GoinkyoSpawnCandidate, GroupJoinTargetData, PrefixKey, RelayObservation,
+    SessionKey, Stage, StoreIntent,
 };
 use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
@@ -776,7 +776,8 @@ fn event_loop(
                 Some(&mut tick_timings),
                 &mut glance_gate,
             );
-            events.push_back(Event::Tick { relay });
+            let brigades = std::mem::take(&mut glance_gate.brigades);
+            events.push_back(Event::Tick { relay, brigades });
             let observation =
                 gather_goinkyo_observation(&state, deps.store, app, Some(&mut tick_timings));
             events.push_back(Event::GoinkyoAwaitingSpawn { observation });
@@ -2059,6 +2060,11 @@ fn gather_relay_observations(
     mut timings: Option<&mut TickTimings>,
     glance_gate: &mut GlanceGate,
 ) -> Vec<RelayObservation> {
+    // Before anything that can return: the loop forwards whatever the gate
+    // holds after the call, so a tick that bails out must not leave the
+    // previous tick's brigade facts behind — a brigade disbanded in between
+    // would be handed to the core again, and named in a status, a second late.
+    glance_gate.begin_tick();
     let roster_start = Instant::now();
     let brigades = match store.borrow().list_brigades() {
         Ok(brigades) => brigades,
@@ -2092,7 +2098,6 @@ fn gather_relay_observations(
         t.relay_claude_snapshot += claude_snapshot_start.elapsed();
     }
     let mut observations = Vec::new();
-    glance_gate.begin_tick();
     // One rowid lookup per tick: while no message has been appended, no
     // member's glance can have a new answer, so none is re-read.
     let glance_start = Instant::now();
@@ -2109,6 +2114,18 @@ fn gather_relay_observations(
         if let Some(t) = timings.as_deref_mut() {
             t.relay_roster += roster_start.elapsed();
         }
+        // What names this brigade to the operator, from the roster just read:
+        // no further query. A brigade whose roster could not be read is not
+        // listed (core keeps what it had).
+        glance_gate.brigades.push(BrigadeNameFacts {
+            brigade_id: brigade.id,
+            name: brigade.name.clone(),
+            director_session: members
+                .iter()
+                .find(|member| member.role == BrigadeRole::Director)
+                .and_then(|member| member.session_id.as_ref())
+                .map(|session| session.0.clone()),
+        });
         for member in &members {
             let Some(session_id) = member.session_id.as_ref() else {
                 continue;
@@ -2170,11 +2187,14 @@ fn gather_relay_observations(
             let glance_start = Instant::now();
             let glance = glance_gate.read(
                 &store.borrow(),
-                brigade.id,
-                &member.token,
-                &session_id.0,
-                member.role,
+                GlanceMember {
+                    brigade_id: brigade.id,
+                    token: &member.token,
+                    session_id: &session_id.0,
+                    role: member.role,
+                },
                 newest_message,
+                has_unseen,
             );
             if let Some(t) = timings.as_deref_mut() {
                 t.relay_glance += glance_start.elapsed();
@@ -3139,6 +3159,13 @@ struct TickTimings {
 /// next to the other per-run shell state; the core never sees it (it keeps the
 /// glances themselves, `engine::MemberFacts`).
 ///
+/// Two answers are not gated. A member with unseen mail has its inbound glance
+/// read every tick: the relay may nudge it in this very tick and quote that
+/// mail, and any comparison of message ids leaves a window in which a message
+/// arrives between the comparison and the read. (The sent glance of such a
+/// member is still gated, from the copy kept here.) And with no newest id at
+/// all — the lookup failed — everything is read.
+///
 /// Measured on a synthetic store of 6000 messages over 6 brigades: the two
 /// reads for three members cost about 0.6 ms, and a member nobody has ever
 /// written to or heard from about 0.4 ms on its own (no index on
@@ -3146,18 +3173,45 @@ struct TickTimings {
 /// second. The gate is one 40 us rowid lookup.
 #[derive(Default)]
 struct GlanceGate {
-    /// Per member: the newest message id and the session it was read for. A
-    /// token is reused after a dismissal, so the session is part of the
-    /// identity: a new Worker under an old token is a new member.
-    read_at: HashMap<(BrigadeId, MemberToken), (i64, String)>,
+    /// Per member: what was read for it last. A token is reused after a
+    /// dismissal, so the session is part of the identity: a new Worker under
+    /// an old token is a new member.
+    read_at: HashMap<(BrigadeId, MemberToken), GlanceRead>,
     /// The members [`Self::read`] was asked about since [`Self::begin_tick`].
     visited: HashSet<(BrigadeId, MemberToken)>,
+    /// What this tick's gather read about each brigade it visited (name and
+    /// Director session); the loop takes it for the `Tick`. Lives here only
+    /// because this is the one value `gather_relay_observations` already
+    /// threads through for the tick's own memory.
+    brigades: Vec<BrigadeNameFacts>,
+}
+
+/// What [`GlanceGate`] remembers of one member's last read.
+struct GlanceRead {
+    /// The newest message id of the tick it was read in — never newer than
+    /// what the read could see, so a message that lands mid-read is read
+    /// again next tick rather than skipped.
+    newest_message: i64,
+    session_id: String,
+    /// The sent half, kept so a member whose inbound half is re-read every
+    /// tick (it has unseen mail) does not also re-read this one.
+    sent: Option<MessageGlance>,
+}
+
+/// Who a glance is read for.
+struct GlanceMember<'a> {
+    brigade_id: BrigadeId,
+    token: &'a str,
+    session_id: &'a str,
+    role: BrigadeRole,
 }
 
 impl GlanceGate {
-    /// Start a tick's visits (see [`Self::end_tick`]).
+    /// Start a tick's visits (see [`Self::end_tick`]), and forget what the
+    /// previous tick read about brigades.
     fn begin_tick(&mut self) {
         self.visited.clear();
+        self.brigades.clear();
     }
 
     /// Drop every entry for a member this tick did not visit — dismissed,
@@ -3169,33 +3223,51 @@ impl GlanceGate {
         self.read_at.retain(|id, _| visited.contains(id));
     }
 
-    /// The member's glance if it needs reading: never read yet, or a message
-    /// has been appended since. `None` means "nothing new": the core keeps
-    /// what it holds. A failed read also answers `None` and is retried next
-    /// tick, so a transient error never blanks a tile.
+    /// The member's glance if it needs reading: never read yet, a message has
+    /// been appended since, or `has_unseen` (see the type's doc). `None` means
+    /// "nothing new": the core keeps what it holds. A failed read also answers
+    /// `None` and is retried next tick, so a transient error never blanks a
+    /// tile.
     fn read(
         &mut self,
         store: &Store,
-        brigade_id: BrigadeId,
-        token: &str,
-        session_id: &str,
-        role: BrigadeRole,
+        member: GlanceMember<'_>,
         newest_message: Option<i64>,
+        has_unseen: bool,
     ) -> Option<MemberGlance> {
+        let GlanceMember {
+            brigade_id,
+            token,
+            session_id,
+            role,
+        } = member;
         let id = (brigade_id, token.to_string());
         self.visited.insert(id.clone());
-        if let Some(newest) = newest_message
-            && self
-                .read_at
-                .get(&id)
-                .is_some_and(|(read, session)| *read == newest && session == session_id)
-        {
+        let known_sent = match (newest_message, self.read_at.get(&id)) {
+            (Some(newest), Some(read))
+                if read.newest_message == newest && read.session_id == session_id =>
+            {
+                Some(read.sent.clone())
+            }
+            _ => None,
+        };
+        if known_sent.is_some() && !has_unseen {
             return None;
         }
         let inbound = store.latest_inbound_glance(brigade_id, token, role).ok()?;
-        let sent = store.latest_sent_glance(brigade_id, token).ok()?;
-        if let Some(newest) = newest_message {
-            self.read_at.insert(id, (newest, session_id.to_string()));
+        let sent = match known_sent {
+            Some(sent) => sent,
+            None => store.latest_sent_glance(brigade_id, token).ok()?,
+        };
+        if let Some(newest_message) = newest_message {
+            self.read_at.insert(
+                id,
+                GlanceRead {
+                    newest_message,
+                    session_id: session_id.to_string(),
+                    sent: sent.clone(),
+                },
+            );
         }
         Some(MemberGlance { inbound, sent })
     }
@@ -3953,11 +4025,9 @@ mod tests {
         let read = |gate: &mut GlanceGate, store: &Store, token: &str| {
             gate.read(
                 store,
-                brigade,
-                token,
-                "session-a",
-                BrigadeRole::Worker,
+                worker_of(brigade, token, "session-a"),
                 store.max_brigade_message_id().ok(),
+                false,
             )
         };
 
@@ -3987,11 +4057,9 @@ mod tests {
         let blind = |gate: &mut GlanceGate| {
             gate.read(
                 &store,
-                brigade,
-                "worker-1",
-                "session-a",
-                BrigadeRole::Worker,
+                worker_of(brigade, "worker-1", "session-a"),
                 None,
+                false,
             )
         };
         assert!(blind(&mut gate).is_some());
@@ -4005,11 +4073,9 @@ mod tests {
         assert!(
             gate.read(
                 &store,
-                brigade,
-                "worker-1",
-                "session-b",
-                BrigadeRole::Worker,
-                newest
+                worker_of(brigade, "worker-1", "session-b"),
+                newest,
+                false
             )
             .is_some()
         );
@@ -4036,8 +4102,11 @@ mod tests {
 
         gather(&mut gate);
         assert_eq!(remembered(&gate), ["director", "worker-1"]);
+        // Settled: only the Director, who still has unseen mail, is read again.
         assert!(
-            gather(&mut gate).iter().all(|o| o.glance.is_none()),
+            gather(&mut gate)
+                .iter()
+                .all(|o| o.glance.is_none() == !o.has_unseen),
             "settled"
         );
 
@@ -4072,6 +4141,207 @@ mod tests {
         );
     }
 
+    fn worker_of<'a>(brigade: BrigadeId, token: &'a str, session: &'a str) -> GlanceMember<'a> {
+        GlanceMember {
+            brigade_id: brigade,
+            token,
+            session_id: session,
+            role: BrigadeRole::Worker,
+        }
+    }
+
+    #[test]
+    fn a_member_with_unseen_mail_has_its_inbound_glance_read_every_tick_whatever_the_ids_say() {
+        let store = Store::open_in_memory().unwrap();
+        let brigade = store.create_brigade("cell").unwrap();
+        let send = |from: &str, to_role, body: &str| {
+            store
+                .enqueue_brigade_message(brigade, from, to_role, None, body)
+                .unwrap()
+        };
+        send("director", BrigadeRole::Worker, "first");
+        send("worker-1", BrigadeRole::Director, "reply");
+        let newest = store.max_brigade_message_id().ok();
+        let mut gate = GlanceGate::default();
+        let read = |gate: &mut GlanceGate, has_unseen| {
+            gate.read(
+                &store,
+                worker_of(brigade, "worker-1", "s"),
+                newest,
+                has_unseen,
+            )
+        };
+
+        let first = read(&mut gate, true).expect("never read");
+        assert_eq!(
+            first.inbound.as_ref().map(|g| g.line.as_str()),
+            Some("first")
+        );
+        assert_eq!(first.sent.as_ref().map(|g| g.line.as_str()), Some("reply"));
+
+        // The very same newest id: nothing unseen, the gate still skips...
+        assert_eq!(read(&mut gate, false), None);
+        // ...but with unseen mail the inbound half is read again, and picks up
+        // a message the stale `newest` does not know about.
+        send("director", BrigadeRole::Worker, "landed just now");
+        let again = read(&mut gate, true).expect("unseen mail: read, ids equal or not");
+        assert_eq!(
+            again.inbound.as_ref().map(|g| g.line.as_str()),
+            Some("landed just now")
+        );
+        // The sent half came from what the gate kept, not from a second query.
+        assert_eq!(again.sent, first.sent);
+        // And it is still skipped once nothing is unseen. (The stale id: a
+        // message that landed mid-gather is read next tick, when the id moves.)
+        assert_eq!(read(&mut gate, false), None);
+        let moved = store.max_brigade_message_id().ok();
+        assert!(
+            gate.read(&store, worker_of(brigade, "worker-1", "s"), moved, false)
+                .is_some(),
+            "the id moved: read afresh"
+        );
+        // The recorded id after an unseen read is the tick's own, so it cannot
+        // be newer than what that read saw.
+        assert_eq!(
+            gate.read_at
+                .get(&(brigade, "worker-1".to_string()))
+                .map(|read| read.newest_message),
+            moved
+        );
+    }
+
+    #[test]
+    fn the_relay_gather_carries_each_visited_brigades_name_and_director_session() {
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        // A second brigade, with a Director that has no session id yet, and a
+        // third whose roster has no Director at all.
+        {
+            let mut store = store.borrow_mut();
+            let second = store.create_brigade("Second task").unwrap();
+            store
+                .add_brigade_member(second, "director", BrigadeRole::Director, None)
+                .unwrap();
+            store.create_brigade("Empty roster").unwrap();
+        }
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut gathered = GlanceGate::default();
+
+        gather_relay_observations(&state, &store, &home, None, &app, None, &mut gathered);
+        let facts = gathered.brigades;
+
+        // `staged_worker` made brigade 1 named "cell" with Director session "dir".
+        let by_id = |id| facts.iter().find(|f| f.brigade_id == id).cloned();
+        assert_eq!(
+            by_id(1),
+            Some(BrigadeNameFacts {
+                brigade_id: 1,
+                name: "cell".to_string(),
+                director_session: Some("dir".to_string()),
+            })
+        );
+        assert_eq!(
+            by_id(2),
+            Some(BrigadeNameFacts {
+                brigade_id: 2,
+                name: "Second task".to_string(),
+                director_session: None,
+            })
+        );
+        assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
+        assert_eq!(facts.len(), 3, "every visited brigade, once");
+    }
+
+    #[test]
+    fn a_gather_whose_brigade_list_fails_hands_back_no_facts_from_an_earlier_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        let mut store = Store::open(&db).unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+        let config = BrigadeConfig::default();
+        let now = Instant::now();
+        let mut gate = GlanceGate::default();
+
+        // A tick that read the brigade: its name facts reach the core.
+        let relay = gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        assert_eq!(gate.brigades.len(), 1);
+        engine::update(
+            &mut state,
+            &mut app,
+            &config,
+            Event::Tick {
+                relay,
+                brigades: gate.brigades.clone(),
+            },
+            now,
+        );
+        assert_ne!(
+            state.brigade_name(&app, brigade_id),
+            format!("brigade {brigade_id}"),
+            "the core knows the brigade's name"
+        );
+
+        // The brigade is disbanded; the core forgets its name at once.
+        store.borrow_mut().delete_brigade(brigade_id).unwrap();
+        engine::update(
+            &mut state,
+            &mut app,
+            &config,
+            Event::Disbanded {
+                brigade_id,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+        assert_eq!(
+            state.brigade_name(&app, brigade_id),
+            format!("brigade {brigade_id}")
+        );
+
+        // The next gather cannot list brigades at all (the table is gone from
+        // under it), and the facts the gate still holds from the tick before —
+        // nothing took them — must not be handed back.
+        let other = rusqlite::Connection::open(&db).unwrap();
+        other
+            .execute_batch("ALTER TABLE brigades RENAME TO brigades_gone")
+            .unwrap();
+        assert!(
+            store.borrow().list_brigades().is_err(),
+            "the failure is real"
+        );
+        let relay = gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        assert!(relay.is_empty());
+        assert!(gate.brigades.is_empty(), "nothing stale is forwarded");
+        engine::update(
+            &mut state,
+            &mut app,
+            &config,
+            Event::Tick {
+                relay,
+                brigades: std::mem::take(&mut gate.brigades),
+            },
+            now,
+        );
+        assert_eq!(
+            state.brigade_name(&app, brigade_id),
+            format!("brigade {brigade_id}"),
+            "the disbanded brigade's name stays gone"
+        );
+    }
+
     #[test]
     fn the_relay_gather_carries_each_members_glances_without_consuming_the_mail() {
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
@@ -4103,8 +4373,22 @@ mod tests {
             "the resolved product travels with it"
         );
 
-        // The next tick with no new message reads nothing.
-        assert!(gather(&mut gate).iter().all(|o| o.glance.is_none()));
+        // The next tick with no new message reads nothing for a member with
+        // nothing unseen, and the inbound half again for the Director, whose
+        // mail is still unread (and whose sent half is what the gate kept).
+        let quiet = gather(&mut gate);
+        assert!(
+            quiet
+                .iter()
+                .find(|o| o.token == "worker-1")
+                .unwrap()
+                .glance
+                .is_none()
+        );
+        assert_eq!(
+            quiet.iter().find(|o| o.token == "director").unwrap().glance,
+            director.glance
+        );
         // Reading was not receiving: the Director still has unseen mail.
         assert!(director.has_unseen);
         assert!(
@@ -4170,14 +4454,17 @@ mod tests {
                         inbound: Some(MessageGlance {
                             created_at_ms: now_ms - 5 * 60 * 1000,
                             line: "run the whole suite and report".to_string(),
+                            from_token: Some("director".to_string()),
                         }),
                         sent: Some(MessageGlance {
                             created_at_ms: now_ms,
                             line: "\u{30c6}\u{30b9}\u{30c8}".repeat(40),
+                            from_token: Some("worker-1".to_string()),
                         }),
                     }),
                     Some(AgentKind::Codex),
                 )],
+                brigades: Vec::new(),
             },
             Instant::now(),
         );
@@ -4228,6 +4515,7 @@ mod tests {
             &brigade,
             Event::Tick {
                 relay: vec![observation(None, None)],
+                brigades: Vec::new(),
             },
             Instant::now(),
         );
@@ -6479,6 +6767,7 @@ mod tests {
             &BrigadeConfig::default(),
             Event::Tick {
                 relay: relay.clone(),
+                brigades: Vec::new(),
             },
             now,
         );
@@ -6486,7 +6775,10 @@ mod tests {
             &mut state,
             &mut app,
             &BrigadeConfig::default(),
-            Event::Tick { relay },
+            Event::Tick {
+                relay,
+                brigades: Vec::new(),
+            },
             now + Duration::from_secs(1),
         );
         assert!(cmds.iter().any(|cmd| matches!(
@@ -7803,7 +8095,10 @@ mod tests {
             run_start + Duration::from_millis(50),
         );
         recorder.record(
-            &Event::Tick { relay: vec![] },
+            &Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             run_start + Duration::from_millis(1200),
         );
         drop(recorder);
@@ -7845,7 +8140,10 @@ mod tests {
 
         let mut recorder = EventRecorder::open(&path, run_start).unwrap();
         recorder.record(
-            &Event::Tick { relay: vec![] },
+            &Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
             run_start - Duration::from_secs(1),
         );
         drop(recorder);
