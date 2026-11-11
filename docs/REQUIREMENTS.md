@@ -449,6 +449,17 @@ a terminal resize cancels the drag and changes nothing. Each side keeps a
 minimum (sidebar 16 columns, pane area 20, Director and stack 20 each, a
 stacked tile 4 rows); a drag stops there, and a terminal too small for the
 minimums gives up the preference rather than refusing to draw.
+Worker tiles can be reordered within the stack (the master stays first): drag a
+tile by its title label. From the press the tile's border and title are drawn
+in yellow; once the pointer moves, its label follows the pointer (reversed
+yellow, cut to the screen) and a yellow line shows the edge where the tile would
+land, chosen by the pointer's row alone; the tile drops on release, and every
+cue disappears on release and on every cancel. Or use
+`Shift`+`Up`/`Down` after the prefix chord. The order is a per-brigade
+preference by member token, re-applied whenever the pane list is rebuilt, so a
+tile keeps its place (and its height) across re-staging and across Workers
+arriving in a different order; a member with no place in it goes after the
+ordered ones, and dismissing a Worker forgets its place.
 The preferences live in memory only for now — they last as long as the
 emporium process, per brigade (`BrigadeId` and member token), and a Worker
 added later gets the mean of the others' height.
@@ -463,6 +474,7 @@ added later gets the mean of the others' height.
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
+| … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down (focus stays on it) |
 | … `1`-`9` | jump to pane N |
 | … `s`/`Esc` | back to the sidebar |
 | … `x` | kill the focused pane (confirm) |

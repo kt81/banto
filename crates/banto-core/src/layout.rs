@@ -52,6 +52,11 @@ pub struct BrigadeLayout {
     pub master_permille: u16,
     /// Relative heights of the stack's tiles, by member token.
     pub row_weights: HashMap<MemberToken, u16>,
+    /// The operator's preferred order of the stack's tiles, top to bottom,
+    /// by member token. `Stage::Brigade::panes` is what is on screen; this is
+    /// what puts it back after something rebuilds `panes` (staging the
+    /// brigade again, a Worker arriving). Empty until a tile has been moved.
+    pub stack_order: Vec<MemberToken>,
 }
 
 impl Default for BrigadeLayout {
@@ -59,6 +64,7 @@ impl Default for BrigadeLayout {
         Self {
             master_permille: DEFAULT_MASTER_PERMILLE,
             row_weights: HashMap::new(),
+            stack_order: Vec::new(),
         }
     }
 }
@@ -344,6 +350,10 @@ pub struct Geometry {
     pub areas: Areas,
     pub tiles: Vec<(SessionKey, Rect)>,
     handles: Vec<Handle>,
+    /// The title-label cells of every stack tile of a stack with two or more
+    /// tiles — what a press picks a tile up by. Just the label: the rest of
+    /// a title row is not assumed to be inert.
+    labels: Vec<(SessionKey, Rect)>,
 }
 
 impl Geometry {
@@ -361,11 +371,87 @@ impl Geometry {
             .find(|handle| handle.hits.iter().any(|hit| hit.contains(at)))
     }
 
+    /// The stack tile whose title label a press at (`column`, `row`) lands on.
+    pub fn label_at(&self, column: u16, row: u16) -> Option<&SessionKey> {
+        let at = ratatui_core::layout::Position::new(column, row);
+        self.labels
+            .iter()
+            .find(|(_, cells)| cells.contains(at))
+            .map(|(key, _)| key)
+    }
+
+    /// The slot (an index into `tiles`, so into `panes`; always a stack tile)
+    /// that a pointer on `row` is over while moving a tile: the tile the row
+    /// falls in, the first stack slot above the stack, the last below it.
+    /// `None` when there is no stack to drop into.
+    pub fn drop_slot(&self, row: u16) -> Option<usize> {
+        let stack = self.tiles.get(1..).filter(|stack| stack.len() >= 2)?;
+        let last = stack.len();
+        let top = stack[0].1.y;
+        if row < top {
+            return Some(1);
+        }
+        let index = stack
+            .iter()
+            .position(|(_, rect)| row < rect.y + rect.height)
+            .map_or(last, |at| at + 1);
+        Some(index)
+    }
+
+    /// The line that previews moving the tile at `from` to the slot `to`: the
+    /// top edge of the target tile when moving up, its bottom edge when
+    /// moving down, across the stack's width. `None` when `to` is `from`.
+    pub fn move_line(&self, from: usize, to: usize) -> Option<Rect> {
+        let target = self.tiles.get(to)?.1;
+        let row = match to.cmp(&from) {
+            std::cmp::Ordering::Equal => return None,
+            std::cmp::Ordering::Less => target.y,
+            std::cmp::Ordering::Greater => target.y + target.height.saturating_sub(1),
+        };
+        Some(Rect::new(target.x, row, target.width, 1))
+    }
+
     pub fn handle_for(&self, boundary: &Boundary) -> Option<&Handle> {
         self.handles
             .iter()
             .find(|handle| &handle.boundary == boundary)
     }
+}
+
+/// Put the stack in the preferred order: `panes[1..]` stably sorted by each
+/// member's rank in `order`, members with no rank after the ranked ones in
+/// their current relative order. `panes[0]` (the master) is never touched,
+/// and `focused` keeps pointing at the same key. Returns whether anything
+/// moved.
+///
+/// The one function that applies the preference; the engine calls it once,
+/// at the end of every `update`, so no branch that rebuilds `panes` has to
+/// remember to.
+pub fn sort_stack<'a>(
+    panes: &mut [SessionKey],
+    focused: &mut usize,
+    order: &[MemberToken],
+    token_of: impl Fn(&SessionKey) -> Option<&'a str>,
+) -> bool {
+    let Some((_, stack)) = panes.split_first_mut() else {
+        return false;
+    };
+    let rank = |key: &SessionKey| {
+        token_of(key)
+            .and_then(|token| order.iter().position(|ranked| ranked == token))
+            .unwrap_or(usize::MAX)
+    };
+    if stack.is_sorted_by_key(rank) {
+        return false;
+    }
+    let focused_key = panes.get(*focused).cloned();
+    panes[1..].sort_by_key(rank);
+    if let Some(key) = focused_key
+        && let Some(index) = panes.iter().position(|pane| *pane == key)
+    {
+        *focused = index;
+    }
+    true
 }
 
 /// The text drawn on a tile's top border for the tile labelled `label`: the
@@ -473,8 +559,8 @@ pub fn geometry(
             // cell after the left corner (the master/stack handle's) through
             // the right border column — the screen edge, where a pointer
             // lands when the boundary is grabbed from the right. Except the
-            // lower row's label cells: those are the tile's own, a plain
-            // click now and the tile's move handle later.
+            // lower row's label cells: those are the tile's own, the handle
+            // it is picked up by to be moved ([`Geometry::label_at`]).
             let (_, label_end) = title_columns(below, &label_of(below_key));
             let right = below.x + below.width;
             let lower_start = label_end.max(below.x + 1);
@@ -498,10 +584,21 @@ pub fn geometry(
         }
     }
 
+    let mut labels = Vec::new();
+    if matches!(stage, Stage::Brigade { .. }) && tiles.len() >= 3 {
+        for (key, tile) in &tiles[1..] {
+            let (start, end) = title_columns(*tile, &label_of(key));
+            if end > start {
+                labels.push((key.clone(), Rect::new(start, tile.y, end - start, 1)));
+            }
+        }
+    }
+
     Geometry {
         areas,
         tiles,
         handles,
+        labels,
     }
 }
 
@@ -895,6 +992,177 @@ mod tests {
         // The right border column is the one cell past the clipped label.
         assert_eq!(what_is_at(&g, right, lower.y), "stack");
         assert_eq!(what_is_at(&g, right - 1, lower.y), "none");
+    }
+
+    // --- stack order ----------------------------------------------------------
+
+    fn names(panes: &[SessionKey]) -> Vec<&str> {
+        panes.iter().map(SessionKey::as_str).collect()
+    }
+
+    fn tokens_of(key: &SessionKey) -> Option<&'static str> {
+        // The member token of `w3` is `worker-3`, the Director's is `director`.
+        match key.as_str() {
+            "d" => Some("director"),
+            "w1" => Some("worker-1"),
+            "w2" => Some("worker-2"),
+            "w3" => Some("worker-3"),
+            "w4" => Some("worker-4"),
+            _ => None,
+        }
+    }
+
+    fn ranked(tokens: &[&str]) -> Vec<MemberToken> {
+        tokens.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn sort_stack_orders_the_stack_by_rank_and_leaves_the_master_alone() {
+        let mut panes = vec![key("d"), key("w1"), key("w2"), key("w3")];
+        let mut focused = 0;
+        let moved = sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-3", "worker-1", "worker-2"]),
+            tokens_of,
+        );
+        assert!(moved);
+        assert_eq!(names(&panes), ["d", "w3", "w1", "w2"]);
+    }
+
+    #[test]
+    fn sort_stack_puts_unranked_members_after_the_ranked_ones_in_their_current_order() {
+        let mut panes = vec![key("d"), key("w4"), key("w1"), key("w3"), key("w2")];
+        let mut focused = 0;
+        sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-2", "worker-1"]),
+            tokens_of,
+        );
+        // w2, w1 ranked; w4 and w3 are not, and keep the order they had.
+        assert_eq!(names(&panes), ["d", "w2", "w1", "w4", "w3"]);
+        // A key with no token at all is unranked too.
+        let mut panes = vec![key("d"), key("ghost"), key("w1")];
+        sort_stack(&mut panes, &mut focused, &ranked(&["worker-1"]), tokens_of);
+        assert_eq!(names(&panes), ["d", "w1", "ghost"]);
+    }
+
+    #[test]
+    fn sort_stack_keeps_focus_on_the_same_key_and_reports_no_change_when_sorted() {
+        let mut panes = vec![key("d"), key("w1"), key("w2"), key("w3")];
+        let mut focused = 1; // w1
+        sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-3", "worker-2", "worker-1"]),
+            tokens_of,
+        );
+        assert_eq!(names(&panes), ["d", "w3", "w2", "w1"]);
+        assert_eq!(focused, 3, "still w1");
+        assert!(!sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-3", "worker-2", "worker-1"]),
+            tokens_of
+        ));
+        assert_eq!(focused, 3);
+        // The master focused stays at 0.
+        let mut panes = vec![key("d"), key("w1"), key("w2")];
+        let mut focused = 0;
+        sort_stack(&mut panes, &mut focused, &ranked(&["worker-2"]), tokens_of);
+        assert_eq!((names(&panes), focused), (vec!["d", "w2", "w1"], 0));
+    }
+
+    #[test]
+    fn sort_stack_never_moves_the_first_pane_even_if_it_is_ranked() {
+        // Whoever sits at `panes[0]` is the master, whatever the preference
+        // says about its token.
+        let mut panes = vec![key("w1"), key("w2"), key("w3")];
+        let mut focused = 0;
+        sort_stack(
+            &mut panes,
+            &mut focused,
+            &ranked(&["worker-3", "worker-2", "worker-1"]),
+            tokens_of,
+        );
+        assert_eq!(names(&panes), ["w1", "w3", "w2"]);
+        let mut none: Vec<SessionKey> = Vec::new();
+        assert!(!sort_stack(
+            &mut none,
+            &mut focused,
+            &ranked(&["worker-1"]),
+            tokens_of
+        ));
+    }
+
+    #[test]
+    fn the_drop_slot_is_the_tile_under_the_row_or_the_nearest_end_of_the_stack() {
+        // A pane area that starts below row 0, so there is a row above it.
+        let stage = brigade_stage(&["d", "w1", "w2", "w3"]);
+        let g = geometry(
+            Rect::new(0, 2, 120, 38),
+            &stage,
+            SIDEBAR_WIDTH,
+            DEFAULT_MASTER_PERMILLE,
+            &[1, 1, 1],
+            &|k| k.as_str().to_string(),
+        );
+        let stack_top = g.tiles[1].1.y;
+        assert_eq!(
+            g.drop_slot(stack_top - 1),
+            Some(1),
+            "above the stack: first"
+        );
+        assert_eq!(g.drop_slot(0), Some(1));
+        for (slot, (_, tile)) in g.tiles.iter().enumerate().skip(1) {
+            for row in [tile.y, tile.y + tile.height / 2, tile.y + tile.height - 1] {
+                assert_eq!(g.drop_slot(row), Some(slot), "row {row} is in slot {slot}");
+            }
+        }
+        let bottom = g.tiles[3].1.y + g.tiles[3].1.height;
+        assert_eq!(g.drop_slot(bottom), Some(3), "below the stack: last");
+        assert_eq!(g.drop_slot(500), Some(3));
+        // No stack, or a stack of one: nowhere to drop.
+        assert_eq!(geo(120, 40, &["d"]).drop_slot(5), None);
+        assert_eq!(geo(120, 40, &["d", "w1"]).drop_slot(5), None);
+    }
+
+    #[test]
+    fn the_move_line_is_the_targets_top_edge_going_up_and_its_bottom_edge_going_down() {
+        let g = geo(120, 40, &["d", "w1", "w2", "w3"]);
+        let (w1, w2, w3) = (g.tiles[1].1, g.tiles[2].1, g.tiles[3].1);
+        assert_eq!(g.move_line(3, 1), Some(Rect::new(w1.x, w1.y, w1.width, 1)));
+        assert_eq!(g.move_line(2, 1), Some(Rect::new(w1.x, w1.y, w1.width, 1)));
+        assert_eq!(
+            g.move_line(1, 3),
+            Some(Rect::new(w3.x, w3.y + w3.height - 1, w3.width, 1))
+        );
+        assert_eq!(
+            g.move_line(1, 2),
+            Some(Rect::new(w2.x, w2.y + w2.height - 1, w2.width, 1))
+        );
+        assert_eq!(g.move_line(2, 2), None, "its own slot: nothing");
+    }
+
+    #[test]
+    fn the_label_cells_exist_only_for_stack_tiles_of_a_stack_of_two_or_more() {
+        let g = geo(120, 40, &["d", "w1", "w2"]);
+        let (master, w1) = (g.tiles[0].1, g.tiles[1].1);
+        assert_eq!(g.label_at(w1.x + 2, w1.y), Some(&key("w1")));
+        assert_eq!(g.label_at(w1.x + 1, w1.y), Some(&key("w1")));
+        assert_eq!(g.label_at(w1.x, w1.y), None, "the corner is not the label");
+        // " w1 " is four cells.
+        assert_eq!(g.label_at(w1.x + 5, w1.y), None, "past the label");
+        assert_eq!(g.label_at(w1.x + 2, w1.y + 1), None, "not the title row");
+        assert_eq!(
+            g.label_at(master.x + 2, master.y),
+            None,
+            "the master's label"
+        );
+        // A stack of one has nothing to reorder.
+        let one = geo(120, 40, &["d", "w1"]);
+        assert_eq!(one.label_at(one.tiles[1].1.x + 2, one.tiles[1].1.y), None);
     }
 
     #[test]

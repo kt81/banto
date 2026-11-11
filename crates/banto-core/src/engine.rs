@@ -40,13 +40,13 @@ use crate::model::{
     SessionRow, SessionToOpen,
 };
 
-use crate::layout::master_permille_for;
 pub use crate::layout::{
     Areas, Axis, Boundary, BrigadeLayout, DEFAULT_MASTER_PERMILLE, Geometry, Handle,
     MIN_HEIGHT_FOR_SUMMARY, MIN_MASTER_WIDTH, MIN_PANE_AREA_WIDTH, MIN_SIDEBAR_WIDTH,
     MIN_STACK_TILE_HEIGHT, MIN_STACK_WIDTH, SIDEBAR_WIDTH, SUMMARY_HEIGHT, layout, master_width,
     pane_content, stack_heights, stage_tiles,
 };
+use crate::layout::{master_permille_for, sort_stack};
 
 /// Stable identity for a kept-alive embedded session: the real Claude
 /// session id once known, or a synthetic placeholder for a freshly-launched
@@ -137,7 +137,10 @@ pub enum Stage {
         /// `1`-`9`) — a best-effort convention (`update_spawned`'s
         /// `BrigadeMember` arm still inserts the Director's own key at the
         /// front when it recognizes it, everyone else appended in arrival
-        /// order), never a source of role truth. Nothing here still infers
+        /// order), never a source of role truth. Past `panes[0]`, the
+        /// operator's preferred order (`BrigadeLayout::stack_order`) is
+        /// re-applied at the end of every `update`, so whatever rebuilt or
+        /// appended to this list is put back in it. Nothing here still infers
         /// a role — or, since `EmporiumState::member_tokens` landed, a
         /// member's identity at all — from where a key sits; `director`
         /// above and `member_tokens` are what changed that.
@@ -793,6 +796,50 @@ struct Drag {
 /// What the status line says while a boundary is being dragged.
 const DRAG_HINT: &str = "resize: release to apply · Esc cancels";
 
+/// A stack tile being dragged to another slot by its title label: which tile,
+/// and where the pointer was last. Exclusive with a boundary [`Drag`]; the
+/// stack does not change until the release, like the resize.
+///
+/// The slot the row selects is derived from the current geometry wherever it
+/// is needed (the preview line, the commit), never stored: an index into
+/// `panes` means something else the moment a pane arrives or leaves while the
+/// button is held. Only the row picks the slot; the column is kept for the
+/// ghost that follows the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MoveDrag {
+    key: SessionKey,
+    column: u16,
+    row: u16,
+    /// Whether a `Drag` event has arrived since the press. A bare press shows
+    /// the tile marked and nothing else.
+    dragged: bool,
+}
+
+/// What a mouse gesture in progress adds to the finished frame, decided here
+/// and painted by the shell (`drag_overlay`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragOverlay {
+    /// A line: the boundary being resized, or the edge a moved tile would
+    /// land at. `None` while a moved tile is over its own slot.
+    pub line: Option<(Rect, Axis)>,
+    /// The tile being moved, drawn in the gesture colour for the whole
+    /// gesture, from the press.
+    pub marked: Option<SessionKey>,
+    /// The moved tile's label following the pointer, once it has moved.
+    pub ghost: Option<Ghost>,
+}
+
+/// A piece of text painted at a screen cell, already clipped to the screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ghost {
+    pub text: String,
+    pub x: u16,
+    pub y: u16,
+}
+
+/// What the status line says while a tile is being moved.
+const MOVE_HINT: &str = "move: release to drop · Esc cancels";
+
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
     pub stage: Stage,
@@ -919,6 +966,8 @@ pub struct EmporiumState {
     /// the layout moves once, when the button is released
     /// ([`update_drag_mouse`]).
     drag: Option<Drag>,
+    /// The tile move in progress, if any (see [`MoveDrag`]).
+    move_drag: Option<MoveDrag>,
     /// The configured prefix chord (`[keys] prefix`), fixed for the run.
     prefix: PrefixKey,
     /// When the prefix was last armed (see [`update_key`]'s prefix handling
@@ -1102,6 +1151,7 @@ impl EmporiumState {
             sidebar_width: SIDEBAR_WIDTH,
             brigade_layouts: HashMap::new(),
             drag: None,
+            move_drag: None,
             prefix,
             prefix_armed: None,
             next_plain_id: 0,
@@ -1413,13 +1463,79 @@ impl EmporiumState {
         }
     }
 
-    /// The line to draw over the screen while a boundary is being dragged:
-    /// its cells, and which way it runs. `None` when nothing is being dragged.
-    pub fn drag_overlay(&self, area: Rect) -> Option<(Rect, Axis)> {
+    /// What to draw over the finished frame for the mouse gesture in
+    /// progress; `None` when there is none.
+    ///
+    /// A resize is a line at the boundary. A move is the tile marked from the
+    /// press, a line at the edge it would land at (none over its own slot),
+    /// and, once the pointer has moved, the tile's label at the pointer.
+    pub fn drag_overlay(&self, area: Rect) -> Option<DragOverlay> {
+        if let Some(moving) = &self.move_drag {
+            let Stage::Brigade { panes, .. } = &self.stage else {
+                return None;
+            };
+            let from = panes.iter().position(|key| *key == moving.key)?;
+            let geometry = self.geometry(area);
+            let line = geometry
+                .drop_slot(moving.row)
+                .and_then(|slot| geometry.move_line(from, slot))
+                .map(|line| (line, Axis::Horizontal));
+            let ghost = moving
+                .dragged
+                .then(|| {
+                    clip_to_screen(
+                        crate::layout::title_text(&self.tile_label(&moving.key)),
+                        moving.column,
+                        moving.row,
+                        area,
+                    )
+                })
+                .flatten();
+            return Some(DragOverlay {
+                line,
+                marked: Some(moving.key.clone()),
+                ghost,
+            });
+        }
         let drag = self.drag.as_ref()?;
         let geometry = self.geometry(area);
         let handle = geometry.handle_for(&drag.boundary)?;
-        Some((handle.line_at(drag.preview), handle.axis))
+        // Clamped against the handle as it is now: the pane list can change
+        // under a held button and move the limits the stored preview was
+        // clamped to. This is what a release at the same pointer would commit.
+        let preview = handle.clamp(i32::from(drag.preview));
+        Some(DragOverlay {
+            line: Some((handle.line_at(preview), handle.axis)),
+            marked: None,
+            ghost: None,
+        })
+    }
+
+    /// End whatever mouse gesture is in progress without applying it.
+    fn cancel_gestures(&mut self) {
+        self.drag = None;
+        self.move_drag = None;
+    }
+
+    /// Put the stack in each brigade's preferred order (see
+    /// [`layout::sort_stack`]). Run at the end of every `update`.
+    fn apply_stack_order(&mut self) {
+        let Stage::Brigade {
+            id, panes, focused, ..
+        } = &mut self.stage
+        else {
+            return;
+        };
+        let Some(layout) = self.brigade_layouts.get(id) else {
+            return;
+        };
+        if layout.stack_order.is_empty() {
+            return;
+        }
+        let tokens = &self.member_tokens;
+        sort_stack(panes, focused, &layout.stack_order, |key| {
+            tokens.get(key).map(String::as_str)
+        });
     }
 
     /// The status line's text: the drag hint for as long as a drag is in
@@ -1429,6 +1545,8 @@ impl EmporiumState {
     pub fn displayed_status(&self) -> Option<&str> {
         if self.drag.is_some() {
             Some(DRAG_HINT)
+        } else if self.move_drag.is_some() {
+            Some(MOVE_HINT)
         } else {
             self.status.as_deref()
         }
@@ -1531,6 +1649,10 @@ enum PrefixAction {
     CyclePane,
     /// An arrow key: move by grid geometry — see [`arrow_target`].
     Move(Direction),
+    /// Shift+Up / Shift+Down: move the focused stack tile one slot, see
+    /// [`move_focused_tile`]. Plain arrows (and any other modifier
+    /// combination) stay [`Self::Move`].
+    MoveTile(Direction),
     /// `1`-`9`, in range: focus the pane at this 0-based index. This
     /// addresses `Stage`'s pane list directly (`1` is always `panes[0]`,
     /// the master tile — geometry, not role; see `Stage::Brigade::panes`'s
@@ -1564,6 +1686,10 @@ fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> 
     match key.code {
         KeyCode::Tab => PrefixAction::CyclePane,
         KeyCode::Char('o') if key.modifiers.is_empty() => PrefixAction::CyclePane,
+        KeyCode::Up if key.modifiers == Modifiers::SHIFT => PrefixAction::MoveTile(Direction::Up),
+        KeyCode::Down if key.modifiers == Modifiers::SHIFT => {
+            PrefixAction::MoveTile(Direction::Down)
+        }
         KeyCode::Left => PrefixAction::Move(Direction::Left),
         KeyCode::Right => PrefixAction::Move(Direction::Right),
         KeyCode::Up => PrefixAction::Move(Direction::Up),
@@ -2428,11 +2554,14 @@ pub fn update(
             // Focus leaving the window is the one way a release can be lost
             // without a `Moved` ever arriving: the terminal stops reporting.
             if !focused {
-                state.drag = None;
+                state.cancel_gestures();
             }
             Vec::new()
         }
     };
+    // Before anything sizes a tile: whatever rebuilt `panes` this event is
+    // put back in the operator's order first.
+    state.apply_stack_order();
     validate_drag(state, app);
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(refresh_waiting_display(state, app, now));
@@ -2692,7 +2821,7 @@ fn update_resized(state: &mut EmporiumState, app: &mut App, width: u16, height: 
     state.size = (width, height);
     // The terminal changed under the gesture: whatever the drag was holding
     // was measured against geometry that no longer exists.
-    state.drag = None;
+    state.cancel_gestures();
     let areas = state.geometry(Rect::new(0, 0, width, height)).areas;
     app.set_viewport_height(areas.sidebar.height.saturating_sub(2) as usize);
     Vec::new()
@@ -2728,10 +2857,10 @@ fn update_key(
 ) -> Vec<Cmd> {
     let code = key.code;
 
-    // Esc cancels a boundary drag and goes no further: it must not reach the
-    // child or the sidebar.
-    if state.drag.is_some() && code == KeyCode::Esc {
-        state.drag = None;
+    // Esc cancels a drag (a boundary, or a tile being moved) and goes no
+    // further: it must not reach the child or the sidebar.
+    if (state.drag.is_some() || state.move_drag.is_some()) && code == KeyCode::Esc {
+        state.cancel_gestures();
         return Vec::new();
     }
 
@@ -2903,6 +3032,7 @@ fn resolve_armed_prefix(
             apply_focus_slot(state, next);
             Vec::new()
         }
+        PrefixAction::MoveTile(direction) => move_focused_tile(state, direction),
         PrefixAction::FocusPane(index) => {
             state.focus = Focus::Pane;
             if let Stage::Brigade { focused, .. } = &mut state.stage {
@@ -4028,6 +4158,9 @@ fn update_mouse(
     if state.drag.is_some() {
         return update_drag_mouse(state, mouse);
     }
+    if state.move_drag.is_some() {
+        return update_move_mouse(state, mouse);
+    }
     let pos = Position::new(mouse.column, mouse.row);
     let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
     let areas = geometry.areas;
@@ -4059,6 +4192,21 @@ fn update_mouse(
                 && let Some(p) = panes.iter().position(|k| k == key)
             {
                 *focused = p;
+            }
+            // The press also takes hold of a stack tile by its title label.
+            // The focus it just gave is the same as ever; a tile with no
+            // member token has no place in an order preference, so it is not
+            // picked up.
+            if let Some(key) = geometry.label_at(mouse.column, mouse.row)
+                && state.member_tokens.contains_key(key)
+            {
+                state.move_drag = Some(MoveDrag {
+                    key: key.clone(),
+                    column: mouse.column,
+                    row: mouse.row,
+                    dragged: false,
+                });
+                return Vec::new();
             }
         }
         if state.focus == Focus::Pane
@@ -4116,6 +4264,146 @@ fn update_mouse(
         }
         _ => Vec::new(),
     }
+}
+
+/// `text` placed with its first cell at (`x`, `y`) and cut to what fits in
+/// `area`, by display width; `None` when nothing of it fits.
+fn clip_to_screen(text: String, x: u16, y: u16, area: Rect) -> Option<Ghost> {
+    if !area.contains(Position::new(x, y)) {
+        return None;
+    }
+    let room = usize::from(area.right() - x);
+    let mut clipped = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let cell = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cell > room {
+            break;
+        }
+        width += cell;
+        clipped.push(ch);
+    }
+    (!clipped.is_empty()).then_some(Ghost {
+        text: clipped,
+        x,
+        y,
+    })
+}
+
+/// One mouse event while a tile is being moved by its title label.
+///
+/// Owned exactly like a boundary drag (see [`update_drag_mouse`]): nothing is
+/// forwarded to a child, focused or scrolled however many panes the pointer
+/// crosses, a press of any button or a `Moved` cancels, the stack changes
+/// only on the release. Where the tile would land is decided by the
+/// pointer's row alone — its column may wander over the master or the
+/// sidebar.
+fn update_move_mouse(state: &mut EmporiumState, mouse: MouseEvent) -> Vec<Cmd> {
+    let Some(moving) = state.move_drag.clone() else {
+        return Vec::new();
+    };
+    let slot = state
+        .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+        .drop_slot(mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(_) | MouseEventKind::Moved => state.move_drag = None,
+        MouseEventKind::Drag(MouseButton::Left) => match slot {
+            Some(_) => {
+                state.move_drag = Some(MoveDrag {
+                    column: mouse.column,
+                    row: mouse.row,
+                    dragged: true,
+                    ..moving
+                })
+            }
+            None => state.move_drag = None,
+        },
+        MouseEventKind::Up(MouseButton::Left) => {
+            state.move_drag = None;
+            if let Some(target) = slot {
+                move_tile(state, &moving.key, target);
+            }
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// Move the stack tile `key` to slot `to` (an index into `panes`), the tiles
+/// in between shifting by one, by recording the result as the brigade's
+/// preferred order: the staged stack tiles in their new order, then any
+/// earlier-ranked members that are not staged right now, in their old
+/// relative order, so a member that is off-stage keeps its place. The panes
+/// themselves are reordered by `apply_stack_order` at the end of the same
+/// `update`. Row weights are keyed by token, so a tile takes its height
+/// with it and nothing is rewritten here.
+fn move_tile(state: &mut EmporiumState, key: &SessionKey, to: usize) {
+    let Stage::Brigade { id, panes, .. } = &state.stage else {
+        return;
+    };
+    let Some(from) = panes.iter().position(|pane| pane == key) else {
+        return;
+    };
+    if from == 0 || to == 0 || to >= panes.len() || from == to {
+        return;
+    }
+    let mut stack: Vec<&SessionKey> = panes[1..].iter().collect();
+    let moved = stack.remove(from - 1);
+    stack.insert(to - 1, moved);
+    let staged: Vec<MemberToken> = stack
+        .into_iter()
+        .filter_map(|pane| state.member_tokens.get(pane).cloned())
+        .collect();
+    let layout = state.brigade_layouts.entry(*id).or_default();
+    let off_stage: Vec<MemberToken> = layout
+        .stack_order
+        .iter()
+        .filter(|token| !staged.contains(token))
+        .cloned()
+        .collect();
+    layout.stack_order = staged.into_iter().chain(off_stage).collect();
+}
+
+/// Prefix + Shift+Up / Shift+Down: move the focused stack tile one slot, the
+/// focus staying on it. Every refusal says why, the way an out-of-range
+/// pane number does.
+fn move_focused_tile(state: &mut EmporiumState, direction: Direction) -> Vec<Cmd> {
+    let refusal = match (&state.stage, state.focus) {
+        (_, Focus::Sidebar) => Some("prefix: focus a tile to move it"),
+        (Stage::Brigade { focused: 0, .. } | Stage::Solo(_) | Stage::Empty, _) => {
+            Some("prefix: the master tile stays put")
+        }
+        (Stage::Brigade { focused, .. }, _) if direction == Direction::Up && *focused <= 1 => {
+            Some("prefix: already at the top of the stack")
+        }
+        (Stage::Brigade { focused, panes, .. }, _)
+            if direction == Direction::Down && focused + 1 >= panes.len() =>
+        {
+            Some("prefix: already at the bottom of the stack")
+        }
+        (Stage::Brigade { focused, panes, .. }, _)
+            if panes
+                .get(*focused)
+                .is_none_or(|key| !state.member_tokens.contains_key(key)) =>
+        {
+            Some("prefix: this tile has no member to keep an order for")
+        }
+        _ => None,
+    };
+    if let Some(reason) = refusal {
+        state.status = Some(reason.to_string());
+        return Vec::new();
+    }
+    if let Stage::Brigade { focused, panes, .. } = &state.stage {
+        let to = if direction == Direction::Up {
+            *focused - 1
+        } else {
+            *focused + 1
+        };
+        let key = panes[*focused].clone();
+        move_tile(state, &key, to);
+    }
+    Vec::new()
 }
 
 /// The boundary position a pointer at `mouse` previews, clamped to what that
@@ -4231,6 +4519,18 @@ fn commit_drag(state: &mut EmporiumState, boundary: &Boundary, position: u16) {
 /// changed — a pane closed, another brigade staged). Run at the end of every
 /// `update`, so no event handler has to remember to cancel it.
 fn validate_drag(state: &mut EmporiumState, app: &App) {
+    if let Some(moving) = &state.move_drag {
+        // A tile being moved must still be a stack tile, in a stack that has
+        // somewhere to put it.
+        let still_movable = matches!(
+            &state.stage,
+            Stage::Brigade { panes, .. }
+                if panes.len() >= 3 && panes[1..].contains(&moving.key)
+        );
+        if app.modal().is_some() || !still_movable {
+            state.move_drag = None;
+        }
+    }
     let Some(drag) = &state.drag else {
         return;
     };
@@ -5120,6 +5420,7 @@ fn update_worker_dismissed(
                 (member, state.brigade_layouts.get_mut(&brigade_id))
             {
                 layout.row_weights.remove(&token);
+                layout.stack_order.retain(|ranked| *ranked != token);
             }
             let staged = matches!(
                 &state.stage,
@@ -11611,6 +11912,13 @@ mod tests {
         )
     }
 
+    /// The line the overlay would draw, if any.
+    fn overlay_line(state: &EmporiumState) -> Option<(Rect, Axis)> {
+        state
+            .drag_overlay(DRAG_AREA)
+            .and_then(|overlay| overlay.line)
+    }
+
     fn handle_of(state: &EmporiumState, wanted: &Boundary) -> Handle {
         state
             .geometry(DRAG_AREA)
@@ -11997,7 +12305,7 @@ mod tests {
     }
 
     #[test]
-    fn a_press_on_a_tiles_title_label_starts_no_drag_and_focuses_the_tile() {
+    fn a_press_on_a_tiles_title_label_starts_no_resize_and_focuses_the_tile() {
         let (mut state, mut app, brigade, now) = drag_fixture(3);
         let lower = state.geometry(DRAG_AREA).tiles[2].1;
         assert_eq!(state.tile_label(&SessionKey::from_id("w2")), "worker-2");
@@ -12014,7 +12322,14 @@ mod tests {
                 lower.y,
                 now,
             );
-            assert!(state.drag.is_none(), "column {column} is the label's");
+            assert!(
+                state.drag.is_none(),
+                "column {column} is the label's, not the boundary's"
+            );
+            // The label is what a tile is picked up by (stage 2): the press
+            // that focuses it also starts a move.
+            assert!(state.move_drag.is_some());
+            state.move_drag = None;
             assert_eq!(state.focus, Focus::Pane);
             assert!(
                 matches!(&state.stage, Stage::Brigade { focused: 2, .. }),
@@ -12036,6 +12351,1342 @@ mod tests {
             now,
         );
         assert!(state.drag.is_some());
+    }
+
+    // --- moving a tile within the stack ---------------------------------------
+
+    fn order_of(state: &EmporiumState) -> Vec<String> {
+        match &state.stage {
+            Stage::Brigade { panes, .. } => panes.iter().map(|k| k.as_str().to_string()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn focused_name(state: &EmporiumState) -> Option<String> {
+        state.stage.focused_key().map(|k| k.as_str().to_string())
+    }
+
+    fn tile_of(state: &EmporiumState, name: &str) -> Rect {
+        state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, rect)| *rect)
+            .expect("the tile is staged")
+    }
+
+    /// A cell on `name`'s title label.
+    fn label_cell(state: &EmporiumState, name: &str) -> (u16, u16) {
+        let tile = tile_of(state, name);
+        (tile.x + 2, tile.y)
+    }
+
+    /// Give `worker-1..=n` distinct row weights, so a tile's height says
+    /// whose it is.
+    fn weigh_workers(state: &mut EmporiumState, workers: usize) {
+        let mut layout = BrigadeLayout::default();
+        for n in 1..=workers {
+            layout
+                .row_weights
+                .insert(format!("worker-{n}"), (n * 10) as u16);
+        }
+        state.brigade_layouts.insert(1, layout);
+    }
+
+    fn press_label(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        name: &str,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let (column, row) = label_cell(state, name);
+        mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            now,
+        )
+    }
+
+    /// Press `name`'s label, drag to `to_row` (the column wanders off over
+    /// the master), release there. Returns every command.
+    fn move_with_mouse(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        name: &str,
+        to_row: u16,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let mut cmds = press_label(state, app, brigade, name, now);
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            cmds.extend(mouse_event(state, app, brigade, kind, 10, to_row, now));
+        }
+        cmds
+    }
+
+    /// Move `name` onto the slot of the tile `onto`: press its label, drag to
+    /// a row inside the target, release there.
+    fn move_onto(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        name: &str,
+        onto: &str,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let row = tile_of(state, onto).y + 1;
+        move_with_mouse(state, app, brigade, name, row, now)
+    }
+
+    /// `order` with the element at stack position `from` moved to `to`.
+    fn moved(order: &[&str], from: usize, to: usize) -> Vec<String> {
+        let mut order: Vec<String> = order.iter().map(|s| s.to_string()).collect();
+        let tile = order.remove(from);
+        order.insert(to, tile);
+        order
+    }
+
+    #[test]
+    fn dragging_a_tile_onto_any_other_slot_gives_the_expected_order() {
+        for workers in [3usize, 4] {
+            let names: Vec<String> = (1..=workers).map(|n| format!("w{n}")).collect();
+            let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+            for from in 0..workers {
+                for to in (0..workers).filter(|to| *to != from) {
+                    let (mut state, mut app, brigade, now) = drag_fixture(workers);
+                    weigh_workers(&mut state, workers);
+                    let weights_before = state.brigade_layouts[&1].row_weights.clone();
+                    let target_row = tile_of(&state, &names[to]).y + 1;
+
+                    move_with_mouse(
+                        &mut state,
+                        &mut app,
+                        &brigade,
+                        &names[from],
+                        target_row,
+                        now,
+                    );
+
+                    let mut expected = vec!["dir".to_string()];
+                    expected.extend(moved(&names_ref, from, to));
+                    assert_eq!(
+                        order_of(&state),
+                        expected,
+                        "{workers} workers, tile {from} onto slot {to}"
+                    );
+                    assert_eq!(state.focus, Focus::Pane);
+                    assert_eq!(
+                        focused_name(&state).as_deref(),
+                        Some(names[from].as_str()),
+                        "focus follows the moved tile"
+                    );
+                    assert_eq!(
+                        state.brigade_layouts[&1].row_weights, weights_before,
+                        "a move rewrites no weight"
+                    );
+                    // The weights travel with their tiles: top to bottom they
+                    // are the moved order's weights.
+                    let expected_weights: Vec<u16> = moved(&names_ref, from, to)
+                        .iter()
+                        .map(|name| name[1..].parse::<u16>().unwrap() * 10)
+                        .collect();
+                    assert_eq!(state.stack_weights(), expected_weights);
+                    assert!(state.move_drag.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_below_the_stack_drops_last_and_a_press_alone_changes_nothing() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        // Row 39 is the status bar, below every tile.
+        move_with_mouse(&mut state, &mut app, &brigade, "w1", 39, now);
+        assert_eq!(order_of(&state), ["dir", "w2", "w3", "w1"]);
+
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            10,
+            39,
+            now,
+        );
+        // w2 is not last, so that was a move to the end.
+        assert_eq!(order_of(&state), ["dir", "w1", "w3", "w2"]);
+    }
+
+    #[test]
+    fn releasing_over_the_tiles_own_slot_changes_nothing() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let own = tile_of(&state, "w2");
+        let before = order_of(&state);
+
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        assert_eq!(overlay_line(&state), None, "nothing to preview yet");
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            70,
+            own.y + 3,
+            now,
+        );
+        assert_eq!(overlay_line(&state), None, "still its own slot");
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            70,
+            own.y + 3,
+            now,
+        );
+
+        assert_eq!(order_of(&state), before);
+        assert!(
+            state.brigade_layouts.is_empty(),
+            "no preference was recorded"
+        );
+        assert_eq!(
+            focused_name(&state).as_deref(),
+            Some("w2"),
+            "the press's focus stays"
+        );
+    }
+
+    #[test]
+    fn a_move_shows_a_line_at_the_edge_where_the_tile_would_land_and_a_hint() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let (w1, w3) = (tile_of(&state, "w1"), tile_of(&state, "w3"));
+        assert_eq!(state.displayed_status(), None);
+
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        assert_eq!(
+            state.displayed_status(),
+            Some("move: release to drop · Esc cancels")
+        );
+        // Up: the target's top edge, across the stack.
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            w1.y + 2,
+            now,
+        );
+        assert_eq!(
+            overlay_line(&state),
+            Some((Rect::new(w1.x, w1.y, w1.width, 1), Axis::Horizontal))
+        );
+        // Down: the target's bottom edge.
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            w3.y + 2,
+            now,
+        );
+        assert_eq!(
+            overlay_line(&state),
+            Some((
+                Rect::new(w3.x, w3.y + w3.height - 1, w3.width, 1),
+                Axis::Horizontal
+            ))
+        );
+
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            5,
+            w3.y + 2,
+            now,
+        );
+        assert_eq!(overlay_line(&state), None);
+        assert_eq!(state.displayed_status(), None);
+    }
+
+    fn drag_to_cell(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        column: u16,
+        row: u16,
+        now: Instant,
+    ) {
+        mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+    }
+
+    #[test]
+    fn a_bare_press_marks_the_moved_tile_and_shows_no_ghost_and_no_line() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        assert_eq!(
+            state.drag_overlay(DRAG_AREA),
+            None,
+            "nothing before the press"
+        );
+
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+
+        assert_eq!(
+            state.drag_overlay(DRAG_AREA),
+            Some(DragOverlay {
+                line: None,
+                marked: Some(SessionKey::from_id("w2")),
+                ghost: None,
+            })
+        );
+    }
+
+    #[test]
+    fn the_first_drag_adds_a_ghost_at_the_pointer_with_or_without_a_landing_line() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let (w1, w2) = (tile_of(&state, "w1"), tile_of(&state, "w2"));
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+
+        // Over its own slot: marked and ghosted, no line to land at.
+        drag_to_cell(&mut state, &mut app, &brigade, 70, w2.y + 3, now);
+        assert_eq!(
+            state.drag_overlay(DRAG_AREA),
+            Some(DragOverlay {
+                line: None,
+                marked: Some(SessionKey::from_id("w2")),
+                ghost: Some(Ghost {
+                    text: " worker-2 ".to_string(),
+                    x: 70,
+                    y: w2.y + 3,
+                }),
+            })
+        );
+
+        // Over another slot: the same plus the line.
+        drag_to_cell(&mut state, &mut app, &brigade, 50, w1.y + 2, now);
+        assert_eq!(
+            state.drag_overlay(DRAG_AREA),
+            Some(DragOverlay {
+                line: Some((Rect::new(w1.x, w1.y, w1.width, 1), Axis::Horizontal)),
+                marked: Some(SessionKey::from_id("w2")),
+                ghost: Some(Ghost {
+                    text: " worker-2 ".to_string(),
+                    x: 50,
+                    y: w1.y + 2,
+                }),
+            })
+        );
+
+        // The column does not choose the slot, only where the ghost is.
+        let line = overlay_line(&state);
+        drag_to_cell(&mut state, &mut app, &brigade, 5, w1.y + 2, now);
+        let overlay = state.drag_overlay(DRAG_AREA).unwrap();
+        assert_eq!(overlay.line, line);
+        assert_eq!(overlay.ghost.map(|g| (g.x, g.y)), Some((5, w1.y + 2)));
+    }
+
+    #[test]
+    fn the_ghost_is_clipped_at_the_right_edge_and_can_sit_on_the_status_bar_row() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        let ghost_at = |state: &EmporiumState| state.drag_overlay(DRAG_AREA).unwrap().ghost;
+
+        // 120 columns: from 115 there are five cells left.
+        drag_to_cell(&mut state, &mut app, &brigade, 115, 10, now);
+        assert_eq!(
+            ghost_at(&state),
+            Some(Ghost {
+                text: " work".to_string(),
+                x: 115,
+                y: 10
+            })
+        );
+        drag_to_cell(&mut state, &mut app, &brigade, 119, 10, now);
+        assert_eq!(
+            ghost_at(&state),
+            Some(Ghost {
+                text: " ".to_string(),
+                x: 119,
+                y: 10
+            }),
+            "one cell is all that is left"
+        );
+        // Row 39 is the status bar: still on screen, still ghosted (and the
+        // pointer there means the last slot).
+        drag_to_cell(&mut state, &mut app, &brigade, 40, 39, now);
+        assert_eq!(
+            ghost_at(&state),
+            Some(Ghost {
+                text: " worker-2 ".to_string(),
+                x: 40,
+                y: 39
+            })
+        );
+        // Off the screen there is nothing to paint.
+        drag_to_cell(&mut state, &mut app, &brigade, 120, 10, now);
+        assert_eq!(ghost_at(&state), None);
+        assert!(state.drag_overlay(DRAG_AREA).unwrap().marked.is_some());
+    }
+
+    #[test]
+    fn both_cues_are_gone_after_the_release() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let w1 = tile_of(&state, "w1");
+        press_label(&mut state, &mut app, &brigade, "w3", now);
+        drag_to_cell(&mut state, &mut app, &brigade, 60, w1.y + 1, now);
+        assert!(state.drag_overlay(DRAG_AREA).is_some());
+
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            60,
+            w1.y + 1,
+            now,
+        );
+
+        assert_eq!(state.drag_overlay(DRAG_AREA), None);
+    }
+
+    #[test]
+    fn a_resize_has_a_line_and_neither_mark_nor_ghost() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let boundary = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &boundary).position;
+        drag_to(&mut state, &mut app, &brigade, &boundary, start + 5, now);
+
+        let overlay = state.drag_overlay(DRAG_AREA).unwrap();
+
+        assert!(overlay.line.is_some());
+        assert_eq!(overlay.marked, None);
+        assert_eq!(overlay.ghost, None);
+    }
+
+    #[test]
+    fn the_master_label_and_a_stack_of_one_start_no_move() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 2;
+        }
+        let master = state.geometry(DRAG_AREA).tiles[0].1;
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            master.x + 2,
+            master.y,
+            now,
+        );
+        assert!(state.move_drag.is_none() && state.drag.is_none());
+        assert_eq!(
+            focused_name(&state).as_deref(),
+            Some("dir"),
+            "it still focuses the master"
+        );
+
+        let (mut state, mut app, brigade, now) = drag_fixture(1);
+        press_label(&mut state, &mut app, &brigade, "w1", now);
+        assert!(state.move_drag.is_none(), "one tile has nowhere to go");
+        assert_eq!(focused_name(&state).as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn pressing_a_label_focuses_the_tile_exactly_as_before_and_starts_the_move() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        state.focus = Focus::Sidebar;
+        let cmds = press_label(&mut state, &mut app, &brigade, "w3", now);
+        assert!(cmds.is_empty());
+        assert_eq!(state.focus, Focus::Pane);
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+        assert_eq!(
+            state.move_drag,
+            Some(MoveDrag {
+                key: SessionKey::from_id("w3"),
+                column: label_cell(&state, "w3").0,
+                row: label_cell(&state, "w3").1,
+                dragged: false,
+            })
+        );
+    }
+
+    /// A move in progress on `w2` of three Workers, the pointer on `w1`.
+    fn moving_w2_up() -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let w1 = tile_of(&state, "w1");
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            60,
+            w1.y + 1,
+            now,
+        );
+        assert_eq!(state.move_drag.as_ref().map(|m| m.row), Some(w1.y + 1));
+        (state, app, brigade, now)
+    }
+
+    /// The line a move preview should show for a tile moved down onto `name`:
+    /// that tile's bottom edge, across the stack, as the geometry stands now.
+    fn bottom_edge_of(state: &EmporiumState, name: &str) -> (Rect, Axis) {
+        let tile = tile_of(state, name);
+        (
+            Rect::new(tile.x, tile.y + tile.height - 1, tile.width, 1),
+            Axis::Horizontal,
+        )
+    }
+
+    #[test]
+    fn the_move_preview_follows_the_pointer_when_a_director_arrives_late_under_a_held_button() {
+        // The Director has not been staged yet, so a Worker holds `panes[0]`
+        // and w2 is the first stack tile.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let dir = SessionKey::from_id("dir");
+        state.unstage(&dir);
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(dir.clone()),
+            panes: ["w1", "w2", "w3"].map(SessionKey::from_id).to_vec(),
+            focused: 0,
+        };
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        // Low enough to be over w3 both with two stack tiles and with three.
+        let row = 35;
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            60,
+            row,
+            now,
+        );
+        assert_eq!(overlay_line(&state), Some(bottom_edge_of(&state, "w3")));
+
+        // The Director arrives and takes the front; every index shifts.
+        state.pending_opens.insert(
+            dir.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false,
+                cwd: PathBuf::from("/work"),
+            },
+        );
+        state
+            .member_tokens
+            .insert(dir.clone(), DIRECTOR_TOKEN.to_string());
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key: dir },
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3"]);
+        assert!(
+            state.move_drag.is_some(),
+            "the gesture survives the arrival"
+        );
+
+        // The pointer has not moved: still over w3, so the line is still at
+        // w3's (new) bottom edge, not gone and not on another tile.
+        assert!(
+            tile_of(&state, "w3").y <= row
+                && row < tile_of(&state, "w3").y + tile_of(&state, "w3").height
+        );
+        assert_eq!(overlay_line(&state), Some(bottom_edge_of(&state, "w3")));
+
+        // And the release lands where the pointer was.
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            60,
+            row,
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w1", "w3", "w2"]);
+    }
+
+    #[test]
+    fn the_move_preview_follows_the_pointer_when_a_pane_above_the_target_goes_away() {
+        let (mut state, mut app, brigade, now) = drag_fixture(4);
+        let row = tile_of(&state, "w4").y + 6;
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            60,
+            row,
+            now,
+        );
+        assert_eq!(overlay_line(&state), Some(bottom_edge_of(&state, "w4")));
+
+        // w1, above the target, exits: the stack shrinks to three tiles, so
+        // the slot index the pointer selected before no longer exists.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("w1"),
+                reason: None,
+            },
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w2", "w3", "w4"]);
+        let w4 = tile_of(&state, "w4");
+        assert!(w4.y <= row && row < w4.y + w4.height, "still over w4");
+        assert_eq!(overlay_line(&state), Some(bottom_edge_of(&state, "w4")));
+
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            60,
+            row,
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w3", "w4", "w2"]);
+    }
+
+    #[test]
+    fn a_resize_preview_is_clamped_to_the_limits_as_they_stand_after_the_pane_list_changes() {
+        // Drag the w1/w2 boundary to its lowest allowed place, then a third
+        // Worker arrives: w2 is shorter, so the boundary may go less far.
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let boundary = w1_over_w2();
+        drag_to(&mut state, &mut app, &brigade, &boundary, 39, now);
+        let stale = state.drag.as_ref().unwrap().preview;
+
+        let w3 = SessionKey::from_id("w3");
+        state.screens.insert(w3.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(w3.clone(), "worker-3".to_string());
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.push(w3);
+        }
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        let handle = handle_of(&state, &boundary);
+        assert!(
+            stale > handle.max,
+            "the limit moved under the stored preview"
+        );
+        let (line, axis) = overlay_line(&state).expect("the drag survives");
+        assert_eq!(axis, Axis::Horizontal);
+        assert_eq!(
+            line.y,
+            handle.max - 1,
+            "drawn at the limit, on the border before it"
+        );
+    }
+
+    #[test]
+    fn every_cancel_leaves_the_order_untouched() {
+        type Cancel = Box<dyn Fn(&mut EmporiumState, &mut App, &BrigadeConfig, Instant)>;
+        let cancels: Vec<(&str, Cancel)> = vec![
+            (
+                "Esc",
+                Box::new(|state, app, brigade, now| {
+                    forward_key(state, app, brigade, KeyCode::Esc, Modifiers::NONE, now);
+                }),
+            ),
+            (
+                "a press of the left button",
+                Box::new(|state, app, brigade, now| {
+                    mouse_event(
+                        state,
+                        app,
+                        brigade,
+                        MouseEventKind::Down(MouseButton::Left),
+                        60,
+                        5,
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a press of another button",
+                Box::new(|state, app, brigade, now| {
+                    mouse_event(
+                        state,
+                        app,
+                        brigade,
+                        MouseEventKind::Down(MouseButton::Right),
+                        60,
+                        5,
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a move with no button held",
+                Box::new(|state, app, brigade, now| {
+                    mouse_event(state, app, brigade, MouseEventKind::Moved, 60, 5, now);
+                }),
+            ),
+            (
+                "the window losing focus",
+                Box::new(|state, app, brigade, now| {
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::WindowFocusChanged { focused: false },
+                        now,
+                    );
+                }),
+            ),
+            (
+                "a modal opening",
+                Box::new(|state, app, brigade, now| {
+                    app.open_new_session_modal();
+                    update(state, app, brigade, Event::Tick { relay: vec![] }, now);
+                }),
+            ),
+            (
+                "a terminal resize",
+                Box::new(|state, app, brigade, now| {
+                    update(
+                        state,
+                        app,
+                        brigade,
+                        Event::Resized {
+                            width: 120,
+                            height: 40,
+                        },
+                        now,
+                    );
+                }),
+            ),
+            (
+                "the tile being moved going away",
+                Box::new(|state, app, brigade, now| {
+                    state.unstage(&SessionKey::from_id("w2"));
+                    update(state, app, brigade, Event::Tick { relay: vec![] }, now);
+                }),
+            ),
+        ];
+        for (what, cancel) in cancels {
+            let (mut state, mut app, brigade, now) = moving_w2_up();
+            let before = order_of(&state);
+            let focus = (state.focus, focused_name(&state));
+
+            cancel(&mut state, &mut app, &brigade, now);
+
+            assert!(state.move_drag.is_none(), "{what} cancels");
+            assert_eq!(state.displayed_status(), None, "{what}: the hint is gone");
+            assert_eq!(
+                state.drag_overlay(DRAG_AREA),
+                None,
+                "{what}: the mark and the ghost are gone"
+            );
+            assert!(
+                state.brigade_layouts.is_empty(),
+                "{what}: no preference recorded"
+            );
+            if what == "the tile being moved going away" {
+                continue;
+            }
+            assert_eq!(order_of(&state), before, "{what} leaves the order alone");
+            if what != "a modal opening" {
+                assert_eq!((state.focus, focused_name(&state)), focus, "{what}: focus");
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_in_progress_never_writes_to_a_pane_it_crosses() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        for name in ["dir", "w1", "w2", "w3"] {
+            state
+                .screens
+                .get_mut(&SessionKey::from_id(name))
+                .unwrap()
+                .process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        let mut cmds = press_label(&mut state, &mut app, &brigade, "w3", now);
+        // Over the SGR-mouse master, a stack tile's interior, the sidebar,
+        // and finally released over the first tile.
+        let w1 = tile_of(&state, "w1");
+        for (kind, column, row) in [
+            (MouseEventKind::Drag(MouseButton::Left), 70, 12),
+            (MouseEventKind::Drag(MouseButton::Left), 10, 12),
+            (MouseEventKind::Drag(MouseButton::Left), w1.x + 4, w1.y + 3),
+            (MouseEventKind::ScrollUp, w1.x + 4, w1.y + 3),
+            (MouseEventKind::Up(MouseButton::Left), w1.x + 4, w1.y + 3),
+        ] {
+            cmds.extend(mouse_event(
+                &mut state, &mut app, &brigade, kind, column, row, now,
+            ));
+        }
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(
+            order_of(&state),
+            ["dir", "w3", "w1", "w2"],
+            "and the move did land"
+        );
+    }
+
+    #[test]
+    fn the_order_survives_a_rebuilt_pane_list_and_leaves_the_focus_on_its_key() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+        assert_eq!(order_of(&state), ["dir", "w3", "w1", "w2"]);
+
+        // Staged again in member order (what `stage_brigade` builds).
+        let keys: Vec<SessionKey> = ["dir", "w1", "w2", "w3"].map(SessionKey::from_id).to_vec();
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(keys[0].clone()),
+            panes: keys,
+            focused: 2, // w2
+        };
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        assert_eq!(order_of(&state), ["dir", "w3", "w1", "w2"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+    }
+
+    #[test]
+    fn the_order_survives_off_stage_and_applies_to_whatever_arrives() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+        let layout_before = state.brigade_layouts[&1].clone();
+
+        // Another session takes the stage; members unstage one by one.
+        for name in ["w1", "w2", "w3", "dir"] {
+            state.unstage(&SessionKey::from_id(name));
+        }
+        state.stage = Stage::Solo(SessionKey::from_id("elsewhere"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert_eq!(state.brigade_layouts[&1], layout_before);
+
+        // The brigade comes back, members arriving through `Spawned` in the
+        // opposite order to the preference.
+        let dir = SessionKey::from_id("dir");
+        state
+            .member_tokens
+            .insert(dir.clone(), DIRECTOR_TOKEN.to_string());
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(dir.clone()),
+            panes: vec![dir],
+            focused: 0,
+        };
+        for token in ["worker-1", "worker-2", "worker-3"] {
+            open_worker(
+                &mut state,
+                1,
+                token,
+                std::path::Path::new("/work"),
+                "",
+                None,
+                AgentKind::ClaudeCode,
+            );
+        }
+        for token in ["worker-1", "worker-2", "worker-3"] {
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Spawned {
+                    key: SessionKey::new_worker(1, token),
+                },
+                now,
+            );
+        }
+        // The preference was w3, w1, w2.
+        assert_eq!(
+            order_of(&state),
+            [
+                "dir",
+                "new-worker::1::worker-3",
+                "new-worker::1::worker-1",
+                "new-worker::1::worker-2"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_director_arriving_late_at_the_front_does_not_disturb_the_stack_order() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+
+        // The Director is not staged yet: a Worker holds `panes[0]`.
+        let dir = SessionKey::from_id("dir");
+        state.unstage(&dir);
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(dir.clone()),
+            panes: ["w1", "w2", "w3"].map(SessionKey::from_id).to_vec(),
+            focused: 0,
+        };
+        state.pending_opens.insert(
+            dir.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false,
+                cwd: PathBuf::from("/work"),
+            },
+        );
+        state
+            .member_tokens
+            .insert(dir.clone(), DIRECTOR_TOKEN.to_string());
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key: dir },
+            now,
+        );
+
+        // The Director goes to the front, and the Worker it displaced joins
+        // the stack in its ranked place.
+        assert_eq!(order_of(&state), ["dir", "w3", "w1", "w2"]);
+    }
+
+    #[test]
+    fn members_without_a_rank_land_after_the_ranked_ones_in_their_own_order() {
+        let (mut state, mut app, brigade, now) = drag_fixture(4);
+        let layout = BrigadeLayout {
+            stack_order: vec!["worker-4".to_string(), "worker-2".to_string()],
+            ..BrigadeLayout::default()
+        };
+        state.brigade_layouts.insert(1, layout);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        assert_eq!(order_of(&state), ["dir", "w4", "w2", "w1", "w3"]);
+    }
+
+    #[test]
+    fn a_move_keeps_an_off_stage_members_place_after_the_staged_ones() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let layout = BrigadeLayout {
+            stack_order: vec!["worker-9".to_string(), "worker-8".to_string()],
+            ..BrigadeLayout::default()
+        };
+        state.brigade_layouts.insert(1, layout);
+
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+
+        assert_eq!(
+            state.brigade_layouts[&1].stack_order,
+            ["worker-3", "worker-1", "worker-2", "worker-9", "worker-8"]
+        );
+    }
+
+    #[test]
+    fn dismissing_a_worker_forgets_its_slot_and_a_reused_token_does_not_inherit_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+        assert_eq!(
+            state.brigade_layouts[&1].stack_order,
+            ["worker-3", "worker-1", "worker-2"]
+        );
+
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+        assert_eq!(
+            state.brigade_layouts[&1].stack_order,
+            ["worker-1", "worker-2"]
+        );
+        assert_eq!(order_of(&state), ["dir", "w1", "w2"]);
+
+        // add-worker numbers max + 1, so the next Worker is `worker-3` again;
+        // put it at the front of the panes to see where it ends up.
+        let again = SessionKey::from_id("w3-again");
+        state.screens.insert(again.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(again.clone(), "worker-3".to_string());
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.insert(1, again);
+        }
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3-again"]);
+    }
+
+    #[test]
+    fn another_brigades_dismissal_result_does_not_forget_this_brigades_slot() {
+        let (mut state, mut app, brigade, now) = two_brigades_with_a_worker_3_each();
+        state.brigade_layouts.get_mut(&1).unwrap().stack_order =
+            vec!["worker-3".to_string(), "worker-1".to_string()];
+        state.pending_dismiss = Some(SessionKey::from_id("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+
+        update(&mut state, &mut app, &brigade, dismissed(2), now);
+
+        assert_eq!(
+            state.brigade_layouts[&1].stack_order,
+            ["worker-3", "worker-1"]
+        );
+    }
+
+    #[test]
+    fn disbanding_forgets_the_order_with_the_rest() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        move_onto(&mut state, &mut app, &brigade, "w2", "w1", now);
+        assert!(!state.brigade_layouts[&1].stack_order.is_empty());
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+
+        assert!(!state.brigade_layouts.contains_key(&1));
+    }
+
+    #[test]
+    fn a_pane_exiting_keeps_its_slot() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: SessionKey::from_id("w1"),
+                reason: None,
+            },
+            now,
+        );
+
+        assert_eq!(
+            state.brigade_layouts[&1].stack_order,
+            ["worker-3", "worker-1", "worker-2"]
+        );
+    }
+
+    /// Arm the prefix and press `code`+`modifiers` after it.
+    fn prefix_key(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        code: KeyCode,
+        modifiers: Modifiers,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        state.prefix_armed = Some(now);
+        forward_key(state, app, brigade, code, modifiers, now)
+    }
+
+    fn focus_stack_slot(state: &mut EmporiumState, slot: usize) {
+        state.focus = Focus::Pane;
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = slot;
+        }
+    }
+
+    #[test]
+    fn prefix_shift_up_and_down_move_the_focused_tile_one_slot_and_keep_focus_on_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+
+        focus_stack_slot(&mut state, 2); // w2
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::SHIFT,
+            now,
+        );
+        assert!(writes_of(&cmds).is_empty(), "nothing leaks into the child");
+        assert_eq!(order_of(&state), ["dir", "w2", "w1", "w3"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+        assert_eq!(state.focus, Focus::Pane);
+        assert_eq!(state.prefix_armed, None);
+
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Down,
+            Modifiers::SHIFT,
+            now,
+        );
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Down,
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w1", "w3", "w2"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+        assert_eq!(
+            state.brigade_layouts[&1].stack_order,
+            ["worker-1", "worker-3", "worker-2"]
+        );
+    }
+
+    #[test]
+    fn prefix_shift_arrows_refuse_with_a_reason_at_the_edges_the_master_and_the_sidebar() {
+        let cases: [(&str, usize, KeyCode, &str); 4] = [
+            (
+                "top",
+                1,
+                KeyCode::Up,
+                "prefix: already at the top of the stack",
+            ),
+            (
+                "bottom",
+                3,
+                KeyCode::Down,
+                "prefix: already at the bottom of the stack",
+            ),
+            (
+                "master up",
+                0,
+                KeyCode::Up,
+                "prefix: the master tile stays put",
+            ),
+            (
+                "master down",
+                0,
+                KeyCode::Down,
+                "prefix: the master tile stays put",
+            ),
+        ];
+        for (what, slot, code, expected) in cases {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            focus_stack_slot(&mut state, slot);
+            let cmds = prefix_key(&mut state, &mut app, &brigade, code, Modifiers::SHIFT, now);
+            assert!(cmds.is_empty(), "{what}");
+            assert_eq!(state.status.as_deref(), Some(expected), "{what}");
+            assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3"], "{what}");
+            assert!(state.brigade_layouts.is_empty(), "{what}");
+            assert_eq!(state.focus, Focus::Pane, "{what}");
+        }
+
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        state.focus = Focus::Sidebar;
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("prefix: focus a tile to move it")
+        );
+        assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3"]);
+
+        // A solo session has no stack either.
+        let (mut state, mut app, brigade, now) = drag_fixture(0);
+        state.stage = Stage::Solo(SessionKey::from_id("dir"));
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Down,
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("prefix: the master tile stays put")
+        );
+    }
+
+    #[test]
+    fn prefix_plain_arrows_still_move_focus_and_never_the_order() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 2);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w1"));
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Down,
+            Modifiers::NONE,
+            now,
+        );
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Down,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+        // Any other modifier combination keeps resolving as it always did.
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::CONTROL,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::ALT,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w1"));
+        assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3"]);
+        assert!(state.brigade_layouts.is_empty());
+    }
+
+    #[test]
+    fn the_number_keys_address_the_new_order() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+        assert_eq!(order_of(&state), ["dir", "w3", "w1", "w2"]);
+
+        for (digit, expected) in [('1', "dir"), ('2', "w3"), ('3', "w1"), ('4', "w2")] {
+            prefix_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char(digit),
+                Modifiers::NONE,
+                now,
+            );
+            assert_eq!(
+                focused_name(&state).as_deref(),
+                Some(expected),
+                "prefix {digit}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_resizes_exactly_the_tiles_whose_content_size_changed() {
+        let (mut state, mut app, brigade, now) = drag_fixture(4);
+        let before: Vec<(String, (u16, u16))> = state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .map(|(key, rect)| {
+                let content = pane_content(*rect);
+                (key.as_str().to_string(), (content.height, content.width))
+            })
+            .collect();
+
+        let cmds = move_onto(&mut state, &mut app, &brigade, "w4", "w1", now);
+
+        let after: HashMap<String, (u16, u16)> = state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .map(|(key, rect)| {
+                let content = pane_content(*rect);
+                (key.as_str().to_string(), (content.height, content.width))
+            })
+            .collect();
+        let mut expected: Vec<String> = before
+            .iter()
+            .filter(|(name, size)| after[name] != *size)
+            .map(|(name, _)| name.clone())
+            .collect();
+        expected.sort();
+        let resized: Vec<String> = resizes(&cmds)
+            .into_iter()
+            .map(|(key, _, _)| key.as_str().to_string())
+            .collect();
+        assert_eq!(resized, expected);
+        // Equal weights over 39 rows are 10, 10, 9, 10: moving the last tile
+        // to the top shifts the short row from third to fourth.
+        assert_eq!(resized, ["w2", "w3"], "and the rest keep their size");
     }
 
     #[test]
@@ -12566,7 +14217,7 @@ mod tests {
     fn the_hint_and_the_preview_line_exist_exactly_as_long_as_the_drag() {
         let (mut state, mut app, brigade, now) = drag_fixture(2);
         assert_eq!(state.displayed_status(), None);
-        assert_eq!(state.drag_overlay(DRAG_AREA), None);
+        assert_eq!(overlay_line(&state), None);
 
         let master = Boundary::Master { brigade: 1 };
         let start = handle_of(&state, &master).position;
@@ -12575,7 +14226,7 @@ mod tests {
             state.displayed_status(),
             Some("resize: release to apply · Esc cancels")
         );
-        let (line, axis) = state.drag_overlay(DRAG_AREA).unwrap();
+        let (line, axis) = overlay_line(&state).unwrap();
         assert_eq!(axis, Axis::Vertical);
         assert_eq!(
             line.x,
@@ -12600,7 +14251,7 @@ mod tests {
         );
 
         release_at(&mut state, &mut app, &brigade, &master, start + 6, now);
-        assert_eq!(state.drag_overlay(DRAG_AREA), None);
+        assert_eq!(overlay_line(&state), None);
         assert_ne!(
             state.displayed_status(),
             Some("resize: release to apply · Esc cancels")

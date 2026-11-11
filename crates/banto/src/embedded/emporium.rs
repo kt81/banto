@@ -47,7 +47,7 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
-    self, Axis, Cmd, EmporiumState, Event, Focus, GoinkyoObservation, GoinkyoSpawnCandidate,
+    self, Axis, Cmd, EmporiumState, Event, Focus, Ghost, GoinkyoObservation, GoinkyoSpawnCandidate,
     GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage, StoreIntent,
 };
 use banto_core::input::InputEvent;
@@ -2585,6 +2585,9 @@ fn draw(
     // The same geometry the core sizes the PTYs and hit-tests the mouse with.
     let geometry = state.geometry(full_area);
     let areas = geometry.areas;
+    // What a mouse gesture in progress adds on top of the finished frame.
+    let overlay = state.drag_overlay(full_area);
+    let marked_tile = overlay.as_ref().and_then(|o| o.marked.as_ref());
 
     let sidebar_title = if app.mode() == Mode::Search {
         format!("/ {}", app.query())
@@ -2622,9 +2625,12 @@ fn draw(
             };
             let focused_tile = focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let waiting = state.attention_panes().contains(key);
-            let block = Block::bordered()
-                .title(pane_title(&state.tile_label(key), focused_tile))
-                .border_style(border_style(focused_tile, waiting));
+            let block = tile_block(
+                &state.tile_label(key),
+                focused_tile,
+                waiting,
+                marked_tile == Some(key),
+            );
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
             let cursor = paint_pane(
@@ -2657,11 +2663,18 @@ fn draw(
     // a `SessionKey` entry on its own.
     pane_render_cache.retain(|key, _| state.screens.contains_key(key));
 
-    // A boundary being dragged is previewed by a line over the finished
-    // frame; the geometry underneath does not move until the release. Drawn
-    // into the composed buffer, so the frame-skip sees it appear and go.
-    if let Some((line, axis)) = state.drag_overlay(full_area) {
-        paint_drag_line(frame.buffer_mut(), line, axis);
+    // A gesture in progress is previewed over the finished frame; the
+    // geometry underneath does not move until the release. The moved tile is
+    // already marked (`tile_block`); then the line, then the ghost on top.
+    // All of it goes into the composed buffer, so the frame-skip sees it
+    // appear and go.
+    if let Some(overlay) = &overlay {
+        if let Some((line, axis)) = overlay.line {
+            paint_drag_line(frame.buffer_mut(), line, axis);
+        }
+        if let Some(ghost) = &overlay.ghost {
+            paint_ghost(frame.buffer_mut(), ghost);
+        }
     }
 
     render_status_bar(
@@ -2681,10 +2694,48 @@ fn draw(
     frame_cursor
 }
 
-/// The colour of the line previewing a boundary drag. Neither the focus cyan
-/// nor the waiting magenta (`border_style`), so it cannot be mistaken for
-/// either.
+/// The colour of a mouse gesture: the line previewing a boundary drag, a tile
+/// being moved and the ghost of its label. Neither the focus cyan nor the
+/// waiting magenta (`border_style`), so it cannot be mistaken for either.
 const DRAG_LINE_COLOR: Color = Color::Yellow;
+
+/// A tile's frame. A tile being moved is drawn in the gesture colour — border
+/// and title, replacing whichever focus, waiting or plain style it would have
+/// had — from the press to the end of the gesture. The title text is the
+/// same either way: its cells are the move handle and the resize handle's
+/// exclusion (`layout::title_columns`).
+fn tile_block(label: &str, focused: bool, waiting: bool, marked: bool) -> Block<'static> {
+    if marked {
+        return Block::bordered()
+            .title(Span::styled(
+                title_text(label),
+                Style::default()
+                    .fg(DRAG_LINE_COLOR)
+                    .add_modifier(Modifier::REVERSED),
+            ))
+            .border_style(Style::default().fg(DRAG_LINE_COLOR));
+    }
+    Block::bordered()
+        .title(pane_title(label, focused))
+        .border_style(border_style(focused, waiting))
+}
+
+/// Paint the moved tile's label following the pointer, in reversed gesture
+/// colour, over whatever the frame had there.
+fn paint_ghost(buffer: &mut Buffer, ghost: &Ghost) {
+    let style = Style::default()
+        .fg(DRAG_LINE_COLOR)
+        .add_modifier(Modifier::REVERSED);
+    let room = buffer.area.right().saturating_sub(ghost.x);
+    if !buffer.area.contains(Position::new(ghost.x, ghost.y)) {
+        return;
+    }
+    let width = unicode_width::UnicodeWidthStr::width(ghost.text.as_str()).min(usize::from(room));
+    for x in ghost.x..ghost.x + width as u16 {
+        buffer[(x, ghost.y)].reset();
+    }
+    buffer.set_stringn(ghost.x, ghost.y, &ghost.text, usize::from(room), style);
+}
 
 /// Paint the drag preview: a heavy line over `line`'s cells, replacing
 /// whatever the frame had there (a border, or a child's text).
@@ -2721,8 +2772,7 @@ fn render_status_bar(
     /// own `ARCHIVED_HINT` for why this one is not in the bar unconditionally.
     const ARCHIVED_HINT: &str = " · D restore";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
-    const PREFIX_HINTS: &str =
-        "prefix: o/Tab cycle · arrows move · 1-9 pane · b literal · s sidebar · x kill";
+    const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+arrows reorder · 1-9 pane · b literal · s sidebar · x kill";
 
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
@@ -3346,6 +3396,214 @@ mod tests {
                     (start..end).contains(&x),
                     "width {width}, {label:?}, column {x}"
                 );
+            }
+        }
+    }
+
+    /// A brigade of the Director and two Workers staged through the core's
+    /// own formation events, on a 120x40 terminal.
+    fn staged_brigade_of_two_workers() -> (EmporiumState, App, BrigadeConfig) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+        let brigade = BrigadeConfig::default();
+        let now = Instant::now();
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::ClaudeCode,
+                worker_model: "sonnet".to_string(),
+                result: Ok((1, vec!["worker-1".to_string(), "worker-2".to_string()])),
+            },
+            now,
+        );
+        let director = match cmds.as_slice() {
+            [Cmd::OpenEmbedded { key, .. }] => key.clone(),
+            other => panic!("expected a Director open, got {other:?}"),
+        };
+        let mut opened = vec![director.clone()];
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key: director },
+            now,
+        );
+        opened.extend(cmds.iter().filter_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { key, .. } => Some(key.clone()),
+            _ => None,
+        }));
+        for key in opened.into_iter().skip(1) {
+            engine::update(&mut state, &mut app, &brigade, Event::Spawned { key }, now);
+        }
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 120,
+                height: 40,
+            },
+            now,
+        );
+        (state, app, brigade)
+    }
+
+    fn mouse(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        kind: banto_core::input::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) {
+        engine::update(
+            state,
+            app,
+            brigade,
+            Event::Input(InputEvent::Mouse(banto_core::input::MouseEvent {
+                kind,
+                column,
+                row,
+            })),
+            Instant::now(),
+        );
+    }
+
+    fn render(state: &EmporiumState, app: &App) -> Buffer {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        let mut cache = HashMap::new();
+        terminal
+            .draw(|frame| {
+                let _ = draw(
+                    frame,
+                    app,
+                    state,
+                    SystemTime::now(),
+                    Instant::now(),
+                    &mut cache,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn text_at(buffer: &Buffer, x: u16, y: u16, len: u16) -> String {
+        (x..x + len).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn a_tile_being_moved_is_drawn_in_the_gesture_colour_with_its_label_ghosted_at_the_pointer() {
+        use banto_core::input::{MouseButton, MouseEventKind};
+        let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
+        let area = Rect::new(0, 0, 120, 40);
+        let tiles = state.geometry(area).tiles;
+        let (moved, other) = (tiles[1].1, tiles[2].1);
+        // The Worker tiles' own colours before anything happens.
+        let before = render(&state, &app);
+        assert_ne!(before[(moved.x, moved.y + 3)].fg, DRAG_LINE_COLOR);
+
+        // A bare press: the tile is marked, nothing follows the pointer.
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            moved.x + 2,
+            moved.y,
+        );
+        let pressed = render(&state, &app);
+        for (x, y) in [
+            (moved.x, moved.y + 3),
+            (moved.x + moved.width - 1, moved.y + 3),
+            (moved.x + 5, moved.y + moved.height - 1),
+        ] {
+            assert_eq!(pressed[(x, y)].fg, DRAG_LINE_COLOR, "border cell ({x},{y})");
+        }
+        assert_eq!(
+            text_at(&pressed, moved.x + 1, moved.y, 10),
+            " worker-1 ",
+            "the text is unchanged"
+        );
+        assert_eq!(pressed[(moved.x + 2, moved.y)].fg, DRAG_LINE_COLOR);
+        assert_ne!(
+            pressed[(other.x, other.y + 3)].fg,
+            DRAG_LINE_COLOR,
+            "only the moved tile"
+        );
+        assert!(
+            !text_at(&pressed, 50, 20, 10).contains("worker-1"),
+            "no ghost before the pointer moves"
+        );
+
+        // Dragged over the master pane's interior, lower than the second
+        // tile's top: the ghost is there, and a landing line under it.
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            50,
+            25,
+        );
+        let dragging = render(&state, &app);
+        assert_eq!(text_at(&dragging, 50, 25, 10), " worker-1 ");
+        for x in 50..60 {
+            let cell = &dragging[(x, 25)];
+            assert_eq!(cell.fg, DRAG_LINE_COLOR);
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "reversed at {x}"
+            );
+        }
+        assert_eq!(
+            dragging[(60, 25)].fg,
+            Color::Reset,
+            "the ghost is exactly its text wide"
+        );
+        assert_eq!(
+            dragging[(other.x + 4, other.y + other.height - 1)].symbol(),
+            "\u{2501}"
+        );
+        assert_eq!(
+            dragging[(moved.x, moved.y + 3)].fg,
+            DRAG_LINE_COLOR,
+            "still marked"
+        );
+
+        // A ghost near the right edge is cut to the screen.
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Drag(MouseButton::Left),
+            116,
+            25,
+        );
+        let edge = render(&state, &app);
+        assert_eq!(text_at(&edge, 116, 25, 4), " wor");
+        assert_eq!(edge[(119, 25)].fg, DRAG_LINE_COLOR);
+
+        // The release removes every cue.
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            116,
+            25,
+        );
+        let done = render(&state, &app);
+        // Rows above the status bar, which has colours of its own.
+        for y in 0..39 {
+            for x in 36..120 {
+                if done[(x, y)].fg == DRAG_LINE_COLOR {
+                    panic!("a gesture-coloured cell is left at ({x},{y})");
+                }
             }
         }
     }
