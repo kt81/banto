@@ -27,7 +27,7 @@ use rusqlite::{OptionalExtension, params};
 
 use banto_core::model::{
     AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
-    MessageGlance, SessionId,
+    MessageGlance, SessionId, StoredLayout, StoredMemberLayout,
 };
 
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
@@ -244,6 +244,14 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM brigade_messages WHERE brigade_id = ?1 AND to_member = ?2",
+            params![brigade_id, token],
+        )?;
+        // The member's own arrangement (rank, weight, collapsed) went with its
+        // row. The soloed member is a brigade-level column naming a token, so
+        // it needs clearing by hand: tokens are reused, and a new Worker must
+        // not inherit a dismissed one's solo.
+        tx.execute(
+            "UPDATE brigades SET solo_member = NULL WHERE id = ?1 AND solo_member = ?2",
             params![brigade_id, token],
         )?;
         tx.commit()?;
@@ -515,6 +523,143 @@ impl Store {
         )?)
     }
 
+    /// A brigade's stored arrangement preferences: the brigade-level values
+    /// and, for every member that has any, its stack rank, row weight and
+    /// collapsed flag. A brigade that does not exist reads as no preference.
+    ///
+    /// The file is banto's own but it outlives versions, so every value is
+    /// validated on the way out and an unusable one reads as "no
+    /// preference", never as an error or an out-of-range number: a permille
+    /// outside 0..=1000, a width outside 1..=1000 columns, a negative or
+    /// absurd rank, a weight outside 1..=65535, and a `solo_member` that is
+    /// not a member of this brigade.
+    pub fn brigade_layout(&self, brigade_id: BrigadeId) -> Result<StoredLayout, StoreError> {
+        let brigade = self
+            .conn
+            .query_row(
+                "SELECT master_permille, collapsed_stack_width, solo_member
+                 FROM brigades WHERE id = ?1",
+                [brigade_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((master_permille, collapsed_stack_width, solo_member)) = brigade else {
+            return Ok(StoredLayout::default());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT member_token, stack_rank, row_weight, minimized
+             FROM brigade_members WHERE brigade_id = ?1
+             ORDER BY member_token",
+        )?;
+        let rows = stmt.query_map([brigade_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut tokens = Vec::new();
+        let mut members = Vec::new();
+        for row in rows {
+            let (token, rank, weight, minimized) = row?;
+            let entry = StoredMemberLayout {
+                token: token.clone(),
+                stack_rank: rank
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|v| *v < MAX_STORED_RANK),
+                row_weight: weight
+                    .and_then(|v| u16::try_from(v).ok())
+                    .filter(|v| *v >= 1),
+                // Only 1 is "collapsed"; any other number is not one of ours
+                // and reads as no preference like every other stored value.
+                minimized: minimized == 1,
+            };
+            tokens.push(token);
+            if entry.stack_rank.is_some() || entry.row_weight.is_some() || entry.minimized {
+                members.push(entry);
+            }
+        }
+        Ok(StoredLayout {
+            master_permille: master_permille
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v <= 1000),
+            collapsed_stack_width: collapsed_stack_width
+                .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| (1..=1000).contains(v)),
+            solo_member: solo_member.filter(|token| tokens.contains(token)),
+            members,
+        })
+    }
+
+    /// Replace a brigade's stored arrangement from a whole snapshot, in one
+    /// transaction: the brigade-level values (a `None` writes NULL, "the
+    /// default") and every member the snapshot lists.
+    ///
+    /// A token in the snapshot with no member row is ignored — this never
+    /// inserts a member — and a member row the snapshot does not list is left
+    /// exactly as it is. A solo naming a token with no member row is written
+    /// as none. Idempotent: writing the same snapshot again changes nothing.
+    /// A brigade that does not exist (disbanded since the snapshot was taken)
+    /// is a silent no-op: no row is created and nothing is reported.
+    pub fn save_brigade_layout(
+        &mut self,
+        brigade_id: BrigadeId,
+        layout: &StoredLayout,
+    ) -> Result<(), StoreError> {
+        // IMMEDIATE: the statements below must see one consistent state of the
+        // brigade and its members, not one another process changes midway.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The soloed member is written only if it is a member of this brigade
+        // *now*. A snapshot can be older than a dismissal that happened in
+        // another process (the emporium, an agent's MCP server): without the
+        // check the late save would put a dismissed member's token back, and
+        // the next Worker to reuse that token would inherit the solo.
+        tx.execute(
+            "UPDATE brigades
+             SET master_permille = ?2,
+                 collapsed_stack_width = ?3,
+                 solo_member = CASE
+                     WHEN ?4 IS NOT NULL AND EXISTS (
+                         SELECT 1 FROM brigade_members
+                         WHERE brigade_id = ?1 AND member_token = ?4
+                     ) THEN ?4
+                     ELSE NULL
+                 END
+             WHERE id = ?1",
+            params![
+                brigade_id,
+                layout.master_permille,
+                layout.collapsed_stack_width,
+                layout.solo_member
+            ],
+        )?;
+        for member in &layout.members {
+            tx.execute(
+                "UPDATE brigade_members
+                 SET stack_rank = ?3, row_weight = ?4, minimized = ?5
+                 WHERE brigade_id = ?1 AND member_token = ?2",
+                params![
+                    brigade_id,
+                    member.token,
+                    member.stack_rank,
+                    member.row_weight,
+                    i64::from(member.minimized)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The newest message in `brigade_id` that `member_token` (of
     /// `recipient_role`) can receive — addressed to its role and either a
     /// broadcast or to it by name, the same visibility rule as
@@ -613,6 +758,10 @@ impl Store {
         )?)
     }
 }
+
+/// Ranks beyond this read as "no preference": no brigade has anything like
+/// this many members, so a larger stored number is not one of ours.
+const MAX_STORED_RANK: u32 = 10_000;
 
 /// How many characters of a body the glance queries read. A body can be many
 /// kilobytes of pasted output; the glance only needs its first non-empty line.
@@ -1883,6 +2032,409 @@ mod tests {
         println!(
             "glance reads, 6000 messages / 6 brigades: 3 members {per_tick:?} per tick; \
              one never-matching member {never:?}; MAX(id) gate {gate:?}"
+        );
+    }
+
+    // --- stored arrangement ------------------------------------------------------
+
+    fn member_layout(
+        token: &str,
+        rank: Option<u32>,
+        weight: Option<u16>,
+        minimized: bool,
+    ) -> StoredMemberLayout {
+        StoredMemberLayout {
+            token: token.to_string(),
+            stack_rank: rank,
+            row_weight: weight,
+            minimized,
+        }
+    }
+
+    fn brigade_with(store: &mut Store, tokens: &[&str]) -> BrigadeId {
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+        for token in tokens {
+            store
+                .add_brigade_member(br, token, BrigadeRole::Worker, Some(&sid(token)))
+                .unwrap();
+        }
+        br
+    }
+
+    #[test]
+    fn every_stored_arrangement_field_round_trips() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1", "worker-2", "worker-3"]);
+        let layout = StoredLayout {
+            master_permille: Some(640),
+            collapsed_stack_width: Some(44),
+            solo_member: Some("worker-2".to_string()),
+            members: vec![
+                member_layout("worker-1", Some(2), Some(7), true),
+                member_layout("worker-2", Some(0), None, false),
+                member_layout("worker-3", None, Some(12), false),
+            ],
+        };
+
+        store.save_brigade_layout(br, &layout).unwrap();
+        let mut read = store.brigade_layout(br).unwrap();
+
+        // Members come back in token order; the director has nothing stored.
+        read.members.sort_by(|a, b| a.token.cmp(&b.token));
+        assert_eq!(read, layout);
+    }
+
+    #[test]
+    fn a_new_brigade_and_a_missing_one_read_as_no_preference() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1"]);
+        assert_eq!(store.brigade_layout(br).unwrap(), StoredLayout::default());
+        assert_eq!(store.brigade_layout(9999).unwrap(), StoredLayout::default());
+        // Saving to a brigade that does not exist is a harmless no-op.
+        store
+            .save_brigade_layout(
+                9999,
+                &StoredLayout {
+                    master_permille: Some(1),
+                    ..StoredLayout::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_ignores_unknown_tokens_and_leaves_absent_members_alone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1", "worker-2"]);
+        store
+            .save_brigade_layout(
+                br,
+                &StoredLayout {
+                    members: vec![
+                        member_layout("worker-1", Some(0), Some(5), true),
+                        member_layout("worker-2", Some(1), Some(6), false),
+                    ],
+                    ..StoredLayout::default()
+                },
+            )
+            .unwrap();
+        let members_before = store.brigade_members(br).unwrap().len();
+
+        // A later snapshot that lists only worker-1 (changed) and a ghost.
+        store
+            .save_brigade_layout(
+                br,
+                &StoredLayout {
+                    master_permille: Some(300),
+                    members: vec![
+                        member_layout("worker-1", None, None, false),
+                        member_layout("ghost", Some(0), Some(1), true),
+                    ],
+                    ..StoredLayout::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.brigade_members(br).unwrap().len(),
+            members_before,
+            "a snapshot never inserts a member"
+        );
+        let read = store.brigade_layout(br).unwrap();
+        assert_eq!(read.master_permille, Some(300));
+        assert!(read.members.iter().all(|m| m.token != "ghost"));
+        assert!(
+            read.members.iter().all(|m| m.token != "worker-1"),
+            "worker-1 was written back to nothing"
+        );
+        let two = read.members.iter().find(|m| m.token == "worker-2").unwrap();
+        assert_eq!(
+            two,
+            &member_layout("worker-2", Some(1), Some(6), false),
+            "left as it was"
+        );
+    }
+
+    #[test]
+    fn saving_the_same_snapshot_twice_changes_nothing() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1"]);
+        let layout = StoredLayout {
+            master_permille: Some(700),
+            collapsed_stack_width: None,
+            solo_member: Some("worker-1".to_string()),
+            members: vec![member_layout("worker-1", Some(0), Some(9), true)],
+        };
+        store.save_brigade_layout(br, &layout).unwrap();
+        let once = store.brigade_layout(br).unwrap();
+        store.save_brigade_layout(br, &layout).unwrap();
+        assert_eq!(store.brigade_layout(br).unwrap(), once);
+        // Brigade-level `None` writes NULL: back to the default.
+        store
+            .save_brigade_layout(br, &StoredLayout::default())
+            .unwrap();
+        let read = store.brigade_layout(br).unwrap();
+        assert_eq!((read.master_permille, read.solo_member), (None, None));
+    }
+
+    #[test]
+    fn a_dismissed_member_forgets_its_arrangement_and_a_reused_token_starts_fresh() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1", "worker-2"]);
+        store
+            .save_brigade_layout(
+                br,
+                &StoredLayout {
+                    solo_member: Some("worker-2".to_string()),
+                    members: vec![
+                        member_layout("worker-1", Some(1), Some(8), true),
+                        member_layout("worker-2", Some(0), Some(3), true),
+                    ],
+                    ..StoredLayout::default()
+                },
+            )
+            .unwrap();
+
+        store.dismiss_worker(br, "worker-2").unwrap();
+        let after = store.brigade_layout(br).unwrap();
+        assert!(after.members.iter().all(|m| m.token != "worker-2"));
+        assert_eq!(
+            after.solo_member, None,
+            "a solo naming a gone member reads as none"
+        );
+
+        // add-worker numbers max + 1, so the token comes back for a new Worker.
+        store
+            .add_brigade_member(br, "worker-2", BrigadeRole::Worker, Some(&sid("fresh")))
+            .unwrap();
+        let again = store.brigade_layout(br).unwrap();
+        assert!(
+            again.members.iter().all(|m| m.token != "worker-2"),
+            "{again:?}"
+        );
+        // The solo named the dismissed member; the brigade row was cleared
+        // with it, so the new Worker under the same token does not inherit it.
+        assert_eq!(again.solo_member, None);
+        assert!(again.members.iter().any(|m| m.token == "worker-1"));
+    }
+
+    /// Two connections to one file-backed store, the way the emporium and an
+    /// agent's MCP server hold it.
+    fn two_connections() -> (tempfile::TempDir, Store, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+        (dir, a, b)
+    }
+
+    #[test]
+    fn a_late_save_cannot_put_a_dismissed_members_solo_back() {
+        let (_dir, mut a, mut b) = two_connections();
+        let br = brigade_with(&mut a, &["worker-1", "worker-2"]);
+        // A took its snapshot while worker-1 was soloed...
+        let stale = StoredLayout {
+            master_permille: Some(600),
+            solo_member: Some("worker-1".to_string()),
+            members: vec![member_layout("worker-1", Some(0), Some(4), true)],
+            ..StoredLayout::default()
+        };
+        // ...then another process dismissed worker-1...
+        b.dismiss_worker(br, "worker-1").unwrap();
+        // ...and A's save lands afterwards.
+        a.save_brigade_layout(br, &stale).unwrap();
+
+        let read = a.brigade_layout(br).unwrap();
+        assert_eq!(
+            read.solo_member, None,
+            "the dismissed member's solo stays gone"
+        );
+        assert_eq!(
+            read.master_permille,
+            Some(600),
+            "the rest of the snapshot still lands"
+        );
+        // add-worker numbers max + 1: the token comes back for a new Worker,
+        // which must not inherit the solo.
+        b.add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("fresh")))
+            .unwrap();
+        let again = a.brigade_layout(br).unwrap();
+        assert_eq!(again.solo_member, None);
+        assert!(again.members.iter().all(|m| m.token != "worker-1"));
+    }
+
+    #[test]
+    fn a_solo_naming_a_current_member_is_written() {
+        let (_dir, mut a, _b) = two_connections();
+        let br = brigade_with(&mut a, &["worker-1"]);
+        a.save_brigade_layout(
+            br,
+            &StoredLayout {
+                solo_member: Some("worker-1".to_string()),
+                ..StoredLayout::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            a.brigade_layout(br).unwrap().solo_member.as_deref(),
+            Some("worker-1")
+        );
+        // The Director is a member too: soloing the master is stored.
+        a.save_brigade_layout(
+            br,
+            &StoredLayout {
+                solo_member: Some("director".to_string()),
+                ..StoredLayout::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            a.brigade_layout(br).unwrap().solo_member.as_deref(),
+            Some("director")
+        );
+    }
+
+    #[test]
+    fn a_save_for_a_brigade_disbanded_in_the_meantime_is_a_silent_no_op() {
+        let (_dir, mut a, mut b) = two_connections();
+        let br = brigade_with(&mut a, &["worker-1"]);
+        let stale = StoredLayout {
+            master_permille: Some(300),
+            collapsed_stack_width: Some(50),
+            solo_member: Some("worker-1".to_string()),
+            members: vec![member_layout("worker-1", Some(0), Some(9), true)],
+        };
+        b.delete_brigade(br).unwrap();
+
+        a.save_brigade_layout(br, &stale)
+            .expect("nothing to report: the brigade is simply gone");
+
+        let count = |table: &str| -> i64 {
+            a.conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count("brigades"), 0, "no brigade row was created");
+        assert_eq!(count("brigade_members"), 0, "no member row was created");
+        assert_eq!(a.brigade_layout(br).unwrap(), StoredLayout::default());
+    }
+
+    #[test]
+    fn only_one_in_the_minimized_flag_means_collapsed() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1", "worker-2", "worker-3"]);
+        for (token, flag) in [("worker-1", 1), ("worker-2", 2), ("worker-3", -1)] {
+            store
+                .conn
+                .execute(
+                    "UPDATE brigade_members SET minimized = ?3
+                     WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token, flag],
+                )
+                .unwrap();
+        }
+
+        let read = store.brigade_layout(br).unwrap();
+
+        assert_eq!(
+            read.members,
+            [member_layout("worker-1", None, None, true)],
+            "2 and -1 are no preference, so those members have no entry at all"
+        );
+    }
+
+    #[test]
+    fn disbanding_a_brigade_removes_its_arrangement() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(&mut store, &["worker-1"]);
+        store
+            .save_brigade_layout(
+                br,
+                &StoredLayout {
+                    master_permille: Some(500),
+                    members: vec![member_layout("worker-1", Some(0), Some(4), true)],
+                    ..StoredLayout::default()
+                },
+            )
+            .unwrap();
+
+        store.delete_brigade(br).unwrap();
+
+        assert_eq!(store.brigade_layout(br).unwrap(), StoredLayout::default());
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM brigade_members", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn nonsensical_stored_values_read_as_no_preference_and_never_panic() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = brigade_with(
+            &mut store,
+            &["worker-1", "worker-2", "worker-3", "worker-4"],
+        );
+        let set_member = |token: &str, rank: i64, weight: i64, minimized: i64| {
+            store
+                .conn
+                .execute(
+                    "UPDATE brigade_members SET stack_rank = ?3, row_weight = ?4, minimized = ?5
+                     WHERE brigade_id = ?1 AND member_token = ?2",
+                    params![br, token, rank, weight, minimized],
+                )
+                .unwrap();
+        };
+        set_member("worker-1", -1, -5, 0);
+        set_member("worker-2", 4_000_000_000, 70_000, 0);
+        set_member("worker-3", 3, 0, 7);
+        set_member("worker-4", 2, 65_535, 1);
+        store
+            .conn
+            .execute(
+                "UPDATE brigades SET master_permille = 5000, collapsed_stack_width = -3,
+                 solo_member = 'not-a-member' WHERE id = ?1",
+                [br],
+            )
+            .unwrap();
+
+        let read = store.brigade_layout(br).unwrap();
+
+        assert_eq!(read.master_permille, None);
+        assert_eq!(read.collapsed_stack_width, None);
+        assert_eq!(read.solo_member, None);
+        let by = |token: &str| read.members.iter().find(|m| m.token == token);
+        assert!(
+            by("worker-1").is_none(),
+            "negative rank and weight: nothing"
+        );
+        assert!(by("worker-2").is_none(), "huge rank and weight: nothing");
+        assert_eq!(
+            by("worker-3"),
+            Some(&member_layout("worker-3", Some(3), None, false)),
+            "a 7 in the flag is not a collapse; the rank beside it is still good"
+        );
+        assert_eq!(
+            by("worker-4"),
+            Some(&member_layout("worker-4", Some(2), Some(65_535), true))
+        );
+        // Boundary values that are fine stay.
+        store
+            .conn
+            .execute(
+                "UPDATE brigades SET master_permille = 1000, collapsed_stack_width = 1000 WHERE id = ?1",
+                [br],
+            )
+            .unwrap();
+        let read = store.brigade_layout(br).unwrap();
+        assert_eq!(
+            (read.master_permille, read.collapsed_stack_width),
+            (Some(1000), Some(1000))
         );
     }
 

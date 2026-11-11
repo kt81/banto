@@ -565,6 +565,11 @@ fn event_loop(
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
     let mut glance_gate = GlanceGate::default();
+    // The stored sidebar width, fed as the very first event of the very first
+    // iteration (see the loop) so it is part of the recorded stream.
+    let mut stored_sidebar_width = Some(Event::SidebarWidthLoaded {
+        width: deps.store.borrow().sidebar_width().ok().flatten(),
+    });
     // Opened once, off this thread — see `banto_io::input`'s module doc for
     // why the read no longer happens inline here: a slow iteration
     // (rendering, a reload pass, ...) between this loop getting back around
@@ -585,6 +590,13 @@ fn event_loop(
         let _ = terminal.backend().take_timings();
         let now = Instant::now();
         let mut events: VecDeque<Event> = VecDeque::new();
+        // Ahead of the first `Resized` and of anything an operator could do:
+        // the stage is empty until a later iteration, so no pane exists whose
+        // size could be computed with the default width first. (A native
+        // resize arriving in this same iteration is moved to the front of
+        // `events` below; the viewport height it sets does not depend on the
+        // sidebar's width, so the order between the two does not matter.)
+        events.extend(stored_sidebar_width.take());
 
         // Geometry is cached from startup, native resize input, and the
         // once-a-second fallback below. `Terminal::draw` used to perform a
@@ -1547,11 +1559,30 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                     })
                     .collect()
             });
+            // The brigade's stored arrangement rides the same round trip, so
+            // it is in core state before the stage (and its first PTY sizes)
+            // is built. A failed read is no arrangement, not a failed resolve.
+            let layout = membership
+                .as_ref()
+                .and_then(|(brigade_id, _, _)| store.brigade_layout(*brigade_id).ok());
             vec![Event::MembershipResolved {
                 session_id,
                 membership,
                 members,
+                layout,
             }]
+        }
+        // Preferences are written the way a pin is: fire and forget, nothing
+        // reported on failure. The arrangement is memory-first and rewritten in
+        // full on its next change, so a failed write costs at most one restart's
+        // worth of arrangement, not a session.
+        StoreIntent::SaveBrigadeLayout { brigade_id, layout } => {
+            let _ = store.borrow_mut().save_brigade_layout(brigade_id, &layout);
+            Vec::new()
+        }
+        StoreIntent::SaveSidebarWidth { width } => {
+            let _ = store.borrow().set_sidebar_width(width);
+            Vec::new()
         }
         StoreIntent::FormBrigade {
             director_row_id,
@@ -4258,6 +4289,294 @@ mod tests {
         let stack = state.geometry(area).tiles[1].1;
         let stack_right = stack.x + stack.width - 1;
         assert_eq!(text_at(&after, stack_right - 3, stack.y, 3), "[+]");
+    }
+
+    // --- arrangement persistence, end to end --------------------------------------
+
+    /// Feed `events` through the core and keep going on what comes back: store
+    /// intents are executed against `store` (and their answers fed in), every
+    /// open is answered with a spawn. Returns every command seen.
+    fn drive(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        store: &RefCell<Store>,
+        events: Vec<Event>,
+    ) -> Vec<Cmd> {
+        let mut seen = Vec::new();
+        let mut queue: VecDeque<Event> = events.into();
+        while let Some(event) = queue.pop_front() {
+            for cmd in engine::update(state, app, brigade, event, Instant::now()) {
+                match &cmd {
+                    Cmd::Store(intent) => queue.extend(execute_store_intent(intent.clone(), store)),
+                    Cmd::OpenEmbedded { key, .. } => {
+                        queue.push_back(Event::Spawned { key: key.clone() })
+                    }
+                    _ => {}
+                }
+                seen.push(cmd);
+            }
+        }
+        seen
+    }
+
+    fn key_event(code: banto_core::input::KeyCode, mods: banto_core::input::Modifiers) -> Event {
+        Event::Input(InputEvent::Key(banto_core::input::KeyEvent::new(
+            code, mods,
+        )))
+    }
+
+    /// A brigade of the Director and two Workers, all with session rows, in a
+    /// store file; returns the app and the store.
+    fn stored_brigade_in(path: &std::path::Path) -> (App, RefCell<Store>) {
+        let mut store = Store::open(path).unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        assert_eq!(br, 1);
+        for (token, role, session) in [
+            ("director", BrigadeRole::Director, "dir"),
+            ("worker-1", BrigadeRole::Worker, "w1"),
+            ("worker-2", BrigadeRole::Worker, "w2"),
+        ] {
+            store
+                .add_brigade_member(br, token, role, Some(&SessionId(session.to_string())))
+                .unwrap();
+        }
+        let app = App::new(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1", AgentKind::ClaudeCode),
+            test_row("w2", AgentKind::ClaudeCode),
+        ]);
+        (app, RefCell::new(store))
+    }
+
+    /// One "run" of the emporium over `store`: nothing but what the store
+    /// holds, the sidebar width fed first as the real loop does, the brigade
+    /// staged by activating its Director.
+    fn start_run(app: &mut App, brigade: &BrigadeConfig, store: &RefCell<Store>) -> EmporiumState {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let width = store.borrow().sidebar_width().unwrap();
+        drive(
+            &mut state,
+            app,
+            brigade,
+            store,
+            vec![
+                Event::SidebarWidthLoaded { width },
+                Event::Resized {
+                    width: 120,
+                    height: 40,
+                },
+                key_event(
+                    banto_core::input::KeyCode::Enter,
+                    banto_core::input::Modifiers::NONE,
+                ),
+            ],
+        );
+        state
+    }
+
+    /// Tiles by name, collapsed flags, the pane area, the pane order.
+    type Picture = (Vec<(String, Rect)>, Vec<bool>, Rect, Vec<String>);
+
+    fn picture(state: &EmporiumState) -> Picture {
+        let geometry = state.geometry(Rect::new(0, 0, 120, 40));
+        (
+            geometry
+                .tiles
+                .iter()
+                .map(|(key, rect)| (key.as_str().to_string(), *rect))
+                .collect(),
+            geometry.collapsed.clone(),
+            geometry.areas.pane,
+            match &state.stage {
+                Stage::Brigade { panes, .. } => {
+                    panes.iter().map(|k| k.as_str().to_string()).collect()
+                }
+                _ => Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn an_arrangement_survives_a_restart_through_a_real_store() {
+        use banto_core::engine::Boundary;
+        use banto_core::input::{KeyCode, Modifiers, MouseButton, MouseEventKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let brigade = BrigadeConfig::default();
+        let area = Rect::new(0, 0, 120, 40);
+
+        // --- first run: stage the brigade, then arrange it
+        let (mut app, store) = stored_brigade_in(&path);
+        let mut state = start_run(&mut app, &brigade, &store);
+        let plain = picture(&state);
+        assert_eq!(plain.3, ["dir", "w1", "w2"], "staged in member order");
+
+        let press = |state: &mut EmporiumState, app: &mut App, kind, column, row| {
+            drive(
+                state,
+                app,
+                &brigade,
+                &store,
+                vec![Event::Input(InputEvent::Mouse(
+                    banto_core::input::MouseEvent { kind, column, row },
+                ))],
+            );
+        };
+        let drag = |state: &mut EmporiumState, app: &mut App, boundary: Boundary, by: i32| {
+            let handle = state
+                .geometry(area)
+                .handle_for(&boundary)
+                .cloned()
+                .expect("the boundary exists");
+            let hit = handle.hits()[0];
+            let (column, row) = (hit.x + 2.min(hit.width - 1), hit.y);
+            let target = |from: u16| (i32::from(from) + by) as u16;
+            let (to_column, to_row) = match handle.axis {
+                Axis::Vertical => (target(column), row),
+                Axis::Horizontal => (column, target(row)),
+            };
+            press(
+                state,
+                app,
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            );
+            press(
+                state,
+                app,
+                MouseEventKind::Drag(MouseButton::Left),
+                to_column,
+                to_row,
+            );
+            press(
+                state,
+                app,
+                MouseEventKind::Up(MouseButton::Left),
+                to_column,
+                to_row,
+            );
+        };
+        // The sidebar, the master edge, a row edge.
+        drag(&mut state, &mut app, Boundary::Sidebar, 10);
+        drag(&mut state, &mut app, Boundary::Master { brigade: 1 }, 5);
+        let w1 = SessionKey::from_id("w1");
+        let w2 = SessionKey::from_id("w2");
+        drag(
+            &mut state,
+            &mut app,
+            Boundary::Stack {
+                brigade: 1,
+                above: w1.clone(),
+                below: w2.clone(),
+            },
+            4,
+        );
+        // Reorder from the keyboard: focus w2, shift-up after the prefix.
+        let prefix_then = |state: &mut EmporiumState, app: &mut App, code, mods| {
+            drive(
+                state,
+                app,
+                &brigade,
+                &store,
+                vec![
+                    key_event(KeyCode::Char('b'), Modifiers::CONTROL),
+                    key_event(code, mods),
+                ],
+            );
+        };
+        prefix_then(&mut state, &mut app, KeyCode::Char('3'), Modifiers::NONE);
+        prefix_then(&mut state, &mut app, KeyCode::Up, Modifiers::SHIFT);
+        // Collapse the tile now second (w1), from its button.
+        let minimize = state
+            .geometry(area)
+            .buttons()
+            .iter()
+            .find(|b| b.key == w1 && b.kind == ButtonKind::Minimize)
+            .cloned()
+            .unwrap();
+        press(
+            &mut state,
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            minimize.rect.x,
+            minimize.rect.y,
+        );
+        let arranged = picture(&state);
+        assert_ne!(arranged, plain, "the arrangement changed the picture");
+        assert_eq!(arranged.3, ["dir", "w2", "w1"]);
+        assert_eq!(arranged.1, [false, false, true]);
+
+        // --- a second run from nothing but the file
+        drop(state);
+        drop(store);
+        let (mut app2, store2) = {
+            let store = Store::open(&path).unwrap();
+            (
+                App::new(vec![
+                    test_row("dir", AgentKind::ClaudeCode),
+                    test_row("w1", AgentKind::ClaudeCode),
+                    test_row("w2", AgentKind::ClaudeCode),
+                ]),
+                RefCell::new(store),
+            )
+        };
+        let restarted = start_run(&mut app2, &brigade, &store2);
+
+        assert_eq!(
+            picture(&restarted),
+            arranged,
+            "the same screen after a restart"
+        );
+        assert_eq!(
+            restarted.geometry(area).areas.pane.x,
+            46,
+            "the sidebar width came back"
+        );
+    }
+
+    #[test]
+    fn restoring_everything_is_stored_too_so_a_restart_returns_to_the_defaults() {
+        use banto_core::input::{KeyCode, Modifiers};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        let brigade = BrigadeConfig::default();
+        let (mut app, store) = stored_brigade_in(&path);
+        let mut state = start_run(&mut app, &brigade, &store);
+        let plain = picture(&state);
+        let chord = |state: &mut EmporiumState, app: &mut App, code, mods| {
+            drive(
+                state,
+                app,
+                &brigade,
+                &store,
+                vec![
+                    key_event(KeyCode::Char('b'), Modifiers::CONTROL),
+                    key_event(code, mods),
+                ],
+            );
+        };
+        chord(&mut state, &mut app, KeyCode::Char('3'), Modifiers::NONE);
+        chord(&mut state, &mut app, KeyCode::Char('m'), Modifiers::NONE);
+        assert_ne!(picture(&state), plain);
+        chord(&mut state, &mut app, KeyCode::Char('M'), Modifiers::SHIFT);
+        assert_eq!(picture(&state), plain);
+
+        let (mut app2, store2) = (
+            App::new(vec![
+                test_row("dir", AgentKind::ClaudeCode),
+                test_row("w1", AgentKind::ClaudeCode),
+                test_row("w2", AgentKind::ClaudeCode),
+            ]),
+            RefCell::new(Store::open(&path).unwrap()),
+        );
+        let restarted = start_run(&mut app2, &brigade, &store2);
+        assert_eq!(
+            picture(&restarted),
+            plain,
+            "the cleared flag was written, not just forgotten"
+        );
     }
 
     #[test]

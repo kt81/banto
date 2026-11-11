@@ -507,6 +507,32 @@ pub struct MessageGlance {
     pub line: String,
 }
 
+/// One member's arrangement preferences as the store keeps them (its columns
+/// in `brigade_members`): its place in the stack, its row weight, whether it
+/// is collapsed. `None`/`false` mean "no preference".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMemberLayout {
+    pub token: MemberToken,
+    /// Position in the stack order, 0 first. Members are ordered by this, then
+    /// by token for equal ranks.
+    pub stack_rank: Option<u32>,
+    pub row_weight: Option<u16>,
+    pub minimized: bool,
+}
+
+/// A brigade's stored arrangement preferences: the brigade-level values (each
+/// `None` meaning "the default") and one entry per member that has any.
+/// Plain data for the store boundary — it travels in `Event`s and
+/// `StoreIntent`s, so it is serde — and converted to and from the live
+/// `layout::BrigadeLayout` in core.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredLayout {
+    pub master_permille: Option<u16>,
+    pub collapsed_stack_width: Option<u16>,
+    pub solo_member: Option<MemberToken>,
+    pub members: Vec<StoredMemberLayout>,
+}
+
 /// What a collapsed tile shows of a member's mail, as the shell read it from
 /// the store this tick: the newest message addressed to the member and the
 /// newest it sent (either may not exist).

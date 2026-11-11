@@ -37,7 +37,7 @@ use crate::key_encode::{
 };
 use crate::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
-    MessageGlance, PtyExitReason, SessionRow, SessionToOpen,
+    MessageGlance, PtyExitReason, SessionRow, SessionToOpen, StoredLayout,
 };
 
 pub use crate::layout::{
@@ -882,6 +882,13 @@ pub struct EmporiumState {
     /// brigade disbanded, like the layout preferences; a pane exiting or
     /// being relaunched keeps it.
     member_facts: HashMap<(BrigadeId, MemberToken), MemberFacts>,
+    /// The arrangement the store last held for each brigade — what it was
+    /// read as, or last given. [`persist_preferences`] writes a brigade's
+    /// layout whenever it differs from this, so a write follows exactly the
+    /// changes that matter and nothing else.
+    persisted_layouts: HashMap<BrigadeId, BrigadeLayout>,
+    /// The same for the sidebar width.
+    persisted_sidebar_width: u16,
     /// When real operator input was last forwarded to each pane, keyed by
     /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
     /// only ever suppresses a nudge for the pane the operator is actually
@@ -1159,6 +1166,8 @@ impl EmporiumState {
             status_set_at: None,
             relay_states: HashMap::new(),
             member_facts: HashMap::new(),
+            persisted_layouts: HashMap::new(),
+            persisted_sidebar_width: SIDEBAR_WIDTH,
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
@@ -1968,6 +1977,17 @@ pub enum StoreIntent {
     ResolveMembership {
         session_id: String,
     },
+    /// Persist a brigade's arrangement preferences: the whole snapshot, in one
+    /// transaction (`Store::save_brigade_layout`). Fire and forget, like a
+    /// pin: a failed write loses a preference, not the session.
+    SaveBrigadeLayout {
+        brigade_id: BrigadeId,
+        layout: StoredLayout,
+    },
+    /// Persist the sidebar width (`Store::set_sidebar_width`).
+    SaveSidebarWidth {
+        width: u16,
+    },
     FormBrigade {
         director_row_id: String,
         director_agent: AgentKind,
@@ -2331,6 +2351,19 @@ pub enum Event {
         /// trip (`stage_brigade` needs the whole roster, not just the
         /// activating row's own membership).
         members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
+        /// The resolved brigade's stored arrangement preferences, read in the
+        /// same shell round trip so they are in state before the brigade's
+        /// first geometry is computed. `None` for no brigade, no usable
+        /// read, or a capture recorded before this field existed.
+        #[serde(default)]
+        layout: Option<StoredLayout>,
+    },
+    /// The sidebar width the store held at startup, if it held one. Fed once,
+    /// ahead of the first resize, as an `Event` rather than constructor
+    /// state: a replay rebuilds every pane's size from the event stream, and
+    /// a width that reached state any other way would size them differently.
+    SidebarWidthLoaded {
+        width: Option<u16>,
     },
     /// Answers `Cmd::CheckCodexTrust`: whether banto's `SessionStart` hook
     /// looks trusted right now, and whether it could even fire from this
@@ -2599,7 +2632,19 @@ pub fn update(
             session_id,
             membership,
             members,
-        } => update_membership_resolved(state, app, brigade, session_id, membership, members),
+            layout,
+        } => {
+            update_membership_resolved(state, app, brigade, session_id, membership, members, layout)
+        }
+        Event::SidebarWidthLoaded { width } => {
+            if let Some(width) = width {
+                // A preference like any other: clamped wherever it is used,
+                // and what the store holds, so not written back.
+                state.sidebar_width = width;
+                state.persisted_sidebar_width = width;
+            }
+            Vec::new()
+        }
         Event::CodexTrustChecked {
             primed,
             hook_launchable,
@@ -2685,6 +2730,7 @@ pub fn update(
     refocus_expanded(state, None);
     validate_drag(state, app);
     cmds.extend(resize_staged_tiles(state));
+    cmds.extend(persist_preferences(state));
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
     cmds
@@ -3663,6 +3709,7 @@ fn update_membership_resolved(
     session_id: String,
     membership: Option<(BrigadeId, MemberToken, BrigadeRole)>,
     members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
+    layout: Option<StoredLayout>,
 ) -> Vec<Cmd> {
     let Some(purpose) = state.pending_membership.take() else {
         return Vec::new();
@@ -3699,13 +3746,16 @@ fn update_membership_resolved(
     };
     match purpose {
         PendingMembership::Activate => match membership {
-            Some((brigade_id, _, BrigadeRole::Director)) => stage_brigade(
-                state,
-                app,
-                brigade_id,
-                &members.unwrap_or_default(),
-                brigade,
-            ),
+            Some((brigade_id, _, BrigadeRole::Director)) => {
+                adopt_stored_layout(state, brigade_id, layout.as_ref());
+                stage_brigade(
+                    state,
+                    app,
+                    brigade_id,
+                    &members.unwrap_or_default(),
+                    brigade,
+                )
+            }
             // Spelled out rather than `_`, same reasoning as the
             // `DismissWorker` branch above: staging the whole brigade is a
             // Director-only action, so a Goinkyo activated directly opens
@@ -4529,6 +4579,64 @@ fn update_move_mouse(state: &mut EmporiumState, mouse: MouseEvent) -> Vec<Cmd> {
         _ => {}
     }
     Vec::new()
+}
+
+/// Bring a brigade's stored arrangement into state before its stage is built,
+/// so the very first geometry — the first PTY sizes — already uses it.
+///
+/// In-memory wins: a brigade this run already holds a layout for keeps it. Every
+/// change is written as it happens, so what memory holds is never older than
+/// the store, and a stale read must not undo a change made since.
+fn adopt_stored_layout(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    stored: Option<&StoredLayout>,
+) {
+    let Some(stored) = stored else {
+        return;
+    };
+    if state.brigade_layouts.contains_key(&brigade_id) {
+        return;
+    }
+    let layout = BrigadeLayout::from_stored(stored);
+    state.persisted_layouts.insert(brigade_id, layout.clone());
+    state.brigade_layouts.insert(brigade_id, layout);
+}
+
+/// The writes that keep the store matching what the operator has arranged:
+/// one `SaveBrigadeLayout` for each brigade whose layout differs from what the
+/// store last held, one `SaveSidebarWidth` if the width does. Run at the end
+/// of every `update`; since it only compares, a draw-only or tick-only event
+/// writes nothing, and neither does a gesture that committed nothing, a
+/// refused key, or a "restore all" with nothing to restore.
+fn persist_preferences(state: &mut EmporiumState) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    if state.sidebar_width != state.persisted_sidebar_width {
+        state.persisted_sidebar_width = state.sidebar_width;
+        cmds.push(Cmd::Store(StoreIntent::SaveSidebarWidth {
+            width: state.sidebar_width,
+        }));
+    }
+    let mut brigades: Vec<BrigadeId> = state.brigade_layouts.keys().copied().collect();
+    brigades.sort_unstable();
+    for brigade_id in brigades {
+        let layout = &state.brigade_layouts[&brigade_id];
+        let previous = state.persisted_layouts.get(&brigade_id);
+        let unchanged = match previous {
+            Some(previous) => previous == layout,
+            None => *layout == BrigadeLayout::default(),
+        };
+        if unchanged {
+            continue;
+        }
+        let snapshot = layout.to_stored(previous);
+        state.persisted_layouts.insert(brigade_id, layout.clone());
+        cmds.push(Cmd::Store(StoreIntent::SaveBrigadeLayout {
+            brigade_id,
+            layout: snapshot,
+        }));
+    }
+    cmds
 }
 
 /// Move the stack tile `key` to slot `to` (an index into `panes`), the tiles
@@ -5746,6 +5854,7 @@ fn update_disbanded(
                 None => Stage::Empty,
             };
             state.brigade_layouts.remove(&brigade_id);
+            state.persisted_layouts.remove(&brigade_id);
             state.member_facts.retain(|(id, _), _| *id != brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
@@ -5802,7 +5911,16 @@ fn update_worker_dismissed(
             // reused, so anything left would be inherited by the next Worker.)
             if let Some(token) = member {
                 state.member_facts.remove(&(brigade_id, token.clone()));
-                if let Some(layout) = state.brigade_layouts.get_mut(&brigade_id) {
+                // The store forgets the member's row with its arrangement
+                // (and the solo naming it), so the persisted copy forgets it
+                // too: nothing is written for a dismissal.
+                for layout in [
+                    state.brigade_layouts.get_mut(&brigade_id),
+                    state.persisted_layouts.get_mut(&brigade_id),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     layout.row_weights.remove(&token);
                     layout.stack_order.retain(|ranked| *ranked != token);
                     layout.minimized.remove(&token);
@@ -6441,7 +6559,7 @@ fn update_goinkyo_directory_trust_checked(
 mod tests {
     use std::path::PathBuf;
 
-    use crate::model::Activity;
+    use crate::model::{Activity, StoredMemberLayout};
     use crate::screen::Screen;
 
     use super::*;
@@ -7167,6 +7285,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 membership: None,
                 members: None,
+                layout: None,
             },
             now,
         );
@@ -7426,6 +7545,7 @@ mod tests {
                     session_id: "dir".to_string(),
                     membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                     members: Some(roster.clone()),
+                    layout: None,
                 },
                 now,
             )
@@ -7696,6 +7816,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             now,
         );
@@ -7764,6 +7885,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             now,
         );
@@ -7881,6 +8003,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             now,
         );
@@ -7951,6 +8074,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             now,
         );
@@ -8003,6 +8127,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             now,
         );
@@ -8072,6 +8197,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             now,
         );
@@ -8148,6 +8274,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             test_instant(),
         );
@@ -8185,6 +8312,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             test_instant(),
         );
@@ -8529,6 +8657,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: None,
                 members: None,
+                layout: None,
             },
             test_instant(),
         );
@@ -8564,6 +8693,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: None,
                 members: None,
+                layout: None,
             },
             test_instant(),
         );
@@ -8679,6 +8809,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: None,
                 members: None,
+                layout: None,
             },
             test_instant(),
         );
@@ -8738,6 +8869,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: None,
                 members: None,
+                layout: None,
             },
             test_instant(),
         );
@@ -8769,6 +8901,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: None,
                 members: None,
+                layout: None,
             },
             test_instant(),
         );
@@ -14975,6 +15108,694 @@ mod tests {
         assert!(!state.brigade_layouts.contains_key(&1));
     }
 
+    // --- persistence ---------------------------------------------------------------
+
+    /// The `SaveBrigadeLayout` snapshots among `cmds`.
+    fn layout_writes(cmds: &[Cmd]) -> Vec<(BrigadeId, StoredLayout)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::Store(StoreIntent::SaveBrigadeLayout { brigade_id, layout }) => {
+                    Some((*brigade_id, layout.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn width_writes(cmds: &[Cmd]) -> Vec<u16> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::Store(StoreIntent::SaveSidebarWidth { width }) => Some(*width),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn any_preference_write(cmds: &[Cmd]) -> bool {
+        !layout_writes(cmds).is_empty() || !width_writes(cmds).is_empty()
+    }
+
+    fn member_entry<'a>(layout: &'a StoredLayout, token: &str) -> Option<&'a StoredMemberLayout> {
+        layout.members.iter().find(|m| m.token == token)
+    }
+
+    #[test]
+    fn a_committed_resize_of_each_boundary_writes_exactly_once_with_the_right_snapshot() {
+        // The sidebar: the width, not a brigade.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        drag_to(&mut state, &mut app, &brigade, &Boundary::Sidebar, 48, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &Boundary::Sidebar, 48, now);
+        assert_eq!(width_writes(&cmds), [48]);
+        assert!(layout_writes(&cmds).is_empty());
+
+        // The master/stack edge in the ordinary state: the share.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start + 6, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &master, start + 6, now);
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1, "{cmds:?}");
+        assert_eq!(writes[0].0, 1);
+        assert_eq!(
+            writes[0].1.master_permille,
+            Some(layout_of(&state).master_permille)
+        );
+        assert_eq!(writes[0].1.collapsed_stack_width, None);
+        assert!(width_writes(&cmds).is_empty());
+
+        // The same edge while every tile is collapsed: the collapsed width.
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(2);
+        let before = layout_writes(&update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        ));
+        assert!(before.is_empty());
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start - 3, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &master, start - 3, now);
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].1.collapsed_stack_width,
+            Some(DEFAULT_COLLAPSED_STACK_WIDTH + 3)
+        );
+        assert_eq!(writes[0].1.master_permille, None);
+
+        // A row boundary: the expanded members' weights.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let row = w1_over_w2();
+        let start = handle_of(&state, &row).position;
+        drag_to(&mut state, &mut app, &brigade, &row, start + 2, now);
+        let cmds = release_at(&mut state, &mut app, &brigade, &row, start + 2, now);
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1);
+        let snapshot = &writes[0].1;
+        for token in ["worker-1", "worker-2", "worker-3"] {
+            let entry = member_entry(snapshot, token).expect(token);
+            assert_eq!(
+                entry.row_weight,
+                layout_of(&state).row_weights.get(token).copied()
+            );
+        }
+    }
+
+    #[test]
+    fn moving_collapsing_and_soloing_each_write_once_with_the_resulting_arrangement() {
+        // A mouse move.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let cmds = move_onto(&mut state, &mut app, &brigade, "w3", "w1", now);
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1, "{cmds:?}");
+        let ranks: Vec<(String, Option<u32>)> = writes[0]
+            .1
+            .members
+            .iter()
+            .map(|m| (m.token.clone(), m.stack_rank))
+            .collect();
+        assert_eq!(
+            ranks,
+            [
+                ("worker-1".to_string(), Some(1)),
+                ("worker-2".to_string(), Some(2)),
+                ("worker-3".to_string(), Some(0)),
+            ]
+        );
+
+        // A keyboard move.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 2);
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(layout_writes(&cmds).len(), 1, "{cmds:?}");
+
+        // Minimize, then open again: two writes in all, one each.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 2);
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1);
+        assert!(member_entry(&writes[0].1, "worker-2").unwrap().minimized);
+        let cmds = press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w2",
+            ButtonKind::Minimize,
+            now,
+        );
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1);
+        assert!(
+            !member_entry(&writes[0].1, "worker-2").unwrap().minimized,
+            "a cleared flag is written (the member is listed though nothing is set)"
+        );
+
+        // Solo: the member's token at brigade level.
+        let cmds = press_button(&mut state, &mut app, &brigade, "w3", ButtonKind::Solo, now);
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1.solo_member.as_deref(), Some("worker-3"));
+        // Restore-all: the solo and every flag go.
+        set_collapse(&mut state, &["worker-1"], Some("worker-3"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('M'),
+            Modifiers::SHIFT,
+            now,
+        );
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1, "{cmds:?}");
+        assert_eq!(writes[0].1.solo_member, None);
+        assert!(writes[0].1.members.iter().all(|m| !m.minimized));
+    }
+
+    #[test]
+    fn nothing_is_written_for_a_gesture_that_committed_nothing_or_a_refused_key_or_a_tick() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let mut all = Vec::new();
+
+        // Press and release on the spot, on a resize handle and on a label.
+        let master = Boundary::Master { brigade: 1 };
+        let handle = handle_of(&state, &master);
+        let (column, row) = grab_point(&handle);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            all.extend(mouse_event(
+                &mut state, &mut app, &brigade, kind, column, row, now,
+            ));
+        }
+        let (c, r) = label_cell(&state, "w2");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            all.extend(mouse_event(&mut state, &mut app, &brigade, kind, c, r, now));
+        }
+        // A drag cancelled with Esc, and a move cancelled the same way.
+        drag_to(
+            &mut state,
+            &mut app,
+            &brigade,
+            &master,
+            handle.position + 5,
+            now,
+        );
+        all.extend(forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        ));
+        press_label(&mut state, &mut app, &brigade, "w3", now);
+        drag_to_cell(&mut state, &mut app, &brigade, 60, 3, now);
+        all.extend(forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        ));
+        // Refused keys: collapse on the master, shift-up at the top, restore-all with nothing.
+        focus_stack_slot(&mut state, 0);
+        all.extend(prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        ));
+        focus_stack_slot(&mut state, 1);
+        all.extend(prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::SHIFT,
+            now,
+        ));
+        all.extend(prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('M'),
+            Modifiers::SHIFT,
+            now,
+        ));
+        // Ticks, output, a resize and focus changes.
+        all.extend(update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        ));
+        all.extend(update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key_of("w1"),
+                chunk: b"x".to_vec(),
+            },
+            now,
+        ));
+        all.extend(update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 100,
+                height: 30,
+            },
+            now,
+        ));
+        all.extend(update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::WindowFocusChanged { focused: false },
+            now,
+        ));
+
+        assert!(!any_preference_write(&all), "{all:?}");
+    }
+
+    #[test]
+    fn dismissal_and_disband_write_nothing_the_store_forgets_them_itself() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-3"], Some("worker-3"));
+        // Settle: the setup above is a change like any other; flush its write.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        state.pending_dismiss = Some(key_of("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+        let cmds = update(&mut state, &mut app, &brigade, dismissed(1), now);
+        assert!(!any_preference_write(&cmds), "{cmds:?}");
+        assert_eq!(layout_of(&state).solo_member, None);
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+        assert!(!any_preference_write(&cmds), "{cmds:?}");
+        assert!(state.persisted_layouts.is_empty());
+    }
+
+    /// A staged-by-the-store brigade: the Director and two Workers that all
+    /// have session rows, resolved through the real event.
+    fn resolve_brigade_with(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        stored: Option<StoredLayout>,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        state.pending_membership = Some(PendingMembership::Activate);
+        update(
+            state,
+            app,
+            brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(vec![
+                    (
+                        "director".to_string(),
+                        BrigadeRole::Director,
+                        Some("dir".to_string()),
+                    ),
+                    (
+                        "worker-1".to_string(),
+                        BrigadeRole::Worker,
+                        Some("w1".to_string()),
+                    ),
+                    (
+                        "worker-2".to_string(),
+                        BrigadeRole::Worker,
+                        Some("w2".to_string()),
+                    ),
+                ]),
+                layout: stored,
+            },
+            now,
+        )
+    }
+
+    fn stored_arrangement() -> StoredLayout {
+        StoredLayout {
+            master_permille: Some(700),
+            collapsed_stack_width: Some(40),
+            solo_member: None,
+            members: vec![
+                StoredMemberLayout {
+                    token: "worker-2".to_string(),
+                    stack_rank: Some(0),
+                    row_weight: Some(1),
+                    minimized: false,
+                },
+                StoredMemberLayout {
+                    token: "worker-1".to_string(),
+                    stack_rank: Some(1),
+                    row_weight: Some(3),
+                    minimized: false,
+                },
+            ],
+        }
+    }
+
+    fn fresh_state_sized_120x40() -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir"), row("w1"), row("w2")]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 120,
+                height: 40,
+            },
+            now,
+        );
+        (state, app, brigade, now)
+    }
+
+    fn spawn_all(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        for name in ["dir", "w1", "w2"] {
+            cmds.extend(update(
+                state,
+                app,
+                brigade,
+                Event::Spawned { key: key_of(name) },
+                now,
+            ));
+        }
+        cmds
+    }
+
+    #[test]
+    fn a_stored_layout_is_in_state_before_the_first_sizing_so_no_pane_is_sized_to_the_default() {
+        let (mut state, mut app, brigade, now) = fresh_state_sized_120x40();
+        let resolve = resolve_brigade_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            Some(stored_arrangement()),
+            now,
+        );
+        assert!(
+            !any_preference_write(&resolve),
+            "adopting what the store holds is not a change"
+        );
+        let cmds = spawn_all(&mut state, &mut app, &brigade, now);
+
+        // The stored order, weights and share are what is on screen.
+        assert_eq!(order_of(&state), ["dir", "w2", "w1"]);
+        let pane = state.geometry(DRAG_AREA).areas.pane;
+        let expected_master = crate::layout::master_width(pane.width, 700);
+        assert_eq!(tile_of(&state, "dir").width, expected_master);
+        let (w2, w1) = (tile_of(&state, "w2"), tile_of(&state, "w1"));
+        assert!(w1.height > w2.height, "weights 3 : 1");
+
+        // Every size the master was ever given is either the lone full-width
+        // pane or the stored share: never the default 50% split.
+        let default_master = crate::layout::master_width(pane.width, DEFAULT_MASTER_PERMILLE);
+        let master_widths: Vec<u16> = resizes(&cmds)
+            .into_iter()
+            .filter(|(key, _, _)| key.as_str() == "dir")
+            .map(|(_, _, cols)| cols)
+            .collect();
+        assert!(!master_widths.is_empty());
+        assert!(
+            master_widths.iter().all(|cols| *cols
+                != pane_content(Rect {
+                    width: default_master,
+                    ..pane
+                })
+                .width),
+            "{master_widths:?}"
+        );
+        assert_eq!(
+            *master_widths.last().unwrap(),
+            pane_content(tile_of(&state, "dir")).width
+        );
+        // The Workers were sized to their stored tiles at their last resize.
+        for (name, tile) in [("w1", w1), ("w2", w2)] {
+            let last = resizes(&cmds)
+                .into_iter()
+                .rev()
+                .find(|(key, _, _)| key.as_str() == name)
+                .expect(name);
+            let content = pane_content(tile);
+            assert_eq!((last.1, last.2), (content.height, content.width), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_stored_collapsed_tile_is_never_sized_and_a_stored_solo_collapses_the_others() {
+        let (mut state, mut app, brigade, now) = fresh_state_sized_120x40();
+        let mut stored = stored_arrangement();
+        stored.members[1].minimized = true; // worker-1
+        resolve_brigade_with(&mut state, &mut app, &brigade, Some(stored), now);
+        let cmds = spawn_all(&mut state, &mut app, &brigade, now);
+        assert_eq!(collapsed_names(&state), ["w1"]);
+        assert!(
+            resizes(&cmds)
+                .iter()
+                .all(|(key, _, _)| key.as_str() != "w1"),
+            "a stored collapsed tile keeps the size it was spawned at: {cmds:?}"
+        );
+
+        let (mut state, mut app, brigade, now) = fresh_state_sized_120x40();
+        let mut stored = stored_arrangement();
+        stored.solo_member = Some("worker-2".to_string());
+        resolve_brigade_with(&mut state, &mut app, &brigade, Some(stored), now);
+        spawn_all(&mut state, &mut app, &brigade, now);
+        assert_eq!(collapsed_names(&state), ["w1"]);
+        assert_eq!(state.soloed_key(), Some(&key_of("w2")));
+    }
+
+    #[test]
+    fn what_this_run_holds_wins_over_a_later_stored_copy() {
+        let (mut state, mut app, brigade, now) = fresh_state_sized_120x40();
+        resolve_brigade_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            Some(stored_arrangement()),
+            now,
+        );
+        spawn_all(&mut state, &mut app, &brigade, now);
+        // The operator rearranges: the change is written.
+        let cmds = move_onto(&mut state, &mut app, &brigade, "w1", "w2", now);
+        assert_eq!(layout_writes(&cmds).len(), 1);
+        assert_eq!(order_of(&state), ["dir", "w1", "w2"]);
+
+        // Staged again (the shell reads the store, which a stale copy of is
+        // what `stored_arrangement` is): memory is not overwritten.
+        state.stage = Stage::Empty;
+        let cmds = resolve_brigade_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            Some(stored_arrangement()),
+            now,
+        );
+        assert!(!any_preference_write(&cmds));
+        assert_eq!(layout_of(&state).stack_order, ["worker-1", "worker-2"]);
+        assert_eq!(layout_of(&state).master_permille, 700);
+    }
+
+    #[test]
+    fn a_brigade_with_no_stored_arrangement_uses_the_defaults_and_writes_nothing() {
+        let (mut state, mut app, brigade, now) = fresh_state_sized_120x40();
+        let a = resolve_brigade_with(&mut state, &mut app, &brigade, None, now);
+        let b = spawn_all(&mut state, &mut app, &brigade, now);
+        assert!(!any_preference_write(&a) && !any_preference_write(&b));
+        assert_eq!(order_of(&state), ["dir", "w1", "w2"]);
+        assert!(state.brigade_layouts.is_empty());
+        // An empty stored layout is the same as none.
+        let (mut state, mut app, brigade, now) = fresh_state_sized_120x40();
+        resolve_brigade_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            Some(StoredLayout::default()),
+            now,
+        );
+        let cmds = spawn_all(&mut state, &mut app, &brigade, now);
+        assert!(!any_preference_write(&cmds));
+        assert_eq!(order_of(&state), ["dir", "w1", "w2"]);
+    }
+
+    #[test]
+    fn the_stored_sidebar_width_arrives_as_an_event_applies_clamps_and_is_not_written_back() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::SidebarWidthLoaded { width: Some(50) },
+            now,
+        );
+        assert!(!any_preference_write(&cmds));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 120,
+                height: 40,
+            },
+            now,
+        );
+        assert_eq!(state.geometry(Rect::new(0, 0, 120, 40)).areas.pane.x, 50);
+
+        // Clamped at use, never rewritten: a small terminal squeezes it, a
+        // big one gets it back.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 60,
+                height: 40,
+            },
+            now,
+        );
+        assert!(state.geometry(Rect::new(0, 0, 60, 40)).areas.pane.x <= 40);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 160,
+                height: 40,
+            },
+            now,
+        );
+        assert!(!any_preference_write(&cmds));
+        assert_eq!(state.geometry(Rect::new(0, 0, 160, 40)).areas.pane.x, 50);
+
+        // Nothing stored: the default.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::SidebarWidthLoaded { width: None },
+            now,
+        );
+        assert_eq!(state.sidebar_width, SIDEBAR_WIDTH);
+        // An absurd stored width is still only a preference.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::SidebarWidthLoaded { width: Some(1000) },
+            now,
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 100,
+                height: 40,
+            },
+            now,
+        );
+        let geometry = state.geometry(Rect::new(0, 0, 100, 40));
+        assert!(geometry.areas.pane.width >= MIN_PANE_AREA_WIDTH);
+    }
+
+    #[test]
+    fn the_new_event_fields_round_trip_and_older_captures_still_parse() {
+        let loaded = Event::SidebarWidthLoaded { width: Some(44) };
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), loaded);
+
+        let resolved = Event::MembershipResolved {
+            session_id: "dir".to_string(),
+            membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+            members: Some(vec![]),
+            layout: Some(stored_arrangement()),
+        };
+        let json = serde_json::to_string(&resolved).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), resolved);
+
+        // A capture from before `layout` existed.
+        let old = r#"{"MembershipResolved":{"session_id":"dir","membership":null,"members":null}}"#;
+        let Event::MembershipResolved { layout, .. } = serde_json::from_str::<Event>(old).unwrap()
+        else {
+            panic!("expected MembershipResolved");
+        };
+        assert_eq!(layout, None);
+
+        // The intents round trip too (they sit in recorded Cmd histories).
+        let intent = StoreIntent::SaveBrigadeLayout {
+            brigade_id: 2,
+            layout: stored_arrangement(),
+        };
+        let json = serde_json::to_string(&intent).unwrap();
+        assert_eq!(serde_json::from_str::<StoreIntent>(&json).unwrap(), intent);
+    }
+
     #[test]
     fn the_keys_m_z_and_capital_m_refuse_with_a_reason_where_they_make_no_sense() {
         // The sidebar.
@@ -15773,7 +16594,9 @@ mod tests {
                 &mut state, &mut app, &brigade, kind, column, row, now,
             ));
         }
-        assert!(cmds.is_empty(), "{cmds:?}");
+        // The only command is the preference write of the move that landed.
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(layout_writes(&cmds).len(), 1, "{cmds:?}");
         assert_eq!(
             order_of(&state),
             ["dir", "w3", "w1", "w2"],
@@ -17927,6 +18750,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: Some(roster),
+                layout: None,
             },
             test_instant(),
         );
@@ -19504,6 +20328,7 @@ mod tests {
                 session_id: "w5".to_string(),
                 membership: Some((1, "worker-5".to_string(), BrigadeRole::Worker)),
                 members: None,
+                layout: None,
             },
             now,
         );
@@ -19661,6 +20486,7 @@ mod tests {
                 session_id: "w1".to_string(),
                 membership: Some((1, "worker-1".to_string(), BrigadeRole::Worker)),
                 members: None,
+                layout: None,
             },
             now,
         );
@@ -19707,6 +20533,7 @@ mod tests {
                 session_id: "g1".to_string(),
                 membership: Some((1, "goinkyo".to_string(), BrigadeRole::Goinkyo)),
                 members: None,
+                layout: None,
             },
             now,
         );
@@ -19743,6 +20570,7 @@ mod tests {
                 session_id: "dir".to_string(),
                 membership: Some((1, "director".to_string(), BrigadeRole::Director)),
                 members: None,
+                layout: None,
             },
             now,
         );

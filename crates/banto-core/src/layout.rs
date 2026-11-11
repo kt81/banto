@@ -17,7 +17,7 @@ use ratatui_core::layout::{Constraint, Layout, Rect};
 use unicode_width::UnicodeWidthStr;
 
 use crate::engine::{SessionKey, Stage};
-use crate::model::{BrigadeId, MemberToken};
+use crate::model::{BrigadeId, MemberToken, StoredLayout, StoredMemberLayout};
 
 /// The sidebar's default width in columns (its preference starts here).
 pub const SIDEBAR_WIDTH: u16 = 36;
@@ -57,7 +57,11 @@ const BUTTON_WIDTH: u16 = 3;
 
 /// Layout preferences for one brigade, kept per [`BrigadeId`] and keyed by
 /// member rather than by pane or position, so they survive the brigade going
-/// off-stage, a pane being re-keyed, and a member being relaunched.
+/// off-stage, a pane being re-keyed, and a member being relaunched. They are
+/// also stored (`Store::save_brigade_layout`, migration v15): written whenever
+/// they change, read when the brigade is staged, with the same member-token
+/// keys. [`BrigadeLayout::to_stored`] and [`BrigadeLayout::from_stored`] are
+/// the two directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrigadeLayout {
     /// The master tile's share of the pane area's width, in permille.
@@ -82,6 +86,79 @@ pub struct BrigadeLayout {
     /// turning it off brings back exactly what was collapsed before. Named for the mixer's solo, not
     /// `Stage::Solo` (a single session that is no brigade's).
     pub solo_member: Option<MemberToken>,
+}
+
+impl BrigadeLayout {
+    /// The live preferences a stored brigade arrangement describes: members
+    /// with a rank form the stack order (by rank, then token), the rest follow
+    /// from their own fields, and a brigade-level `None` is the default.
+    /// Values are taken as they are — they are preferences, clamped wherever
+    /// they are used, and the store has already dropped what it could not
+    /// make sense of.
+    pub fn from_stored(stored: &StoredLayout) -> Self {
+        let mut ranked: Vec<(u32, &MemberToken)> = stored
+            .members
+            .iter()
+            .filter_map(|member| member.stack_rank.map(|rank| (rank, &member.token)))
+            .collect();
+        ranked.sort();
+        BrigadeLayout {
+            master_permille: stored.master_permille.unwrap_or(DEFAULT_MASTER_PERMILLE),
+            collapsed_stack_width: stored
+                .collapsed_stack_width
+                .unwrap_or(DEFAULT_COLLAPSED_STACK_WIDTH),
+            row_weights: stored
+                .members
+                .iter()
+                .filter_map(|member| member.row_weight.map(|w| (member.token.clone(), w)))
+                .collect(),
+            stack_order: ranked.into_iter().map(|(_, token)| token.clone()).collect(),
+            minimized: stored
+                .members
+                .iter()
+                .filter(|member| member.minimized)
+                .map(|member| member.token.clone())
+                .collect(),
+            solo_member: stored.solo_member.clone(),
+        }
+    }
+
+    /// The snapshot to store for these preferences: brigade-level values
+    /// (a default is written as `None`, "no preference") and one entry per
+    /// member that has any now *or had any in `previous`* — the last
+    /// arrangement the store was given. The store leaves a member the snapshot
+    /// does not list exactly as it is, so a member whose arrangement was just
+    /// cleared (a collapsed tile opened by "restore all") has to be listed,
+    /// with nothing set, to be cleared there too.
+    pub fn to_stored(&self, previous: Option<&BrigadeLayout>) -> StoredLayout {
+        let mut tokens: std::collections::BTreeSet<&MemberToken> =
+            std::collections::BTreeSet::new();
+        for layout in std::iter::once(self).chain(previous) {
+            tokens.extend(layout.stack_order.iter());
+            tokens.extend(layout.row_weights.keys());
+            tokens.extend(layout.minimized.iter());
+        }
+        StoredLayout {
+            master_permille: (self.master_permille != DEFAULT_MASTER_PERMILLE)
+                .then_some(self.master_permille),
+            collapsed_stack_width: (self.collapsed_stack_width != DEFAULT_COLLAPSED_STACK_WIDTH)
+                .then_some(self.collapsed_stack_width),
+            solo_member: self.solo_member.clone(),
+            members: tokens
+                .into_iter()
+                .map(|token| StoredMemberLayout {
+                    token: token.clone(),
+                    stack_rank: self
+                        .stack_order
+                        .iter()
+                        .position(|ranked| ranked == token)
+                        .and_then(|rank| u32::try_from(rank).ok()),
+                    row_weight: self.row_weights.get(token).copied(),
+                    minimized: self.minimized.contains(token),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Default for BrigadeLayout {
@@ -1589,6 +1666,88 @@ mod tests {
             .find(|h| matches!(h.boundary, Boundary::Master { .. }))
             .unwrap();
         assert_eq!(open_handle.min, pane.x + MIN_MASTER_WIDTH);
+    }
+
+    #[test]
+    fn a_layout_round_trips_through_its_stored_form() {
+        let mut layout = BrigadeLayout {
+            master_permille: 640,
+            collapsed_stack_width: 44,
+            solo_member: Some("worker-2".to_string()),
+            ..BrigadeLayout::default()
+        };
+        layout.stack_order = vec![
+            "worker-3".to_string(),
+            "worker-1".to_string(),
+            "worker-2".to_string(),
+        ];
+        layout.row_weights.insert("worker-1".to_string(), 7);
+        layout.row_weights.insert("worker-3".to_string(), 12);
+        layout.minimized.insert("worker-2".to_string());
+
+        let stored = layout.to_stored(None);
+        assert_eq!(BrigadeLayout::from_stored(&stored), layout);
+        // Defaults are written as "no preference".
+        let plain = BrigadeLayout::default().to_stored(None);
+        assert_eq!(plain, StoredLayout::default());
+        assert_eq!(BrigadeLayout::from_stored(&plain), BrigadeLayout::default());
+    }
+
+    #[test]
+    fn a_snapshot_lists_a_member_whose_arrangement_was_just_cleared() {
+        let mut before = BrigadeLayout::default();
+        before.minimized.insert("worker-1".to_string());
+        before.row_weights.insert("worker-2".to_string(), 5);
+        let after = BrigadeLayout::default();
+
+        let stored = after.to_stored(Some(&before));
+
+        // The store leaves members it is not told about as they are, so these
+        // two are listed with nothing set.
+        let tokens: Vec<&str> = stored.members.iter().map(|m| m.token.as_str()).collect();
+        assert_eq!(tokens, ["worker-1", "worker-2"]);
+        assert!(
+            stored
+                .members
+                .iter()
+                .all(|m| m.stack_rank.is_none() && m.row_weight.is_none() && !m.minimized)
+        );
+    }
+
+    #[test]
+    fn stored_ranks_become_the_stack_order_by_rank_then_token() {
+        let stored = StoredLayout {
+            members: vec![
+                StoredMemberLayout {
+                    token: "worker-2".to_string(),
+                    stack_rank: Some(1),
+                    row_weight: None,
+                    minimized: false,
+                },
+                StoredMemberLayout {
+                    token: "worker-1".to_string(),
+                    stack_rank: Some(1),
+                    row_weight: None,
+                    minimized: false,
+                },
+                StoredMemberLayout {
+                    token: "worker-3".to_string(),
+                    stack_rank: Some(0),
+                    row_weight: None,
+                    minimized: false,
+                },
+                StoredMemberLayout {
+                    token: "worker-4".to_string(),
+                    stack_rank: None,
+                    row_weight: Some(2),
+                    minimized: false,
+                },
+            ],
+            ..StoredLayout::default()
+        };
+        let layout = BrigadeLayout::from_stored(&stored);
+        assert_eq!(layout.stack_order, ["worker-3", "worker-1", "worker-2"]);
+        assert_eq!(layout.row_weights.get("worker-4"), Some(&2));
     }
 
     #[test]

@@ -503,9 +503,24 @@ first); its label still moves it. A collapsed tile's child is not resized, since
 a repaint into a three-row grid would wreck the screen the operator comes back
 to; it is sized when it opens. The row resize handle lies between expanded
 neighbours and rewrites only their weights.
-The preferences live in memory only for now — they last as long as the
-emporium process, per brigade (`BrigadeId` and member token), and a Worker
-added later gets the mean of the others' height.
+**What is kept across a restart.** Everything arranged above is stored in banto's
+own sqlite store (schema v15) and comes back the next time banto runs: the
+sidebar width (table `ui_prefs`, key `sidebar_width`); per brigade, the master
+share, the collapsed stack width and the soloed member (columns on `brigades`);
+per member, its place in the stack order, its row weight and its collapsed flag
+(columns on `brigade_members`). NULL means "no preference, use the default".
+The per-member values live on the member's own row on purpose: a dismissed
+Worker's row is deleted, so its arrangement goes with it and a reused token
+(add-worker numbers the highest plus one) starts fresh; disbanding the brigade
+deletes the rest. A brigade's arrangement is read together with its roster when
+it is staged, so the first PTY sizes are already the stored ones; it is written
+(the whole snapshot, one transaction) at the moment it actually changes — a
+committed resize or move, a collapse, a solo, restore-all — and never for a
+gesture that changed nothing, and never from a draw or a tick. What the run
+already holds wins over a read of the store. Stored values are preferences like
+any other: out-of-range ones read as "no preference", and what is used is
+clamped to the terminal at use, never rewritten. A write that fails is silent,
+as a failed pin is. A Worker added later gets the mean of the others' height.
 
 **Keys** (emporium; everything the chōba has except split, plus):
 

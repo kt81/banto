@@ -19,6 +19,7 @@ mod lineage;
 mod migrations;
 mod panes;
 mod pins;
+mod ui_prefs;
 
 pub use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,

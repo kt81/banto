@@ -250,27 +250,94 @@ const MIGRATIONS: &[&str] = &[
     // necessarily written a discoverable session transcript. Keep old rows
     // NULL so they retain the historical App-row fallback.
     "ALTER TABLE brigade_members ADD COLUMN agent TEXT;",
+    // v15: the emporium's arrangement preferences survive a restart.
+    //
+    // Per-member values (stack position, row weight, collapsed) are columns on
+    // `brigade_members`, not a side table keyed by token, because a member row
+    // is deleted on dismissal and with its brigade on disband: forgetting a
+    // dismissed Worker's arrangement, and a reused token starting fresh, come
+    // with the row for nothing. (Tokens are reused: add-worker picks the
+    // highest number plus one.) Brigade-level values are columns on `brigades`
+    // for the same reason. NULL means "no preference, use the default"; the
+    // `minimized` flag has no NULL because "not collapsed" is its default.
+    //
+    // `ui_prefs` is the store's first key/value table, for what belongs to
+    // the whole window rather than a brigade (today: `sidebar_width`).
+    "ALTER TABLE brigade_members ADD COLUMN stack_rank INTEGER;
+    ALTER TABLE brigade_members ADD COLUMN row_weight INTEGER;
+    ALTER TABLE brigade_members ADD COLUMN minimized INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE brigades ADD COLUMN master_permille INTEGER;
+    ALTER TABLE brigades ADD COLUMN collapsed_stack_width INTEGER;
+    ALTER TABLE brigades ADD COLUMN solo_member TEXT;
+    CREATE TABLE ui_prefs (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
 /// (negative or newer than this build) is rejected.
+///
+/// Several processes open the same file (the emporium, each agent's `banto`
+/// MCP server, a second banto), so a migration is decided *under the write
+/// lock*: `BEGIN IMMEDIATE` first, then `user_version`, then apply or skip,
+/// then commit. Choosing the script from a version read before taking the lock
+/// would use a stale answer — the process that waited on the lock would run an
+/// `ALTER TABLE ... ADD COLUMN` on a database the other one had already
+/// migrated, and fail to open.
+///
+/// But almost every open finds the file already current, and taking the write
+/// lock for that would turn each open into a writer: it would queue behind any
+/// write in progress and fail with `SQLITE_BUSY` after the busy timeout where
+/// a plain read succeeds. So a lock-free read comes first, and the lock is
+/// taken only when there is something to do. That read cannot be wrong in the
+/// way the stale one above was: `user_version` only ever increases, so seeing
+/// the latest version without the lock means it is the latest version, full
+/// stop. Any other answer sends the caller into the locked loop, which
+/// re-reads under the lock.
 pub(super) fn apply(conn: &Connection) -> Result<(), StoreError> {
-    loop {
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version < 0 || version > MIGRATIONS.len() as i64 {
-            return Err(StoreError::UnsupportedSchemaVersion(version));
-        }
-        let idx = version as usize;
-        if idx == MIGRATIONS.len() {
-            return Ok(());
-        }
-        let script = format!(
-            "BEGIN;\n{}\nPRAGMA user_version = {};\nCOMMIT;",
-            MIGRATIONS[idx],
-            idx + 1
-        );
-        conn.execute_batch(&script)?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == MIGRATIONS.len() as i64 {
+        return Ok(());
     }
+    if version < 0 || version > MIGRATIONS.len() as i64 {
+        return Err(StoreError::UnsupportedSchemaVersion(version));
+    }
+    loop {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match apply_one(conn) {
+            Ok(done) => {
+                conn.execute_batch("COMMIT")?;
+                if done {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                // The error is the one to report; a failed rollback adds nothing.
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// With the write lock held: bring the database up one version, or report
+/// (`true`) that it is already current.
+fn apply_one(conn: &Connection) -> Result<bool, StoreError> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 0 || version > MIGRATIONS.len() as i64 {
+        return Err(StoreError::UnsupportedSchemaVersion(version));
+    }
+    let idx = version as usize;
+    if idx == MIGRATIONS.len() {
+        return Ok(true);
+    }
+    conn.execute_batch(&format!(
+        "{}\nPRAGMA user_version = {};",
+        MIGRATIONS[idx],
+        idx + 1
+    ))?;
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1045,6 +1112,294 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v14_to_v15_upgrade_keeps_the_rows_and_reads_the_new_columns_as_no_preference() {
+        use banto_core::model::BrigadeRole;
+        assert_eq!(
+            MIGRATIONS.len(),
+            15,
+            "this test is about the last migration"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v14 code left it: a brigade with a Director and a
+        // Worker, a pin, and no arrangement columns at all.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..14] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO brigade_members (brigade_id, member_token, role, session_id, agent)
+                 VALUES (1, 'director', 'director', 'dir', 'claude'),
+                        (1, 'worker-1', 'worker', 'w1', 'codex')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pins (session_id, pinned_at_ms) VALUES ('w1', 5)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 14).unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+
+        // Everything that was there still is.
+        let members = store.brigade_members(1).unwrap();
+        assert_eq!(members.len(), 2);
+        let worker = store.brigade_member(1, "worker-1").unwrap().unwrap();
+        assert_eq!(worker.role, BrigadeRole::Worker);
+        assert_eq!(worker.session_id, Some(SessionId("w1".to_string())));
+        assert_eq!(store.pinned_ids().unwrap(), [SessionId("w1".to_string())]);
+        // The new columns default to "no preference".
+        assert_eq!(
+            store.brigade_layout(1).unwrap(),
+            banto_core::model::StoredLayout::default()
+        );
+        assert_eq!(store.sidebar_width().unwrap(), None);
+        let (rank, weight, minimized): (Option<i64>, Option<i64>, i64) = store
+            .conn
+            .query_row(
+                "SELECT stack_rank, row_weight, minimized FROM brigade_members
+                 WHERE member_token = 'worker-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rank, weight, minimized), (None, None, 0));
+
+        // And the upgraded store takes writes.
+        store.set_sidebar_width(44).unwrap();
+        assert_eq!(store.sidebar_width().unwrap(), Some(44));
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    /// A file-backed database exactly as v14 code left it: a brigade with a
+    /// Director and a Worker.
+    fn v14_database(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        for script in &MIGRATIONS[0..14] {
+            conn.execute_batch(script).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
+             VALUES (1, 'director', 'director', 'dir'), (1, 'worker-1', 'worker', 'w1')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 14).unwrap();
+    }
+
+    fn open_with_timeout(path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        conn
+    }
+
+    fn assert_current_and_intact(path: &std::path::Path) {
+        let store = Store::open(path).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert_eq!(
+            store.brigade_members(1).unwrap().len(),
+            2,
+            "the data is intact"
+        );
+    }
+
+    #[test]
+    fn a_connection_opened_before_another_migrated_the_file_applies_as_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        v14_database(&db);
+        // B is opened first, A migrates the whole file, then B applies.
+        let b = open_with_timeout(&db);
+        let a = open_with_timeout(&db);
+        super::apply(&a).unwrap();
+
+        super::apply(&b).expect("the second process finds nothing to do");
+
+        assert_current_and_intact(&db);
+    }
+
+    #[test]
+    fn a_process_that_waited_on_the_write_lock_does_not_rerun_what_the_holder_applied() {
+        // The interleaving that used to fail: B has chosen its script from a
+        // version read before A committed, then gets the lock.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        v14_database(&db);
+        let a = open_with_timeout(&db);
+        // A holds the write lock with v15 applied but not yet committed.
+        a.execute_batch("BEGIN IMMEDIATE").unwrap();
+        a.execute_batch(&format!("{}\nPRAGMA user_version = 15;", MIGRATIONS[14]))
+            .unwrap();
+
+        let path = db.clone();
+        let b = std::thread::spawn(move || {
+            let conn = open_with_timeout(&path);
+            super::apply(&conn)
+        });
+        // Long enough for B to have started and be waiting on A.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        a.execute_batch("COMMIT").unwrap();
+
+        b.join()
+            .unwrap()
+            .expect("B waited, saw v15, and did nothing");
+        assert_current_and_intact(&db);
+    }
+
+    #[test]
+    fn several_processes_opening_a_previous_version_store_at_once_all_succeed() {
+        for round in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("banto.db");
+            v14_database(&db);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let (path, start) = (db.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        let conn = open_with_timeout(&path);
+                        start.wait();
+                        super::apply(&conn)
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread
+                    .join()
+                    .unwrap()
+                    .unwrap_or_else(|err| panic!("round {round}: {err}"));
+            }
+            assert_current_and_intact(&db);
+        }
+    }
+
+    #[test]
+    fn opening_an_already_current_store_does_not_wait_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        drop(Store::open(&db).unwrap());
+        // Another process is mid-write: it holds the write lock, uncommitted.
+        let writer = open_with_timeout(&db);
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+            .execute("INSERT INTO ui_prefs (key, value) VALUES ('x', '1')", [])
+            .unwrap();
+
+        // The store's busy timeout is 5 s; a plain read must not use any of it.
+        let started = std::time::Instant::now();
+        let store = Store::open(&db).expect("a current store opens beside a writer");
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(1500),
+            "opened after {waited:?}: it queued behind the writer"
+        );
+        assert_eq!(store.brigade_members(1).unwrap().len(), 0);
+        writer.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn a_future_version_is_refused_on_the_fast_path_without_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        drop(Store::open(&db).unwrap());
+        let conn = open_with_timeout(&db);
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 3)
+            .unwrap();
+        // A writer holds the lock throughout, as in the previous test.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        let Err(err) = Store::open(&db) else {
+            panic!("a newer schema must be refused");
+        };
+        assert!(
+            matches!(err, StoreError::UnsupportedSchemaVersion(v) if v == MIGRATIONS.len() as i64 + 3)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn the_store_runs_in_the_default_rollback_journal_mode() {
+        // Nothing sets a journal mode, so a file-backed store is in DELETE
+        // mode: a reader is let in beside a writer that holds only the
+        // reserved lock (what `BEGIN IMMEDIATE` takes), and waits only for the
+        // brief exclusive moment of a commit.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("banto.db")).unwrap();
+        let mode: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn a_failing_migration_step_is_rolled_back_and_the_lock_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        v14_database(&db);
+        // Make v15's first ALTER fail: the column already exists.
+        let conn = open_with_timeout(&db);
+        conn.execute_batch("ALTER TABLE brigade_members ADD COLUMN stack_rank INTEGER")
+            .unwrap();
+        assert!(super::apply(&conn).is_err());
+        // Nothing was half-applied and the connection is not stuck in a transaction.
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 14);
+        assert!(conn.is_autocommit());
+        let other = open_with_timeout(&db);
+        other
+            .execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            .expect("the write lock is free");
+    }
+
+    #[test]
+    fn a_database_one_version_ahead_of_the_arrangement_migration_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        drop(Store::open(&db).unwrap());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        drop(conn);
+
+        let Err(err) = Store::open(&db) else {
+            panic!("a newer schema must be refused");
+        };
+        assert!(
+            matches!(err, StoreError::UnsupportedSchemaVersion(v) if v == MIGRATIONS.len() as i64 + 1)
+        );
     }
 
     #[test]
