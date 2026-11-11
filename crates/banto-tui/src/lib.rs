@@ -10,10 +10,12 @@
 //! - [`render`] `vt100` screen -> ratatui text, the predecessor `paint`
 //!   replaced; its width tests are the regression net for that swap
 //! - [`view`] the shared session-list / summary panel widgets
+//! - [`strip`] the body of a collapsed stack tile, from a plain data struct
 //! - [`text`] column-aware text truncation, shared by `render_modal`/`view`
 
 pub mod paint;
 pub mod render;
 pub mod render_modal;
+pub mod strip;
 pub mod text;
 pub mod view;

@@ -356,7 +356,7 @@ fn agent_label(row: &SessionRow) -> String {
 ///
 /// Both stay off the activity dot's hues so the two coloured things in one
 /// row don't read as related.
-fn agent_label_color(agent: AgentKind) -> Color {
+pub fn agent_label_color(agent: AgentKind) -> Color {
     match agent {
         AgentKind::ClaudeCode => Color::Rgb(217, 119, 87),
         AgentKind::Codex => Color::Rgb(16, 163, 127),
@@ -506,7 +506,9 @@ fn summary_meta(
     parts.join("  \u{b7}  ")
 }
 
-fn activity_color(activity: Activity) -> Color {
+/// The colour of an activity, shared with every other surface that names one
+/// (the emporium's collapsed tiles) so none can drift from the sidebar dot.
+pub fn activity_color(activity: Activity) -> Color {
     match activity {
         Activity::Busy => Color::Green,
         Activity::Waiting => WAITING_ACTIVITY_COLOR,
@@ -514,6 +516,16 @@ fn activity_color(activity: Activity) -> Color {
         Activity::Idle(AgeBucket::Today) => Color::Yellow,
         Activity::Idle(AgeBucket::ThisWeek) => Color::Gray,
         Activity::Idle(AgeBucket::Older) => Color::DarkGray,
+    }
+}
+
+/// An activity in one lowercase word: busy / waiting / alive / idle.
+pub fn activity_word(activity: Activity) -> &'static str {
+    match activity {
+        Activity::Busy => "busy",
+        Activity::Waiting => "waiting",
+        Activity::Alive => "alive",
+        Activity::Idle(_) => "idle",
     }
 }
 

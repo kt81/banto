@@ -47,13 +47,15 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
-    self, Axis, Cmd, EmporiumState, Event, Focus, Ghost, GoinkyoObservation, GoinkyoSpawnCandidate,
-    GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage, StoreIntent,
+    self, Axis, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost, GoinkyoObservation,
+    GoinkyoSpawnCandidate, GroupJoinTargetData, PrefixKey, RelayObservation, SessionKey, Stage,
+    StoreIntent,
 };
 use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
 use banto_core::model::{
-    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberToken, SessionId, SessionToOpen,
+    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberGlance, MemberToken, MessageGlance,
+    SessionId, SessionToOpen,
 };
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::screen::Screen;
@@ -73,6 +75,7 @@ use banto_io::status::{
 };
 use banto_io::store::Store;
 use banto_tui::paint;
+use banto_tui::strip::{StripData, StripMessage, render_strip};
 use banto_tui::view::{self, WAITING_ACTIVITY_COLOR};
 
 use crate::opener;
@@ -561,6 +564,7 @@ fn event_loop(
     let mut watch = LiveWatch::new(deps.claude_home, deps.codex_home);
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
+    let mut glance_gate = GlanceGate::default();
     // Opened once, off this thread — see `banto_io::input`'s module doc for
     // why the read no longer happens inline here: a slow iteration
     // (rendering, a reload pass, ...) between this loop getting back around
@@ -758,6 +762,7 @@ fn event_loop(
                 deps.codex_home,
                 app,
                 Some(&mut tick_timings),
+                &mut glance_gate,
             );
             events.push_back(Event::Tick { relay });
             let observation =
@@ -2021,6 +2026,7 @@ fn gather_relay_observations(
     codex_home: Option<&CodexHome>,
     app: &App,
     mut timings: Option<&mut TickTimings>,
+    glance_gate: &mut GlanceGate,
 ) -> Vec<RelayObservation> {
     let roster_start = Instant::now();
     let brigades = match store.borrow().list_brigades() {
@@ -2055,6 +2061,14 @@ fn gather_relay_observations(
         t.relay_claude_snapshot += claude_snapshot_start.elapsed();
     }
     let mut observations = Vec::new();
+    glance_gate.begin_tick();
+    // One rowid lookup per tick: while no message has been appended, no
+    // member's glance can have a new answer, so none is re-read.
+    let glance_start = Instant::now();
+    let newest_message = store.borrow().max_brigade_message_id().ok();
+    if let Some(t) = timings.as_deref_mut() {
+        t.relay_glance += glance_start.elapsed();
+    }
     for brigade in brigades {
         let roster_start = Instant::now();
         let members = match store.borrow().brigade_members(brigade.id) {
@@ -2122,6 +2136,18 @@ fn gather_relay_observations(
                 },
                 None => None,
             };
+            let glance_start = Instant::now();
+            let glance = glance_gate.read(
+                &store.borrow(),
+                brigade.id,
+                &member.token,
+                &session_id.0,
+                member.role,
+                newest_message,
+            );
+            if let Some(t) = timings.as_deref_mut() {
+                t.relay_glance += glance_start.elapsed();
+            }
             observations.push(RelayObservation {
                 brigade_id: brigade.id,
                 token: member.token.clone(),
@@ -2129,9 +2155,11 @@ fn gather_relay_observations(
                 has_unseen,
                 is_idle_this_tick,
                 agent,
+                glance,
             });
         }
     }
+    glance_gate.end_tick();
     observations
 }
 
@@ -2619,20 +2647,51 @@ fn draw(
         );
     } else {
         let focused_key = state.stage.focused_key().cloned();
-        for (key, rect) in tiles {
+        for (index, (key, rect)) in tiles.iter().enumerate() {
             let Some(screen) = state.screens.get(key) else {
                 continue;
             };
-            let focused_tile = focus == Focus::Pane && focused_key.as_ref() == Some(key);
+            let collapsed = geometry.collapsed[index];
+            // A collapsed tile is never the focused one (the core keeps focus
+            // off it), so its border carries attention only.
+            let focused_tile =
+                !collapsed && focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let waiting = state.attention_panes().contains(key);
-            let block = tile_block(
-                &state.tile_label(key),
-                focused_tile,
-                waiting,
-                marked_tile == Some(key),
-            );
+            let marked = marked_tile == Some(key);
+            let block = tile_block(&state.tile_label(key), focused_tile, waiting, marked);
             let content = block.inner(*rect);
             frame.render_widget(block, *rect);
+            paint_tile_buttons(
+                frame.buffer_mut(),
+                &geometry,
+                key,
+                tile_border_color(focused_tile, waiting, marked),
+                state.soloed_key() == Some(key),
+            );
+            if collapsed {
+                // The child keeps running untouched; only its facts are shown.
+                let row = app.row_for_id(key.as_str());
+                let facts = state.member_facts(key);
+                let data = StripData {
+                    // The session list's row when there is one; the product
+                    // the relay resolved from the store before it has.
+                    agent: row
+                        .map(|row| row.agent)
+                        .or_else(|| facts.and_then(|facts| facts.agent)),
+                    activity: row.map(|row| row.activity),
+                    output_age: state
+                        .last_output_at(key)
+                        .map(|at| tick.saturating_duration_since(at)),
+                    inbound: facts
+                        .and_then(|facts| facts.inbound.as_ref())
+                        .map(strip_message),
+                    sent: facts
+                        .and_then(|facts| facts.sent.as_ref())
+                        .map(strip_message),
+                };
+                render_strip(frame.buffer_mut(), content, &data, now);
+                continue;
+            }
             let cursor = paint_pane(
                 frame.buffer_mut(),
                 pane_render_cache,
@@ -2698,6 +2757,53 @@ fn draw(
 /// being moved and the ghost of its label. Neither the focus cyan nor the
 /// waiting magenta (`border_style`), so it cannot be mistaken for either.
 const DRAG_LINE_COLOR: Color = Color::Yellow;
+
+/// A stored message glance as the strip draws it.
+fn strip_message(glance: &MessageGlance) -> StripMessage {
+    let millis = u64::try_from(glance.created_at_ms).unwrap_or(0);
+    StripMessage {
+        at: SystemTime::UNIX_EPOCH + Duration::from_millis(millis),
+        text: glance.line.clone(),
+    }
+}
+
+/// The colour of a tile's border: the gesture colour while it is being moved,
+/// else focus, waiting and plain as `border_style` has them.
+fn tile_border_color(focused: bool, waiting: bool, marked: bool) -> Color {
+    if marked {
+        DRAG_LINE_COLOR
+    } else {
+        border_style(focused, waiting).fg.unwrap_or(Color::Reset)
+    }
+}
+
+/// Paint `key`'s title-row buttons over its border row, in the border's own
+/// colour. The soloed tile's `[S]` is reversed while its solo is active.
+fn paint_tile_buttons(
+    buffer: &mut Buffer,
+    geometry: &banto_core::layout::Geometry,
+    key: &SessionKey,
+    color: Color,
+    soloed: bool,
+) {
+    for button in geometry
+        .buttons()
+        .iter()
+        .filter(|button| &button.key == key)
+    {
+        let mut style = Style::default().fg(color);
+        if soloed && button.kind == ButtonKind::Solo {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        buffer.set_stringn(
+            button.rect.x,
+            button.rect.y,
+            button.text,
+            usize::from(button.rect.width),
+            style,
+        );
+    }
+}
 
 /// A tile's frame. A tile being moved is drawn in the gesture colour — border
 /// and title, replacing whichever focus, waiting or plain style it would have
@@ -2772,7 +2878,7 @@ fn render_status_bar(
     /// own `ARCHIVED_HINT` for why this one is not in the bar unconditionally.
     const ARCHIVED_HINT: &str = " · D restore";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
-    const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+arrows reorder · 1-9 pane · b literal · s sidebar · x kill";
+    const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+arrows reorder · m collapse · z solo · M restore · 1-9 pane · b literal · s sidebar · x kill";
 
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
@@ -2989,10 +3095,79 @@ struct TickTimings {
     /// reason.
     relay_claude_snapshot: Duration,
     relay_unseen: Duration,
+    /// The message-glance gate and the reads it lets through (`GlanceGate`).
+    relay_glance: Duration,
     relay_activity_claude: Duration,
     relay_activity_codex_sqlite: Duration,
     relay_activity_codex_rollout: Duration,
     goinkyo_roster: Duration,
+}
+
+/// Which members' message glances have been read, and at which newest message
+/// id, so a tick with no new message reads nothing. Lives in the event loop,
+/// next to the other per-run shell state; the core never sees it (it keeps the
+/// glances themselves, `engine::MemberFacts`).
+///
+/// Measured on a synthetic store of 6000 messages over 6 brigades: the two
+/// reads for three members cost about 0.6 ms, and a member nobody has ever
+/// written to or heard from about 0.4 ms on its own (no index on
+/// `brigade_messages`, so the scan runs the whole table) — per tick, every
+/// second. The gate is one 40 us rowid lookup.
+#[derive(Default)]
+struct GlanceGate {
+    /// Per member: the newest message id and the session it was read for. A
+    /// token is reused after a dismissal, so the session is part of the
+    /// identity: a new Worker under an old token is a new member.
+    read_at: HashMap<(BrigadeId, MemberToken), (i64, String)>,
+    /// The members [`Self::read`] was asked about since [`Self::begin_tick`].
+    visited: HashSet<(BrigadeId, MemberToken)>,
+}
+
+impl GlanceGate {
+    /// Start a tick's visits (see [`Self::end_tick`]).
+    fn begin_tick(&mut self) {
+        self.visited.clear();
+    }
+
+    /// Drop every entry for a member this tick did not visit — dismissed,
+    /// disbanded, or simply not live right now — so a resident process does
+    /// not keep a record per member it has ever seen. A member that comes back
+    /// is read again, which is the safe direction.
+    fn end_tick(&mut self) {
+        let visited = std::mem::take(&mut self.visited);
+        self.read_at.retain(|id, _| visited.contains(id));
+    }
+
+    /// The member's glance if it needs reading: never read yet, or a message
+    /// has been appended since. `None` means "nothing new": the core keeps
+    /// what it holds. A failed read also answers `None` and is retried next
+    /// tick, so a transient error never blanks a tile.
+    fn read(
+        &mut self,
+        store: &Store,
+        brigade_id: BrigadeId,
+        token: &str,
+        session_id: &str,
+        role: BrigadeRole,
+        newest_message: Option<i64>,
+    ) -> Option<MemberGlance> {
+        let id = (brigade_id, token.to_string());
+        self.visited.insert(id.clone());
+        if let Some(newest) = newest_message
+            && self
+                .read_at
+                .get(&id)
+                .is_some_and(|(read, session)| *read == newest && session == session_id)
+        {
+            return None;
+        }
+        let inbound = store.latest_inbound_glance(brigade_id, token, role).ok()?;
+        let sent = store.latest_sent_glance(brigade_id, token).ok()?;
+        if let Some(newest) = newest_message {
+            self.read_at.insert(id, (newest, session_id.to_string()));
+        }
+        Some(MemberGlance { inbound, sent })
+    }
 }
 
 #[derive(Default)]
@@ -3077,7 +3252,7 @@ fn log_slow_iteration(
             file,
             "{ms} emporium: slow tick fork_roster={}us fork_live_scan={}us fork_per_member={}us \
              relay_roster={}us relay_live_scan={}us relay_claude_snapshot={}us relay_unseen={}us \
-             relay_activity_claude={}us relay_activity_codex_sqlite={}us \
+             relay_glance={}us relay_activity_claude={}us relay_activity_codex_sqlite={}us \
              relay_activity_codex_rollout={}us goinkyo_roster={}us",
             tick_timings.fork_roster.as_micros(),
             tick_timings.fork_live_scan.as_micros(),
@@ -3086,6 +3261,7 @@ fn log_slow_iteration(
             tick_timings.relay_live_scan.as_micros(),
             tick_timings.relay_claude_snapshot.as_micros(),
             tick_timings.relay_unseen.as_micros(),
+            tick_timings.relay_glance.as_micros(),
             tick_timings.relay_activity_claude.as_micros(),
             tick_timings.relay_activity_codex_sqlite.as_micros(),
             tick_timings.relay_activity_codex_rollout.as_micros(),
@@ -3159,8 +3335,10 @@ fn log_slow_iteration(
 /// **The resulting file is a LOCAL DIAGNOSTIC ARTIFACT, never a repo
 /// fixture.** Unlike `BANTO_INPUT_LOG` (which deliberately logs a paste's
 /// length, never its text), this recorder writes every event whole —
-/// keystrokes, pasted text, PTY output chunks, session ids. A real capture
-/// necessarily contains real session content; repo invariant 2 ("never
+/// keystrokes, pasted text, PTY output chunks, session ids, and — in every
+/// relay `Tick` — the first line of each live member's newest brigade
+/// messages (what a collapsed tile shows; `RelayObservation::glance`). A real
+/// capture necessarily contains real session content; repo invariant 2 ("never
 /// bring real session data into the repository") applies with full force.
 /// `banto_core::replay`'s own fixtures are hand-written synthetic streams
 /// only — never a `BANTO_RECORD_EVENTS` capture, however tempting it is to
@@ -3403,8 +3581,19 @@ mod tests {
     /// A brigade of the Director and two Workers staged through the core's
     /// own formation events, on a 120x40 terminal.
     fn staged_brigade_of_two_workers() -> (EmporiumState, App, BrigadeConfig) {
+        staged_brigade_of_two_workers_with_rows(Vec::new())
+    }
+
+    /// The same, with `extra_rows` in the session list (to give the Workers
+    /// rows of their own: the Worker panes are keyed
+    /// `new-worker::1::worker-N` until the store learns their session ids).
+    fn staged_brigade_of_two_workers_with_rows(
+        extra_rows: Vec<SessionRow>,
+    ) -> (EmporiumState, App, BrigadeConfig) {
         let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+        let mut rows = vec![test_row("dir", AgentKind::ClaudeCode)];
+        rows.extend(extra_rows);
+        let mut app = App::new(rows);
         let brigade = BrigadeConfig::default();
         let now = Instant::now();
         let cmds = engine::update(
@@ -3606,6 +3795,533 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_collapsed_tile_shows_its_title_buttons_and_status_row_and_shows_waiting() {
+        use banto_core::input::{MouseButton, MouseEventKind};
+        let mut waiting = test_row("new-worker::1::worker-1", AgentKind::ClaudeCode);
+        waiting.activity = Activity::Waiting;
+        let mut busy = test_row("new-worker::1::worker-2", AgentKind::Codex);
+        busy.activity = Activity::Busy;
+        let (mut state, mut app, brigade) =
+            staged_brigade_of_two_workers_with_rows(vec![waiting, busy]);
+        let area = Rect::new(0, 0, 120, 40);
+        let button_of = |state: &EmporiumState, name: &str, kind: ButtonKind| {
+            state
+                .geometry(area)
+                .buttons()
+                .iter()
+                .find(|b| b.key.as_str().ends_with(name) && b.kind == kind)
+                .cloned()
+                .unwrap()
+        };
+        let w2_key = SessionKey::from_id("new-worker::1::worker-2");
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: w2_key.clone(),
+                chunk: b"hello".to_vec(),
+            },
+            Instant::now(),
+        );
+
+        // Collapse worker-1 with its own button.
+        let minimize = button_of(&state, "worker-1", ButtonKind::Minimize);
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            minimize.rect.x,
+            minimize.rect.y,
+        );
+        let geometry = state.geometry(area);
+        let strip = geometry.tiles[1].1;
+        assert!(geometry.is_collapsed(&geometry.tiles[1].0));
+        assert_eq!(strip.height, banto_core::engine::COLLAPSED_TILE_HEIGHT);
+
+        let buffer = render(&state, &app);
+        // Title row: the label, then the buttons ending before the corner.
+        assert_eq!(text_at(&buffer, strip.x + 1, strip.y, 10), " worker-1 ");
+        let right = strip.x + strip.width - 1;
+        assert_eq!(text_at(&buffer, right - 6, strip.y, 6), "[S][+]");
+        // Status row: agent, activity (waiting, in the waiting colour), and
+        // the honest "no output yet" for a pane that has not written.
+        let row = strip.y + 1;
+        assert_eq!(
+            text_at(&buffer, strip.x + 1, row, 32).trim_end(),
+            "Claude \u{b7} waiting \u{b7} no output yet"
+        );
+        assert_eq!(buffer[(strip.x + 1 + 9, row)].fg, WAITING_ACTIVITY_COLOR);
+        // Rows two and three are blank in part A.
+        for y in [strip.y + 2, strip.y + 3] {
+            assert_eq!(text_at(&buffer, strip.x + 1, y, 30).trim_end(), "");
+        }
+        // A tile waiting for the operator is the one case he must not miss:
+        // the collapsed tile's border shows it.
+        for (x, y) in [
+            (strip.x, strip.y + 2),
+            (strip.x + 7, strip.y + strip.height - 1),
+            (right, strip.y + 2),
+        ] {
+            assert_eq!(
+                buffer[(x, y)].fg,
+                WAITING_ACTIVITY_COLOR,
+                "border cell ({x},{y})"
+            );
+        }
+
+        // The expanded tile beside it: its buttons say [_], its [S] is plain
+        // until it is soloed, then reversed.
+        let w2 = state.geometry(area).tiles[2].1;
+        let w2_right = w2.x + w2.width - 1;
+        assert_eq!(text_at(&buffer, w2_right - 6, w2.y, 6), "[S][_]");
+        assert!(
+            !buffer[(w2_right - 6, w2.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        let solo = button_of(&state, "worker-2", ButtonKind::Solo);
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            solo.rect.x,
+            solo.rect.y,
+        );
+        let soloed = render(&state, &app);
+        assert!(
+            soloed[(w2_right - 6, w2.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "[S] reversed"
+        );
+        assert!(
+            !soloed[(w2_right - 3, w2.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "[_] is not"
+        );
+        assert_eq!(text_at(&soloed, w2_right - 3, w2.y, 3), "[_]");
+    }
+
+    // --- message glances: store -> gate -> Event -> state -> strip ---------------
+
+    #[test]
+    fn the_gate_reads_a_member_once_then_again_only_when_a_message_is_appended() {
+        let store = Store::open_in_memory().unwrap();
+        let brigade = store.create_brigade("cell").unwrap();
+        store
+            .enqueue_brigade_message(brigade, "director", BrigadeRole::Worker, None, "first")
+            .unwrap();
+        let mut gate = GlanceGate::default();
+        let read = |gate: &mut GlanceGate, store: &Store, token: &str| {
+            gate.read(
+                store,
+                brigade,
+                token,
+                "session-a",
+                BrigadeRole::Worker,
+                store.max_brigade_message_id().ok(),
+            )
+        };
+
+        let first = read(&mut gate, &store, "worker-1").expect("never read: read now");
+        assert_eq!(first.inbound.map(|g| g.line), Some("first".to_string()));
+        assert_eq!(
+            read(&mut gate, &store, "worker-1"),
+            None,
+            "nothing new: nothing read"
+        );
+        // Another member has its own record of what it has read.
+        assert!(read(&mut gate, &store, "worker-2").is_some());
+        assert_eq!(read(&mut gate, &store, "worker-2"), None);
+
+        store
+            .enqueue_brigade_message(brigade, "director", BrigadeRole::Worker, None, "second")
+            .unwrap();
+        let again = read(&mut gate, &store, "worker-1").expect("a message arrived");
+        assert_eq!(again.inbound.map(|g| g.line), Some("second".to_string()));
+        assert!(
+            read(&mut gate, &store, "worker-2").is_some(),
+            "and for everyone"
+        );
+
+        // Without a newest id (the lookup failed) it always reads: a blank
+        // tile on a transient error is the worse failure.
+        let blind = |gate: &mut GlanceGate| {
+            gate.read(
+                &store,
+                brigade,
+                "worker-1",
+                "session-a",
+                BrigadeRole::Worker,
+                None,
+            )
+        };
+        assert!(blind(&mut gate).is_some());
+        assert!(blind(&mut gate).is_some());
+
+        // A new Worker under a reused token is read afresh even though no
+        // message has been appended since the old one was.
+        let _ = read(&mut gate, &store, "worker-1");
+        assert_eq!(read(&mut gate, &store, "worker-1"), None);
+        let newest = store.max_brigade_message_id().ok();
+        assert!(
+            gate.read(
+                &store,
+                brigade,
+                "worker-1",
+                "session-b",
+                BrigadeRole::Worker,
+                newest
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn the_gate_forgets_dismissed_members_and_disbanded_brigades_and_rereads_a_returner() {
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut gate = GlanceGate::default();
+        let gather = |gate: &mut GlanceGate| {
+            gather_relay_observations(&state, &store, &home, None, &app, None, gate)
+        };
+        let remembered = |gate: &GlanceGate| {
+            let mut ids: Vec<String> = gate
+                .read_at
+                .keys()
+                .map(|(_, token)| token.clone())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        gather(&mut gate);
+        assert_eq!(remembered(&gate), ["director", "worker-1"]);
+        assert!(
+            gather(&mut gate).iter().all(|o| o.glance.is_none()),
+            "settled"
+        );
+
+        // The Worker is dismissed: its entry goes on the next tick.
+        store.borrow_mut().dismiss_worker(1, "worker-1").unwrap();
+        gather(&mut gate);
+        assert_eq!(remembered(&gate), ["director"]);
+
+        // It comes back under the same token and session: read again, though
+        // no message has been appended since.
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+        let back = gather(&mut gate);
+        let worker = back.iter().find(|o| o.token == "worker-1").unwrap();
+        assert!(worker.glance.is_some(), "a returning member is read afresh");
+        assert_eq!(remembered(&gate), ["director", "worker-1"]);
+
+        // The brigade is disbanded: nothing is left.
+        store.borrow_mut().delete_brigade(1).unwrap();
+        gather(&mut gate);
+        assert!(gate.read_at.is_empty());
+        assert!(
+            gate.visited.is_empty(),
+            "and no visit is carried over a tick"
+        );
+    }
+
+    #[test]
+    fn the_relay_gather_carries_each_members_glances_without_consuming_the_mail() {
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut gate = GlanceGate::default();
+        let gather = |gate: &mut GlanceGate| {
+            gather_relay_observations(&state, &store, &home, None, &app, None, gate)
+        };
+
+        let observations = gather(&mut gate);
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        let director = observations.iter().find(|o| o.token == "director").unwrap();
+        // `staged_worker` queued "hi" from worker-1 to the Director.
+        let worker_glance = worker.glance.as_ref().expect("first read");
+        assert_eq!(
+            worker_glance.sent.as_ref().map(|g| g.line.as_str()),
+            Some("hi")
+        );
+        assert_eq!(worker_glance.inbound, None);
+        let director_glance = director.glance.as_ref().expect("first read");
+        assert_eq!(
+            director_glance.inbound.as_ref().map(|g| g.line.as_str()),
+            Some("hi")
+        );
+        assert_eq!(director_glance.sent, None);
+        assert!(
+            worker.agent.is_some(),
+            "the resolved product travels with it"
+        );
+
+        // The next tick with no new message reads nothing.
+        assert!(gather(&mut gate).iter().all(|o| o.glance.is_none()));
+        // Reading was not receiving: the Director still has unseen mail.
+        assert!(director.has_unseen);
+        assert!(
+            store
+                .borrow()
+                .has_unseen_brigade_messages(1, "director", BrigadeRole::Director)
+                .unwrap()
+        );
+
+        // A new message is picked up on the next tick.
+        store
+            .borrow()
+            .enqueue_brigade_message(
+                1,
+                "director",
+                BrigadeRole::Worker,
+                None,
+                "\u{1b}[31mdo it\nnow",
+            )
+            .unwrap();
+        let after = gather(&mut gate);
+        let worker = after.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(
+            worker
+                .glance
+                .as_ref()
+                .and_then(|g| g.inbound.as_ref())
+                .map(|g| g.line.as_str()),
+            Some("[31mdo it"),
+            "reduced to its first line with the escape removed"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_tiles_message_rows_come_through_an_observation_and_clip_by_width() {
+        use banto_core::input::{MouseButton, MouseEventKind};
+        let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
+        let area = Rect::new(0, 0, 120, 40);
+        let key = SessionKey::from_id("new-worker::1::worker-1");
+        let observation = |glance: Option<MemberGlance>, agent| RelayObservation {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            key: key.clone(),
+            has_unseen: false,
+            is_idle_this_tick: None,
+            agent,
+            glance,
+        };
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation(
+                    Some(MemberGlance {
+                        inbound: Some(MessageGlance {
+                            created_at_ms: now_ms - 5 * 60 * 1000,
+                            line: "run the whole suite and report".to_string(),
+                        }),
+                        sent: Some(MessageGlance {
+                            created_at_ms: now_ms,
+                            line: "\u{30c6}\u{30b9}\u{30c8}".repeat(40),
+                        }),
+                    }),
+                    Some(AgentKind::Codex),
+                )],
+            },
+            Instant::now(),
+        );
+        let minimize = state
+            .geometry(area)
+            .buttons()
+            .iter()
+            .find(|b| b.key == key && b.kind == ButtonKind::Minimize)
+            .cloned()
+            .unwrap();
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            minimize.rect.x,
+            minimize.rect.y,
+        );
+        let strip = state.geometry(area).tiles[1].1;
+        let inner = strip.width - 2;
+
+        let buffer = render(&state, &app);
+
+        // The agent comes from the relay's facts: the list has no row for it.
+        assert!(text_at(&buffer, strip.x + 1, strip.y + 1, 12).starts_with("Codex"));
+        let inbound = text_at(&buffer, strip.x + 1, strip.y + 2, inner);
+        assert!(
+            inbound.starts_with("\u{2190} 5m run the whole suite and report"),
+            "{inbound:?}"
+        );
+        let sent = text_at(&buffer, strip.x + 1, strip.y + 3, inner);
+        // A wide character's second cell reads as a space in the buffer.
+        let compact: String = sent.chars().filter(|c| *c != ' ').collect();
+        assert!(
+            compact.starts_with("\u{2192}now\u{30c6}\u{30b9}\u{30c8}"),
+            "{sent:?}"
+        );
+        // Wide text is cut by display width at the content edge, ellipsis
+        // included, and nothing spills onto the border.
+        assert!(compact.ends_with('\u{2026}'), "{sent:?}");
+        let right = strip.x + strip.width - 1;
+        assert_eq!(buffer[(right, strip.y + 3)].symbol(), "\u{2502}");
+
+        // An observation that re-read nothing leaves the rows as they are.
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![observation(None, None)],
+            },
+            Instant::now(),
+        );
+        let buffer = render(&state, &app);
+        assert!(
+            text_at(&buffer, strip.x + 1, strip.y + 2, 20).starts_with("\u{2190} 5m run the whole")
+        );
+    }
+
+    #[test]
+    fn the_master_tile_has_a_solo_button_drawn_reversed_while_its_solo_is_active() {
+        use banto_core::input::{MouseButton, MouseEventKind};
+        let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
+        let area = Rect::new(0, 0, 120, 40);
+        let master = state.geometry(area).tiles[0].1;
+        let right = master.x + master.width - 1;
+
+        let before = render(&state, &app);
+        assert_eq!(text_at(&before, right - 3, master.y, 3), "[S]");
+        // The label ends well before it: the cells between are plain border.
+        assert_eq!(text_at(&before, right - 4, master.y, 1), "\u{2500}");
+        assert!(
+            !before[(right - 3, master.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        // Solo only: no collapse button on the master.
+        assert!(!text_at(&before, master.x + 1, master.y, master.width - 2).contains("[_]"));
+
+        let button = state
+            .geometry(area)
+            .buttons()
+            .iter()
+            .find(|b| b.key == state.geometry(area).tiles[0].0)
+            .cloned()
+            .unwrap();
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            button.rect.x,
+            button.rect.y,
+        );
+
+        assert!(state.soloed_key().is_some(), "the press soloed the master");
+        // The master is wider now (the stack narrowed), so its button moved.
+        let master = state.geometry(area).tiles[0].1;
+        let right = master.x + master.width - 1;
+        let after = render(&state, &app);
+        assert!(
+            after[(right - 3, master.y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "[S] reversed"
+        );
+        assert_eq!(text_at(&after, right - 3, master.y, 3), "[S]");
+        // Soloing the master collapsed every stack tile: their buttons read [+].
+        let stack = state.geometry(area).tiles[1].1;
+        let stack_right = stack.x + stack.width - 1;
+        assert_eq!(text_at(&after, stack_right - 3, stack.y, 3), "[+]");
+    }
+
+    #[test]
+    fn a_collapsed_tiles_output_age_comes_from_the_panes_last_output() {
+        use banto_core::input::{MouseButton, MouseEventKind};
+        let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
+        let area = Rect::new(0, 0, 120, 40);
+        let key = SessionKey::from_id("new-worker::1::worker-1");
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutput {
+                key: key.clone(),
+                chunk: b"x".to_vec(),
+            },
+            Instant::now(),
+        );
+        let minimize = state
+            .geometry(area)
+            .buttons()
+            .iter()
+            .find(|b| b.key == key && b.kind == ButtonKind::Minimize)
+            .cloned()
+            .unwrap();
+        mouse(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            minimize.rect.x,
+            minimize.rect.y,
+        );
+        let strip = state.geometry(area).tiles[1].1;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        let mut cache = HashMap::new();
+        let mut row_at = |tick: Instant| {
+            terminal
+                .draw(|frame| {
+                    let _ = draw(frame, &app, &state, SystemTime::now(), tick, &mut cache);
+                })
+                .unwrap();
+            text_at(terminal.backend().buffer(), strip.x + 1, strip.y + 1, 40)
+        };
+        let just_now = Instant::now();
+        // The agent and activity are unknown for a pane the list has no row
+        // for; the output age is still there.
+        assert!(row_at(just_now).trim_end().ends_with("output now"));
+        assert!(
+            row_at(just_now + Duration::from_secs(25))
+                .trim_end()
+                .ends_with("output 20s ago")
+        );
+        assert!(
+            row_at(just_now + Duration::from_secs(130))
+                .trim_end()
+                .ends_with("output 2m ago")
+        );
+        assert!(
+            row_at(just_now + Duration::from_secs(7300))
+                .trim_end()
+                .ends_with("output 2h ago")
+        );
     }
 
     #[test]
@@ -5318,6 +6034,7 @@ mod tests {
             Some(&CodexHome::new(codex_home.path().to_path_buf())),
             &app,
             None,
+            &mut GlanceGate::default(),
         );
 
         let worker = observations
@@ -5341,6 +6058,7 @@ mod tests {
             Some(&CodexHome::new(codex_home.path().to_path_buf())),
             &app,
             None,
+            &mut GlanceGate::default(),
         );
 
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
@@ -5369,6 +6087,7 @@ mod tests {
             None,
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(
@@ -5425,6 +6144,7 @@ mod tests {
             None,
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         assert!(relay.iter().any(|observation| {
             observation.brigade_id == offstage_brigade
@@ -5481,6 +6201,7 @@ mod tests {
             None,
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(true));
@@ -5505,6 +6226,7 @@ mod tests {
             None,
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(false));
@@ -5534,6 +6256,7 @@ mod tests {
             None,
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(false));
@@ -5552,6 +6275,7 @@ mod tests {
             None,
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, None);
@@ -5582,6 +6306,7 @@ mod tests {
             Some(&CodexHome::new(codex_home.path().to_path_buf())),
             &app,
             None,
+            &mut GlanceGate::default(),
         );
         let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, None);

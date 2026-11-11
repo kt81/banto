@@ -428,7 +428,9 @@ facts about the outside world into `Event`s, calls the pure `update`, and
 executes the `Cmd`s it returns (process spawning, PTY I/O, store reads/writes);
 none of the *decisions* live in the shell. `BANTO_RECORD_EVENTS=<path>`
 captures every `Event` fed into `update` as a replay stream (`docs/DISCIPLINE.md`
-§8) — a captured file contains real session content and must never be
+§8) — a captured file contains real session content (keystrokes, pasted text,
+PTY output, and the first line of each live member's newest brigade messages,
+which the relay `Tick` carries for the collapsed tiles) and must never be
 committed.
 
 **Layout.** A solo session fills the whole pane. A staged brigade (see
@@ -460,6 +462,47 @@ preference by member token, re-applied whenever the pane list is rebuilt, so a
 tile keeps its place (and its height) across re-staging and across Workers
 arriving in a different order; a member with no place in it goes after the
 ordered ones, and dismissing a Worker forgets its place.
+A stack tile can be collapsed to a five-row strip (border, three content
+rows, border) that shows status-like facts instead of the session's screen,
+which keeps running untouched: the `[_]` button in its title row (or `m`), `[+]`
+to open it again. The strip's first content row reads agent · activity
+(busy / waiting / alive / idle, in the sidebar dot's colours) · output age
+("output now", then in ten-second steps to a minute, then minutes, then hours;
+for Codex, which never reports busy or waiting, the output age is the only
+liveness signal and is the last thing dropped on a narrow row). The next two
+rows read `← <age> <first line of the last message sent to this member>` and
+`→ <age> <first line of the last message this member sent>`, from banto's own
+brigade message store, read without touching any read cursor (a glance is not a
+delivery) and re-read only when a message has been appended; each is reduced at
+the store to its first non-empty line with control characters removed and cut to
+200 characters, then clipped to the row by display width, and blank when there
+is none. A collapsed tile
+that is waiting for the operator still shows the waiting colour on its border. A
+tile's `[S]` button (or `z`) *solos* it, as on an audio mixer: every other stack
+tile is shown collapsed until the solo is turned off (the master tile has an `[S]`
+button too, and no collapse button: soloing it collapses the whole stack, which
+then narrows as described below). Turning the solo off brings back exactly
+what had been collapsed one by one (the solo is an overlay on those choices,
+never a rewrite; it is unrelated to the single-session "solo" stage). `M`
+clears both. Both buttons sit right-aligned in every stack tile's title row,
+only where the row has room for the label, a gap and both. When every stack
+tile is collapsed the stack stays the right-hand column but narrows to a width
+of its own (the "collapsed stack width", 36 columns until moved, per brigade;
+a width in columns, not a share, since a strip needs a fixed amount of room to be
+readable on any terminal) and the master takes the rest; the strips stack from
+the top in order and the space below them is left empty. The master is never
+narrower there than in the ordinary split at the same width (the strips can be
+narrower than the ordinary stack, never wider), so whatever fit on it before —
+its title with its `[S]` button — still fits. Opening any tile
+returns to the ordinary master share. Dragging the master/stack edge sets
+whichever of the two preferences is in force (the collapsed width while every
+tile is collapsed, the master's share otherwise); the master's PTY is resized once on
+entering and once on leaving that state. A collapsed tile is not
+focusable (the focus ring, F3 and the arrows skip it; the pane number opens it
+first); its label still moves it. A collapsed tile's child is not resized, since
+a repaint into a three-row grid would wreck the screen the operator comes back
+to; it is sized when it opens. The row resize handle lies between expanded
+neighbours and rewrites only their weights.
 The preferences live in memory only for now — they last as long as the
 emporium process, per brigade (`BrigadeId` and member token), and a Worker
 added later gets the mean of the others' height.
@@ -475,6 +518,9 @@ added later gets the mean of the others' height.
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
 | … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down (focus stays on it) |
+| … `m` | collapse the focused stack tile to a strip, or open it again |
+| … `z` | solo the focused tile (the master included; every stack tile but the soloed one is collapsed), or turn its solo off |
+| … `M` | open every collapsed tile and turn the solo off |
 | … `1`-`9` | jump to pane N |
 | … `s`/`Esc` | back to the sidebar |
 | … `x` | kill the focused pane (confirm) |

@@ -36,17 +36,18 @@ use crate::key_encode::{
     wrap_bracketed_paste,
 };
 use crate::model::{
-    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberToken, PtyExitReason,
-    SessionRow, SessionToOpen,
+    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
+    MessageGlance, PtyExitReason, SessionRow, SessionToOpen,
 };
 
 pub use crate::layout::{
-    Areas, Axis, Boundary, BrigadeLayout, DEFAULT_MASTER_PERMILLE, Geometry, Handle,
+    Areas, Axis, Boundary, BrigadeLayout, ButtonKind, COLLAPSED_TILE_HEIGHT,
+    DEFAULT_COLLAPSED_STACK_WIDTH, DEFAULT_MASTER_PERMILLE, Geometry, Handle,
     MIN_HEIGHT_FOR_SUMMARY, MIN_MASTER_WIDTH, MIN_PANE_AREA_WIDTH, MIN_SIDEBAR_WIDTH,
-    MIN_STACK_TILE_HEIGHT, MIN_STACK_WIDTH, SIDEBAR_WIDTH, SUMMARY_HEIGHT, layout, master_width,
-    pane_content, stack_heights, stage_tiles,
+    MIN_STACK_TILE_HEIGHT, MIN_STACK_WIDTH, SIDEBAR_WIDTH, SUMMARY_HEIGHT, TileButton, layout,
+    master_width, pane_content, stack_heights, stage_tiles,
 };
-use crate::layout::{master_permille_for, sort_stack};
+use crate::layout::{LayoutPrefs, master_permille_for, sort_stack};
 
 /// Stable identity for a kept-alive embedded session: the real Claude
 /// session id once known, or a synthetic placeholder for a freshly-launched
@@ -432,6 +433,26 @@ pub struct RelayObservation {
     /// this field existed, which reads as "not Claude".
     #[serde(default)]
     pub agent: Option<AgentKind>,
+    /// The member's newest inbound and sent message, for its collapsed tile.
+    /// `None` means "not read this tick, nothing new to say" — the shell skips
+    /// the reads while the store has no new message — so it keeps whatever
+    /// the core already holds; `Some` replaces it (even with two empty
+    /// halves, which says the member has no mail). Message text, so it ends
+    /// up in a recorded stream (`BANTO_RECORD_EVENTS`).
+    #[serde(default)]
+    pub glance: Option<MemberGlance>,
+}
+
+/// What banto knows about a live member that is neither on its screen nor in
+/// the session list: the product it runs as (the shell resolves it from the
+/// store's recorded choice, else the member's row) and its newest inbound and
+/// sent message. Kept per `(BrigadeId, MemberToken)` from the relay
+/// observations; a collapsed tile's body is drawn from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberFacts {
+    pub agent: Option<AgentKind>,
+    pub inbound: Option<MessageGlance>,
+    pub sent: Option<MessageGlance>,
 }
 
 /// A brigade's Goinkyo member row that exists but has neither a session id
@@ -791,6 +812,12 @@ struct Drag {
     grab_offset: i32,
     /// The previewed position of the boundary, already clamped.
     preview: u16,
+    /// Whether every stack tile was collapsed when the press landed. The
+    /// master/stack boundary sets a different preference in each state
+    /// (the collapsed stack width, or the master's share) and keeps its
+    /// identity across them, so a gesture that began in one must not commit
+    /// in the other.
+    all_collapsed: bool,
 }
 
 /// What the status line says while a boundary is being dragged.
@@ -800,11 +827,11 @@ const DRAG_HINT: &str = "resize: release to apply · Esc cancels";
 /// and where the pointer was last. Exclusive with a boundary [`Drag`]; the
 /// stack does not change until the release, like the resize.
 ///
-/// The slot the row selects is derived from the current geometry wherever it
-/// is needed (the preview line, the commit), never stored: an index into
+/// The slot the pointer selects is derived from the current geometry wherever
+/// it is needed (the preview line, the commit), never stored: an index into
 /// `panes` means something else the moment a pane arrives or leaves while the
-/// button is held. Only the row picks the slot; the column is kept for the
-/// ghost that follows the pointer.
+/// button is held. Only the pointer's row picks the slot; the column only
+/// places the ghost that follows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MoveDrag {
     key: SessionKey,
@@ -851,6 +878,10 @@ pub struct EmporiumState {
     /// the first off-stage Director left with unread mail exposed that sharing
     /// a cooldown or attempt count across those cells is wrong.
     pub relay_states: HashMap<(BrigadeId, MemberToken), RelayState>,
+    /// See [`MemberFacts`]. Forgotten when the member is dismissed or the
+    /// brigade disbanded, like the layout preferences; a pane exiting or
+    /// being relaunched keeps it.
+    member_facts: HashMap<(BrigadeId, MemberToken), MemberFacts>,
     /// When real operator input was last forwarded to each pane, keyed by
     /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
     /// only ever suppresses a nudge for the pane the operator is actually
@@ -1127,6 +1158,7 @@ impl EmporiumState {
             status: None,
             status_set_at: None,
             relay_states: HashMap::new(),
+            member_facts: HashMap::new(),
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
@@ -1418,21 +1450,95 @@ impl EmporiumState {
     /// sizing all call this, so they cannot disagree, and a caller cannot
     /// forget one of the layout preferences it takes.
     pub fn geometry(&self, area: Rect) -> Geometry {
-        let master_permille = match &self.stage {
-            Stage::Brigade { id, .. } => self
-                .brigade_layouts
-                .get(id)
-                .map_or(DEFAULT_MASTER_PERMILLE, |layout| layout.master_permille),
-            _ => DEFAULT_MASTER_PERMILLE,
+        let layout = match &self.stage {
+            Stage::Brigade { id, .. } => self.brigade_layouts.get(id),
+            _ => None,
         };
+        let stack_weights = self.stack_weights();
+        let stack_collapsed = self.stack_collapsed();
         crate::layout::geometry(
             area,
             &self.stage,
-            self.sidebar_width,
-            master_permille,
-            &self.stack_weights(),
+            &LayoutPrefs {
+                sidebar_width: self.sidebar_width,
+                master_permille: layout
+                    .map_or(DEFAULT_MASTER_PERMILLE, |layout| layout.master_permille),
+                collapsed_stack_width: layout.map_or(DEFAULT_COLLAPSED_STACK_WIDTH, |layout| {
+                    layout.collapsed_stack_width
+                }),
+                stack_weights: &stack_weights,
+                stack_collapsed: &stack_collapsed,
+                master_soloable: matches!(
+                    &self.stage,
+                    Stage::Brigade { panes, .. }
+                        if panes.len() >= 2 && self.member_tokens.contains_key(&panes[0])
+                ),
+            },
             &|key| self.tile_label(key),
         )
+    }
+
+    /// One flag per stack tile of the staged brigade, in `panes` order: shown
+    /// collapsed. Solo is an overlay on the operator's own collapsing: while
+    /// the soloed member is a staged tile — the master or a stack tile —
+    /// every stack tile but it is collapsed, whatever `minimized` says (so
+    /// soloing the master collapses the whole stack); with no active solo a
+    /// tile is collapsed iff its member is in `minimized`. A soloed member
+    /// whose pane is momentarily gone (it exited, it is being relaunched)
+    /// leaves the preference in place but inactive.
+    pub fn stack_collapsed(&self) -> Vec<bool> {
+        let Stage::Brigade { id, panes, .. } = &self.stage else {
+            return Vec::new();
+        };
+        let layout = self.brigade_layouts.get(id);
+        let token_of = |key: &SessionKey| self.member_tokens.get(key).map(String::as_str);
+        let solo = layout
+            .and_then(|layout| layout.solo_member.as_deref())
+            .filter(|soloed| panes.iter().any(|key| token_of(key) == Some(*soloed)));
+        panes
+            .get(1..)
+            .unwrap_or_default()
+            .iter()
+            .map(|key| match solo {
+                Some(soloed) => token_of(key) != Some(soloed),
+                None => token_of(key)
+                    .is_some_and(|token| layout.is_some_and(|l| l.minimized.contains(token))),
+            })
+            .collect()
+    }
+
+    /// The tile that is the active solo, if any (see [`Self::stack_collapsed`]
+    /// for when a solo is active).
+    pub fn soloed_key(&self) -> Option<&SessionKey> {
+        let Stage::Brigade { id, panes, .. } = &self.stage else {
+            return None;
+        };
+        let soloed = self.brigade_layouts.get(id)?.solo_member.as_deref()?;
+        panes
+            .iter()
+            .find(|key| self.member_tokens.get(*key).map(String::as_str) == Some(soloed))
+    }
+
+    /// What banto knows about the member of the staged brigade whose pane is
+    /// `key`, if the relay has observed it yet.
+    pub fn member_facts(&self, key: &SessionKey) -> Option<&MemberFacts> {
+        let Stage::Brigade { id, .. } = &self.stage else {
+            return None;
+        };
+        self.member_facts
+            .get(&(*id, self.member_tokens.get(key)?.clone()))
+    }
+
+    /// When the pane last produced output.
+    pub fn last_output_at(&self, key: &SessionKey) -> Option<Instant> {
+        self.last_output_at.get(key).copied()
+    }
+
+    /// One flag per staged pane, `panes` order (the master's always false).
+    fn pane_collapsed(&self) -> Vec<bool> {
+        let mut flags = vec![false];
+        flags.extend(self.stack_collapsed());
+        flags
     }
 
     /// The label a tile's title shows — role, not position: `director`
@@ -1649,6 +1755,13 @@ enum PrefixAction {
     CyclePane,
     /// An arrow key: move by grid geometry — see [`arrow_target`].
     Move(Direction),
+    /// `m`: collapse the focused stack tile to a strip, or open it again.
+    ToggleMinimize,
+    /// `z`: solo the focused tile — master or stack — (every stack tile but it
+    /// collapsed), or turn its solo off. Mixer solo, not `Stage::Solo`.
+    ToggleSolo,
+    /// `M`: open every collapsed tile and turn the solo off.
+    RestoreAll,
     /// Shift+Up / Shift+Down: move the focused stack tile one slot, see
     /// [`move_focused_tile`]. Plain arrows (and any other modifier
     /// combination) stay [`Self::Move`].
@@ -1703,6 +1816,13 @@ fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> 
             }
         }
         KeyCode::Esc => PrefixAction::Sidebar,
+        KeyCode::Char('m') if key.modifiers.is_empty() => PrefixAction::ToggleMinimize,
+        KeyCode::Char('z') if key.modifiers.is_empty() => PrefixAction::ToggleSolo,
+        // A shifted letter arrives as the uppercased `Char` with or without
+        // the modifier flag, depending on the terminal.
+        KeyCode::Char('M') if key.modifiers.is_empty() || key.modifiers == Modifiers::SHIFT => {
+            PrefixAction::RestoreAll
+        }
         KeyCode::Char('s') if key.modifiers.is_empty() => PrefixAction::Sidebar,
         KeyCode::Char('x') if key.modifiers.is_empty() => PrefixAction::Kill,
         _ => PrefixAction::Unbound,
@@ -1747,9 +1867,11 @@ fn apply_focus_slot(state: &mut EmporiumState, slot: FocusSlot) {
 }
 
 /// `o`/Tab: the next slot forward in the ring `[Sidebar, Pane(0), Pane(1),
-/// ...]` (length `1 + pane_count`), wrapping. A ring of length 1 (`Empty`,
-/// `pane_count == 0`) has nowhere else to go and stays put.
-fn cycle_forward(from: FocusSlot, pane_count: usize) -> FocusSlot {
+/// ...]` (length `1 + pane_count`), wrapping, skipping collapsed panes
+/// (`collapsed`: one flag per pane, a missing one counts as expanded). A ring
+/// of length 1 (`Empty`, `pane_count == 0`) has nowhere else to go and stays
+/// put.
+fn cycle_forward(from: FocusSlot, pane_count: usize, collapsed: &[bool]) -> FocusSlot {
     let ring_len = 1 + pane_count;
     if ring_len <= 1 {
         return FocusSlot::Sidebar;
@@ -1758,7 +1880,10 @@ fn cycle_forward(from: FocusSlot, pane_count: usize) -> FocusSlot {
         FocusSlot::Sidebar => 0,
         FocusSlot::Pane(n) => 1 + n,
     };
-    let next = (pos + 1) % ring_len;
+    let mut next = (pos + 1) % ring_len;
+    while next != 0 && collapsed.get(next - 1).copied().unwrap_or(false) {
+        next = (next + 1) % ring_len;
+    }
     if next == 0 {
         FocusSlot::Sidebar
     } else {
@@ -1771,7 +1896,13 @@ fn cycle_forward(from: FocusSlot, pane_count: usize) -> FocusSlot {
 /// Left/Right cross columns; Up/Down step within the stack only, clamped
 /// (no wrap). Every edge case (sidebar's Left, a solo/master pane's
 /// Up/Down, a stack pane's Right) is a deliberate no-op, not an omission.
-fn arrow_target(from: FocusSlot, direction: Direction, pane_count: usize) -> FocusSlot {
+fn arrow_target(
+    from: FocusSlot,
+    direction: Direction,
+    pane_count: usize,
+    collapsed: &[bool],
+) -> FocusSlot {
+    let expanded = |n: usize| !collapsed.get(n).copied().unwrap_or(false);
     match (from, direction) {
         (FocusSlot::Sidebar, Direction::Right) => {
             if pane_count == 0 {
@@ -1783,31 +1914,20 @@ fn arrow_target(from: FocusSlot, direction: Direction, pane_count: usize) -> Foc
         (FocusSlot::Sidebar, _) => FocusSlot::Sidebar,
 
         (FocusSlot::Pane(0), Direction::Left) => FocusSlot::Sidebar,
-        (FocusSlot::Pane(0), Direction::Right) => {
-            if pane_count >= 2 {
-                FocusSlot::Pane(1)
-            } else {
-                FocusSlot::Pane(0)
-            }
-        }
+        (FocusSlot::Pane(0), Direction::Right) => (1..pane_count)
+            .find(|n| expanded(*n))
+            .map_or(FocusSlot::Pane(0), FocusSlot::Pane),
         (FocusSlot::Pane(0), Direction::Up | Direction::Down) => FocusSlot::Pane(0),
 
         (FocusSlot::Pane(_), Direction::Left) => FocusSlot::Pane(0),
         (FocusSlot::Pane(n), Direction::Right) => FocusSlot::Pane(n),
-        (FocusSlot::Pane(n), Direction::Up) => {
-            if n > 1 {
-                FocusSlot::Pane(n - 1)
-            } else {
-                FocusSlot::Pane(n)
-            }
-        }
-        (FocusSlot::Pane(n), Direction::Down) => {
-            if n + 1 < pane_count {
-                FocusSlot::Pane(n + 1)
-            } else {
-                FocusSlot::Pane(n)
-            }
-        }
+        (FocusSlot::Pane(n), Direction::Up) => (1..n)
+            .rev()
+            .find(|m| expanded(*m))
+            .map_or(FocusSlot::Pane(n), FocusSlot::Pane),
+        (FocusSlot::Pane(n), Direction::Down) => (n + 1..pane_count)
+            .find(|m| expanded(*m))
+            .map_or(FocusSlot::Pane(n), FocusSlot::Pane),
     }
 }
 
@@ -2562,6 +2682,7 @@ pub fn update(
     // Before anything sizes a tile: whatever rebuilt `panes` this event is
     // put back in the operator's order first.
     state.apply_stack_order();
+    refocus_expanded(state, None);
     validate_drag(state, app);
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(refresh_waiting_display(state, app, now));
@@ -2669,11 +2790,17 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
 /// (a HashMap lookup per staged tile) and correct without needing every
 /// stage-mutating branch to remember to call it.
 fn resize_staged_tiles(state: &mut EmporiumState) -> Vec<Cmd> {
-    let tiles = state
-        .geometry(Rect::new(0, 0, state.size.0, state.size.1))
-        .tiles;
+    let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
     let mut cmds = Vec::new();
-    for (key, rect) in tiles {
+    for ((key, rect), collapsed) in geometry.tiles.into_iter().zip(geometry.collapsed) {
+        // A collapsed tile's child keeps the size it had: the grid's resize
+        // truncates rather than reflows, and a child repainting into a
+        // three-row grid would destroy the screen the operator comes back to
+        // (an off-stage pane lives the same way). It is sized by this same
+        // pass the moment it expands.
+        if collapsed {
+            continue;
+        }
         let content = pane_content(rect);
         if let Some(screen) = state.screens.get_mut(&key)
             && screen.resize(content.height, content.width)
@@ -2894,10 +3021,17 @@ fn update_key(
         return Vec::new();
     }
     if code == KeyCode::F(3) {
+        let collapsed = state.pane_collapsed();
         if let Stage::Brigade { panes, focused, .. } = &mut state.stage
             && !panes.is_empty()
         {
-            *focused = (*focused + 1) % panes.len();
+            // The next expanded pane; the master is never collapsed, so the
+            // walk always ends somewhere.
+            let mut next = (*focused + 1) % panes.len();
+            while collapsed.get(next).copied().unwrap_or(false) {
+                next = (next + 1) % panes.len();
+            }
+            *focused = next;
         }
         return Vec::new();
     }
@@ -3023,17 +3157,45 @@ fn resolve_armed_prefix(
             }
         }
         PrefixAction::CyclePane => {
-            let next = cycle_forward(current_focus_slot(state), pane_count);
+            let next = cycle_forward(
+                current_focus_slot(state),
+                pane_count,
+                &state.pane_collapsed(),
+            );
             apply_focus_slot(state, next);
             Vec::new()
         }
         PrefixAction::Move(direction) => {
-            let next = arrow_target(current_focus_slot(state), direction, pane_count);
+            let next = arrow_target(
+                current_focus_slot(state),
+                direction,
+                pane_count,
+                &state.pane_collapsed(),
+            );
             apply_focus_slot(state, next);
             Vec::new()
         }
         PrefixAction::MoveTile(direction) => move_focused_tile(state, direction),
+        PrefixAction::ToggleMinimize => collapse_focused_tile(state),
+        PrefixAction::ToggleSolo => solo_focused_tile(state),
+        PrefixAction::RestoreAll => {
+            if matches!(state.stage, Stage::Brigade { .. }) {
+                restore_all(state);
+            } else {
+                state.status = Some("prefix: no stack to restore".to_string());
+            }
+            Vec::new()
+        }
         PrefixAction::FocusPane(index) => {
+            // A collapsed pane is opened first: addressing it by number is
+            // asking to work in it.
+            if let Stage::Brigade { panes, .. } = &state.stage
+                && index > 0
+                && state.pane_collapsed().get(index).copied().unwrap_or(false)
+                && let Some(key) = panes.get(index).cloned()
+            {
+                toggle_minimize(state, &key);
+            }
             state.focus = Focus::Pane;
             if let Stage::Brigade { focused, .. } = &mut state.stage {
                 *focused = index;
@@ -4165,6 +4327,20 @@ fn update_mouse(
     let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
     let areas = geometry.areas;
 
+    // A left press on a title-row button does what the button says at once:
+    // nothing is forwarded, nothing scrolls, no gesture starts.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+        && let Some(button) = geometry.button_at(mouse.column, mouse.row)
+    {
+        let (key, kind) = (button.key.clone(), button.kind);
+        match kind {
+            ButtonKind::Solo => toggle_solo(state, &key),
+            ButtonKind::Minimize => toggle_minimize(state, &key),
+        }
+        refocus_expanded(state, Some(&key));
+        return Vec::new();
+    }
+
     // A left press on a boundary picks it up — and does nothing else: no
     // focus change, no report to a child, no scrolling.
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
@@ -4178,6 +4354,7 @@ fn update_mouse(
             boundary: handle.boundary.clone(),
             grab_offset: i32::from(handle.position) - i32::from(along),
             preview: handle.position,
+            all_collapsed: geometry.all_collapsed,
         });
         return Vec::new();
     }
@@ -4185,6 +4362,31 @@ fn update_mouse(
     if areas.pane.contains(pos) {
         let tiles = &geometry.tiles;
         let hit = tiles.iter().find(|(_, rect)| rect.contains(pos)).cloned();
+        // The space under a column of strips holds nothing: a press, a wheel
+        // turn or a drag there does nothing at all.
+        if hit.is_none() && !tiles.is_empty() {
+            return Vec::new();
+        }
+        // A collapsed tile is not a place to click: its body and border do
+        // nothing (no focus, no report to the child, no scrolling). Its label
+        // still takes hold of it to move it, without focusing it; its buttons
+        // were handled above.
+        if let Some((key, _)) = &hit
+            && geometry.is_collapsed(key)
+        {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && geometry.label_at(mouse.column, mouse.row) == Some(key)
+                && state.member_tokens.contains_key(key)
+            {
+                state.move_drag = Some(MoveDrag {
+                    key: key.clone(),
+                    column: mouse.column,
+                    row: mouse.row,
+                    dragged: false,
+                });
+            }
+            return Vec::new();
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             state.focus = Focus::Pane;
             if let Stage::Brigade { panes, focused, .. } = &mut state.stage
@@ -4364,6 +4566,173 @@ fn move_tile(state: &mut EmporiumState, key: &SessionKey, to: usize) {
     layout.stack_order = staged.into_iter().chain(off_stage).collect();
 }
 
+/// The staged brigade's id and the member token of the stack tile `key`, when
+/// `key` is a stack tile that has a token to keep preferences under.
+fn stack_tile_member(state: &EmporiumState, key: &SessionKey) -> Option<(BrigadeId, MemberToken)> {
+    let Stage::Brigade { id, panes, .. } = &state.stage else {
+        return None;
+    };
+    if !panes.get(1..).unwrap_or_default().contains(key) {
+        return None;
+    }
+    Some((*id, state.member_tokens.get(key)?.clone()))
+}
+
+/// Collapse the stack tile `key` to a strip, or open it again.
+///
+/// While a solo is active this ends it first, and the tile ends up as the
+/// click asked: a tile shown collapsed is opened (taken out of `minimized`),
+/// the soloed tile itself is collapsed (put into it); the other tiles fall
+/// back to their own flags. Without a solo it flips the tile's membership.
+fn toggle_minimize(state: &mut EmporiumState, key: &SessionKey) {
+    let Some((brigade_id, token)) = stack_tile_member(state, key) else {
+        return;
+    };
+    // A gesture held across a change of what is collapsed was measured
+    // against a layout that no longer exists.
+    state.cancel_gestures();
+    let solo_active = state.soloed_key().is_some();
+    let shown_collapsed = match &state.stage {
+        Stage::Brigade { panes, .. } => panes
+            .get(1..)
+            .unwrap_or_default()
+            .iter()
+            .position(|pane| pane == key)
+            .and_then(|at| state.stack_collapsed().get(at).copied())
+            .unwrap_or(false),
+        _ => false,
+    };
+    let layout = state.brigade_layouts.entry(brigade_id).or_default();
+    if solo_active {
+        layout.solo_member = None;
+        if shown_collapsed {
+            layout.minimized.remove(&token);
+        } else {
+            layout.minimized.insert(token);
+        }
+    } else if !layout.minimized.remove(&token) {
+        layout.minimized.insert(token);
+    }
+}
+
+/// The staged brigade's id and the member token of the tile `key`, master or
+/// stack, when the brigade has a stack at all (a lone pane has nothing to
+/// solo against) and `key` has a token to keep the preference under.
+fn soloable_member(state: &EmporiumState, key: &SessionKey) -> Option<(BrigadeId, MemberToken)> {
+    let Stage::Brigade { id, panes, .. } = &state.stage else {
+        return None;
+    };
+    if panes.len() < 2 || !panes.contains(key) {
+        return None;
+    }
+    Some((*id, state.member_tokens.get(key)?.clone()))
+}
+
+/// Solo the tile `key` (the master or a stack tile), or turn its solo off when
+/// it already is the one. Moving the solo from another tile just names the
+/// new one. Never touches `minimized`.
+fn toggle_solo(state: &mut EmporiumState, key: &SessionKey) {
+    let Some((brigade_id, token)) = soloable_member(state, key) else {
+        return;
+    };
+    state.cancel_gestures();
+    let layout = state.brigade_layouts.entry(brigade_id).or_default();
+    layout.solo_member = if layout.solo_member.as_ref() == Some(&token) {
+        None
+    } else {
+        Some(token)
+    };
+}
+
+/// Open every collapsed tile and turn the solo off.
+fn restore_all(state: &mut EmporiumState) {
+    let Stage::Brigade { id, .. } = &state.stage else {
+        return;
+    };
+    let id = *id;
+    state.cancel_gestures();
+    let layout = state.brigade_layouts.entry(id).or_default();
+    layout.solo_member = None;
+    layout.minimized.clear();
+    refocus_expanded(state, None);
+}
+
+/// A collapsed tile is not focusable. If the focused pane is collapsed, move
+/// the focus to the tile just acted on if that is expanded, else to the
+/// nearest expanded stack tile (below first, then above), else to the master.
+/// Run after every operation and at the end of every `update`, so nothing
+/// that collapses a tile — a solo returning with its pane — has to remember.
+fn refocus_expanded(state: &mut EmporiumState, acted: Option<&SessionKey>) {
+    let collapsed = state.pane_collapsed();
+    let Stage::Brigade { panes, focused, .. } = &mut state.stage else {
+        return;
+    };
+    if !collapsed.get(*focused).copied().unwrap_or(false) {
+        return;
+    }
+    let expanded = |index: &usize| !collapsed.get(*index).copied().unwrap_or(false);
+    let acted = acted
+        .and_then(|key| panes.iter().position(|pane| pane == key))
+        .filter(expanded);
+    *focused = acted
+        .or_else(|| (*focused + 1..panes.len()).find(expanded))
+        .or_else(|| (1..*focused).rev().find(expanded))
+        .unwrap_or(0);
+}
+
+/// Prefix + `m`: collapse the focused tile, or open it again.
+fn collapse_focused_tile(state: &mut EmporiumState) -> Vec<Cmd> {
+    let refusal = match (&state.stage, state.focus) {
+        (_, Focus::Sidebar) => Some("prefix: focus a tile to collapse it"),
+        (Stage::Brigade { focused: 0, .. } | Stage::Solo(_) | Stage::Empty, _) => {
+            Some("prefix: the master tile can't be collapsed")
+        }
+        _ => None,
+    };
+    let key = state.stage.focused_key().cloned();
+    let refusal = refusal.or_else(|| {
+        key.as_ref()
+            .is_none_or(|key| stack_tile_member(state, key).is_none())
+            .then_some("prefix: this tile has no member to collapse")
+    });
+    if let Some(reason) = refusal {
+        state.status = Some(reason.to_string());
+        return Vec::new();
+    }
+    if let Some(key) = key {
+        toggle_minimize(state, &key);
+        refocus_expanded(state, Some(&key));
+    }
+    Vec::new()
+}
+
+/// Prefix + `z`: solo the focused tile — the master included — or turn its
+/// solo off.
+fn solo_focused_tile(state: &mut EmporiumState) -> Vec<Cmd> {
+    if state.focus == Focus::Sidebar {
+        state.status = Some("prefix: focus a tile to solo it".to_string());
+        return Vec::new();
+    }
+    let Some(key) = state.stage.focused_key().cloned() else {
+        return Vec::new();
+    };
+    if soloable_member(state, &key).is_none() {
+        let alone = !matches!(&state.stage, Stage::Brigade { panes, .. } if panes.len() >= 2);
+        state.status = Some(
+            if alone {
+                "prefix: no stack to solo"
+            } else {
+                "prefix: this tile has no member to solo"
+            }
+            .to_string(),
+        );
+        return Vec::new();
+    }
+    toggle_solo(state, &key);
+    refocus_expanded(state, Some(&key));
+    Vec::new()
+}
+
 /// Prefix + Shift+Up / Shift+Down: move the focused stack tile one slot, the
 /// focus staying on it. Every refusal says why, the way an out-of-range
 /// pane number does.
@@ -4474,25 +4843,32 @@ fn commit_drag(state: &mut EmporiumState, boundary: &Boundary, position: u16) {
         Boundary::Sidebar => state.sidebar_width = position,
         Boundary::Master { brigade } => {
             let pane = geometry.areas.pane;
-            state
-                .brigade_layouts
-                .entry(*brigade)
-                .or_default()
-                .master_permille = master_permille_for(position - pane.x, pane.width);
+            let layout = state.brigade_layouts.entry(*brigade).or_default();
+            if geometry.all_collapsed {
+                // The column of strips has a width of its own: where the
+                // boundary sits is how much room the stack gets.
+                layout.collapsed_stack_width = pane.x + pane.width - position;
+            } else {
+                layout.master_permille = master_permille_for(position - pane.x, pane.width);
+            }
         }
         Boundary::Stack {
             brigade,
             above,
             below,
         } => {
-            // Every stack member's weight becomes the height it ends up with,
-            // so a later window resize scales the whole stack as dragged
-            // rather than only the two tiles that moved.
+            // Every *expanded* stack member's weight becomes the height it ends
+            // up with, so a later window resize scales the whole expanded
+            // stack as dragged rather than only the two tiles that moved.
+            // A collapsed member keeps the weight it has: its strip height is
+            // not a height it chose.
             let mut heights: Vec<(SessionKey, u16)> = geometry
                 .tiles
                 .iter()
+                .zip(&geometry.collapsed)
                 .skip(1)
-                .map(|(key, rect)| (key.clone(), rect.height))
+                .filter(|(_, collapsed)| !**collapsed)
+                .map(|((key, rect), _)| (key.clone(), rect.height))
                 .collect();
             let moved = heights.iter().position(|(key, _)| key == above);
             if let Some(i) = moved
@@ -4535,7 +4911,12 @@ fn validate_drag(state: &mut EmporiumState, app: &App) {
         return;
     };
     let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
-    if app.modal().is_some() || geometry.handle_for(&drag.boundary).is_none() {
+    // The master/stack boundary is the same boundary whether or not the stack
+    // is all strips, but it means a different preference in each; a pane
+    // arriving or leaving can flip that under a held button.
+    let meaning_changed = matches!(drag.boundary, Boundary::Master { .. })
+        && drag.all_collapsed != geometry.all_collapsed;
+    if app.modal().is_some() || geometry.handle_for(&drag.boundary).is_none() || meaning_changed {
         state.drag = None;
     }
 }
@@ -5365,6 +5746,7 @@ fn update_disbanded(
                 None => Stage::Empty,
             };
             state.brigade_layouts.remove(&brigade_id);
+            state.member_facts.retain(|(id, _), _| *id != brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
                 .into_iter()
@@ -5413,14 +5795,21 @@ fn update_worker_dismissed(
         Ok((hidden, directors)) => {
             app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
-            // Forget the dismissed member's row weight. Only a dismissal does
-            // this — a pane exiting, being relaunched or leaving the stage
-            // keeps the member, and its weight with it.
-            if let (Some(token), Some(layout)) =
-                (member, state.brigade_layouts.get_mut(&brigade_id))
-            {
-                layout.row_weights.remove(&token);
-                layout.stack_order.retain(|ranked| *ranked != token);
+            // Forget everything kept under the dismissed member's token: its
+            // layout preferences and what its tile shows. Only a dismissal
+            // does this — a pane exiting, being relaunched or leaving the
+            // stage keeps the member, and what is kept for it. (Tokens are
+            // reused, so anything left would be inherited by the next Worker.)
+            if let Some(token) = member {
+                state.member_facts.remove(&(brigade_id, token.clone()));
+                if let Some(layout) = state.brigade_layouts.get_mut(&brigade_id) {
+                    layout.row_weights.remove(&token);
+                    layout.stack_order.retain(|ranked| *ranked != token);
+                    layout.minimized.remove(&token);
+                    if layout.solo_member.as_ref() == Some(&token) {
+                        layout.solo_member = None;
+                    }
+                }
             }
             let staged = matches!(
                 &state.stage,
@@ -5453,6 +5842,23 @@ fn update_tick(
     now: Instant,
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
+
+    // What each observed member's collapsed tile shows. A member the shell did
+    // not re-read (`glance: None`) keeps what it had; an agent the shell
+    // could not resolve this tick does not erase one it could before.
+    for observation in &relay {
+        let facts = state
+            .member_facts
+            .entry((observation.brigade_id, observation.token.clone()))
+            .or_default();
+        if observation.agent.is_some() {
+            facts.agent = observation.agent;
+        }
+        if let Some(MemberGlance { inbound, sent }) = &observation.glance {
+            facts.inbound = inbound.clone();
+            facts.sent = sent.clone();
+        }
+    }
 
     // Phase two of a nudge: send the delayed submitting `\r` in its own PTY
     // write. A chunk boundary can carry meaning for the embedded PTY, so
@@ -9672,6 +10078,7 @@ mod tests {
         let mut now = test_instant();
 
         let observation = || RelayObservation {
+            glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
@@ -9770,6 +10177,7 @@ mod tests {
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
         let observation = || RelayObservation {
+            glance: None,
             brigade_id: 2,
             token: DIRECTOR_TOKEN.to_string(),
             key: offstage.clone(),
@@ -10455,6 +10863,7 @@ mod tests {
             *focused = 1;
         }
         let observation = || RelayObservation {
+            glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
@@ -10510,6 +10919,7 @@ mod tests {
         );
 
         let observation = || RelayObservation {
+            glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
@@ -10582,6 +10992,7 @@ mod tests {
                 brigade,
                 Event::Tick {
                     relay: vec![RelayObservation {
+                        glance: None,
                         brigade_id: 1,
                         token: token.to_string(),
                         key: key.clone(),
@@ -11017,6 +11428,7 @@ mod tests {
             brigade,
             Event::Tick {
                 relay: vec![RelayObservation {
+                    glance: None,
                     brigade_id: 1,
                     token: token.to_string(),
                     key: key.clone(),
@@ -11359,6 +11771,7 @@ mod tests {
             brigade,
             Event::Tick {
                 relay: vec![RelayObservation {
+                    glance: None,
                     brigade_id: 1,
                     token: "director".to_string(),
                     key: key.clone(),
@@ -12151,7 +12564,17 @@ mod tests {
         let handle = handle_of(state, boundary);
         match handle.axis {
             Axis::Vertical => vec![(handle.position - 1, 20), (handle.position, 20)],
-            Axis::Horizontal => handle.hits().iter().map(|hit| (hit.x + 2, hit.y)).collect(),
+            // One press per row of the gap (the lower row's last cell, the
+            // right corner, is a second rectangle on the same row).
+            Axis::Horizontal => {
+                let mut rows: Vec<(u16, u16)> = Vec::new();
+                for hit in handle.hits() {
+                    if rows.iter().all(|(_, y)| *y != hit.y) {
+                        rows.push((hit.x + 2.min(hit.width - 1), hit.y));
+                    }
+                }
+                rows
+            }
         }
     }
 
@@ -12784,6 +13207,2191 @@ mod tests {
         assert!(overlay.line.is_some());
         assert_eq!(overlay.marked, None);
         assert_eq!(overlay.ghost, None);
+    }
+
+    // --- collapsing and solo ---------------------------------------------------
+
+    /// Which stack tiles are shown collapsed, by pane name, in stack order.
+    fn collapsed_names(state: &EmporiumState) -> Vec<String> {
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            return Vec::new();
+        };
+        panes[1..]
+            .iter()
+            .zip(state.stack_collapsed())
+            .filter(|(_, collapsed)| *collapsed)
+            .map(|(key, _)| key.as_str().to_string())
+            .collect()
+    }
+
+    fn set_collapse(state: &mut EmporiumState, minimized: &[&str], solo: Option<&str>) {
+        let layout = state.brigade_layouts.entry(1).or_default();
+        layout.minimized = minimized.iter().map(|t| t.to_string()).collect();
+        layout.solo_member = solo.map(str::to_string);
+    }
+
+    fn layout_of(state: &EmporiumState) -> BrigadeLayout {
+        state.brigade_layouts.get(&1).cloned().unwrap_or_default()
+    }
+
+    fn token_set(tokens: &[&str]) -> HashSet<MemberToken> {
+        tokens.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn key_of(name: &str) -> SessionKey {
+        SessionKey::from_id(name)
+    }
+
+    fn press_button(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        name: &str,
+        kind: ButtonKind,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        let button = state
+            .geometry(DRAG_AREA)
+            .buttons()
+            .iter()
+            .find(|b| b.key.as_str() == name && b.kind == kind)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} has a {kind:?} button"));
+        mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            button.rect.x + 1,
+            button.rect.y,
+            now,
+        )
+    }
+
+    #[test]
+    fn a_stack_tile_is_collapsed_by_its_own_flag_unless_a_solo_overrides_it() {
+        let cases: [(&[&str], Option<&str>, &[&str]); 7] = [
+            (&[], None, &[]),
+            (&["worker-2"], None, &["w2"]),
+            (&["worker-1", "worker-3"], None, &["w1", "w3"]),
+            (&[], Some("worker-1"), &["w2", "w3"]),
+            // The soloed tile is shown whatever its own flag says.
+            (&["worker-1"], Some("worker-1"), &["w2", "w3"]),
+            // The solo moving to another tile: the flags are not consulted.
+            (&["worker-2"], Some("worker-3"), &["w1", "w2"]),
+            // A soloed member that is not staged leaves the flags in force.
+            (&["worker-2"], Some("worker-9"), &["w2"]),
+        ];
+        for (minimized, solo, expected) in cases {
+            let (mut state, _, _, _) = drag_fixture(3);
+            set_collapse(&mut state, minimized, solo);
+            assert_eq!(
+                collapsed_names(&state),
+                expected,
+                "minimized {minimized:?}, solo {solo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_solo_is_inactive_while_its_pane_is_gone_and_comes_back_with_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-3"], Some("worker-1"));
+        assert_eq!(collapsed_names(&state), ["w2", "w3"]);
+
+        // The soloed pane exits: the preference stays, but the others show as
+        // their own flags say.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("w1"),
+                reason: None,
+            },
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-1"));
+        assert_eq!(collapsed_names(&state), ["w3"]);
+        assert_eq!(state.soloed_key(), None);
+
+        // It comes back (relaunched in the same place in the order).
+        let again = key_of("w1");
+        state.screens.insert(again.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(again.clone(), "worker-1".to_string());
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.insert(1, again.clone());
+        }
+        assert_eq!(collapsed_names(&state), ["w2", "w3"]);
+        assert_eq!(state.soloed_key(), Some(&again));
+    }
+
+    #[test]
+    fn each_operation_leaves_exactly_the_sets_it_should() {
+        let (mut state, _, _, _) = drag_fixture(3);
+        let (w1, w2, w3) = (key_of("w1"), key_of("w2"), key_of("w3"));
+
+        // Without a solo, minimize flips membership.
+        toggle_minimize(&mut state, &w2);
+        assert_eq!(layout_of(&state).minimized, token_set(&["worker-2"]));
+        toggle_minimize(&mut state, &w2);
+        assert_eq!(layout_of(&state).minimized, token_set(&[]));
+
+        // Solo names a tile, moves to another, and goes off on the same one;
+        // it never touches `minimized`.
+        set_collapse(&mut state, &["worker-3"], None);
+        toggle_solo(&mut state, &w1);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-1"));
+        toggle_solo(&mut state, &w2);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-2"));
+        assert_eq!(layout_of(&state).minimized, token_set(&["worker-3"]));
+        toggle_solo(&mut state, &w2);
+        assert_eq!(layout_of(&state).solo_member, None);
+
+        // Minimize while a solo is on, on a tile shown collapsed: the solo
+        // ends and the tile is opened (taken out of the set); the others fall
+        // back to their own flags.
+        set_collapse(&mut state, &["worker-3"], Some("worker-2"));
+        toggle_minimize(&mut state, &w1);
+        assert_eq!(layout_of(&state).solo_member, None);
+        assert_eq!(layout_of(&state).minimized, token_set(&["worker-3"]));
+        assert_eq!(collapsed_names(&state), ["w3"]);
+
+        // ...on the soloed tile itself: the solo ends and it is collapsed.
+        set_collapse(&mut state, &["worker-3"], Some("worker-2"));
+        toggle_minimize(&mut state, &w2);
+        assert_eq!(layout_of(&state).solo_member, None);
+        assert_eq!(
+            layout_of(&state).minimized,
+            token_set(&["worker-2", "worker-3"])
+        );
+        assert_eq!(collapsed_names(&state), ["w2", "w3"]);
+
+        // Restore all.
+        restore_all(&mut state);
+        assert_eq!(layout_of(&state).minimized, token_set(&[]));
+        assert_eq!(layout_of(&state).solo_member, None);
+        assert_eq!(collapsed_names(&state), Vec::<String>::new());
+        let _ = w3;
+    }
+
+    #[test]
+    fn collapsing_the_focused_tile_moves_focus_below_then_above_then_to_the_master() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 2); // w2
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(collapsed_names(&state), ["w2"]);
+        assert_eq!(
+            focused_name(&state).as_deref(),
+            Some("w3"),
+            "the nearest expanded one below"
+        );
+
+        // Collapse w3 as well: nothing below, w1 is above.
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(collapsed_names(&state), ["w2", "w3"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w1"));
+
+        // The last expanded one: the master.
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(collapsed_names(&state), ["w1", "w2", "w3"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("dir"));
+        assert_eq!(state.focus, Focus::Pane);
+    }
+
+    #[test]
+    fn soloing_another_tile_focuses_it_and_restoring_leaves_focus_where_it_is() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 1); // w1
+        // Solo w3 from its button: w1, focused, is collapsed, so focus goes to
+        // the tile acted on.
+        press_button(&mut state, &mut app, &brigade, "w3", ButtonKind::Solo, now);
+        assert_eq!(collapsed_names(&state), ["w1", "w2"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('M'),
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(collapsed_names(&state), Vec::<String>::new());
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn a_solo_returning_with_its_pane_cannot_leave_focus_on_a_collapsed_tile() {
+        // The safety net at the end of every update, not an operation.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &[], Some("worker-3"));
+        focus_stack_slot(&mut state, 1); // w1, which the solo collapses
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        assert_eq!(collapsed_names(&state), ["w1", "w2"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn a_collapsed_tile_gets_no_resize_and_exactly_one_when_it_opens() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let size_of =
+            |state: &EmporiumState, name: &str| state.screens[&key_of(name)].screen().size();
+        let before = size_of(&state, "w2");
+
+        focus_stack_slot(&mut state, 2);
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+
+        assert_eq!(collapsed_names(&state), ["w2"]);
+        assert!(
+            resizes(&cmds)
+                .iter()
+                .all(|(key, _, _)| key.as_str() != "w2"),
+            "{cmds:?}"
+        );
+        assert_eq!(
+            size_of(&state, "w2"),
+            before,
+            "its screen was not resized either"
+        );
+        // The neighbours, now taller, were.
+        let resized: Vec<String> = resizes(&cmds)
+            .into_iter()
+            .map(|(k, _, _)| k.as_str().to_string())
+            .collect();
+        assert_eq!(resized, ["w1", "w3"]);
+
+        // While it is collapsed its weight changes, so the size it opens at is
+        // not the size it kept.
+        state
+            .brigade_layouts
+            .get_mut(&1)
+            .unwrap()
+            .row_weights
+            .extend([
+                ("worker-1".to_string(), 10),
+                ("worker-2".to_string(), 30),
+                ("worker-3".to_string(), 10),
+            ]);
+
+        // Open it from its [+] button: one resize for it.
+        let cmds = press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w2",
+            ButtonKind::Minimize,
+            now,
+        );
+        let for_w2: Vec<_> = resizes(&cmds)
+            .into_iter()
+            .filter(|(k, _, _)| k.as_str() == "w2")
+            .collect();
+        assert_eq!(for_w2.len(), 1, "{cmds:?}");
+        let content = pane_content(tile_of(&state, "w2"));
+        assert_eq!(for_w2[0].1, content.height);
+        assert_eq!(for_w2[0].2, content.width);
+        assert_eq!(collapsed_names(&state), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_row_drag_across_a_collapsed_tile_rewrites_only_the_expanded_weights() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let mut layout = BrigadeLayout::default();
+        layout.row_weights.insert("worker-1".to_string(), 1);
+        layout.row_weights.insert("worker-2".to_string(), 99);
+        layout.row_weights.insert("worker-3".to_string(), 1);
+        layout.minimized = token_set(&["worker-2"]);
+        state.brigade_layouts.insert(1, layout);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        let boundary = Boundary::Stack {
+            brigade: 1,
+            above: key_of("w1"),
+            below: key_of("w3"),
+        };
+        let (w1, w3) = (tile_of(&state, "w1"), tile_of(&state, "w3"));
+        let strip = tile_of(&state, "w2");
+        let start = handle_of(&state, &boundary).position;
+
+        drag_to(&mut state, &mut app, &brigade, &boundary, start + 3, now);
+        release_at(&mut state, &mut app, &brigade, &boundary, start + 3, now);
+
+        let weights = layout_of(&state).row_weights;
+        assert_eq!(
+            weights["worker-2"], 99,
+            "the collapsed member keeps its own"
+        );
+        assert_eq!(weights["worker-1"], w1.height + 3);
+        assert_eq!(weights["worker-3"], w3.height - 3);
+        assert_eq!(
+            tile_of(&state, "w2").height,
+            strip.height,
+            "the strip did not change"
+        );
+    }
+
+    #[test]
+    fn the_buttons_do_what_they_say_at_once_and_start_nothing_else() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        // Every pane asks for mouse reports, so a stray press would be
+        // forwarded to the pane under it.
+        for name in ["dir", "w1", "w2", "w3"] {
+            state
+                .screens
+                .get_mut(&key_of(name))
+                .unwrap()
+                .process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        let focus_before = (state.focus, focused_name(&state));
+
+        let cmds = press_button(&mut state, &mut app, &brigade, "w2", ButtonKind::Solo, now);
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(state.drag.is_none() && state.move_drag.is_none());
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-2"));
+        assert_eq!(collapsed_names(&state), ["w1", "w3"]);
+        assert_eq!(
+            (state.focus, focused_name(&state)),
+            focus_before,
+            "master focus stays"
+        );
+
+        // [S] on a collapsed tile makes it the solo.
+        press_button(&mut state, &mut app, &brigade, "w3", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-3"));
+        assert_eq!(collapsed_names(&state), ["w1", "w2"]);
+        // [S] on the soloed tile turns it off.
+        press_button(&mut state, &mut app, &brigade, "w3", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member, None);
+
+        // [_] collapses, [+] opens.
+        press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        assert_eq!(collapsed_names(&state), ["w1"]);
+        let cmds = press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        assert!(writes_of(&cmds).is_empty());
+        assert_eq!(collapsed_names(&state), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_press_on_a_collapsed_tiles_body_or_border_changes_nothing_and_its_label_moves_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        for name in ["dir", "w1", "w2", "w3"] {
+            state
+                .screens
+                .get_mut(&key_of(name))
+                .unwrap()
+                .process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        set_collapse(&mut state, &["worker-2"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        let strip = tile_of(&state, "w2");
+        let before = (state.focus, focused_name(&state));
+
+        for (column, row) in [
+            (strip.x + 5, strip.y + 2),  // body
+            (strip.x, strip.y + 2),      // left border (a boundary's cell? no: master handle)
+            (strip.x + 20, strip.y + 4), // bottom border
+        ] {
+            let cmds = mouse_event(
+                &mut state,
+                &mut app,
+                &brigade,
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                now,
+            );
+            if column == strip.x {
+                // The master/stack boundary's column: that is a resize, not a click.
+                state.drag = None;
+                continue;
+            }
+            assert!(cmds.is_empty(), "{cmds:?}");
+            assert_eq!(
+                (state.focus, focused_name(&state)),
+                before,
+                "({column},{row})"
+            );
+            assert!(state.drag.is_none() && state.move_drag.is_none());
+        }
+        let cmds = mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::ScrollUp,
+            strip.x + 5,
+            strip.y + 2,
+            now,
+        );
+        assert!(cmds.is_empty());
+
+        // Its label starts a move without focusing it.
+        let (column, row) = label_cell(&state, "w2");
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+        assert!(state.move_drag.is_some());
+        assert_eq!((state.focus, focused_name(&state)), before, "not focused");
+    }
+
+    #[test]
+    fn the_focus_ring_f3_and_the_arrows_skip_collapsed_tiles() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-2"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        // The ring: master, w1, w3, sidebar, master.
+        focus_stack_slot(&mut state, 0);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            prefix_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char('o'),
+                Modifiers::NONE,
+                now,
+            );
+            seen.push(if state.focus == Focus::Sidebar {
+                "sidebar".to_string()
+            } else {
+                focused_name(&state).unwrap()
+            });
+        }
+        assert_eq!(seen, ["w1", "w3", "sidebar", "dir"]);
+
+        // A collapsed last tile: the ring and F3 wrap past it. (Landing on it
+        // and being refocused would send them back to where they were.)
+        set_collapse(&mut state, &["worker-3"], None);
+        focus_stack_slot(&mut state, 2);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('o'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(state.focus, Focus::Sidebar, "the ring skips w3");
+        focus_stack_slot(&mut state, 2);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::F(3),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("dir"), "F3 skips w3");
+        set_collapse(&mut state, &["worker-2"], None);
+
+        // F3 steps through the panes, skipping the collapsed one.
+        focus_stack_slot(&mut state, 1);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::F(3),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::F(3),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("dir"));
+
+        // Arrows: Up/Down jump over it, Right from the master goes to the
+        // first expanded tile.
+        focus_stack_slot(&mut state, 1);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Down,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w1"));
+        focus_stack_slot(&mut state, 0);
+        set_collapse(&mut state, &["worker-1"], None);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Right,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+
+        // With every stack tile collapsed Right from the master does nothing.
+        focus_stack_slot(&mut state, 0);
+        set_collapse(&mut state, &["worker-1", "worker-2", "worker-3"], None);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Right,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(focused_name(&state).as_deref(), Some("dir"));
+    }
+
+    #[test]
+    fn a_pane_number_opens_a_collapsed_pane_and_focuses_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-2", "worker-3"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('3'),
+            Modifiers::NONE,
+            now,
+        );
+
+        assert_eq!(layout_of(&state).minimized, token_set(&["worker-3"]));
+        assert_eq!(collapsed_names(&state), ["w3"]);
+        assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+        assert_eq!(state.focus, Focus::Pane);
+
+        // With a solo on, the number ends it and opens the pane.
+        set_collapse(&mut state, &["worker-3"], Some("worker-1"));
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('4'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member, None);
+        assert_eq!(collapsed_names(&state), Vec::<String>::new());
+        assert_eq!(focused_name(&state).as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn a_strip_is_moved_by_the_pointers_row_among_strips_with_a_horizontal_line() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-1", "worker-2", "worker-3"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        let (w1, w3) = (tile_of(&state, "w1"), tile_of(&state, "w3"));
+
+        press_label(&mut state, &mut app, &brigade, "w1", now);
+        // The column wanders over the master; only the row counts.
+        drag_to_cell(&mut state, &mut app, &brigade, 40, w3.y + 2, now);
+        assert_eq!(
+            overlay_line(&state),
+            Some((
+                Rect::new(w3.x, w3.y + w3.height - 1, w3.width, 1),
+                Axis::Horizontal
+            ))
+        );
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            40,
+            w3.y + 2,
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w2", "w3", "w1"]);
+        assert_eq!(w1.width, w3.width);
+
+        // Released in the empty space under the strips: the last slot.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-1", "worker-2", "worker-3"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        press_label(&mut state, &mut app, &brigade, "w1", now);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            110,
+            30,
+            now,
+        );
+        assert_eq!(order_of(&state), ["dir", "w2", "w3", "w1"]);
+    }
+
+    /// Release the held left button over `name`'s tile (a row
+    /// inside it) and report the order.
+    fn release_over(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        name: &str,
+        now: Instant,
+    ) -> Vec<String> {
+        let tile = tile_of(state, name);
+        let (column, row) = (tile.x + 3, tile.y + 1);
+        drag_to_cell(state, app, brigade, column, row, now);
+        mouse_event(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+        order_of(state)
+    }
+
+    #[test]
+    fn collapsing_the_tile_under_a_held_label_so_that_every_tile_is_collapsed_ends_the_move() {
+        // Only w2 is expanded; a column-mode move of it is under way.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-1", "worker-3"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        assert!(state.move_drag.is_some());
+
+        // prefix + m collapses w2: every stack tile is collapsed.
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        assert!(
+            state.move_drag.is_none(),
+            "the gesture ended with the change"
+        );
+        assert_eq!(state.drag_overlay(DRAG_AREA), None);
+        // The gesture is gone, so the release that follows reorders nothing.
+        let order = release_over(&mut state, &mut app, &brigade, "w3", now);
+        assert_eq!(order, ["dir", "w1", "w2", "w3"]);
+        assert!(layout_of(&state).stack_order.is_empty());
+    }
+
+    #[test]
+    fn any_collapse_operation_ends_a_gesture_even_when_the_layout_stays_a_column() {
+        for key in [
+            ('m', Modifiers::NONE),
+            ('z', Modifiers::NONE),
+            ('M', Modifiers::SHIFT),
+        ] {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            // Held on w1's label; w1 is also the focused tile, so m/z act on it.
+            press_label(&mut state, &mut app, &brigade, "w1", now);
+            assert!(state.move_drag.is_some());
+            prefix_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char(key.0),
+                key.1,
+                now,
+            );
+            assert!(state.move_drag.is_none(), "{key:?} ends the move");
+            assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3"]);
+        }
+        // A resize held on a boundary ends too.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let boundary = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &boundary).position;
+        drag_to(&mut state, &mut app, &brigade, &boundary, start + 4, now);
+        assert!(state.drag.is_some());
+        focus_stack_slot(&mut state, 2);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert!(state.drag.is_none());
+        let sidebar_width_before = state.sidebar_width;
+        release_at(&mut state, &mut app, &brigade, &boundary, start + 4, now);
+        assert_eq!(state.sidebar_width, sidebar_width_before);
+        assert!(layout_of(&state).master_permille == DEFAULT_MASTER_PERMILLE);
+    }
+
+    #[test]
+    fn the_last_expanded_pane_leaving_under_a_held_label_keeps_the_move_alive_and_by_row() {
+        // No operation at all: w3 exits, which leaves the stack all
+        // collapsed and narrows the column. The move reads the pointer's row
+        // either way, so its meaning did not change.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-1", "worker-2"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        press_label(&mut state, &mut app, &brigade, "w1", now);
+        assert!(state.move_drag.is_some());
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("w3"),
+                reason: None,
+            },
+            now,
+        );
+
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        assert!(state.move_drag.is_some());
+        let order = release_over(&mut state, &mut app, &brigade, "w2", now);
+        assert_eq!(order, ["dir", "w2", "w1"]);
+    }
+
+    #[test]
+    fn a_pane_arriving_into_an_all_collapsed_stack_under_a_held_label_keeps_the_move_alive() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        set_collapse(&mut state, &["worker-1", "worker-2"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        press_label(&mut state, &mut app, &brigade, "w1", now);
+
+        open_worker(
+            &mut state,
+            1,
+            "worker-3",
+            std::path::Path::new("/work"),
+            "",
+            None,
+            AgentKind::ClaudeCode,
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: SessionKey::new_worker(1, "worker-3"),
+            },
+            now,
+        );
+
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        assert!(
+            state.move_drag.is_some(),
+            "a row move means the same in both"
+        );
+        let order = release_over(
+            &mut state,
+            &mut app,
+            &brigade,
+            "new-worker::1::worker-3",
+            now,
+        );
+        assert_eq!(order, ["dir", "w2", "new-worker::1::worker-3", "w1"]);
+    }
+
+    #[test]
+    fn a_solo_returning_in_a_column_layout_keeps_the_held_move_alive() {
+        // The soloed member's pane is gone, so the solo is inactive and the
+        // stack is a column; it comes back, every other tile collapses.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &[], Some("worker-3"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("w3"),
+                reason: None,
+            },
+            now,
+        );
+        assert_eq!(collapsed_names(&state), Vec::<String>::new());
+        press_label(&mut state, &mut app, &brigade, "w1", now);
+        assert!(state.move_drag.is_some());
+
+        let again = key_of("w3");
+        state.screens.insert(again.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(again.clone(), "worker-3".to_string());
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.push(again);
+        }
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        // Column mode throughout, so the gesture's meaning did not change:
+        // it survives, as a pane arriving under a held button always did.
+        assert_eq!(collapsed_names(&state), ["w1", "w2"]);
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        assert!(state.move_drag.is_some());
+    }
+
+    // --- every stack tile collapsed: the narrow column of strips ---------------
+
+    fn all_collapsed_fixture(workers: usize) -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, mut app, brigade, now) = drag_fixture(workers);
+        let tokens: Vec<String> = (1..=workers).map(|n| format!("worker-{n}")).collect();
+        let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        set_collapse(&mut state, &tokens, None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        (state, app, brigade, now)
+    }
+
+    fn master_width(state: &EmporiumState) -> u16 {
+        state.geometry(DRAG_AREA).tiles[0].1.width
+    }
+
+    #[test]
+    fn the_stack_stays_at_the_side_when_every_tile_is_collapsed_and_nothing_is_a_band() {
+        let (state, _, _, _) = all_collapsed_fixture(3);
+        let geometry = state.geometry(DRAG_AREA);
+        let pane = geometry.areas.pane;
+        let master = geometry.tiles[0].1;
+        assert_eq!(master.height, pane.height, "the master keeps every row");
+        assert_eq!(master.width, pane.width - DEFAULT_COLLAPSED_STACK_WIDTH);
+        for (_, strip) in &geometry.tiles[1..] {
+            assert!(strip.x >= master.x + master.width, "right of the master");
+            assert_eq!(strip.width, DEFAULT_COLLAPSED_STACK_WIDTH);
+            assert_eq!(strip.height, COLLAPSED_TILE_HEIGHT);
+        }
+        assert_eq!(geometry.tiles[1].1.y, pane.y, "from the top");
+    }
+
+    #[test]
+    fn the_collapsed_stack_width_follows_the_collapse_state_through_solo_and_restore() {
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(3);
+        let narrow = master_width(&state);
+        let wide = {
+            let (open, _, _, _) = drag_fixture(3);
+            master_width(&open)
+        };
+        assert!(
+            narrow > wide,
+            "a 36-column stack leaves the master more than half"
+        );
+
+        // A solo on a collapsed tile opens it: the ordinary share is back.
+        press_button(&mut state, &mut app, &brigade, "w2", ButtonKind::Solo, now);
+        assert_eq!(master_width(&state), wide);
+        // The solo moving to another tile changes nothing about the width.
+        press_button(&mut state, &mut app, &brigade, "w3", ButtonKind::Solo, now);
+        assert_eq!(master_width(&state), wide);
+        // The solo ending returns to the underlying all-collapsed state.
+        press_button(&mut state, &mut app, &brigade, "w3", ButtonKind::Solo, now);
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        assert_eq!(master_width(&state), narrow);
+        // Opening any one tile.
+        press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        assert_eq!(master_width(&state), wide);
+        // Collapsing it again, and restoring all.
+        press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        assert_eq!(master_width(&state), narrow);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('M'),
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(master_width(&state), wide);
+    }
+
+    #[test]
+    fn the_masters_pty_is_resized_once_entering_and_once_leaving_the_all_collapsed_state() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-1", "worker-2"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        focus_stack_slot(&mut state, 3); // w3, the last open tile
+        let for_master = |cmds: &[Cmd]| {
+            resizes(cmds)
+                .into_iter()
+                .filter(|(key, _, _)| key.as_str() == "dir")
+                .count()
+        };
+
+        // Entering: collapsing the last open tile.
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        assert_eq!(for_master(&cmds), 1, "{cmds:?}");
+        assert!(
+            resizes(&cmds)
+                .iter()
+                .all(|(key, _, _)| key.as_str() == "dir"),
+            "strips are never resized: {cmds:?}"
+        );
+        let content = pane_content(tile_of(&state, "dir"));
+        assert_eq!(
+            resizes(&cmds)[0].1..=resizes(&cmds)[0].2,
+            content.height..=content.width
+        );
+
+        // A tick changes nothing.
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert!(resizes(&cmds).is_empty());
+
+        // Leaving: opening a tile.
+        let cmds = press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        assert_eq!(for_master(&cmds), 1, "{cmds:?}");
+    }
+
+    #[test]
+    fn dragging_the_master_stack_boundary_sets_the_preference_of_the_state_it_is_in() {
+        // All collapsed: the collapsed stack width, and only that.
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(3);
+        let boundary = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &boundary).position;
+        // (4 columns wider: the ordinary stack is 42, and the strips never get
+        // more than that.)
+        drag_to(&mut state, &mut app, &brigade, &boundary, start - 4, now);
+        release_at(&mut state, &mut app, &brigade, &boundary, start - 4, now);
+        let layout = layout_of(&state);
+        assert_eq!(
+            layout.collapsed_stack_width,
+            DEFAULT_COLLAPSED_STACK_WIDTH + 4
+        );
+        assert_eq!(
+            layout.master_permille, DEFAULT_MASTER_PERMILLE,
+            "the share is not touched"
+        );
+        assert_eq!(
+            tile_of(&state, "w1").width,
+            DEFAULT_COLLAPSED_STACK_WIDTH + 4
+        );
+
+        // Opening a tile: the ordinary share applies, and dragging sets it.
+        press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        let share_before = layout_of(&state).master_permille;
+        assert_eq!(share_before, DEFAULT_MASTER_PERMILLE);
+        let start = handle_of(&state, &boundary).position;
+        // (To the left, so the ordinary stack gets wider than the collapsed
+        // width and the dragged collapsed width is not capped when it comes
+        // back below.)
+        drag_to(&mut state, &mut app, &brigade, &boundary, start - 8, now);
+        release_at(&mut state, &mut app, &brigade, &boundary, start - 8, now);
+        let layout = layout_of(&state);
+        assert_ne!(layout.master_permille, DEFAULT_MASTER_PERMILLE);
+        assert_eq!(
+            layout.collapsed_stack_width,
+            DEFAULT_COLLAPSED_STACK_WIDTH + 4,
+            "the collapsed width is not touched"
+        );
+
+        // Collapsing again brings back the dragged collapsed width.
+        press_button(
+            &mut state,
+            &mut app,
+            &brigade,
+            "w1",
+            ButtonKind::Minimize,
+            now,
+        );
+        assert_eq!(
+            tile_of(&state, "w2").width,
+            DEFAULT_COLLAPSED_STACK_WIDTH + 4
+        );
+    }
+
+    #[test]
+    fn the_collapsed_width_drag_is_clamped_and_the_preference_survives_a_roomier_terminal() {
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(2);
+        let boundary = Boundary::Master { brigade: 1 };
+        // Far to the right: the stack would be narrower than its minimum.
+        drag_to(&mut state, &mut app, &brigade, &boundary, 119, now);
+        release_at(&mut state, &mut app, &brigade, &boundary, 119, now);
+        assert_eq!(tile_of(&state, "w1").width, MIN_STACK_WIDTH);
+        // Far to the left: the master would be narrower than the ordinary
+        // split's (42 of 84), which is as far as it may go.
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(2);
+        drag_to(&mut state, &mut app, &brigade, &boundary, 0, now);
+        release_at(&mut state, &mut app, &brigade, &boundary, 0, now);
+        assert_eq!(master_width(&state), 42);
+    }
+
+    #[test]
+    fn a_held_master_stack_drag_ends_when_a_pane_flips_the_state_under_it() {
+        // All collapsed, drag held; an open Worker arrives.
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(2);
+        let boundary = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &boundary).position;
+        drag_to(&mut state, &mut app, &brigade, &boundary, start - 6, now);
+        assert!(state.drag.is_some());
+        open_worker(
+            &mut state,
+            1,
+            "worker-3",
+            std::path::Path::new("/work"),
+            "",
+            None,
+            AgentKind::ClaudeCode,
+        );
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: SessionKey::new_worker(1, "worker-3"),
+            },
+            now,
+        );
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        assert!(
+            state.drag.is_none(),
+            "the same boundary now means another preference"
+        );
+        release_at(&mut state, &mut app, &brigade, &boundary, start - 6, now);
+        let layout = layout_of(&state);
+        assert_eq!(layout.collapsed_stack_width, DEFAULT_COLLAPSED_STACK_WIDTH);
+        assert_eq!(
+            layout.master_permille, DEFAULT_MASTER_PERMILLE,
+            "nothing was committed"
+        );
+
+        // The other way: one open tile, drag held, that tile's pane exits.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-1", "worker-2"], None);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        let start = handle_of(&state, &boundary).position;
+        drag_to(&mut state, &mut app, &brigade, &boundary, start + 6, now);
+        assert!(state.drag.is_some());
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("w3"),
+                reason: None,
+            },
+            now,
+        );
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+        assert!(state.drag.is_none());
+        assert_eq!(layout_of(&state).master_permille, DEFAULT_MASTER_PERMILLE);
+    }
+
+    #[test]
+    fn a_press_in_the_empty_space_under_the_strips_does_nothing() {
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(2);
+        for name in ["dir", "w1", "w2"] {
+            state
+                .screens
+                .get_mut(&key_of(name))
+                .unwrap()
+                .process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        focus_stack_slot(&mut state, 0);
+        state.focus = Focus::Sidebar;
+        let before = (state.focus, focused_name(&state));
+        let strip = tile_of(&state, "w2");
+        let (column, row) = (strip.x + 5, strip.y + strip.height + 4);
+        assert!(
+            state
+                .geometry(DRAG_AREA)
+                .tiles
+                .iter()
+                .all(|(_, t)| !t.contains(ratatui_core::layout::Position::new(column, row)))
+        );
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Moved,
+        ] {
+            let cmds = mouse_event(&mut state, &mut app, &brigade, kind, column, row, now);
+            assert!(cmds.is_empty(), "{kind:?}: {cmds:?}");
+        }
+        assert_eq!(
+            (state.focus, focused_name(&state)),
+            before,
+            "no focus change"
+        );
+        assert!(state.drag.is_none() && state.move_drag.is_none());
+    }
+
+    #[test]
+    fn a_tiny_terminal_never_panics_with_every_tile_collapsed() {
+        for (width, height) in [
+            (0u16, 0u16),
+            (1, 1),
+            (10, 5),
+            (36, 8),
+            (40, 6),
+            (60, 12),
+            (120, 7),
+        ] {
+            let (mut state, mut app, brigade, now) = all_collapsed_fixture(4);
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Resized { width, height },
+                now,
+            );
+            let area = Rect::new(0, 0, width, height);
+            let handles: Vec<Handle> = state.geometry(area).handles().to_vec();
+            for handle in handles {
+                let column = handle.hits()[0].x;
+                let row = handle.hits()[0].y;
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Drag(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    mouse_event(&mut state, &mut app, &brigade, kind, column, row, now);
+                }
+            }
+            let _ = state.drag_overlay(area);
+        }
+    }
+
+    // --- soloing the master -------------------------------------------------------
+
+    fn master_button_count(state: &EmporiumState) -> usize {
+        state
+            .geometry(DRAG_AREA)
+            .buttons()
+            .iter()
+            .filter(|b| b.key.as_str() == "dir")
+            .count()
+    }
+
+    #[test]
+    fn the_master_can_be_the_soloed_tile_and_that_collapses_every_stack_tile() {
+        let cases: [(&[&str], Option<&str>, &[&str]); 5] = [
+            (&[], Some("director"), &["w1", "w2", "w3"]),
+            // The flags are not consulted while a solo is active.
+            (&["worker-2"], Some("director"), &["w1", "w2", "w3"]),
+            // The solo moves from the master to a stack tile and back.
+            (&[], Some("worker-2"), &["w1", "w3"]),
+            (&["worker-1"], Some("director"), &["w1", "w2", "w3"]),
+            // Off: each tile is back on its own flag.
+            (&["worker-1"], None, &["w1"]),
+        ];
+        for (minimized, solo, expected) in cases {
+            let (mut state, _, _, _) = drag_fixture(3);
+            set_collapse(&mut state, minimized, solo);
+            assert_eq!(collapsed_names(&state), expected, "{minimized:?} {solo:?}");
+        }
+        let (mut state, _, _, _) = drag_fixture(3);
+        set_collapse(&mut state, &[], Some("director"));
+        assert_eq!(state.soloed_key(), Some(&key_of("dir")));
+    }
+
+    #[test]
+    fn soloing_the_master_reaches_the_all_collapsed_column_and_leaving_it_returns() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let wide = master_width(&state);
+        press_button(&mut state, &mut app, &brigade, "dir", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        let geometry = state.geometry(DRAG_AREA);
+        assert!(geometry.all_collapsed);
+        assert_eq!(
+            geometry.tiles[1].1.width, DEFAULT_COLLAPSED_STACK_WIDTH,
+            "the existing rule, nothing new"
+        );
+        assert!(master_width(&state) > wide);
+
+        // Moving the solo master -> a strip -> the master again.
+        press_button(&mut state, &mut app, &brigade, "w2", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-2"));
+        assert_eq!(collapsed_names(&state), ["w1", "w3"]);
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        press_button(&mut state, &mut app, &brigade, "dir", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        assert!(state.geometry(DRAG_AREA).all_collapsed);
+
+        // Off from the master's own button: the ordinary layout is back.
+        press_button(&mut state, &mut app, &brigade, "dir", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member, None);
+        assert!(!state.geometry(DRAG_AREA).all_collapsed);
+        assert_eq!(master_width(&state), wide);
+        assert!(layout_of(&state).minimized.is_empty(), "never touched");
+    }
+
+    #[test]
+    fn the_master_has_a_solo_button_only_where_it_has_something_to_solo_against() {
+        // A brigade with a stack, the master's member known.
+        let (state, _, _, _) = drag_fixture(2);
+        assert_eq!(master_button_count(&state), 1);
+        let button = state
+            .geometry(DRAG_AREA)
+            .buttons()
+            .iter()
+            .find(|b| b.key.as_str() == "dir")
+            .cloned()
+            .unwrap();
+        assert_eq!(button.kind, ButtonKind::Solo);
+        assert_eq!(button.text, "[S]");
+        let master = tile_of(&state, "dir");
+        let right = master.x + master.width - 1;
+        assert_eq!(
+            button.rect,
+            Rect::new(right - 3, master.y, 3, 1),
+            "ending before the corner"
+        );
+
+        // One pane: nothing to collapse.
+        let (state, _, _, _) = drag_fixture(0);
+        assert_eq!(master_button_count(&state), 0);
+        // A single-session stage.
+        let (mut state, _, _, _) = drag_fixture(2);
+        state.stage = Stage::Solo(key_of("dir"));
+        assert_eq!(master_button_count(&state), 0);
+        // A master with no member token.
+        let (mut state, _, _, _) = drag_fixture(2);
+        state.member_tokens.remove(&key_of("dir"));
+        assert_eq!(master_button_count(&state), 0);
+    }
+
+    #[test]
+    fn the_master_button_needs_room_for_the_label_a_gap_and_itself() {
+        // " director " is 10 cells; the button needs 10 + 1 + 3 inner columns.
+        let mut seen = (false, false);
+        for width in 40..130u16 {
+            let (mut state, mut app, brigade, now) = drag_fixture(2);
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Resized { width, height: 40 },
+                now,
+            );
+            let area = Rect::new(0, 0, width, 40);
+            let master = state.geometry(area).tiles[0].1;
+            let has = state
+                .geometry(area)
+                .buttons()
+                .iter()
+                .any(|b| b.key.as_str() == "dir");
+            assert_eq!(
+                has,
+                master.width - 2 >= 10 + 1 + 3,
+                "master {} wide",
+                master.width
+            );
+            if has {
+                seen.0 = true;
+            } else {
+                seen.1 = true;
+            }
+        }
+        assert!(seen.0 && seen.1, "the sweep crosses the threshold");
+    }
+
+    #[test]
+    fn the_masters_title_row_has_no_handle_and_its_label_still_starts_no_move() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let master = tile_of(&state, "dir");
+        let right = master.x + master.width - 1;
+        let geometry = state.geometry(DRAG_AREA);
+        // Nothing along the master's title row between its corners is a
+        // handle (the corners are the vertical boundaries' own).
+        for x in master.x + 1..right {
+            assert!(geometry.handle_at(x, master.y).is_none(), "column {x}");
+        }
+        // The label cells are not a move handle either (master label).
+        let (column, row) = (master.x + 2, master.y);
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            now,
+        );
+        assert!(state.move_drag.is_none() && state.drag.is_none());
+        assert_eq!(focused_name(&state).as_deref(), Some("dir"));
+    }
+
+    #[test]
+    fn the_masters_solo_button_acts_at_once_cancels_a_held_gesture_and_forwards_nothing() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        for name in ["dir", "w1", "w2", "w3"] {
+            state
+                .screens
+                .get_mut(&key_of(name))
+                .unwrap()
+                .process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        focus_stack_slot(&mut state, 2); // a stack tile has focus
+
+        let cmds = press_button(&mut state, &mut app, &brigade, "dir", ButtonKind::Solo, now);
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(state.drag.is_none() && state.move_drag.is_none());
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        assert_eq!(collapsed_names(&state), ["w1", "w2", "w3"]);
+        // The focused tile was just collapsed: focus goes to the tile acted
+        // on, the master.
+        assert_eq!(focused_name(&state).as_deref(), Some("dir"));
+        assert_eq!(state.focus, Focus::Pane);
+
+        // Like any solo operation it ends a held gesture.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        press_label(&mut state, &mut app, &brigade, "w2", now);
+        assert!(state.move_drag.is_some());
+        toggle_solo(&mut state, &key_of("dir"));
+        assert!(state.move_drag.is_none());
+        let _ = (&mut app, &brigade, now);
+    }
+
+    #[test]
+    fn prefix_z_on_the_master_toggles_the_masters_solo_and_on_a_stack_tile_moves_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 0);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        assert_eq!(collapsed_names(&state), ["w1", "w2", "w3"]);
+        assert_eq!(
+            focused_name(&state).as_deref(),
+            Some("dir"),
+            "the master stays focused"
+        );
+
+        // Solo a strip from the key: it needs focus, and a strip cannot have
+        // it; the strip's own [S] moves the solo there.
+        press_button(&mut state, &mut app, &brigade, "w1", ButtonKind::Solo, now);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-1"));
+        focus_stack_slot(&mut state, 0);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(
+            layout_of(&state).solo_member.as_deref(),
+            Some("director"),
+            "moved back"
+        );
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member, None);
+    }
+
+    #[test]
+    fn opening_a_strip_during_a_master_solo_ends_the_solo_and_leaves_the_rest_on_their_flags() {
+        for open in ["button", "number"] {
+            let (mut state, mut app, brigade, now) = drag_fixture(3);
+            set_collapse(&mut state, &["worker-3"], Some("director"));
+            assert_eq!(collapsed_names(&state), ["w1", "w2", "w3"]);
+
+            if open == "button" {
+                press_button(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    "w2",
+                    ButtonKind::Minimize,
+                    now,
+                );
+            } else {
+                prefix_key(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    KeyCode::Char('3'),
+                    Modifiers::NONE,
+                    now,
+                );
+            }
+
+            assert_eq!(layout_of(&state).solo_member, None, "{open}");
+            // w2 is open; w1 has no flag of its own, w3 has.
+            assert_eq!(collapsed_names(&state), ["w3"], "{open}");
+            assert_eq!(
+                layout_of(&state).minimized,
+                token_set(&["worker-3"]),
+                "{open}"
+            );
+            if open == "number" {
+                assert_eq!(focused_name(&state).as_deref(), Some("w2"));
+            }
+        }
+    }
+
+    #[test]
+    fn soloing_the_master_from_the_sidebar_in_a_narrow_pane_area_keeps_its_button() {
+        // The reviewer's case: a 32-column pane area (68 columns in all), the
+        // ordinary master 16 wide, room for " director " + a gap + [S].
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 68,
+                height: 40,
+            },
+            now,
+        );
+        let area = Rect::new(0, 0, 68, 40);
+        assert_eq!(state.geometry(area).areas.pane.width, 32);
+        let master_button = |state: &EmporiumState| {
+            state
+                .geometry(area)
+                .buttons()
+                .iter()
+                .find(|b| b.key.as_str() == "dir")
+                .cloned()
+        };
+        let before = master_button(&state).expect("the button fits in the ordinary split");
+        state.focus = Focus::Sidebar;
+        let press = |state: &mut EmporiumState, app: &mut App, button: &TileButton| {
+            mouse_event(
+                state,
+                app,
+                &brigade,
+                MouseEventKind::Down(MouseButton::Left),
+                button.rect.x + 1,
+                button.rect.y,
+                now,
+            );
+        };
+
+        press(&mut state, &mut app, &before);
+
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        assert!(state.geometry(area).all_collapsed);
+        assert_eq!(
+            state.focus,
+            Focus::Sidebar,
+            "a button press does not move focus"
+        );
+        let after = master_button(&state).expect("the button that was just clicked is still there");
+        assert!(state.geometry(area).tiles[0].1.width >= 16);
+        // A second press on it turns the solo off again.
+        press(&mut state, &mut app, &after);
+        assert_eq!(layout_of(&state).solo_member, None);
+        assert!(!state.geometry(area).all_collapsed);
+        assert!(master_button(&state).is_some());
+        // And prefix z from the sidebar is still not how you get out of it
+        // (it is refused there), which is why the button has to stay.
+        let again = master_button(&state).unwrap();
+        press(&mut state, &mut app, &again);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("prefix: focus a tile to solo it")
+        );
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+    }
+
+    #[test]
+    fn a_stack_member_dismissed_during_a_master_solo_keeps_the_solo() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-2"], Some("director"));
+        state.pending_dismiss = Some(key_of("w2"));
+        state.pending_dismiss_member = Some((1, "worker-2".to_string()));
+
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+
+        let layout = layout_of(&state);
+        assert_eq!(layout.solo_member.as_deref(), Some("director"));
+        assert!(
+            layout.minimized.is_empty(),
+            "the dismissed member's flag went"
+        );
+        assert_eq!(collapsed_names(&state), ["w1", "w3"]);
+    }
+
+    #[test]
+    fn the_soloed_masters_pane_exiting_leaves_the_solo_inactive_and_returning_revives_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-3"], Some("director"));
+        assert_eq!(collapsed_names(&state), ["w1", "w2", "w3"]);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("dir"),
+                reason: None,
+            },
+            now,
+        );
+
+        // The preference stays; w1 now holds the master position and the
+        // stack is back on its own flags.
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        assert_eq!(state.soloed_key(), None);
+        assert_eq!(collapsed_names(&state), ["w3"]);
+
+        // The Director's pane returns to the master position.
+        let again = key_of("dir");
+        state.screens.insert(again.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(again.clone(), DIRECTOR_TOKEN.to_string());
+        if let Stage::Brigade { panes, .. } = &mut state.stage {
+            panes.insert(0, again.clone());
+        }
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+        assert_eq!(state.soloed_key(), Some(&again));
+        assert_eq!(collapsed_names(&state), ["w1", "w2", "w3"]);
+    }
+
+    #[test]
+    fn a_master_solo_is_forgotten_with_its_member_and_on_disband() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        set_collapse(&mut state, &[], Some("director"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+        assert!(!state.brigade_layouts.contains_key(&1));
+    }
+
+    #[test]
+    fn the_keys_m_z_and_capital_m_refuse_with_a_reason_where_they_make_no_sense() {
+        // The sidebar.
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        state.focus = Focus::Sidebar;
+        for (key, mods, expected) in [
+            ('m', Modifiers::NONE, "prefix: focus a tile to collapse it"),
+            ('z', Modifiers::NONE, "prefix: focus a tile to solo it"),
+        ] {
+            prefix_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char(key),
+                mods,
+                now,
+            );
+            assert_eq!(state.status.as_deref(), Some(expected));
+        }
+        // The master.
+        focus_stack_slot(&mut state, 0);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("prefix: the master tile can't be collapsed")
+        );
+        // The master takes a solo (and turns it off again): it has a member.
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("director"));
+        assert!(layout_of(&state).minimized.is_empty());
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member, None);
+
+        // A master with no member token has nothing to key a solo by.
+        state.member_tokens.remove(&key_of("dir"));
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(
+            state.status.as_deref(),
+            Some("prefix: this tile has no member to solo")
+        );
+        assert_eq!(layout_of(&state).solo_member, None);
+
+        // A solo (single-session) stage.
+        let (mut state, mut app, brigade, now) = drag_fixture(0);
+        state.stage = Stage::Solo(key_of("dir"));
+        for key in ['m', 'z'] {
+            prefix_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char(key),
+                Modifiers::NONE,
+                now,
+            );
+            assert!(state.status.is_some(), "{key}");
+        }
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('M'),
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(state.status.as_deref(), Some("prefix: no stack to restore"));
+    }
+
+    #[test]
+    fn the_keys_m_and_z_work_on_the_focused_stack_tile_and_capital_m_with_or_without_shift() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        focus_stack_slot(&mut state, 3);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('z'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-3"));
+        assert_eq!(collapsed_names(&state), ["w1", "w2"]);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('m'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(layout_of(&state).minimized, token_set(&["worker-3"]));
+        assert_eq!(layout_of(&state).solo_member, None);
+        for mods in [Modifiers::NONE, Modifiers::SHIFT] {
+            set_collapse(&mut state, &["worker-1"], Some("worker-2"));
+            prefix_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char('M'),
+                mods,
+                now,
+            );
+            assert!(layout_of(&state).minimized.is_empty());
+            assert_eq!(layout_of(&state).solo_member, None);
+        }
+    }
+
+    #[test]
+    fn dismissal_forgets_collapse_and_solo_and_disband_forgets_everything() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-3", "worker-1"], Some("worker-3"));
+        // A foreign brigade's result does nothing.
+        state.pending_dismiss = Some(key_of("w3"));
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+        update(&mut state, &mut app, &brigade, dismissed(2), now);
+        assert_eq!(layout_of(&state).solo_member.as_deref(), Some("worker-3"));
+
+        // (A result for any brigade spends `pending_dismiss`; ask again.)
+        state.pending_dismiss = Some(key_of("w3"));
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+        assert_eq!(layout_of(&state).minimized, token_set(&["worker-1"]));
+        assert_eq!(layout_of(&state).solo_member, None);
+
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+        assert!(!state.brigade_layouts.contains_key(&1));
+    }
+
+    #[test]
+    fn a_pane_exit_and_a_restage_keep_the_collapse_preferences() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        set_collapse(&mut state, &["worker-2"], Some("worker-1"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("w2"),
+                reason: None,
+            },
+            now,
+        );
+        state.stage = Stage::Solo(key_of("elsewhere"));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick { relay: vec![] },
+            now,
+        );
+
+        let layout = layout_of(&state);
+        assert_eq!(layout.minimized, token_set(&["worker-2"]));
+        assert_eq!(layout.solo_member.as_deref(), Some("worker-1"));
+    }
+
+    // --- what a member was last told and last said ------------------------------
+
+    fn glance(at_ms: i64, line: &str) -> MessageGlance {
+        MessageGlance {
+            created_at_ms: at_ms,
+            line: line.to_string(),
+        }
+    }
+
+    fn observe(
+        name: &str,
+        token: &str,
+        agent: Option<AgentKind>,
+        glance: Option<MemberGlance>,
+    ) -> RelayObservation {
+        RelayObservation {
+            brigade_id: 1,
+            token: token.to_string(),
+            key: key_of(name),
+            has_unseen: false,
+            is_idle_this_tick: None,
+            agent,
+            glance,
+        }
+    }
+
+    fn tick_with(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        relay: Vec<RelayObservation>,
+        now: Instant,
+    ) {
+        update(state, app, brigade, Event::Tick { relay }, now);
+    }
+
+    #[test]
+    fn a_relay_observation_fills_the_members_facts_and_the_tile_reads_them() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        assert_eq!(
+            state.member_facts(&key_of("w1")),
+            None,
+            "nothing observed yet"
+        );
+
+        tick_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![observe(
+                "w1",
+                "worker-1",
+                Some(AgentKind::Codex),
+                Some(MemberGlance {
+                    inbound: Some(glance(1_000, "run the tests")),
+                    sent: Some(glance(2_000, "done")),
+                }),
+            )],
+            now,
+        );
+
+        let facts = state.member_facts(&key_of("w1")).expect("observed");
+        assert_eq!(facts.agent, Some(AgentKind::Codex));
+        assert_eq!(facts.inbound, Some(glance(1_000, "run the tests")));
+        assert_eq!(facts.sent, Some(glance(2_000, "done")));
+        // Another member is not touched.
+        assert_eq!(state.member_facts(&key_of("w2")), None);
+    }
+
+    #[test]
+    fn no_glance_keeps_what_the_core_has_and_an_empty_one_clears_it() {
+        let (mut state, mut app, brigade, now) = drag_fixture(1);
+        let full = MemberGlance {
+            inbound: Some(glance(1, "in")),
+            sent: Some(glance(2, "out")),
+        };
+        tick_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![observe(
+                "w1",
+                "worker-1",
+                Some(AgentKind::ClaudeCode),
+                Some(full),
+            )],
+            now,
+        );
+
+        // A tick the shell skipped the reads on, and one where the agent could
+        // not be resolved: both leave the facts alone.
+        tick_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![observe("w1", "worker-1", None, None)],
+            now,
+        );
+        let facts = state.member_facts(&key_of("w1")).unwrap();
+        assert_eq!(facts.agent, Some(AgentKind::ClaudeCode));
+        assert_eq!(facts.inbound, Some(glance(1, "in")));
+        assert_eq!(facts.sent, Some(glance(2, "out")));
+
+        // A real, empty answer is "this member has no mail".
+        tick_with(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![observe(
+                "w1",
+                "worker-1",
+                None,
+                Some(MemberGlance::default()),
+            )],
+            now,
+        );
+        let facts = state.member_facts(&key_of("w1")).unwrap();
+        assert_eq!(facts.inbound, None);
+        assert_eq!(facts.sent, None);
+    }
+
+    #[test]
+    fn facts_are_forgotten_on_dismissal_and_disband_but_not_on_exit_or_restage() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let observed = |state: &mut EmporiumState, app: &mut App| {
+            for (name, token) in [("w1", "worker-1"), ("w2", "worker-2")] {
+                tick_with(
+                    state,
+                    app,
+                    &brigade,
+                    vec![observe(
+                        name,
+                        token,
+                        Some(AgentKind::ClaudeCode),
+                        Some(MemberGlance {
+                            inbound: Some(glance(5, "in")),
+                            sent: None,
+                        }),
+                    )],
+                    now,
+                );
+            }
+        };
+        observed(&mut state, &mut app);
+
+        // A pane exiting and the brigade going off-stage keep them.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("w1"),
+                reason: None,
+            },
+            now,
+        );
+        assert!(
+            state
+                .member_facts
+                .contains_key(&(1, "worker-1".to_string()))
+        );
+        assert!(
+            state
+                .member_facts
+                .contains_key(&(1, "worker-2".to_string()))
+        );
+
+        // Dismissal forgets that member only (and only for its own brigade).
+        state.pending_dismiss = Some(key_of("w2"));
+        state.pending_dismiss_member = Some((1, "worker-2".to_string()));
+        update(&mut state, &mut app, &brigade, dismissed(2), now);
+        assert!(
+            state
+                .member_facts
+                .contains_key(&(1, "worker-2".to_string())),
+            "foreign result"
+        );
+        state.pending_dismiss = Some(key_of("w2"));
+        update(&mut state, &mut app, &brigade, dismissed(1), now);
+        assert!(
+            !state
+                .member_facts
+                .contains_key(&(1, "worker-2".to_string()))
+        );
+        assert!(
+            state
+                .member_facts
+                .contains_key(&(1, "worker-1".to_string()))
+        );
+
+        // Disband forgets the brigade's.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id: 1,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        );
+        assert!(state.member_facts.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_observation_round_trips_with_its_glance_and_old_streams_still_parse() {
+        let with = observe(
+            "w1",
+            "worker-1",
+            Some(AgentKind::Codex),
+            Some(MemberGlance {
+                inbound: Some(glance(7, "first line")),
+                sent: None,
+            }),
+        );
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayObservation>(&json).unwrap(),
+            with
+        );
+
+        // A stream recorded before the field existed has no `glance`.
+        let old = r#"{"brigade_id":1,"token":"worker-1","key":"w1","has_unseen":false,"is_idle_this_tick":null}"#;
+        let parsed: RelayObservation = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.glance, None);
+        assert_eq!(parsed.agent, None);
     }
 
     #[test]
@@ -14513,6 +17121,7 @@ mod tests {
         let mut now = test_instant();
 
         let observation = || RelayObservation {
+            glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
             key: worker.clone(),
@@ -16343,7 +18952,7 @@ mod tests {
             &mut app,
             &brigade,
             Event::Input(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char('z'),
+                KeyCode::Char('y'),
                 Modifiers::NONE,
             ))),
             now,
@@ -17565,32 +20174,41 @@ mod tests {
     fn cycle_forward_wraps_through_sidebar_director_and_workers() {
         let pane_count = 3; // director + 2 workers
         assert_eq!(
-            cycle_forward(FocusSlot::Sidebar, pane_count),
+            cycle_forward(FocusSlot::Sidebar, pane_count, &[]),
             FocusSlot::Pane(0)
         );
         assert_eq!(
-            cycle_forward(FocusSlot::Pane(0), pane_count),
+            cycle_forward(FocusSlot::Pane(0), pane_count, &[]),
             FocusSlot::Pane(1)
         );
         assert_eq!(
-            cycle_forward(FocusSlot::Pane(1), pane_count),
+            cycle_forward(FocusSlot::Pane(1), pane_count, &[]),
             FocusSlot::Pane(2)
         );
         assert_eq!(
-            cycle_forward(FocusSlot::Pane(2), pane_count),
+            cycle_forward(FocusSlot::Pane(2), pane_count, &[]),
             FocusSlot::Sidebar
         );
     }
 
     #[test]
     fn cycle_forward_on_a_solo_stage_toggles_between_sidebar_and_the_pane() {
-        assert_eq!(cycle_forward(FocusSlot::Sidebar, 1), FocusSlot::Pane(0));
-        assert_eq!(cycle_forward(FocusSlot::Pane(0), 1), FocusSlot::Sidebar);
+        assert_eq!(
+            cycle_forward(FocusSlot::Sidebar, 1, &[]),
+            FocusSlot::Pane(0)
+        );
+        assert_eq!(
+            cycle_forward(FocusSlot::Pane(0), 1, &[]),
+            FocusSlot::Sidebar
+        );
     }
 
     #[test]
     fn cycle_forward_on_an_empty_stage_is_a_noop() {
-        assert_eq!(cycle_forward(FocusSlot::Sidebar, 0), FocusSlot::Sidebar);
+        assert_eq!(
+            cycle_forward(FocusSlot::Sidebar, 0, &[]),
+            FocusSlot::Sidebar
+        );
     }
 
     #[test]
@@ -17685,7 +20303,7 @@ mod tests {
 
         for (from, direction, pane_count, expected) in cases {
             assert_eq!(
-                arrow_target(from, direction, pane_count),
+                arrow_target(from, direction, pane_count, &[]),
                 expected,
                 "from {from:?}, {direction:?}, pane_count {pane_count}"
             );

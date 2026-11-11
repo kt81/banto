@@ -496,6 +496,26 @@ pub struct BrigadeMessage {
     pub to_member: Option<MemberToken>,
 }
 
+/// A brigade message reduced to what a collapsed tile shows: when it was
+/// queued and the first line of its body (see
+/// `banto_io::store::glance_line` for the reduction). Message text in a plain
+/// data struct, so it travels in an `Event` and shows up in a recorded
+/// stream (`BANTO_RECORD_EVENTS`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageGlance {
+    pub created_at_ms: i64,
+    pub line: String,
+}
+
+/// What a collapsed tile shows of a member's mail, as the shell read it from
+/// the store this tick: the newest message addressed to the member and the
+/// newest it sent (either may not exist).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberGlance {
+    pub inbound: Option<MessageGlance>,
+    pub sent: Option<MessageGlance>,
+}
+
 /// Why a hosted child process exited, as far as banto could tell — plain
 /// data, translated at the shell boundary from the PTY host's own richer
 /// exit status (`banto_io::pty::PtyIo::exited`, `Child::wait()`'s own

@@ -11,7 +11,7 @@
 //! rewritten because the terminal happens to be small, so widening the
 //! terminal again brings the preferred split back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui_core::layout::{Constraint, Layout, Rect};
 use unicode_width::UnicodeWidthStr;
@@ -43,6 +43,18 @@ pub const MIN_STACK_TILE_HEIGHT: u16 = 4;
 /// The master tile's default share of the pane area's width, in permille.
 pub const DEFAULT_MASTER_PERMILLE: u16 = 500;
 
+/// Rows a collapsed stack tile takes: its border, three content rows, its
+/// border.
+pub const COLLAPSED_TILE_HEIGHT: u16 = 5;
+
+/// The stack column's default width while every stack tile is collapsed, in
+/// columns. A width, not a share: a strip needs a fixed amount of room to be
+/// readable however wide the terminal is.
+pub const DEFAULT_COLLAPSED_STACK_WIDTH: u16 = 36;
+
+/// Width of one title-row button (`[S]`, `[_]`, `[+]`).
+const BUTTON_WIDTH: u16 = 3;
+
 /// Layout preferences for one brigade, kept per [`BrigadeId`] and keyed by
 /// member rather than by pane or position, so they survive the brigade going
 /// off-stage, a pane being re-keyed, and a member being relaunched.
@@ -50,6 +62,11 @@ pub const DEFAULT_MASTER_PERMILLE: u16 = 500;
 pub struct BrigadeLayout {
     /// The master tile's share of the pane area's width, in permille.
     pub master_permille: u16,
+    /// The stack column's width in columns while every stack tile is
+    /// collapsed (the master takes the rest); the ordinary share applies the
+    /// moment any tile is open. Its own preference, set by dragging the
+    /// master/stack boundary in that state.
+    pub collapsed_stack_width: u16,
     /// Relative heights of the stack's tiles, by member token.
     pub row_weights: HashMap<MemberToken, u16>,
     /// The operator's preferred order of the stack's tiles, top to bottom,
@@ -57,14 +74,25 @@ pub struct BrigadeLayout {
     /// what puts it back after something rebuilds `panes` (staging the
     /// brigade again, a Worker arriving). Empty until a tile has been moved.
     pub stack_order: Vec<MemberToken>,
+    /// The members the operator collapsed one by one.
+    pub minimized: HashSet<MemberToken>,
+    /// The member the operator soloed, if any: while that member is a staged
+    /// tile — the master or a stack tile — every stack tile but it is shown
+    /// collapsed, whatever `minimized` says. An overlay, never a rewrite, so
+    /// turning it off brings back exactly what was collapsed before. Named for the mixer's solo, not
+    /// `Stage::Solo` (a single session that is no brigade's).
+    pub solo_member: Option<MemberToken>,
 }
 
 impl Default for BrigadeLayout {
     fn default() -> Self {
         Self {
             master_permille: DEFAULT_MASTER_PERMILLE,
+            collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
             row_weights: HashMap::new(),
             stack_order: Vec::new(),
+            minimized: HashSet::new(),
+            solo_member: None,
         }
     }
 }
@@ -136,6 +164,35 @@ pub fn master_width(area_width: u16, permille: u16) -> u16 {
         share.clamp(1, area_width - 1)
     } else {
         share.min(area_width)
+    }
+}
+
+/// The master tile's width when the stack beside it is all strips and wants
+/// `stack_width` columns.
+///
+/// **Invariant: the result is never narrower than [`master_width`] at the same
+/// area width and `master_permille`** (the master of the ordinary split). The
+/// all-collapsed state exists to give the master room, so entering it can
+/// only widen the master or leave it alone: whatever fit on the master before
+/// (a title with its `[S]` button, say) still fits. To keep it, the stack's
+/// share is first capped at what the ordinary split leaves it
+/// (`area_width - master_width(..)`), then clamped like [`master_width`]: the
+/// stack keeps [`MIN_STACK_WIDTH`] and the master [`MIN_MASTER_WIDTH`] when
+/// both fit, one column each in a pane area too narrow for that. (Both clamps
+/// preserve the invariant: the ordinary split already respects them.) So the
+/// preference can make the strips narrower than the ordinary stack but never
+/// wider.
+pub fn master_width_beside_strips(area_width: u16, stack_width: u16, master_permille: u16) -> u16 {
+    let ordinary = master_width(area_width, master_permille);
+    let stack_width = stack_width.min(area_width - ordinary);
+    if area_width >= MIN_MASTER_WIDTH + MIN_STACK_WIDTH {
+        area_width - stack_width.clamp(MIN_STACK_WIDTH, area_width - MIN_MASTER_WIDTH)
+    } else if area_width >= 2 {
+        area_width
+            .saturating_sub(stack_width)
+            .clamp(1, area_width - 1)
+    } else {
+        area_width
     }
 }
 
@@ -239,14 +296,84 @@ pub fn stage_tiles(
     master_permille: u16,
     stack_weights: &[u16],
 ) -> Vec<(SessionKey, Rect)> {
+    place(
+        pane_area,
+        stage,
+        master_permille,
+        DEFAULT_COLLAPSED_STACK_WIDTH,
+        stack_weights,
+        &[],
+    )
+    .tiles
+}
+
+/// Where [`place`] put every tile, and how.
+struct Placement {
+    tiles: Vec<(SessionKey, Rect)>,
+    /// Per tile (`tiles` order, the master's entry always false): drawn as a
+    /// strip.
+    collapsed: Vec<bool>,
+    /// Every stack tile is collapsed (and there is at least one).
+    all_collapsed: bool,
+}
+
+/// [`stage_tiles`] with collapsed tiles (`collapsed`: one flag per stack tile,
+/// in `panes` order; a missing one counts as expanded).
+///
+/// The stack is always the right-hand column. A collapsed tile keeps its
+/// place in the order at [`COLLAPSED_TILE_HEIGHT`] rows; the expanded tiles
+/// share the rest by their weights (four rows at least). While *every* stack
+/// tile is collapsed the column narrows to `collapsed_stack_width` columns
+/// (the master taking the rest), the strips stack from the top, and the space
+/// below them is empty: there is nothing there to draw or to hit.
+///
+/// A column too short for its strips and the expanded tiles' minimums
+/// degrades to a plain proportional split of the rows it has — every tile
+/// shrinks, none is dropped — rather than panicking.
+fn place(
+    pane_area: Rect,
+    stage: &Stage,
+    master_permille: u16,
+    collapsed_stack_width: u16,
+    stack_weights: &[u16],
+    collapsed_in: &[bool],
+) -> Placement {
+    let single = |key: &SessionKey| Placement {
+        tiles: vec![(key.clone(), pane_area)],
+        collapsed: vec![false],
+        all_collapsed: false,
+    };
+    let nothing = || Placement {
+        tiles: Vec::new(),
+        collapsed: Vec::new(),
+        all_collapsed: false,
+    };
     match stage {
-        Stage::Empty => Vec::new(),
-        Stage::Solo(key) => vec![(key.clone(), pane_area)],
+        Stage::Empty => nothing(),
+        Stage::Solo(key) => single(key),
         Stage::Brigade { panes, .. } => match panes.split_first() {
-            None => Vec::new(),
-            Some((director, [])) => vec![(director.clone(), pane_area)],
+            None => nothing(),
+            Some((director, [])) => single(director),
             Some((director, workers)) => {
-                let master_w = master_width(pane_area.width, master_permille);
+                let n = workers.len();
+                let collapsed: Vec<bool> = (0..n)
+                    .map(|i| collapsed_in.get(i).copied().unwrap_or(false))
+                    .collect();
+                let weights: Vec<u16> = (0..n)
+                    .map(|i| stack_weights.get(i).copied().unwrap_or(1))
+                    .collect();
+                let all_collapsed = collapsed.iter().all(|c| *c);
+                let mut collapsed_flags = vec![false];
+                collapsed_flags.extend(&collapsed);
+                let master_w = if all_collapsed {
+                    master_width_beside_strips(
+                        pane_area.width,
+                        collapsed_stack_width,
+                        master_permille,
+                    )
+                } else {
+                    master_width(pane_area.width, master_permille)
+                };
                 let master = Rect {
                     width: master_w,
                     ..pane_area
@@ -256,17 +383,66 @@ pub fn stage_tiles(
                     width: pane_area.width - master_w,
                     ..pane_area
                 };
-                let weights: Vec<u16> = (0..workers.len())
-                    .map(|i| stack_weights.get(i).copied().unwrap_or(1))
-                    .collect();
-                let heights = stack_heights(stack.height, &weights, MIN_STACK_TILE_HEIGHT);
+                let collapsed_count = collapsed.iter().filter(|c| **c).count() as u16;
+                let expanded_count = n as u16 - collapsed_count;
+                let fixed = COLLAPSED_TILE_HEIGHT.saturating_mul(collapsed_count);
+                let fits = expanded_count > 0
+                    && stack.height >= fixed.saturating_add(MIN_STACK_TILE_HEIGHT * expanded_count);
+                let heights: Vec<u16> = if fits {
+                    // Collapsed tiles keep their fixed height; the expanded
+                    // ones share the rest by their weights.
+                    let shared: Vec<u16> = weights
+                        .iter()
+                        .zip(&collapsed)
+                        .filter(|(_, c)| !**c)
+                        .map(|(w, _)| *w)
+                        .collect();
+                    let mut shared =
+                        stack_heights(stack.height - fixed, &shared, MIN_STACK_TILE_HEIGHT)
+                            .into_iter();
+                    collapsed
+                        .iter()
+                        .map(|c| {
+                            if *c {
+                                COLLAPSED_TILE_HEIGHT
+                            } else {
+                                shared.next().unwrap_or(0)
+                            }
+                        })
+                        .collect()
+                } else if all_collapsed && stack.height >= fixed {
+                    // All strips and room for them: five rows each from the
+                    // top, the rest of the column left empty.
+                    vec![COLLAPSED_TILE_HEIGHT; n]
+                } else if collapsed_count == 0 {
+                    stack_heights(stack.height, &weights, MIN_STACK_TILE_HEIGHT)
+                } else {
+                    // Not enough room for the strips and the expanded tiles'
+                    // minimums (or for the strips alone): split what there
+                    // is in proportion to what each would like.
+                    let wanted: Vec<u16> = collapsed
+                        .iter()
+                        .map(|c| {
+                            if *c {
+                                COLLAPSED_TILE_HEIGHT
+                            } else {
+                                MIN_STACK_TILE_HEIGHT
+                            }
+                        })
+                        .collect();
+                    stack_heights(stack.height, &wanted, 1)
+                };
                 let mut tiles = vec![(director.clone(), master)];
                 let mut y = stack.y;
                 for (worker, height) in workers.iter().zip(heights) {
                     tiles.push((worker.clone(), Rect { y, height, ..stack }));
                     y += height;
                 }
-                tiles
+                Placement {
+                    tiles,
+                    collapsed: collapsed_flags,
+                    all_collapsed,
+                }
             }
         },
     }
@@ -354,6 +530,34 @@ pub struct Geometry {
     /// tiles — what a press picks a tile up by. Just the label: the rest of
     /// a title row is not assumed to be inert.
     labels: Vec<(SessionKey, Rect)>,
+    /// Per tile, in `tiles` order: drawn as a strip (the master never is).
+    pub collapsed: Vec<bool>,
+    /// Every stack tile is collapsed: the stack column is narrowed to the
+    /// collapsed stack width and the master takes the rest.
+    pub all_collapsed: bool,
+    /// The title-row buttons of every stack tile that has room for them.
+    buttons: Vec<TileButton>,
+}
+
+/// What a title-row button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// `[S]`: solo this tile.
+    Solo,
+    /// `[_]` on an expanded tile, `[+]` on a collapsed one: collapse or open
+    /// this tile.
+    Minimize,
+}
+
+/// One button in a stack tile's title row. The geometry owns its cells, like
+/// the handles and the label, so drawing and hit-testing cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileButton {
+    pub key: SessionKey,
+    pub kind: ButtonKind,
+    pub rect: Rect,
+    /// What is drawn there, ASCII: `[S]`, `[_]` or `[+]`.
+    pub text: &'static str,
 }
 
 impl Geometry {
@@ -371,6 +575,25 @@ impl Geometry {
             .find(|handle| handle.hits.iter().any(|hit| hit.contains(at)))
     }
 
+    /// Whether the tile of `key` is drawn as a strip.
+    pub fn is_collapsed(&self, key: &SessionKey) -> bool {
+        self.tiles
+            .iter()
+            .position(|(tile, _)| tile == key)
+            .is_some_and(|index| self.collapsed[index])
+    }
+
+    /// Every title-row button, in stack order.
+    pub fn buttons(&self) -> &[TileButton] {
+        &self.buttons
+    }
+
+    /// The button a press at (`column`, `row`) lands on.
+    pub fn button_at(&self, column: u16, row: u16) -> Option<&TileButton> {
+        let at = ratatui_core::layout::Position::new(column, row);
+        self.buttons.iter().find(|button| button.rect.contains(at))
+    }
+
     /// The stack tile whose title label a press at (`column`, `row`) lands on.
     pub fn label_at(&self, column: u16, row: u16) -> Option<&SessionKey> {
         let at = ratatui_core::layout::Position::new(column, row);
@@ -382,13 +605,13 @@ impl Geometry {
 
     /// The slot (an index into `tiles`, so into `panes`; always a stack tile)
     /// that a pointer on `row` is over while moving a tile: the tile the row
-    /// falls in, the first stack slot above the stack, the last below it.
+    /// falls in, the first stack slot above the stack, the last below it —
+    /// including the empty space under a column of strips, which is "below".
     /// `None` when there is no stack to drop into.
     pub fn drop_slot(&self, row: u16) -> Option<usize> {
         let stack = self.tiles.get(1..).filter(|stack| stack.len() >= 2)?;
         let last = stack.len();
-        let top = stack[0].1.y;
-        if row < top {
+        if row < stack[0].1.y {
             return Some(1);
         }
         let index = stack
@@ -473,22 +696,56 @@ pub fn title_columns(tile: Rect, label: &str) -> (u16, u16) {
     (start, start.saturating_add(width))
 }
 
+/// Everything the operator has chosen (and the collapsing in force) that the
+/// geometry depends on, resolved by the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutPrefs<'a> {
+    pub sidebar_width: u16,
+    pub master_permille: u16,
+    /// The stack column's width while every stack tile is collapsed.
+    pub collapsed_stack_width: u16,
+    /// One entry per stack tile of the staged brigade, in `panes` order (see
+    /// [`place`]).
+    pub stack_weights: &'a [u16],
+    /// One entry per stack tile, in `panes` order: shown collapsed.
+    pub stack_collapsed: &'a [bool],
+    /// The tile in the master position has a member to solo, so it gets a
+    /// `[S]` button. (The geometry knows keys, not members.)
+    pub master_soloable: bool,
+}
+
 /// Compute the whole geometry for `area`.
 ///
-/// `stack_weights` has one entry per stack tile of the staged brigade, in
-/// `panes` order (see [`stage_tiles`]). `label_of` is a tile's title label
-/// (the shell draws it with [`title_text`]); the stack row handle keeps off
-/// the lower tile's label, which is the tile's own to click.
+/// `label_of` is a tile's
+/// title label (the shell draws it with [`title_text`]); the stack row handle
+/// keeps off the lower tile's label and buttons, which are the tile's own.
 pub fn geometry(
     area: Rect,
     stage: &Stage,
-    sidebar_width: u16,
-    master_permille: u16,
-    stack_weights: &[u16],
+    prefs: &LayoutPrefs,
     label_of: &dyn Fn(&SessionKey) -> String,
 ) -> Geometry {
+    let LayoutPrefs {
+        sidebar_width,
+        master_permille,
+        collapsed_stack_width,
+        stack_weights,
+        stack_collapsed,
+        master_soloable,
+    } = *prefs;
     let areas = layout(area, sidebar_width);
-    let tiles = stage_tiles(areas.pane, stage, master_permille, stack_weights);
+    let Placement {
+        tiles,
+        collapsed,
+        all_collapsed,
+    } = place(
+        areas.pane,
+        stage,
+        master_permille,
+        collapsed_stack_width,
+        stack_weights,
+        stack_collapsed,
+    );
     let body_height = areas.pane.height;
     let mut handles = Vec::new();
 
@@ -516,6 +773,26 @@ pub fn geometry(
         });
     }
 
+    // Buttons first: the stack row handles keep off them. Every stack tile
+    // gets solo and collapse; the master gets solo alone (it cannot be
+    // collapsed), and only where there is a stack to collapse.
+    let mut buttons = Vec::new();
+    if matches!(stage, Stage::Brigade { .. }) && tiles.len() >= 2 {
+        for (index, (key, tile)) in tiles.iter().enumerate() {
+            let (_, label_end) = title_columns(*tile, &label_of(key));
+            if index == 0 {
+                if master_soloable {
+                    buttons.extend(buttons_for(key, *tile, label_end, false, false));
+                }
+            } else {
+                buttons.extend(buttons_for(key, *tile, label_end, collapsed[index], true));
+            }
+        }
+    }
+
+    // The master/stack boundary exists whatever is collapsed (what dragging
+    // it sets depends on whether the stack is all strips). The row boundaries
+    // below lie between expanded tiles, so an all-strips stack has none.
     if let Stage::Brigade { id, .. } = stage
         && tiles.len() >= 2
     {
@@ -529,8 +806,16 @@ pub fn geometry(
                 axis: Axis::Vertical,
                 hits: vec![Rect::new(stack_x - 1, pane.y, 2, pane.height)],
                 position: stack_x,
+                // While every tile is collapsed the master is never narrower
+                // than the ordinary split's (see `master_width_beside_strips`),
+                // so that is as far left as the boundary may be dragged.
                 min: if room {
-                    pane.x + MIN_MASTER_WIDTH
+                    pane.x
+                        + if all_collapsed {
+                            master_width(pane.width, master_permille).max(MIN_MASTER_WIDTH)
+                        } else {
+                            MIN_MASTER_WIDTH
+                        }
                 } else {
                     stack_x
                 },
@@ -543,30 +828,53 @@ pub fn geometry(
             });
         }
         // The stack's own horizontal boundaries come after every vertical
-        // one, so a vertical handle wins where they meet.
-        for pair in tiles[1..].windows(2) {
-            let (above_key, above) = (&pair[0].0, pair[0].1);
-            let (below_key, below) = (&pair[1].0, pair[1].1);
-            if above.width < 3 || below.y == 0 {
+        // one, so a vertical handle wins where they meet. A boundary lies
+        // between two *expanded* tiles that are neighbours once the collapsed
+        // ones are ignored; dragging it changes those two heights only.
+        let expanded: Vec<usize> = (1..tiles.len()).filter(|i| !collapsed[*i]).collect();
+        for pair in expanded.windows(2) {
+            let (above_key, above) = (&tiles[pair[0]].0, tiles[pair[0]].1);
+            let (below_key, below) = (&tiles[pair[1]].0, tiles[pair[1]].1);
+            if above.width < 3 || above.height == 0 || below.height == 0 {
                 continue;
             }
+            let position = above.y + above.height;
             let (min, max) = (
                 above.y + MIN_STACK_TILE_HEIGHT,
-                (below.y + below.height).saturating_sub(MIN_STACK_TILE_HEIGHT),
+                (position + below.height).saturating_sub(MIN_STACK_TILE_HEIGHT),
             );
-            // The gap the eye sees is two rows: the upper tile's bottom border
-            // and the lower tile's top border. Both are the handle, from the
-            // cell after the left corner (the master/stack handle's) through
-            // the right border column — the screen edge, where a pointer
-            // lands when the boundary is grabbed from the right. Except the
-            // lower row's label cells: those are the tile's own, the handle
-            // it is picked up by to be moved ([`Geometry::label_at`]).
-            let (_, label_end) = title_columns(below, &label_of(below_key));
-            let right = below.x + below.width;
-            let lower_start = label_end.max(below.x + 1);
-            let mut hits = vec![Rect::new(above.x + 1, below.y - 1, above.width - 1, 1)];
-            if lower_start < right {
-                hits.push(Rect::new(lower_start, below.y, right - lower_start, 1));
+            // The gap the eye sees between directly adjacent tiles is two
+            // rows: the upper tile's bottom border and the lower tile's top
+            // border. Both are the handle, from the cell after the left
+            // corner (the master/stack handle's) through the right border
+            // column — the screen edge, where a pointer lands when the
+            // boundary is grabbed from the right. Except the lower row's
+            // label cells (the tile's own: the handle it is picked up by to
+            // be moved, [`Geometry::label_at`]) and its buttons. With a
+            // collapsed tile in between there is only the upper row.
+            let mut hits = vec![Rect::new(above.x + 1, position - 1, above.width - 1, 1)];
+            if below.y == position {
+                let (_, label_end) = title_columns(below, &label_of(below_key));
+                let right = below.x + below.width;
+                let lower_start = label_end.max(below.x + 1);
+                let kept_off = buttons
+                    .iter()
+                    .filter(|button| button.key == *below_key)
+                    .map(|button| button.rect.x)
+                    .min();
+                // Up to the first button, and the right corner past the last.
+                let first_run_end = kept_off.unwrap_or(right);
+                if lower_start < first_run_end {
+                    hits.push(Rect::new(
+                        lower_start,
+                        below.y,
+                        first_run_end - lower_start,
+                        1,
+                    ));
+                }
+                if kept_off.is_some() {
+                    hits.push(Rect::new(right - 1, below.y, 1, 1));
+                }
             }
             handles.push(Handle {
                 boundary: Boundary::Stack {
@@ -576,7 +884,7 @@ pub fn geometry(
                 },
                 axis: Axis::Horizontal,
                 hits,
-                position: below.y,
+                position,
                 min,
                 max,
                 span: (above.x, above.x + above.width),
@@ -599,7 +907,45 @@ pub fn geometry(
         tiles,
         handles,
         labels,
+        collapsed,
+        all_collapsed,
+        buttons,
     }
+}
+
+/// The title-row buttons of a tile — solo and collapse for a stack tile, solo
+/// alone (`with_minimize` false) for the master — right-aligned and ending just
+/// before the right corner, when the row has room for the label, one gap cell
+/// and all of them; none otherwise (the keys still work).
+fn buttons_for(
+    key: &SessionKey,
+    tile: Rect,
+    label_end: u16,
+    collapsed: bool,
+    with_minimize: bool,
+) -> Vec<TileButton> {
+    let count = if with_minimize { 2 } else { 1 };
+    let inner = tile.width.saturating_sub(2);
+    let label_width = label_end.saturating_sub(tile.x.saturating_add(1));
+    if inner < label_width + 1 + count * BUTTON_WIDTH || tile.width < 2 {
+        return Vec::new();
+    }
+    let first = tile.x + tile.width - 1 - count * BUTTON_WIDTH;
+    let mut buttons = vec![TileButton {
+        key: key.clone(),
+        kind: ButtonKind::Solo,
+        rect: Rect::new(first, tile.y, BUTTON_WIDTH, 1),
+        text: "[S]",
+    }];
+    if with_minimize {
+        buttons.push(TileButton {
+            key: key.clone(),
+            kind: ButtonKind::Minimize,
+            rect: Rect::new(first + BUTTON_WIDTH, tile.y, BUTTON_WIDTH, 1),
+            text: if collapsed { "[+]" } else { "[_]" },
+        });
+    }
+    buttons
 }
 
 #[cfg(test)]
@@ -838,9 +1184,14 @@ mod tests {
         geometry(
             Rect::new(0, 0, width, height),
             &stage,
-            SIDEBAR_WIDTH,
-            DEFAULT_MASTER_PERMILLE,
-            &vec![1; panes.len().saturating_sub(1)],
+            &LayoutPrefs {
+                sidebar_width: SIDEBAR_WIDTH,
+                master_permille: DEFAULT_MASTER_PERMILLE,
+                collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
+                stack_weights: &vec![1; panes.len().saturating_sub(1)],
+                stack_collapsed: &[],
+                master_soloable: false,
+            },
             label_of,
         )
     }
@@ -931,6 +1282,13 @@ mod tests {
         let right = lower.x + lower.width - 1;
         // `label_width` cells after the left corner are the label's.
         let label_cells = lower.x + 1..lower.x + 1 + label_width;
+        // The two buttons, six cells ending before the right corner, when
+        // the row has room for the label, a gap and both.
+        let button_cells = if lower.width - 2 >= label_width + 1 + 6 {
+            right - 6..right
+        } else {
+            0..0
+        };
         for x in lower.x..=right {
             let expected_upper = if x == lower.x { "master" } else { "stack" };
             assert_eq!(
@@ -940,7 +1298,7 @@ mod tests {
             );
             let expected_lower = if x == lower.x {
                 "master"
-            } else if label_cells.contains(&x) {
+            } else if label_cells.contains(&x) || button_cells.contains(&x) {
                 "none"
             } else {
                 "stack"
@@ -961,6 +1319,608 @@ mod tests {
             "none",
             "past the tile"
         );
+    }
+
+    // --- collapsed tiles ------------------------------------------------------
+
+    fn geo_collapsed(width: u16, height: u16, panes: &[&str], collapsed: &[bool]) -> Geometry {
+        geo_collapsed_weighted(width, height, panes, collapsed, &vec![1; panes.len() - 1])
+    }
+
+    fn geo_collapsed_weighted(
+        width: u16,
+        height: u16,
+        panes: &[&str],
+        collapsed: &[bool],
+        weights: &[u16],
+    ) -> Geometry {
+        geometry(
+            Rect::new(0, 0, width, height),
+            &brigade_stage(panes),
+            &LayoutPrefs {
+                sidebar_width: SIDEBAR_WIDTH,
+                master_permille: DEFAULT_MASTER_PERMILLE,
+                collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
+                stack_weights: weights,
+                stack_collapsed: collapsed,
+                master_soloable: false,
+            },
+            &|key| key.as_str().to_string(),
+        )
+    }
+
+    fn heights(g: &Geometry) -> Vec<u16> {
+        g.tiles
+            .iter()
+            .skip(1)
+            .map(|(_, rect)| rect.height)
+            .collect()
+    }
+
+    #[test]
+    fn with_nothing_collapsed_the_geometry_is_what_it_was() {
+        for n in 1..=5 {
+            let mut panes = vec!["d"];
+            panes.extend(["w1", "w2", "w3", "w4", "w5"].iter().take(n));
+            let plain = geo(120, 40, &panes);
+            let flags = geo_collapsed(120, 40, &panes, &vec![false; n]);
+            assert_eq!(plain.tiles, flags.tiles, "{n} workers");
+            assert!(!flags.all_collapsed);
+            assert!(flags.collapsed.iter().all(|c| !c));
+        }
+    }
+
+    #[test]
+    fn a_collapsed_tile_keeps_its_place_at_five_rows_and_the_rest_share_what_is_left() {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[false, true, false]);
+        // 39 stack rows: 5 for the strip, 34 shared by two equal weights.
+        assert_eq!(heights(&g), vec![17, COLLAPSED_TILE_HEIGHT, 17]);
+        assert_eq!(g.collapsed, vec![false, false, true, false]);
+        assert!(g.is_collapsed(&key("w2")) && !g.is_collapsed(&key("w1")));
+        // In order, touching, filling the stack.
+        let mut y = g.tiles[1].1.y;
+        for (_, tile) in &g.tiles[1..] {
+            assert_eq!(tile.y, y);
+            y += tile.height;
+        }
+        assert_eq!(y, 39);
+        // The master is untouched.
+        assert_eq!(
+            g.tiles[0].1,
+            geo(120, 40, &["d", "w1", "w2", "w3"]).tiles[0].1
+        );
+    }
+
+    #[test]
+    fn expanded_tiles_share_the_remaining_rows_by_their_weights() {
+        let g = geo_collapsed_weighted(
+            120,
+            40,
+            &["d", "w1", "w2", "w3"],
+            &[false, true, false],
+            &[1, 50, 3],
+        );
+        // The collapsed tile's weight is nothing to anyone: 34 rows by 1:3.
+        assert_eq!(heights(&g), vec![9, COLLAPSED_TILE_HEIGHT, 25]);
+    }
+
+    #[test]
+    fn collapsed_tiles_degrade_without_panicking_when_there_is_no_room() {
+        for height in 0..=30u16 {
+            for collapsed in [
+                [false, true, false],
+                [true, true, false],
+                [true, true, true],
+                [false, false, true],
+            ] {
+                let g = geo_collapsed(120, height, &["d", "w1", "w2", "w3"], &collapsed);
+                // Whatever the room, no tile leaves the pane area.
+                let pane = g.areas.pane;
+                for (key, tile) in &g.tiles {
+                    assert!(
+                        tile.x >= pane.x
+                            && tile.y >= pane.y
+                            && tile.right() <= pane.right()
+                            && tile.bottom() <= pane.bottom(),
+                        "{key:?} {tile:?} outside {pane:?} ({height} rows, {collapsed:?})"
+                    );
+                }
+            }
+        }
+        // One row short of the strip plus two minimums: proportional, summing.
+        let g = geo_collapsed(120, 14, &["d", "w1", "w2", "w3"], &[false, true, false]);
+        assert_eq!(heights(&g).iter().sum::<u16>(), g.areas.pane.height);
+    }
+
+    #[test]
+    fn when_every_stack_tile_is_collapsed_the_stack_is_a_narrow_column_of_strips_from_the_top() {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[true, true, true]);
+        assert!(g.all_collapsed);
+        let pane = g.areas.pane;
+        let master = g.tiles[0].1;
+        // The column is the collapsed stack width wide; the master has the rest.
+        for (key, tile) in &g.tiles[1..] {
+            assert_eq!(tile.width, DEFAULT_COLLAPSED_STACK_WIDTH, "{key:?}");
+            assert_eq!(tile.x, pane.x + pane.width - DEFAULT_COLLAPSED_STACK_WIDTH);
+        }
+        assert_eq!(master.width, pane.width - DEFAULT_COLLAPSED_STACK_WIDTH);
+        assert_eq!(master.height, pane.height, "the master is as tall as ever");
+        // Strips: five rows each, stacked from the top in stack order.
+        let mut y = pane.y;
+        for (key, tile) in &g.tiles[1..] {
+            assert_eq!(tile.y, y, "{key:?} follows the previous strip");
+            assert_eq!(tile.height, COLLAPSED_TILE_HEIGHT);
+            y += tile.height;
+        }
+        assert_eq!(
+            g.tiles[1..]
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            ["w1", "w2", "w3"]
+        );
+        // Below them the column is empty: nothing there to draw or hit.
+        assert!(y < pane.y + pane.height);
+        let empty_row = y + 2;
+        assert!(
+            g.tiles
+                .iter()
+                .all(|(_, t)| !t.contains(ratatui_core::layout::Position::new(
+                    pane.x + pane.width - 5,
+                    empty_row
+                )))
+        );
+        assert_eq!(what_is_at(&g, pane.x + pane.width - 5, empty_row), "none");
+        assert_eq!(g.button_at(pane.x + pane.width - 5, empty_row), None);
+        assert_eq!(g.label_at(pane.x + pane.width - 5, empty_row), None);
+    }
+
+    #[test]
+    fn the_collapsed_stack_width_is_a_preference_clamped_at_use() {
+        let width_with = |width: u16, preferred: u16| {
+            let g = geometry(
+                Rect::new(0, 0, width, 40),
+                &brigade_stage(&["d", "w1", "w2"]),
+                &LayoutPrefs {
+                    sidebar_width: SIDEBAR_WIDTH,
+                    master_permille: DEFAULT_MASTER_PERMILLE,
+                    collapsed_stack_width: preferred,
+                    stack_weights: &[1, 1],
+                    stack_collapsed: &[true, true],
+                    master_soloable: false,
+                },
+                &|key| key.as_str().to_string(),
+            );
+            (g.tiles[0].1.width, g.tiles[1].1.width, g.areas.pane.width)
+        };
+        // A pane area 84 wide (120 - 36), the ordinary stack 42 of it. A
+        // preference narrower than that is used as is.
+        assert_eq!(width_with(120, 30), (54, 30, 84));
+        // Too small: the stack keeps its minimum...
+        assert_eq!(width_with(120, 2).1, MIN_STACK_WIDTH);
+        // ...too large: the strips never get more than the ordinary stack
+        // would have (the master is never narrower than in the ordinary
+        // split).
+        assert_eq!(width_with(120, 50), (42, 42, 84));
+        assert_eq!(width_with(120, 200), (42, 42, 84));
+        // Not rewritten: asking again with a roomier terminal gives the
+        // preferred width back.
+        assert_eq!(width_with(160, 50).1, 50);
+        // A pane area too narrow for both minimums degrades, one column at least each.
+        for width in 36..60u16 {
+            let (master, stack, pane) = width_with(width, 36);
+            assert_eq!(master + stack, pane, "{width}");
+            assert!(master >= 1 && stack >= 1, "{width}");
+        }
+        // The ordinary share is untouched by it while a tile is open.
+        let open = geo_collapsed(120, 40, &["d", "w1", "w2"], &[true, false]);
+        assert!(!open.all_collapsed);
+        assert_eq!(open.tiles[0].1.width, 42);
+    }
+
+    #[test]
+    fn the_all_collapsed_master_is_never_narrower_than_the_ordinary_master() {
+        // Every terminal width (so every pane-area width the layout produces),
+        // every preference including ones larger than the pane, every share.
+        let preferences = [0u16, 1, 10, 19, 20, 36, 50, 84, 150, 400, u16::MAX];
+        let shares = [0u16, 1, 100, 250, 499, 500, 501, 750, 900, 1000];
+        for width in 0..=240u16 {
+            for &preferred in &preferences {
+                for &share in &shares {
+                    let build = |collapsed: &[bool]| {
+                        geometry(
+                            Rect::new(0, 0, width, 40),
+                            &brigade_stage(&["d", "w1", "w2"]),
+                            &LayoutPrefs {
+                                sidebar_width: SIDEBAR_WIDTH,
+                                master_permille: share,
+                                collapsed_stack_width: preferred,
+                                stack_weights: &[1, 1],
+                                stack_collapsed: collapsed,
+                                master_soloable: true,
+                            },
+                            &|key| key.as_str().to_string(),
+                        )
+                    };
+                    let ordinary = build(&[false, false]);
+                    let collapsed = build(&[true, true]);
+                    let context = format!("width {width}, preference {preferred}, share {share}");
+                    assert!(
+                        collapsed.all_collapsed && !ordinary.all_collapsed,
+                        "{context}"
+                    );
+                    let (before, after) = (ordinary.tiles[0].1, collapsed.tiles[0].1);
+                    assert!(
+                        after.width >= before.width,
+                        "{context}: {before:?} -> {after:?}"
+                    );
+                    // The tiles still partition the pane area's width.
+                    assert_eq!(
+                        after.width + collapsed.tiles[1].1.width,
+                        collapsed.areas.pane.width,
+                        "{context}"
+                    );
+                    // So a button that fit before still fits.
+                    let has = |g: &Geometry| g.buttons().iter().any(|b| b.key.as_str() == "d");
+                    assert!(!has(&ordinary) || has(&collapsed), "{context}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_master_stack_handle_cannot_be_dragged_left_of_the_ordinary_masters_edge_when_all_collapsed()
+     {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2"], &[true, true]);
+        let handle = g
+            .handles()
+            .iter()
+            .find(|h| matches!(h.boundary, Boundary::Master { .. }))
+            .unwrap();
+        let pane = g.areas.pane;
+        // 84 wide: the ordinary master is 42, so the boundary stops there.
+        assert_eq!(handle.min, pane.x + 42);
+        assert_eq!(handle.clamp(0), pane.x + 42);
+        // The ordinary state still goes down to the master's own minimum.
+        let open = geo_collapsed(120, 40, &["d", "w1", "w2"], &[false, false]);
+        let open_handle = open
+            .handles()
+            .iter()
+            .find(|h| matches!(h.boundary, Boundary::Master { .. }))
+            .unwrap();
+        assert_eq!(open_handle.min, pane.x + MIN_MASTER_WIDTH);
+    }
+
+    #[test]
+    fn more_strips_than_rows_degrade_proportionally_and_nothing_panics() {
+        // Eight strips want 40 rows; the pane has 39. Every strip shrinks a
+        // little rather than the last being dropped or clipped.
+        let panes: Vec<&str> = ["d", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8"].to_vec();
+        let g = geo_collapsed(120, 40, &panes, &[true; 8]);
+        assert!(g.all_collapsed);
+        assert_eq!(heights(&g).iter().sum::<u16>(), g.areas.pane.height);
+        assert!(heights(&g).iter().all(|h| *h >= 4), "{:?}", heights(&g));
+        // Enough rows for all of them: five each from the top, the rest empty.
+        let roomy = geo_collapsed(120, 50, &panes, &[true; 8]);
+        assert_eq!(heights(&roomy), vec![COLLAPSED_TILE_HEIGHT; 8]);
+        for height in 0..14 {
+            for width in 0..60 {
+                let _ = geo_collapsed(width, height, &["d", "w1", "w2"], &[true, true]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_master_stack_handle_exists_in_both_states_and_row_handles_only_between_open_tiles() {
+        let all = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[true, true, true]);
+        let kinds: Vec<&Boundary> = all.handles().iter().map(|h| &h.boundary).collect();
+        assert!(kinds.contains(&&Boundary::Sidebar));
+        assert!(kinds.contains(&&Boundary::Master { brigade: 1 }));
+        assert!(
+            kinds.iter().all(|b| !matches!(b, Boundary::Stack { .. })),
+            "no row handle between strips"
+        );
+        let handle = all
+            .handles()
+            .iter()
+            .find(|h| matches!(h.boundary, Boundary::Master { .. }))
+            .unwrap();
+        assert_eq!(
+            handle.position, all.tiles[1].1.x,
+            "at the narrow column's edge"
+        );
+        assert_eq!(
+            handle.hits()[0].height,
+            all.areas.pane.height,
+            "the full body height, strips or not"
+        );
+        let column = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[true, true, false]);
+        assert!(
+            column
+                .handles()
+                .iter()
+                .any(|h| matches!(h.boundary, Boundary::Master { .. }))
+        );
+    }
+
+    #[test]
+    fn a_row_handle_lies_between_expanded_neighbours_ignoring_collapsed_tiles() {
+        // w1 expanded, w2 collapsed, w3 expanded: one boundary, w1 | w3.
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[false, true, false]);
+        let rows: Vec<&Handle> = g
+            .handles()
+            .iter()
+            .filter(|h| matches!(h.boundary, Boundary::Stack { .. }))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let handle = rows[0];
+        assert_eq!(
+            handle.boundary,
+            Boundary::Stack {
+                brigade: 1,
+                above: key("w1"),
+                below: key("w3")
+            }
+        );
+        let (w1, w2, w3) = (g.tiles[1].1, g.tiles[2].1, g.tiles[3].1);
+        // The upper tile's bottom border row only: the tiles are not adjacent.
+        assert_eq!(handle.position, w1.y + w1.height);
+        assert_eq!(handle.hits().len(), 1);
+        assert_eq!(what_is_at(&g, w1.x + 5, w1.y + w1.height - 1), "stack");
+        assert_eq!(
+            what_is_at(&g, w2.x + 5, w2.y),
+            "none",
+            "the strip's own title row"
+        );
+        assert_eq!(
+            what_is_at(&g, w3.x + 20, w3.y),
+            "none",
+            "a title row past a gap is not a handle"
+        );
+        // It moves the two expanded tiles against each other, keeping both at
+        // four rows or more.
+        assert_eq!(handle.min, w1.y + MIN_STACK_TILE_HEIGHT);
+        assert_eq!(
+            handle.max,
+            w1.y + w1.height + w3.height - MIN_STACK_TILE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn adjacent_expanded_tiles_keep_the_two_row_gap_beside_a_collapsed_one() {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[false, false, true]);
+        let rows: Vec<&Handle> = g
+            .handles()
+            .iter()
+            .filter(|h| matches!(h.boundary, Boundary::Stack { .. }))
+            .collect();
+        assert_eq!(rows.len(), 1, "only w1 | w2: w3 is collapsed");
+        assert_eq!(
+            rows[0].boundary,
+            Boundary::Stack {
+                brigade: 1,
+                above: key("w1"),
+                below: key("w2")
+            }
+        );
+        let w2 = g.tiles[2].1;
+        assert_eq!(
+            what_is_at(&g, w2.x + 20, w2.y),
+            "stack",
+            "the lower title row past the label"
+        );
+    }
+
+    #[test]
+    fn buttons_sit_right_aligned_before_the_corner_only_where_the_row_has_room() {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2"], &[false, true]);
+        for (name, text_of_minimize) in [("w1", "[_]"), ("w2", "[+]")] {
+            let tile = g.tiles.iter().find(|(k, _)| k.as_str() == name).unwrap().1;
+            let buttons: Vec<&TileButton> = g
+                .buttons()
+                .iter()
+                .filter(|b| b.key.as_str() == name)
+                .collect();
+            assert_eq!(buttons.len(), 2, "{name}");
+            assert_eq!(buttons[0].kind, ButtonKind::Solo);
+            assert_eq!(buttons[0].text, "[S]");
+            assert_eq!(buttons[1].kind, ButtonKind::Minimize);
+            assert_eq!(buttons[1].text, text_of_minimize);
+            let right_corner = tile.x + tile.width - 1;
+            assert_eq!(buttons[0].rect, Rect::new(right_corner - 6, tile.y, 3, 1));
+            assert_eq!(buttons[1].rect, Rect::new(right_corner - 3, tile.y, 3, 1));
+        }
+        // The master has none.
+        assert!(g.buttons().iter().all(|b| b.key.as_str() != "d"));
+        // A cell on a button finds it.
+        let w1 = g.tiles[1].1;
+        assert_eq!(
+            g.button_at(w1.x + w1.width - 5, w1.y).map(|b| b.kind),
+            Some(ButtonKind::Solo)
+        );
+        assert_eq!(
+            g.button_at(w1.x + w1.width - 2, w1.y).map(|b| b.kind),
+            Some(ButtonKind::Minimize)
+        );
+        assert_eq!(
+            g.button_at(w1.x + w1.width - 1, w1.y),
+            None,
+            "the corner is not a button"
+        );
+    }
+
+    #[test]
+    fn buttons_need_room_for_the_label_a_gap_and_both_buttons() {
+        // The label " w1 " is 4 cells, so a tile needs 4 + 1 + 6 inner columns.
+        let buttons_at = |width: u16| {
+            // A pane area exactly `width` columns wide: sidebar 36 + width.
+            let g = geo_collapsed(36 + width, 40, &["d", "w1", "w2"], &[false, false]);
+            let stack = g.tiles[1].1;
+            (
+                stack.width,
+                g.buttons()
+                    .iter()
+                    .filter(|b| b.key.as_str() == "w1")
+                    .count(),
+            )
+        };
+        // Master 50/50: the stack tile is about half of `width`. Find the
+        // threshold from the geometry itself.
+        let mut seen_none = false;
+        let mut seen_both = false;
+        for width in 20..=60 {
+            let (tile_width, count) = buttons_at(width);
+            let room = tile_width.saturating_sub(2) >= 4 + 1 + 6;
+            assert_eq!(count == 2, room, "stack tile {tile_width} wide");
+            seen_none |= count == 0;
+            seen_both |= count == 2;
+        }
+        assert!(seen_none && seen_both, "the sweep crosses the threshold");
+    }
+
+    #[test]
+    fn the_row_handle_keeps_off_the_lower_tiles_buttons_but_not_the_right_corner() {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2"], &[false, false]);
+        let w2 = g.tiles[2].1;
+        let right = w2.x + w2.width - 1;
+        // Label (10 cells from x+1), then handle, then six button cells, then
+        // the corner.
+        assert_eq!(what_is_at(&g, w2.x + 3, w2.y), "none", "label");
+        assert_eq!(
+            what_is_at(&g, w2.x + 12, w2.y),
+            "stack",
+            "gap before the buttons"
+        );
+        for x in right - 6..right {
+            assert_eq!(what_is_at(&g, x, w2.y), "none", "button cell {x}");
+        }
+        assert_eq!(what_is_at(&g, right, w2.y), "stack", "the right corner");
+        // The upper row is whole.
+        for x in w2.x + 1..=right {
+            assert_eq!(what_is_at(&g, x, w2.y - 1), "stack");
+        }
+    }
+
+    #[test]
+    fn among_strips_the_drop_slot_is_by_row_and_the_empty_space_below_is_the_last_slot() {
+        let g = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[true, true, true]);
+        let (w1, w2, w3) = (g.tiles[1].1, g.tiles[2].1, g.tiles[3].1);
+        assert_eq!(g.drop_slot(w1.y + 1), Some(1));
+        assert_eq!(g.drop_slot(w2.y + 2), Some(2));
+        assert_eq!(g.drop_slot(w3.y + 4), Some(3));
+        assert_eq!(
+            g.drop_slot(w3.y + w3.height + 6),
+            Some(3),
+            "under the strips"
+        );
+        assert_eq!(
+            g.move_line(3, 1),
+            Some(Rect::new(w1.x, w1.y, w1.width, 1)),
+            "a horizontal line across the strip column"
+        );
+        assert_eq!(
+            g.move_line(1, 3),
+            Some(Rect::new(w3.x, w3.y + w3.height - 1, w3.width, 1))
+        );
+    }
+
+    fn geo_with_master_button(width: u16, height: u16, panes: &[&str]) -> Geometry {
+        geometry(
+            Rect::new(0, 0, width, height),
+            &brigade_stage(panes),
+            &LayoutPrefs {
+                sidebar_width: SIDEBAR_WIDTH,
+                master_permille: DEFAULT_MASTER_PERMILLE,
+                collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
+                stack_weights: &vec![1; panes.len().saturating_sub(1)],
+                stack_collapsed: &[],
+                master_soloable: true,
+            },
+            &|key| key.as_str().to_string(),
+        )
+    }
+
+    #[test]
+    fn the_master_gets_a_solo_button_and_no_collapse_button() {
+        let g = geo_with_master_button(120, 40, &["d", "w1", "w2"]);
+        let master = g.tiles[0].1;
+        let mine: Vec<&TileButton> = g
+            .buttons()
+            .iter()
+            .filter(|b| b.key.as_str() == "d")
+            .collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].kind, ButtonKind::Solo);
+        assert_eq!(mine[0].text, "[S]");
+        let right_corner = master.x + master.width - 1;
+        assert_eq!(mine[0].rect, Rect::new(right_corner - 3, master.y, 3, 1));
+        // The stack tiles keep both of theirs.
+        assert_eq!(
+            g.buttons()
+                .iter()
+                .filter(|b| b.key.as_str() == "w1")
+                .count(),
+            2
+        );
+        // Found by a press, and the corner beside it is not a button.
+        assert_eq!(
+            g.button_at(right_corner - 2, master.y).map(|b| b.kind),
+            Some(ButtonKind::Solo)
+        );
+        assert_eq!(g.button_at(right_corner, master.y), None);
+    }
+
+    #[test]
+    fn no_master_button_without_a_stack_a_member_or_room() {
+        // Not soloable (no member): none, whatever the width.
+        let g = geo_collapsed(120, 40, &["d", "w1"], &[false]);
+        assert!(g.buttons().iter().all(|b| b.key.as_str() != "d"));
+        // A brigade of one: nothing to collapse.
+        let one = geo_with_master_button(120, 40, &["d"]);
+        assert!(one.buttons().is_empty());
+        // A solo-session stage.
+        let solo = geometry(
+            Rect::new(0, 0, 120, 40),
+            &Stage::Solo(key("d")),
+            &LayoutPrefs {
+                sidebar_width: SIDEBAR_WIDTH,
+                master_permille: DEFAULT_MASTER_PERMILLE,
+                collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
+                stack_weights: &[],
+                stack_collapsed: &[],
+                master_soloable: true,
+            },
+            &|k| k.as_str().to_string(),
+        );
+        assert!(solo.buttons().is_empty());
+        // A master title too narrow for label + gap + button: none.
+        let narrow = geometry(
+            Rect::new(0, 0, 60, 40),
+            &brigade_stage(&["d", "w1"]),
+            &LayoutPrefs {
+                sidebar_width: SIDEBAR_WIDTH,
+                master_permille: DEFAULT_MASTER_PERMILLE,
+                collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
+                stack_weights: &[1],
+                stack_collapsed: &[],
+                master_soloable: true,
+            },
+            &|_| "a-much-longer-master-label".to_string(),
+        );
+        assert!(narrow.buttons().iter().all(|b| b.key.as_str() != "d"));
+    }
+
+    #[test]
+    fn the_masters_title_row_has_no_handle_cells_and_no_move_label() {
+        let g = geo_with_master_button(120, 40, &["d", "w1", "w2"]);
+        let master = g.tiles[0].1;
+        let right_corner = master.x + master.width - 1;
+        // Between the corners (the left corner is the sidebar boundary's, the
+        // right one the master/stack boundary's).
+        for x in master.x + 1..right_corner {
+            assert_eq!(what_is_at(&g, x, master.y), "none", "column {x}");
+        }
+        assert_eq!(g.label_at(master.x + 2, master.y), None);
     }
 
     #[test]
@@ -1103,9 +2063,14 @@ mod tests {
         let g = geometry(
             Rect::new(0, 2, 120, 38),
             &stage,
-            SIDEBAR_WIDTH,
-            DEFAULT_MASTER_PERMILLE,
-            &[1, 1, 1],
+            &LayoutPrefs {
+                sidebar_width: SIDEBAR_WIDTH,
+                master_permille: DEFAULT_MASTER_PERMILLE,
+                collapsed_stack_width: DEFAULT_COLLAPSED_STACK_WIDTH,
+                stack_weights: &[1, 1, 1],
+                stack_collapsed: &[],
+                master_soloable: false,
+            },
             &|k| k.as_str().to_string(),
         );
         let stack_top = g.tiles[1].1.y;
@@ -1132,16 +2097,11 @@ mod tests {
     fn the_move_line_is_the_targets_top_edge_going_up_and_its_bottom_edge_going_down() {
         let g = geo(120, 40, &["d", "w1", "w2", "w3"]);
         let (w1, w2, w3) = (g.tiles[1].1, g.tiles[2].1, g.tiles[3].1);
-        assert_eq!(g.move_line(3, 1), Some(Rect::new(w1.x, w1.y, w1.width, 1)));
-        assert_eq!(g.move_line(2, 1), Some(Rect::new(w1.x, w1.y, w1.width, 1)));
-        assert_eq!(
-            g.move_line(1, 3),
-            Some(Rect::new(w3.x, w3.y + w3.height - 1, w3.width, 1))
-        );
-        assert_eq!(
-            g.move_line(1, 2),
-            Some(Rect::new(w2.x, w2.y + w2.height - 1, w2.width, 1))
-        );
+        let across = |rect: Rect, row: u16| Some(Rect::new(rect.x, row, rect.width, 1));
+        assert_eq!(g.move_line(3, 1), across(w1, w1.y));
+        assert_eq!(g.move_line(2, 1), across(w1, w1.y));
+        assert_eq!(g.move_line(1, 3), across(w3, w3.y + w3.height - 1));
+        assert_eq!(g.move_line(1, 2), across(w2, w2.y + w2.height - 1));
         assert_eq!(g.move_line(2, 2), None, "its own slot: nothing");
     }
 

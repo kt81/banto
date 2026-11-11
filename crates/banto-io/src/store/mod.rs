@@ -23,6 +23,7 @@ mod pins;
 pub use banto_core::model::{
     Brigade, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, MemberToken,
 };
+pub use brigades::glance_line;
 pub use groups::{Group, GroupId};
 pub use panes::PaneRecord;
 
