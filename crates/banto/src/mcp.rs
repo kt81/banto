@@ -230,7 +230,7 @@ fn tools_list_result() -> Value {
                                 consultation stays open — you are not limited to the request \
                                 that started it. Fails if a Goinkyo is already part of this \
                                 brigade: only one consults at a time — call dismiss_goinkyo to \
-                                end the current one first. Nothing else ends one: an \
+                                end the current one first. A consultation does not end by itself: an \
                                 arbitration you already have your answer to is finished, and \
                                 leaving it open costs a running session with nothing left to \
                                 do.",

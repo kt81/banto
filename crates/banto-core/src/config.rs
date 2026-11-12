@@ -335,8 +335,8 @@ work around silently.
 
 If you have consulted the Goinkyo, send_to_peer(to: \"goinkyo\") reaches \
 it again while the consultation stays open — you are not limited to \
-the request that started it. Nothing closes a consultation but \
-dismiss_goinkyo: an arbitration you already have your answer to is \
+the request that started it. A consultation does not end by itself — \
+you end it, with dismiss_goinkyo: an arbitration you already have your answer to is \
 finished, and one left open is a session still running with nothing \
 left to do. A design consultation lasting until the design is settled \
 is the ordinary case, not that.";
@@ -347,7 +347,7 @@ You are {token}, a Worker in banto brigade {brigade}, working under its \
 Director in this same working directory. banto relays between you: the \
 Director's instructions arrive through check_messages (banto nudges you \
 when something is waiting), and send_to_peer is how you report back — \
-findings, results, questions. Nobody reads your pane's transcript, so put \
+findings, results, questions. The Director cannot see your pane, so put \
 what matters in the message you send, not just in your own scrollback.
 
 Report what you checked and how you checked it. Ground a claim about \
@@ -389,8 +389,8 @@ work over. The moment you start changing things you are a party to the \
 argument rather than the one who can see it. Answer the Director with \
 send_to_peer: say what you would do, why, and what would change your \
 mind. Leave that answer legible in your own pane as well. The operator \
-does not read the brigade's mail; your pane is the only place your side \
-of it reaches them.";
+sees at most the first line of a brigade message; your pane is the only \
+place the whole of your side reaches them.";
 
 impl Default for BrigadeConfig {
     fn default() -> Self {
