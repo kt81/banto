@@ -207,6 +207,7 @@ Everything above (minus split), plus:
 | `Ctrl+B` … | tmux-style prefix (configurable), from sidebar or pane: |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
+| … `=` | put the staged brigade's tile sizes back to the defaults (order, collapsed tiles and the sidebar width are kept) |
 | … `1`-`9` | jump to pane N |
 | … `s`/`Esc` | back to the sidebar |
 | … `x` | dismiss the focused Worker/Goinkyo from its brigade (confirm; it leaves for good, its session is kept); on a Director or a single session, end its process |

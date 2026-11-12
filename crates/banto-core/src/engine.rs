@@ -2092,6 +2092,9 @@ enum PrefixAction {
     ToggleSolo,
     /// `M`: open every collapsed tile and turn the solo off.
     RestoreAll,
+    /// `=`: put the staged brigade's tile sizes back to the defaults — see
+    /// [`reset_sizes`].
+    ResetSizes,
     /// Shift+Up / Shift+Down: move the focused stack tile one slot, see
     /// [`move_focused_tile`]. Plain arrows (and any other modifier
     /// combination) stay [`Self::Move`].
@@ -2153,6 +2156,11 @@ fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> 
         // the modifier flag, depending on the terminal.
         KeyCode::Char('M') if key.modifiers.is_empty() || key.modifiers == Modifiers::SHIFT => {
             PrefixAction::RestoreAll
+        }
+        // On layouts where `=` is a shifted key the terminal reports the
+        // character with or without the modifier flag, as it does for `M`.
+        KeyCode::Char('=') if key.modifiers.is_empty() || key.modifiers == Modifiers::SHIFT => {
+            PrefixAction::ResetSizes
         }
         KeyCode::Char('s') if key.modifiers.is_empty() => PrefixAction::Sidebar,
         KeyCode::Char('x') if key.modifiers.is_empty() => PrefixAction::Kill,
@@ -3620,6 +3628,10 @@ fn resolve_armed_prefix(
             } else {
                 state.status = Some("prefix: no stack to restore".to_string());
             }
+            Vec::new()
+        }
+        PrefixAction::ResetSizes => {
+            reset_sizes(state, now);
             Vec::new()
         }
         PrefixAction::FocusPane(index) => {
@@ -5271,6 +5283,42 @@ fn restore_all(state: &mut EmporiumState) {
     layout.solo_member = None;
     layout.minimized.clear();
     refocus_expanded(state, None);
+}
+
+/// Prefix + `=`: forget the sizes the operator dragged the staged brigade to —
+/// every member's row weight (staged or not, so a member reopened later does not
+/// bring an old height back), the master share, and the collapsed stack's width.
+///
+/// Sizes only: the stack order, what is collapsed or soloed, the names and the
+/// join order are arrangement, not size, and stay; so does the sidebar's width,
+/// a window-level preference of a different layer. Works from any focus, as
+/// `M` does, because it acts on the brigade, not on a tile. The tiles' PTYs are
+/// resized, and the one layout save emitted, by the passes at the end of the
+/// `update` this runs in — a brigade already at its defaults changes nothing
+/// there, and says so here.
+fn reset_sizes(state: &mut EmporiumState, now: Instant) {
+    let Stage::Brigade { id, .. } = &state.stage else {
+        state.set_status("prefix: no brigade layout to reset", now);
+        return;
+    };
+    let id = *id;
+    // A drag was measured against sizes that are about to change.
+    state.cancel_gestures();
+    let layout = state.brigade_layouts.entry(id).or_default();
+    let already_default = layout.master_permille == DEFAULT_MASTER_PERMILLE
+        && layout.collapsed_stack_width == DEFAULT_COLLAPSED_STACK_WIDTH
+        && layout.row_weights.is_empty();
+    layout.master_permille = DEFAULT_MASTER_PERMILLE;
+    layout.collapsed_stack_width = DEFAULT_COLLAPSED_STACK_WIDTH;
+    layout.row_weights.clear();
+    state.set_status(
+        if already_default {
+            "sizes already at their defaults"
+        } else {
+            "sizes reset"
+        },
+        now,
+    );
 }
 
 /// A collapsed tile is not focusable. If the focused pane is collapsed, move
@@ -24165,6 +24213,333 @@ mod tests {
             cmds.len(),
             1,
             "one death an hour is an agent updating itself, not a broken one: {cmds:?}"
+        );
+    }
+
+    // --- prefix + = : put the sizes back ---------------------------------------
+
+    fn contents(state: &EmporiumState) -> Vec<(String, (u16, u16))> {
+        state
+            .geometry(DRAG_AREA)
+            .tiles
+            .iter()
+            .map(|(key, rect)| {
+                let content = pane_content(*rect);
+                (key.as_str().to_string(), (content.height, content.width))
+            })
+            .collect()
+    }
+
+    fn row_edge() -> Boundary {
+        Boundary::Stack {
+            brigade: 1,
+            above: key_of("w1"),
+            below: key_of("w2"),
+        }
+    }
+
+    fn tick(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig, now: Instant) {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
+            },
+            now,
+        );
+    }
+
+    /// A brigade of three Workers arranged by hand in every way a size and an
+    /// order can be: a row edge, the master edge (open), the master edge again
+    /// with every tile collapsed (the collapsed width), the sidebar edge, a
+    /// moved tile, a collapsed Worker, a name. Ends with only `worker-3`
+    /// collapsed and the focus on the master.
+    fn hand_arranged() -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let start = handle_of(&state, &row_edge()).position;
+        drag_to(&mut state, &mut app, &brigade, &row_edge(), start + 4, now);
+        release_at(&mut state, &mut app, &brigade, &row_edge(), start + 4, now);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start - 8, now);
+        release_at(&mut state, &mut app, &brigade, &master, start - 8, now);
+        set_collapse(&mut state, &["worker-1", "worker-2", "worker-3"], None);
+        tick(&mut state, &mut app, &brigade, now);
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start + 6, now);
+        release_at(&mut state, &mut app, &brigade, &master, start + 6, now);
+        set_collapse(&mut state, &["worker-3"], None);
+        tick(&mut state, &mut app, &brigade, now);
+        drag_to(&mut state, &mut app, &brigade, &Boundary::Sidebar, 48, now);
+        release_at(&mut state, &mut app, &brigade, &Boundary::Sidebar, 48, now);
+        focus_stack_slot(&mut state, 3);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Up,
+            Modifiers::SHIFT,
+            now,
+        );
+        focus_stack_slot(&mut state, 0);
+        state.state_member_name(1, "worker-1", Some("impl"));
+        state.resolve_member_names(1);
+        let layout = layout_of(&state);
+        assert!(!layout.row_weights.is_empty());
+        assert_ne!(layout.master_permille, DEFAULT_MASTER_PERMILLE);
+        assert_ne!(layout.collapsed_stack_width, DEFAULT_COLLAPSED_STACK_WIDTH);
+        assert!(!layout.stack_order.is_empty());
+        (state, app, brigade, now)
+    }
+
+    fn status(state: &EmporiumState) -> String {
+        state.displayed_status().unwrap_or_default().to_string()
+    }
+
+    fn press_equals(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        prefix_key(
+            state,
+            app,
+            brigade,
+            KeyCode::Char('='),
+            Modifiers::NONE,
+            now,
+        )
+    }
+
+    #[test]
+    fn prefix_equals_resolves_with_or_without_the_shift_flag_and_nothing_else_does() {
+        let prefix = PrefixKey::default();
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT] {
+            assert_eq!(
+                resolve_prefix_key(&KeyEvent::new(KeyCode::Char('='), modifiers), &prefix, 3),
+                PrefixAction::ResetSizes
+            );
+        }
+        for modifiers in [Modifiers::CONTROL, Modifiers::ALT] {
+            assert_eq!(
+                resolve_prefix_key(&KeyEvent::new(KeyCode::Char('='), modifiers), &prefix, 3),
+                PrefixAction::Unbound
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_equals_puts_every_size_back_and_leaves_everything_else() {
+        let (mut state, mut app, brigade, now) = hand_arranged();
+        let before = layout_of(&state);
+        let sidebar_before = state.sidebar_width;
+        let name_before = state.member_display_name(1, "worker-1").map(str::to_string);
+        let contents_before = contents(&state);
+
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+
+        // A never-arranged brigade of the same members, with only what `=` is
+        // meant to leave alone: the order, the collapsed flags, the sidebar.
+        let (mut reference, _, _, _) = drag_fixture(3);
+        reference.sidebar_width = sidebar_before;
+        reference.brigade_layouts.insert(
+            1,
+            BrigadeLayout {
+                stack_order: before.stack_order.clone(),
+                minimized: before.minimized.clone(),
+                ..BrigadeLayout::default()
+            },
+        );
+        let mut app_ref = app_with(vec![]);
+        tick(&mut reference, &mut app_ref, &brigade, now);
+        assert_eq!(
+            state.geometry(DRAG_AREA).tiles,
+            reference.geometry(DRAG_AREA).tiles,
+            "cell for cell the default geometry"
+        );
+
+        let after = layout_of(&state);
+        assert_eq!(after.master_permille, DEFAULT_MASTER_PERMILLE);
+        assert_eq!(after.collapsed_stack_width, DEFAULT_COLLAPSED_STACK_WIDTH);
+        assert!(after.row_weights.is_empty());
+        assert_eq!(after.stack_order, before.stack_order);
+        assert_eq!(after.minimized, before.minimized);
+        assert_eq!(after.solo_member, before.solo_member);
+        assert_eq!(state.sidebar_width, sidebar_before);
+        assert_eq!(
+            state.member_display_name(1, "worker-1").map(str::to_string),
+            name_before
+        );
+        assert_eq!(status(&state), "sizes reset");
+
+        // One layout save, with no size in it; no sidebar write.
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1, "{cmds:?}");
+        let (id, snapshot) = &writes[0];
+        assert_eq!(*id, 1);
+        assert_eq!(snapshot.master_permille, None);
+        assert_eq!(snapshot.collapsed_stack_width, None);
+        assert!(snapshot.members.iter().all(|m| m.row_weight.is_none()));
+        assert!(width_writes(&cmds).is_empty());
+
+        // Resized once, and only the tiles whose content size changed.
+        // (A collapsed tile is never resized: it shows a strip, not its child.)
+        let contents_after = contents(&state);
+        let collapsed = collapsed_names(&state);
+        let mut expected: Vec<String> = contents_before
+            .iter()
+            .zip(&contents_after)
+            .filter(|(b, a)| b != a && !collapsed.contains(&a.0))
+            .map(|(_, a)| a.0.clone())
+            .collect();
+        expected.sort();
+        let resized = resizes(&cmds);
+        assert_eq!(
+            resized
+                .iter()
+                .map(|(k, _, _)| k.as_str().to_string())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!expected.is_empty(), "the arrangement did change sizes");
+        for (key, rows, cols) in resized {
+            let (_, (h, w)) = contents_after
+                .iter()
+                .find(|(name, _)| name == key.as_str())
+                .unwrap()
+                .clone();
+            assert_eq!((rows, cols), (h, w));
+        }
+    }
+
+    #[test]
+    fn prefix_equals_clears_the_weight_held_for_a_member_that_is_not_staged() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let mut layout = BrigadeLayout::default();
+        layout.row_weights.insert("worker-9".to_string(), 77);
+        state.brigade_layouts.insert(1, layout.clone());
+        state.persisted_layouts.insert(1, layout);
+
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+
+        assert!(layout_of(&state).row_weights.is_empty());
+        let writes = layout_writes(&cmds);
+        assert_eq!(writes.len(), 1, "{cmds:?}");
+        let entry = member_entry(&writes[0].1, "worker-9").expect("listed, so the store clears it");
+        assert_eq!(entry.row_weight, None);
+    }
+
+    #[test]
+    fn prefix_equals_on_a_brigade_at_its_defaults_says_so_and_saves_nothing() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let before = sizes(&state);
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+        assert!(!any_preference_write(&cmds), "{cmds:?}");
+        assert!(resizes(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(status(&state), "sizes already at their defaults");
+        assert_eq!(sizes(&state), before);
+        // And a second press after a real reset is the same.
+        let (mut state, mut app, brigade, now) = hand_arranged();
+        press_equals(&mut state, &mut app, &brigade, now);
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+        assert!(!any_preference_write(&cmds), "{cmds:?}");
+        assert_eq!(status(&state), "sizes already at their defaults");
+    }
+
+    #[test]
+    fn prefix_equals_is_refused_with_nothing_staged_or_for_a_single_session() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(status(&state), "prefix: no brigade layout to reset");
+
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.screens.insert(key_of("solo"), Screen::new(24, 80));
+        state.stage = Stage::Solo(key_of("solo"));
+        state.focus = Focus::Pane;
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+        assert!(!any_preference_write(&cmds), "{cmds:?}");
+        assert_eq!(status(&state), "prefix: no brigade layout to reset");
+        assert!(state.brigade_layouts.is_empty());
+    }
+
+    #[test]
+    fn prefix_equals_cancels_a_drag_in_progress() {
+        let (mut state, mut app, brigade, now) = drag_fixture(3);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start - 8, now);
+        assert!(state.drag.is_some());
+
+        press_equals(&mut state, &mut app, &brigade, now);
+        assert!(state.drag.is_none());
+        // Letting go afterwards commits nothing.
+        let cmds = release_at(&mut state, &mut app, &brigade, &master, start - 8, now);
+        assert!(!any_preference_write(&cmds), "{cmds:?}");
+        assert_eq!(layout_of(&state).master_permille, DEFAULT_MASTER_PERMILLE);
+    }
+
+    #[test]
+    fn prefix_equals_works_from_the_sidebar_and_with_the_shift_flag() {
+        let (mut state, mut app, brigade, now) = hand_arranged();
+        state.focus = Focus::Sidebar;
+        let cmds = prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('='),
+            Modifiers::SHIFT,
+            now,
+        );
+        assert_eq!(layout_writes(&cmds).len(), 1, "{cmds:?}");
+        assert_eq!(status(&state), "sizes reset");
+        assert_eq!(state.focus, Focus::Sidebar, "focus is not moved");
+    }
+
+    #[test]
+    fn after_a_reset_a_restart_reads_the_defaults_back() {
+        let (mut state, mut app, brigade, now) = hand_arranged();
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+        let (_, snapshot) = layout_writes(&cmds).remove(0);
+        let order = layout_of(&state).stack_order;
+
+        // A fresh process staging the brigade reads what was last saved.
+        let (mut restarted, _, _, _) = drag_fixture(3);
+        restarted.brigade_layouts.clear();
+        adopt_stored_layout(&mut restarted, 1, Some(&snapshot));
+        let read = layout_of(&restarted);
+        assert_eq!(read.master_permille, DEFAULT_MASTER_PERMILLE);
+        assert_eq!(read.collapsed_stack_width, DEFAULT_COLLAPSED_STACK_WIDTH);
+        assert!(read.row_weights.is_empty());
+        assert_eq!(read.stack_order, order, "the order was kept");
+    }
+
+    #[test]
+    fn prefix_equals_returns_the_collapsed_stack_width_when_every_tile_is_collapsed() {
+        let (mut state, mut app, brigade, now) = all_collapsed_fixture(2);
+        let boundary = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &boundary).position;
+        drag_to(&mut state, &mut app, &brigade, &boundary, start - 6, now);
+        release_at(&mut state, &mut app, &brigade, &boundary, start - 6, now);
+        assert_ne!(
+            tile_of(&state, "w1").width,
+            DEFAULT_COLLAPSED_STACK_WIDTH,
+            "dragged"
+        );
+
+        let cmds = press_equals(&mut state, &mut app, &brigade, now);
+        assert_eq!(tile_of(&state, "w1").width, DEFAULT_COLLAPSED_STACK_WIDTH);
+        assert!(state.geometry(DRAG_AREA).all_collapsed, "still collapsed");
+        assert_eq!(layout_writes(&cmds).len(), 1);
+        assert_eq!(
+            layout_of(&state).collapsed_stack_width,
+            DEFAULT_COLLAPSED_STACK_WIDTH
         );
     }
 }

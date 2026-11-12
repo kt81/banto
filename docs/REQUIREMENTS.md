@@ -552,6 +552,21 @@ first); its label still moves it. A collapsed tile's child is not resized, since
 a repaint into a three-row grid would wreck the screen the operator comes back
 to; it is sized when it opens. The row resize handle lies between expanded
 neighbours and rewrites only their weights.
+**Putting the sizes back** (prefix + `=`, from the sidebar or a pane, on a staged
+brigade). Forgets every row weight the layout holds for the brigade — staged
+members' and off-stage ones' alike, so a member reopened later brings no old
+height back — and returns the master share and the collapsed stack width to their
+defaults. It leaves the arrangement alone: stack order, collapsed flags, solo,
+display names and join order are not sizes, and the sidebar width is a
+window-level preference of a different layer, not part of any brigade. Like the
+other layout operations it ends a drag or move in progress; the panes are resized
+once, only where a tile's size really changes, and one layout save is written when
+something changed. A brigade already at its defaults changes and saves nothing and
+says so (`sizes already at their defaults`); with no brigade staged, or a single
+session, it is refused (`prefix: no brigade layout to reset`). The case that
+prompted it: a Worker added later takes the mean of the others' heights, so weights
+set when a brigade had two Workers leave one tile much smaller than the rest once it
+has four.
 **What is kept across a restart.** Everything arranged above is stored in banto's
 own sqlite store (schema v15) and comes back the next time banto runs: the
 sidebar width (table `ui_prefs`, key `sidebar_width`); per brigade, the master
@@ -565,7 +580,7 @@ by its next consultation) from inheriting it; disbanding the brigade deletes the
 rest. A brigade's arrangement is read together with its roster when
 it is staged, so the first PTY sizes are already the stored ones; it is written
 (the whole snapshot, one transaction) at the moment it actually changes — a
-committed resize or move, a collapse, a solo, restore-all — and never for a
+committed resize or move, a collapse, a solo, restore-all, a size reset — and never for a
 gesture that changed nothing, and never from a draw or a tick. What the run
 already holds wins over a read of the store. Stored values are preferences like
 any other: out-of-range ones read as "no preference", and what is used is
@@ -586,6 +601,7 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 | … `m` | collapse the focused stack tile to a strip, or open it again |
 | … `z` | solo the focused tile (the master included; every stack tile but the soloed one is collapsed), or turn its solo off |
 | … `M` | open every collapsed tile and turn the solo off |
+| … `=` | put the staged brigade's tile sizes back to the defaults (see the layout paragraph) |
 | … `1`-`9` | jump to pane N |
 | … `s`/`Esc` | back to the sidebar |
 | … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted); on a Director or a single session, end its process (confirm) |

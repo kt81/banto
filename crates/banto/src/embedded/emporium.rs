@@ -2963,7 +2963,7 @@ fn render_status_bar(
     /// own `ARCHIVED_HINT` for why this one is not in the bar unconditionally.
     const ARCHIVED_HINT: &str = " · D restore";
     const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
-    const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+arrows reorder · m collapse · z solo · M restore · 1-9 pane · b literal · s sidebar · x kill";
+    const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+arrows reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x kill";
 
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
