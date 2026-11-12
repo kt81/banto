@@ -197,7 +197,9 @@ cargo run -- --claude-home /path/to/.claude
 
 ### Emporium
 
-Everything above (minus split), plus:
+Everything above (minus split), plus — and with one difference: with any session
+running, `q`/`Esc` takes two presses within 3 seconds (the first shows `Esc again
+to quit — N session(s) running`), since quitting ends every hosted process:
 
 | Key | Action |
 |---|---|

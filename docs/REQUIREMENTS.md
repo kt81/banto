@@ -594,6 +594,7 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 | `Enter` | Open embedded; on a Director, stage its whole cell |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
+| `q`/`Esc` (list focused) | Quit — with nothing hosted, at once; with any session running (staged or off-stage, collapsed tiles included) the first press only shows `Esc again to quit — N session(s) running` and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. Any other key, a mouse press, the focus leaving the list or the window running out drops it silently. Esc stays one of the two keys because an IME swallows `q`. The chōba quits on one press, as before |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |

@@ -17,7 +17,7 @@ pub const PREFIX_HINTS: &str = "prefix: Esc cancel · o/Tab cycle · arrows move
 
 const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
                           F3 next pane · / search · n new · d archive · g group · \
-                          Tab grouped/flat · p pin · a reveal · q quit";
+                          Tab grouped/flat · p pin · a reveal · q/Esc quit";
 
 /// Appended only while an archived row is on screen — see the choba's own
 /// `ARCHIVED_HINT` for why it is not in the bar unconditionally.
@@ -97,7 +97,7 @@ mod tests {
             hints,
             "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
              F3 next pane · / search · n new · d archive · g group · \
-             Tab grouped/flat · p pin · a reveal · q quit"
+             Tab grouped/flat · p pin · a reveal · q/Esc quit"
         );
         assert!(!hints.contains("Tab view"));
     }

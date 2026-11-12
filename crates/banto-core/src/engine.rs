@@ -1095,6 +1095,11 @@ pub struct EmporiumState {
     /// can show the pending-prefix hint while armed (reading state for
     /// drawing is legal; only `update` may write it).
     pub prefix_armed: Option<Instant>,
+    /// A first quit key on the list that has to be confirmed because hosted
+    /// sessions are running, and whose window has not passed. Dropped by any
+    /// other key, a mouse press, the focus leaving the list, the sessions all
+    /// ending, or the window running out.
+    pending_quit: Option<PendingQuit>,
     /// The next discriminator [`Self::mint_plain_key`] hands out. Only ever
     /// increments, even past a closed pane's key going out of scope — a
     /// reused discriminator could attach a stale mapping (an old screen, a
@@ -1290,6 +1295,7 @@ impl EmporiumState {
             move_drag: None,
             prefix,
             prefix_armed: None,
+            pending_quit: None,
             next_plain_id: 0,
             window_focused: true,
             last_focus_notified: None,
@@ -1990,14 +1996,18 @@ impl EmporiumState {
     }
 
     /// The status line's text: the drag hint for as long as a drag is in
-    /// progress, otherwise the transient status. Derived rather than set, so
+    /// progress, then the quit prompt for as long as a quit waits to be
+    /// confirmed, otherwise the transient status. Derived rather than set, so
     /// it cannot outlast the gesture or expire under it (a status times out
-    /// after [`STATUS_TIMEOUT`], a held button does not).
+    /// after [`STATUS_TIMEOUT`], a held button does not) and another status set
+    /// meanwhile cannot hide the prompt — it shows again once the prompt is gone.
     pub fn displayed_status(&self) -> Option<&str> {
         if self.drag.is_some() {
             Some(DRAG_HINT)
         } else if self.move_drag.is_some() {
             Some(MOVE_HINT)
+        } else if let Some(pending) = &self.pending_quit {
+            Some(&pending.prompt)
         } else {
             self.status.as_deref()
         }
@@ -2019,6 +2029,26 @@ impl EmporiumState {
 /// How long the prefix stays armed with no follow-up key before
 /// [`update_tick`] disarms it on its own.
 const PREFIX_ARM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a first quit key on the session list waits for its second while
+/// hosted sessions are running. A separate matter from the prefix's timeout —
+/// that one is a half-typed chord, this one is a confirmation — and the two are
+/// free to differ.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+/// A first quit key that has not been confirmed yet (see [`update_key`]'s list
+/// arm). The prompt is kept here, rebuilt at the end of every update from the
+/// live count, so what the operator reads is current and `displayed_status` can
+/// hand it out as text.
+#[derive(Debug)]
+struct PendingQuit {
+    at: Instant,
+    prompt: String,
+}
+
+fn quit_prompt(live: usize) -> String {
+    format!("Esc again to quit \u{2014} {live} session(s) running")
+}
 
 /// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
 /// see [`crate::config::KeysConfig`]). Parsing lives here rather than in
@@ -3161,11 +3191,33 @@ pub fn update(
     state.apply_stack_order();
     refocus_expanded(state, None);
     validate_drag(state, app);
+    settle_pending_quit(state, now);
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(persist_preferences(state));
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
     cmds
+}
+
+/// Keep a waiting quit honest: gone once its window has run out, once the focus
+/// has left the list (the Esc it asks for would go to a pane), or once nothing
+/// is running any more (one press quits then); otherwise its prompt carries the
+/// current count. Run at the end of every update, so the window ends on the
+/// first event after it, and a key that lands exactly on its edge is judged by
+/// the key handler, which treats the edge as expired.
+fn settle_pending_quit(state: &mut EmporiumState, now: Instant) {
+    let live = state.screens.len();
+    let Some(pending) = &mut state.pending_quit else {
+        return;
+    };
+    if state.focus != Focus::Sidebar
+        || live == 0
+        || now.saturating_duration_since(pending.at) >= QUIT_CONFIRM_WINDOW
+    {
+        state.pending_quit = None;
+    } else {
+        pending.prompt = quit_prompt(live);
+    }
 }
 
 /// Refresh the one fact behind both attention views: a mark is on screen when
@@ -3461,6 +3513,9 @@ fn update_key(
     now: Instant,
 ) -> Vec<Cmd> {
     let code = key.code;
+    // Whatever this key is, a quit that was waiting for confirmation is over;
+    // only the list's own quit arm below may use it, to confirm.
+    let pending_quit = state.pending_quit.take();
 
     // Esc cancels a drag (a boundary, or a tile being moved) and goes no
     // further: it must not reach the child or the sidebar.
@@ -3541,7 +3596,21 @@ fn update_key(
             // must never also fire `b`'s add-worker).
             match (code, mods) {
                 (KeyCode::Char('q'), Modifiers::NONE) | (KeyCode::Esc, _) => {
-                    app.request_quit();
+                    // Quitting ends every hosted process, so with any running it
+                    // takes a second quit key (Esc or `q`, whichever the operator
+                    // has to hand — an IME swallows `q`) inside the window.
+                    let live = state.screens.len();
+                    let confirmed = pending_quit.is_some_and(|pending| {
+                        now.saturating_duration_since(pending.at) < QUIT_CONFIRM_WINDOW
+                    });
+                    if live == 0 || confirmed {
+                        app.request_quit();
+                    } else {
+                        state.pending_quit = Some(PendingQuit {
+                            at: now,
+                            prompt: quit_prompt(live),
+                        });
+                    }
                     Vec::new()
                 }
                 (KeyCode::Up, _) | (KeyCode::Char('k'), Modifiers::NONE) => {
@@ -4915,6 +4984,9 @@ fn update_mouse(
     mouse: MouseEvent,
     now: Instant,
 ) -> Vec<Cmd> {
+    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+        state.pending_quit = None;
+    }
     if app.modal().is_some() {
         return Vec::new();
     }
@@ -24652,15 +24724,18 @@ mod tests {
         assert_eq!(state.focus, Focus::Sidebar);
         assert!(!app.should_quit(), "the cancel is not the list's own Esc");
 
-        // Whereas an Esc with no prefix armed is the list's own, and quits.
-        forward_key(
-            &mut state,
-            &mut app,
-            &brigade,
-            KeyCode::Esc,
-            Modifiers::NONE,
-            now,
-        );
+        // Whereas an Esc with no prefix armed is the list's own: with panes
+        // running, the first arms a quit and the second quits.
+        for _ in 0..2 {
+            forward_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Esc,
+                Modifiers::NONE,
+                now,
+            );
+        }
         assert!(app.should_quit());
     }
 
@@ -24708,16 +24783,18 @@ mod tests {
         );
         assert_eq!(writes_of(&cmds), [(key_of("w1"), vec![0x1b])]);
 
-        // The list: the list's own Esc, which quits.
+        // The list: the list's own Esc — a first quit key with panes running.
         state.focus = Focus::Sidebar;
-        forward_key(
-            &mut state,
-            &mut app,
-            &brigade,
-            KeyCode::Esc,
-            Modifiers::NONE,
-            later,
-        );
+        for _ in 0..2 {
+            forward_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Esc,
+                Modifiers::NONE,
+                later,
+            );
+        }
         assert!(app.should_quit());
     }
 
@@ -24755,5 +24832,285 @@ mod tests {
         assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
         assert_eq!(state.prefix_armed, None);
         assert_eq!(layout_of(&state).master_permille, DEFAULT_MASTER_PERMILLE);
+    }
+
+    // --- quitting with sessions running takes a second key ------------------------
+
+    fn quit_key(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        code: KeyCode,
+        at: Instant,
+    ) -> Vec<Cmd> {
+        forward_key(state, app, brigade, code, Modifiers::NONE, at)
+    }
+
+    /// The fixture's brigade of `workers` + 1 hosted panes, the list focused.
+    fn list_focused(workers: usize) -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, app, brigade, now) = drag_fixture(workers);
+        state.focus = Focus::Sidebar;
+        (state, app, brigade, now)
+    }
+
+    fn prompt(state: &EmporiumState) -> Option<String> {
+        state.displayed_status().map(str::to_string)
+    }
+
+    #[test]
+    fn the_first_quit_key_arms_a_prompt_with_the_count_and_the_second_quits() {
+        for (first, second) in [
+            (KeyCode::Esc, KeyCode::Esc),
+            (KeyCode::Char('q'), KeyCode::Char('q')),
+            (KeyCode::Char('q'), KeyCode::Esc),
+            (KeyCode::Esc, KeyCode::Char('q')),
+        ] {
+            let (mut state, mut app, brigade, now) = list_focused(2);
+            let cmds = quit_key(&mut state, &mut app, &brigade, first, now);
+            assert!(cmds.is_empty(), "{cmds:?}");
+            assert!(!app.should_quit(), "{first:?}: not yet");
+            assert_eq!(
+                prompt(&state).as_deref(),
+                Some("Esc again to quit \u{2014} 3 session(s) running"),
+                "{first:?}"
+            );
+
+            quit_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                second,
+                now + Duration::from_secs(1),
+            );
+            assert!(app.should_quit(), "{first:?} then {second:?}");
+        }
+    }
+
+    #[test]
+    fn with_nothing_running_one_quit_key_quits() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut state = EmporiumState::new(PrefixKey::default());
+            let mut app = app_with(vec![]);
+            let brigade = brigade_config();
+            quit_key(&mut state, &mut app, &brigade, code, test_instant());
+            assert!(app.should_quit(), "{code:?}");
+            assert_eq!(prompt(&state), None);
+        }
+    }
+
+    #[test]
+    fn the_count_includes_off_stage_and_collapsed_panes_and_follows_panes_that_end() {
+        let (mut state, mut app, brigade, now) = list_focused(3);
+        // A kept-alive pane that is not staged, and a collapsed tile.
+        state
+            .screens
+            .insert(key_of("off-stage"), Screen::new(24, 80));
+        set_collapse(&mut state, &["worker-3"], None);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert_eq!(
+            prompt(&state).as_deref(),
+            Some("Esc again to quit \u{2014} 5 session(s) running")
+        );
+
+        // One ends during the window: the prompt is rebuilt, not stale.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: key_of("off-stage"),
+                reason: Some(PtyExitReason::Code(0)),
+            },
+            now,
+        );
+        assert_eq!(
+            prompt(&state).as_deref(),
+            Some("Esc again to quit \u{2014} 4 session(s) running")
+        );
+    }
+
+    #[test]
+    fn the_window_runs_out_and_a_later_quit_key_arms_again() {
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(prompt(&state).is_some());
+
+        // Just inside the window a tick leaves it alone ...
+        tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            now + QUIT_CONFIRM_WINDOW - Duration::from_millis(1),
+        );
+        assert!(prompt(&state).is_some());
+        // ... and at the edge it is gone, silently.
+        let at_edge = now + QUIT_CONFIRM_WINDOW;
+        tick(&mut state, &mut app, &brigade, at_edge);
+        assert_eq!(prompt(&state), None);
+        assert!(!app.should_quit());
+
+        // A single Esc afterwards is a first press again.
+        quit_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            at_edge + Duration::from_secs(10),
+        );
+        assert!(!app.should_quit());
+        assert!(prompt(&state).is_some());
+    }
+
+    #[test]
+    fn a_quit_key_exactly_at_the_edge_does_not_confirm_and_one_just_inside_does() {
+        // Before any tick has noticed the window is over, the key handler judges
+        // it: the edge itself is expired.
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        quit_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            now + QUIT_CONFIRM_WINDOW,
+        );
+        assert!(!app.should_quit(), "the edge is outside the window");
+        assert!(prompt(&state).is_some(), "it is a fresh first press");
+
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        quit_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            now + QUIT_CONFIRM_WINDOW - Duration::from_millis(1),
+        );
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn another_key_or_a_mouse_press_drops_the_prompt_and_is_handled_normally() {
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        app.replace_rows(vec![row("a"), row("b")]);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        let selected_before = app.selected_row().map(|r| r.id.clone());
+
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Char('j'), now);
+        assert_eq!(prompt(&state), None, "dropped, silently");
+        assert_ne!(
+            app.selected_row().map(|r| r.id.clone()),
+            selected_before,
+            "and `j` was handled"
+        );
+
+        // So a following Esc is a first press, not a confirmation.
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(!app.should_quit());
+
+        // A mouse press drops it too.
+        mouse_event(
+            &mut state,
+            &mut app,
+            &brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            DRAG_AREA.width - 1,
+            0,
+            now,
+        );
+        assert_eq!(prompt(&state), None);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn the_prompt_stays_visible_over_another_status_set_meanwhile() {
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        state.set_status("something else happened", now);
+        assert!(
+            prompt(&state).unwrap().starts_with("Esc again to quit"),
+            "the pending quit is not overwritten"
+        );
+        assert!(state.status.is_some(), "the other status is kept for after");
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(app.should_quit(), "and the quit still works");
+    }
+
+    #[test]
+    fn prefix_esc_cancels_the_prefix_only_and_never_arms_a_quit() {
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(state.prefix_armed, None);
+        assert_eq!(prompt(&state), None, "no quit prompt");
+        assert!(!app.should_quit());
+        // The cancelled Esc was not a first quit key: the next one is.
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(!app.should_quit());
+        assert!(prompt(&state).is_some());
+    }
+
+    #[test]
+    fn a_modal_or_search_keeps_its_own_esc_and_arms_nothing() {
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), None);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(app.modal().is_none(), "the modal's Esc closed it");
+        assert_eq!(prompt(&state), None);
+        assert!(!app.should_quit());
+
+        app.enter_search();
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert_eq!(app.mode(), Mode::Normal, "the search's Esc left it");
+        assert_eq!(prompt(&state), None);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn the_prompt_goes_when_the_focus_moves_to_a_pane_by_key_or_by_event() {
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::F(2),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(state.focus, Focus::Pane);
+        assert_eq!(prompt(&state), None);
+        // That Esc goes to the pane, as any key does.
+        let cmds = quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert_eq!(writes_of(&cmds).len(), 1);
+        assert!(!app.should_quit());
+
+        // Not by a key: something else puts the focus on a pane.
+        let (mut state, mut app, brigade, now) = list_focused(2);
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        state.focus = Focus::Pane;
+        tick(&mut state, &mut app, &brigade, now);
+        assert_eq!(prompt(&state), None);
+    }
+
+    #[test]
+    fn a_held_drag_keeps_its_own_esc_and_arms_no_quit() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        state.focus = Focus::Sidebar;
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start - 8, now);
+        assert!(state.drag.is_some());
+        quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
+        assert!(state.drag.is_none(), "the drag's Esc won");
+        assert_eq!(prompt(&state), None, "no quit armed by it");
+        assert!(!app.should_quit());
     }
 }
