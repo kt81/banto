@@ -836,7 +836,8 @@ them:
    "MCP mediation server" below) only ever travels through that launch's own
    argv, so a pane opened before formation can't carry it.
    `Modal::ConfirmDirectorReopen` — Enter kills that pane and re-issues
-   formation only once `Event::PtyExited` confirms it actually exited (any
+   formation only once the pane is confirmed gone — `Event::PtyExited`, or
+   `Event::PtyOutputLost` for the pane it killed (any
    sooner risks `banto::opener::decide_inplace_resume` seeing the not-yet-dead
    session as still live and refusing the reopen); Esc cancels the whole
    attempt. Placed first, ahead of the other two, because it is both the
@@ -919,7 +920,9 @@ keeps everyone: staging reopens every member there is (resuming its session, or 
 fresh spawn for a Worker with nothing to resume).
 
 **A Worker that ends on its own.** An exit banto did not ask for (a crash, an
-agent updating itself, Ctrl+D in the pane) is relaunched in place when it can be:
+agent updating itself, Ctrl+D in the pane) — one whose *process is known to have
+exited*, which is the wait thread's report and nothing else — is relaunched in
+place when it can be:
 the Worker has a session to resume and did not already die within the last minute.
 When it cannot — it never spoke, so there is no session row to resume, or it died
 again inside that minute — the Worker leaves the brigade (`Store::dismiss_worker`,
@@ -929,6 +932,21 @@ so and leaves the member. It is Workers only: a Director's or a Goinkyo's pane
 ending un-stages it and keeps the member, as before. It never fires for an exit
 banto asked for (a kill, a dismissal, a disband), while banto is quitting, for a
 brigade being disbanded, twice for one member, or when the row is already gone.
+
+**A pane whose output is lost.** The pane's output stream can end without the
+process having: the reader thread stops on any read error, and ConPTY and Unix
+disagree about whether an exit also produces an end of stream. So that end is not
+taken for an exit. The shell gives the wait thread one second (a bounded,
+non-blocking wait inside the per-pane poll, `OUTPUT_LOST_GRACE` in
+`crates/banto/src/embedded/session.rs`) to report the process's end; if it does,
+it is an exit as above. If it does not, banto reports `Event::PtyOutputLost`
+instead, and core closes the unreadable tile, asks the process to end, and **keeps
+the member** — nothing is removed from the store and nothing is relaunched in
+place (a reader that fails at once would loop, and relaunching while the old
+process may still run would resume one session twice). The status says so
+(`lost the output of worker-5 — pane closed; it stays in the brigade`), and the
+next staging reopens the member, one pane. Nobody ever leaves a brigade on that
+evidence alone.
 
 **Config** (`crates/banto-core/src/config.rs`, `[brigade]` in config.toml):
 

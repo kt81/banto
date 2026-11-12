@@ -1019,11 +1019,13 @@ pub struct EmporiumState {
     pending_worker_addition: Option<PendingWorkerAddition>,
     pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
     /// The session id of a Director-to-be whose already-open pane was just
-    /// killed (`confirm_director_reopen_modal`), waiting on its
-    /// `Event::PtyExited` before formation can continue — reopening any
-    /// sooner would resume a session `banto::opener::decide_inplace_resume`
-    /// still sees as live and refuse. `update_pty_exited` takes it once the exit
-    /// for this exact key lands. Unlike `pending_brigade_formation`/
+    /// killed (`confirm_director_reopen_modal`), waiting for that pane to be gone
+    /// before formation can continue — reopening any sooner would resume a
+    /// session `banto::opener::decide_inplace_resume` still sees as live and
+    /// refuse. `update_pty_exited` takes it once the end of this exact key lands:
+    /// an `Event::PtyExited`, or an `Event::PtyOutputLost` (which
+    /// `update_pty_output_lost` hands to it, since the pane banto killed is gone
+    /// either way). Unlike `pending_brigade_formation`/
     /// `pending_codex_trust_formation`, not cleared on every Esc: by the
     /// time this is set, `Modal::ConfirmDirectorReopen` is already closed
     /// (see that function), so no *other* modal's Esc should touch it.
@@ -1211,6 +1213,12 @@ pub struct EmporiumState {
     /// cleared on success: a member that dies once an hour should be
     /// restarted each time, and one that dies twice in a minute should not.
     last_relaunch: HashMap<SessionKey, Instant>,
+    /// The order panes were spawned in, by a counter the core keeps (no clock):
+    /// the only way to tell which of several panes held for one member is the
+    /// newest. Moved by a re-key, dropped with the pane.
+    spawn_order: HashMap<SessionKey, u64>,
+    /// The next value of [`Self::spawn_order`].
+    next_spawn: u64,
 }
 
 /// How soon after restarting a member's pane banto declines to restart it
@@ -1297,6 +1305,8 @@ impl EmporiumState {
             last_attention_bell: None,
             expected_exits: HashSet::new(),
             last_relaunch: HashMap::new(),
+            spawn_order: HashMap::new(),
+            next_spawn: 0,
         }
     }
 
@@ -1384,6 +1394,9 @@ impl EmporiumState {
         if let Some(value) = self.last_relaunch.remove(old_key) {
             self.last_relaunch.insert(new_key.clone(), value);
         }
+        if let Some(value) = self.spawn_order.remove(old_key) {
+            self.spawn_order.insert(new_key.clone(), value);
+        }
         if self.pending_dismiss.as_ref() == Some(old_key) {
             self.pending_dismiss = Some(new_key.clone());
         }
@@ -1436,6 +1449,7 @@ impl EmporiumState {
     /// step it has no reason to know about.
     fn unstage(&mut self, key: &SessionKey) {
         self.stage.remove(key);
+        self.spawn_order.remove(key);
         let token = self.member_tokens.remove(key);
         let brigade_id = self.member_brigades.remove(key);
         if let (Some(token), Some(brigade_id)) = (token, brigade_id) {
@@ -2552,16 +2566,24 @@ pub enum Event {
     },
     PtyExited {
         key: SessionKey,
-        /// What the shell's own `child.wait()` reported, if anything —
-        /// `None` covers both a stream recorded before this field existed
-        /// (`#[serde(default)]`, same precedent as `RowsLoaded::superseded`)
-        /// and a live tick where the shell reported the pane gone before its
-        /// own wait-observation caught up (`banto::embedded::session::
-        /// PtyHandle::poll`'s doc has the race). [`PtyExitReason::Unknown`]
-        /// is different from either: the shell *did* observe the exit, but
-        /// `wait()` itself returned an error rather than a status.
+        /// What the shell's own `child.wait()` reported. A live shell sends
+        /// `PtyExited` only with a reason — the report is what proves the process
+        /// ended; a pane whose output merely stopped is [`Self::PtyOutputLost`].
+        /// `None` therefore only appears in a stream recorded before this field
+        /// existed (`#[serde(default)]`, same precedent as
+        /// `RowsLoaded::superseded`), which still means an exit.
+        /// [`PtyExitReason::Unknown`] is different: the shell *did* observe the
+        /// exit, but `wait()` itself returned an error rather than a status.
         #[serde(default)]
         reason: Option<PtyExitReason>,
+    },
+    /// The pane's output stream ended or failed (its reader thread hit a read
+    /// error) and the process is **not known to have exited**: no exit report
+    /// came within the shell's bounded wait. banto can no longer read the pane,
+    /// but the process may well be running, so unlike [`Self::PtyExited`] this
+    /// proves nothing about the member — see `update_pty_output_lost`.
+    PtyOutputLost {
+        key: SessionKey,
     },
     /// The shell's `Cmd::WritePty` executor found no live handle for `key`
     /// — see `update_pty_write_dropped`'s own doc for why this is expected
@@ -2860,6 +2882,7 @@ pub fn update(
         Event::PtyExited { key, reason } => {
             update_pty_exited(state, app, brigade, key, reason, now)
         }
+        Event::PtyOutputLost { key } => update_pty_output_lost(state, app, brigade, key, now),
         Event::PtyWriteDropped { key } => update_pty_write_dropped(state, key, now),
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
@@ -4451,6 +4474,51 @@ impl RoleLaunch {
     }
 }
 
+/// The live panes core holds for the member `(brigade_id, token)`: a screen under
+/// a key whose ownership maps name that member — whatever the key is. A member's
+/// identity is its brigade and token, never its key: the key is a placeholder
+/// until discovery re-keys it to a session id, and is renamed again by a
+/// compaction fork.
+fn live_panes_of(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> Vec<SessionKey> {
+    let mut keys: Vec<SessionKey> = state
+        .screens
+        .keys()
+        .filter(|key| {
+            state.member_brigades.get(*key) == Some(&brigade_id)
+                && state.member_tokens.get(*key).map(String::as_str) == Some(token)
+        })
+        .cloned()
+        .collect();
+    keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    keys
+}
+
+/// Which of several live panes for one member survives: the one whose key is the
+/// session id the roster records for it, else the most recently spawned
+/// ([`EmporiumState::spawn_order`], a counter the core keeps, so "recent" is
+/// known and not guessed), else — only for a pane the core never saw spawn — the
+/// greatest key, which is arbitrary but the same every time.
+fn surviving_pane(
+    state: &EmporiumState,
+    live: &[SessionKey],
+    recorded: Option<&SessionKey>,
+) -> SessionKey {
+    if let Some(recorded) = recorded
+        && live.contains(recorded)
+    {
+        return recorded.clone();
+    }
+    live.iter()
+        .max_by_key(|key| {
+            (
+                state.spawn_order.get(*key).copied(),
+                key.as_str().to_string(),
+            )
+        })
+        .cloned()
+        .expect("at least one live pane")
+}
+
 /// Stage brigade `brigade_id`: `members` is its full roster (token, role,
 /// session id if known), already fetched by the shell alongside the
 /// membership resolution that led here. A member whose row is already
@@ -4496,7 +4564,44 @@ fn stage_brigade(
     let mut panes = Vec::new();
     let mut cmds = Vec::new();
     let mut missing = 0;
+    let mut duplicates = 0;
     for (token, role, session_id) in members {
+        // First, whatever the member's roster entry or session list say: if core
+        // already holds a live pane for this member, that pane is its tile and
+        // nothing is opened. Without this a Worker with a recorded session id but
+        // no transcript (so no session row) was looked for only under its
+        // placeholder key — where discovery had already re-keyed it away from —
+        // and a second process was started each time the brigade was staged.
+        let live = live_panes_of(state, brigade_id, token);
+        if !live.is_empty() {
+            let recorded = session_id.as_deref().map(SessionKey::from_id);
+            let survivor = surviving_pane(state, &live, recorded.as_ref());
+            // Any others are duplicates of one member — closed through the path
+            // that marks the exit as asked for, so they are neither relaunched
+            // nor counted as the Worker leaving the brigade. Ownership goes
+            // first, so the survivor's process is never touched and nothing
+            // else is named by the duplicate's key.
+            for duplicate in live.iter().filter(|key| **key != survivor) {
+                state.unstage(duplicate);
+                cmds.push(kill_pane(state, duplicate.clone()));
+                duplicates += 1;
+            }
+            if *role == BrigadeRole::Goinkyo {
+                state.goinkyo_pane.insert(brigade_id, survivor.clone());
+            }
+            // The store should name the pane the operator sees, so the relay and
+            // the MCP's liveness address it: a real id that differs from the
+            // roster's is recorded (a placeholder key is discovery's to resolve).
+            if !survivor.is_synthetic() && recorded.as_ref() != Some(&survivor) {
+                cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
+                    brigade_id,
+                    token: token.clone(),
+                    session_id: survivor.as_str().to_string(),
+                }));
+            }
+            panes.push(survivor);
+            continue;
+        }
         let resolved_row = session_id.as_deref().and_then(|sid| app.row_for_id(sid));
         match resolved_row {
             Some(row) => {
@@ -4652,6 +4757,16 @@ fn stage_brigade(
     state.focus = Focus::Pane;
     if missing > 0 {
         state.status = Some(format!("brigade staged ({missing} member(s) not found)"));
+    }
+    if duplicates > 0 {
+        let said = format!(
+            "closed {duplicates} duplicate pane{} of one member",
+            if duplicates == 1 { "" } else { "s" }
+        );
+        state.status = Some(match state.status.take() {
+            Some(earlier) => format!("{earlier}; {said}"),
+            None => said,
+        });
     }
     cmds
 }
@@ -5515,6 +5630,8 @@ fn update_spawned(
     state
         .screens
         .insert(key.clone(), crate::screen::Screen::new(24, 80));
+    state.spawn_order.insert(key.clone(), state.next_spawn);
+    state.next_spawn += 1;
     let Some(pending) = state.pending_opens.remove(&key) else {
         return Vec::new();
     };
@@ -5888,12 +6005,82 @@ fn update_pty_exited(
     }
 }
 
+/// A pane whose output is lost while its process is not known to have exited.
+/// The pane is unusable — banto cannot read it — so the tile goes; but nothing
+/// says the member left, so **nothing is removed from the store** (the member,
+/// its cursor and its mail stay) and nothing is relaunched.
+///
+/// The process is asked to end through the asked-for path ([`kill_pane`]), so it
+/// leaves no orphan and a later exit report is not mistaken for an unrequested
+/// one (the record is kept after the cleanup below consumes it: the shell drops
+/// the handle once the screen is gone, so none is expected, and a stale record
+/// is cleared by the next spawn of the key).
+///
+/// Not relaunched in place, on purpose: a reader that fails immediately would
+/// loop, restarting a process each time, and a relaunch while the old process
+/// might still be alive would resume one session twice (the double-resume the
+/// brigade guards against). The next staging reopens the member — the one-pane
+/// rule makes that a single reopen.
+///
+/// If a Director reopen or wiring is waiting on this very pane to be gone, the
+/// pane is gone as far as it can tell: continue as for an exit.
+fn update_pty_output_lost(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade: &BrigadeConfig,
+    key: SessionKey,
+    now: Instant,
+) -> Vec<Cmd> {
+    let waited_on = state
+        .pending_director_reopen
+        .as_deref()
+        .is_some_and(|id| SessionKey::from_id(id) == key)
+        || state
+            .pending_director_wiring
+            .as_ref()
+            .is_some_and(|wiring| SessionKey::from_id(&wiring.director_row_id) == key);
+    if waited_on || state.expected_exits.contains(&key) {
+        // banto asked for this one (or is waiting for it): the lost output is
+        // just how the end of a pane it killed reached it.
+        return update_pty_exited(state, app, brigade, key, None, now);
+    }
+    // Said as the operator knows it, before the cleanup drops the member's maps.
+    let call = match (
+        state.member_brigades.get(&key),
+        state.member_tokens.get(&key),
+    ) {
+        (Some(brigade_id), Some(token)) => state.member_call(Some(*brigade_id), token),
+        _ => app
+            .row_for_id(key.as_str())
+            .map(|row| row.display_title().to_string())
+            .unwrap_or_else(|| key.as_str().to_string()),
+    };
+    let is_member = state.member_tokens.contains_key(&key);
+    let cmds = vec![kill_pane(state, key.clone())];
+    // The ordinary cleanup of a pane that ended (screen, tile, ownership), as an
+    // asked-for exit: it neither relaunches nor removes the member.
+    update_pty_exited(state, app, brigade, key.clone(), None, now);
+    state.expected_exits.insert(key);
+    state.set_status(
+        if is_member {
+            format!("lost the output of {call} \u{2014} pane closed; it stays in the brigade")
+        } else {
+            format!("lost the output of {call} \u{2014} pane closed")
+        },
+        now,
+    );
+    cmds
+}
+
 /// Whether a pane that just ended is a Worker that left on its own — the only
 /// exit after which, if it is not relaunched, the member is removed from its
 /// brigade (no confirmation: nobody is at the keyboard for it). Every condition
 /// is a way this could remove a member that was meant to stay or was already
 /// going:
 ///
+/// - **its process is known to have exited**: this runs only for
+///   `Event::PtyExited`, which the shell sends on the wait thread's report; a pane
+///   whose output merely stopped is `Event::PtyOutputLost`, which removes nobody.
 /// - **banto did not ask for the exit** (`banto_asked`, [`kill_pane`]): a kill
 ///   the operator or a teardown requested — disband, dismissal, the Goinkyo's end,
 ///   a Director reopen — has its own outcome already.
@@ -7176,6 +7363,12 @@ mod display_name_tests;
 
 #[cfg(test)]
 mod member_exit_tests;
+
+#[cfg(test)]
+mod one_pane_tests;
+
+#[cfg(test)]
+mod one_pane_duplicates_tests;
 
 #[cfg(test)]
 mod stack_order_tests;

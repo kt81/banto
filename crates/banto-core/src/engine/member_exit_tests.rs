@@ -722,3 +722,197 @@ fn two_workers_ending_together_are_each_removed_under_their_own_token() {
     );
     assert!(state.removing_exited.is_empty());
 }
+
+// --- output lost is not an exit --------------------------------------------------
+//
+// The pane's output stream ending (a reader error) says nothing about the
+// process: only the shell's exit report does. These pin what core does with the
+// first fact when the second is missing.
+
+fn output_lost(state: &mut EmporiumState, app: &mut App, id: &str, at: Instant) -> Vec<Cmd> {
+    send(state, app, Event::PtyOutputLost { key: key(id) }, at)
+}
+
+fn opens_a_pane(cmds: &[Cmd]) -> bool {
+    cmds.iter()
+        .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. }))
+}
+
+fn removes_a_member(cmds: &[Cmd]) -> bool {
+    cmds.iter().any(|cmd| {
+        matches!(
+            cmd,
+            Cmd::Store(StoreIntent::DismissExitedWorker { .. } | StoreIntent::DismissWorker { .. })
+        )
+    })
+}
+
+#[test]
+fn lost_output_never_removes_a_worker_that_has_no_session_to_resume() {
+    // The exact case an exit removes: a Worker that never spoke.
+    let (mut state, mut app) = brigade(&[]);
+    let t = now();
+    let cmds = without_resizes(output_lost(&mut state, &mut app, "w1", t));
+    assert!(!removes_a_member(&cmds), "{cmds:?}");
+    assert!(state.removing_exited.is_empty());
+    // The unreadable pane is closed, and its process asked to end.
+    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }]);
+    assert!(matches!(&state.stage, Stage::Brigade { panes, .. } if !panes.contains(&key("w1"))));
+    assert!(!state.screens.contains_key(&key("w1")));
+    assert_eq!(
+        status(&state),
+        "lost the output of worker-1 \u{2014} pane closed; it stays in the brigade"
+    );
+}
+
+#[test]
+fn lost_output_does_not_relaunch_a_worker_that_has_a_session_to_resume() {
+    // An exit relaunches this one; lost output must not start a second process
+    // while the first may still be running.
+    let (mut state, mut app) = brigade(&["w1"]);
+    let cmds = without_resizes(output_lost(&mut state, &mut app, "w1", now()));
+    assert!(!opens_a_pane(&cmds), "{cmds:?}");
+    assert!(!removes_a_member(&cmds), "{cmds:?}");
+    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }]);
+    assert!(!state.last_relaunch.contains_key(&key("w1")));
+}
+
+#[test]
+fn lost_output_is_said_by_the_members_quoted_name() {
+    let (mut state, mut app) = brigade(&[]);
+    state.state_member_name(1, "worker-1", Some("impl"));
+    state.resolve_member_names(1);
+    output_lost(&mut state, &mut app, "w1", now());
+    assert_eq!(
+        status(&state),
+        "lost the output of \"impl\" \u{2014} pane closed; it stays in the brigade"
+    );
+}
+
+#[test]
+fn the_exit_that_follows_lost_output_removes_nobody_either() {
+    // The process may yet end (it was asked to): that report is the asked-for
+    // one, not a Worker leaving on its own.
+    let (mut state, mut app) = brigade(&[]);
+    let t = now();
+    output_lost(&mut state, &mut app, "w1", t);
+    let cmds = without_resizes(exits(&mut state, &mut app, "w1", t));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(state.removing_exited.is_empty());
+}
+
+#[test]
+fn lost_output_of_the_director_closes_its_pane_and_keeps_the_member() {
+    let (mut state, mut app) = brigade(&["w1"]);
+    let cmds = without_resizes(output_lost(&mut state, &mut app, "dir", now()));
+    assert_eq!(cmds, vec![Cmd::KillPty { key: key("dir") }]);
+    assert!(matches!(
+        &state.stage,
+        Stage::Brigade { director: None, .. }
+    ));
+    assert!(
+        status(&state).starts_with("lost the output of"),
+        "{}",
+        status(&state)
+    );
+}
+
+#[test]
+fn lost_output_of_the_goinkyo_closes_its_pane_and_removes_nobody() {
+    let (mut state, mut app) = brigade(&[]);
+    let goinkyo = SessionKey::new_worker(1, GOINKYO_TOKEN);
+    state.screens.insert(goinkyo.clone(), Screen::new(24, 80));
+    state
+        .member_tokens
+        .insert(goinkyo.clone(), GOINKYO_TOKEN.to_string());
+    state.member_brigades.insert(goinkyo.clone(), 1);
+    state.goinkyo_pane.insert(1, goinkyo.clone());
+    if let Stage::Brigade { panes, .. } = &mut state.stage {
+        panes.push(goinkyo.clone());
+    }
+    let cmds = without_resizes(send(
+        &mut state,
+        &mut app,
+        Event::PtyOutputLost {
+            key: goinkyo.clone(),
+        },
+        now(),
+    ));
+    assert_eq!(cmds, vec![Cmd::KillPty { key: goinkyo }]);
+    assert!(state.goinkyo_pane.is_empty());
+}
+
+#[test]
+fn lost_output_of_a_single_session_just_closes_it() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    state.screens.insert(key("solo"), Screen::new(24, 80));
+    state.stage = Stage::Solo(key("solo"));
+    let mut app = App::new(vec![row("solo")]);
+    let cmds = without_resizes(output_lost(&mut state, &mut app, "solo", now()));
+    assert_eq!(cmds, vec![Cmd::KillPty { key: key("solo") }]);
+    assert!(!state.screens.contains_key(&key("solo")));
+    assert_eq!(
+        status(&state),
+        "lost the output of solo \u{2014} pane closed"
+    );
+}
+
+#[test]
+fn lost_output_of_a_pane_banto_asked_to_end_is_an_ordinary_asked_for_end() {
+    // Dismissal in flight: the pane was killed on purpose, and the kill reached
+    // banto as a lost stream. No second kill, no claim that anything was lost.
+    let (mut state, mut app) = brigade(&[]);
+    let t = now();
+    let kill = kill_pane(&mut state, key("w1"));
+    assert!(matches!(kill, Cmd::KillPty { .. }));
+    let cmds = without_resizes(output_lost(&mut state, &mut app, "w1", t));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(!state.screens.contains_key(&key("w1")));
+    assert!(
+        !status(&state).starts_with("lost the output"),
+        "{}",
+        status(&state)
+    );
+}
+
+#[test]
+fn lost_output_of_a_pane_that_is_already_gone_does_nothing_harmful() {
+    let (mut state, mut app) = brigade(&[]);
+    let t = now();
+    output_lost(&mut state, &mut app, "w1", t);
+    let cmds = without_resizes(output_lost(&mut state, &mut app, "w1", t));
+    assert!(!removes_a_member(&cmds), "{cmds:?}");
+    assert!(!opens_a_pane(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn a_confirmed_exit_still_removes_the_worker_lost_output_would_have_spared() {
+    // The pair, side by side: the same Worker, the same state; only the fact
+    // reported differs.
+    let (mut state, mut app) = brigade(&[]);
+    let cmds = without_resizes(exits(&mut state, &mut app, "w1", now()));
+    assert!(removes_a_member(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn lost_output_of_a_director_being_reopened_continues_the_reopen_and_cannot_hang_it() {
+    // The reopen waits for the pane to be gone; the pane it killed may reach
+    // banto as a lost stream instead of an exit report.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    state.screens.insert(key("dir"), Screen::new(24, 80));
+    let mut app = App::new(vec![row("dir")]);
+    app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
+    let cmds = confirm_director_reopen_modal(&mut state, &mut app);
+    assert_eq!(cmds, vec![Cmd::KillPty { key: key("dir") }]);
+
+    let cmds = output_lost(&mut state, &mut app, "dir", now());
+    assert!(!state.screens.contains_key(&key("dir")));
+    assert!(state.pending_director_reopen.is_none());
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Cmd::Store(StoreIntent::FormBrigade { .. })]
+        ),
+        "{cmds:?}"
+    );
+}

@@ -39,10 +39,10 @@ pub struct PtyIo {
     /// what `Child::wait()` reported (translated to banto-core's own plain
     /// [`PtyExitReason`] here, at the I/O boundary — see that type's own
     /// doc for why the richer `portable_pty::ExitStatus` never leaves this
-    /// crate). On ConPTY, a child's exit does **not** produce EOF on
-    /// `output` (the pseudoconsole keeps the pipe open), so `output`
-    /// disconnecting is a Unix-only signal — this channel is the active,
-    /// cross-platform one. See `PortablePtyHost::open`'s exit-waiter thread
+    /// crate). The only proof the process ended: `output` disconnecting is
+    /// not one, because the reader thread drops its sender on *any* read
+    /// error, and on ConPTY a child's exit does **not** produce EOF on
+    /// `output` at all (the pseudoconsole keeps the pipe open). See `PortablePtyHost::open`'s exit-waiter thread
     /// and, in the `banto` crate, `embedded::session::PtyHandle::poll`'s
     /// doc for how the two combine.
     pub exited: Receiver<PtyExitReason>,

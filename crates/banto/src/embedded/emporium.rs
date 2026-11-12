@@ -613,7 +613,8 @@ fn event_loop(
         // advancing too, matching the pre-migration "pump every session").
         // `PtyPoll::Disconnected` is only ever reached once a handle's every
         // last chunk has been drained (see `PtyHandle::poll`'s doc), so a
-        // handle reports it once, right here, then gets dropped below.
+        // handle reports its end once, right here, then gets dropped below —
+        // as an exit or as lost output, whichever the evidence supports.
         let pty_pump_start = Instant::now();
         for (key, handle) in &mut handles {
             loop {
@@ -624,10 +625,12 @@ fn event_loop(
                     }),
                     PtyPoll::Empty => break,
                     PtyPoll::Disconnected => {
-                        events.push_back(Event::PtyExited {
-                            key: key.clone(),
-                            reason: handle.exit_reason(),
-                        });
+                        // Two facts, reported apart (`disconnect_event`): core
+                        // decides what each means.
+                        events.push_back(super::session::disconnect_event(
+                            key.clone(),
+                            handle.exit_reason(),
+                        ));
                         break;
                     }
                 }
