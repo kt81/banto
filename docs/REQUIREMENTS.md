@@ -587,7 +587,7 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 | … `M` | open every collapsed tile and turn the solo off |
 | … `1`-`9` | jump to pane N |
 | … `s`/`Esc` | back to the sidebar |
-| … `x` | kill the focused pane (confirm) |
+| … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted); on a Director or a single session, end its process (confirm) |
 | … `b`/`Ctrl+B` | send a literal prefix chord through to the child |
 
 While the prefix is armed, the status bar shows the full binding table.
@@ -746,14 +746,22 @@ with no Goinkyo row at all — unstages and kills whatever pane was tracked
 for it, the same way dismissing a Worker already closes its pane. Two ways
 to end one: the Director's own `dismiss_goinkyo` MCP tool (see "MCP
 mediation server" below), or the operator picking Dismiss from the
-prefix-`x` kill-confirm dialog on the Goinkyo's own pane — the same choice
-a Worker's pane already offered.
+prefix-`x` confirm dialog on the Goinkyo's own pane — the same one-step
+dismissal a Worker's pane has. Both end in the same store operation
+(`Store::dismiss_worker(brigade, "goinkyo")`); the MCP tool then relies on the
+next tick finding the row gone, while the operator's path also unstages the
+pane at once and forgets what the core kept for the token — the tick's later
+`NoGoinkyo` still releases the one-shot spawn guard and asks to kill a pane that
+is already gone (a no-op). Neither removes the consultation's request file; the
+next consultation overwrites it.
 
 That dialog decides in two separate stages, not one, both role-based now:
-*whether to offer* Dismiss at all reads `Stage::Brigade`'s own `director:
-Option<SessionKey>` field directly (`director.is_some() &&
-director.as_ref() != panes.get(focused)`) — not the focused pane's
-position. `panes`' own order is display-only and best-effort (a convenience
+*whether the confirm dismisses* anything reads the focused pane's member token
+in a staged brigade (a Worker's or the Goinkyo's, never the Director's) — not
+the pane's position, and not whether the Director's own pane is currently known:
+a Worker is plainly a Worker either way. (Not dismissed, the confirm only ends
+the process: the Director's own pane, a single non-brigade session, and a pane of
+a staged brigade the core holds no member token for.) `panes`' own order is display-only and best-effort (a convenience
 `update_spawned` attempts on arrival, director-first when it can, never
 load-bearing): `Store::brigade_members`' `ORDER BY` puts the Director
 first and the common formation path preserves that into `panes`, but a
@@ -764,7 +772,8 @@ matters for correctness, only for which pane a fresh operator's eye lands
 on first. *Whether a confirmed Dismiss actually deletes anything* is a
 separate, later check on the member's real role from the store
 (`update_membership_resolved`), which refuses for a Director regardless of
-what the dialog showed — unchanged, and still the check that actually
+what the dialog showed — and, like an answer that names no member at all, now
+says so in the status instead of doing nothing — still the check that actually
 guards deletion; the two stages agreeing is what closes the old UX gap
 (Dismiss missing, or offered, on the wrong pane) that a position-derived
 first stage used to risk. Disband does *not* reach the
@@ -899,11 +908,27 @@ terminal's input line, and a dropped Enter with text still present could make
 a retry duplicate the bootstrap sentence. Exhaustion remains visible as a
 periodic qualified status reminder rather than silently looping.
 
-**Lifecycle.** Killing a Worker's pane (prefix-`x`) lets it respawn fresh under
-the same token next time its brigade is staged; *dismissing* one (a separate
-choice on the same confirm dialog) removes it from the brigade for good —
-membership, message cursor, and any mail addressed specifically to it, all
-gone. Disbanding (`B` on a Director) removes the whole cell.
+**Lifecycle.** A Worker is disposable. Prefix-`x` on a Worker's (or the Goinkyo's)
+tile asks once and *dismisses* it: it leaves the brigade for good — membership,
+read cursor, and any mail addressed specifically to it, all gone — and its pane
+ends; its session itself is not deleted (it can still be resumed on its own).
+There is no "close the pane but keep the member": one with no pane has no tile to
+act on, and too many tiles is what collapse and solo are for. A Director leaves
+only by disbanding the brigade (`B`), which removes the whole cell. A **restart**
+keeps everyone: staging reopens every member there is (resuming its session, or a
+fresh spawn for a Worker with nothing to resume).
+
+**A Worker that ends on its own.** An exit banto did not ask for (a crash, an
+agent updating itself, Ctrl+D in the pane) is relaunched in place when it can be:
+the Worker has a session to resume and did not already die within the last minute.
+When it cannot — it never spoke, so there is no session row to resume, or it died
+again inside that minute — the Worker leaves the brigade (`Store::dismiss_worker`,
+no confirmation) and the status says so (`worker-5 exited — removed from the
+brigade`, `"impl" exited again — removed from the brigade`); a store failure says
+so and leaves the member. It is Workers only: a Director's or a Goinkyo's pane
+ending un-stages it and keeps the member, as before. It never fires for an exit
+banto asked for (a kill, a dismissal, a disband), while banto is quitting, for a
+brigade being disbanded, twice for one member, or when the row is already gone.
 
 **Config** (`crates/banto-core/src/config.rs`, `[brigade]` in config.toml):
 

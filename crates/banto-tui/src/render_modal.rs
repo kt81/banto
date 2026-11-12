@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::app::{
-    GroupJoinState, GroupRenameState, KillChoice, Modal, NewSessionPlacement, NewSessionState,
+    GroupJoinState, GroupRenameState, Modal, NewSessionPlacement, NewSessionState,
     WorkerAgentPickerState,
 };
 
@@ -183,10 +183,8 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_cho
         }
         Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
         Modal::ConfirmKill {
-            title,
-            worker_choice,
-            ..
-        } => render_confirm_kill_modal(frame, title, *worker_choice, area),
+            title, dismisses, ..
+        } => render_confirm_kill_modal(frame, title, dismisses.as_deref(), area),
         Modal::WorkerAgentPicker(state) => render_worker_agent_picker_modal(frame, state, area),
         Modal::ConfirmCodexTrust => render_confirm_codex_trust_modal(frame, area),
         Modal::ConfirmDirectorReopen { name, .. } => {
@@ -425,23 +423,14 @@ fn render_confirm_director_reopen_modal(frame: &mut Frame, name: &str, area: Rec
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Render the emporium's prefix-`x` kill confirm dialog. A Director or solo
-/// pane (`worker_choice: None`) keeps the original one-line yes/no prompt:
-/// killing only ends the process — brigade membership is untouched, so a
-/// killed Worker respawns fresh under the same token the next time its
-/// brigade is staged (the same disposable-Worker semantics `stage_brigade`
-/// already has for one that's simply gone). A Worker's pane
-/// (`worker_choice: Some`) instead shows both choices as a two-item list —
-/// close pane (the paragraph above) or dismiss it from the brigade for
-/// good — with Up/Down toggling which is highlighted, the same candidate-
-/// list idiom as every other modal here.
-fn render_confirm_kill_modal(
-    frame: &mut Frame,
-    title: &str,
-    worker_choice: Option<KillChoice>,
-    area: Rect,
-) {
-    let Some(choice) = worker_choice else {
+/// Render the emporium's prefix-`x` confirm dialog. For a brigade member other
+/// than the Director (`dismisses: Some(who)`) confirming dismisses it, and the
+/// dialog says exactly that — who, that it leaves the brigade for good, and that
+/// its session itself is not deleted. A Director or solo pane (`dismisses:
+/// None`) keeps the plain kill prompt: ending the process is all it does, and a
+/// Director is removed by disbanding.
+fn render_confirm_kill_modal(frame: &mut Frame, title: &str, dismisses: Option<&str>, area: Rect) {
+    let Some(who) = dismisses else {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
@@ -454,8 +443,8 @@ fn render_confirm_kill_modal(
         let lines = vec![
             Line::from(prompt),
             Line::from(Span::styled(
-                "Ends the process now. A Worker respawns fresh next time its \
-                 brigade is staged; a Director does not.",
+                "Ends the process now. A Director stays in its brigade \
+                 (disband it with B to remove it).",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -466,43 +455,25 @@ fn render_confirm_kill_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" Kill Worker \u{2014} confirm ")
-        .title_bottom(" \u{2191}\u{2193} choose  Enter confirm  Esc cancel ");
+        .title(" Dismiss from the brigade \u{2014} confirm ")
+        .title_bottom(" Enter dismiss  Esc cancel ");
     let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
-    let [prompt_area, list_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-
-    let prompt = truncate_to_width(
-        &format!("\"{title}\" \u{2014} what now?"),
-        prompt_area.width,
-    );
-    frame.render_widget(Paragraph::new(prompt), prompt_area);
-
-    let items = [
-        ListItem::new(vec![
-            Line::from("Close pane"),
-            Line::from(Span::styled(
-                "  Keeps its place in the brigade.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
-        ListItem::new(vec![
-            Line::from("Dismiss from the brigade"),
-            Line::from(Span::styled(
-                "  For good \u{2014} membership, cursor, and its mail are gone.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
+    let prompt = truncate_to_width(&format!("Dismiss {who} from the brigade?"), inner.width);
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(Span::styled(
+            "It leaves for good \u{2014} membership, read cursor and the mail \
+             addressed to it. Its session is not deleted: it can still be \
+             resumed on its own.",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut list_state = ListState::default();
-    list_state.select(Some(match choice {
-        KillChoice::ClosePane => 0,
-        KillChoice::Dismiss => 1,
-    }));
-    frame.render_stateful_widget(list, list_area, &mut list_state);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        inner,
+    );
 }
 
 /// Render the `g` group-join dialog: a one-line new-group-name input (same
@@ -727,20 +698,33 @@ mod tests {
     }
 
     #[test]
-    fn worker_kill_modal_shows_both_choices() {
-        let area = Rect::new(2, 2, 50, 10);
-        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+    fn member_kill_modal_says_who_is_dismissed_and_what_that_means() {
+        let area = Rect::new(2, 2, 60, 10);
+        let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
         terminal
-            .draw(|frame| {
-                render_confirm_kill_modal(frame, "worker-1", Some(KillChoice::ClosePane), area)
-            })
+            .draw(|frame| render_confirm_kill_modal(frame, "worker-1", Some("\"impl\""), area))
             .unwrap();
         let text = buffer_text(terminal.backend().buffer());
 
-        assert!(text.contains("Close pane"), "missing first choice:\n{text}");
         assert!(
-            text.contains("Dismiss from the brigade"),
-            "missing second choice:\n{text}"
+            text.contains("Dismiss \"impl\" from the brigade?"),
+            "missing who:\n{text}"
+        );
+        for part in [
+            "for good",
+            "membership",
+            "read cursor",
+            "mail",
+            "not deleted",
+            "resumed",
+        ] {
+            assert!(text.contains(part), "missing {part:?}:\n{text}");
+        }
+        assert!(text.contains("Enter dismiss"), "missing the hint:\n{text}");
+        assert!(text.contains("Esc cancel"), "missing the hint:\n{text}");
+        assert!(
+            !text.contains("Close pane"),
+            "there is no close-only choice any more:\n{text}"
         );
     }
 
@@ -758,8 +742,8 @@ mod tests {
             "missing plain prompt:\n{text}"
         );
         assert!(
-            !text.contains("Dismiss from the brigade"),
-            "a Director/solo pane must not show the dismiss choice:\n{text}"
+            !text.contains("Dismiss"),
+            "a Director/solo pane must not offer to dismiss:\n{text}"
         );
     }
 

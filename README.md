@@ -209,7 +209,7 @@ Everything above (minus split), plus:
 | … arrows | directional pane navigation |
 | … `1`-`9` | jump to pane N |
 | … `s`/`Esc` | back to the sidebar |
-| … `x` | kill the focused pane (confirm) |
+| … `x` | dismiss the focused Worker/Goinkyo from its brigade (confirm; it leaves for good, its session is kept); on a Director or a single session, end its process |
 | … `b`/`Ctrl+B` | send a literal prefix chord to the child |
 
 While the prefix is armed, the status bar shows the full binding table —

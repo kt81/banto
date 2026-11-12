@@ -1660,13 +1660,39 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let result = store
                 .dismiss_worker(brigade_id, &token)
                 .map_err(|err| err.to_string())
-                .map(|()| {
+                .map(|_| {
                     (
                         crate::tui::load_hidden_member_ids(&store),
                         crate::tui::load_directors(&store),
                     )
                 });
             vec![Event::WorkerDismissed { brigade_id, result }]
+        }
+        // The same store operation for a Worker that ended on its own and could
+        // not be relaunched; what differs is the answer, which names the member
+        // and says whether a row was there.
+        StoreIntent::DismissExitedWorker {
+            brigade_id,
+            token,
+            repeated,
+        } => {
+            let mut store = store.borrow_mut();
+            let result = store
+                .dismiss_worker(brigade_id, &token)
+                .map_err(|err| err.to_string())
+                .map(|removed| {
+                    (
+                        removed,
+                        crate::tui::load_hidden_member_ids(&store),
+                        crate::tui::load_directors(&store),
+                    )
+                });
+            vec![Event::ExitedWorkerDismissed {
+                brigade_id,
+                token,
+                repeated,
+                result,
+            }]
         }
         StoreIntent::SetMemberSession {
             brigade_id,
@@ -5724,6 +5750,116 @@ mod tests {
         .unwrap();
         assert_ne!(other, brigade_id);
         assert_eq!(tokens, ["worker-1"]);
+    }
+
+    #[test]
+    fn dismissing_an_exited_worker_answers_with_its_token_and_whether_a_row_was_there() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        let token = store.add_worker(brigade_id, None).unwrap();
+        let store = RefCell::new(store);
+        let intent = |token: &str, repeated| StoreIntent::DismissExitedWorker {
+            brigade_id,
+            token: token.to_string(),
+            repeated,
+        };
+
+        let events = execute_store_intent(intent(&token, true), &store);
+        let [
+            Event::ExitedWorkerDismissed {
+                brigade_id: id,
+                token: answered,
+                repeated,
+                result: Ok((removed, ..)),
+            },
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(
+            (*id, answered.as_str(), *repeated, *removed),
+            (brigade_id, "worker-1", true, true)
+        );
+        assert!(
+            store
+                .borrow()
+                .brigade_member(brigade_id, "worker-1")
+                .unwrap()
+                .is_none()
+        );
+
+        // Asked again for a row that is gone: removed = false.
+        let events = execute_store_intent(intent("worker-1", false), &store);
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ExitedWorkerDismissed {
+                result: Ok((false, ..)),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_worker_that_ends_unspoken_is_gone_from_the_roster_brigade_status_reads() {
+        // End to end over a temp file store: add a Worker, let its pane end
+        // without it ever having spoken, run the removal the core asks for.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        let mut writer = Store::open(&db).unwrap();
+        let brigade_id = writer.create_brigade("cell").unwrap();
+        writer
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        // The two Workers `staged_brigade_of_two_workers` stages.
+        for _ in 0..2 {
+            writer
+                .add_worker(brigade_id, Some(AgentKind::ClaudeCode))
+                .unwrap();
+        }
+        let store = RefCell::new(Store::open(&db).unwrap());
+        let roster = |store: &RefCell<Store>| -> Vec<String> {
+            store
+                .borrow()
+                .brigade_members(brigade_id)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.token)
+                .collect()
+        };
+        assert_eq!(roster(&store), ["director", "worker-1", "worker-2"]);
+
+        let (mut state, mut app, config) = staged_brigade_of_two_workers();
+        let worker = SessionKey::from_id("new-worker::1::worker-1");
+        // The pane ends on its own: there is no session row to resume.
+        let mut events = VecDeque::from([Event::PtyExited {
+            key: worker.clone(),
+            reason: None,
+        }]);
+        while let Some(event) = events.pop_front() {
+            for cmd in engine::update(&mut state, &mut app, &config, event, Instant::now()) {
+                if let Cmd::Store(intent) = cmd {
+                    events.extend(execute_store_intent(intent, &store));
+                }
+            }
+        }
+
+        // The roster brigade_status and the staging read no longer lists it ...
+        assert_eq!(roster(&store), ["director", "worker-2"]);
+        // ... the other Worker is untouched, the tile is gone, and the operator
+        // was told.
+        assert!(matches!(
+            &state.stage,
+            Stage::Brigade { panes, .. } if !panes.contains(&worker) && panes.len() == 2
+        ));
+        assert_eq!(
+            state.displayed_status(),
+            Some("worker-1 exited \u{2014} removed from the brigade")
+        );
     }
 
     #[test]

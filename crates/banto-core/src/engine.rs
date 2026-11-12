@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use ratatui_core::layout::{Position, Rect};
 use serde::{Deserialize, Serialize};
 
-use crate::app::{App, ClickOutcome, GroupId, GroupJoinTarget, KillChoice, Modal, Mode};
+use crate::app::{App, ClickOutcome, GroupId, GroupJoinTarget, Modal, Mode};
 use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::display_text::{display_name, shorten_to_columns};
 use crate::input::{
@@ -127,8 +127,8 @@ pub enum Stage {
         /// legitimate state, not a gap to close: `stage_brigade` sets it
         /// leniently from the store's own member row (no session id
         /// recorded yet there → `None`), and closing just the Director's
-        /// own pane (prefix-`x`, `ClosePane` — never routed through
-        /// dismiss, see `PrefixAction::Kill`'s own doc; `Stage::remove`
+        /// own pane (prefix-`x` on it only ends the process — a Director leaves
+        /// a brigade by disbanding it, see `PrefixAction::Kill`'s own doc; `Stage::remove`
         /// clears this field the same moment it drops that pane from
         /// `panes`) leaves a brigade legitimately staged around its other
         /// members with the Director simply unknown-for-now. Every
@@ -1055,6 +1055,16 @@ pub struct EmporiumState {
     /// nothing would overwrite it) and, for the Goinkyo, whose token the next
     /// consultation reuses, be inherited by a different member.
     pending_dismiss_member: Option<(BrigadeId, MemberToken)>,
+    /// Brigades being disbanded (the confirm was given) or disbanded: a pane of
+    /// one that ends afterwards is not a Worker leaving, so no dismissal
+    /// follows (`unrequested_worker_exit`). Brigade ids are never reissued, so
+    /// an entry never has to be taken back — except when the disband fails.
+    disbanding: HashSet<BrigadeId>,
+    /// Workers whose removal from the store, after an exit nobody asked for, is
+    /// in flight: never asked for twice, and the answer
+    /// ([`Event::ExitedWorkerDismissed`]) carries the token, so it needs no
+    /// slot shared with the operator's own dismissal.
+    removing_exited: HashSet<(BrigadeId, MemberToken)>,
     pub size: (u16, u16),
     /// The sidebar's width in columns, as the operator last dragged it
     /// (default [`SIDEBAR_WIDTH`]). A preference: clamped wherever it is
@@ -1215,10 +1225,13 @@ const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 /// Every kill banto performs goes through here. The alternative — reading the
 /// surrounding state at exit time — very nearly works: dismissing a Worker,
 /// disbanding, and both Goinkyo paths all un-stage before they kill, so by
-/// the time the exit arrives the key is already gone from the stage. The one
-/// that does not is the plain `x` kill, which sets nothing and un-stages
-/// nothing, and is therefore indistinguishable at exit time from a child that
-/// died by itself. That asymmetry is what this exists to remove.
+/// the time the exit arrives the key is already gone from the stage. The ones
+/// that do not — prefix-`x` on a Director or a single session, which only ends
+/// the process — set nothing and un-stage nothing, and are therefore
+/// indistinguishable at exit time from a child that died by itself. That
+/// asymmetry is what this exists to remove; and an exit banto did not ask for is
+/// the one after which a Worker that cannot be relaunched leaves its brigade
+/// (`unrequested_worker_exit`), so the record must never be missing.
 fn kill_pane(state: &mut EmporiumState, key: SessionKey) -> Cmd {
     state.expected_exits.insert(key.clone());
     Cmd::KillPty { key }
@@ -1260,6 +1273,8 @@ impl EmporiumState {
             pending_director_wiring: None,
             pending_dismiss: None,
             pending_dismiss_member: None,
+            disbanding: HashSet::new(),
+            removing_exited: HashSet::new(),
             size: (0, 0),
             sidebar_width: SIDEBAR_WIDTH,
             brigade_layouts: HashMap::new(),
@@ -2078,7 +2093,8 @@ enum PrefixAction {
     OutOfRange,
     /// `s` or Esc: return focus to the sidebar.
     Sidebar,
-    /// `x`: open the kill-confirm dialog for the focused pane.
+    /// `x`: open the confirm dialog for the focused pane — dismissing a brigade
+    /// member other than the Director, ending the process of anything else.
     Kill,
     /// Anything else — including any of the plain-char bindings above with
     /// a modifier held (a Ctrl/Alt-mangled `o`/`s`/`x`/digit is never a
@@ -2332,6 +2348,17 @@ pub enum StoreIntent {
         brigade_id: BrigadeId,
         token: MemberToken,
     },
+    /// Remove a Worker whose pane ended without banto asking and could not be
+    /// relaunched (`update_pty_exited`): the same store operation as
+    /// [`Self::DismissWorker`], answered by [`Event::ExitedWorkerDismissed`],
+    /// which carries the token so it shares nothing with the operator's own
+    /// dismissal. `repeated`: it died again inside the relaunch cooldown, for
+    /// the status text.
+    DismissExitedWorker {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+        repeated: bool,
+    },
     SetMemberSession {
         brigade_id: BrigadeId,
         token: MemberToken,
@@ -2413,8 +2440,8 @@ pub enum Cmd {
         permission_mode: Option<String>,
         disallowed_tools: Option<String>,
     },
-    /// Kill the child at `key` — active termination (prefix-`x` confirm, or
-    /// a disbanded brigade's Workers). The passive `Event::PtyExited` fold
+    /// Kill the child at `key` — active termination (a confirmed prefix-`x`
+    /// dismissal or kill, a disbanded brigade's Workers, a Goinkyo's end). The passive `Event::PtyExited` fold
     /// is what actually cleans up the pane once this takes effect; this Cmd
     /// is only ever "make the exit happen".
     KillPty {
@@ -2724,6 +2751,15 @@ pub enum Event {
         brigade_id: BrigadeId,
         result: Result<(HashSet<String>, HashSet<String>), String>,
     },
+    /// `StoreIntent::DismissExitedWorker` completed. On success: whether a row
+    /// was there to remove (`false`: it was already gone, so nothing is said),
+    /// then the refreshed hidden/director sets, as for [`Self::WorkerDismissed`].
+    ExitedWorkerDismissed {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+        repeated: bool,
+        result: Result<(bool, HashSet<String>, HashSet<String>), String>,
+    },
     MemberSessionRecorded {
         hidden: HashSet<String>,
         directors: HashSet<String>,
@@ -3024,6 +3060,12 @@ pub fn update(
         Event::WorkerDismissed { brigade_id, result } => {
             update_worker_dismissed(state, app, brigade_id, result, now)
         }
+        Event::ExitedWorkerDismissed {
+            brigade_id,
+            token,
+            repeated,
+            result,
+        } => update_exited_worker_dismissed(state, app, brigade_id, token, repeated, result, now),
         Event::MemberSessionRecorded { hidden, directors } => {
             app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
@@ -3589,20 +3631,24 @@ fn resolve_armed_prefix(
                 .row_for_id(target.as_str())
                 .map(|row| row.display_title().to_string())
                 .unwrap_or_else(|| target.as_str().to_string());
-            // Role, not position: the focused pane is dismissable when we
-            // know who the Director is *and* it isn't them —
-            // `update_membership_resolved` is what actually tells Worker
-            // from Goinkyo apart once dismiss is confirmed, so no store
-            // round trip is needed just to grow the dialog its second
-            // choice. `director == None` (the Director's own pane closed,
-            // or never resolved) is the safe side: refuse rather than guess
-            // — see `Stage::Brigade::director`'s own doc.
-            let dismissable = matches!(
-                &state.stage,
-                Stage::Brigade { director, focused, panes, .. }
-                    if director.is_some() && director.as_ref() != panes.get(*focused)
-            );
-            app.open_confirm_kill_modal(target.as_str().to_string(), title, dismissable);
+            // Who confirming dismisses, if anyone. Role, not position: a pane of
+            // a staged brigade is a member whose token core holds, and anything
+            // but the Director's is a Worker or the Goinkyo — dismissed, named as
+            // the operator knows it. That holds with or without a known Director
+            // pane: a Worker is plainly a Worker either way. Not dismissed (the
+            // confirm only ends the process, as it always did): the Director's
+            // own pane (a Director leaves by disbanding, `B`), and a single
+            // non-brigade session — including a member opened solo from the
+            // sidebar, which carries no membership in the stage to read.
+            let dismisses = match &state.stage {
+                Stage::Brigade { id, director, .. } if director.as_ref() != Some(&target) => state
+                    .member_tokens
+                    .get(&target)
+                    .filter(|token| token.as_str() != DIRECTOR_TOKEN)
+                    .map(|token| state.member_call(Some(*id), token)),
+                _ => None,
+            };
+            app.open_confirm_kill_modal(target.as_str().to_string(), title, dismisses);
             Vec::new()
         }
         PrefixAction::Unbound => {
@@ -3753,7 +3799,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::GroupRename) => confirm_group_rename_modal(app),
         Some(Kind::GroupDelete) => confirm_group_delete_modal(app),
         Some(Kind::New) => confirm_new_session_modal(app),
-        Some(Kind::Disband) => confirm_disband_modal(app),
+        Some(Kind::Disband) => confirm_disband_modal(state, app),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
         Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
         Some(Kind::CodexTrust) => confirm_codex_trust_modal(state, app),
@@ -3944,45 +3990,44 @@ fn update_new_session_cwd_checked(
     }]
 }
 
-fn confirm_disband_modal(app: &mut App) -> Vec<Cmd> {
+fn confirm_disband_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let Some(Modal::ConfirmDisband { brigade_id, .. }) = app.modal() else {
         return Vec::new();
     };
     let brigade_id = *brigade_id;
     app.close_modal();
+    // From the confirm, not from the result: a pane that ends while the disband
+    // is in flight is not a Worker leaving a brigade that is about to be gone.
+    state.disbanding.insert(brigade_id);
     vec![Cmd::Store(StoreIntent::Disband { brigade_id })]
 }
 
-/// Confirm the kill dialog. [`KillChoice::ClosePane`] (the only choice for a
-/// Director/solo pane, and the default for a dismissable member's — Worker
-/// or Goinkyo) just makes the exit happen — no store mutation, membership
-/// persists, and a killed member respawns fresh under the same token the
-/// next time its brigade is staged (the existing, field-tested disposable-
-/// Worker semantics `stage_brigade` already has for one whose process is
-/// simply gone — equally true for a Goinkyo with a resolved session id, its
-/// own resumed-member branch there). The passive `Event::PtyExited` fold
-/// (unchanged, see `update_pty_exited`) is what actually cleans up the pane
-/// once the kill takes effect.
+/// Confirm the prefix-`x` dialog. For a brigade member other than the Director —
+/// a Worker or the Goinkyo, the dialog's `dismisses` is `Some` — confirming
+/// **dismisses** it: it leaves the brigade for good (membership, read cursor,
+/// mail addressed to it) and its pane ends. There is no "close the pane and keep
+/// the member": a Worker is disposable, and a member with no pane has no tile to
+/// act on, so keeping one only made invisible members. (A restart is unaffected:
+/// staging reopens every member there is.) For the Director's own pane and for a
+/// single session, `dismisses` is `None` and confirming only ends the process
+/// — a Director leaves a brigade by disbanding it.
 ///
-/// [`KillChoice::Dismiss`] needs `(brigade_id, token)` before
-/// `StoreIntent::DismissWorker` can be built: a still-awaiting-discovery
-/// member's synthetic key already embeds them
-/// ([`SessionKey::worker_identity`] — Worker-named, Goinkyo-shaped too, see
-/// its own doc), so that path builds the intent right here; a resolved
-/// member's real session id does not, so that path stashes
-/// [`PendingMembership::DismissWorker`] and spends one `ResolveMembership`
-/// round trip instead. Either way `state.pending_dismiss` is set first, so
+/// Dismissing needs `(brigade_id, token)` before `StoreIntent::DismissWorker` can
+/// be built: a still-awaiting-discovery member's synthetic key already embeds
+/// them ([`SessionKey::worker_identity`] — Worker-named, Goinkyo-shaped too, see
+/// its own doc), so that path builds the intent right here; a resolved member's
+/// real session id does not, so that path stashes
+/// [`PendingMembership::DismissWorker`] and spends one `ResolveMembership` round
+/// trip instead. Either way `state.pending_dismiss` is set first, so
 /// [`update_worker_dismissed`] knows which pane to actually remove once the
-/// dismissal (or its round trip) comes back.
+/// dismissal (or its round trip) comes back. The passive `Event::PtyExited` fold
+/// (see `update_pty_exited`) is what cleans up a pane that was only killed.
 fn confirm_kill_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
-    let Some(Modal::ConfirmKill {
-        key, worker_choice, ..
-    }) = app.modal()
-    else {
+    let Some(Modal::ConfirmKill { key, dismisses, .. }) = app.modal() else {
         return Vec::new();
     };
     let key = SessionKey::from_id(key);
-    let dismiss = *worker_choice == Some(KillChoice::Dismiss);
+    let dismiss = dismisses.is_some();
     app.close_modal();
     if !dismiss {
         return vec![kill_pane(state, key)];
@@ -4059,9 +4104,24 @@ fn update_membership_resolved(
                 state.pending_dismiss_member = Some((brigade_id, token.clone()));
                 vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
             }
-            Some((_, _, BrigadeRole::Director)) | None => {
+            // An answer that is no member to dismiss: said, never silent — the
+            // pane is still there and the operator pressed Enter.
+            Some((_, _, BrigadeRole::Director)) => {
                 state.pending_dismiss = None;
                 state.pending_dismiss_member = None;
+                state.status = Some(
+                    "the Director cannot be dismissed — disband the brigade (B) to remove it"
+                        .to_string(),
+                );
+                Vec::new()
+            }
+            None => {
+                state.pending_dismiss = None;
+                state.pending_dismiss_member = None;
+                state.status = Some(
+                    "could not tell which brigade member this pane is — nothing was dismissed"
+                        .to_string(),
+                );
                 Vec::new()
             }
         };
@@ -5634,28 +5694,29 @@ enum ExitHandling {
 /// replaced, and the pane goes with it. Everything banto persists about the
 /// member survives that — the store row, its token, its session id — so what
 /// was lost is only the pane, and re-opening the whole brigade is a heavy way
-/// to get one back. `Some(cmd)` means the tile stays where it is and its
-/// screen is rebuilt when the spawn lands (`update_spawned` already tolerates
-/// a key that is still staged); `None` means this exit is handled the way
-/// every exit was before.
+/// to get one back. `Some(Relaunch)` means the tile stays where it is and its
+/// screen is rebuilt when the spawn lands (`update_spawned` already tolerates a
+/// key that is still staged). `None` and `Some(GaveUp)` mean it is not coming
+/// back: `update_pty_exited` then un-stages the pane and, for a Worker that left
+/// on its own, removes the member from its brigade (`unrequested_worker_exit`) —
+/// a member with no pane is an invisible one.
 ///
-/// Five things have to hold, and each of them is a way this could resurrect
+/// Four things have to hold, and each of them is a way this could resurrect
 /// something that was meant to stay dead:
 ///
-/// - **banto did not ask for the exit** ([`kill_pane`]). This is what keeps a
-///   plain `x` kill dead: the operator ending a Worker's pane is the one
-///   deliberate exit that changes nothing else observable, and without the
-///   record it looks exactly like a process that fell over.
-/// - **The pane is still staged.** Dismissing, disbanding and both Goinkyo
-///   paths all un-stage before they kill, so anything already gone from the
-///   stage was on its way out for a reason this function cannot see.
+/// - **banto did not ask for the exit** ([`kill_pane`]). A kill banto requested —
+///   dismissing, disbanding, a Goinkyo's end — is not a process that fell over.
+/// - **banto still holds a screen for the pane.** A key whose pane was already
+///   dealt with has nothing left to restart.
 /// - **It is a Worker.** The Director's own pane has two reopen paths of its
 ///   own that run before this, and a Goinkyo's absence is answered by
 ///   `gather_goinkyo_observation` against the store rather than here.
 /// - **Its session resolves to a row**, because this restarts a session
-///   rather than starting one. A Worker still awaiting discovery has nothing
-///   to resume; it keeps the old behaviour, and staging respawns it fresh.
-/// - **It was not restarted a moment ago** ([`RELAUNCH_COOLDOWN`]).
+///   rather than starting one. A Worker that never spoke has nothing to resume
+///   and, with no one to ask, leaves the brigade.
+///
+/// And it is **not restarted a moment ago** ([`RELAUNCH_COOLDOWN`]): a second
+/// death inside it is `GaveUp`, and the Worker leaves too.
 fn relaunch_member(
     state: &mut EmporiumState,
     app: &App,
@@ -5750,6 +5811,10 @@ fn update_pty_exited(
     now: Instant,
 ) -> Vec<Cmd> {
     let banto_asked = state.expected_exits.remove(&key);
+    // Decided before anything below touches the member's maps: whether this is a
+    // Worker that left on its own, so that if it cannot be relaunched it leaves
+    // the brigade instead of lingering in the roster with no tile.
+    let leaving = unrequested_worker_exit(state, app, &key, banto_asked);
     let gave_up = match relaunch_member(state, app, brigade, &key, banto_asked, now) {
         Some(ExitHandling::Relaunch(cmd)) => return vec![*cmd],
         Some(ExitHandling::GaveUp) => true,
@@ -5757,10 +5822,10 @@ fn update_pty_exited(
     };
     state.screens.remove(&key);
     state.unstage(&key);
-    // A Goinkyo pane can close this way without ever being dismissed (the
-    // operator plain-kills it, or its process just dies) — `goinkyo_pane`'s
-    // own doc: still discoverable, so a later re-stage reopens it the same
-    // way a killed Worker's pane does. Dropping the entry here is state
+    // A Goinkyo pane can close this way without ever being dismissed (its
+    // process just dies) — `goinkyo_pane`'s own doc: still discoverable, so a
+    // later re-stage resumes it (the member stays; only a Worker that leaves on
+    // its own is removed, `unrequested_worker_exit`). Dropping the entry here is state
     // hygiene, not correctness (a stale entry only means a future
     // `NoGoinkyo` tries to unstage/kill an already-gone key, both harmless
     // no-ops), but leaving it around would be one more stale-value question
@@ -5808,7 +5873,67 @@ fn update_pty_exited(
         status.push_str(" (restarted once already — left closed)");
     }
     state.set_status(status, now);
-    Vec::new()
+    // Not relaunched (the relaunch returned above), so the Worker is not coming
+    // back: it leaves the brigade. Its answer replaces the status above.
+    match leaving {
+        Some((brigade_id, token)) => {
+            state.removing_exited.insert((brigade_id, token.clone()));
+            vec![Cmd::Store(StoreIntent::DismissExitedWorker {
+                brigade_id,
+                token,
+                repeated: gave_up,
+            })]
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Whether a pane that just ended is a Worker that left on its own — the only
+/// exit after which, if it is not relaunched, the member is removed from its
+/// brigade (no confirmation: nobody is at the keyboard for it). Every condition
+/// is a way this could remove a member that was meant to stay or was already
+/// going:
+///
+/// - **banto did not ask for the exit** (`banto_asked`, [`kill_pane`]): a kill
+///   the operator or a teardown requested — disband, dismissal, the Goinkyo's end,
+///   a Director reopen — has its own outcome already.
+/// - **banto is not quitting** (`App::should_quit`): the loop still drains the
+///   iteration's queue after the quit key, and a pane that ends in that queue
+///   ends because banto is closing, not because its Worker left. (After the loop
+///   every handle is closed without another event being read.)
+/// - **the pane is one banto still holds a screen for**, so a second event for
+///   the same key finds nothing and no member is removed twice.
+/// - **it is a Worker of a brigade**: not the Director, not the Goinkyo (a
+///   consultation that ends without being dismissed keeps today's outcome), not a
+///   pane with no membership.
+/// - **its brigade is not being disbanded or gone** ([`EmporiumState::disbanding`]).
+/// - **no dismissal of this member is already in flight**: the operator's own
+///   (`pending_dismiss`), or the one this function starts (`removing_exited`).
+fn unrequested_worker_exit(
+    state: &EmporiumState,
+    app: &App,
+    key: &SessionKey,
+    banto_asked: bool,
+) -> Option<(BrigadeId, MemberToken)> {
+    if banto_asked || app.should_quit() || !state.screens.contains_key(key) {
+        return None;
+    }
+    let brigade_id = *state.member_brigades.get(key)?;
+    let token = state.member_tokens.get(key)?.clone();
+    if token == DIRECTOR_TOKEN
+        || token == GOINKYO_TOKEN
+        || state.goinkyo_pane.values().any(|pane| pane == key)
+        || state.disbanding.contains(&brigade_id)
+        || state.pending_dismiss.as_ref() == Some(key)
+        || state
+            .pending_dismiss_member
+            .as_ref()
+            .is_some_and(|(brigade, member)| *brigade == brigade_id && *member == token)
+        || state.removing_exited.contains(&(brigade_id, token.clone()))
+    {
+        return None;
+    }
+    Some((brigade_id, token))
 }
 
 /// `Cmd::WritePty`'s target had no live handle when the shell went to write
@@ -6223,6 +6348,7 @@ fn update_disbanded(
                 Some(key) => Stage::Solo(key.clone()),
                 None => Stage::Empty,
             };
+            state.disbanding.insert(brigade_id);
             state.brigade_layouts.remove(&brigade_id);
             state.persisted_layouts.remove(&brigade_id);
             state.brigade_names.remove(&brigade_id);
@@ -6237,10 +6363,80 @@ fn update_disbanded(
                 .collect()
         }
         Err(err) => {
+            // The brigade lives on: its Workers ending are Workers ending again.
+            state.disbanding.remove(&brigade_id);
             state.set_status(format!("failed to disband: {err}"), now);
             Vec::new()
         }
     }
+}
+
+/// Forget everything the core keeps under a dismissed member's token: what its
+/// tile shows, its stated name, its place in the join order, and its layout
+/// preferences (the store forgets the row's arrangement with the row, and the
+/// solo naming it, so the persisted copy forgets it too: nothing is written for
+/// a dismissal).
+fn forget_dismissed_member(state: &mut EmporiumState, brigade_id: BrigadeId, token: &str) {
+    state.member_facts.remove(&(brigade_id, token.to_string()));
+    state.stated_names.remove(&(brigade_id, token.to_string()));
+    if let Some(joined) = state.member_order.get_mut(&brigade_id) {
+        joined.retain(|listed| listed != token);
+    }
+    // Its name is free again for another member.
+    state.resolve_member_names(brigade_id);
+    for layout in [
+        state.brigade_layouts.get_mut(&brigade_id),
+        state.persisted_layouts.get_mut(&brigade_id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        layout.row_weights.remove(token);
+        layout.stack_order.retain(|ranked| ranked != token);
+        layout.minimized.remove(token);
+        if layout.solo_member.as_deref() == Some(token) {
+            layout.solo_member = None;
+        }
+    }
+}
+
+/// The answer to [`StoreIntent::DismissExitedWorker`]. The pane is long gone
+/// (`update_pty_exited` unstaged it), so only the member is left to deal with:
+/// on success its state is forgotten as for any dismissal and the operator is
+/// told it left; a store failure says so and leaves the member where it is, as
+/// an operator's dismissal that failed does. A row that was already gone (`false`)
+/// is forgotten silently — there is nothing to report.
+fn update_exited_worker_dismissed(
+    state: &mut EmporiumState,
+    app: &mut App,
+    brigade_id: BrigadeId,
+    token: MemberToken,
+    repeated: bool,
+    result: Result<(bool, HashSet<String>, HashSet<String>), String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    state.removing_exited.remove(&(brigade_id, token.clone()));
+    // Said as the operator knows the member, before its name is forgotten.
+    let call = state.member_call(Some(brigade_id), &token);
+    match result {
+        Ok((removed, hidden, directors)) => {
+            app.set_hidden_member_ids(hidden);
+            app.set_directors(directors);
+            forget_dismissed_member(state, brigade_id, &token);
+            if removed {
+                let again = if repeated { " again" } else { "" };
+                state.set_status(
+                    format!("{call} exited{again} \u{2014} removed from the brigade"),
+                    now,
+                );
+            }
+        }
+        Err(err) => state.set_status(
+            format!("{call} exited \u{2014} could not be removed from the brigade: {err}"),
+            now,
+        ),
+    }
+    Vec::new()
 }
 
 /// On success: remove just the dismissed Worker's pane — unlike
@@ -6286,30 +6482,7 @@ fn update_worker_dismissed(
             // the Goinkyo's is reused by its next consultation, which would inherit
             // it.)
             if let Some(token) = member {
-                state.member_facts.remove(&(brigade_id, token.clone()));
-                state.stated_names.remove(&(brigade_id, token.clone()));
-                if let Some(joined) = state.member_order.get_mut(&brigade_id) {
-                    joined.retain(|listed| *listed != token);
-                }
-                // Its name is free again for another member.
-                state.resolve_member_names(brigade_id);
-                // The store forgets the member's row with its arrangement
-                // (and the solo naming it), so the persisted copy forgets it
-                // too: nothing is written for a dismissal.
-                for layout in [
-                    state.brigade_layouts.get_mut(&brigade_id),
-                    state.persisted_layouts.get_mut(&brigade_id),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    layout.row_weights.remove(&token);
-                    layout.stack_order.retain(|ranked| *ranked != token);
-                    layout.minimized.remove(&token);
-                    if layout.solo_member.as_ref() == Some(&token) {
-                        layout.solo_member = None;
-                    }
-                }
+                forget_dismissed_member(state, brigade_id, &token);
             }
             let staged = matches!(
                 &state.stage,
@@ -7000,6 +7173,9 @@ fn update_goinkyo_directory_trust_checked(
 
 #[cfg(test)]
 mod display_name_tests;
+
+#[cfg(test)]
+mod member_exit_tests;
 
 #[cfg(test)]
 mod stack_order_tests;
@@ -21300,10 +21476,16 @@ mod tests {
     }
 
     #[test]
-    fn armed_x_on_a_worker_pane_grows_the_dismiss_choice() {
+    fn armed_x_on_a_worker_pane_offers_to_dismiss_it_by_the_name_the_operator_knows() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let worker = SessionKey::from_id("w1");
+        state
+            .member_tokens
+            .insert(director.clone(), DIRECTOR_TOKEN.to_string());
+        state
+            .member_tokens
+            .insert(worker.clone(), "worker-1".to_string());
         state.stage = Stage::Brigade {
             id: 1,
             director: Some(director.clone()),
@@ -21331,9 +21513,9 @@ mod tests {
             app.modal(),
             Some(Modal::ConfirmKill {
                 key,
-                worker_choice: Some(KillChoice::ClosePane),
+                dismisses: Some(who),
                 ..
-            }) if key == "w1"
+            }) if key == "w1" && who == "worker-1"
         ));
     }
 
@@ -21369,7 +21551,7 @@ mod tests {
             app.modal(),
             Some(Modal::ConfirmKill {
                 key,
-                worker_choice: None,
+                dismisses: None,
                 ..
             }) if key == "dir"
         ));
@@ -21410,7 +21592,7 @@ mod tests {
             app.modal(),
             Some(Modal::ConfirmKill {
                 key,
-                worker_choice: None,
+                dismisses: None,
                 ..
             }) if key == "dir"
         ));
@@ -21725,7 +21907,7 @@ mod tests {
     fn kill_confirm_enter_emits_kill_pty() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
-        app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string(), false);
+        app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string(), None);
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -21751,7 +21933,7 @@ mod tests {
     fn kill_confirm_esc_closes_with_no_cmd() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
-        app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string(), false);
+        app.open_confirm_kill_modal("sess-1".to_string(), "sess-1".to_string(), None);
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -21962,8 +22144,11 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let key = SessionKey::new_worker(1, "worker-4");
-        app.open_confirm_kill_modal(key.as_str().to_string(), "worker-4".to_string(), true);
-        app.modal_select_next();
+        app.open_confirm_kill_modal(
+            key.as_str().to_string(),
+            "worker-4".to_string(),
+            Some("worker-4".to_string()),
+        );
         let brigade = brigade_config();
         let now = test_instant();
         let enter = || {
@@ -21980,8 +22165,7 @@ mod tests {
 
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("w5")]);
-        app.open_confirm_kill_modal("w5".to_string(), "w5".to_string(), true);
-        app.modal_select_next();
+        app.open_confirm_kill_modal("w5".to_string(), "w5".to_string(), Some("w5".to_string()));
         update(&mut state, &mut app, &brigade, enter(), now);
         assert_eq!(state.pending_dismiss_member, None, "unknown until resolved");
         update(
@@ -22051,8 +22235,11 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::new_worker(1, "worker-1");
         let mut app = app_with(vec![]);
-        app.open_confirm_kill_modal(key.as_str().to_string(), "worker-1".to_string(), true);
-        app.modal_select_next(); // ClosePane -> Dismiss
+        app.open_confirm_kill_modal(
+            key.as_str().to_string(),
+            "worker-1".to_string(),
+            Some("worker-1".to_string()),
+        );
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -22087,8 +22274,11 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::new_worker(1, "goinkyo");
         let mut app = app_with(vec![]);
-        app.open_confirm_kill_modal(key.as_str().to_string(), "goinkyo".to_string(), true);
-        app.modal_select_next(); // ClosePane -> Dismiss
+        app.open_confirm_kill_modal(
+            key.as_str().to_string(),
+            "goinkyo".to_string(),
+            Some("goinkyo".to_string()),
+        );
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -22121,8 +22311,7 @@ mod tests {
         // be built.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("w1")]);
-        app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), true);
-        app.modal_select_next(); // ClosePane -> Dismiss
+        app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), Some("w1".to_string()));
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -22177,8 +22366,7 @@ mod tests {
         // did nothing at all.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("g1")]);
-        app.open_confirm_kill_modal("g1".to_string(), "g1".to_string(), true);
-        app.modal_select_next(); // ClosePane -> Dismiss
+        app.open_confirm_kill_modal("g1".to_string(), "g1".to_string(), Some("g1".to_string()));
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -22251,13 +22439,12 @@ mod tests {
     }
 
     #[test]
-    fn kill_confirm_close_pane_never_touches_the_store_even_on_a_worker_pane() {
-        // The default choice: identical to today's plain kill, no round
-        // trip, no DismissWorker — a Worker pane's dialog only grows a
-        // second choice, it never changes the first one's meaning.
+    fn kill_confirm_on_a_director_or_solo_pane_only_ends_the_process_and_never_touches_the_store() {
+        // No dismissal for a Director (it leaves by disbanding) or a single
+        // session: no round trip, no DismissWorker.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
-        app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), true);
+        app.open_confirm_kill_modal("dir".to_string(), "dir".to_string(), None);
         let brigade = brigade_config();
         let now = test_instant();
 
@@ -22275,7 +22462,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Cmd::KillPty {
-                key: SessionKey::from_id("w1")
+                key: SessionKey::from_id("dir")
             }]
         );
         assert!(state.pending_dismiss.is_none());
@@ -23621,17 +23808,15 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_the_operator_killed_stays_dead() {
-        // The plain `x` kill: the one deliberate exit that changes nothing
-        // else observable, and so the one that needs `kill_pane`'s record to
-        // be told from a crash at all.
+    fn a_worker_banto_killed_stays_dead() {
+        // Any kill banto asks for: only `kill_pane`'s record tells it from a
+        // crash, and it must be neither relaunched nor removed a second time.
         let (mut state, mut app) = staged_brigade_with_worker();
         let brigade = brigade_config();
         let worker = SessionKey::from_id("w1");
-        app.open_confirm_kill_modal("w1".to_string(), "w1".to_string(), true);
 
-        let kill = confirm_kill_modal(&mut state, &mut app);
-        assert!(matches!(&kill[..], [Cmd::KillPty { key }] if *key == worker));
+        let kill = kill_pane(&mut state, worker.clone());
+        assert!(matches!(&kill, Cmd::KillPty { key } if *key == worker));
 
         let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
 
@@ -23739,8 +23924,17 @@ mod tests {
         );
 
         assert!(
-            cmds.is_empty(),
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
             "a member that cannot start must not be respawned as fast as it fails: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::Store(StoreIntent::DismissExitedWorker { repeated: true, .. })
+            )),
+            "it leaves the brigade instead of lingering without a tile: {cmds:?}"
         );
         assert!(
             state.status.as_deref().unwrap().contains("left closed"),

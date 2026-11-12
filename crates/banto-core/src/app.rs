@@ -128,28 +128,30 @@ pub enum Modal {
     /// Director's title, for the prompt. The chōba never opens this, but
     /// still has to render/dispatch it since the two share `App`/`render_modal`.
     ConfirmDisband { brigade_id: i64, name: String },
-    /// The emporium's prefix-`x` kill confirm dialog: Enter kills the
-    /// session's process (`key`, its `SessionKey` as a plain string — see
-    /// `crate::embedded::engine::SessionKey`; kept as `String` here so
-    /// `Modal` doesn't need to depend on an `embedded`-internal type), Esc
-    /// cancels. `title` is the session's display title, for the prompt.
-    /// The chōba never opens this either, for the same reason as
-    /// `ConfirmDisband`.
+    /// The emporium's prefix-`x` confirm dialog. Enter confirms, Esc cancels.
+    /// What confirming does depends on who the focused pane is:
+    ///
+    /// - a brigade member other than the Director — a Worker or the Goinkyo
+    ///   (`dismisses` is `Some`) — is **dismissed**: it leaves the brigade for
+    ///   good (membership, read cursor, mail addressed to it) and its pane ends.
+    ///   There is no "close the pane and keep the member": a Worker is
+    ///   disposable, and a member with no pane has no tile to act on.
+    /// - a Director or a single non-brigade session (`dismisses` is `None`) has
+    ///   its process ended and nothing else: a Director leaves a brigade by
+    ///   disbanding it (`B`), and a solo session has no brigade at all.
+    ///
+    /// `key` is the pane's `SessionKey` as a plain string (kept a `String` so
+    /// `Modal` does not depend on an `embedded`-internal type); `title` is its
+    /// session title, for the plain prompt. The chōba never opens this, for the
+    /// same reason as `ConfirmDisband`.
     ConfirmKill {
         key: String,
         title: String,
-        /// `Some` only when the focused pane is a brigade member other than
-        /// the Director's — a Worker or a Goinkyo (the engine decides this
-        /// structurally, from which pane is focused: never `panes[0]` — see
-        /// `crate::embedded::engine::PrefixAction::Kill`) — which of the
-        /// dialog's two choices is currently highlighted. `None` for a
-        /// Director or solo pane, whose dialog stays the single kill-only
-        /// confirm it always was: dismissing a Director is disband's job
-        /// (`B`), and a solo pane has no brigade to dismiss from at all.
-        /// Still named for the Worker it originally meant only — see
-        /// `crate::embedded::engine::update_membership_resolved`'s own doc
-        /// for the same "rename or not" question, deferred the same way.
-        worker_choice: Option<KillChoice>,
+        /// How the dialog names the member it is about to dismiss — what the
+        /// operator calls it (a quoted display name or its bare token), decided
+        /// in core so the dialog and the statuses agree. `None`: this is the
+        /// plain kill prompt (see above).
+        dismisses: Option<String>,
     },
     /// The emporium's formation-time picker for `[brigade] worker_agent =
     /// "select"`: choose which product this brigade's *Workers* (not the
@@ -180,30 +182,6 @@ pub enum Modal {
         director_row_id: String,
         name: String,
     },
-}
-
-/// The two choices in a Worker's prefix-`x` kill confirm dialog (see
-/// [`Modal::ConfirmKill`]). Toggled by Up/Down, same as any other modal's
-/// candidate selection ([`App::modal_select_prev`]/[`App::modal_select_next`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KillChoice {
-    /// End the process; membership survives — the token respawns fresh next
-    /// time its brigade is staged (today's only behavior, for every pane
-    /// kind). Highlighted by default: the less destructive of the two.
-    ClosePane,
-    /// Remove the Worker from the brigade for good (暇を出す): its
-    /// membership, read cursor, and any mail addressed specifically to it
-    /// are gone too, on top of ending the process.
-    Dismiss,
-}
-
-impl KillChoice {
-    fn toggle(self) -> Self {
-        match self {
-            KillChoice::ClosePane => KillChoice::Dismiss,
-            KillChoice::Dismiss => KillChoice::ClosePane,
-        }
-    }
 }
 
 /// How much of the list the `a` key is currently revealing.
@@ -1267,31 +1245,21 @@ impl App {
     }
 
     /// Move the open modal's candidate selection. No-op when no modal is
-    /// open, or it has no candidate list. A Worker's kill-confirm dialog has
-    /// only two choices, so prev/next both just toggle between them.
+    /// open, or it has no candidate list.
     pub fn modal_select_prev(&mut self) {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_selection(-1),
             Some(Modal::GroupJoin(state)) => state.move_selection(-1),
-            Some(Modal::ConfirmKill {
-                worker_choice: Some(choice),
-                ..
-            }) => *choice = choice.toggle(),
             _ => {}
         }
     }
 
     /// Move the open modal's candidate selection. No-op when no modal is
-    /// open, or it has no candidate list. A Worker's kill-confirm dialog has
-    /// only two choices, so prev/next both just toggle between them.
+    /// open, or it has no candidate list.
     pub fn modal_select_next(&mut self) {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_selection(1),
             Some(Modal::GroupJoin(state)) => state.move_selection(1),
-            Some(Modal::ConfirmKill {
-                worker_choice: Some(choice),
-                ..
-            }) => *choice = choice.toggle(),
             _ => {}
         }
     }
@@ -1812,18 +1780,21 @@ impl App {
         });
     }
 
-    /// Open the emporium's kill confirm dialog for the given session (bound
-    /// to prefix-`x` on the focused pane). `dismissable` grows the dialog a
-    /// second choice, defaulted to [`KillChoice::ClosePane`] — see
-    /// [`Modal::ConfirmKill`]. True for a Worker or a Goinkyo pane, never
-    /// for the Director's own or a solo session (dismiss is a brigade-
-    /// membership concept; the field itself is still named `worker_choice`,
-    /// see its own doc for why that's a separate question from this one).
-    pub fn open_confirm_kill_modal(&mut self, key: String, title: String, dismissable: bool) {
+    /// Open the emporium's confirm dialog for the given session (bound to
+    /// prefix-`x` on the focused pane). `dismisses` is how the dialog names the
+    /// member that confirming dismisses from its brigade — `Some` for a Worker
+    /// or a Goinkyo pane, `None` for the Director's own pane or a solo session,
+    /// whose confirm only ends the process — see [`Modal::ConfirmKill`].
+    pub fn open_confirm_kill_modal(
+        &mut self,
+        key: String,
+        title: String,
+        dismisses: Option<String>,
+    ) {
         self.modal = Some(Modal::ConfirmKill {
             key,
             title,
-            worker_choice: dismissable.then_some(KillChoice::ClosePane),
+            dismisses,
         });
     }
 
@@ -4132,7 +4103,7 @@ mod tests {
         assert!(!app.accepts_text_input());
         app.close_modal();
 
-        app.open_confirm_kill_modal("sess".to_string(), "Sess".to_string(), false);
+        app.open_confirm_kill_modal("sess".to_string(), "Sess".to_string(), None);
         assert!(!app.accepts_text_input());
     }
 

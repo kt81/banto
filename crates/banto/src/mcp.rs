@@ -1000,7 +1000,7 @@ fn tool_dismiss_goinkyo(ctx: &mut ServerContext) -> Value {
         return tool_error("No Goinkyo is part of this brigade right now.");
     }
     match ctx.store.dismiss_worker(brigade, GOINKYO_TOKEN) {
-        Ok(()) => tool_text(
+        Ok(_) => tool_text(
             "Consultation ended. The Goinkyo's pane will close on its own shortly.".to_string(),
             false,
         ),

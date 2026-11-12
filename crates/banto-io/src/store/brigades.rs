@@ -295,13 +295,18 @@ impl Store {
     /// would hand it straight to whichever stranger inherits the token next. Broadcasts (`to_member IS NULL`)
     /// are untouched — they belong to the role, not this one member, and
     /// every other member's own cursor still governs what they've seen of
-    /// them. Dismissing a non-member is a no-op.
-    pub fn dismiss_worker(&mut self, brigade_id: BrigadeId, token: &str) -> Result<(), StoreError> {
+    /// them. Dismissing a non-member is a no-op. Returns whether a member row
+    /// was there to remove (`false`: it was already gone).
+    pub fn dismiss_worker(
+        &mut self,
+        brigade_id: BrigadeId,
+        token: &str,
+    ) -> Result<bool, StoreError> {
         let tx = self.conn.transaction()?;
-        tx.execute(
+        let removed = tx.execute(
             "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
             params![brigade_id, token],
-        )?;
+        )? > 0;
         tx.execute(
             "DELETE FROM brigade_cursors WHERE brigade_id = ?1 AND member_token = ?2",
             params![brigade_id, token],
@@ -319,7 +324,7 @@ impl Store {
             params![brigade_id, token],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(removed)
     }
 
     /// Returns a brigade's members: the Director first, then every other role
@@ -2591,6 +2596,19 @@ mod tests {
         let expected: Vec<String> = (1..=20).map(|n| format!("worker-{n}")).collect();
         assert_eq!(all, expected, "twenty adds, twenty distinct numbers");
         assert_eq!(worker_seq(&first, br), 20);
+    }
+
+    #[test]
+    fn dismissing_says_whether_a_member_was_there_to_remove() {
+        let (mut store, br) = brigade_with_director();
+        let token = store.add_worker(br, None).unwrap();
+        assert!(store.dismiss_worker(br, &token).unwrap());
+        // Already gone: a no-op, and it says so.
+        assert!(!store.dismiss_worker(br, &token).unwrap());
+        assert!(!store.dismiss_worker(br, "worker-9").unwrap());
+        assert!(!store.dismiss_worker(br + 1, "worker-1").unwrap());
+        // Nothing else was touched.
+        assert_eq!(store.brigade_members(br).unwrap().len(), 1);
     }
 
     #[test]
