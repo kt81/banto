@@ -603,7 +603,8 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 | … `M` | open every collapsed tile and turn the solo off |
 | … `=` | put the staged brigade's tile sizes back to the defaults (see the layout paragraph) |
 | … `1`-`9` | jump to pane N |
-| … `s`/`Esc` | back to the sidebar |
+| … `s` | back to the sidebar |
+| … `Esc` | cancel the prefix: nothing else happens — focus stays, nothing reaches the child |
 | … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted); on a Director or a single session, end its process (confirm) |
 | … `b`/`Ctrl+B` | send a literal prefix chord through to the child |
 

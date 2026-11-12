@@ -209,7 +209,8 @@ Everything above (minus split), plus:
 | … arrows | directional pane navigation |
 | … `=` | put the staged brigade's tile sizes back to the defaults (order, collapsed tiles and the sidebar width are kept) |
 | … `1`-`9` | jump to pane N |
-| … `s`/`Esc` | back to the sidebar |
+| … `s` | back to the sidebar |
+| … `Esc` | cancel the prefix (focus stays; nothing is sent to the child) |
 | … `x` | dismiss the focused Worker/Goinkyo from its brigade (confirm; it leaves for good, its session is kept); on a Director or a single session, end its process |
 | … `b`/`Ctrl+B` | send a literal prefix chord to the child |
 

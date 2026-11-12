@@ -13,7 +13,7 @@ use banto_core::engine::Focus;
 pub const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
 
 /// Shown while the prefix chord is armed: the keys the chord's follow-up takes.
-pub const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+Up/Down reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x close";
+pub const PREFIX_HINTS: &str = "prefix: Esc cancel · o/Tab cycle · arrows move · Shift+Up/Down reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x close";
 
 const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
                           F3 next pane · / search · n new · d archive · g group · \
@@ -158,6 +158,9 @@ mod tests {
     #[test]
     fn the_prefix_hints_describe_current_behaviour() {
         assert!(PREFIX_HINTS.ends_with("x close"));
+        // First, not last: the bar is clipped from the right on a narrow terminal,
+        // and Esc is the key someone reaches for when they want out.
+        assert!(PREFIX_HINTS.starts_with("prefix: Esc cancel"));
         assert!(!PREFIX_HINTS.contains("kill"));
         assert!(PREFIX_HINTS.contains("Shift+Up/Down reorder"));
     }

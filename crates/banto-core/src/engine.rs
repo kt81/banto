@@ -2137,8 +2137,13 @@ enum PrefixAction {
     FocusPane(usize),
     /// `1`-`9`, but the staged brigade doesn't have that many panes.
     OutOfRange,
-    /// `s` or Esc: return focus to the sidebar.
+    /// `s`: return focus to the sidebar.
     Sidebar,
+    /// Esc, with any modifiers: back out of the prefix. It is already disarmed
+    /// by the time anything resolves, so this does nothing more — no focus
+    /// change, no status (the hint line simply goes away), and no Esc forwarded
+    /// to the child, where it would interrupt the agent.
+    Cancel,
     /// `x`: open the confirm dialog for the focused pane — dismissing a brigade
     /// member other than the Director, ending the process of anything else.
     Kill,
@@ -2178,7 +2183,7 @@ fn resolve_prefix_key(key: &KeyEvent, prefix: &PrefixKey, pane_count: usize) -> 
                 PrefixAction::OutOfRange
             }
         }
-        KeyCode::Esc => PrefixAction::Sidebar,
+        KeyCode::Esc => PrefixAction::Cancel,
         KeyCode::Char('m') if key.modifiers.is_empty() => PrefixAction::ToggleMinimize,
         KeyCode::Char('z') if key.modifiers.is_empty() => PrefixAction::ToggleSolo,
         // A shifted letter arrives as the uppercased `Char` with or without
@@ -3687,6 +3692,7 @@ fn resolve_armed_prefix(
             state.focus = Focus::Sidebar;
             Vec::new()
         }
+        PrefixAction::Cancel => Vec::new(),
         PrefixAction::Kill => {
             let Some(target) = state.stage.focused_key().cloned() else {
                 return Vec::new();
@@ -24584,5 +24590,170 @@ mod tests {
             layout_of(&state).collapsed_stack_width,
             DEFAULT_COLLAPSED_STACK_WIDTH
         );
+    }
+
+    // --- prefix + Esc cancels the prefix ----------------------------------------
+
+    fn esc_after_prefix(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        modifiers: Modifiers,
+        now: Instant,
+    ) -> Vec<Cmd> {
+        prefix_key(state, app, brigade, KeyCode::Esc, modifiers, now)
+    }
+
+    #[test]
+    fn prefix_esc_from_a_pane_cancels_and_changes_nothing() {
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT, Modifiers::CONTROL] {
+            let (mut state, mut app, brigade, now) = drag_fixture(2);
+            focus_stack_slot(&mut state, 1);
+            state.status = None;
+            let focused_before = state.stage.focused_key().cloned();
+
+            let cmds = esc_after_prefix(&mut state, &mut app, &brigade, modifiers, now);
+
+            assert_eq!(state.prefix_armed, None, "{modifiers:?}: disarmed");
+            assert_eq!(state.focus, Focus::Pane, "{modifiers:?}: focus stays");
+            assert_eq!(
+                state.stage.focused_key().cloned(),
+                focused_before,
+                "{modifiers:?}: same focused tile"
+            );
+            assert!(
+                writes_of(&cmds).is_empty(),
+                "{modifiers:?}: Esc not forwarded"
+            );
+            assert!(cmds.is_empty(), "{modifiers:?}: {cmds:?}");
+            assert_eq!(state.status, None, "{modifiers:?}: no status");
+            assert!(!app.should_quit());
+
+            // The next key is an ordinary one for the pane.
+            let cmds = forward_key(
+                &mut state,
+                &mut app,
+                &brigade,
+                KeyCode::Char('x'),
+                Modifiers::NONE,
+                now,
+            );
+            assert_eq!(writes_of(&cmds), [(key_of("w1"), b"x".to_vec())]);
+        }
+    }
+
+    #[test]
+    fn prefix_esc_from_the_list_cancels_and_cannot_quit() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        state.focus = Focus::Sidebar;
+        let cmds = esc_after_prefix(&mut state, &mut app, &brigade, Modifiers::NONE, now);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(state.prefix_armed, None);
+        assert_eq!(state.focus, Focus::Sidebar);
+        assert!(!app.should_quit(), "the cancel is not the list's own Esc");
+
+        // Whereas an Esc with no prefix armed is the list's own, and quits.
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        );
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn prefix_s_still_moves_focus_to_the_list_and_f2_still_toggles() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        focus_stack_slot(&mut state, 1);
+        prefix_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('s'),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(state.focus, Focus::Sidebar);
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::F(2),
+            Modifiers::NONE,
+            now,
+        );
+        assert_eq!(state.focus, Focus::Pane);
+    }
+
+    #[test]
+    fn esc_after_the_prefix_timed_out_is_an_ordinary_key_for_whatever_has_focus() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        focus_stack_slot(&mut state, 1);
+        state.prefix_armed = Some(now);
+        let later = now + PREFIX_ARM_TIMEOUT;
+        tick(&mut state, &mut app, &brigade, later);
+        assert_eq!(state.prefix_armed, None, "timed out");
+
+        // A pane: the Esc goes to the child.
+        let cmds = forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            later,
+        );
+        assert_eq!(writes_of(&cmds), [(key_of("w1"), vec![0x1b])]);
+
+        // The list: the list's own Esc, which quits.
+        state.focus = Focus::Sidebar;
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            later,
+        );
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn esc_with_a_drag_in_progress_and_the_prefix_armed_ends_the_drag_first_then_the_prefix() {
+        let (mut state, mut app, brigade, now) = drag_fixture(2);
+        let master = Boundary::Master { brigade: 1 };
+        let start = handle_of(&state, &master).position;
+        drag_to(&mut state, &mut app, &brigade, &master, start - 8, now);
+        assert!(state.drag.is_some());
+        state.prefix_armed = Some(now);
+
+        // One Esc, one thing: the gesture, as always, and it goes no further.
+        let cmds = forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(state.drag.is_none());
+        assert!(state.prefix_armed.is_some(), "the prefix is still armed");
+
+        // The next Esc backs out of the prefix, and nothing reaches the child.
+        let cmds = forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            now,
+        );
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(state.prefix_armed, None);
+        assert_eq!(layout_of(&state).master_permille, DEFAULT_MASTER_PERMILLE);
     }
 }
