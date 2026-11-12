@@ -43,6 +43,7 @@ use banto_core::model::{
     AgentKind, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken,
     SessionId,
 };
+use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
@@ -74,13 +75,50 @@ pub struct Identity {
 /// checks each product's separate live-state source. `goinkyo_dir` is where
 /// [`tool_consult_goinkyo`] writes a consultation request; `None` when the
 /// platform's data-local directory couldn't be determined (see
-/// `banto_io::config::default_db_path`, the same fallibility).
+/// `banto_io::config::default_db_path`, the same fallibility). `message_log` is
+/// `Some` only when `[brigade] message_log` is on (see [`MessageLog`]).
 struct ServerContext {
     identity: Identity,
     store: Store,
     claude_home: ClaudeHome,
     codex_home: Option<CodexHome>,
     goinkyo_dir: Option<PathBuf>,
+    message_log: Option<MessageLog>,
+}
+
+/// The opt-in brigade message log (`banto_io::brigade_log`) as this process
+/// uses it: a failed write never fails a tool call or changes its result, and stdout — the
+/// MCP channel — is never touched. Every entry is attempted, so a log that
+/// becomes writable again resumes; only the warning is limited, to the first
+/// failure, noted once on stderr so a log that silently stays empty can be
+/// diagnosed without answering every message with another line nobody reads.
+struct MessageLog {
+    log: BrigadeLog,
+    warned: bool,
+}
+
+impl MessageLog {
+    fn record(&mut self, brigade: BrigadeId, entry: &Entry<'_>) {
+        if let Err(err) = self.log.append(brigade, entry)
+            && !self.warned
+        {
+            self.warned = true;
+            // Not `eprintln!`: that panics when stderr cannot be written, and the
+            // log must never take a tool call down with it.
+            let _ = writeln!(
+                io::stderr(),
+                "banto: the brigade message log could not be written ({}): {err}",
+                self.log.path_for(brigade).display()
+            );
+        }
+    }
+}
+
+/// The brigade message log for this process: `None` unless `[brigade]
+/// message_log` is on and a data directory is known, so a disabled log never
+/// even names a path.
+pub(crate) fn message_log_for(enabled: bool, dir: Option<PathBuf>) -> Option<BrigadeLog> {
+    enabled.then_some(dir).flatten().map(BrigadeLog::new)
 }
 
 /// Run the MCP server on stdio until the client closes the connection (EOF on
@@ -91,6 +129,7 @@ pub fn run_stdio_server(
     claude_home: ClaudeHome,
     codex_home: Option<CodexHome>,
     goinkyo_dir: Option<PathBuf>,
+    message_log: Option<BrigadeLog>,
 ) -> Result<()> {
     let mut ctx = ServerContext {
         identity,
@@ -98,6 +137,7 @@ pub fn run_stdio_server(
         claude_home,
         codex_home,
         goinkyo_dir,
+        message_log: message_log.map(|log| MessageLog { log, warned: false }),
     };
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -606,24 +646,79 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
         target.as_ref().map(|(member, _)| member.as_str()),
         text,
     ) {
-        Ok(_) => tool_text(
-            match &target {
-                Some((member, _)) => {
-                    // Looked up now, not remembered: a rename lands on the very
-                    // next call. A failed read costs the name, not the delivery.
-                    let name = ctx
-                        .store
-                        .brigade_member(brigade, member)
-                        .ok()
-                        .flatten()
-                        .and_then(|row| row.display_name);
-                    format!("Delivered to {}.", labelled(member, name.as_deref()))
-                }
-                None => format!("Delivered to your {}.", role_label(to_role)),
-            },
-            false,
-        ),
+        Ok(queue_id) => {
+            log_message(
+                ctx,
+                brigade,
+                &token,
+                queue_id,
+                (to_role, target.as_ref().map(|(member, _)| member.as_str())),
+                text,
+            );
+            tool_text(
+                match &target {
+                    Some((member, _)) => {
+                        // Looked up now, not remembered: a rename lands on the very
+                        // next call. A failed read costs the name, not the delivery.
+                        let name = ctx
+                            .store
+                            .brigade_member(brigade, member)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| row.display_name);
+                        format!("Delivered to {}.", labelled(member, name.as_deref()))
+                    }
+                    None => format!("Delivered to your {}.", role_label(to_role)),
+                },
+                false,
+            )
+        }
         Err(err) => tool_error(&format!("failed to send: {err}")),
+    }
+}
+
+/// Append an accepted message to the brigade message log, if it is on. The names
+/// are read only then — they cost a store read each — and a name that cannot be
+/// read costs the name, not the entry.
+fn log_message(
+    ctx: &mut ServerContext,
+    brigade: BrigadeId,
+    sender: &str,
+    queue_id: i64,
+    recipient: (BrigadeRole, Option<&str>),
+    body: &str,
+) {
+    if ctx.message_log.is_none() {
+        return;
+    }
+    let name_of = |ctx: &ServerContext, token: &str| {
+        ctx.store
+            .brigade_member(brigade, token)
+            .ok()
+            .flatten()
+            .and_then(|row| row.display_name)
+    };
+    let sender_name = name_of(ctx, sender);
+    let (to_role, to_member) = recipient;
+    let to_name = to_member.and_then(|member| name_of(ctx, member));
+    let entry = Entry {
+        at: SystemTime::now(),
+        kind: EntryKind::Message { queue_id },
+        from: Party {
+            token: sender,
+            name: sender_name.as_deref(),
+        },
+        to: match to_member {
+            Some(token) => Recipient::Member(Party {
+                token,
+                name: to_name.as_deref(),
+            }),
+            None => Recipient::Role(to_role),
+        },
+        body,
+    };
+    if let Some(log) = ctx.message_log.as_mut() {
+        log.record(brigade, &entry);
     }
 }
 
@@ -936,14 +1031,36 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         Ok(path) => path,
         Err(err) => return tool_error(&format!("failed to file the consultation: {err}")),
     };
-
-    match ctx.store.add_brigade_member_with_agent(
+    let registered = ctx.store.add_brigade_member_with_agent(
         brigade,
         GOINKYO_TOKEN,
         BrigadeRole::Goinkyo,
         None,
         Some(AgentKind::ClaudeCode),
-    ) {
+    );
+    // Logged as what the Goinkyo reads, and only once the call has succeeded: a
+    // call that returns an error leaves no entry.
+    if registered.is_ok()
+        && let Some(log) = ctx.message_log.as_mut()
+    {
+        log.record(
+            brigade,
+            &Entry {
+                at: SystemTime::now(),
+                kind: EntryKind::ConsultationRequest,
+                from: Party {
+                    token: request.requested_by,
+                    name: None,
+                },
+                to: Recipient::Member(Party {
+                    token: GOINKYO_TOKEN,
+                    name: None,
+                }),
+                body: &render_goinkyo_request(&request),
+            },
+        );
+    }
+    match registered {
         Ok(()) => tool_text(
             format!(
                 "Consultation filed at {}. A Goinkyo member row now exists for this brigade \
@@ -1416,6 +1533,7 @@ mod tests {
             // success path sets a tempdir instead, so nothing ever writes
             // under the real `dirs::data_local_dir()`.
             goinkyo_dir: None,
+            message_log: None,
         }
     }
 
@@ -1915,6 +2033,7 @@ mod tests {
             claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
             codex_home: None,
             goinkyo_dir: None,
+            message_log: None,
         };
         (dir, ctx, emporium)
     }
@@ -3706,5 +3825,237 @@ mod tests {
             bodies.contains(&"broadcast opinion") && bodies.contains(&"addressed opinion"),
             "both of the Goinkyo's own messages must survive, got {bodies:?}"
         );
+    }
+
+    // --- the opt-in brigade message log ---------------------------------------
+
+    /// `ctx` with the message log on, writing under `dir` (a test's own temp
+    /// directory — never the real data directory).
+    fn with_message_log(mut ctx: ServerContext, dir: &Path) -> ServerContext {
+        ctx.message_log = message_log_for(true, Some(dir.to_path_buf()))
+            .map(|log| MessageLog { log, warned: false });
+        ctx
+    }
+
+    fn log_text(dir: &Path, brigade: BrigadeId) -> String {
+        std::fs::read_to_string(BrigadeLog::new(dir.to_path_buf()).path_for(brigade))
+            .unwrap_or_default()
+    }
+
+    /// The header lines of a log, with the timestamp (the one thing that varies)
+    /// checked for shape and removed, and the trailing `bytes=` checked for
+    /// presence and removed (each test that cares compares it itself).
+    fn headers_without_time(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with("@@@ "))
+            .map(|line| {
+                let mut words = line.splitn(3, ' ');
+                words.next();
+                let time = words.next().unwrap();
+                assert_eq!(time.len(), 20, "{line}");
+                assert!(time.ends_with('Z') && time.as_bytes()[10] == b'T', "{line}");
+                let rest = words.next().unwrap();
+                let (fields, bytes) = rest.rsplit_once(" bytes=").expect("bytes= in the header");
+                assert!(bytes.parse::<usize>().is_ok(), "{line}");
+                format!("@@@ {fields}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_log_is_off_unless_enabled_and_a_data_directory_is_known() {
+        let dir = PathBuf::from("/some/dir");
+        assert!(message_log_for(false, Some(dir.clone())).is_none());
+        assert!(message_log_for(true, None).is_none());
+        assert!(message_log_for(true, Some(dir)).is_some());
+    }
+
+    #[test]
+    fn with_the_log_off_a_send_creates_no_file_and_no_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = named_ctx();
+        assert!(ctx.message_log.is_none(), "the default for every context");
+        let response = call(&mut ctx, &send_call("hello", None));
+        assert!(!is_error(&response));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_enabled_send_appends_one_whole_entry_with_the_header_fields_and_the_verbatim_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        let mut ctx = with_message_log(named_ctx(), &logs);
+        let body = "Please look at the parser.\n\n  - first\n  - second\nThanks.";
+        let response = call(&mut ctx, &send_call(body, None));
+        assert!(!is_error(&response), "{response}");
+
+        let text = log_text(&logs, 1);
+        let queue_id = ctx
+            .store
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+            .unwrap()[0]
+            .id;
+        assert_eq!(
+            headers_without_time(&text),
+            [format!(
+                "@@@ message #{queue_id} from=director to=role:worker"
+            )]
+        );
+        assert!(text.ends_with(&format!("\n{body}\n\n")), "{text}");
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!(" bytes={}", body.len())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_addressed_message_names_its_recipient_and_a_named_sender_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        let mut ctx = with_message_log(named_ctx(), &logs);
+        name_it(&mut ctx.store, 1, "worker-1", "impl");
+
+        call(&mut ctx, &send_call("to the named one", Some("worker-1")));
+        call(&mut ctx, &send_call("to the unnamed one", Some("worker-2")));
+        // The named Worker answers the Director.
+        let mut worker = worker_ctx_of(ctx, "worker-1");
+        call(&mut worker, &send_call("done", None));
+
+        let headers = headers_without_time(&log_text(&logs, 1));
+        let tails: Vec<&str> = headers
+            .iter()
+            .map(|h| h.splitn(4, ' ').nth(3).unwrap())
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                "from=director to=worker-1 \"impl\"",
+                "from=director to=worker-2",
+                "from=worker-1 \"impl\" to=role:director",
+            ]
+        );
+        // Queue ids ascend with the order sent.
+        assert!(headers[0].contains("message #1 ") && headers[1].contains("message #2 "));
+    }
+
+    #[test]
+    fn an_accepted_consultation_request_is_logged_as_the_text_the_goinkyo_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        let requests = tmp.path().join("requests");
+        let mut ctx = with_message_log(
+            ctx(
+                "dir",
+                Some(1),
+                Some("director"),
+                Some(BrigadeRole::Director),
+            ),
+            &logs,
+        );
+        ctx.store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        ctx.goinkyo_dir = Some(requests.clone());
+
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+        assert!(!is_error(&response), "{response}");
+
+        let text = log_text(&logs, 1);
+        assert_eq!(
+            headers_without_time(&text),
+            ["@@@ consultation-request from=director to=goinkyo"]
+        );
+        let filed = std::fs::read_to_string(goinkyo_request_path(&requests, 1)).unwrap();
+        assert!(text.ends_with(&format!("\n{filed}\n\n")), "{text}");
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!(" bytes={}", filed.len())),
+            "{text}"
+        );
+
+        // A refused request logs nothing more.
+        let before = text.len();
+        let mut bad = full_goinkyo_args();
+        bad.as_object_mut().unwrap().remove("question");
+        let refused = call(&mut ctx, &goinkyo_call(bad));
+        assert!(is_error(&refused));
+        assert_eq!(log_text(&logs, 1).len(), before);
+    }
+
+    #[test]
+    fn a_consultation_whose_registration_fails_leaves_no_log_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        let (db_dir, ctx, _emporium) = file_backed_ctx();
+        let mut ctx = with_message_log(ctx, &logs);
+        ctx.goinkyo_dir = Some(tmp.path().join("requests"));
+        // The request file gets written, but registering the Goinkyo member then
+        // fails: a trigger on a second connection to the same database refuses the
+        // insert.
+        rusqlite::Connection::open(db_dir.path().join("banto.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_goinkyo BEFORE INSERT ON brigade_members \
+                 WHEN NEW.member_token = 'goinkyo' \
+                 BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;",
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &goinkyo_call(full_goinkyo_args()));
+
+        assert!(is_error(&response), "{response}");
+        assert!(
+            result_text(&response).contains("failed to register the Goinkyo"),
+            "{response}"
+        );
+        assert!(
+            goinkyo_request_path(&tmp.path().join("requests"), 1).exists(),
+            "the request file was written before registration failed"
+        );
+        assert!(!logs.exists(), "but no log entry, and no log directory");
+    }
+
+    #[test]
+    fn a_refused_send_is_not_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        let mut ctx = with_message_log(named_ctx(), &logs);
+        let refused = call(&mut ctx, &send_call("hello", Some("worker-9")));
+        assert!(is_error(&refused));
+        assert!(!logs.exists());
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_written_leaves_the_send_and_its_result_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The log directory's path is a file, so nothing can be created there.
+        let blocker = tmp.path().join("logs");
+        std::fs::write(&blocker, "in the way").unwrap();
+        let mut broken = with_message_log(named_ctx(), &blocker);
+        let mut plain = named_ctx();
+
+        let with_log = call(&mut broken, &send_call("hello", Some("worker-1")));
+        let without = call(&mut plain, &send_call("hello", Some("worker-1")));
+
+        assert!(!is_error(&with_log), "{with_log}");
+        assert_eq!(result_text(&with_log), result_text(&without));
+        // The message was still queued for its recipient.
+        assert_eq!(
+            broken
+                .store
+                .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .len(),
+            1
+        );
+        // The failure is noted once, not once per message.
+        assert!(broken.message_log.as_ref().unwrap().warned);
+        let second = call(&mut broken, &send_call("again", Some("worker-1")));
+        assert!(!is_error(&second));
     }
 }

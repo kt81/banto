@@ -266,6 +266,13 @@ pub struct BrigadeConfig {
     /// (`Edit`/`Write`/`NotebookEdit`) — consistent with a role meant to be
     /// called holding nothing of its own, but a real cost, not a free one.
     pub goinkyo_disallowed_tools: String,
+    /// Append every brigade message, in full, to a plain-text file under banto's
+    /// own data directory (`banto_io::brigade_log`) — for someone developing
+    /// banto who wants to audit what the agents told each other. Off by default:
+    /// the file holds real conversation content and banto never rotates or
+    /// deletes it. The location is not configurable, so that it can never leave
+    /// banto's own directory.
+    pub message_log: bool,
 }
 
 /// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
@@ -408,6 +415,7 @@ impl Default for BrigadeConfig {
             goinkyo_effort: "max".to_string(),
             goinkyo_permission_mode: "auto".to_string(),
             goinkyo_disallowed_tools: "Edit,Write,NotebookEdit".to_string(),
+            message_log: false,
         }
     }
 }
@@ -836,6 +844,14 @@ mod tests {
             Some("lead {peers}")
         );
         assert_eq!(config.brigade.prompt_for(BrigadeRole::Worker), None);
+    }
+
+    #[test]
+    fn the_brigade_message_log_is_off_unless_the_config_turns_it_on() {
+        assert!(!Config::default().brigade.message_log);
+        assert!(!parse("").brigade.message_log);
+        assert!(!parse("[brigade]\nworkers = 2\n").brigade.message_log);
+        assert!(parse("[brigade]\nmessage_log = true\n").brigade.message_log);
     }
 
     #[test]

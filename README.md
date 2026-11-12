@@ -279,6 +279,10 @@ week_days = 7
 workers = 1         # Workers auto-spawned per cell (1..=8)
 worker_model = "sonnet"   # --model for spawned Workers ("" = inherit)
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
+# For banto developers: append every brigade message, in full, to
+# <data dir>/banto/logs/brigade-<id>.log. Off by default. The file holds real
+# conversation content; banto never rotates or deletes it — don't commit it.
+message_log = false
 # Role briefings appended to each member's system prompt at launch.
 # {brigade} / {token} / {peers} are substituted; "" launches with no
 # briefing. The defaults tell a Director to delegate (and that it can name a

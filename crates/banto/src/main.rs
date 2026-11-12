@@ -284,7 +284,19 @@ fn main() -> Result<()> {
                 member,
                 role: role.as_deref().and_then(BrigadeRole::from_token),
             };
-            mcp::run_stdio_server(store, identity, claude_home, codex_home, goinkyo_dir)
+            // Opt-in; the directory is banto's own, whatever the config says.
+            let message_log = mcp::message_log_for(
+                config.brigade.message_log,
+                banto_io::brigade_log::default_dir(),
+            );
+            mcp::run_stdio_server(
+                store,
+                identity,
+                claude_home,
+                codex_home,
+                goinkyo_dir,
+                message_log,
+            )
         }
         Some(Command::Hook) => unreachable!("Command::Hook returns before load_config runs"),
         None => {

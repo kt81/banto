@@ -3885,6 +3885,22 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_brigades_id_is_never_issued_again() {
+        // `brigades.id` is AUTOINCREMENT: the brigade message log names its file by
+        // this id, so a reused one would pour a new brigade's messages into a
+        // disbanded one's file.
+        let mut store = Store::open_in_memory().unwrap();
+        let first = store.create_brigade("a").unwrap();
+        let second = store.create_brigade("b").unwrap();
+        store.delete_brigade(second).unwrap();
+        let third = store.create_brigade("c").unwrap();
+        assert!(third > second, "{first} {second} {third}");
+        store.delete_brigade(third).unwrap();
+        store.delete_brigade(first).unwrap();
+        assert!(store.create_brigade("d").unwrap() > third);
+    }
+
+    #[test]
     fn delete_brigade_purges_its_messages_and_cursors_but_not_another_brigades() {
         let mut store = Store::open_in_memory().unwrap();
         let a = store.create_brigade("a").unwrap();

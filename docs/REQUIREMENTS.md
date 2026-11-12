@@ -993,6 +993,7 @@ pub struct BrigadeConfig {
     pub goinkyo_effort: String,     // --effort for an auto-spawned Goinkyo; "" = no flag; default "max"; Claude only
     pub goinkyo_permission_mode: String, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; default "auto"; Claude only
     pub goinkyo_disallowed_tools: String, // --disallowedTools for an auto-spawned Goinkyo; "" = no flag; default "Edit,Write,NotebookEdit"; Claude only
+    pub message_log: bool,          // append every brigade message to a plain-text file under banto's data dir (see "Message log" below); default false
 }
 ```
 
@@ -1064,6 +1065,39 @@ the launch argv, the config file lives under banto's own data directory
 (`dirs::data_local_dir()/banto/mcp/<brigade_id>-<token>.json`) and is never
 installed into Claude Code's own configuration (`crates/banto/src/mcp.rs`
 module doc; `crates/banto/src/embedded/emporium.rs`'s `write_mcp_config`).
+
+**Message log (`[brigade] message_log = true`, off by default).** For someone
+developing banto who wants to audit what the agents told each other. Every
+message `send_to_peer` accepts, and every `consult_goinkyo` request (as the text
+the Goinkyo reads), is appended in full to
+`dirs::data_local_dir()/banto/logs/brigade-<brigade_id>.log`, written by the
+`banto _mcp` process that handled the call (`crates/banto-io/src/brigade_log.rs`).
+The location is not configurable, so the file is always inside banto's own data
+directory. An entry is a header line starting with `@@@` — UTC time, `message
+#<queue id>` or `consultation-request`, `from=<token>` and `to=<token>` or
+`to=role:<role>` (a display name in quotes after its token), and last
+`bytes=<n>` — then the body verbatim, then two newlines:
+
+```
+@@@ 2026-11-13T09:15:02Z message #42 from=worker-1 "impl" to=director bytes=34
+Parser check finished (synthetic).
+
+```
+
+`bytes=` is the length in bytes of the body as given, nothing the log adds
+counted; because the body is verbatim, a line of it can look exactly like a
+header, and a reader must skip `bytes=` bytes after the header line (and the two
+newlines) rather than scan for `@@@`. Each entry is handed to the OS whole, in one
+`write` on an append-only handle; it could interleave with another process's
+only if the OS accepted the write short and a second one were needed. No lock is
+taken. Measured on one machine (local NTFS, 16 processes at once, entries up to
+1 MB each) that never happened — a measurement, not a guarantee. A log that cannot
+be written never fails the tool call or changes its result (one note on stderr, never stdout,
+the MCP channel; every later entry is still attempted). There is no reader,
+rotation or cleanup: **the file holds real conversation content, banto never
+rotates or deletes it, and it must not be committed anywhere.** Brigade ids are
+never reissued within one database (`brigades.id` is `AUTOINCREMENT`); a replaced
+database starts over at 1 and would append to the old files.
 
 **Codex carries the same server a different way — no config file at all.**
 Codex has no `--mcp-config` equivalent; the launch instead adds `-c
