@@ -16,8 +16,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
 use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 
 use super::{ProviderError, SessionProvider};
 use crate::codex_home::CodexHome;
@@ -38,6 +38,65 @@ impl CodexProvider {
     }
 }
 
+/// Whether a `threads.source` value marks the thread as a sub-agent's — Codex's
+/// own automatic-review child of a session, not something a person converses
+/// with. Measured (Codex 0.147 and 0.166-0.167.1): an ordinary session's
+/// `source` is plain text (`cli`; `codex exec` records `exec`), while a
+/// sub-agent's is a JSON object in the same TEXT column
+/// (`{"subagent":{"other":"guardian"}}`). `thread_source` is the wrong key — it
+/// is newer, nullable, and its value for the same thread already changed between
+/// those versions (`subagent` on 0.147, `guardian_review` later) — and so is the
+/// title, which is only text a product chose.
+///
+/// The rule points one way on purpose: only a value positively recognised as a
+/// sub-agent's hides a row. Plain text of any value (one banto has never seen
+/// included), an empty value, a JSON object *without* a `subagent` key, text that
+/// does not parse, and a value that is not text at all all stay listed — hiding a
+/// session the operator really started costs far more than showing a sub-agent
+/// thread that a future Codex shapes differently.
+///
+/// Takes the cell as a [`ValueRef`], decided inside the row mapper: reading it
+/// into a `String` (or an owned `Value`, which converts text through UTF-8) fails
+/// on a TEXT cell holding invalid UTF-8, and a failed read drops the whole row
+/// before this could answer "not a sub-agent". Invalid bytes simply do not parse.
+fn is_subagent_source(source: ValueRef<'_>) -> bool {
+    let ValueRef::Text(bytes) = source else {
+        return false;
+    };
+    matches!(
+        serde_json::from_slice::<serde_json::Value>(bytes),
+        Ok(serde_json::Value::Object(map)) if map.contains_key("subagent")
+    )
+}
+
+/// A TEXT column read leniently: invalid UTF-8 degrades to replacement
+/// characters instead of failing the read, which would drop a whole row for a
+/// column the row can do without. Only for the descriptive columns (`title`,
+/// `cwd`, `first_user_message`); `id` and `rollout_path` stay strict — a lossy id
+/// or path would name a different thing, not a damaged label.
+fn lossy_text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    })
+}
+
+/// The `source` select item for a `threads` table: the column when this Codex
+/// version's schema has it, else `NULL` (every row then reads as not a
+/// sub-agent's, i.e. everything is listed, as before the column was read). The
+/// provider names its other columns outright and fails without them; this one is
+/// the filter's alone, so its absence must not take discovery down.
+fn source_column(conn: &Connection) -> &'static str {
+    let has_source = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('threads') WHERE name = 'source'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if has_source { "source" } else { "NULL" }
+}
+
 impl SessionProvider for CodexProvider {
     fn name(&self) -> AgentKind {
         AgentKind::Codex
@@ -49,19 +108,25 @@ impl SessionProvider for CodexProvider {
             return Ok(Vec::new());
         }
         let conn = open_read_only(&db_path)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived \
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived, {} \
              FROM threads",
-        )?;
+            source_column(&conn)
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                lossy_text(row, 1)?,
+                lossy_text(row, 2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                lossy_text(row, 4)?,
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<bool>>(6)?,
+                // Decided here, from whatever the cell holds: a typed read would
+                // fail on a non-text or non-UTF-8 value and the row would be
+                // skipped below — hiding a session for a reason that has nothing
+                // to do with sub-agents.
+                is_subagent_source(row.get_ref(7)?),
             ))
         })?;
 
@@ -70,7 +135,19 @@ impl SessionProvider for CodexProvider {
             // unexpectedly-shaped) is skipped, not fatal to the whole scan.
             .flatten()
             .filter_map(
-                |(id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived)| {
+                |(
+                    id,
+                    title,
+                    cwd,
+                    rollout_path,
+                    first_user_message,
+                    updated_at_ms,
+                    archived,
+                    is_subagent,
+                )| {
+                    if is_subagent {
+                        return None;
+                    }
                     // `id` and `rollout_path` are what banto cannot function
                     // without; everything else degrades gracefully instead of
                     // dropping the row (see session_meta_from_row for size).
@@ -100,17 +177,19 @@ impl SessionProvider for CodexProvider {
         let Ok(conn) = open_read_only(&db_path) else {
             return Vec::new();
         };
-        let Ok(mut stmt) =
-            conn.prepare("SELECT id, cwd, updated_at_ms FROM threads WHERE updated_at_ms >= ?1")
-        else {
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT id, cwd, updated_at_ms, {} FROM threads WHERE updated_at_ms >= ?1",
+            source_column(&conn)
+        )) else {
             return Vec::new();
         };
         let since_ms = system_time_to_unix_ms(since);
         let Ok(rows) = stmt.query_map([since_ms], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                lossy_text(row, 1)?,
                 row.get::<_, i64>(2)?,
+                is_subagent_source(row.get_ref(3)?),
             ))
         }) else {
             return Vec::new();
@@ -118,7 +197,12 @@ impl SessionProvider for CodexProvider {
 
         let mut matches: Vec<(i64, SessionId)> = rows
             .flatten()
-            .filter_map(|(id, raw_cwd, updated_at_ms)| {
+            // A fresh Worker is found by "the oldest thread in its cwd since it
+            // launched", and Codex starts a sub-agent thread of its own beside
+            // every launch or resume — in the same cwd, at the same moment. Left
+            // in, one could be taken for the Worker's session.
+            .filter(|(_, _, _, is_subagent)| !is_subagent)
+            .filter_map(|(id, raw_cwd, updated_at_ms, _)| {
                 let id = id?;
                 let matched = raw_cwd
                     .as_deref()
@@ -219,6 +303,23 @@ mod tests {
             created_at_ms INTEGER, \
             model TEXT, \
             archived INTEGER DEFAULT 0\
+        )";
+
+    /// The same shape with the `source` column newer Codex versions record
+    /// (nullable here though Codex's is NOT NULL, so the lenient reading of a
+    /// NULL is testable too).
+    const CREATE_THREADS_WITH_SOURCE: &str = "\
+        CREATE TABLE threads (\
+            id TEXT PRIMARY KEY, \
+            title TEXT, \
+            cwd TEXT, \
+            rollout_path TEXT, \
+            first_user_message TEXT, \
+            updated_at_ms INTEGER, \
+            created_at_ms INTEGER, \
+            model TEXT, \
+            archived INTEGER DEFAULT 0, \
+            source TEXT\
         )";
 
     fn codex_home(dir: &TempDir) -> CodexHome {
@@ -514,5 +615,203 @@ mod tests {
                 SessionId("newer".to_string())
             ]
         );
+    }
+
+    // --- sub-agent threads are not sessions -------------------------------------
+
+    /// A database whose rows are `(id, source)`, all in `/work/proj`, with a
+    /// distinct `updated_at_ms` each (their order is the list's order).
+    fn write_sourced(home: &CodexHome, rollout: &Path, rows: &[(&str, rusqlite::types::Value)]) {
+        fs::create_dir_all(home.root()).unwrap();
+        let conn = Connection::open(home.threads_db_path()).unwrap();
+        conn.execute_batch(CREATE_THREADS_WITH_SOURCE).unwrap();
+        for (i, (id, source)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO threads (id, cwd, rollout_path, updated_at_ms, source) \
+                 VALUES (?1, '/work/proj', ?2, ?3, ?4)",
+                rusqlite::params![id, rollout.to_string_lossy(), 1_000 + i as i64, source],
+            )
+            .unwrap();
+        }
+    }
+
+    fn text(s: &str) -> rusqlite::types::Value {
+        rusqlite::types::Value::Text(s.to_string())
+    }
+
+    /// Every source shape the filter must tell apart, as `(id, value, hidden)`.
+    fn source_cases() -> Vec<(&'static str, rusqlite::types::Value, bool)> {
+        use rusqlite::types::Value;
+        vec![
+            ("plain-cli", text("cli"), false),
+            ("plain-exec", text("exec"), false),
+            ("plain-unseen", text("some-future-source"), false),
+            ("empty", text(""), false),
+            (
+                "object-without-the-key",
+                text(r#"{"other":"guardian"}"#),
+                false,
+            ),
+            ("empty-object", text("{}"), false),
+            ("garbage", text("{not json"), false),
+            ("json-string", text(r#""subagent""#), false),
+            ("json-array", text(r#"[{"subagent":1}]"#), false),
+            ("not-text-integer", Value::Integer(7), false),
+            ("not-text-null", Value::Null, false),
+            ("not-text-real", Value::Real(1.5), false),
+            (
+                "not-text-blob",
+                Value::Blob(b"{\"subagent\":1}".to_vec()),
+                false,
+            ),
+            (
+                "guardian",
+                text(r#"{"subagent":{"other":"guardian"}}"#),
+                true,
+            ),
+            ("subagent-string", text(r#"{"subagent":"review"}"#), true),
+            (
+                "subagent-other",
+                text(r#"{"subagent":{"other":"x"}}"#),
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn discover_hides_exactly_the_threads_that_are_recognised_sub_agents() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        let cases = source_cases();
+        let rows: Vec<_> = cases.iter().map(|(id, v, _)| (*id, v.clone())).collect();
+        write_sourced(&home, &rollout, &rows);
+
+        let mut listed: Vec<String> = provider(&dir)
+            .discover()
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.id.0)
+            .collect();
+        listed.sort();
+        let mut expected: Vec<String> = cases
+            .iter()
+            .filter(|(_, _, hidden)| !hidden)
+            .map(|(id, _, _)| id.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn find_new_sessions_never_returns_a_sub_agent_thread() {
+        // The Worker-discovery path: a guardian thread created beside a launch
+        // sorts first (oldest) and must not be taken for the Worker's session.
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        write_sourced(
+            &home,
+            &rollout,
+            &[
+                ("guardian", text(r#"{"subagent":{"other":"guardian"}}"#)),
+                ("workers-own", text("cli")),
+                ("exec-run", text("exec")),
+                ("odd", text("{not json")),
+            ],
+        );
+        let found = provider(&dir).find_new_sessions(Path::new("/work/proj"), UNIX_EPOCH);
+        assert_eq!(
+            found,
+            vec![
+                SessionId("workers-own".to_string()),
+                SessionId("exec-run".to_string()),
+                SessionId("odd".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_schema_without_the_source_column_lists_everything_as_before() {
+        // The legacy fixture has no `source` column.
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        write_thread(
+            &home,
+            ThreadRow {
+                cwd: Some("/work/proj"),
+                ..ThreadRow::new("old-schema", &rollout)
+            },
+            true,
+        );
+        assert_eq!(provider(&dir).discover().unwrap().len(), 1);
+        assert_eq!(
+            provider(&dir).find_new_sessions(Path::new("/work/proj"), UNIX_EPOCH),
+            vec![SessionId("old-schema".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_source_that_is_text_but_not_utf8_leaves_the_session_listed() {
+        // SQLite stores whatever bytes it is given under TEXT affinity; a typed
+        // read of such a cell fails, and a failed read used to drop the row.
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        write_sourced(&home, &rollout, &[("fine", text("cli"))]);
+        {
+            let conn = Connection::open(home.threads_db_path()).unwrap();
+            conn.execute(
+                "INSERT INTO threads (id, cwd, rollout_path, updated_at_ms, source) \
+                 VALUES ('bad-utf8', '/work/proj', ?1, 2000, CAST(X'FF' AS TEXT))",
+                rusqlite::params![rollout.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let mut ids: Vec<String> = provider(&dir)
+            .discover()
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.id.0)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["bad-utf8", "fine"]);
+        let found = provider(&dir).find_new_sessions(Path::new("/work/proj"), UNIX_EPOCH);
+        assert_eq!(
+            found,
+            vec![
+                SessionId("fine".to_string()),
+                SessionId("bad-utf8".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_descriptive_column_degrades_it_and_keeps_the_row() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        write_sourced(&home, &rollout, &[]);
+        {
+            let conn = Connection::open(home.threads_db_path()).unwrap();
+            conn.execute(
+                "INSERT INTO threads (id, title, cwd, first_user_message, rollout_path, \
+                 updated_at_ms, source) VALUES ('damaged', CAST(X'41FF' AS TEXT), \
+                 CAST(X'2F77FF' AS TEXT), CAST(X'42FF' AS TEXT), ?1, 1, 'cli')",
+                rusqlite::params![rollout.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let sessions = provider(&dir).discover().unwrap();
+        assert_eq!(sessions.len(), 1, "the row survives");
+        assert_eq!(sessions[0].title.as_deref(), Some("A\u{FFFD}"));
+        assert_eq!(sessions[0].preview.as_deref(), Some("B\u{FFFD}"));
+        assert!(sessions[0].cwd.is_some());
     }
 }
