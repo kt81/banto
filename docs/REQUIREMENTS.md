@@ -608,6 +608,14 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 | … `b`/`Ctrl+B` | send a literal prefix chord through to the child |
 
 While the prefix is armed, the status bar shows the full binding table.
+Otherwise its idle hints follow the focus, because that is where keys go: with
+the session list focused, the list keys (`Tab grouped/flat`, `F2 pane`, `F3 next
+pane`, …, plus `D restore` while an archived row is on screen); with a pane
+focused, only what banto itself takes there — the configured prefix chord as the
+operator would name it (`Ctrl+B`, or a bare character), `F2 list`, and `F3 next
+pane` when the staged brigade has more than one tile that is not collapsed; while
+searching, the search keys. A transient status replaces the hints. The text is
+built by one pure function (`banto_tui::hints`).
 Multiline paste and file drag&drop into panes are synthesized into bracketed
 pastes host-side, since the Windows console never reports pastes as pastes.
 

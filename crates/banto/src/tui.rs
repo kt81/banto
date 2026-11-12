@@ -1946,7 +1946,7 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 /// for a narrow terminal and get truncated.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     const NORMAL_HINTS: &str = "j/k\u{2191}\u{2193} move  PgUp/PgDn page  Enter open  s split  \
-                                / search  n new  N new-split  d archive  g group  Tab view  \
+                                / search  n new  N new-split  d archive  g group  Tab grouped/flat  \
                                 p pin  a reveal  q/Esc quit";
     /// Appended only while an archived row is on screen. The bar was already
     /// tight enough that the operator named it as the constraint on adding

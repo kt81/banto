@@ -13,6 +13,7 @@
 //! - [`strip`] the body of a collapsed stack tile, from a plain data struct
 //! - [`text`] column-aware text truncation, shared by `render_modal`/`view`
 
+pub mod hints;
 pub mod paint;
 pub mod render;
 pub mod render_modal;

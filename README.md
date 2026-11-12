@@ -214,7 +214,8 @@ Everything above (minus split), plus:
 | … `b`/`Ctrl+B` | send a literal prefix chord to the child |
 
 While the prefix is armed, the status bar shows the full binding table —
-nothing to memorize. Multiline paste and file drag&drop into panes work
+nothing to memorize; otherwise its hints follow the focus (the list keys when the
+list is focused, just the prefix chord and `F2`/`F3` when a pane is). Multiline paste and file drag&drop into panes work
 (synthesized into bracketed pastes host-side, since the Windows console
 never reports pastes as pastes).
 

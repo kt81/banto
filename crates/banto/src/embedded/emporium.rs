@@ -2821,13 +2821,7 @@ fn draw(
         }
     }
 
-    render_status_bar(
-        frame,
-        app,
-        state.displayed_status(),
-        state.prefix_armed.is_some(),
-        areas.status,
-    );
+    render_status_bar(frame, app, state, areas.status);
 
     if let Some(modal) = app.modal() {
         // `true`: the emporium binds Shift-Tab to `App::modal_toggle_agent`
@@ -2949,43 +2943,27 @@ fn paint_drag_line(buffer: &mut Buffer, line: Rect, axis: Axis) {
 /// Bottom status bar: emporium key hints (or a transient status, or — while
 /// a prefix chord is armed — the pending-prefix hint) on the left, the match
 /// count on the right.
-fn render_status_bar(
-    frame: &mut ratatui::Frame,
-    app: &App,
-    status: Option<&str>,
-    prefix_armed: bool,
-    area: Rect,
-) {
-    const NORMAL_HINTS: &str = "j/k move · Enter open · F2 focus · B brigade/disband · b +worker · \
-                                F3 pane · / search · n new · d archive · g group · Tab view · \
-                                p pin · a reveal · q quit";
-    /// Appended only while an archived row is on screen — see the chōba's
-    /// own `ARCHIVED_HINT` for why this one is not in the bar unconditionally.
-    const ARCHIVED_HINT: &str = " · D restore";
-    const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
-    const PREFIX_HINTS: &str = "prefix: o/Tab cycle · arrows move · Shift+arrows reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x kill";
-
+fn render_status_bar(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, area: Rect) {
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
     let counts_width = counts.chars().count() as u16;
     let [left, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(counts_width)]).areas(area);
 
-    let (text, color) = if prefix_armed {
-        (PREFIX_HINTS.to_string(), Color::Cyan)
+    let (text, color) = if state.prefix_armed.is_some() {
+        (banto_tui::hints::PREFIX_HINTS.to_string(), Color::Cyan)
     } else {
-        match status {
+        match state.displayed_status() {
             Some(message) => (message.to_string(), Color::Yellow),
-            None => {
-                let mut hints = if app.mode() == Mode::Search {
-                    SEARCH_HINTS.to_string()
-                } else {
-                    NORMAL_HINTS.to_string()
-                };
-                if app.mode() != Mode::Search && app.any_archived_visible() {
-                    hints.push_str(ARCHIVED_HINT);
-                }
-                (hints, Color::Gray)
-            }
+            None => (
+                banto_tui::hints::idle_hints(&banto_tui::hints::IdleHintsInput {
+                    focus: state.focus,
+                    mode: app.mode(),
+                    archived_visible: app.any_archived_visible(),
+                    prefix_label: &state.prefix_label(),
+                    focusable_tiles: state.focusable_tile_count(),
+                }),
+                Color::Gray,
+            ),
         }
     };
     frame.render_widget(
@@ -3821,6 +3799,59 @@ mod tests {
 
     fn text_at(buffer: &Buffer, x: u16, y: u16, len: u16) -> String {
         (x..x + len).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    // --- the idle hint line follows the focus -----------------------------------
+
+    fn status_row(buffer: &Buffer) -> String {
+        let bottom = buffer.area.height - 1;
+        text_at(buffer, 0, bottom, buffer.area.width)
+    }
+
+    #[test]
+    fn with_a_pane_focused_the_bar_names_the_prefix_and_none_of_the_list_keys() {
+        let (mut state, app, _brigade) = staged_brigade_of_two_workers();
+        state.status = None;
+        state.focus = Focus::Pane;
+        let bar = status_row(&render(&state, &app));
+        assert!(bar.contains("Ctrl+B prefix"), "{bar:?}");
+        assert!(bar.contains("F2 list"), "{bar:?}");
+        assert!(
+            bar.contains("F3 next pane"),
+            "a brigade of several tiles: {bar:?}"
+        );
+        for list_only in [
+            "j/k",
+            "Enter open",
+            "b +worker",
+            "/ search",
+            "Tab",
+            "q quit",
+        ] {
+            assert!(!bar.contains(list_only), "{list_only:?} in {bar:?}");
+        }
+
+        // The list focused again: the list keys, worded for what they do.
+        state.focus = Focus::Sidebar;
+        let bar = status_row(&render(&state, &app));
+        assert!(bar.contains("F2 pane"), "{bar:?}");
+        assert!(bar.contains("j/k move"), "{bar:?}");
+        assert!(!bar.contains("prefix"), "{bar:?}");
+    }
+
+    #[test]
+    fn a_configured_prefix_is_shown_as_configured_and_a_single_session_has_no_f3() {
+        let mut state = EmporiumState::new(PrefixKey::parse("C-a"));
+        let app = App::new(vec![test_row("solo", AgentKind::ClaudeCode)]);
+        let key = SessionKey::from_id("solo");
+        state
+            .screens
+            .insert(key.clone(), banto_core::screen::Screen::new(24, 80));
+        state.stage = Stage::Solo(key);
+        state.focus = Focus::Pane;
+        let bar = status_row(&render(&state, &app));
+        assert!(bar.contains("Ctrl+A prefix · F2 list"), "{bar:?}");
+        assert!(!bar.contains("F3"), "{bar:?}");
     }
 
     #[test]

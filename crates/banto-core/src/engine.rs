@@ -1782,6 +1782,21 @@ impl EmporiumState {
         )
     }
 
+    /// The configured prefix chord as the operator names it (`PrefixKey::label`).
+    pub fn prefix_label(&self) -> String {
+        self.prefix.label()
+    }
+
+    /// How many tiles `F3` can step through: the staged brigade's tiles that are
+    /// not collapsed, and 0 when what is staged is not a brigade (`F3` does
+    /// nothing there).
+    pub fn focusable_tile_count(&self) -> usize {
+        match &self.stage {
+            Stage::Brigade { .. } => self.pane_collapsed().iter().filter(|c| !**c).count(),
+            _ => 0,
+        }
+    }
+
     /// One flag per stack tile of the staged brigade, in `panes` order: shown
     /// collapsed. Solo is an overlay on the operator's own collapsing: while
     /// the soloed member is a staged tile — the master or a stack tile —
@@ -2043,6 +2058,20 @@ impl PrefixKey {
 
     fn matches(&self, key: &KeyEvent) -> bool {
         key.code == self.code && key.modifiers == self.mods
+    }
+
+    /// The chord as the operator would name it on a hint line: `Ctrl+B` for a
+    /// Control chord (a letter shown upper-case), the character itself for a
+    /// bare one, `Space` for a bare space.
+    pub fn label(&self) -> String {
+        match (self.code, self.mods) {
+            (KeyCode::Char(c), mods) if mods == Modifiers::CONTROL => {
+                format!("Ctrl+{}", c.to_ascii_uppercase())
+            }
+            (KeyCode::Char(' '), _) => "Space".to_string(),
+            (KeyCode::Char(c), _) => c.to_string(),
+            _ => "prefix".to_string(),
+        }
     }
 
     /// The prefix's own key event — what "send the prefix through literally"
@@ -21470,6 +21499,20 @@ mod tests {
                 mods: Modifiers::CONTROL,
             }
         );
+    }
+
+    #[test]
+    fn prefix_key_labels_read_as_the_operator_would_name_them() {
+        assert_eq!(PrefixKey::default().label(), "Ctrl+B");
+        assert_eq!(PrefixKey::parse("C-b").label(), "Ctrl+B");
+        assert_eq!(PrefixKey::parse("C-a").label(), "Ctrl+A");
+        assert_eq!(PrefixKey::parse("C-]").label(), "Ctrl+]");
+        assert_eq!(PrefixKey::parse("`").label(), "`");
+        assert_eq!(PrefixKey::parse(" ").label(), "Space");
+        // Invalid values fall back to the default chord, so its label.
+        assert_eq!(PrefixKey::parse("").label(), "Ctrl+B");
+        assert_eq!(PrefixKey::parse("C-").label(), "Ctrl+B");
+        assert_eq!(PrefixKey::parse("ctrl-b").label(), "Ctrl+B");
     }
 
     #[test]
