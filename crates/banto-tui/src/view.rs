@@ -1096,7 +1096,7 @@ mod tests {
         let mut app = App::new(vec![row("r", "Short", cwd, now)]);
         app.set_viewport_height(10);
 
-        // 34 cols (the emporium sidebar's width) is below MIN_WIDTH_FOR_CWD
+        // 34 cols (the emporium sidebar's inner width at its default) is below MIN_WIDTH_FOR_CWD
         // — the short title alone would ordinarily
         // leave more than enough room for cwd under the
         // title-leaves-room rule, but the floor overrides it here.

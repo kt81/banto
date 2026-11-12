@@ -11,6 +11,12 @@
 //! - [`search`] nucleo fuzzy search
 //! - [`app`]    the chōba list TUI's UI-free state (`App` and friends)
 //! - [`engine`] the emporium's pure core: `update(state, ev, now) -> Vec<Cmd>`
+//! - [`layout`] the emporium's geometry: tiles, drag handles and the layout
+//!   preferences, as a pure function of the area, the stage and those
+//!   preferences
+//! - [`display_text`] the one policy for someone else's text shown on a banto line
+//! - [`member_name`] the rule for a brigade member's display name
+//! - [`input_line`] reading a hosted Claude pane's input line off its screen
 //! - [`screen`] the emporium's per-pane `vt100` terminal model
 //! - [`key_encode`] key-event -> PTY-child-stdin byte encoding
 //! - [`replay`] the record/replay event-stream format (`docs/DISCIPLINE.md` §8)

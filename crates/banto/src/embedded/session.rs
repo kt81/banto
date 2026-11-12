@@ -24,7 +24,8 @@ use banto_io::pty::{PtyHost, PtyIo, Resizer, STRIPPED_CHILD_ENV_VARS};
 pub(crate) enum PtyPoll {
     /// One chunk of output — becomes `Event::PtyOutput`.
     Chunk(Vec<u8>),
-    /// Nothing available right now; the child is still running.
+    /// Nothing available right now: the child is running, or its end is still
+    /// being confirmed (see [`PtyHandle::poll`]).
     Empty,
     /// The output stream is gone, with every chunk it ever sent already
     /// drained (this variant is only reached once no `Chunk` remains). That says

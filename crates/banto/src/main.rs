@@ -19,7 +19,7 @@
 //!
 //! Everything under the resolved Claude home, and under the resolved Codex
 //! home, is treated as strictly read-only.
-//! banto's own database (session <-> pane map, groups, pins) lives under
+//! banto's own database (session <-> pane map, groups, pins, brigades) lives under
 //! `Config.db_path`, falling back to [`config::default_db_path`].
 //!
 //! `config.toml` itself is located by [`config::resolve_config_path`]'s
@@ -172,10 +172,10 @@ enum Command {
         #[arg(long)]
         brigade: Option<i64>,
         /// This session's banto-owned member token within the brigade
-        /// (`director`, `worker-1`, `worker-2`, ...).
+        /// (`director`, `worker-1`, `worker-2`, ..., or `goinkyo`).
         #[arg(long)]
         member: Option<String>,
-        /// This session's role in the brigade: `director` or `worker`.
+        /// This session's role in the brigade: `director`, `worker` or `goinkyo`.
         /// Parsed for compatibility with `--mcp-config` files already on
         /// disk; the live role always comes from the store instead.
         #[arg(long)]
@@ -328,7 +328,7 @@ fn main() -> Result<()> {
 /// order. An explicit override (`--config` / `BANTO_CONFIG`) must exist and
 /// parse, or startup fails with a plain one-line error; every other tier
 /// (XDG/`~/.config` discovery, the platform default) is lenient — a missing
-/// or broken file there just means defaults, same as before this round.
+/// or broken file there just means defaults.
 fn load_config(cli_override: Option<&Path>) -> Result<Config> {
     let env_override = std::env::var_os("BANTO_CONFIG").map(PathBuf::from);
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);

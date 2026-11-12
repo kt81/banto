@@ -8,7 +8,7 @@
 //!
 //! `EmporiumState` replaces the old `Emporium` struct. The append-only
 //! sessions invariant retires with it: `screens` can lose entries
-//! (`PtyExited`), and `Stage` holds [`SessionKey`]s rather than indices, so a
+//! (`PtyExited`, `PtyOutputLost`), and `Stage` holds [`SessionKey`]s rather than indices, so a
 //! removal never invalidates anything else holding a key.
 //!
 //! Two round trips exist here that the pre-migration code didn't need,
@@ -122,7 +122,7 @@ pub enum Stage {
         id: BrigadeId,
         /// The Director's own key, authoritative — role no longer has to be
         /// derived from position anywhere (`add_worker`, `update_disbanded`,
-        /// `PrefixAction::Kill`, `gather_goinkyo_observation`, `tile_title`
+        /// `PrefixAction::Kill`, `gather_goinkyo_observation`, `tile_label`
         /// all read this instead of assuming `panes[0]`). `None` is a
         /// legitimate state, not a gap to close: `stage_brigade` sets it
         /// leniently from the store's own member row (no session id
@@ -757,7 +757,7 @@ enum PendingMembership {
     Activate,
     /// `B`.
     BrigadeKey,
-    /// Prefix-`x` confirmed "dismiss" on a Worker pane whose key isn't a
+    /// Prefix-`x` confirmed on a Worker (or Goinkyo) pane whose key isn't a
     /// synthetic placeholder, so its token isn't embedded in the key itself
     /// ([`SessionKey::worker_identity`]) — one round trip to learn
     /// `(brigade_id, token)` before `StoreIntent::DismissWorker` can be
@@ -1090,8 +1090,8 @@ pub struct EmporiumState {
     prefix: PrefixKey,
     /// When the prefix was last armed (see [`update_key`]'s prefix handling
     /// and [`PREFIX_ARM_TIMEOUT`]) — `Some` only between the prefix chord
-    /// landing on a focused pane and the very next key resolving it (or the
-    /// timeout disarming it on a [`Event::Tick`]). `pub` so the shell
+    /// (from either focus) and the very next key resolving it (or the timeout
+    /// disarming it on a [`Event::Tick`]). `pub` so the shell
     /// can show the pending-prefix hint while armed (reading state for
     /// drawing is legal; only `update` may write it).
     pub prefix_armed: Option<Instant>,
@@ -1710,7 +1710,7 @@ impl EmporiumState {
 
     /// `brigade_id`'s Goinkyo pane, if [`Self::goinkyo_pane`] currently
     /// tracks one — read-only, for the shell's own display purposes
-    /// (`tile_title`): the field itself stays private so only this crate's
+    /// (`tile_label`): the field itself stays private so only this crate's
     /// own one-shot-guard bookkeeping ever writes to it.
     pub fn goinkyo_pane_for(&self, brigade_id: BrigadeId) -> Option<&SessionKey> {
         self.goinkyo_pane.get(&brigade_id)
@@ -2409,7 +2409,7 @@ pub enum StoreIntent {
         brigade_id: BrigadeId,
         cwd: PathBuf,
         /// Same reasoning as `FormBrigade`'s own `worker_agent`: resolved
-        /// once, at the `B`-press moment, in [`add_worker`] — either
+        /// once, at the `b`-press moment, in [`add_worker`] — either
         /// directly, or (`[brigade] worker_agent = "select"`) via the same
         /// `Modal::WorkerAgentPicker` formation uses, see
         /// [`EmporiumState::pending_worker_addition`]. Unlike formation, a
@@ -2424,8 +2424,8 @@ pub enum StoreIntent {
     Disband {
         brigade_id: BrigadeId,
     },
-    /// Remove one Worker from its brigade for good (the emporium's
-    /// prefix-`x` "dismiss" choice) — membership, cursor, and any mail
+    /// Remove one brigade member from it for good (a confirmed prefix-`x` on
+    /// a Worker or the Goinkyo) — membership, cursor, and any mail
     /// addressed specifically to it, all gone (`Store::dismiss_worker`).
     /// `(brigade_id, token)` are already known by the time this is built —
     /// see `confirm_kill_modal`'s dismiss path and
@@ -2591,11 +2591,11 @@ pub enum Cmd {
     /// (`execute_check_worker_directory_trust` calls `codex_directory_trust`
     /// specifically). The Goinkyo's `cwd` is ordinarily the Director's own
     /// already-trusted one, so this is expected to pass immediately in the
-    /// common case — but this is the first time banto ever types blind into
-    /// a *Claude* pane at all (a Worker never gets typed into —
-    /// `poll_discovery`'s own doc), so the same risk
-    /// `CheckWorkerDirectoryTrust` exists to avoid for Codex applies here
-    /// too, however rarely it actually fires. Issued by [`update_tick`]
+    /// common case — but the kickoff is the one place banto types into a
+    /// *Claude* pane it has not first observed idle (the relay nudge only types
+    /// into a member it has seen idle, which a pane sitting at a trust prompt
+    /// never is), so the same risk `CheckWorkerDirectoryTrust` exists to avoid
+    /// for Codex applies here too, however rarely it actually fires. Issued by [`update_tick`]
     /// once a [`PendingGoinkyoKickoff`]'s quiet period has elapsed, every
     /// tick, until the answer comes back trusted. The shell answers with
     /// `Event::GoinkyoDirectoryTrustChecked`.
@@ -2714,8 +2714,9 @@ pub enum Event {
     /// `DiscoveryTracker::notified_untrusted`), so this pane's silence gets
     /// explained instead of looking broken.
     /// Unlike [`Self::CodexWorkerDiscoveryTimedOut`], there is no keystroke
-    /// to hold back here (Claude is never typed into by banto at all) and no
-    /// give-up timeout either — Claude discovery still waits forever,
+    /// to hold back here (this tracker only looks for the session id, and the
+    /// relay nudge types into a member only once it is identified and seen
+    /// idle) and no give-up timeout either — Claude discovery still waits forever,
     /// unchanged; this only ever adds a one-time status line on top of that
     /// wait.
     ClaudeWorkerDirectoryUntrusted {
@@ -5875,7 +5876,7 @@ fn update_spawned(
 ///
 /// `Select` is a stand-in for `Inherit` here, not a considered choice of its
 /// own: every call site that reaches this function runs well after
-/// formation already started — a re-stage, a later `B` add-worker, or the
+/// formation already started — a re-stage, a later `b` add-worker, or the
 /// moment right after the Director itself finished spawning — with no
 /// synchronous UI moment left to interrupt with a picker. The formation
 /// modal that actually asks the operator up front (so every one of these
@@ -9231,9 +9232,8 @@ mod tests {
 
     #[test]
     fn stage_brigade_fresh_worker_spawn_inherits_a_claude_directors_product_unchanged() {
-        // The explicit regression this round asked for: with the default
-        // `[brigade] worker_agent = "inherit"`, a Claude Director's cell
-        // must not change by a single byte.
+        // The regression guard for the default `[brigade] worker_agent =
+        // "inherit"`: a Claude Director's cell must not change by a single byte.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config(); // worker_agent defaults to Inherit
@@ -9590,7 +9590,7 @@ mod tests {
     #[test]
     fn worker_added_passes_the_carried_agent_and_model_straight_to_open_worker() {
         // `worker_agent`/`worker_model` are already fully resolved by the
-        // time this event exists (`add_worker`, at `B`-press) — this only
+        // time this event exists (`add_worker`, at `b`-press) — this only
         // pins that `update_worker_added` passes them through unchanged
         // rather than re-deriving anything from `brigade`.
         let mut state = EmporiumState::new(PrefixKey::default());
@@ -11998,10 +11998,10 @@ mod tests {
 
     #[test]
     fn a_nudge_for_one_pane_is_not_suppressed_by_input_forwarded_to_a_different_pane() {
-        // The bug this round fixes: `last_forwarded_input` used to be one
-        // run-wide `Instant`, so typing into the focused Director pane
-        // silenced a nudge to the Worker the moment focus moved there —
-        // even though the Worker itself had never received a keystroke.
+        // `last_forwarded_input` is per pane: were it one run-wide `Instant`,
+        // typing into the focused Director pane would silence a nudge to the
+        // Worker the moment focus moved there — even though the Worker itself
+        // had never received a keystroke.
         let (mut state, mut app, brigade, director, worker, mut now) =
             two_pane_brigade_focused_on(0); // Director focused first
 
@@ -21882,7 +21882,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_x_on_the_director_pane_has_no_dismiss_choice() {
+    fn armed_x_on_the_director_pane_does_not_dismiss() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let worker = SessionKey::from_id("w1");
@@ -21920,10 +21920,10 @@ mod tests {
     }
 
     #[test]
-    fn armed_x_on_the_director_pane_has_no_dismiss_choice_even_when_panes_are_reversed() {
+    fn armed_x_on_the_director_pane_does_not_dismiss_even_when_panes_are_reversed() {
         // The Worker staged solo first, ahead of the Director, so `panes[0]`
-        // is the Worker — proves the dismissable check reads `director`,
-        // not position.
+        // is the Worker — proves the check for whether confirming dismisses
+        // reads `director`, not position.
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let worker = SessionKey::from_id("w1");
@@ -22629,10 +22629,9 @@ mod tests {
 
     #[test]
     fn kill_confirm_dismiss_on_a_synthetic_goinkyo_key_emits_dismiss_worker_directly() {
-        // `SessionKey::worker_identity` never checked role to begin with
-        // (see its own doc) — this pins that the synthetic-key path already
-        // worked for a still-undiscovered Goinkyo before this round, same
-        // as it does for a Worker.
+        // `SessionKey::worker_identity` checks no role (see its own doc), so the
+        // synthetic-key path works for a still-undiscovered Goinkyo, same as for
+        // a Worker; this pins it.
         let mut state = EmporiumState::new(PrefixKey::default());
         let key = SessionKey::new_worker(1, "goinkyo");
         let mut app = app_with(vec![]);
@@ -22722,10 +22721,9 @@ mod tests {
 
     #[test]
     fn kill_confirm_dismiss_on_a_resolved_goinkyo_key_works_the_same_way_as_a_worker() {
-        // The actual bug this round fixes: `update_membership_resolved`
-        // used to abort silently for anything but `BrigadeRole::Worker`,
-        // which meant choosing Dismiss on a discovered Goinkyo's own pane
-        // did nothing at all.
+        // `update_membership_resolved` must not abort for a role other than
+        // `BrigadeRole::Worker`: were it to, confirming the dialog on a
+        // discovered Goinkyo's own pane would do nothing at all.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("g1")]);
         app.open_confirm_kill_modal("g1".to_string(), "g1".to_string(), Some("g1".to_string()));
@@ -22769,12 +22767,11 @@ mod tests {
 
     #[test]
     fn kill_confirm_dismiss_on_the_directors_own_resolved_key_aborts() {
-        // The Director never even gets the Dismiss choice in the first
-        // place (`dismissable` is false for it — see `PrefixAction::Kill`'s
-        // own doc) — this proves the engine's own decision, independent of
-        // the modal ever offering it, still refuses: dismissing a Director
-        // is disband's job, not this flow's, no matter how the round trip
-        // was reached.
+        // The Director's pane never opens a dialog that dismisses (`dismisses`
+        // is `None` for it — see `PrefixAction::Kill`'s own doc) — this proves
+        // the engine's own decision, independent of the dialog, still refuses:
+        // dismissing a Director is disband's job, not this flow's, no matter
+        // how the round trip was reached.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
         state.pending_membership = Some(PendingMembership::DismissWorker);

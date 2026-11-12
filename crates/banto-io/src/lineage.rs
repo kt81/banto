@@ -260,9 +260,8 @@ mod tests {
         );
         let copy_content = compact_boundary_line(&["P1"]) + "{\"type\":\"user\",\"uuid\":\"P1\"}\n";
         let copy_path = write(dir.path(), "copy.jsonl", &copy_content);
-        // The copy is newer, so a plain newest-first presence scan (today's
-        // behavior before this round) would pick it first; classification
-        // must still prefer the true original.
+        // The copy is newer, so a plain newest-first presence scan would pick
+        // it first; classification must still prefer the true original.
         set_mtime(&original_path, 1_000);
         set_mtime(&copy_path, 2_000);
         let child_path = write(dir.path(), "child.jsonl", "{\"type\":\"mode\"}\n");

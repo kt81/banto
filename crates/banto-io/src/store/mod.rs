@@ -3,7 +3,10 @@
 //! Responsibilities (docs/REQUIREMENTS.md "Module layout"):
 //! - groups / pins / archived sessions (banto-owned; never written to
 //!   Claude's files)
-//! - session <-> pane mapping for the opener (phase 2 consumes this)
+//! - session <-> pane mapping for the opener
+//! - brigades: their members (with display names), the message queue between
+//!   them, and the emporium's arrangement preferences (`brigades.rs`,
+//!   `ui_prefs.rs`)
 //!
 //! No session index cache or filesystem path ever lives here (see
 //! `migrations::MIGRATIONS`'s v11 for why) — every row is keyed by session

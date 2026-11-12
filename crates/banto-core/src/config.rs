@@ -491,9 +491,9 @@ pub struct AgentBinaries {
     pub codex: Option<PathBuf>,
 }
 
-/// Emporium keybinding settings. Just the tmux-style prefix chord this
-/// round — full user-remappable keymaps are out of scope (a scoped decision,
-/// not an oversight: see `crate::engine`'s `PrefixKey`).
+/// Emporium keybinding settings. Just the tmux-style prefix chord — full
+/// user-remappable keymaps are out of scope (a scoped decision, not an
+/// oversight: see `crate::engine`'s `PrefixKey`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct KeysConfig {

@@ -35,7 +35,7 @@ Linux dogfooding is underway.
 ## Why not just tmux?
 
 tmux is a window manager for terminals. banto is a lifecycle manager for
-Claude Code sessions: it knows their ids, the directories they were started
+Claude Code and Codex sessions: it knows their ids, the directories they were started
 in, which are still running, and which of them you filed under what. Picking
 a row does not open a shell that happens to run `claude` — it returns you to
 one specific conversation, or to the process already having it.
@@ -46,8 +46,9 @@ there for the times you would rather not run a multiplexer at all.
 ## What it does
 
 The ledger has a name: the **chōba** (帳場, "the shop counter"), banto's
-default view, built by indexing the session files Claude Code CLI writes
-under `~/.claude` — read-only, always; see below. Whatever you pick there
+default view, built by indexing the session files Claude Code writes under
+`~/.claude` and the session index Codex keeps under `~/.codex` — read-only,
+always; see below. Whatever you pick there
 opens one of three ways:
 
 - **In-place** (default, `Enter`): banto hands its own terminal to
@@ -192,7 +193,8 @@ cargo run -- --claude-home /path/to/.claude
 | `/` | Search (fuzzy, title + cwd) |
 | `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
-| `a` | Toggle showing hidden sessions (agent-run, superseded ancestors) |
+| `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
+| `D` | Restore (un-archive) the selected session, while archived ones are revealed |
 | `q` / `Esc` | Quit |
 
 ### Emporium
@@ -206,9 +208,15 @@ to quit — N session(s) running`), since quitting ends every hosted process:
 | `Enter` | Open embedded; on a Director, stage its whole cell |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
+| `F2` | Move focus between the list and the panes |
+| `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
 | `Ctrl+B` … | tmux-style prefix (configurable), from sidebar or pane: |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
+| … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down (focus stays on it) |
+| … `m` | collapse the focused stack tile to a strip, or open it again |
+| … `z` | solo the focused tile (the master included; every stack tile but the soloed one is collapsed), or turn its solo off |
+| … `M` | open every collapsed tile and turn the solo off |
 | … `=` | put the staged brigade's tile sizes back to the defaults (order, collapsed tiles and the sidebar width are kept) |
 | … `1`-`9` | jump to pane N |
 | … `s` | back to the sidebar |
@@ -221,6 +229,12 @@ nothing to memorize; otherwise its hints follow the focus (the list keys when th
 list is focused, just the prefix chord and `F2`/`F3` when a pane is). Multiline paste and file drag&drop into panes work
 (synthesized into bracketed pastes host-side, since the Windows console
 never reports pastes as pastes).
+
+With the mouse: drag the boundary between the list and the panes, between the
+master tile and the stack, or between two stack tiles to resize; drag a stack
+tile by its title to move it; `[S]` in any tile's title row solos it, and a
+stack tile also has `[_]` to collapse it to a strip (`[+]` opens it again). Each brigade's
+arrangement, and the sidebar's width, is remembered across restarts.
 
 ## Configuration
 

@@ -1,16 +1,16 @@
-//! Brigades: an internal operational cell of one Director session and one or
-//! more Worker sessions, hosted together as tiled panes in the emporium mode.
+//! Brigades: an internal operational cell of one Director session and its
+//! Worker sessions (formed with at least one; dismissing Workers can later
+//! leave it with none), hosted together as tiled panes in the emporium mode.
 //!
 //! A brigade is a *separate* concept from a group: a group is the user's own
 //! filing (project / phase), while a brigade is a live operational unit — a
-//! Director commanding Worker(s). It is an internal term, never surfaced to the
-//! user.
+//! Director commanding Worker(s).
 //!
 //! `brigade_members` is keyed by a banto-owned `member_token` ('director',
 //! 'worker-1', 'worker-2', ...) rather than the session id itself: a
 //! Worker is formed *before* its agent product assigns it a session id (banto
 //! auto-spawns a fresh `claude` process and only later discovers its id —
-//! see `crate::embedded::emporium`'s `PendingNew` flow), so the id has to be
+//! see `banto_core::engine`'s `PendingOpen` flow), so the id has to be
 //! a nullable column (`session_id`) filled in after the fact, not the
 //! primary identity. Two policies are layered here in code rather than
 //! enforced by the schema:
@@ -276,13 +276,12 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a member from its brigade for good — the emporium's
-    /// prefix-`x` "dismiss" choice on a Worker or a Goinkyo pane (as
-    /// opposed to just closing its pane), and `dismiss_goinkyo`'s own way
-    /// of ending a consultation from the other process. `token` is the only
-    /// thing this ever filters by, no role — named for the first of those
-    /// two callers, kept for the second rather than adding a
-    /// same-shaped sibling with a different name (see
+    /// Removes a member from its brigade for good — the emporium's prefix-`x`
+    /// on a Worker or a Goinkyo pane, a Worker that ended on its own and could
+    /// not be relaunched, and `dismiss_goinkyo`'s own way of ending a
+    /// consultation from the other process. `token` is the only thing this ever
+    /// filters by, no role — named for the Worker callers, kept for the
+    /// Goinkyo's rather than adding a same-shaped sibling with a different name (see
     /// `crate::mcp::tool_dismiss_goinkyo`'s own doc): membership, its read
     /// cursor, AND — unlike [`Self::remove_brigade_member`], which this
     /// does not reuse, since that one is used elsewhere to tidy up a

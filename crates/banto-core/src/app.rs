@@ -96,7 +96,7 @@ struct PendingRiskyOpen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Letter keys are commands (`j`/`k` move, `/` searches, `p` pins, `a`
-    /// toggles the agent filter, `q`/Esc quit).
+    /// cycles what the list reveals, `q`/Esc quit).
     Normal,
     /// Typed characters filter the list; Esc cancels back to [`Mode::Normal`].
     Search,
@@ -842,7 +842,7 @@ pub struct App {
     directors: HashSet<String>,
     /// Session ids superseded by an auto-compaction continuation (every id
     /// with a known successor; see `banto_io::lineage`/`Store::lineage_parent_ids`).
-    /// Hidden from `filtered` like `hidden`, gated by [`Self::show_agents`]
+    /// Hidden from `filtered` like `hidden`, gated by [`Self::reveal`]
     /// rather than always-off, UNLESS the session is currently live (see
     /// [`Self::compute_filtered`]) — a running resumed ancestor must stay
     /// visible, hiding it would lie about what's actually running. A cache
@@ -850,8 +850,8 @@ pub struct App {
     /// [`Self::with_superseded`]/[`Self::set_superseded`].
     superseded: HashSet<String>,
     /// `Config.agents`, resolved — display-only here, not a name-doubling
-    /// coincidence with [`Self::show_agents`]: that one hides/reveals
-    /// already-loaded *rows* (spawned-agent sessions), this one only
+    /// coincidence with [`Self::reveal`]: that one hides/reveals
+    /// already-loaded *rows* (agent-run, superseded and archived ones), this one only
     /// explains why [`Self::rows`] can be short to begin with — the actual
     /// filtering happened before discovery ever produced a row (see
     /// `crate::config::resolve_agents`'s doc). Never affects `filtered`.
@@ -859,10 +859,10 @@ pub struct App {
     /// calls [`Self::with_enabled_agents`] (most tests) behaves as
     /// unrestricted, matching `Config.agents`'s own empty-string default.
     enabled_agents: BTreeSet<AgentKind>,
-    /// Whether agent-run sessions (`SessionRow::is_agent`) and non-live
-    /// superseded sessions are included in `filtered`. Off by default: a
-    /// human browsing their own sessions doesn't usually want every
-    /// spawned-agent or superseded-ancestor session cluttering the list.
+    /// How much of the list `filtered` includes (see [`Reveal`]). Ordinary
+    /// sessions only by default: a human browsing their own sessions doesn't
+    /// usually want every spawned-agent or superseded-ancestor session, or what
+    /// they archived, cluttering the list.
     reveal: Reveal,
     /// Every known group, alphabetical by name — a cache for sorting/display
     /// only, the store is the durable source of truth; see [`Self::with_groups`].
@@ -935,7 +935,7 @@ pub struct VisibleRow<'a> {
     pub director: bool,
     /// True when this session has a known auto-compaction continuation —
     /// shown regardless of *why* the row is visible (still live, or the
-    /// `a` toggle is on).
+    /// `a` cycle has revealed what banto hid).
     pub superseded: bool,
 }
 
@@ -1573,10 +1573,8 @@ impl App {
         lines
     }
 
-    // --- agent filter -------------------------------------------------------
+    // --- reveal levels ------------------------------------------------------
 
-    /// Whether agent-run sessions are currently included in the list. Only
-    /// used by tests; production code reads `hidden_agent_count()` instead.
     /// Whether any row on screen right now is one the operator archived —
     /// what decides whether `D`'s hint is worth the width it costs. True
     /// only at [`Reveal::Archived`] with something actually buried, which is
@@ -1599,11 +1597,11 @@ impl App {
         self.reveal
     }
 
-    /// Number of sessions matching the current query that the `a` toggle is
-    /// currently hiding: agent-run sessions, plus superseded (auto-compaction
-    /// ancestor) sessions that aren't currently live (see
-    /// [`Self::is_hidden_superseded`]). Always `0` once [`Self::show_agents`]
-    /// is on.
+    /// Number of sessions matching the current query that the current
+    /// [`Reveal`] level is hiding: agent-run sessions, superseded
+    /// (auto-compaction ancestor) sessions that aren't currently live (see
+    /// [`Self::is_hidden_superseded`]), and archived ones. Always `0` at
+    /// [`Reveal::Archived`].
     pub fn hidden_count(&self) -> usize {
         rank_indices(&self.query, &self.haystacks)
             .into_iter()
@@ -1627,7 +1625,7 @@ impl App {
 
     /// True when `rows[i]` has a known auto-compaction continuation and is
     /// not currently live — the condition under which [`Self::compute_filtered`]
-    /// hides it (subject to [`Self::show_agents`]). A live superseded row
+    /// hides it (subject to [`Self::reveal`]). A live superseded row
     /// (a resumed ancestor still running) is never hidden: hiding a running
     /// session would lie about what's actually going on.
     fn is_hidden_superseded(&self, i: usize) -> bool {
@@ -1900,9 +1898,9 @@ impl App {
         self.filtered_waiting_generation = self.filtered_waiting_generation.wrapping_add(1);
     }
 
-    /// Rank `rows` against the current query, then drop agent-run and
-    /// hidden-superseded sessions unless [`Self::show_agents`] is on (see
-    /// [`Self::is_hidden_superseded`]), and always drop brigade Workers
+    /// Rank `rows` against the current query, then drop what the current
+    /// [`Reveal`] level hides (agent-run, hidden-superseded and archived
+    /// sessions; see [`Self::is_hidden_superseded`]), and always drop brigade Workers
     /// (banto's own implementation detail, not something the user picks
     /// directly — see `hidden`). Ranking (and, with an empty query, the
     /// pinned-first base order) always runs first and is never affected by
@@ -2337,7 +2335,7 @@ impl App {
 
     /// The loaded session with this id, if present — searches the full list,
     /// not just the current filter/sort, so a session referenced by id (e.g. a
-    /// brigade member that the agent filter or search would otherwise hide)
+    /// brigade member that the reveal level or search would otherwise hide)
     /// can still be resolved back to its title/cwd. A plain accessor, unaware
     /// of any brigade concept.
     pub fn row_for_id(&self, id: &str) -> Option<&SessionRow> {
@@ -4510,7 +4508,7 @@ mod tests {
     #[test]
     fn a_header_count_reflects_the_current_agent_filter() {
         // A search query flattens grouped view entirely (see
-        // `grouped_view_stays_flat_while_searching`), so the agent filter —
+        // `grouped_view_stays_flat_while_searching`), so the reveal filter —
         // which doesn't — is what actually demonstrates a header's count
         // tracking the *filtered* set rather than every row in its section.
         let mut app = App::new(vec![

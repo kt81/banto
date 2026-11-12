@@ -15,7 +15,6 @@ fn title(scene: &Scene, token: &str) -> String {
 
 /// The geometry facts a rename must not touch: every tile's rectangle, the
 /// order, the layout preferences, and what is collapsed.
-/// Tile rectangles, order, collapsed flags and the layout preferences.
 type Arrangement = (Vec<(String, Rect)>, Vec<String>, Vec<bool>, String);
 
 fn arrangement(scene: &Scene) -> Arrangement {

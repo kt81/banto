@@ -111,8 +111,9 @@ user's Windows Terminal:
   banto owns the layout: it is just which context's pane list gets rendered.)
 - **Hidden contexts keep running in the background** — off-screen tickers keep
   advancing; switching back shows the counter has moved on.
-- **Keyboard routes to the focused pane** (F4 cycles focus; click focuses a
-  pane; the focused pane's cursor is mirrored).
+- **Keyboard routes to the focused pane** (in the spike build F4 cycled focus;
+  click focused a pane; the focused pane's cursor was mirrored). The shipped
+  keymap is in `docs/REQUIREMENTS.md`'s Emporium keys section.
 - **Strongest result:** `claude` launched *inside* a hosted shell pane retained
   full session state across repeated context switches — a heavy alt-screen TUI
   in a backgrounded pane survives being hidden and reshown. This is the
@@ -142,18 +143,18 @@ Mouse forwarding into the child and scrollback viewing were both on the list
 above; both have since landed.
 
 - **Mouse forwarding into the child** (SGR mouse translate):
-  `Screen::wants_sgr_mouse` (`crates/banto-core/src/engine.rs:3610`) gates
+  `Screen::wants_sgr_mouse` (`crates/banto-core/src/screen.rs`) gates
   whether a mouse event reaches the child's own SGR mouse mode instead of
   banto's own pane control. Click/drag landed (2026-07-27); the wheel
   case — forward to the child vs. scroll banto's own pane — joined the same
   gate later (2026-08-02, the same day as scrollback below), tested by
   `wheel_over_a_pane_that_wants_sgr_mouse_is_forwarded_not_consumed`
-  (`engine.rs:7680`).
+  (`crates/banto-core/src/engine.rs`).
 - **Scrollback viewing** (2026-08-02): `Screen::scrollback()`/
-  `Screen::scroll()` (`crates/banto-core/src/screen.rs:141`/`:169`), wired
-  from mouse-wheel handling at `engine.rs:3625`, tested by
+  `Screen::scroll()` (`crates/banto-core/src/screen.rs`), wired from the wheel
+  branch of `update_mouse` in `crates/banto-core/src/engine.rs`, tested by
   `wheel_over_a_pane_that_does_not_want_sgr_mouse_scrolls_its_own_scrollback`
-  (`engine.rs:7643`); the scrollback-*capture* fix this depends on
+  (same file); the scrollback-*capture* fix this depends on
   (`portable-pty-psmux`) is in `docs/REQUIREMENTS.md`'s "Emporium mode"
   section.
 

@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn director_or_solo_kill_modal_keeps_the_single_choice_prompt() {
+    fn director_or_solo_kill_modal_is_the_plain_kill_prompt() {
         let area = Rect::new(2, 2, 50, 10);
         let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
         terminal

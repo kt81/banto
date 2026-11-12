@@ -568,7 +568,7 @@ prompted it: a Worker added later takes the mean of the others' heights, so weig
 set when a brigade had two Workers leave one tile much smaller than the rest once it
 has four.
 **What is kept across a restart.** Everything arranged above is stored in banto's
-own sqlite store (schema v15) and comes back the next time banto runs: the
+own sqlite store and comes back the next time banto runs: the
 sidebar width (table `ui_prefs`, key `sidebar_width`); per brigade, the master
 share, the collapsed stack width and the soloed member (columns on `brigades`);
 per member, its place in the stack order, its row weight and its collapsed flag
@@ -659,8 +659,9 @@ needs to know about.
 
 ## Brigade (Director/Worker cells)
 
-A brigade is an internal operational cell of one Director session and one or
-more Worker sessions, hosted together as tiled panes in the emporium
+A brigade is an internal operational cell of one Director session and its
+Worker sessions (formed with at least one; dismissing Workers can later leave
+it with none), hosted together as tiled panes in the emporium
 (`crates/banto-io/src/store/migrations.rs` v4 migration comment). It is a
 separate concept from groups (the user's own project/phase filing): a brigade
 is a live operational unit, not a filing category. A session belongs to at

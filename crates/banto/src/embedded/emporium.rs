@@ -1,6 +1,6 @@
 //! The "emporium" (大店 / `--emporium` / `--oodana`) mode: banto as a
-//! persistent left sidebar (the session list) plus a right pane hosting the
-//! selected session embedded.
+//! persistent left sidebar (the session list) plus a pane area beside it that
+//! hosts the staged session or a brigade's tiles, embedded.
 //!
 //! Per `docs/DISCIPLINE.md` §4, this module is a thin **shell**: it gathers
 //! facts about the outside world into
@@ -350,7 +350,8 @@ pub struct EmporiumSettings<'a> {
     pub resolved_agents: &'a ResolvedAgents,
 }
 
-/// Run the emporium mode until the user quits (`q`/Esc from the sidebar).
+/// Run the emporium mode until the user quits (`q`/Esc from the sidebar; a
+/// second press while sessions are running).
 pub fn run(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
@@ -542,7 +543,7 @@ struct Deps<'a> {
     /// `[brigade]` from config.toml. Lives here rather than as its own
     /// `event_loop` parameter because `execute_cmd` needs it too now (a
     /// member's launch argv carries its role briefing — see
-    /// [`render_briefing`]).
+    /// [`member_briefing`]).
     brigade: &'a BrigadeConfig,
     /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
     agent_binaries: &'a AgentBinaries,
@@ -804,8 +805,8 @@ fn event_loop(
         }
         let dispatch_dur = dispatch_start.elapsed();
 
-        // A `PtyExited` handler drops the session's `Screen`; the handle
-        // itself (now pointing at a dead reader thread) is reaped here.
+        // A `PtyExited` or `PtyOutputLost` handler drops the session's `Screen`;
+        // the handle itself (now pointing at a dead reader thread) is reaped here.
         // This is also why every core-side `screens` rekey must reach the
         // handle map (`Cmd::RekeyPty`): a handle left under a stale key
         // reads as "screen gone" and is reaped here, which on Unix closes
@@ -1886,9 +1887,8 @@ fn codex_briefed_session_id(
 ///    Worker as a brand-new session.
 /// 2. **Session files** (`find_new_sessions`, not the single-best
 ///    `find_new_session`), greedily assigned oldest-first, disambiguating a
-///    batch spawned into one cwd at once — mirrors the pre-migration
-///    `discover_new_ids`. The fallback whenever the direct child isn't the
-///    `claude` process itself (see `PtyIo::pid`).
+///    batch spawned into one cwd at once. The fallback whenever the direct
+///    child isn't the `claude` process itself (see `PtyIo::pid`).
 /// 3. **The store's `briefed_session_id`** ([`codex_briefed_session_id`]),
 ///    tried only for a tracker whose `agent` is `AgentKind::Codex`: sources
 ///    1 and 2 don't apply to it at all — see that function's own doc.
@@ -2726,7 +2726,7 @@ fn draw(
         frame.render_widget(
             Paragraph::new(
                 "Select a session and press Enter.\n\
-                 F2 toggles focus · B starts a brigade · q quits.",
+                 B brigade/disband · q/Esc quit.",
             ),
             content,
         );
@@ -3806,6 +3806,28 @@ mod tests {
     fn status_row(buffer: &Buffer) -> String {
         let bottom = buffer.area.height - 1;
         text_at(buffer, 0, bottom, buffer.area.width)
+    }
+
+    #[test]
+    fn the_empty_pane_placeholder_offers_enter_brigade_and_quit_but_not_f2() {
+        // Shown only while nothing is staged, when the list has the focus: F2 has
+        // nowhere to go from there, so it is not offered.
+        let state = EmporiumState::new(PrefixKey::default());
+        let app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+        let buffer = render(&state, &app);
+        let screen: String = (0..buffer.area.height)
+            .map(|y| text_at(&buffer, 0, y, buffer.area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("Select a session and press Enter."),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("B brigade/disband · q/Esc quit."),
+            "{screen}"
+        );
+        assert!(!screen.contains("F2 toggles"), "{screen}");
     }
 
     #[test]
@@ -7112,10 +7134,9 @@ mod tests {
 
     #[test]
     fn a_claude_members_idle_detection_is_unchanged_by_the_codex_split() {
-        // Same live-file-based check as before this round, now reached via
-        // the AgentKind::ClaudeCode arm instead of being the only arm — the
-        // alive-and-busy and alive-and-waiting cases are their own tests
-        // below, not this one.
+        // The live-file-based check, reached via the AgentKind::ClaudeCode arm
+        // beside Codex's own — the alive-and-busy and alive-and-waiting cases
+        // are their own tests below, not this one.
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         write_live_state(
@@ -8254,10 +8275,10 @@ mod tests {
         );
     }
 
-    // --- tile_title -----------------------------------------------------
+    // --- tile_label -----------------------------------------------------
 
     #[test]
-    fn tile_title_uses_member_token_even_when_panes_are_reversed() {
+    fn tile_label_uses_member_token_even_when_panes_are_reversed() {
         // Drive formation through the core so this test proves the renderer
         // receives the token as state data, then reverse geometry to prove
         // neither label is derived from a pane index.
@@ -8318,7 +8339,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_title_labels_the_goinkyo_pane_by_role_not_position() {
+    fn tile_label_labels_the_goinkyo_pane_by_role_not_position() {
         // Drives the real spawn path (`Event::GoinkyoAwaitingSpawn` then
         // `Event::Spawned`) rather than poking at `goinkyo_pane` directly —
         // it is private to `banto-core`, reachable from here only through

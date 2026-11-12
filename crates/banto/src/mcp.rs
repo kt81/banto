@@ -10,12 +10,17 @@
 //!
 //! The server shares banto's own sqlite store with the TUI process (exactly the
 //! cross-process access the store's busy_timeout was set up for), and mediates a
-//! pull-based message queue:
-//! - `send_to_peer(text)` enqueues a message to the opposite role in the brigade
-//!   (Director -> every Worker, or Worker -> Director);
+//! pull-based message queue, with a few brigade tools beside it:
+//! - `send_to_peer(text, to?)` enqueues a message to the opposite role in the
+//!   brigade (Director -> every Worker, or Worker/Goinkyo -> Director), or to one
+//!   member by token;
 //! - `check_messages()` pulls the messages addressed to this session's role that
 //!   it hasn't seen yet, wrapped in firewall framing that names them as relayed
-//!   from another AI rather than a direct operator instruction.
+//!   from another AI rather than a direct operator instruction;
+//! - `brigade_status()` reports who is in the brigade and what each is doing;
+//! - `consult_goinkyo(..)` / `dismiss_goinkyo()` (Director only) summon and end
+//!   the Goinkyo;
+//! - `name_member(member, name)` (Director only) labels a Worker.
 //!
 //! Delivery is a *pull*, never a stdin injection: even though the embedded banto
 //! is the sole writer to a child's stdin, injecting a peer's message there would
@@ -205,10 +210,12 @@ fn tools_list_result() -> Value {
             {
                 "name": "brigade_status",
                 "description": "Who you are in this brigade, who your peers are, and what each \
-                                of them is doing right now (idle, busy, not running) — plus \
-                                whether anyone is holding unread mail from you. Answering at \
-                                all also proves the banto channel is up. Call it when you want \
-                                to know whether there is anyone to delegate to.",
+                                of them is doing right now (idle, busy or waiting; just running, \
+                                for a peer banto can only see to be alive; not running; or \
+                                starting up) \
+                                — plus whether anyone is holding unread mail from you. \
+                                Answering at all also proves the banto channel is up. Call it \
+                                when you want to know whether there is anyone to delegate to.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
             {
@@ -316,7 +323,7 @@ fn tools_list_result() -> Value {
                                 shows beside its token in brigade_status, in message headers and \
                                 on the operator's screen. A name is only a label — its token \
                                 (worker-2, …) stays what identifies it, and send_to_peer's `to` \
-                                still takes the token. At most 24 columns, no double quote, \
+                                still takes the token. At most 24 columns, no double quote or square bracket, \
                                 unique among this brigade's members, and not a token or \
                                 something that looks like one. Only Workers can be named, not \
                                 the Director or the Goinkyo.",
@@ -360,12 +367,9 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
 /// addressable peers, each with what it is doing right now and whether it is
 /// sitting on unread mail from the caller.
 ///
-/// Replaces what used to be a bare `banto_ping` echoing the session id back.
-/// The liveness answer is kept (a reply at all means the channel is up), but
-/// a health check was the wrong shape for the one tool a member reaches for
-/// first: a Director that has to *infer* it has Workers from three tool
-/// names mostly doesn't, and the roster was sitting unread in banto's own
-/// store the whole time.
+/// A reply at all means the channel is up. The roster is the point: a Director
+/// that has to *infer* it has Workers from three tool names mostly doesn't,
+/// while the roster sits in banto's own store.
 ///
 /// Every read here is non-consuming — `has_unseen_brigade_messages`, never
 /// `fetch_brigade_messages` — so asking about the mail can never swallow it.
@@ -1404,7 +1408,7 @@ mod tests {
             store,
             // No `sessions/` dir under it: every peer reads as "not
             // running", which is what a test without live fixtures should
-            // see. `brigade_status_reports_a_live_peers_activity` writes
+            // see. `brigade_status_reports_a_live_peers_activity_from_its_live_state_file` writes
             // real live-state files into its own temp home instead.
             claude_home: ClaudeHome::new(PathBuf::from("/nonexistent")),
             codex_home: None,
@@ -2348,8 +2352,7 @@ mod tests {
 
     /// Exercises the broadcast default through the real `send_to_peer` call
     /// (not `store.enqueue_brigade_message` directly) with two registered
-    /// Workers, so `to_role`'s new `default_broadcast_role` path — not just
-    /// its old `peer_role`-derived equivalent — is what this asserts on.
+    /// Workers, so it is `BrigadeRole::broadcast_target` that picks the recipients.
     #[test]
     fn send_to_peer_director_broadcast_reaches_every_worker() {
         let mut ctx = ctx(

@@ -11,6 +11,7 @@
 //!   replaced; its width tests are the regression net for that swap
 //! - [`view`] the shared session-list / summary panel widgets
 //! - [`strip`] the body of a collapsed stack tile, from a plain data struct
+//! - [`hints`] the emporium's status-bar key hints, as text
 //! - [`text`] column-aware text truncation, shared by `render_modal`/`view`
 
 pub mod hints;

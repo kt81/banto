@@ -1421,8 +1421,8 @@ enum EscapeOutcome {
 /// terminating letter's own — `parse`/[`replay`] still only ever see the
 /// plain `char`s, and replay's own dispatch is unchanged: it always sends
 /// `KeyModifiers::NONE`, regardless of what a replayed character actually
-/// arrived with (this round changes leaked-arrow *recognition*, not
-/// replay's dispatch semantics).
+/// arrived with (leaked-arrow *recognition* uses the modifiers; replay's
+/// dispatch semantics do not).
 fn swallow_one_sequence(
     app: &mut App,
     ctx: &Context,
@@ -2310,7 +2310,7 @@ mod tests {
         // (grouped view is on by default) — the header carries the pin
         // marker; the row itself stays unmarked (repeating it on every row
         // under the header would be pure noise; see
-        // `App::VisibleRow::in_pinned_section`).
+        // `App::grouped_view_in_effect`).
         let lines: Vec<&str> = text.lines().collect();
         let beta_pos = lines
             .iter()
