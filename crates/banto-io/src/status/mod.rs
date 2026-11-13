@@ -5,8 +5,9 @@
 //! Sources, in priority order (docs/REQUIREMENTS.md, "Activity indicator"):
 //! 1. `<claude_home>/sessions/<pid>.json` + PID alive + status=busy -> Busy
 //! 2. `<claude_home>/sessions/<pid>.json` + PID alive + status=waiting -> Waiting
-//! 3. PID alive, any other or unknown status -> Alive
-//! 4. otherwise bucket the session file mtime into Today / ThisWeek / Older
+//! 3. PID alive + status=shell (a background command still running) -> Busy
+//! 4. PID alive, any other or unknown status -> Alive
+//! 5. otherwise bucket the session file mtime into Today / ThisWeek / Older
 //!
 //! The status values belong to Claude Code, not banto. Unknown values must
 //! degrade to [`Activity::Alive`], preserving today's behavior if upstream
@@ -66,14 +67,97 @@ use banto_core::status::{AgeThresholds, age_bucket};
 /// member's measurement (not re-measured here): the turn has ended but a
 /// background shell command of the session, or of one of its sub-agents, is
 /// still running; when that work ends Claude is re-invoked (`"busy"`) and then
-/// goes `"idle"`. The list keeps drawing it as [`Activity::Alive`] — the
-/// catch-all it already fell into — and the relay still counts it as idle
-/// enough to nudge, since it is neither busy nor waiting for the operator; only
-/// [`claude_quiescence`] tells it apart from `"idle"`.
+/// goes `"idle"`. The list shows it as [`Activity::Busy`], which is what the quit
+/// question and the brigade watch already counted it as (not idle: a command is
+/// running that ending the session would lose), so what is drawn and what is
+/// decided say the same. The relay is the one reader that does NOT follow: it
+/// still counts `shell` as idle enough to nudge ([`claude_nudgeable`]), since the
+/// turn has ended and the member can take a message. The two readings are
+/// separate on purpose — display here in [`classify_from_alive_pids`], the relay
+/// in [`claude_nudgeable`] — so that changing a word on screen cannot change who
+/// gets nudged.
 pub const LIVE_STATUS_BUSY: &str = "busy";
 pub const LIVE_STATUS_WAITING: &str = "waiting";
 pub const LIVE_STATUS_IDLE: &str = "idle";
 pub const LIVE_STATUS_SHELL: &str = "shell";
+
+/// The one [`LiveSession::waiting_for`] value anything here acts on.
+///
+/// Measured 2026-11-13 on Claude Code 2.1.323, by sampling a live file from
+/// outside: next to `status: "waiting"` the file can carry `waitingFor`. It read
+/// `"input needed"` while the session sat in the picker for a question the
+/// model had asked, and `"dialog open"` while the OPERATOR had a slash-command
+/// picker (`/model`) open that he had opened himself; when he closed it the
+/// status went back to `"idle"`. Not measured: the value for a permission
+/// prompt, for a dialog the product opens on its own, and what `status` says
+/// when a dialog is opened over a running turn. A table of reason strings was
+/// read (not measured) in the Claude Code bundle: "permission prompt", "sandbox
+/// request", "worker request", "goal proposal", "input needed", "dialog open".
+///
+/// Compared for equality and nothing else. "dialog open" is a catch-all, so a
+/// dialog the product opens by itself reads the same, and every other value, or
+/// none, is a `waiting` exactly as before.
+pub const LIVE_WAITING_FOR_DIALOG_OPEN: &str = "dialog open";
+
+/// Whether `entry` is a `waiting` session whose reason is exactly a dialog.
+fn on_a_dialog(entry: &LiveSession) -> bool {
+    entry.status.as_deref() == Some(LIVE_STATUS_WAITING)
+        && entry.waiting_for.as_deref() == Some(LIVE_WAITING_FOR_DIALOG_OPEN)
+}
+
+/// Whether the session `session_id` is `waiting` only because a dialog is open:
+/// it has a live process, nothing busy, at least one `waiting` entry, and every
+/// `waiting` entry says exactly [`LIVE_WAITING_FOR_DIALOG_OPEN`]. The list still
+/// calls such a session Waiting ([`classify`]); this is what lets the bell tell it
+/// apart, and nothing else.
+pub fn waiting_on_a_dialog(
+    live: &[LiveSession],
+    session_id: &str,
+    alive_pids: &HashSet<u32>,
+) -> bool {
+    let mut waiting = false;
+    for entry in live {
+        if entry.session_id.as_deref() != Some(session_id) || !alive_pids.contains(&entry.pid) {
+            continue;
+        }
+        if entry.status.as_deref() == Some(LIVE_STATUS_BUSY) {
+            return false;
+        }
+        if entry.status.as_deref() == Some(LIVE_STATUS_WAITING) {
+            if !on_a_dialog(entry) {
+                return false;
+            }
+            waiting = true;
+        }
+    }
+    waiting
+}
+
+/// Whether the relay may treat the Claude session `session_id` as idle enough to
+/// nudge: `None` when no live entry names it, else whether its first entry has a
+/// live process and is neither busy nor waiting.
+///
+/// A `waiting` session is not idle for the relay whatever it is waiting for,
+/// `"dialog open"` included: a nudge is typed text and an Enter, and typed into
+/// an open dialog its Enter would choose something, so its mail waits. This is
+/// the only place the relay reads the raw status, so that rule cannot come apart
+/// from the others. (What a dialog leaves unknown for the *quiet bell* is a
+/// separate question, [`claude_quiescence`]'s.)
+pub fn claude_nudgeable(
+    live: &[LiveSession],
+    session_id: &str,
+    alive_pids: &HashSet<u32>,
+) -> Option<bool> {
+    live.iter()
+        .find(|entry| entry.session_id.as_deref() == Some(session_id))
+        .map(|entry| {
+            alive_pids.contains(&entry.pid)
+                && !matches!(
+                    entry.status.as_deref(),
+                    Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
+                )
+        })
+}
 
 /// Whether the Claude session `session_id` is known to be idle, from the live
 /// files in `live` and the set of PIDs that are alive.
@@ -85,14 +169,30 @@ pub const LIVE_STATUS_SHELL: &str = "shell";
 /// live PID is `Unknown`: the caller asks about a pane whose process is
 /// running, so an absent file is missing information, not idleness (a fresh
 /// session publishes its file only a moment after it starts).
+///
+/// One exception, `waiting` with exactly [`LIVE_WAITING_FOR_DIALOG_OPEN`]: that
+/// is `Unknown`, not `NotIdle` (unless another entry is busy or waiting for
+/// something else, which wins). Read as not idle, a dialog the operator opens in
+/// a member's pane and closes again would count as work that ended, arm a brigade
+/// that had been quiet, and ring its quiet bell a settle after he closes it; and
+/// `Unknown` is the honest value, since it is not known what status a dialog
+/// opened over a running turn reports, so a dialog proves neither that the
+/// session is idle nor that it is busy. Unknown still asks at quit and holds a
+/// brigade's quiet stretch, so a brigade with a dialog left open cannot go quiet
+/// until it is closed.
 pub fn claude_quiescence(
     live: &[LiveSession],
     session_id: &str,
     alive_pids: &HashSet<u32>,
 ) -> Quiescence {
     let mut seen = false;
+    let mut dialog = false;
     for entry in live {
         if entry.session_id.as_deref() != Some(session_id) || !alive_pids.contains(&entry.pid) {
+            continue;
+        }
+        if on_a_dialog(entry) {
+            dialog = true;
             continue;
         }
         if entry.status.as_deref() != Some(LIVE_STATUS_IDLE) {
@@ -100,10 +200,10 @@ pub fn claude_quiescence(
         }
         seen = true;
     }
-    if seen {
-        Quiescence::Idle
-    } else {
+    if dialog || !seen {
         Quiescence::Unknown
+    } else {
+        Quiescence::Idle
     }
 }
 
@@ -111,8 +211,9 @@ pub fn claude_quiescence(
 ///
 /// A live entry matches `meta` when its `session_id` equals `meta.id.0`.
 /// Precedence: a matching entry whose PID is alive with status `"busy"` wins
-/// ([`Activity::Busy`]), then `"waiting"` ([`Activity::Waiting`]), then any
-/// other matching entry with a live PID ([`Activity::Alive`]); otherwise the
+/// ([`Activity::Busy`]), then `"waiting"` ([`Activity::Waiting`]), then
+/// `"shell"` (a background command still running, also [`Activity::Busy`]), then
+/// any other matching entry with a live PID ([`Activity::Alive`]); otherwise the
 /// session is [`Activity::Idle`] with an [`age_bucket`] computed from
 /// `meta.mtime`.
 pub fn classify(
@@ -145,6 +246,7 @@ pub fn classify_from_alive_pids(
 ) -> Activity {
     let mut any_alive = false;
     let mut any_waiting = false;
+    let mut any_shell = false;
     for entry in live {
         if entry.session_id.as_deref() != Some(meta.id.0.as_str()) {
             continue;
@@ -161,10 +263,16 @@ pub fn classify_from_alive_pids(
         if entry.status.as_deref() == Some(LIVE_STATUS_WAITING) {
             any_waiting = true;
         }
+        if entry.status.as_deref() == Some(LIVE_STATUS_SHELL) {
+            any_shell = true;
+        }
         any_alive = true;
     }
     if any_waiting {
+        // A person is needed, which outranks a command still running.
         Activity::Waiting
+    } else if any_shell {
+        Activity::Busy
     } else if any_alive {
         Activity::Alive
     } else {
@@ -238,6 +346,7 @@ mod tests {
             session_id: session_id.map(str::to_string),
             cwd: None,
             status: status.map(str::to_string),
+            waiting_for: None,
             kind: None,
             name: None,
             proc_start: None,
@@ -472,13 +581,204 @@ mod tests {
     }
 
     #[test]
-    fn shell_is_alive_in_the_list_and_not_idle_for_quiescence() {
-        // What the session list draws for a `shell` session is what it drew
-        // for any status it does not name: the catch-all `Alive`.
+    fn shell_is_busy_in_the_list_and_not_idle_for_quiescence() {
+        // The turn has ended but a background command is still running: what the
+        // list shows is what the quit question already counts, work in progress.
         let meta = meta_with_age(Duration::from_secs(60));
         let live = [live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_SHELL))];
         let probe = MockProbe::with_alive(&[100]);
-        assert_eq!(classify_default(&meta, &live, &probe), Activity::Alive);
+        assert_eq!(classify_default(&meta, &live, &probe), Activity::Busy);
         assert_eq!(quiescence_of(&live, &[100]), Quiescence::NotIdle);
+    }
+
+    #[test]
+    fn every_claude_status_has_one_display_word() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let probe = MockProbe::with_alive(&[100]);
+        for (status, expected) in [
+            (Some("busy"), Activity::Busy),
+            (Some("waiting"), Activity::Waiting),
+            (Some("shell"), Activity::Busy),
+            (Some("idle"), Activity::Alive),
+            (Some("a status nobody has seen"), Activity::Alive),
+            (Some(""), Activity::Alive),
+            (None, Activity::Alive),
+        ] {
+            let live = [live_entry(100, Some(SESSION_ID), status)];
+            assert_eq!(
+                classify_default(&meta, &live, &probe),
+                expected,
+                "status {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_entry_does_not_outrank_a_busy_or_waiting_one_for_the_same_session() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let probe = MockProbe::with_alive(&[100, 200]);
+        let shell = live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_SHELL));
+        let waiting = live_entry(200, Some(SESSION_ID), Some("waiting"));
+        let busy = live_entry(200, Some(SESSION_ID), Some("busy"));
+        assert_eq!(
+            classify_default(&meta, &[shell.clone(), waiting], &probe),
+            Activity::Waiting,
+            "a person is needed"
+        );
+        assert_eq!(
+            classify_default(&meta, &[shell, busy], &probe),
+            Activity::Busy
+        );
+        // A dead shell entry says nothing.
+        let dead = live_entry(300, Some(SESSION_ID), Some(LIVE_STATUS_SHELL));
+        assert_eq!(
+            classify_default(&meta, &[dead], &probe),
+            Activity::Idle(AgeBucket::Today)
+        );
+    }
+
+    fn waiting_entry(pid: u32, waiting_for: Option<&str>) -> LiveSession {
+        LiveSession {
+            waiting_for: waiting_for.map(str::to_string),
+            ..live_entry(pid, Some(SESSION_ID), Some("waiting"))
+        }
+    }
+
+    #[test]
+    fn a_waiting_session_is_waiting_in_the_list_whatever_its_reason_and_a_dialog_is_told_apart() {
+        let meta = meta_with_age(Duration::from_secs(60));
+        let probe = MockProbe::with_alive(&[100]);
+        for (reason, dialog) in [
+            (None, false),
+            (Some("input needed"), false),
+            (Some("permission prompt"), false),
+            (Some("a reason nobody has seen"), false),
+            (Some(""), false),
+            (Some("Dialog Open"), false),
+            (Some("dialog open "), false),
+            (Some("dialog open"), true),
+        ] {
+            let live = [waiting_entry(100, reason)];
+            assert_eq!(
+                classify_default(&meta, &live, &probe),
+                Activity::Waiting,
+                "{reason:?}: still Waiting in the list"
+            );
+            assert_eq!(
+                waiting_on_a_dialog(&live, SESSION_ID, &[100].into_iter().collect()),
+                dialog,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_waiting_session_with_a_live_process_and_nothing_else_to_say_is_on_a_dialog() {
+        let alive: HashSet<u32> = [100, 200].into_iter().collect();
+        let dialog = |live: &[LiveSession]| waiting_on_a_dialog(live, SESSION_ID, &alive);
+        // The reason is only read beside `waiting`.
+        for status in [Some("busy"), Some("idle"), Some("shell"), None] {
+            let entry = LiveSession {
+                waiting_for: Some("dialog open".to_string()),
+                ..live_entry(100, Some(SESSION_ID), status)
+            };
+            assert!(!dialog(&[entry]), "{status:?}");
+        }
+        // A dead process, another session's entry, no entry.
+        assert!(!waiting_on_a_dialog(
+            &[waiting_entry(100, Some("dialog open"))],
+            SESSION_ID,
+            &HashSet::new()
+        ));
+        assert!(!waiting_on_a_dialog(
+            &[waiting_entry(100, Some("dialog open"))],
+            "another-session",
+            &alive
+        ));
+        assert!(!dialog(&[]));
+        // Two live entries for one session: one that is really waiting, or busy,
+        // is the whole story.
+        assert!(dialog(&[
+            waiting_entry(100, Some("dialog open")),
+            waiting_entry(200, Some("dialog open"))
+        ]));
+        assert!(!dialog(&[
+            waiting_entry(100, Some("dialog open")),
+            waiting_entry(200, Some("input needed"))
+        ]));
+        assert!(!dialog(&[
+            waiting_entry(100, Some("dialog open")),
+            live_entry(200, Some(SESSION_ID), Some("busy"))
+        ]));
+    }
+
+    #[test]
+    fn a_dialog_open_session_is_unknown_for_quiescence_and_every_other_waiting_is_not_idle() {
+        for (reason, expected) in [
+            (None, Quiescence::NotIdle),
+            (Some("input needed"), Quiescence::NotIdle),
+            (Some("a reason nobody has seen"), Quiescence::NotIdle),
+            (Some("dialog open"), Quiescence::Unknown),
+        ] {
+            assert_eq!(
+                quiescence_of(&[waiting_entry(100, reason)], &[100]),
+                expected,
+                "{reason:?}"
+            );
+        }
+        // Whatever else is running wins over what a dialog leaves unknown.
+        let busy_too = [
+            waiting_entry(100, Some("dialog open")),
+            live_entry(200, Some(SESSION_ID), Some("busy")),
+        ];
+        assert_eq!(quiescence_of(&busy_too, &[100, 200]), Quiescence::NotIdle);
+        // And an idle entry beside a dialog does not make the session idle.
+        let idle_too = [
+            waiting_entry(100, Some("dialog open")),
+            live_entry(200, Some(SESSION_ID), Some("idle")),
+        ];
+        assert_eq!(quiescence_of(&idle_too, &[100, 200]), Quiescence::Unknown);
+    }
+
+    #[test]
+    fn the_relay_never_sees_a_waiting_session_as_idle_whatever_it_is_waiting_for() {
+        let alive: HashSet<u32> = [100].into_iter().collect();
+        let nudgeable = |entry: LiveSession| claude_nudgeable(&[entry], SESSION_ID, &alive);
+        for reason in [
+            None,
+            Some("input needed"),
+            Some("permission prompt"),
+            Some("a reason nobody has seen"),
+            Some("dialog open"),
+        ] {
+            assert_eq!(
+                nudgeable(waiting_entry(100, reason)),
+                Some(false),
+                "{reason:?}"
+            );
+        }
+        assert_eq!(
+            nudgeable(live_entry(100, Some(SESSION_ID), Some("busy"))),
+            Some(false)
+        );
+        assert_eq!(
+            nudgeable(live_entry(100, Some(SESSION_ID), Some("idle"))),
+            Some(true)
+        );
+        assert_eq!(
+            nudgeable(live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_SHELL))),
+            Some(true),
+            "shell is nudgeable, as before"
+        );
+        assert_eq!(
+            claude_nudgeable(
+                &[live_entry(300, Some(SESSION_ID), Some("idle"))],
+                SESSION_ID,
+                &alive
+            ),
+            Some(false),
+            "a dead process is not idle"
+        );
+        assert_eq!(claude_nudgeable(&[], SESSION_ID, &alive), None);
     }
 }

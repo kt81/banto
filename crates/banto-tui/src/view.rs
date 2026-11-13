@@ -486,6 +486,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: (!title.is_empty()).then(|| title.to_string()),
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
+            dialog_open: false,
             activity: Activity::Idle(AgeBucket::Older),
             is_agent: false,
             preview: None,

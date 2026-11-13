@@ -177,7 +177,8 @@ are slated for removal.
 
 ## Decision (2026-11-13): quitting asks about what could be lost; a quiet brigade rings
 
-Three decisions of the operator, made the same day, about when banto speaks up.
+Three decisions of the operator, made the same day, about when banto speaks up, and the steps that
+followed them (4 to 9).
 Their behaviour is written out in "The emporium: hosted panes" ("Is it idle? (the
 quit question)", "The closing line", "Attention", "The quiet brigade's bell"); this
 entry records what was decided and why.
@@ -219,21 +220,82 @@ and the plan-implementation prompt ring too, not only an approval.
 *What "idle" means, per agent* (the facts behind decision 1 and 3):
 
 - **Claude Code:** the live file's `status` is `idle`. `busy`, `waiting`, `shell`
-  and anything else are not idle; no usable live entry is unknown. `shell` was
-  measured on Claude Code 2.1.323 on 2026-11-13: the turn has ended but a
-  background shell command is still running (see "Data sources").
-- **Codex:** the last turn marker in the rollout says the turn ended
+  and anything else are not idle, except `waiting` with `waitingFor` exactly `dialog
+  open`, which is unknown (item 9); no usable live entry is unknown. `shell` was
+  measured on Claude Code 2.1.323 on 2026-11-13: the turn has ended but a background
+  shell command is still running (see "Data sources").
+- **Codex:** first, what the pane itself reports (item 4 above): idle, done and
+  error → idle; working and blocked → not idle. With no report (or after its
+  `clear`), the last turn marker in the rollout says the turn ended
   (`task_complete`, `turn_aborted`, and the `turn_*` alias spellings); a started
   turn is not idle; no marker is unknown. These marker names are from the Codex
   source at tag `rust-v0.168.0`, not measured here (see "Codex data sources").
-  **Known limit, measured 2026-11-13** (installed `codex-cli 0.168.0`): Codex
-  records nothing about a command it left running after the turn ended — the
-  process was alive for 108 s after `task_complete`, with no rollout or sqlite
-  change and no re-invocation of the model at its end — so such a Codex session
-  reads as idle, and a quit can end it without asking.
+  **Known limit of the rollout alone, measured 2026-11-13** (installed `codex-cli
+  0.168.0`): Codex records nothing about a command it left running after the turn
+  ended — the process was alive for 108 s after `task_complete`, with no rollout or
+  sqlite change and no re-invocation of the model at its end — so a Codex session
+  with no report reads as idle, and a quit can end it without asking.
 
-*Not done:* nothing in this change reads Codex's terminal escape sequences, and
-sub-agent activity is not tracked.
+4. **Later the same day: a hosted Codex pane's own state report is read.** banto
+   reads it out of the pane's output: OSC 7501, the published Program Status
+   Protocol (spec: <https://www.superlogical.com/rex/docs/build/program-status>,
+   proposed by Mitchell Hashimoto,
+   <https://mitchellh.com/writing/program-status-osc7501>; another member read the
+   spec and Codex's source, banto's code reads only the sequences). For a pane known
+   to be Codex that has reported, it decides the quit question and the brigade bell
+   instead of the rollout marker; `blocked` is shown and rung for like a Claude
+   session in `waiting`; `working` shows busy in the list. The relay still reads the
+   rollout marker. *Why:* the rollout cannot see work a Codex session left running
+   after its turn, nor a prompt waiting for the operator, and the pane's own
+   announcement can. *Measured 2026-11-13 on this machine:* the sequence reaches
+   banto's reader through ConPTY, and over six turns its working/done/idle
+   transitions led or matched the rollout-based sample by at most about a second.
+   `blocked` and `working` for background work were **not yet observed on a real
+   session**; what they mean is read from the Codex source. The facts and limits are
+   in "Codex data sources" ("What the markers mean, and where the signal stops").
+5. **Later the same day: an expanded tile says what its pane is doing.** Its title
+   row shows `Agent · word · output age` after the label, in the strip's own words
+   and colours ("Status on an expanded tile"). *Why:* the operator asked: the clear
+   status word was visible only on a minimised tile.
+6. **Every surface reads the same activity, from one source.** For a hosted pane it
+   is a believed Codex report first (`working` is busy, `blocked` is waiting), else
+   the pane's list row, else none (`EmporiumState::reported_activity`). The list
+   rows, the counts and the marks get the report laid over the rows; the strip and
+   the title row read it directly. So a hosted pane with no row in the list yet (a
+   member the list has not picked up) still shows what it reported, and a `blocked`
+   one is marked, counted once and rung for once like a pane with a row. *Why:* the
+   collapsed strip first read the raw rows and showed "alive" for a Codex pane
+   reporting `working` (found in the operator's trial); then the strip and the title
+   took the activity only from the row, so a row-less Codex pane showed no word
+   while the quit question already treated it as not idle (found in review).
+7. **A pane's screen and PTY are never smaller than 2 rows × 2 columns.** A smaller
+   tile keeps a floor-sized screen and child and is drawn clipped ("Size floor").
+   *Why, measured:* the pinned vt100 panics on wrapped text in a one-row screen, in
+   release builds too, and a one-row tile is reachable by shrinking the terminal to
+   4 rows or stacking 6 Workers on a 24-row terminal. The published 0.16.13 no
+   longer has that panic; the fork stays pinned in this change.
+8. **`shell` shows busy.** A live Claude session whose status is `shell` (the turn
+   ended, a background command is still running) is displayed as busy on every
+   surface, matching what the quit question and the watch already counted; the relay
+   still nudges it; `brigade_status` prints the raw word. *Why:* the operator
+   restarted banto without knowing a command was still running in a pane that said
+   "alive".
+9. **A dialog the operator opens does not ring and does not arm.** A Claude session
+   that is `waiting` with `waitingFor` exactly `dialog open` is shown and counted as
+   Waiting everywhere but is left out of the ring set (it rings once if the reason
+   later becomes anything else while still waiting); the relay never nudges a
+   waiting session; for the quit question and the brigade watch it is unknown (quit
+   asks, the quiet stretch is held, a dialog alone never arms the bell). *Measured
+   2026-11-13 on 2.1.323:* `waitingFor` was `input needed` for the ask-the-user
+   picker and `dialog open` for a slash-command picker the operator opened himself.
+   *Why:* banto rang for the dialog the operator opened, and opening and closing
+   `/model` in an idle brigade rang the quiet bell five seconds later. Known limit:
+   a brigade with a dialog left open cannot go quiet until it is closed.
+
+*Not done:* answering the `?` query of the same protocol (which is what would make
+Claude Code report over it too — from the 2.1.323 bundle, read and not run); keeping
+sub-records (reports naming an `id=` are parsed and dropped); and sub-agent activity
+is not tracked.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -242,7 +304,7 @@ sub-agent activity is not tracked.
 | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | Session body. One JSON per line |
 | First few records of the jsonl | `{"type":"custom-title","customTitle":...}` / `{"type":"ai-title","aiTitle":...}` — the title can be extracted by reading only the head chunk. Older formats fall back to the first user message |
 | First record of the jsonl | `{"type":"agent-setting",...}` marks a session run by a spawned agent (subagent / Agent-Teams teammate); interactive sessions open with a `mode` record instead. Sets `SessionMeta.is_agent`, persisted in the store (schema v2) |
-| `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` (`busy`, `waiting`, `idle`; and, measured on Claude Code 2.1.323, 2026-11-13, `shell` — the turn has ended but a background shell command of the session, or of one of its sub-agents, is still running; when that work ends Claude is re-invoked, reads `busy` again and then `idle`), `kind` ("interactive"/"bg"), `name`, `updatedAt` — observed present on both Windows and Linux/WSL. `procStart` is the process's own kernel-reported start time: Linux/WSL records `/proc/<pid>/stat`'s raw `starttime` ticks, while Windows records the raw creation FILETIME (each matched directly against a live process on this machine, 2026-11-10). `RawLiveSession` carries it as optional, so an absent or unrecognized value falls back to bare pid liveness; when it is comparable, banto rejects a recycled PID that belongs to a different process. (Observed directly on this machine's installed Claude Code version; not claimed for every version or platform.) |
+| `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` (`busy`, `waiting`, `idle`; and, measured on Claude Code 2.1.323, 2026-11-13, `shell` — the turn has ended but a background shell command of the session, or of one of its sub-agents, is still running; when that work ends Claude is re-invoked, reads `busy` again and then `idle`), and `waitingFor` beside `waiting` (measured the same day on 2.1.323: `"input needed"` while the session sat in the picker of a question the model had asked, `"dialog open"` while the OPERATOR had a slash-command picker such as `/model` open that he had opened himself, after which `status` went back to `idle`; **not measured:** the value for a permission prompt, for a dialog the product opens on its own, and what `status` says when a dialog is opened over a running turn; a table of reason strings — `permission prompt`, `sandbox request`, `worker request`, `goal proposal`, `input needed`, `dialog open` — was only read in the Claude Code bundle; banto reads the field leniently, a value that is not a string is ignored and keeps the record, and only the exact string `dialog open` means anything), `kind` ("interactive"/"bg"), `name`, `updatedAt` — observed present on both Windows and Linux/WSL. `procStart` is the process's own kernel-reported start time: Linux/WSL records `/proc/<pid>/stat`'s raw `starttime` ticks, while Windows records the raw creation FILETIME (each matched directly against a live process on this machine, 2026-11-10). `RawLiveSession` carries it as optional, so an absent or unrecognized value falls back to bare pid liveness; when it is comparable, banto rejects a recycled PID that belongs to a different process. (Observed directly on this machine's installed Claude Code version; not claimed for every version or platform.) |
 | `~/.claude/history.jsonl` and others | Unused in the MVP |
 
 **Timing (measured 2026-07-25, Claude Code 2.1.219).** The session-body and
@@ -349,37 +411,95 @@ final message on one line north of 11KB — a small fixed tail can land
 entirely inside that one line and misreport idle right when the answer
 matters most.
 
-**What the markers mean, and where the signal stops.** The same tail is what
-the emporium's "is it idle?" question asks of a hosted Codex session (see "The
-emporium: hosted panes" below). A started turn is `task_started` (alias
-`turn_started`); a turn that ended is `task_complete` (alias `turn_complete`) or
-`turn_aborted` (an interrupt, a replaced turn, an ended review, a budget stop);
-the last such record in the tail decides (a start after an abort is mid-turn
-again; what follows a `replaced` abort is not among the facts below, so nothing
-is assumed about it), and no marker at all is "unknown", never "idle". The
-relay's Codex-side reading is the same function, so an interrupted Codex member
-now counts as idle for nudging too; before, it read as mid-turn until its next
-turn. *Read in the Codex source at tag
-`rust-v0.168.0` (not measured here):* all three are written to the rollout in
-both of Codex's history modes; an errored turn ends in a `task_complete` that
-carries an `error`; the requests that block a turn on the operator (approvals,
-questions, elicitations) are never written to it; and a process that dies
-mid-turn leaves a `task_started` with no end. **Known limit:** Codex records
-nothing about a command it left running after the turn ended. *Read in the same
-source:* a background terminal survives the end of the turn and is stopped only
-by `/stop` or at session shutdown, its exit is not durable in the legacy
-history mode, and nothing re-invokes the model when it ends. *Measured
-2026-11-13 on this machine's installed Codex (`codex-cli 0.168.0`):* a command
-left running stayed alive for 108 s after `task_complete`, with no rollout or
-sqlite change and no re-invocation at its end. Such a session therefore reads as
-idle here. Two things banto does not do about it: it reads none of the terminal
-escape sequences the Codex TUI writes (the source shows an OSC 7501 lifecycle
-state, `working` while a background terminal exists; *measured 2026-11-13* from
-an event recording on Windows, the hosted Codex pane's output as banto's reader
-receives it contains `ESC ] 7501 ; state=working:app=codex` and
-`state=idle:app=codex`, so ConPTY passes the sequence through — banto still does
-not read it, it is not implemented), and it does not track sub-agent
-activity (a Codex parent's turn ends without waiting for its children).
+**What the markers mean, and where the signal stops.** The same tail is what the
+emporium's "is it idle?" question asks of a hosted Codex session (see "The emporium:
+hosted panes" below). A started turn is `task_started` (alias `turn_started`); a
+turn that ended is `task_complete` (alias `turn_complete`) or `turn_aborted` (an
+interrupt, a replaced turn, an ended review, a budget stop); the last such record in
+the tail decides (a start after an abort is mid-turn again; what follows a
+`replaced` abort is not among the facts below, so nothing is assumed about it), and
+no marker at all is "unknown", never "idle". The relay's Codex-side reading is the
+same function, so an interrupted Codex member now counts as idle for nudging too;
+before, it read as mid-turn until its next turn. *Read in the Codex source at tag
+`rust-v0.168.0` (not measured here):* all three are written to the rollout in both
+of Codex's history modes; an errored turn ends in a `task_complete` that carries an
+`error`; the requests that block a turn on the operator (approvals, questions,
+elicitations) are never written to it; and a process that dies mid-turn leaves a
+`task_started` with no end. **Known limit of the rollout:** Codex records nothing
+about a command it left running after the turn ended. *Read in the same source:* a
+background terminal survives the end of the turn and is stopped only by `/stop` or
+at session shutdown, its exit is not durable in the legacy history mode, and nothing
+re-invokes the model when it ends. *Measured 2026-11-13 on this machine's installed
+Codex (`codex-cli 0.168.0`):* a command left running stayed alive for 108 s after
+`task_complete`, with no rollout or sqlite change and no re-invocation at its end.
+Read from the rollout alone, such a session reads as idle.
+
+**The pane's own report (OSC 7501).** The Codex TUI announces its lifecycle state in
+its terminal output, and banto reads that announcement. The format is the Program
+Status Protocol, a published protocol and not Codex's own: `ESC ] 7501 ;
+state=<idle|working|blocked|done|error>:app=codex[:kind=<permission|question|auth>]
+ST` (ST is `ESC \` or BEL; spec
+<https://www.superlogical.com/rex/docs/build/program-status>, proposed by Mitchell
+Hashimoto in <https://mitchellh.com/writing/program-status-osc7501>; it also has
+`id=` sub-records, `progress`, `title`, `msg` and a `?` feature query). How it is
+read: the pane's `vt100` parser hands every OSC it does not implement to
+`Callbacks::unhandled_osc` once the sequence is complete, whichever chunks it
+arrived in; `banto_core::program_state::parse_osc` reads the one it cares about (at
+most 4096 bytes; an unknown state, a missing `state=` or the `?` form is not a
+report, except for the cut-short case below; unknown keys are ignored). The terminal
+bytes the parser sees are untouched, and the report arrives inside
+`Event::PtyOutput`, an event that already exists, so it is recorded and replayed
+with everything else. Only the **root record** is kept; a report naming a sub-record
+(`id=`) is parsed and dropped, and the `?` query is **not answered**. `clear`
+removes the pane's report, which sends it back to the rollout rule. It is held per
+process (a new process starts with none) and read only for a pane known to be Codex
+*now*: the product is read from the current session list row and from the relay's
+current facts about its member, each time it is asked, and never kept. If the two
+both speak and disagree the pane is not known to be any product, and neither is a
+pane they both leave silent; for such a pane the rollout decides, as for one that
+never reported, and nothing is laid over the list (what the pane said is kept and
+counts again if it becomes known to be Codex). A pane of another product is never
+read this way. Why (found in review): a remembered "is Codex" could be up to a tick
+stale after a list reload and let an old report decide. Two parser details. The
+terminal parser keeps the sequence number and fifteen more `;`-separated parameters,
+so text after the fifteenth `;` of a payload never arrives (a conforming report has
+no `;` outside `id` and unknown keys; Codex writes `state` first). A payload that
+fills every parameter the parser keeps, in which no usable `state=` arrived and that
+is not a `?` query, is taken as possibly cut short and ends the pane's reported
+state as `state=clear` does (the rollout rule decides until the next report), unless
+`id=` arrived (then it was about a sub-record and the root is untouched). Why: a
+report that may have been cut could be the one that ended a working or blocked
+state, so the reader closes to the previous rule when unsure rather than keep
+believing the old state. A sequence cut short by CAN after a complete state still
+counts, by the parser's own behaviour. Cost: processing output does the list-overlay
+work only when that pane's reported state changed in that chunk.
+
+What the report is worth. *Read in the Codex source at tag `rust-v0.168.0`
+(`tui/src/terminal_program_status.rs`, `chatwidget/status_surfaces.rs`,
+`chatwidget/turn_runtime.rs`, `app.rs`):* it is written when the TUI's lifecycle
+state changes (only then) and no setting turns it off; `state=clear` goes out when
+the TUI exits or is suspended. `blocked` is an approval, question or verification
+prompt on screen (kind permission, question or auth). `working` is a turn running or
+pending, **background terminals of the session still running**, a goal active after
+a turn, and also its MCP servers starting — which is the `working` then `idle` a
+pane shows at start-up. `done` and `error` follow a completed or failed turn and
+revert to `idle` only when the operator interacts with the pane (a key, a non-empty
+paste, a non-motion mouse event; focus reports, resize and mouse motion do not), so
+a pane can sit in `done` for good, and nothing in the stream tells who produced the
+input: a host's own writes acknowledge it the same way. An interrupt goes straight
+to `idle`. A resumed thread starts `idle` (replayed history never produces `done`).
+*Measured 2026-11-13 on this machine (`codex-cli 0.168.0`):* the sequences arrive in
+`PtyOutput` chunks, so ConPTY passes them through, and over six turns the `working`,
+`done` and `idle` transitions led or matched the rollout-based sample by at most
+about a second. **Not yet observed on a real session:** `blocked`, and `working` for
+work left running after a turn.
+
+**Limits of the report.** It describes the thread the TUI *displays*: a TUI showing
+another thread than the member's would mislead, and nothing in the stream says
+which. Sub-records are dropped, so sub-agent activity is still not tracked (a Codex
+parent's turn ends without waiting for its children). The `?` query is not answered;
+that is the one thing that would make Claude Code report over the same protocol
+(from the 2.1.323 bundle, read and not run; see the decision entry's "Not done").
 
 **Directory trust** (`crate::directory_trust`, advisory-only, read-only):
 before typing anything into a freshly-spawned Codex Worker's pane (see
@@ -466,7 +586,7 @@ provider/status/store/config modules once sketched here as
 
 ```
 crates/
-├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/search/replay
+├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/program_state/search/replay
 ├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
 │  ├─ provider/         # SessionProvider trait + claude_code impl (JSONL) + codex impl (sqlite)
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
@@ -621,84 +741,103 @@ brigade that predates schema v7 has the order that migration wrote — Director,
 then Workers numbered by their old session ids — because the order the members
 had joined was not kept when the table was rebuilt; the rows come out in that
 numbering order in the bundled SQLite, which SQLite does not promise.
-A stack tile can be collapsed to a five-row strip (border, three content
-rows, border) that shows status-like facts instead of the session's screen,
-which keeps running untouched: the `[_]` button in its title row (or `m`), `[+]`
-to open it again. The strip's first content row reads agent · activity
-(busy / waiting / alive / idle, in the sidebar dot's colours) · output age
-("output now", then in ten-second steps to a minute, then minutes, then hours;
-for Codex, which never reports busy or waiting, the output age is the only
-liveness signal and is the last thing dropped on a narrow row). The next two
-rows read `← <age> <first line of the last message sent to this member>` and
-`→ <age> <first line of the last message this member sent>`, from banto's own
-brigade message store, read without touching any read cursor (a glance is not a
-delivery) and re-read only when a message has been appended; each is reduced at
-the store to its first non-empty line with control characters removed and cut to
-200 characters, then clipped to the row by display width, and blank when there
-is none. A collapsed tile
-that is waiting for the operator still shows the waiting colour on its border. A
-tile's `[S]` button (or `z`) *solos* it, as on an audio mixer: every other stack
-tile is shown collapsed until the solo is turned off (the master tile has an `[S]`
-button too, and no collapse button: soloing it collapses the whole stack, which
-then narrows as described below). Turning the solo off brings back exactly
-what had been collapsed one by one (the solo is an overlay on those choices,
-never a rewrite; it is unrelated to the single-session "solo" stage). `M`
-clears both. Both buttons sit right-aligned in every stack tile's title row,
-only where the row has room for the label, a gap and both. When every stack
-tile is collapsed the stack stays the right-hand column but narrows to a width
-of its own (the "collapsed stack width", 36 columns until moved, per brigade;
-a width in columns, not a share, since a strip needs a fixed amount of room to be
-readable on any terminal) and the master takes the rest; the strips stack from
-the top in order and the space below them is left empty. The master is never
-narrower there than in the ordinary split at the same width (the strips can be
-narrower than the ordinary stack, never wider), so whatever fit on it before —
-its title with its `[S]` button — still fits. Opening any tile
-returns to the ordinary master share. Dragging the master/stack edge sets
-whichever of the two preferences is in force (the collapsed width while every
-tile is collapsed, the master's share otherwise); the master's PTY is resized once on
-entering and once on leaving that state. A collapsed tile is not
-focusable (the focus ring, F3 and the arrows skip it; the pane number opens it
-first); its label still moves it. A collapsed tile's child is not resized, since
-a repaint into a three-row grid would wreck the screen the operator comes back
-to; it is sized when it opens. The row resize handle lies between expanded
-neighbours and rewrites only their weights.
-**Putting the sizes back** (prefix + `=`, from the sidebar or a pane, on a staged
-brigade). Forgets every row weight the layout holds for the brigade — staged
-members' and off-stage ones' alike, so a member reopened later brings no old
+A stack tile can be collapsed to a five-row strip (border, three content rows,
+border) that shows status-like facts instead of the session's screen, which keeps
+running untouched: the `[_]` button in its title row (or `m`), `[+]` to open it
+again. The strip's first content row reads agent · activity · output age, from the
+one function (`tile_status`) that also fills the title row of every expanded tile
+("Status on an expanded tile", below). The activity word is one of four, in the
+sidebar dot's colours: **busy** (a turn or a command is running: a Claude session
+whose live file says `busy` or `shell`, or a Codex pane that reports `working`),
+**waiting** (a person is needed: Claude `waiting`, whatever it waits for, or a Codex
+pane that reports `blocked`), **alive** (a live process with nothing running: Claude
+`idle` or a status banto does not know, a Codex session that has not reported busy
+or waiting), **idle** (no live process; the dot's brightness says how long ago).
+Every surface that shows a pane's activity — the list row and its dot, the Waiting
+count, the attention marks, the strip, the title row — reads the same value, and a
+hosted pane has one source for it: what the pane reported, when it is a Codex pane
+and the report is believed (`working` is busy, `blocked` is waiting); else its list
+row's activity; else none (`EmporiumState::reported_activity`; the quit question and
+the bell are decided from the same report). The list rows, the counts and the marks
+get the report laid over the rows (`App::row_for_id` returns the displayed row, not
+the raw one); the strip and the title row ask `reported_activity` directly, so a
+hosted pane with no row in the list yet still shows what it reported, and a
+`blocked` one is marked, counted once and rung for once like one with a row. The
+strip once read the raw rows and showed "alive" for a Codex pane that was reporting
+`working`, found in the operator's trial; later it and the title took the activity
+only from the row, so a row-less Codex pane showed no word while the quit question
+already treated it as not idle, found in review. The product shown is the row's,
+else the one the relay resolved for the member. Output age is "output now", then in
+ten-second steps to a minute, then minutes, then hours; for Codex, whose session
+files record neither busy nor waiting, the activity word comes from the pane's own
+report once it has made one (`blocked` reads waiting, `working` busy; "Codex data
+sources"), and until then the output age is the only liveness signal and is the last
+thing dropped on a narrow row. The next two rows read `← <age> <first line of the
+last message sent to this member>` and `→ <age> <first line of the last message this
+member sent>`, from banto's own brigade message store, read without touching any
+read cursor (a glance is not a delivery) and re-read only when a message has been
+appended; each is reduced at the store to its first non-empty line with control
+characters removed and cut to 200 characters, then clipped to the row by display
+width, and blank when there is none. A collapsed tile that is waiting for the
+operator still shows the waiting colour on its border. A tile's `[S]` button (or
+`z`) *solos* it, as on an audio mixer: every other stack tile is shown collapsed
+until the solo is turned off (the master tile has an `[S]` button too, and no
+collapse button: soloing it collapses the whole stack, which then narrows as
+described below). Turning the solo off brings back exactly what had been collapsed
+one by one (the solo is an overlay on those choices, never a rewrite; it is
+unrelated to the single-session "solo" stage). `M` clears both. Both buttons sit
+right-aligned in every stack tile's title row, only where the row has room for the
+label, a gap and both. When every stack tile is collapsed the stack stays the
+right-hand column but narrows to a width of its own (the "collapsed stack width", 36
+columns until moved, per brigade; a width in columns, not a share, since a strip
+needs a fixed amount of room to be readable on any terminal) and the master takes
+the rest; the strips stack from the top in order and the space below them is left
+empty. The master is never narrower there than in the ordinary split at the same
+width (the strips can be narrower than the ordinary stack, never wider), so whatever
+fit on it before — its title with its `[S]` button — still fits. Opening any tile
+returns to the ordinary master share. Dragging the master/stack edge sets whichever
+of the two preferences is in force (the collapsed width while every tile is
+collapsed, the master's share otherwise); the master's PTY is resized once on
+entering and once on leaving that state. A collapsed tile is not focusable (the
+focus ring, F3 and the arrows skip it; the pane number opens it first); its label
+still moves it. A collapsed tile's child is not resized, since a repaint into a
+three-row grid would wreck the screen the operator comes back to; it is sized when
+it opens. The row resize handle lies between expanded neighbours and rewrites only
+their weights. **Putting the sizes back** (prefix + `=`, from the sidebar or a pane,
+on a staged brigade). Forgets every row weight the layout holds for the brigade —
+staged members' and off-stage ones' alike, so a member reopened later brings no old
 height back — and returns the master share and the collapsed stack width to their
 defaults. It leaves the arrangement alone: stack order, collapsed flags, solo,
-display names and join order are not sizes, and the sidebar width is a
-window-level preference of a different layer, not part of any brigade. Like the
-other layout operations it ends a drag or move in progress; the panes are resized
-once, only where a tile's size really changes, and one layout save is written when
-something changed. A brigade already at its defaults changes and saves nothing and
-says so (`sizes already at their defaults`); with no brigade staged, or a single
-session, it is refused (`prefix: no brigade layout to reset`). The case that
-prompted it: a Worker added later takes the mean of the others' heights, so weights
-set when a brigade had two Workers leave one tile much smaller than the rest once it
-has four.
+display names and join order are not sizes, and the sidebar width is a window-level
+preference of a different layer, not part of any brigade. Like the other layout
+operations it ends a drag or move in progress; the panes are resized once, only
+where a tile's size really changes, and one layout save is written when something
+changed. A brigade already at its defaults changes and saves nothing and says so
+(`sizes already at their defaults`); with no brigade staged, or a single session, it
+is refused (`prefix: no brigade layout to reset`). The case that prompted it: a
+Worker added later takes the mean of the others' heights, so weights set when a
+brigade had two Workers leave one tile much smaller than the rest once it has four.
 **What is kept across a restart.** Everything arranged above, and the brigade bell's
-switch, is stored in banto's own sqlite store and comes back the next time banto runs: the
-sidebar width (table `ui_prefs`, key `sidebar_width`) and, in the same table, the
-brigade bell's switch (key `bell_when_focused`, `1` or `0`; any other stored
-value reads as no preference, which is off — see "The quiet brigade's bell");
-per brigade, the master
-share, the collapsed stack width and the soloed member (columns on `brigades`);
-per member, its place in the stack order, its row weight and its collapsed flag
-(columns on `brigade_members`). NULL means "no preference, use the default".
-The per-member values live on the member's own row on purpose: a dismissed
-member's row is deleted, so its arrangement goes with it, which bounds what is
-kept and keeps a later member under the same token (only the Goinkyo's is reused,
-by its next consultation) from inheriting it; disbanding the brigade deletes the
-rest. A brigade's arrangement is read together with its roster when
-it is staged, so the first PTY sizes are already the stored ones; it is written
-(the whole snapshot, one transaction) at the moment it actually changes — a
-committed resize or move, a collapse, a solo, restore-all, a size reset — and never for a
-gesture that changed nothing, and never from a draw or a tick. What the run
-already holds wins over a read of the store. Stored values are preferences like
-any other: out-of-range ones read as "no preference", and what is used is
-clamped to the terminal at use, never rewritten. A write that fails is silent,
-as a failed pin is. A Worker added later gets the mean of the others' height.
+switch, is stored in banto's own sqlite store and comes back the next time banto
+runs: the sidebar width (table `ui_prefs`, key `sidebar_width`) and, in the same
+table, the brigade bell's switch (key `bell_when_focused`, `1` or `0`; any other
+stored value reads as no preference, which is off — see "The quiet brigade's bell");
+per brigade, the master share, the collapsed stack width and the soloed member
+(columns on `brigades`); per member, its place in the stack order, its row weight
+and its collapsed flag (columns on `brigade_members`). NULL means "no preference,
+use the default". The per-member values live on the member's own row on purpose: a
+dismissed member's row is deleted, so its arrangement goes with it, which bounds
+what is kept and keeps a later member under the same token (only the Goinkyo's is
+reused, by its next consultation) from inheriting it; disbanding the brigade deletes
+the rest. A brigade's arrangement is read together with its roster when it is
+staged, so the first PTY sizes are already the stored ones; it is written (the whole
+snapshot, one transaction) at the moment it actually changes — a committed resize or
+move, a collapse, a solo, restore-all, a size reset — and never for a gesture that
+changed nothing, and never from a draw or a tick. What the run already holds wins
+over a read of the store. Stored values are preferences like any other: out-of-range
+ones read as "no preference", and what is used is clamped to the terminal at use,
+never rewritten. A write that fails is silent, as a failed pin is. A Worker added
+later gets the mean of the others' height.
 
 **Keys** (one table: the list's keys first, then what the panes add):
 
@@ -750,34 +889,92 @@ way first, then the counts, then the badge's tail.
 Multiline paste and file drag&drop into panes are synthesized into bracketed
 pastes host-side, since the Windows console never reports pastes as pastes.
 
+**Status on an expanded tile.** An expanded tile's title row shows `Agent · word ·
+output age` after the label: the collapsed strip's own words and colours, from the
+one function `tile_status`, so a tile and its strip cannot disagree. It is drawn in
+the stretch of the top border between the label and the buttons: the label and the
+buttons did not move, no hit-test changed, and one border cell stays free on each
+side of it. It is drawn while the tile is being dragged too, in its own colours on
+the border and label the gesture colours; the drop line and the ghost label are
+painted over the finished frame, so where they cross it they win; hit-testing is the
+same. When the room is short it gives way in this order: the agent label, then the
+output age, then the whole status; the word is never cut (a title row has room for
+one thing, and "busy" or "alive" is what it is read for; the strip keeps the age
+over the word because its three rows have room for both). Only the label is reversed
+on a focused tile; the status is not. A pane whose activity is not known shows what
+is known: its agent and output age, then the age alone, and "no output yet" when it
+has produced none. *Why:* the operator asked for it: the clear status word was
+visible only on a minimised tile.
+
+**Size floor.** A hosted pane's screen and its PTY are never smaller than 2 rows × 2
+columns (`MIN_ROWS`/`MIN_COLS` in `banto-core`'s `screen.rs`; a freshly spawned pane
+starts at 24 × 80, `SPAWN_ROWS`/`SPAWN_COLS`, until the first layout pass sizes it).
+A tile smaller than that keeps a floor-sized screen and a floor-sized child and is
+drawn clipped: rows and columns beyond the tile are dropped, so its top-left shows.
+The PTY is told the size the screen took, not the tile's; the one place either is
+resized is `resize_staged_tiles`, so the two cannot differ. A collapsed tile keeps
+the size it had and is floored when it opens again; an off-stage pane keeps the size
+it has. *Why, measured:* the pinned `vt100` panics on wrapped text in a one-row
+screen, in release builds too (an overflow in `Grid::col_wrap`, then `unwrap()`), a
+one-column screen underflows `cols - width` for a wide glyph in a debug build, and a
+screen with no rows or no columns panics outright; a sweep of 27 input classes over
+sizes 0 to 4 on each axis found nothing at two rows and two columns or more. A
+one-row tile is reachable by shrinking the terminal to 4 rows or by stacking 6
+Workers on a 24-row terminal. *Where the pin lives:* `vt100` is `vt100-psmux`,
+pinned in the root `Cargo.toml` (`[patch.crates-io]`) to one commit of `kt81/psmux`,
+branch `banto/vt100-patches`, rev `3a8186e` (the two fixes it carries are explained
+in the comment beside the pin). *A fact for the future, not a plan:* the published
+crate 0.16.13 (2026-10-13) no longer has this one-row panic (read in its source and
+run in a throwaway crate: no panic for one row or more and one column or more, debug
+and release; zero rows or zero columns still panic in a debug build); the fork stays
+pinned.
+
 **Is it idle? (the quit question).** Quitting ends every hosted process, but the
-operator quits when everything is idle and, with the old rule (ask whenever
-anything is hosted), was made to press twice every time. So the question is not
-"is anything hosted" but "could ending a session lose work in flight", and it is
-asked of each hosted pane (staged or off-stage, collapsed or not) as a
-three-valued fact, `banto_core::model::Quiescence`: **idle**, **not idle**,
-**unknown**. Unknown is its own answer, never folded into idle: both readers of
-it fail safe on it (a quit asks; the brigade bell stays silent). The shell
-gathers it about once a second, just ahead of the tick, from reads the tick
-already makes, and hands it to the core as `Event::QuiescenceSampled`, which
-replaces the previous sample as a whole; the core decides, so a replay of the
-recorded stream gets the same answers. Every tick produces a complete sample:
-when the brigade roster cannot be read, the panes that can still be observed
-without it (what the live files and the session list say) keep their fresh
-answer, and only what needed the roster to be understood reads unknown. Nothing
-older than the tick survives into the next one.
+operator quits when everything is idle and, with the old rule (ask whenever anything
+is hosted), was made to press twice every time. So the question is not "is anything
+hosted" but "could ending a session lose work in flight", and it is asked of each
+hosted pane (staged or off-stage, collapsed or not) as a three-valued fact,
+`banto_core::model::Quiescence`: **idle**, **not idle**, **unknown**. Unknown is its
+own answer, never folded into idle: both readers of it fail safe on it (a quit asks;
+the brigade bell stays silent). The shell gathers it about once a second, just ahead
+of the tick, from reads the tick already makes, and hands it to the core as
+`Event::QuiescenceSampled`, which replaces the previous sample as a whole; the core
+decides, so a replay of the recorded stream gets the same answers. Every tick
+produces a complete sample: when the brigade roster cannot be read, the panes that
+can still be observed without it (what the live files and the session list say) keep
+their fresh answer, and only what needed the roster to be understood reads unknown.
+Nothing older than the tick survives into the next one. One thing is decided in the
+core from the pane rather than gathered by the shell: for a pane known to be Codex
+that has reported its own state, the report overrides the shell's sample (below);
+this is the one place `quiescence_of` is decided, for the quit question and the
+brigade bell alike.
 
 - *Claude Code:* the session's live file (`sessions/<pid>.json`, PID alive) says
   `status: idle` → idle. `busy`, `waiting`, `shell` (see "Data sources") and any
   other or missing status → not idle, since each means something is running or
   waiting that ending the session would lose; with several live entries for the
-  session any one that is not idle decides. No live entry with a live PID →
-  unknown (a fresh session publishes its file a moment after it starts).
-- *Codex:* the rollout's last turn marker (see "Codex data sources", "What the
-  markers mean"): ended → idle; started → not idle; no marker, no such thread,
-  no readable rollout or no Codex home → unknown. Known limit, stated there: a
-  command Codex left running after its turn ended is invisible to it, so such a
-  session reads as idle.
+  session any one that is not idle decides. One exception: `waiting` whose
+  `waitingFor` is exactly `dialog open` (a picker the operator opened) is
+  **unknown**, not not-idle, unless another entry is busy or waiting for something
+  else, which wins: read as not idle, a dialog opened and closed again would count
+  as work that ended; unknown is the honest value, since it is not known what status
+  a dialog opened over a running turn reports. Unknown still asks at quit and holds
+  a brigade's quiet stretch. No live entry with a live PID → unknown (a fresh
+  session publishes its file a moment after it starts).
+- *Codex:* first the pane's own report, when it is known to be Codex and has
+  reported (OSC 7501; "Codex data sources", "The pane's own report"): `idle`, `done`
+  and `error` → idle (nothing is running, and a pane may sit in `done` or `error`
+  until the operator touches it); `working` and `blocked` → not idle. It overrides
+  the rollout for the quit question and the brigade bell, because it is the only
+  signal that sees work left running after a turn and a prompt waiting for the
+  operator. With no report, or after `clear`, the rollout's last turn marker ("What
+  the markers mean"): ended → idle; started → not idle; no marker, no such thread,
+  no readable rollout or no Codex home → unknown. The relay does not read the
+  report: it still reads the rollout marker, so a member whose turn ended is
+  nudgeable even with background work, like a Claude member in `shell`. Limits,
+  stated there: a TUI displaying another thread than the member's would mislead;
+  sub-agent activity is not tracked; a Codex session that has not reported and left
+  a command running still reads idle.
 - *A pane the sample does not cover* (opened since the last sample, a brigade
   member with no session id yet) → unknown, so a new pane asks rather than being
   taken for idle. A pane whose process ended is gone and counts for nothing.
@@ -818,32 +1015,64 @@ idle or not, since all of them are about to be ended, and the last frame is alwa
 presented, never skipped as unchanged. Terminal close, a fatal error and a panic
 are not quits in this sense and draw nothing of the kind.
 
-**Attention.** Two things tell the operator that a pane wants him, and a host
-bell comes with the second. A *mark*: a staged pane's border is drawn in the
-waiting colour (magenta) while the session list shows its session as Waiting
-(Claude Code only), or after its child rang BEL while the pane was not
+**Attention.** Two things tell the operator that a pane wants him, and a host bell
+comes with the second. A *mark*: a staged pane is in the mark set, and its border is
+drawn in the waiting colour (magenta) unless it is the focused tile (below), while
+the session list shows its session as Waiting — a Claude Code session whose live
+file says `waiting` (for any reason), or a hosted Codex pane that reports `blocked`
+(OSC 7501, "Codex data sources"; the row, the count and the mark all read the same
+report, which holds exactly as long as the report, the pane or its being Codex does,
+whether or not the list has a row for the pane yet; a Codex pane reporting `working`
+shows busy in the list) — or after its child rang BEL while the pane was not
 *effectively focused* — the focus on the panes, the pane selected, and banto's own
-window focused (the same rule DECSET 1004 focus reports use; before the terminal
-has said anything the window counts as focused). A mark from a BEL clears when the
-pane becomes effectively focused. The sidebar's title counts the visible Waiting
-Claude sessions. The *host bell* (a BEL written to banto's own terminal) rings
-when the set of visible Waiting rows and marked panes gains a member, at most once
-per 3 seconds (`ATTENTION_BELL_COOLDOWN`, shared by every cause below). Only a
-staged pane draws a mark. Codex has no Waiting report; banto launches it with
-`tui.notifications` set to `approval-requested`, `async-question` and
-`plan-mode-prompt` (with `bel` as the method and `always` as the condition), so
-that a prompt waiting on the operator rings the child's BEL, which the mark and
-bell above pick up. *Read in the Codex source at tag `rust-v0.168.0`:* those three
-are TUI notification types (exec/edit/elicitation approvals; a question the model
-asks; the plan-implementation prompt), and the fourth, `agent-turn-complete`, is
-left out on purpose — the bell is meant to be rarer than every turn. *Measured
-2026-08-06 on `codex-cli` 0.146.1 (see `crate::launch`), with the list as it was
-then, `approval-requested` alone:* a plain turn rang nothing; a turn forced to
-request approval rang exactly one bare BEL with the condition `always` and none
-with Codex's default `unfocused` (Codex counts a banto-hosted pane as focused
-whatever the operator is looking at). The two names added since were not part of
-that measurement, and Codex's own approval heuristics decide how often an
-approval is asked at all.
+window focused (the same rule DECSET 1004 focus reports use; before the terminal has
+said anything the window counts as focused). A mark from a BEL clears when the pane
+becomes effectively focused. The mark *set*, the count and the bell do not depend on
+focus (a Waiting pane is in the set while it is focused too, and its bell is the
+same edge); only a BEL latch, and the brigade-quiet fire below, are suppressed for a
+pane the operator is already in. What the border *draws* does depend on it: the tile
+that has the pane focus (banto's own focus on that pane, whether or not its window
+is focused) is drawn in the focus colour (cyan) and its title reversed, which
+outranks the waiting colour, so a focused Waiting tile looks like any focused tile;
+an unfocused one is magenta when Waiting and dark grey when not; a tile being moved
+is yellow; a collapsed tile is never the focused one, so its border shows the
+waiting colour. The list row's dot and the sidebar count show the Waiting session
+whatever the focus. The sidebar's title counts the visible Waiting sessions of
+either product (`banto · waiting N`). The bell rings for the *ring set*: the display
+set minus a Claude session that is Waiting only because a dialog is open
+(`waitingFor` exactly `dialog open`). Such a session is shown, counted and marked
+like any Waiting one, but does not ring: it is the operator's own doing and he is
+looking at it. If its reason later becomes anything else while it is still waiting,
+it enters the ring set and rings once at that moment; a pane latched by a BEL or by
+a quiet brigade rings whatever else it is; and the reason changes the bell and
+nothing else on screen. The *host bell* (a BEL written to banto's own terminal)
+rings when the ring set (the visible Waiting rows and marked panes, less dialog-open
+ones) gains a member, at most once per 3 seconds (`ATTENTION_BELL_COOLDOWN`, shared
+by every cause below). Only a staged pane draws a mark, and staging a brigade puts
+the pane focus on its Director's tile. *What staging does to an off-stage pane's
+mark* (established by driving the real staging path in a test): a BEL latch on an
+off-stage Worker's pane shows and rings once at staging and stays until that pane is
+focused; an off-stage member in Claude `waiting` (or a Codex member reporting
+`blocked`) shows and rings once at staging, except the Director, whose list row is
+visible off-stage and so already rang, from the list, when it started waiting; but a
+BEL latch on an off-stage Director's pane, like a quiet brigade's fire ("The quiet
+brigade's bell", known defect), is cleared by the same staging, because the Director
+is then the effectively focused pane, and is normally never drawn and never rings.
+Codex's session files carry no Waiting state, so beside the pane's own `blocked`
+banto launches it with `tui.notifications` set to `approval-requested`,
+`async-question` and `plan-mode-prompt` (with `bel` as the method and `always` as
+the condition), so that a prompt waiting on the operator rings the child's BEL,
+which the mark and bell above pick up. *Read in the Codex source at tag
+`rust-v0.168.0`:* those three are TUI notification types (exec/edit/elicitation
+approvals; a question the model asks; the plan-implementation prompt), and the
+fourth, `agent-turn-complete`, is left out on purpose — the bell is meant to be
+rarer than every turn. *Measured 2026-08-06 on `codex-cli` 0.146.1 (see
+`crate::launch`), with the list as it was then, `approval-requested` alone:* a plain
+turn rang nothing; a turn forced to request approval rang exactly one bare BEL with
+the condition `always` and none with Codex's default `unfocused` (Codex counts a
+banto-hosted pane as focused whatever the operator is looking at). The two names
+added since were not part of that measurement, and Codex's own approval heuristics
+decide how often an approval is asked at all.
 
 **The quiet brigade's bell.** The operator's reason: a brigade going quiet is the
 moment his input is wanted, and it is rare enough to deserve a sound. It uses the
@@ -888,6 +1117,16 @@ mechanism above rather than a new one.
   bell that first time.
 - A member whose state is *unknown* blocks it and breaks the idle stretch: silence
   is not claimed on missing information. A *waiting* member is not idle.
+- *A dialog the operator opened:* a Claude member that is `waiting` with
+  `waitingFor` exactly `dialog open` reads unknown ("Is it idle?"), so it holds the
+  quiet stretch and never arms the bell by itself. Why: before, opening and closing
+  `/model` in an idle brigade made the member read waiting, then not idle, which
+  armed the brigade, and the quiet bell rang five seconds after he closed it
+  (confirmed by a test on the old engine). Known limit: a brigade with a dialog left
+  open cannot go quiet until it is closed. Not measured: a permission prompt's
+  `waitingFor`, a dialog the product opens by itself (it would read the same), a
+  dialog opened over a running turn (busy wins).
+
 - *Mail on the way:* a brigade is not quiet while one of its hosted members has
   unread brigade mail that the relay will still deliver on its own — the relay is
   automatic (`[brigade].relay = "auto"`) and has not used up its nudge attempts (3,
@@ -937,30 +1176,41 @@ mechanism above rather than a new one.
   selected pane and banto's window focused) — there every turn the Director ends
   would otherwise ring; with the window in the background it marks and rings. A
   fired brigade is spent either way: being in the Director's pane does not save the
-  ring for when the operator leaves it. An off-stage brigade is watched and latches
-  the mark, but only a staged pane draws one, so the mark and the bell wait until
-  the brigade is staged. A brigade whose Director is not hosted is not watched. A
-  brigade is judged only in a tick whose relay observations include its Director
-  (the store was read this tick and still has the brigade, and the Director is
-  hosted with a session), and the observation is about the pane banto itself holds
-  for that member: the pane is hosted and banto's own membership for it is the same
-  brigade and the same member token. Any other observation is ignored by the bell —
-  for "Director observed" and for "unread mail" alike — and so only delays it; the
-  reason, found in review, is that one taken at face value could mark a brigade as
-  observed, or mail as unread, through a pane that is not that member (a tick
-  gathered just before a session-id change the core has already applied). In a tick
-  without that observation — a roster that could not be read, or the brigade gone
-  from the store by any path, another banto on the same database included — nothing
-  fires and the quiet stretch starts over; the armed state is kept. A disband in
-  flight does not fire and its watch is kept as it was; a successful disband ends
-  the watch (what was kept for it is dropped with it); a failed one leaves it
-  watched; and a former Director left open on its own never rings for the brigade
-  that is gone (its pane keeps the membership maps it was staged with, which is why
-  the test is observation, not those maps). A brigade formed again around the same
-  Director is a new brigade and starts fresh. Consequences: during a roster outage
-  of any length nothing rings, and the count starts over when observations return; a
-  Director hosted before its session is discovered is not observed, so its brigade
-  is not judged until discovery completes.
+  ring for when the operator leaves it. **Known defect:** for an off-stage brigade
+  nothing reaches the operator in the normal case. Its fire latches the mark on the
+  Director's pane, but only a staged pane draws one, and staging the brigade (Enter
+  or double-click on the Director's row, which resolves its membership and stages
+  it) puts the pane focus on the Director's tile, so `refresh_waiting_display`
+  removes the effectively focused pane's latch at the start of that same update,
+  before it computes the mark set. With banto's window focused there is no mark in
+  any frame, no bell, and the latch is gone, with the F4 switch off or on. Only if
+  the window is unfocused at the moment of staging does the mark appear, with one
+  bell, and it goes without a sound when the window regains focus. (Established by
+  driving the real staging path in a test; the earlier committed test that claimed
+  the mark and the bell wait until staging staged the brigade in a way the product
+  cannot, and is being re-expressed. No fix is described here; none exists yet.) A
+  brigade whose Director is not hosted is not watched. A brigade is judged only in a
+  tick whose relay observations include its Director (the store was read this tick
+  and still has the brigade, and the Director is hosted with a session), and the
+  observation is about the pane banto itself holds for that member: the pane is
+  hosted and banto's own membership for it is the same brigade and the same member
+  token. Any other observation is ignored by the bell — for "Director observed" and
+  for "unread mail" alike — and so only delays it; the reason, found in review, is
+  that one taken at face value could mark a brigade as observed, or mail as unread,
+  through a pane that is not that member (a tick gathered just before a session-id
+  change the core has already applied). In a tick without that observation — a
+  roster that could not be read, or the brigade gone from the store by any path,
+  another banto on the same database included — nothing fires and the quiet stretch
+  starts over; the armed state is kept. A disband in flight does not fire and its
+  watch is kept as it was; a successful disband ends the watch (what was kept for it
+  is dropped with it); a failed one leaves it watched; and a former Director left
+  open on its own never rings for the brigade that is gone (its pane keeps the
+  membership maps it was staged with, which is why the test is observation, not
+  those maps). A brigade formed again around the same Director is a new brigade and
+  starts fresh. Consequences: during a roster outage of any length nothing rings,
+  and the count starts over when observations return; a Director hosted before its
+  session is discovered is not observed, so its brigade is not judged until
+  discovery completes.
 - *The principle:* the bell decides only from what the tick observed. Why: a
   remembered "unread" or "exists" could hold or ring forever once the thing it
   described could no longer be checked (found in review).
@@ -977,9 +1227,12 @@ mechanism above rather than a new one.
   the operator wants the sound depends on what he is doing, and he wants to change
   it while running. It is a function key rather than a prefix chord because he wants
   to flip it casually, in one keystroke, while working.
-- *Known limits:* the rule trusts each product's own report, so a Codex member
-  running a command left over from its turn reads idle (above); and sub-agent
-  activity is not tracked.
+- *Known limits:* the rule trusts each product's own report. A Codex member is read
+  from its pane's report when it has made one (so work left running after its turn
+  reads working, per the Codex source; not yet observed on a real session) and
+  otherwise from its rollout, where a command left running reads idle ("Is it
+  idle?"); a TUI displaying another thread than the member's would mislead; and
+  sub-agent activity is not tracked.
 
 **ConPTY caveats** (`docs/notes/embedded-pty-spike.md`, 2026-07-22 spike plus
 2026-07-24 dogfooding, all on Windows): never answer the outer terminal's own
@@ -1738,19 +1991,31 @@ themselves.
 1. `sessions/<pid>.json` exists, PID alive, and `status=busy` → **busy**
    (special color, highest priority)
 2. `sessions/<pid>.json` exists, PID alive, and `status=waiting` → **waiting**
-   (Claude Code only; human input is required)
-3. PID alive with any other status → **active** (idle) — `idle` itself, and
-   `shell` (the turn ended with a background shell command still running).
-   Unknown upstream statuses deliberately degrade here.
-4. Otherwise bucket by jsonl mtime: today / this week / older
-
-This is the list's drawing only. The stricter question "is this session known
-to be doing nothing?" — asked by the quit confirmation and the brigade bell
-(see "The emporium: hosted panes") — reads the same file the other way round:
-only `idle` is idle, `shell` is not, and an unrecognised status is not either.
-The relay, which asks whether a member can be nudged, still treats `shell` as
-idle enough: it is neither busy nor waiting for the operator.
+   (human input is required, whatever `waitingFor` says; only the bell tells a
+   dialog apart). A hosted Codex pane that reports `blocked` (OSC 7501)
+   is shown as waiting too, and one that reports `working` as busy — laid over the
+   row for as long as the report holds ("Codex data sources")
+3. `sessions/<pid>.json` exists, PID alive, and `status=shell` (the turn ended with
+   a background command still running) → **busy**, on every surface; a waiting entry
+   outranks it, a person being needed
+4. PID alive with any other status → **alive** (`idle` itself, and unknown upstream
+   statuses, which deliberately degrade here)
+5. Otherwise bucket by jsonl mtime: today / this week / older
    (thresholds and colors configurable)
+
+This is the display (the list row, the strip, the title row, the counts and marks
+all read it; `banto_core::model::Activity`). The stricter question "is this session
+known to be doing nothing?" — asked by the quit confirmation and the brigade bell
+(see "The emporium: hosted panes") — reads the same file the other way round: only
+`idle` is idle, `shell` is not, and an unrecognised status is not either, so what is
+drawn and what is decided say the same about `shell`. (Why `shell` shows busy: the
+operator restarted banto without knowing a command was still running in a pane that
+said "alive".) The relay, which asks whether a member can be nudged, still treats
+`shell` as idle enough: the turn has ended and the member can take a message; it
+never nudges a `waiting` session, `dialog open` included, since a nudge's Enter
+would choose something in the dialog. The raw status stays visible in one place: the
+`brigade_status` MCP tool prints the live file's own word (`busy`, `waiting`,
+`idle`, `shell`) for a Claude peer.
 
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
 when a Codex home resolves, its rollout tree (see "Codex data sources" above

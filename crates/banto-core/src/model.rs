@@ -214,6 +214,17 @@ pub struct SessionRow {
     pub cwd: Option<PathBuf>,
     /// Activity state driving the colored dot.
     pub activity: Activity,
+    /// A Claude session that is [`Activity::Waiting`] because a dialog is open
+    /// (a picker the operator opened in the pane), as its live file says. It is
+    /// still shown and counted as Waiting; only the bell leaves it out, since the
+    /// operator caused it and is looking at it. `false` for everything else,
+    /// including every other reason a session waits.
+    ///
+    /// `#[serde(default)]` so a `docs/DISCIPLINE.md` §8 stream recorded before
+    /// this field existed still replays: "no dialog" is what such a recording
+    /// would have said.
+    #[serde(default)]
+    pub dialog_open: bool,
     /// True when a spawned agent (subagent / Agent-Teams teammate) ran this
     /// session, rather than the user starting it interactively. See
     /// [`SessionMeta::is_agent`].
@@ -630,6 +641,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: Some("Fix login".into()),
             cwd: Some(PathBuf::from("/work/app")),
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
@@ -648,6 +660,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
@@ -666,6 +679,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,

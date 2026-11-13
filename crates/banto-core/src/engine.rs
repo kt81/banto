@@ -37,10 +37,12 @@ use crate::key_encode::{
     wrap_bracketed_paste,
 };
 use crate::member_name;
+use crate::model::Activity;
 use crate::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
     MessageGlance, PtyExitReason, Quiescence, SessionRow, SessionToOpen, StoredLayout,
 };
+use crate::program_state::ReportedState;
 
 pub use crate::layout::{
     Areas, Axis, Boundary, BrigadeLayout, ButtonKind, COLLAPSED_TILE_HEIGHT,
@@ -1247,7 +1249,7 @@ pub struct EmporiumState {
     attention_panes: HashSet<SessionKey>,
     /// Number of distinct Waiting sessions the operator can reach through the
     /// current list result or a staged pane. Kept alongside [`Self::attention_panes`]
-    /// because the sidebar's labelled Claude count includes list rows too,
+    /// because the sidebar's labelled Waiting count includes list rows too,
     /// while its border set can only contain panes.
     visible_waiting_count: usize,
     /// Panes whose child rang BEL while they were not effectively focused.
@@ -2114,6 +2116,75 @@ impl EmporiumState {
         }
     }
 
+    /// Which product the pane in `key` runs, as far as the core knows it now:
+    /// the session list's row for it, and what the relay resolved for its member.
+    /// Read from those two when asked, never kept: a copy would have to be
+    /// refreshed by every handler that changes either (a reload, a tick, a
+    /// rekey), and one that forgot would leave a pane believed to be Codex after
+    /// its row said otherwise.
+    ///
+    /// The two can in principle disagree (the member's facts outlive what the
+    /// list shows, and the relay keeps the last product it resolved); then
+    /// neither wins and the pane is not known to be any product. The mistake that
+    /// is cheap is the one that falls back to the rollout sample, as before any
+    /// report; believing a report from the wrong product is not.
+    fn pane_agent(&self, app: &App, key: &SessionKey) -> Option<AgentKind> {
+        let from_row = app.row_for_id(key.as_str()).map(|row| row.agent);
+        let from_member = (|| {
+            let brigade_id = *self.member_brigades.get(key)?;
+            let token = self.member_tokens.get(key)?;
+            self.member_facts.get(&(brigade_id, token.clone()))?.agent
+        })();
+        match (from_row, from_member) {
+            (Some(row), Some(member)) if row != member => None,
+            (row, member) => row.or(member),
+        }
+    }
+
+    /// What a hosted Codex pane has told banto about its own state (OSC 7501,
+    /// [`crate::program_state`]), since its process started. `None` for a pane
+    /// that is not known to be Codex now — one of another product, or one nobody
+    /// can place — however it came to say something, and for one that has said
+    /// nothing or has said `clear`. What the pane said is kept while it is not
+    /// known to be Codex, and counts again if it becomes so. Asks the report
+    /// first: most panes have none, and placing one scans the session list.
+    fn codex_report(&self, app: &App, key: &SessionKey) -> Option<ReportedState> {
+        let report = self.screens.get(key)?.reported_state()?;
+        (self.pane_agent(app, key) == Some(AgentKind::Codex)).then_some(report)
+    }
+
+    /// The activity a hosted Codex pane's own report gives it: blocked is Waiting,
+    /// working is Busy, anything else (idle, done, error, nothing reported, not
+    /// known to be Codex) is `None` and leaves the row's activity, if any, to
+    /// say. The one decision behind every surface that shows a pane's activity:
+    /// the list rows and the mark set get it laid over as an overlay
+    /// ([`sync_reported_activity`]), and a tile's strip and title take it
+    /// directly, so a pane without a row shows the same.
+    pub fn reported_activity(&self, app: &App, key: &SessionKey) -> Option<Activity> {
+        match self.codex_report(app, key)? {
+            report if report.is_blocked() => Some(Activity::Waiting),
+            ReportedState::Working => Some(Activity::Busy),
+            _ => None,
+        }
+    }
+
+    /// Whether the session in `key`'s pane is known to be idle: the ONE place
+    /// that is decided, for the quit question and the brigade bell alike. A
+    /// Codex pane that has reported its state is believed — it is the only signal
+    /// that sees work left running after a turn and a prompt waiting for the
+    /// operator, which the rollout the shell samples sees neither of — and
+    /// otherwise the shell's sample decides. The relay does not read this.
+    fn quiescence_of(&self, app: &App, key: &SessionKey) -> Quiescence {
+        match self.codex_report(app, key) {
+            Some(report) => report.quiescence(),
+            None => self
+                .quiescence
+                .get(key)
+                .copied()
+                .unwrap_or(Quiescence::Unknown),
+        }
+    }
+
     /// How many hosted panes (staged or not) are not known to be idle: running
     /// something, waiting on the operator, unread, or given input by banto
     /// within [`QUIT_RECENT_INPUT_WINDOW`] (a turn that input started may not
@@ -2122,11 +2193,11 @@ impl EmporiumState {
     /// decides from the sample alone, and the brigade-quiet bell reads only
     /// banto's own writes ([`EmporiumState::last_prompted`]), never the
     /// operator's input.
-    fn not_idle_count(&self, now: Instant) -> usize {
+    fn not_idle_count(&self, app: &App, now: Instant) -> usize {
         self.screens
             .keys()
             .filter(|key| {
-                self.quiescence.get(key) != Some(&Quiescence::Idle)
+                self.quiescence_of(app, key) != Quiescence::Idle
                     || self.took_input_recently(key, now)
             })
             .count()
@@ -2258,7 +2329,7 @@ impl EmporiumState {
         &self.attention_panes
     }
 
-    /// The derived count for the sidebar's labelled Claude Waiting display.
+    /// The derived count for the sidebar's labelled Waiting display.
     /// [`refresh_waiting_display`] is its sole writer.
     pub fn visible_waiting_count(&self) -> usize {
         self.visible_waiting_count
@@ -3202,6 +3273,13 @@ pub fn update(
     ev: Event,
     now: Instant,
 ) -> Vec<Cmd> {
+    // What the Codex panes reported is laid over the list at the end of every
+    // update, recomputed from the current rows and facts. Output is the one event
+    // that cannot change what it is computed from except through the pane's own
+    // report, and it is the hot path, so only an output chunk that changed its
+    // pane's report asks for it. Nothing is remembered between updates, so there
+    // is nothing for a handler to forget.
+    let mut overlay_may_have_changed = true;
     let mut cmds = match ev {
         Event::Input(input) => update_input(state, app, brigade, input, now),
         Event::Resized { width, height } => update_resized(state, app, width, height),
@@ -3209,8 +3287,11 @@ pub fn update(
             state.last_output_at.insert(key.clone(), now);
             let mut cmds = Vec::new();
             let mut rang = false;
+            overlay_may_have_changed = false;
             if let Some(screen) = state.screens.get_mut(&key) {
+                let reported = screen.reported_state();
                 screen.process(&chunk);
+                overlay_may_have_changed = screen.reported_state() != reported;
                 rang = screen.take_audible_bell();
                 // Drained right after the chunk that staged it is processed
                 // (Screen::take_clipboard's own doc: it's one-shot, so the
@@ -3490,9 +3571,12 @@ pub fn update(
     state.apply_stack_order();
     refocus_expanded(state, None);
     validate_drag(state, app);
-    settle_pending_quit(state, now);
+    settle_pending_quit(state, app, now);
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(persist_preferences(state));
+    if overlay_may_have_changed {
+        sync_reported_activity(state, app);
+    }
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
     cmds
@@ -3504,11 +3588,11 @@ pub fn update(
 /// carries the current count. Run at the end of every update, so the window
 /// ends on the first event after it, and a key that lands exactly on its edge
 /// is judged by the key handler, which treats the edge as expired.
-fn settle_pending_quit(state: &mut EmporiumState, now: Instant) {
+fn settle_pending_quit(state: &mut EmporiumState, app: &App, now: Instant) {
     if state.pending_quit.is_none() {
         return;
     }
-    let not_idle = state.not_idle_count(now);
+    let not_idle = state.not_idle_count(app, now);
     let Some(pending) = &mut state.pending_quit else {
         return;
     };
@@ -3663,6 +3747,7 @@ struct QuietWatch {
 /// brigade is staged.
 fn update_brigade_quiet(
     state: &mut EmporiumState,
+    app: &App,
     now: Instant,
     relay_auto: bool,
     observed: &TickObservations,
@@ -3684,11 +3769,7 @@ fn update_brigade_quiet(
             continue;
         };
         let brigade = hosted.entry(brigade_id).or_default();
-        let sampled = state
-            .quiescence
-            .get(key)
-            .copied()
-            .unwrap_or(Quiescence::Unknown);
+        let sampled = state.quiescence_of(app, key);
         // A member that reads idle while banto still owes it its kickoff, or
         // while mail is waiting that the relay will deliver, is not idle in the
         // sense that matters: it is about to be started.
@@ -3801,9 +3882,30 @@ fn ring_host_bell(state: &mut EmporiumState, now: Instant) -> Option<Cmd> {
     }
 }
 
+/// Lay what hosted Codex panes report about themselves over the session list: a
+/// pane reporting `blocked` shows and counts as Waiting, exactly like a Claude
+/// session whose live file says `waiting`, and one reporting `working` as Busy.
+/// A level, recomputed every update from the panes' current reports, so it holds
+/// for as long as the report does and is gone when the report, the pane or its
+/// being known to be Codex is. Nothing is laid over a pane that has reported
+/// nothing.
+fn sync_reported_activity(state: &EmporiumState, app: &mut App) {
+    let reported: HashMap<String, Activity> = state
+        .screens
+        .keys()
+        .filter_map(|key| {
+            let activity = state.reported_activity(app, key)?;
+            Some((key.as_str().to_string(), activity))
+        })
+        .collect();
+    app.set_reported_activity(reported);
+}
+
 /// Refresh the one fact behind both attention views: a mark is on screen when
-/// a Claude Waiting row/tile is visible or a staged pane has latched BEL. The
-/// border reads the staged subset, the sidebar keeps its Claude-only count,
+/// a Waiting row/tile (a Claude session whose live file says waiting, or a
+/// hosted Codex pane reporting blocked) is visible or a staged pane has latched
+/// BEL. The border reads the staged subset, the sidebar keeps its
+/// list-and-stage count,
 /// and the host bell is the edge where this full visible set gains a member.
 /// Keeping all three here prevents their filters from drifting apart.
 ///
@@ -3826,6 +3928,10 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
         state.ring_list_waiting = app
             .filtered_waiting_ids()
             .iter()
+            // A session that is waiting only because a dialog is open stays in
+            // the list's Waiting rows and count; it is left out of the set whose
+            // growth rings the bell.
+            .filter(|id| !app.is_dialog_open_id(id))
             .map(|id| SessionKey::from_id(id))
             .collect();
         state.ring_list_generation = app.filtered_waiting_generation();
@@ -3853,16 +3959,40 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
     let old_panes = std::mem::replace(&mut state.attention_panes, panes);
     state.visible_waiting_count = count;
 
+    // What the bell rings for is the display set minus a Waiting pane that is
+    // only a dialog the operator opened in it: such a pane is stopped for a
+    // person, so its mark stays (it is the one thing on screen that explains a
+    // brigade that does not move, and "dialog open" is a catch-all that a dialog
+    // the product opens by itself reads as too), but it is the operator's own
+    // doing and they are looking at it. A pane that is latched (a BEL, a quiet
+    // brigade) rings whatever else it is. When the reason changes while the
+    // session stays Waiting it enters this set, and rings, at that moment: a
+    // reload that changes it bumps the list generation like any other.
+    let rings = |key: &SessionKey| {
+        state.latched_attention_panes.contains(key) || !app.is_dialog_open_id(key.as_str())
+    };
     let mut gained = false;
     match &mut state.previous_ring_set {
         None => {
             let mut seeded = state.ring_list_waiting.clone();
-            seeded.extend(state.attention_panes.iter().cloned());
+            seeded.extend(
+                state
+                    .attention_panes
+                    .iter()
+                    .filter(|key| rings(key))
+                    .cloned(),
+            );
             state.previous_ring_set = Some(seeded);
         }
         Some(previous) if list_changed => {
             let mut current = state.ring_list_waiting.clone();
-            current.extend(state.attention_panes.iter().cloned());
+            current.extend(
+                state
+                    .attention_panes
+                    .iter()
+                    .filter(|key| rings(key))
+                    .cloned(),
+            );
             gained = current.iter().any(|key| !previous.contains(key));
             *previous = current;
         }
@@ -3870,8 +4000,11 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
             let mut changed = old_panes;
             changed.extend(state.attention_panes.iter().cloned());
             for key in changed {
-                let visible =
-                    state.ring_list_waiting.contains(&key) || state.attention_panes.contains(&key);
+                // Rows have not changed since the last update (a reload or a
+                // report would have bumped the list generation), so a pane's
+                // dialog state is the same now as then.
+                let visible = state.ring_list_waiting.contains(&key)
+                    || (state.attention_panes.contains(&key) && rings(&key));
                 if visible {
                     gained |= previous.insert(key);
                 } else {
@@ -3910,11 +4043,12 @@ fn resize_staged_tiles(state: &mut EmporiumState) -> Vec<Cmd> {
         if let Some(screen) = state.screens.get_mut(&key)
             && screen.resize(content.height, content.width)
         {
-            cmds.push(Cmd::ResizePty {
-                key,
-                rows: content.height,
-                cols: content.width,
-            });
+            // The PTY is told the size the screen took, not the one the tile
+            // has: a tile smaller than the screen's floor keeps its screen and
+            // its child at the floor, drawn clipped, and the two stay the same
+            // size because this is the only place either is resized.
+            let (rows, cols) = screen.size();
+            cmds.push(Cmd::ResizePty { key, rows, cols });
         }
     }
     cmds
@@ -4194,7 +4328,7 @@ fn update_key(
                     // window. The decision uses the last sample, so it can be
                     // about a tick (plus the product's own report lag) behind a
                     // turn that has only just begun.
-                    let not_idle = state.not_idle_count(now);
+                    let not_idle = state.not_idle_count(app, now);
                     let confirmed = pending_quit.is_some_and(|pending| {
                         now.saturating_duration_since(pending.at) < QUIT_CONFIRM_WINDOW
                     });
@@ -6386,9 +6520,10 @@ fn update_spawned(
     // held this key before was last read as.
     state.quiescence.remove(&key);
     state.process_started.insert(key.clone(), now);
-    state
-        .screens
-        .insert(key.clone(), crate::screen::Screen::new(24, 80));
+    state.screens.insert(
+        key.clone(),
+        crate::screen::Screen::new(crate::screen::SPAWN_ROWS, crate::screen::SPAWN_COLS),
+    );
     state.spawn_order.insert(key.clone(), state.next_spawn);
     state.next_spawn += 1;
     let Some(pending) = state.pending_opens.remove(&key) else {
@@ -7820,6 +7955,7 @@ fn update_tick(
     // tick: a brigade is not called quiet in the second its relay wakes a member.
     cmds.extend(update_brigade_quiet(
         state,
+        app,
         now,
         brigade.relay == RelayMode::Auto,
         &observed,
@@ -8180,6 +8316,9 @@ mod one_pane_duplicates_tests;
 mod stack_order_tests;
 
 #[cfg(test)]
+mod small_tile_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
@@ -8201,6 +8340,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: Some(id.to_string()),
             cwd: Some(PathBuf::from("/work/alpha")),
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,

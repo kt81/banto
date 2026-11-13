@@ -105,13 +105,17 @@ been idle for 5 seconds after any of them did real work (starting up is not
 work) — counted from the
 last member going idle or banto last prompting one — the brigade has
 gone quiet — the moment your input is wanted. banto then marks the Director's
-pane (the magenta border a waiting session gets) and rings the terminal bell.
+pane (the magenta border a waiting session gets, though a focused pane keeps its
+focus colour) and rings the terminal bell.
 It stays silent while you are looking at the Director's pane (that pane
 selected and banto's window focused); with the window in the background it
 marks and rings. A member whose state banto cannot read keeps it quiet, as does a
 new Codex Worker or Goinkyo that banto has yet to start, as does a member with an
-unread report still on its way, and a
-brigade that is not on screen shows the mark, and rings, once you stage it.
+unread report still on its way. A brigade that is not on screen does not notify you
+when it goes quiet; a member of it that is waiting on you is shown when you open it.
+A picker you open yourself in a Claude pane (a slash command such as `/model`) shows
+as waiting but does not ring, and keeps its brigade from counting as quiet while it
+is open.
 `F4` switches on "ring even while the Director's pane is focused" (the
 bell only, no mark); the status bar shows `BELL ALWAYS` left of the counts
 while it is on, and the setting is remembered across restarts.
@@ -206,10 +210,12 @@ is hosted. Otherwise it asks first: the status bar shows `Esc again to quit —
 N session(s) not idle`, and a second `q`/`Esc` within 3 seconds quits, since
 quitting ends every hosted process. N counts the sessions that are working,
 waiting on you, of unknown state, or that were typed into (by you, or by banto
-itself) within the last 3 seconds. A Claude Code session reports its own state;
-a Codex session is idle once its last turn has ended — Codex records nothing
-about a command it left running in the background after that, so such a
-session reads as idle. Once quitting is decided the status bar reads `Closing —
+itself) within the last 3 seconds. A Claude Code session reports its own state,
+and so does a Codex one: banto reads the status report the Codex interface writes
+to its terminal (working, blocked on you, done or idle) and, until a session has
+made one, its last turn in the rollout. Codex records nothing about a command it
+left running in the background, so a Codex session that has not reported reads
+as idle. Once quitting is decided the status bar reads `Closing —
 ending N session(s)…` (`Closing…` with none) until banto exits: each session
 is closed in turn and given up to 5 seconds to finish.
 
@@ -254,6 +260,13 @@ master tile and the stack, or between two stack tiles to resize; drag a stack
 tile by its title to move it; `[S]` in any tile's title row solos it, and a
 stack tile also has `[_]` to collapse it to a strip (`[+]` opens it again). Each brigade's
 arrangement, and the sidebar's width, is remembered across restarts.
+
+A tile's title row, and a minimised tile's strip, say what its session is doing:
+**busy** (a turn or a background command is running), **waiting** (it needs you),
+**alive** (running, nothing to do) or **idle** (not running), then how long ago it
+last wrote. A Codex session's word comes from the status report its interface writes
+to its terminal. A tile too small for a screen shows the top-left corner of a
+2-row-by-2-column one: panes are never made smaller than that.
 
 ## Configuration
 

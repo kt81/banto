@@ -31,6 +31,7 @@ pub mod key_encode;
 pub mod layout;
 pub mod member_name;
 pub mod model;
+pub mod program_state;
 pub mod replay;
 pub mod screen;
 pub mod search;

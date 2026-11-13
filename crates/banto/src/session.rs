@@ -249,11 +249,18 @@ pub fn rows_from_metas(
                 now,
                 thresholds,
             );
+            // Told apart here, from the same live file and process snapshot that
+            // gave the activity: the list still draws such a row Waiting, and
+            // the bell leaves it out.
+            let dialog_open = activity == Activity::Waiting
+                && meta.agent == AgentKind::ClaudeCode
+                && status::waiting_on_a_dialog(&live, &meta.id.0, &live_claude);
             SessionRow {
                 id: meta.id.0,
                 agent: meta.agent,
                 title: meta.title,
                 cwd: meta.cwd,
+                dialog_open,
                 activity,
                 is_agent: meta.is_agent,
                 preview: meta.preview,
@@ -446,6 +453,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: Some("Fix login".into()),
             cwd: Some(PathBuf::from("/work/app")),
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
@@ -464,6 +472,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
@@ -482,6 +491,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: None,
             cwd: None,
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
@@ -794,6 +804,68 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_session_is_marked_dialog_open_only_for_exactly_that_reason() {
+        // The live file's process is this test's own, which is alive.
+        let pid = std::process::id();
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        for (live_file, activity, dialog_open) in [
+            (
+                r#"{"status":"waiting","waitingFor":"dialog open"}"#,
+                Activity::Waiting,
+                true,
+            ),
+            (
+                r#"{"status":"waiting","waitingFor":"input needed"}"#,
+                Activity::Waiting,
+                false,
+            ),
+            (
+                r#"{"status":"waiting","waitingFor":"a reason nobody has seen"}"#,
+                Activity::Waiting,
+                false,
+            ),
+            (
+                r#"{"status":"waiting","waitingFor":7}"#,
+                Activity::Waiting,
+                false,
+            ),
+            (r#"{"status":"waiting"}"#, Activity::Waiting, false),
+            // The reason means nothing beside any other status.
+            (
+                r#"{"status":"busy","waitingFor":"dialog open"}"#,
+                Activity::Busy,
+                false,
+            ),
+            (
+                r#"{"status":"idle","waitingFor":"dialog open"}"#,
+                Activity::Alive,
+                false,
+            ),
+        ] {
+            let body = format!(
+                r#"{{"pid":{pid},"sessionId":"sess","kind":"interactive",{}"#,
+                &live_file[1..]
+            );
+            std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap();
+            let rows = rows_from_metas(
+                vec![meta("sess", when)],
+                &claude_home,
+                None,
+                &AgeThresholds::default(),
+            );
+            assert_eq!(
+                (rows[0].activity, rows[0].dialog_open),
+                (activity, dialog_open),
+                "{live_file}"
+            );
+        }
+    }
+
+    #[test]
     fn a_proven_live_codex_session_is_alive_not_aged() {
         let now = SystemTime::now();
         let mut codex = meta("codex-live", now - Duration::from_secs(SECS_PER_DAY * 30));
@@ -827,6 +899,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: Some(title.into()),
             cwd: Some(PathBuf::from(cwd)),
+            dialog_open: false,
             activity,
             is_agent: false,
             preview: None,

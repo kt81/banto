@@ -115,6 +115,13 @@ input_line`), asked when relay decides to nudge. Reading sends nothing;
 the operator approved the principle on 2026-11-10. The next shortcut that
 wants the screen cites this paragraph's conditions, not the instance.
 
+Reading a program's own state report out of its output stream is not a read of
+the painted screen: it is the child's explicit announcement (OSC 7501, for a
+hosted Codex pane), arriving in an event that already exists (`PtyOutput`),
+recorded and replayed like the rest, and it closes to the previous rule whenever
+it is unsure (no report, or `clear`, and the earlier signal decides). It is not an
+instance of the paragraph above, so a shortcut must not cite it for one.
+
 ## 4. The core signature
 
 ```rust

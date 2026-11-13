@@ -30,6 +30,7 @@ pub(super) fn row(id: &str) -> SessionRow {
         agent: AgentKind::ClaudeCode,
         title: Some(id.to_string()),
         cwd: Some(PathBuf::from("/work/alpha")),
+        dialog_open: false,
         activity: Activity::Alive,
         is_agent: false,
         preview: None,

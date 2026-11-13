@@ -24,6 +24,13 @@ pub struct LiveSession {
     pub cwd: Option<PathBuf>,
     /// Reported status, e.g. `"busy"`.
     pub status: Option<String>,
+    /// Why the session is `waiting`, when the file says (JSON key
+    /// `waitingFor`; see [`super::LIVE_WAITING_FOR_DIALOG_OPEN`] for what has
+    /// been observed). Read together with [`Self::status`], in the one place
+    /// this struct is made, and read leniently: absent, not a string, or a string
+    /// nothing here knows all leave the session exactly as it was without the
+    /// field.
+    pub waiting_for: Option<String>,
     /// Session kind: `"interactive"` or `"bg"`.
     pub kind: Option<String>,
     /// Human-readable session name, if any.
@@ -56,10 +63,25 @@ struct RawLiveSession {
     session_id: Option<String>,
     cwd: Option<PathBuf>,
     status: Option<String>,
+    /// Lenient where every other field is strict: a `waitingFor` of any other
+    /// JSON type is `None` and the record is kept, since skipping it would make
+    /// a waiting session disappear from the list over a field nothing depends on.
+    #[serde(default, deserialize_with = "string_or_nothing")]
+    waiting_for: Option<String>,
     kind: Option<String>,
     name: Option<String>,
     proc_start: Option<String>,
     version: Option<String>,
+}
+
+fn string_or_nothing<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => Some(text),
+        _ => None,
+    })
 }
 
 /// Read every `*.json` file in `sessions_dir` as a [`LiveSession`].
@@ -98,6 +120,7 @@ fn parse_live_session_file(path: &Path) -> Option<LiveSession> {
         session_id: raw.session_id,
         cwd: raw.cwd,
         status: raw.status,
+        waiting_for: raw.waiting_for,
         kind: raw.kind,
         name: raw.name,
         proc_start: raw.proc_start,
@@ -147,6 +170,7 @@ mod tests {
                 session_id: Some("00000000-0000-4000-8000-000000000001".into()),
                 cwd: Some(PathBuf::from("/tmp/project")),
                 status: Some("busy".into()),
+                waiting_for: None,
                 kind: Some("interactive".into()),
                 name: Some("fixture session".into()),
                 proc_start: Some("1105463".into()),
@@ -214,6 +238,7 @@ mod tests {
                 session_id: None,
                 cwd: None,
                 status: None,
+                waiting_for: None,
                 kind: None,
                 name: None,
                 proc_start: None,
@@ -258,6 +283,63 @@ mod tests {
         );
 
         assert!(read_live_sessions(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn waiting_for_is_read_when_it_is_a_string_whatever_it_says() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "1.json",
+            r#"{"pid": 1, "status": "waiting", "waitingFor": "dialog open"}"#,
+        );
+        write(
+            dir.path(),
+            "2.json",
+            r#"{"pid": 2, "status": "waiting", "waitingFor": "a reason nobody has seen"}"#,
+        );
+        let mut sessions = read_live_sessions(dir.path());
+        sessions.sort_by_key(|session| session.pid);
+        assert_eq!(sessions[0].waiting_for.as_deref(), Some("dialog open"));
+        assert_eq!(
+            sessions[1].waiting_for.as_deref(),
+            Some("a reason nobody has seen")
+        );
+    }
+
+    #[test]
+    fn waiting_for_absent_or_not_a_string_reads_as_absent_and_keeps_the_record() {
+        // Unlike the other captured fields (see
+        // `skips_file_with_wrong_typed_captured_field`), a `waitingFor` of the
+        // wrong type must not cost the session its record: that would make a
+        // waiting session vanish from the list over a field nobody needs.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "1.json", r#"{"pid": 1, "status": "waiting"}"#);
+        for (pid, value) in [
+            (2, "42"),
+            (3, "true"),
+            (4, "null"),
+            (5, r#"["dialog open"]"#),
+            (6, r#"{"reason": "dialog open"}"#),
+        ] {
+            write(
+                dir.path(),
+                &format!("{pid}.json"),
+                &format!(r#"{{"pid": {pid}, "status": "waiting", "waitingFor": {value}}}"#),
+            );
+        }
+        let mut sessions = read_live_sessions(dir.path());
+        sessions.sort_by_key(|session| session.pid);
+        assert_eq!(sessions.len(), 6, "every record is kept");
+        for session in &sessions {
+            assert_eq!(
+                session.status.as_deref(),
+                Some("waiting"),
+                "pid {}",
+                session.pid
+            );
+            assert_eq!(session.waiting_for, None, "pid {}", session.pid);
+        }
     }
 
     #[test]

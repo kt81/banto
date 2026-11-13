@@ -590,6 +590,7 @@ mod tests {
             session_id: Some(session_id.to_string()),
             cwd: None,
             status: None,
+            waiting_for: None,
             kind: None,
             name: None,
             proc_start: None,

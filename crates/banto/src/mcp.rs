@@ -2173,6 +2173,84 @@ mod tests {
     }
 
     #[test]
+    fn brigade_status_prints_a_claude_peers_raw_status_including_shell() {
+        // What the tool prints for a live Claude peer is the live file's own word
+        // (`busy`, `waiting`, `idle`, and `shell` for a turn that has ended with a
+        // background command still running), not the list's display word.
+        for status in ["busy", "waiting", "idle", "shell"] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+            let pid = std::process::id();
+            std::fs::write(
+                home.path().join("sessions").join(format!("{pid}.json")),
+                format!(r#"{{"pid":{pid},"sessionId":"w1","status":"{status}"}}"#),
+            )
+            .unwrap();
+            let mut ctx = ctx(
+                "dir-session",
+                Some(1),
+                Some("director"),
+                Some(BrigadeRole::Director),
+            );
+            ctx.claude_home = ClaudeHome::new(home.path().to_path_buf());
+            ctx.store
+                .add_brigade_member(
+                    1,
+                    "worker-1",
+                    BrigadeRole::Worker,
+                    Some(&SessionId("w1".into())),
+                )
+                .unwrap();
+            let response = call(&mut ctx, &status_call());
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains(&format!("worker-1 \u{2014} {status}")),
+                "{status}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn brigade_status_calls_a_peer_with_a_dialog_open_waiting_like_any_other_waiting_one() {
+        // `waiting` is still the right word for a peer stopped on a dialog: it is
+        // not nudged and its mail waits for a person, whatever it is waiting for.
+        for waiting_for in [None, Some("dialog open"), Some("input needed")] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+            let pid = std::process::id();
+            let reason = waiting_for
+                .map(|reason| format!(r#","waitingFor":"{reason}""#))
+                .unwrap_or_default();
+            std::fs::write(
+                home.path().join("sessions").join(format!("{pid}.json")),
+                format!(r#"{{"pid":{pid},"sessionId":"w1","status":"waiting"{reason}}}"#),
+            )
+            .unwrap();
+            let mut ctx = ctx(
+                "dir-session",
+                Some(1),
+                Some("director"),
+                Some(BrigadeRole::Director),
+            );
+            ctx.claude_home = ClaudeHome::new(home.path().to_path_buf());
+            ctx.store
+                .add_brigade_member(
+                    1,
+                    "worker-1",
+                    BrigadeRole::Worker,
+                    Some(&SessionId("w1".into())),
+                )
+                .unwrap();
+            let response = call(&mut ctx, &status_call());
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("worker-1 \u{2014} waiting"),
+                "{waiting_for:?}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn brigade_status_reports_a_live_codex_peer_as_running() {
         let (_dir, codex_home) = codex_home_with_live_log("codex-worker", std::process::id());
         let mut ctx = ctx(

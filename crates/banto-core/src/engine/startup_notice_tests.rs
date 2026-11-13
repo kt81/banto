@@ -125,6 +125,7 @@ fn a_notice_on_screen_blocks_no_input_and_asks_for_no_effects() {
             agent: AgentKind::ClaudeCode,
             title: Some(id.to_string()),
             cwd: None,
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,

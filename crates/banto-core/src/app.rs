@@ -777,6 +777,19 @@ pub struct App {
     /// row cache, so the emporium can classify a staged key in O(1) even when
     /// that member is hidden from the list.
     waiting_rows: HashSet<String>,
+    /// Activities the emporium knows better than the session files do: what a
+    /// hosted program has told banto about itself (see
+    /// [`Self::set_reported_activity`]). Laid over `base_rows`' own activity
+    /// whenever `rows` is rebuilt, so a reload of the list cannot lose it.
+    reported_activity: HashMap<String, Activity>,
+    /// Ids of the rows that are Waiting only because a dialog is open
+    /// ([`SessionRow::dialog_open`]), after what hosted panes reported is laid
+    /// over: such a row is displayed as Waiting like any other but is not one the
+    /// bell is rung for.
+    dialog_rows: HashSet<String>,
+    /// Where each id sits in `rows`, rebuilt with it, so [`Self::row_for_id`]
+    /// costs a lookup: every staged tile asks for its row on every frame.
+    row_index: HashMap<String, usize>,
     /// Claude session ids of brigade Workers and Goinkyos (while still a
     /// member of one — see `Store::brigade_hidden_session_ids`'s own doc for
     /// why a Goinkyo drops out on dismissal instead of staying hidden),
@@ -918,6 +931,9 @@ impl App {
             haystacks: Vec::new(),
             pinned: HashSet::new(),
             waiting_rows: HashSet::new(),
+            reported_activity: HashMap::new(),
+            row_index: HashMap::new(),
+            dialog_rows: HashSet::new(),
             hidden: HashSet::new(),
             directors: HashSet::new(),
             superseded: HashSet::new(),
@@ -1728,6 +1744,22 @@ impl App {
         Some((id, now_pinned))
     }
 
+    /// Replace the activities laid over the list from outside the session files
+    /// (a hosted Codex pane's own report of being blocked or working). A session
+    /// named here shows, counts and is marked as having that activity — in the
+    /// list, the Waiting count and the attention marks, which all read the rows —
+    /// until it is left out of a later call. Nothing changes when `reported` is
+    /// what it already was, so calling this on every update costs a comparison.
+    pub fn set_reported_activity(&mut self, reported: HashMap<String, Activity>) {
+        if self.reported_activity == reported {
+            return;
+        }
+        self.reported_activity = reported;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.resort_rows();
+        self.refilter_keeping_selected(selected_id);
+    }
+
     /// Replace the session list (e.g. after a filesystem-change reload),
     /// re-applying the current query unchanged. The previously selected
     /// session stays selected if it still exists, by id rather than index
@@ -1752,12 +1784,37 @@ impl App {
     /// valid again and preserve the selection in one filter computation.
     fn resort_rows(&mut self) {
         self.rows = self.base_rows.clone();
+        for row in &mut self.rows {
+            if let Some(&activity) = self.reported_activity.get(&row.id) {
+                row.activity = activity;
+            }
+        }
         self.rows.sort_by_key(|row| !self.pinned.contains(&row.id));
+        self.row_index.clear();
+        for (at, row) in self.rows.iter().enumerate() {
+            self.row_index.entry(row.id.clone()).or_insert(at);
+        }
         self.haystacks = self.rows.iter().map(SessionRow::haystack).collect();
         self.waiting_rows = self
             .rows
             .iter()
             .filter(|row| row.activity == Activity::Waiting)
+            .map(|row| row.id.clone())
+            .collect();
+        // A pane that reported itself waiting is waiting whether or not the list
+        // has a row for it yet (a member it has not picked up, a reload window),
+        // so its tile is marked, counted and rung for like one that has a row.
+        self.waiting_rows.extend(
+            self.reported_activity
+                .iter()
+                .filter(|(_, activity)| **activity == Activity::Waiting)
+                .map(|(id, _)| id.clone()),
+        );
+        // Read after the overlay: a row a pane reported over is not a dialog.
+        self.dialog_rows = self
+            .rows
+            .iter()
+            .filter(|row| row.activity == Activity::Waiting && row.dialog_open)
             .map(|row| row.id.clone())
             .collect();
     }
@@ -2155,8 +2212,14 @@ impl App {
     /// brigade member that the reveal level or search would otherwise hide)
     /// can still be resolved back to its title/cwd. A plain accessor, unaware
     /// of any brigade concept.
+    ///
+    /// Reads `rows`, not `base_rows`, so the activity it returns is the one the
+    /// list shows, with what a hosted pane has said about itself laid over
+    /// ([`Self::set_reported_activity`]). The collapsed tile's strip draws its
+    /// activity from this row, and reading the raw one showed a Codex Worker
+    /// that reported `working` as plain "alive".
     pub fn row_for_id(&self, id: &str) -> Option<&SessionRow> {
-        self.base_rows.iter().find(|row| row.id == id)
+        self.row_index.get(id).map(|&at| &self.rows[at])
     }
 
     /// Whether `id` is a Waiting row in the current list result. This
@@ -2164,6 +2227,12 @@ impl App {
     /// member hidden from the list is represented by its staged tile instead.
     pub fn is_filtered_waiting_id(&self, id: &str) -> bool {
         self.filtered_waiting.contains(id)
+    }
+
+    /// Whether `id` is Waiting only because a dialog is open: shown and counted
+    /// as Waiting, left out of what the bell rings for.
+    pub fn is_dialog_open_id(&self, id: &str) -> bool {
+        self.dialog_rows.contains(id)
     }
 
     /// Whether a loaded session currently reports Waiting, regardless of list
@@ -2299,6 +2368,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: (!title.is_empty()).then(|| title.to_string()),
             cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
+            dialog_open: false,
             activity: Activity::Idle(AgeBucket::Older),
             is_agent: false,
             preview: None,
@@ -2383,6 +2453,137 @@ mod tests {
         assert!(got.contains(&"a".to_string()));
         assert!(got.contains(&"c".to_string()));
         assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn a_reported_activity_is_laid_over_the_list_and_survives_a_reload() {
+        let mut app = App::new(vec![row("a", "A", ""), row("b", "B", "")]);
+        app.set_viewport_height(20);
+        let activity_of = |app: &App, id: &str| {
+            app.visible()
+                .into_iter()
+                .find_map(|line| match line {
+                    ListLine::Row(r) if r.row.id == id => Some(r.row.activity),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(app.filtered_waiting_count(), 0);
+
+        app.set_reported_activity(
+            [
+                ("a".to_string(), Activity::Waiting),
+                ("b".to_string(), Activity::Busy),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(activity_of(&app, "a"), Activity::Waiting);
+        assert_eq!(activity_of(&app, "b"), Activity::Busy);
+        assert!(app.is_waiting_id("a") && app.is_filtered_waiting_id("a"));
+        assert_eq!(app.filtered_waiting_count(), 1);
+
+        // A reload brings the session files' own activity again; the overlay is
+        // laid back over it.
+        app.replace_rows(vec![row("a", "A", ""), row("b", "B", "")]);
+        assert_eq!(activity_of(&app, "a"), Activity::Waiting);
+        assert_eq!(app.filtered_waiting_count(), 1);
+
+        // Saying the same thing again changes nothing at all (no rebuild).
+        let generation = app.filtered_waiting_generation();
+        app.set_reported_activity(
+            [
+                ("a".to_string(), Activity::Waiting),
+                ("b".to_string(), Activity::Busy),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(app.filtered_waiting_generation(), generation);
+
+        // Leaving a session out takes the overlay off it.
+        app.set_reported_activity([("b".to_string(), Activity::Busy)].into_iter().collect());
+        assert_eq!(activity_of(&app, "a"), Activity::Idle(AgeBucket::Older));
+        assert!(!app.is_waiting_id("a"));
+        assert_eq!(app.filtered_waiting_count(), 0);
+    }
+
+    #[test]
+    fn row_for_id_finds_every_row_whatever_the_list_shows_and_follows_reloads_pins_and_reports() {
+        let mut app = App::new(vec![
+            row("a", "A", ""),
+            row("b", "B", ""),
+            row("c", "C", ""),
+        ]);
+        app.set_hidden_member_ids(["b".to_string()].into_iter().collect());
+        for id in ["a", "b", "c"] {
+            assert_eq!(app.row_for_id(id).map(|row| row.id.as_str()), Some(id));
+        }
+        assert!(app.row_for_id("zzz").is_none());
+
+        // A reload drops one row and brings another.
+        app.replace_rows(vec![row("c", "C", ""), row("d", "D", "")]);
+        assert!(app.row_for_id("a").is_none() && app.row_for_id("b").is_none());
+        assert_eq!(app.row_for_id("d").map(|row| row.id.as_str()), Some("d"));
+
+        // Pinning reorders the rows; the lookup still lands on the right one.
+        while app.selected_row().map(|row| row.id.as_str()) != Some("d") {
+            app.select_next();
+        }
+        assert_eq!(app.toggle_pin(), Some(("d".to_string(), true)));
+        assert_eq!(
+            app.row_for_id("c").map(|row| row.title.clone()),
+            Some(row("c", "C", "").title)
+        );
+        assert_eq!(
+            app.row_for_id("d").map(|row| row.title.clone()),
+            Some(row("d", "D", "").title)
+        );
+
+        // What a hosted pane reports is in the row it returns, and gone again.
+        let reported = [("c".to_string(), Activity::Busy)].into_iter().collect();
+        app.set_reported_activity(reported);
+        assert_eq!(
+            app.row_for_id("c").map(|row| row.activity),
+            Some(Activity::Busy)
+        );
+        assert_eq!(
+            app.row_for_id("d").map(|row| row.activity),
+            Some(Activity::Idle(AgeBucket::Older))
+        );
+        app.set_reported_activity(HashMap::new());
+        assert_eq!(
+            app.row_for_id("c").map(|row| row.activity),
+            Some(Activity::Idle(AgeBucket::Older))
+        );
+    }
+
+    #[test]
+    fn a_dialog_open_row_is_waiting_everywhere_and_known_as_a_dialog_only_while_it_is_waiting() {
+        let waiting_dialog = SessionRow {
+            activity: Activity::Waiting,
+            dialog_open: true,
+            ..row("a", "A", "")
+        };
+        let waiting_question = SessionRow {
+            activity: Activity::Waiting,
+            ..row("b", "B", "")
+        };
+        // A stale flag on a row that is no longer waiting means nothing.
+        let not_waiting = SessionRow {
+            dialog_open: true,
+            ..row("c", "C", "")
+        };
+        let mut app = App::new(vec![waiting_dialog, waiting_question, not_waiting]);
+        assert_eq!(app.filtered_waiting_count(), 2);
+        assert!(app.is_waiting_id("a") && app.is_filtered_waiting_id("a"));
+        assert!(app.is_dialog_open_id("a"));
+        assert!(!app.is_dialog_open_id("b") && !app.is_dialog_open_id("c"));
+        // What a pane reported over the row replaces the whole picture.
+        app.set_reported_activity([("a".to_string(), Activity::Busy)].into_iter().collect());
+        assert!(!app.is_dialog_open_id("a") && !app.is_waiting_id("a"));
+        app.set_reported_activity(HashMap::new());
+        assert!(app.is_dialog_open_id("a"));
     }
 
     #[test]

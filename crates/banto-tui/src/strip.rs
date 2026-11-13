@@ -164,6 +164,98 @@ fn render_status_row(buffer: &mut Buffer, row: Rect, data: &StripData) {
     put(&age, Style::default().fg(Color::Gray));
 }
 
+/// The status an expanded tile's title row carries after its label: the strip's
+/// own status row, in the strip's own words and colours — agent label, activity
+/// word, output age — from the same [`StripData`], so a pane's strip and its
+/// title cannot disagree.
+///
+/// What gives way when `room` cells are not enough, in this order: the agent
+/// label, then the output age, then nothing — the activity word is the point of
+/// the title's status, so it is never cut and never shortened. (The strip keeps
+/// the age over the word, since its three rows have room for both; a title row
+/// does not, and "alive" or "busy" is what the operator reads it for.) Empty
+/// when not even the word fits. A pane with no activity known gets what is left
+/// the same way: agent and age, then age.
+pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)> {
+    let age = data
+        .output_age
+        .map_or_else(|| "no output yet".to_string(), output_age_text);
+    let agent: Part = data
+        .agent
+        .map(|agent| (agent.label().to_string(), agent_label_color(agent)));
+    let word: Part = data.activity.map(|activity| {
+        (
+            activity_word(activity).to_string(),
+            activity_color(activity),
+        )
+    });
+    let age: Part = Some((age, Color::Gray));
+    // Which of agent / word / age each step keeps.
+    let steps: [(bool, bool, bool); 4] = [
+        (true, true, true),
+        (false, true, true),
+        (false, true, false),
+        (false, false, true),
+    ];
+    for (with_agent, with_word, with_age) in steps {
+        // The age alone is for a pane whose activity is not known; beside a word
+        // it would be a status with no status in it.
+        if !with_word && word.is_some() {
+            continue;
+        }
+        let kept: Vec<&(String, Color)> =
+            [(with_agent, &agent), (with_word, &word), (with_age, &age)]
+                .into_iter()
+                .filter(|(keep, _)| *keep)
+                .filter_map(|(_, part)| part.as_ref())
+                .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let width: usize = kept.iter().map(|part| part.0.width()).sum::<usize>()
+            + SEPARATOR.width() * (kept.len() - 1);
+        if width > room {
+            continue;
+        }
+        let mut parts = Vec::new();
+        for (index, (text, color)) in kept.into_iter().enumerate() {
+            if index > 0 {
+                parts.push((SEPARATOR.to_string(), Color::DarkGray));
+            }
+            parts.push((text.clone(), *color));
+        }
+        return parts;
+    }
+    Vec::new()
+}
+
+/// Draw [`title_status_parts`] on row `y` into the cells `from..to` (a free
+/// stretch of a tile's top border), set off by a space on each side the way the
+/// title's own text is. Draws nothing when there is no room for even the word.
+/// Returns the number of cells it used.
+pub fn render_title_status(
+    buffer: &mut Buffer,
+    y: u16,
+    from: u16,
+    to: u16,
+    data: &StripData,
+) -> u16 {
+    let room = usize::from(to.saturating_sub(from)).saturating_sub(2);
+    let parts = title_status_parts(data, room);
+    if parts.is_empty() {
+        return 0;
+    }
+    let mut x = from;
+    buffer.set_string(x, y, " ", Style::default());
+    x += 1;
+    for (text, color) in &parts {
+        buffer.set_string(x, y, text, Style::default().fg(*color));
+        x += text.width() as u16;
+    }
+    buffer.set_string(x, y, " ", Style::default());
+    x + 1 - from
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +466,108 @@ mod tests {
         render_strip(&mut buffer, Rect::new(0, 0, 0, 3), &busy_claude(), now);
         render_strip(&mut buffer, Rect::new(0, 0, 5, 0), &busy_claude(), now);
         assert_eq!(row_text(&buffer, 0, 5).trim_end(), "");
+    }
+
+    fn texts(parts: &[(String, Color)]) -> String {
+        parts.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    fn pane(agent: AgentKind, activity: Activity, age: u64) -> StripData {
+        StripData {
+            agent: Some(agent),
+            activity: Some(activity),
+            output_age: Some(Duration::from_secs(age)),
+            ..StripData::default()
+        }
+    }
+
+    #[test]
+    fn the_title_status_is_the_strips_status_row_in_the_strips_words_and_colours() {
+        let data = pane(AgentKind::Codex, Activity::Busy, 200);
+        let parts = title_status_parts(&data, 80);
+        assert_eq!(texts(&parts), "Codex \u{b7} busy \u{b7} output 3m ago");
+        assert_eq!(parts[0].1, agent_label_color(AgentKind::Codex));
+        assert_eq!(parts[2].1, activity_color(Activity::Busy));
+        assert_eq!(parts[4].1, Color::Gray);
+        // Row one of the strip says exactly this.
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buffer = Buffer::empty(area);
+        render_strip(&mut buffer, area, &data, SystemTime::UNIX_EPOCH);
+        assert_eq!(row_text(&buffer, 0, 80).trim_end(), texts(&parts));
+    }
+
+    #[test]
+    fn the_title_status_gives_way_the_agent_first_then_the_age_and_never_cuts_the_word() {
+        let data = pane(AgentKind::ClaudeCode, Activity::Waiting, 5);
+        let full = "Claude \u{b7} waiting \u{b7} output now"; // 29 cells
+        assert_eq!(full.width(), 29);
+        for (room, expected) in [
+            (200, full),
+            (29, full),
+            (28, "waiting \u{b7} output now"),
+            (20, "waiting \u{b7} output now"),
+            (19, "waiting"),
+            (7, "waiting"),
+            (6, ""),
+            (0, ""),
+        ] {
+            assert_eq!(
+                texts(&title_status_parts(&data, room)),
+                expected,
+                "room {room}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_with_no_activity_known_shows_what_is_known() {
+        let no_activity = StripData {
+            agent: Some(AgentKind::Codex),
+            activity: None,
+            output_age: None,
+            ..StripData::default()
+        };
+        assert_eq!(
+            texts(&title_status_parts(&no_activity, 80)),
+            "Codex \u{b7} no output yet"
+        );
+        assert_eq!(
+            texts(&title_status_parts(&no_activity, 14)),
+            "no output yet"
+        );
+        assert_eq!(texts(&title_status_parts(&no_activity, 12)), "");
+        assert_eq!(
+            texts(&title_status_parts(&StripData::default(), 80)),
+            "no output yet"
+        );
+    }
+
+    #[test]
+    fn render_title_status_sets_the_text_off_with_a_space_each_side_and_reports_its_width() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
+        let used = render_title_status(
+            &mut buffer,
+            0,
+            3,
+            30,
+            &pane(AgentKind::Codex, Activity::Busy, 0),
+        );
+        let drawn: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(drawn.starts_with("   \u{20}Codex"), "{drawn:?}");
+        assert_eq!(drawn.trim_end(), "    Codex \u{b7} busy \u{b7} output now");
+        assert_eq!(used, " Codex \u{b7} busy \u{b7} output now ".width() as u16);
+        // No room: nothing drawn.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
+        assert_eq!(
+            render_title_status(
+                &mut buffer,
+                0,
+                3,
+                8,
+                &pane(AgentKind::Codex, Activity::Busy, 0)
+            ),
+            0
+        );
+        assert_eq!(buffer, Buffer::empty(Rect::new(0, 0, 40, 1)));
     }
 }

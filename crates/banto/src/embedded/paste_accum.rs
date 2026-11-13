@@ -200,6 +200,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             title: Some(id.to_string()),
             cwd: None,
+            dialog_open: false,
             activity: Activity::Alive,
             is_agent: false,
             preview: None,
