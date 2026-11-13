@@ -49,8 +49,19 @@ impl World {
         Env {
             home: Some(self.root.join("fake home")),
             default_config: Some(self.root.join("platform config").join("config.toml")),
-            default_db: Some(self.root.join("platform data").join("banto.db")),
+            data_dir: Some(self.root.join("platform data")),
             ..Env::default()
+        }
+    }
+
+    /// The environment of a child: the same machine, except that its own idea of
+    /// where the platform's data directory is differs from the parent's (another
+    /// `XDG_DATA_HOME` / profile) — which is exactly what the hand-off must
+    /// override.
+    fn child_env(&self) -> Env {
+        Env {
+            data_dir: Some(self.root.join("a different data dir")),
+            ..self.env()
         }
     }
 
@@ -58,6 +69,11 @@ impl World {
     /// directory), whose file names a relative `db_path`; `--claude-home` and
     /// `--codex-home` given relative, the Codex one with a space in it.
     fn parent(&self) -> (Config, Resolved) {
+        self.parent_in(self.env())
+    }
+
+    /// [`Self::parent`] in another environment (one with no data directory, say).
+    fn parent_in(&self, env: Env) -> (Config, Resolved) {
         let conf = self.parent_cwd.join("conf dir");
         std::fs::create_dir_all(&conf).unwrap();
         std::fs::write(
@@ -69,7 +85,7 @@ impl World {
             cli_config: Some(PathBuf::from("conf dir/banto.toml")),
             cli_claude_home: Some(PathBuf::from("homes/claude")),
             cli_codex_home: Some(PathBuf::from("homes/codex home")),
-            env: self.env(),
+            env,
             cwd: Some(self.parent_cwd.clone()),
             ..Inputs::default()
         };
@@ -104,13 +120,14 @@ impl World {
         full.extend(argv.iter().cloned());
         let cli = Cli::try_parse_from(&full)
             .unwrap_or_else(|err| panic!("the child's argv does not parse: {err}\n{full:?}"));
-        let mut env = self.env();
+        let mut env = self.child_env();
         env.banto_config = inherited_config.map(PathBuf::from);
         let inputs = Inputs {
             cli_config: cli.config.clone(),
             cli_claude_home: cli.claude_home.clone(),
             cli_codex_home: cli.codex_home.clone(),
             cli_db_path: cli.db_path.clone(),
+            cli_data_dir: cli.data_dir.clone(),
             parent_config: cli.parent_config.clone(),
             parent_no_config: cli.parent_no_config,
             env,
@@ -121,7 +138,7 @@ impl World {
 
     /// What the `_hook` process resolves from the environment banto gave it.
     fn resolve_hook(&self, given: &[(String, String)], inherited_config: Option<&str>) -> Resolved {
-        let mut env = self.env();
+        let mut env = self.child_env();
         env.banto_config = inherited_config.map(PathBuf::from);
         for (key, value) in given {
             match key.as_str() {
@@ -244,6 +261,29 @@ fn assert_agrees(label: &str, parent: &Resolved, child: &Resolved, homes: bool) 
     );
     if homes {
         check(
+            "data directory",
+            format!("{:?}", parent.data_dir),
+            format!("{:?}", child.data_dir),
+        );
+        // Everything banto derives from it: the MCP configs (and where a member's
+        // goes), the consultation requests, the message logs.
+        let derived = |r: &Resolved| {
+            r.data_dir().map(|d| {
+                (
+                    d.mcp_dir(),
+                    d.member_config_path(7, "worker-1"),
+                    d.goinkyo_dir(),
+                    d.goinkyo_request_path(7),
+                    d.logs_dir(),
+                )
+            })
+        };
+        check(
+            "paths derived from the data directory",
+            format!("{:?}", derived(parent)),
+            format!("{:?}", derived(child)),
+        );
+        check(
             "Claude home",
             format!("{:?}", parent.claude_home),
             format!("{:?}", child.claude_home),
@@ -327,6 +367,43 @@ fn a_wrap_that_starts_a_new_session_resolves_what_its_parent_did() {
     assert_agrees("_wrap new-session", &parent, &child, true);
 }
 
+/// A parent with no data directory (the platform has none) passes none, and a
+/// child handed anything else must not find one for itself — as with the Codex
+/// home, where the parent had none the child has none. The child's own platform
+/// does have one here (`child_env`), which is what it must not use.
+#[test]
+fn children_of_a_parent_with_no_data_directory_have_none_either() {
+    let world = World::new();
+    let (_, parent) = world.parent_in(Env {
+        data_dir: None,
+        ..world.env()
+    });
+    assert_eq!(parent.data_dir, None);
+    let invocations = invocations(&parent);
+    assert!(
+        !invocations.claude_mcp.iter().any(|arg| arg == "--data-dir"),
+        "{:?}",
+        invocations.claude_mcp
+    );
+    for (label, argv) in [
+        ("claude _mcp", &invocations.claude_mcp),
+        ("codex _mcp", &invocations.codex_mcp),
+        ("_wrap resume", &invocations.wrap_resume),
+        ("_wrap new-session", &invocations.wrap_new_session),
+    ] {
+        let child = world
+            .resolve_argv(argv, None)
+            .unwrap_or_else(|err| panic!("{label} cannot start: {err:#}"));
+        assert_eq!(child.data_dir, None, "{label}");
+        assert_agrees(label, &parent, &child, true);
+    }
+    // The hook is handed through the environment and reads no data directory:
+    // it has none either, and its database is still the parent's.
+    let hook = world.resolve_hook(&invocations.hook_env, None);
+    assert_eq!(hook.data_dir, None);
+    assert_agrees("_hook", &parent, &hook, false);
+}
+
 #[test]
 fn a_hook_resolves_the_config_and_database_its_parent_did() {
     let world = World::new();
@@ -376,6 +453,7 @@ fn awkward_paths_come_through_every_builder_and_back_unchanged() {
         db_path: Some(awkward("banto.db")),
         claude_home: Some(awkward("claude home")),
         codex_home: Some(awkward("codex home")),
+        data_dir: Some(awkward("data dir")),
     };
     let invocations = invocations(&parent);
 

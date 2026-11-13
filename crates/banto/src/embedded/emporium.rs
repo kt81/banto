@@ -64,6 +64,7 @@ use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
+use banto_io::data_dir::DataDir;
 use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
 use banto_io::provider::SessionProvider;
 use banto_io::provider::cache::MetaCache;
@@ -1103,6 +1104,7 @@ fn execute_cmd(
             discovery,
         ),
         Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
+        Cmd::SweepDataDir => execute_sweep_data_dir(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
         Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
             execute_check_worker_directory_trust(key, &cwd, deps)
@@ -1148,6 +1150,29 @@ fn execute_cmd(
 fn close_any_open_hyperlink<W: io::Write>(w: &mut W) -> io::Result<()> {
     w.write_all(b"\x1b]8;;\x1b\\")?;
     w.flush()
+}
+
+/// Delete the working files no member of the store needs any more. Runs here, in
+/// the emporium, and nowhere else: the `_mcp` processes only ever write. What is
+/// safe to delete, and what the sweep assumes, is `banto_io::data_dir`'s to say.
+///
+/// The authority check lives here, at the edge: only a data directory whose own
+/// database is the one this process opened is swept
+/// ([`crate::startup::Resolved::sweepable_data_dir`]). An emporium pointed at
+/// another database shares the directory but not the store, and would delete the
+/// everyday one's live files. A store that cannot be read deletes nothing.
+fn execute_sweep_data_dir(deps: &Deps) -> Vec<Event> {
+    if let Some(dir) = deps.child.and_then(|child| child.sweepable_data_dir()) {
+        sweep_data_dir_with(&dir, deps.store, std::time::SystemTime::now());
+    }
+    Vec::new()
+}
+
+fn sweep_data_dir_with(dir: &DataDir, store: &RefCell<Store>, now: std::time::SystemTime) {
+    banto_io::data_dir::sweep(dir, now, || {
+        let rows = store.borrow().all_member_tokens().ok()?;
+        Some(banto_io::data_dir::Facts::from_member_rows(rows))
+    });
 }
 
 /// Read whether banto's `SessionStart` hook looks trusted right now —
@@ -1411,11 +1436,14 @@ fn execute_open_embedded(
             .map(|child| child.child_args())
             .unwrap_or_default();
         let wiring = match &mut launch {
-            opener::AgentLaunch::Claude { mcp_config, .. } => {
-                write_mcp_config(*brigade_id, token, *role, known_id, &child_args).map(|path| {
-                    *mcp_config = Some(path);
+            opener::AgentLaunch::Claude { mcp_config, .. } => data_dir_of(deps)
+                .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))
+                .and_then(|data_dir| {
+                    write_mcp_config(&data_dir, *brigade_id, token, *role, known_id, &child_args)
                 })
-            }
+                .map(|path| {
+                    *mcp_config = Some(path);
+                }),
             opener::AgentLaunch::Codex { brigade: slot, .. } => std::env::current_exe()
                 .map_err(anyhow::Error::from)
                 .map(|exe| {
@@ -2467,7 +2495,7 @@ fn member_briefing(
     let template = deps.brigade.prompt_for(role)?;
     let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
     let request = (role == BrigadeRole::Goinkyo)
-        .then(|| goinkyo_request_path(brigade_id))
+        .then(|| data_dir_of(deps).and_then(|dir| goinkyo_request_path(&dir, brigade_id)))
         .flatten();
     Some(crate::briefing::render(
         template,
@@ -2478,22 +2506,24 @@ fn member_briefing(
     ))
 }
 
-/// Where `crate::mcp::tool_consult_goinkyo` wrote this brigade's
-/// consultation request. Recomputed here rather than threaded through
-/// [`Deps`]: matches [`write_mcp_config`]'s own precedent of resolving
-/// banto's data directory directly at the point of use rather than
-/// injecting it. The join itself is `crate::mcp::resolve_goinkyo_dir` /
-/// `crate::mcp::goinkyo_request_path` — the same two calls
-/// `write_goinkyo_request` makes — rather than repeated here by hand: see
-/// `resolve_goinkyo_dir`'s own doc for why a second hand-written copy would
-/// be a bug waiting for only one side to be edited.
-fn goinkyo_request_path(brigade_id: BrigadeId) -> Option<String> {
-    let dir = crate::mcp::resolve_goinkyo_dir()?;
-    Some(
-        crate::mcp::goinkyo_request_path(&dir, brigade_id)
-            .to_string_lossy()
-            .into_owned(),
-    )
+/// The data directory this emporium works in: the one it resolved at startup
+/// (`EmporiumSettings::child`), which is also what it hands every banto process it
+/// starts. `Deps::child` is `None` only in a test, which then gets the platform's.
+fn data_dir_of(deps: &Deps) -> Option<DataDir> {
+    match deps.child {
+        Some(child) => child.data_dir(),
+        None => DataDir::default_root().map(DataDir::new),
+    }
+}
+
+/// Where `crate::mcp::tool_consult_goinkyo` wrote this brigade's consultation
+/// request: the same `DataDir` path the `_mcp` process was handed, so the two
+/// cannot disagree about where the file is. `None` for a brigade id banto does
+/// not issue.
+fn goinkyo_request_path(data_dir: &DataDir, brigade_id: BrigadeId) -> Option<String> {
+    data_dir
+        .goinkyo_request_path(brigade_id)
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// The `BANTO_*` variables a brigade member's child is launched with.
@@ -2535,6 +2565,7 @@ pub(crate) fn brigade_env(
 /// freshly-spawned Worker. Lives under banto's own data dir, never under
 /// `~/.claude`.
 fn write_mcp_config(
+    data_dir: &DataDir,
     brigade_id: BrigadeId,
     token: &str,
     role: BrigadeRole,
@@ -2543,11 +2574,16 @@ fn write_mcp_config(
 ) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let config = mcp_config_json(&exe, child_args, brigade_id, token, role, session_id);
-    let dir = dirs::data_local_dir()
-        .map(|base| base.join("banto").join("mcp"))
-        .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{brigade_id}-{}.json", sanitize_filename(token)));
+    // A token banto did not issue (a hand-edited store) gets no file rather than
+    // one the sweep could not tell from a stranger's: the spawn fails instead.
+    let path = data_dir
+        .member_config_path(brigade_id, token)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no configuration file name for member {token:?} of brigade {brigade_id}"
+            )
+        })?;
+    std::fs::create_dir_all(data_dir.mcp_dir())?;
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     Ok(path)
 }
@@ -2584,20 +2620,6 @@ pub(crate) fn mcp_config_json(
             }
         }
     })
-}
-
-/// Keep a token safe as a filename component (tokens are `director`/`worker-N`,
-/// but be defensive).
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// How long a pane's synchronized-update block (DECSET 2026,
@@ -7865,6 +7887,7 @@ mod tests {
             db_path: None,
             claude_home: None,
             codex_home: None,
+            data_dir: None,
         };
         assert!(brigade_env(None, None).is_empty());
         // Nothing to say to a process that is not a brigade member's.
@@ -7878,6 +7901,7 @@ mod tests {
             db_path: Some(PathBuf::from("/d dir/banto.db")),
             claude_home: Some(PathBuf::from("/h/claude")),
             codex_home: Some(PathBuf::from("/h/codex")),
+            data_dir: None,
         };
         let env = brigade_env(
             Some(&(7, "worker-1".to_string(), BrigadeRole::Worker)),
@@ -8075,27 +8099,16 @@ mod tests {
     }
 
     #[test]
-    fn goinkyo_request_path_matches_what_the_shared_join_computes() {
-        // `expected` is computed by calling `mcp::resolve_goinkyo_dir` /
-        // `mcp::goinkyo_request_path` directly here, independently of
-        // whatever this function's own body currently does — not just
-        // pinning the `.../goinkyo/42.txt` suffix as a hand-written
-        // literal, which a differently-based independent join could still
-        // satisfy. If this function's body ever stopped delegating to those
-        // same two calls (reverting to its own hand-rolled join, even one
-        // that happens to match today), or if `resolve_goinkyo_dir`'s own
-        // definition changed without this function picking it up, the two
-        // sides would diverge and this would fail.
-        let expected = crate::mcp::resolve_goinkyo_dir().map(|dir| {
-            crate::mcp::goinkyo_request_path(&dir, 42)
-                .to_string_lossy()
-                .into_owned()
-        });
-        assert_eq!(
-            goinkyo_request_path(42),
-            expected,
-            "this platform is assumed to have a data-local dir for the test to be meaningful"
-        );
+    fn goinkyo_request_path_matches_what_the_mcp_server_writes_to() {
+        // The `_mcp` process is handed `DataDir::goinkyo_dir` and writes
+        // `mcp::goinkyo_request_path(that, brigade)`; the briefing's `{request}` is
+        // computed here from the same `DataDir`. They must name one file.
+        let data_dir = DataDir::new(PathBuf::from("/a data dir"));
+        let written_by_mcp = crate::mcp::goinkyo_request_path(&data_dir.goinkyo_dir(), 42)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(goinkyo_request_path(&data_dir, 42), Some(written_by_mcp));
     }
 
     // --- gather_goinkyo_observation ------------------------------------------
@@ -9148,5 +9161,321 @@ mod tests {
                     .collect::<Vec<_>>()
             ]
         );
+    }
+
+    // --- sweeping the data directory --------------------------------------
+    //
+    // Temp directories and an in-memory store only: nothing here may name
+    // the operator's real data directory.
+
+    /// A data directory in a temp dir, with the working files of a store that
+    /// has seen every way a member ends, all last written two hours ago:
+    ///
+    /// - brigade 1: a live Director and Worker, a Worker dismissed
+    ///   (`dismiss_worker`, as the operator's and the exited-Worker dismissal
+    ///   do) and a Goinkyo dismissed (`dismiss_goinkyo` from `_mcp` ends in the
+    ///   same call);
+    /// - brigade 2: disbanded (`delete_brigade`);
+    /// - brigade 3: left with no member, removed by the janitor;
+    /// - brigade 4: live, with a Goinkyo, and not staged by anything.
+    struct SweepWorld {
+        dir: tempfile::TempDir,
+        data_dir: DataDir,
+        store: RefCell<Store>,
+    }
+
+    const TWO_HOURS: Duration = Duration::from_secs(2 * 3600);
+
+    /// `path` as if it had last been written `age` ago.
+    fn written_ago(path: &Path, age: Duration) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    impl SweepWorld {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = DataDir::new(dir.path().join("banto"));
+            let mut store = Store::open_in_memory().unwrap();
+            let b1 = store.create_brigade("one").unwrap();
+            store
+                .add_brigade_member(
+                    b1,
+                    "director",
+                    BrigadeRole::Director,
+                    Some(&SessionId("director-1".to_string())),
+                )
+                .unwrap();
+            let live = store.add_worker(b1, None).unwrap();
+            let dismissed = store.add_worker(b1, None).unwrap();
+            store
+                .add_brigade_member(b1, "goinkyo", BrigadeRole::Goinkyo, None)
+                .unwrap();
+            let b2 = store.create_brigade("two").unwrap();
+            store
+                .add_brigade_member(
+                    b2,
+                    "director",
+                    BrigadeRole::Director,
+                    Some(&SessionId("director-2".to_string())),
+                )
+                .unwrap();
+            let b3 = store.create_brigade("three").unwrap();
+            store
+                .add_brigade_member(
+                    b3,
+                    "director",
+                    BrigadeRole::Director,
+                    Some(&SessionId("director-3".to_string())),
+                )
+                .unwrap();
+            let b4 = store.create_brigade("four").unwrap();
+            store
+                .add_brigade_member(
+                    b4,
+                    "director",
+                    BrigadeRole::Director,
+                    Some(&SessionId("director-4".to_string())),
+                )
+                .unwrap();
+            store
+                .add_brigade_member(b4, "goinkyo", BrigadeRole::Goinkyo, None)
+                .unwrap();
+            assert_eq!(
+                (b1, live.as_str(), dismissed.as_str()),
+                (1, "worker-1", "worker-2")
+            );
+            assert_eq!((b2, b3, b4), (2, 3, 4));
+            for (brigade, token) in [
+                (1, "director"),
+                (1, "worker-1"),
+                (1, "worker-2"),
+                (1, "goinkyo"),
+                (2, "director"),
+                (3, "director"),
+                (4, "director"),
+                (4, "goinkyo"),
+            ] {
+                written_ago(
+                    &data_dir.member_config_path(brigade, token).unwrap(),
+                    TWO_HOURS,
+                );
+            }
+            for brigade in [1, 2, 3, 4] {
+                written_ago(&data_dir.goinkyo_request_path(brigade).unwrap(), TWO_HOURS);
+            }
+            // Now the members end.
+            assert!(store.dismiss_worker(1, "worker-2").unwrap());
+            assert!(store.dismiss_worker(1, "goinkyo").unwrap());
+            store.delete_brigade(2).unwrap();
+            assert!(store.dismiss_worker(3, "director").unwrap());
+            assert_eq!(store.delete_empty_brigades().unwrap(), 1);
+            Self {
+                dir,
+                data_dir,
+                store: RefCell::new(store),
+            }
+        }
+
+        /// What is left of the working files: a member configuration by its file
+        /// name, a consultation request as `request <file name>`; sorted.
+        fn files(&self) -> Vec<String> {
+            let mut left = Vec::new();
+            for entry in std::fs::read_dir(self.data_dir.mcp_dir()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    left.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+            for entry in std::fs::read_dir(self.data_dir.goinkyo_dir()).unwrap() {
+                left.push(format!(
+                    "request {}",
+                    entry.unwrap().file_name().to_string_lossy()
+                ));
+            }
+            left.sort();
+            left
+        }
+
+        /// What the emporium of a process that resolved `db_path` and this data
+        /// directory does on `Cmd::SweepDataDir`.
+        fn sweep_as(&self, db_path: Option<PathBuf>, data_dir: Option<PathBuf>) -> Vec<Event> {
+            let fixture = SpawnFixture::new(self.dir.path().join("claude"));
+            let resolved = crate::startup::Resolved {
+                config_file: crate::startup::ConfigFile::None,
+                db_path,
+                data_dir,
+                claude_home: None,
+                codex_home: None,
+            };
+            // The fixture's own store is empty; the sweep must read this world's.
+            let deps = Deps {
+                store: &self.store,
+                child: Some(&resolved),
+                ..fixture.deps()
+            };
+            execute_cmd(
+                Cmd::SweepDataDir,
+                &deps,
+                &mut HashMap::new(),
+                &mut Vec::new(),
+            )
+        }
+    }
+
+    const SURVIVORS: [&str; 5] = [
+        "1-director.json",
+        "1-worker-1.json",
+        "4-director.json",
+        "4-goinkyo.json",
+        // Only a brigade that has a Goinkyo keeps its request: the dismissed
+        // Goinkyo's (1), the disbanded (2) and the emptied (3) brigades' are gone.
+        "request 4.txt",
+    ];
+
+    #[test]
+    fn a_sweep_leaves_files_only_for_members_the_store_still_has() {
+        let world = SweepWorld::new();
+        let own = world.data_dir.clone();
+        let events = world.sweep_as(Some(own.db_path()), Some(own.root().to_path_buf()));
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(world.files(), SURVIVORS);
+    }
+
+    #[test]
+    fn a_member_the_emporium_is_not_showing_keeps_its_files() {
+        // Brigade 4 is in the store and on no stage: the store is the truth, not
+        // what this process happens to have open.
+        let world = SweepWorld::new();
+        let own = world.data_dir.clone();
+        world.sweep_as(Some(own.db_path()), Some(own.root().to_path_buf()));
+        assert!(
+            world
+                .data_dir
+                .member_config_path(4, "goinkyo")
+                .unwrap()
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn an_emporium_whose_store_is_not_the_directorys_own_deletes_nothing() {
+        // A test profile (`db_path` elsewhere) shares the data directory with the
+        // everyday banto but not its store: to it, the everyday one's files have
+        // no owner. Every way of not being sure leaves everything where it is.
+        let world = SweepWorld::new();
+        let all = world.files();
+        let own = world.data_dir.clone();
+        let root = Some(own.root().to_path_buf());
+        for (label, db_path, data_dir) in [
+            (
+                "another database",
+                Some(world.dir.path().join("test profile.db")),
+                root.clone(),
+            ),
+            (
+                "the database beside, not in, the directory",
+                Some(own.root().parent().unwrap().join("banto.db")),
+                root.clone(),
+            ),
+            ("no database known", None, root.clone()),
+            ("no data directory known", Some(own.db_path()), None),
+            (
+                "a relative data directory and database",
+                Some(PathBuf::from("banto.db")),
+                Some(PathBuf::new()),
+            ),
+        ] {
+            let events = world.sweep_as(db_path, data_dir);
+            assert!(events.is_empty(), "{label}: {events:?}");
+            assert_eq!(world.files(), all, "{label}");
+        }
+        // With no hand-off at all (only a test has none), nothing either.
+        let fixture = SpawnFixture::new(world.dir.path().join("claude"));
+        let deps = Deps {
+            store: &world.store,
+            child: None,
+            ..fixture.deps()
+        };
+        execute_cmd(
+            Cmd::SweepDataDir,
+            &deps,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(world.files(), all);
+        // And the directory's own database does sweep.
+        world.sweep_as(Some(own.db_path()), root);
+        assert_eq!(world.files(), SURVIVORS);
+    }
+
+    #[test]
+    fn files_written_inside_the_grace_survive_whatever_the_store_says() {
+        // A request is written before its row; a config's name is reused (the
+        // Goinkyo's) by a member about to start. Neither has an owner yet.
+        let world = SweepWorld::new();
+        let own = world.data_dir.clone();
+        let young = Duration::from_secs(60);
+        written_ago(&own.goinkyo_request_path(1).unwrap(), young);
+        written_ago(&own.member_config_path(1, "worker-2").unwrap(), young);
+        world.sweep_as(Some(own.db_path()), Some(own.root().to_path_buf()));
+        let files = world.files();
+        assert!(files.contains(&"request 1.txt".to_string()), "{files:?}");
+        assert!(files.contains(&"1-worker-2.json".to_string()), "{files:?}");
+        // Brigade 2's are still old orphans.
+        assert!(!files.contains(&"2-director.json".to_string()), "{files:?}");
+        assert!(!files.contains(&"request 2.txt".to_string()), "{files:?}");
+    }
+
+    #[test]
+    fn files_banto_did_not_name_are_never_deleted() {
+        let world = SweepWorld::new();
+        let own = world.data_dir.clone();
+        let others = [
+            own.mcp_dir().join("notes.txt"),
+            own.mcp_dir().join("7-evil.json"),
+            own.mcp_dir().join("9-worker-1.json.bak"),
+            own.mcp_dir().join("07-worker-1.json"),
+            own.mcp_dir().join("7-worker-01.json"),
+            own.mcp_dir().join("7-Worker-1.json"),
+            own.mcp_dir().join("8-worker-1.JSON"),
+            own.goinkyo_dir().join("9.json"),
+            own.root().join("banto.db"),
+            own.logs_dir().join("brigade-9.log"),
+        ];
+        for other in &others {
+            written_ago(other, TWO_HOURS);
+        }
+        world.sweep_as(Some(own.db_path()), Some(own.root().to_path_buf()));
+        for kept in &others {
+            assert!(kept.is_file(), "{} was deleted", kept.display());
+        }
+    }
+
+    #[test]
+    fn a_sweep_of_a_data_directory_that_does_not_exist_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = DataDir::new(dir.path().join("never made"));
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        sweep_data_dir_with(&data_dir, &store, std::time::SystemTime::now());
+        assert!(!data_dir.root().exists());
+    }
+
+    #[test]
+    fn a_member_that_cannot_be_given_a_configuration_file_is_not_wired() {
+        // A hand-edited store can hold any token; none gets a file the sweep could
+        // not tell from a stranger's.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = DataDir::new(dir.path().join("banto"));
+        let err = write_mcp_config(&data_dir, 1, "evil", BrigadeRole::Worker, None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evil"), "{err}");
+        assert!(!data_dir.root().exists());
+        let path =
+            write_mcp_config(&data_dir, 1, "worker-3", BrigadeRole::Worker, None, &[]).unwrap();
+        assert_eq!(Some(path), data_dir.member_config_path(1, "worker-3"));
     }
 }

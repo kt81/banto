@@ -34,7 +34,8 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// (e.g. `%LOCALAPPDATA%\banto\banto.db` on Windows,
 /// `~/.local/share/banto/banto.db` on Linux).
 pub fn default_db_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|dir| dir.join("banto").join("banto.db"))
+    crate::data_dir::DataDir::default_root()
+        .map(|root| crate::data_dir::DataDir::new(root).db_path())
 }
 
 /// Errors from the strict [`load`] and [`load_explicit`].

@@ -264,6 +264,15 @@ const STATUS_REMINDER_GAP: Duration = Duration::from_secs(25);
 /// prompt, while a burst of panes cannot turn into an alarm.
 const ATTENTION_BELL_COOLDOWN: Duration = Duration::from_secs(3);
 
+/// How soon after the first tick the data directory is swept for the first time,
+/// and then how often. Purely periodic: the sweep only deletes files that have
+/// been idle for `banto_io::data_dir::GRACE` (half an hour), so nothing a
+/// dismissal just ended is deletable yet and acting on the event would gain
+/// nothing — "eventually" is the whole requirement. Each sweep costs two
+/// directory listings and one store read.
+const DATA_DIR_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(60);
+const DATA_DIR_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// How long a freshly-spawned Codex Worker pane's own output must have been
 /// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
 /// — see that constant's doc for why this exists at all. Measured
@@ -909,6 +918,10 @@ pub struct EmporiumState {
     pub focus: Focus,
     pub status: Option<String>,
     status_set_at: Option<Instant>,
+    /// When `Cmd::SweepDataDir` is next due. `None` until the first tick, which
+    /// starts the clock without sweeping: a sweep is never the first thing a
+    /// freshly started emporium does.
+    sweep_due: Option<Instant>,
     /// Relay state belongs to the store's unread-cursor identity, not to a
     /// display name. Two live brigades both call their leader `director`, and
     /// the first off-stage Director left with unread mail exposed that sharing
@@ -1286,6 +1299,7 @@ impl EmporiumState {
             pending_director_wiring: None,
             pending_dismiss: None,
             pending_dismiss_member: None,
+            sweep_due: None,
             disbanding: HashSet::new(),
             removing_exited: HashSet::new(),
             size: (0, 0),
@@ -2556,6 +2570,14 @@ pub enum Cmd {
     /// a [`PendingCodexTrustFormation`] alongside it. The shell answers with
     /// `Event::CodexTrustChecked`.
     CheckCodexTrust,
+    /// Delete the working files (MCP configs, consultation requests) that no
+    /// member in the store owns and that have sat unwritten for the grace period —
+    /// see `banto_io::data_dir::sweep`. Issued once [`DATA_DIR_FIRST_SWEEP_DELAY`]
+    /// after the first tick and every [`DATA_DIR_SWEEP_INTERVAL`] after that,
+    /// whatever else happens: ending a member does not ask for one. The shell
+    /// answers with nothing; a file it could not delete is a candidate again at
+    /// the next.
+    SweepDataDir,
     /// Open a solo pane running Codex's own trust-review startup (`codex -c
     /// <hook override>`, via `crate::codex_trust::trust_argv` — no cwd, no
     /// resume, no MCP overrides, nothing else) under `key`. Confirming
@@ -6886,6 +6908,15 @@ fn update_tick(
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
 
+    match state.sweep_due {
+        None => state.sweep_due = Some(now + DATA_DIR_FIRST_SWEEP_DELAY),
+        Some(due) if now >= due => {
+            state.sweep_due = Some(now + DATA_DIR_SWEEP_INTERVAL);
+            cmds.push(Cmd::SweepDataDir);
+        }
+        Some(_) => {}
+    }
+
     // First, so the statuses below name each brigade by what this very tick
     // read. A brigade the tick does not list keeps its last facts (a failed
     // gather reads nothing and must not blank every name).
@@ -7516,6 +7547,9 @@ fn update_goinkyo_directory_trust_checked(
 
 #[cfg(test)]
 mod display_name_tests;
+
+#[cfg(test)]
+mod data_dir_sweep_tests;
 
 #[cfg(test)]
 mod member_exit_tests;

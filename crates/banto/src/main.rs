@@ -106,6 +106,12 @@ struct Cli {
     #[arg(long, global = true, hide = true, value_name = "PATH")]
     db_path: Option<PathBuf>,
 
+    /// Internal: banto's data directory as a parent banto resolved it — where
+    /// MCP configs, consultation requests and message logs live. Passed like
+    /// `--db-path`.
+    #[arg(long, global = true, hide = true, value_name = "PATH")]
+    data_dir: Option<PathBuf>,
+
     /// Internal: the config file a parent banto loaded, loaded again the same
     /// way. Passed like `--db-path`.
     #[arg(
@@ -255,6 +261,7 @@ fn main() -> Result<()> {
         cli_claude_home: cli.claude_home.clone(),
         cli_codex_home: cli.codex_home.clone(),
         cli_db_path: cli.db_path.clone(),
+        cli_data_dir: cli.data_dir.clone(),
         parent_config: cli.parent_config.clone(),
         parent_no_config: cli.parent_no_config,
         env: startup::Env::from_process(),
@@ -328,14 +335,11 @@ fn main() -> Result<()> {
             let store = open_store(&resolved)?;
             let claude_home = resolved.claude_home()?;
             let codex_home = resolved.codex_home();
-            // Same base as `embedded::emporium::write_mcp_config`'s
-            // `dirs::data_local_dir()/banto/mcp/`, one level further down: a
-            // consultation request isn't an `--mcp-config` file, so it gets
-            // its own subdirectory rather than sharing that one. The join
-            // itself lives in `mcp::resolve_goinkyo_dir` — see its own doc
-            // for why `embedded::emporium` calls the same function rather
-            // than re-deriving this.
-            let goinkyo_dir = mcp::resolve_goinkyo_dir();
+            // The data directory is the parent's (`--data-dir`), so the consultation
+            // request written here, the member configs and the message log all sit
+            // where the emporium that reads and sweeps them looks.
+            let data_dir = resolved.data_dir();
+            let goinkyo_dir = data_dir.as_ref().map(|dir| dir.goinkyo_dir());
             let identity = mcp::Identity {
                 session,
                 brigade,
@@ -345,7 +349,7 @@ fn main() -> Result<()> {
             // Opt-in; the directory is banto's own, whatever the config says.
             let message_log = mcp::message_log_for(
                 config.brigade.message_log,
-                banto_io::brigade_log::default_dir(),
+                data_dir.as_ref().map(|dir| dir.logs_dir()),
             );
             mcp::run_stdio_server(
                 store,

@@ -10,6 +10,8 @@
 //! - [`codex_home`] the root the Codex CLI stores its state under: threads/logs db, rollout tree
 //! - [`codex_liveness`] Codex session liveness via `logs_2.sqlite` (the Codex-side double-resume guard)
 //! - [`codex_trust`] advisory-only read of whether Codex has trusted banto's own SessionStart hook
+//! - [`data_dir`] banto's own data directory: where the database, MCP configs, consultation
+//!   requests and message logs live, and the sweep of working files nobody owns any more
 //! - [`config`]  loading `banto_core::config`'s types from disk
 //! - [`directory_trust`] advisory-only read of whether Codex/Claude Code has trusted a given cwd
 //! - [`input`] raw terminal events, read and timestamped off their own thread
@@ -31,6 +33,7 @@ pub mod codex_home;
 pub mod codex_liveness;
 pub mod codex_trust;
 pub mod config;
+pub mod data_dir;
 pub mod directory_trust;
 pub mod input;
 pub mod lineage;

@@ -518,7 +518,7 @@ fn consultation_age(ctx: &ServerContext, brigade: BrigadeId, token: &str) -> Str
     let filed = ctx
         .goinkyo_dir
         .as_ref()
-        .map(|dir| goinkyo_request_path(dir, brigade))
+        .and_then(|dir| goinkyo_request_path(dir, brigade))
         .and_then(|path| std::fs::metadata(path).ok())
         .and_then(|meta| meta.modified().ok())
         .map(unix_ms);
@@ -1180,34 +1180,22 @@ fn render_goinkyo_request(request: &GoinkyoRequest) -> String {
     out
 }
 
-/// The base directory every consultation request lives under —
-/// `dirs::data_local_dir()/banto/mcp/goinkyo`. The single place that join is
-/// written: `main.rs` calls this to build [`ServerContext::goinkyo_dir`],
-/// and `embedded::emporium`'s `{request}` briefing substitution calls it
-/// too, rather than each re-deriving the same three-segment join by hand —
-/// a duplicate that would silently drift the day only one of them changed,
-/// and a Goinkyo would read a path that no longer matches what this process
-/// writes to.
-pub(crate) fn resolve_goinkyo_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|dir| dir.join("banto").join("mcp").join("goinkyo"))
-}
-
-/// Where `brigade_id`'s consultation request lives under `dir` — the other
-/// half of the shared join (see [`resolve_goinkyo_dir`]'s own doc for why
-/// it's split out): [`write_goinkyo_request`] writes here, and
-/// `embedded::emporium`'s `{request}` substitution reads the same path back
-/// by calling this directly rather than re-deriving `<brigade_id>.txt`
-/// itself.
-pub(crate) fn goinkyo_request_path(dir: &Path, brigade_id: BrigadeId) -> PathBuf {
-    dir.join(format!("{brigade_id}.txt"))
+/// Where `brigade_id`'s consultation request lives under `dir` (the Goinkyo
+/// directory of the data directory, `DataDir::goinkyo_dir`): [`write_goinkyo_request`]
+/// writes here, and `embedded::emporium`'s `{request}` substitution reads the same
+/// path back, both through `DataDir` rather than each spelling `<brigade_id>.txt`.
+/// `None` for a brigade id the store does not issue: no file is written under a
+/// name the data directory's sweep would not know.
+pub(crate) fn goinkyo_request_path(dir: &Path, brigade_id: BrigadeId) -> Option<PathBuf> {
+    banto_io::data_dir::DataDir::request_path_in(dir, brigade_id)
 }
 
 /// Writes the rendered request to [`goinkyo_request_path`]`(dir, brigade_id)`
 /// and returns that path, creating `dir` if needed.
 ///
 /// Takes `dir` as a parameter rather than resolving it itself — production
-/// always passes [`ServerContext::goinkyo_dir`] (built from
-/// [`resolve_goinkyo_dir`] in `main.rs`), tests pass a tempdir — so this
+/// always passes [`ServerContext::goinkyo_dir`] (built in `main.rs` from the
+/// data directory the parent resolved), tests pass a tempdir — so this
 /// needs no real filesystem stubbing to exercise (same reasoning as
 /// `banto_io::config`'s path-taking `load`/`load_explicit`). Only one
 /// Goinkyo consults at a time (`tool_consult_goinkyo`'s own "already
@@ -1218,8 +1206,13 @@ fn write_goinkyo_request(
     brigade_id: BrigadeId,
     request: &GoinkyoRequest,
 ) -> std::io::Result<PathBuf> {
+    let path = goinkyo_request_path(dir, brigade_id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{brigade_id} is not a brigade id banto issues"),
+        )
+    })?;
     std::fs::create_dir_all(dir)?;
-    let path = goinkyo_request_path(dir, brigade_id);
     std::fs::write(&path, render_goinkyo_request(request))?;
     Ok(path)
 }
@@ -3144,14 +3137,17 @@ mod tests {
         assert_eq!(response["error"]["code"], -32601);
     }
 
-    // --- resolve_goinkyo_dir / goinkyo_request_path: the shared join -------
+    // --- goinkyo_request_path: the shared join ----------------------------------
 
     #[test]
     fn goinkyo_request_path_joins_the_brigade_id_as_a_txt_file() {
         assert_eq!(
             goinkyo_request_path(Path::new("/data/goinkyo"), 42),
-            PathBuf::from("/data/goinkyo").join("42.txt")
+            Some(PathBuf::from("/data/goinkyo").join("42.txt"))
         );
+        // A brigade id the store never issues gets no name at all.
+        assert_eq!(goinkyo_request_path(Path::new("/data/goinkyo"), 0), None);
+        assert_eq!(goinkyo_request_path(Path::new("/data/goinkyo"), -3), None);
     }
 
     #[test]
@@ -3177,7 +3173,7 @@ mod tests {
             alternatives: None,
         };
         let written = write_goinkyo_request(tmp.path(), 13, &request).unwrap();
-        assert_eq!(written, goinkyo_request_path(tmp.path(), 13));
+        assert_eq!(Some(written), goinkyo_request_path(tmp.path(), 13));
     }
 
     fn goinkyo_call(arguments: Value) -> String {
@@ -3375,7 +3371,7 @@ mod tests {
         // The filing time is set explicitly rather than taken from "write it
         // second": both land in the same millisecond often enough that the
         // ordering this test is about would hold only sometimes.
-        let path = goinkyo_request_path(tmp.path(), 1);
+        let path = goinkyo_request_path(tmp.path(), 1).unwrap();
         std::fs::write(&path, "request").unwrap();
         std::fs::OpenOptions::new()
             .write(true)
@@ -3396,7 +3392,7 @@ mod tests {
     fn an_exchange_within_the_current_consultation_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = age_ctx(tmp.path());
-        std::fs::write(goinkyo_request_path(tmp.path(), 1), "request").unwrap();
+        std::fs::write(goinkyo_request_path(tmp.path(), 1).unwrap(), "request").unwrap();
         ctx.store
             .enqueue_brigade_message(1, "goinkyo", BrigadeRole::Director, Some("director"), "new")
             .unwrap();
@@ -3443,7 +3439,7 @@ mod tests {
             "a rejected call must not create a Goinkyo member row, got {members:?}"
         );
         assert!(
-            !goinkyo_request_path(dir, brigade).exists(),
+            !goinkyo_request_path(dir, brigade).unwrap().exists(),
             "a rejected call must not leave a consultation request file"
         );
     }
@@ -3968,7 +3964,7 @@ mod tests {
             headers_without_time(&text),
             ["@@@ consultation-request from=director to=goinkyo"]
         );
-        let filed = std::fs::read_to_string(goinkyo_request_path(&requests, 1)).unwrap();
+        let filed = std::fs::read_to_string(goinkyo_request_path(&requests, 1).unwrap()).unwrap();
         assert!(text.ends_with(&format!("\n{filed}\n\n")), "{text}");
         assert!(
             text.lines()
@@ -4014,7 +4010,9 @@ mod tests {
             "{response}"
         );
         assert!(
-            goinkyo_request_path(&tmp.path().join("requests"), 1).exists(),
+            goinkyo_request_path(&tmp.path().join("requests"), 1)
+                .unwrap()
+                .exists(),
             "the request file was written before registration failed"
         );
         assert!(!logs.exists(), "but no log entry, and no log directory");

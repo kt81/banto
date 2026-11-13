@@ -4,8 +4,8 @@
 //! reads it back, rotates it or deletes it.
 //!
 //! One file per brigade, `brigade-<id>.log` under a directory the caller names
-//! (in production [`default_dir`], inside banto's own data directory — the
-//! location is deliberately not configurable, so the log can never be pointed
+//! (in production `DataDir::logs_dir` — inside banto's own data directory, the
+//! location deliberately not configurable, so the log can never be pointed
 //! outside it). Written by the `banto _mcp` processes, one per agent, which
 //! share the file. Each entry is handed to the OS whole, in one `write` on an
 //! append-only handle; entries could interleave only if the OS accepted that
@@ -31,11 +31,6 @@ use banto_core::model::{BrigadeId, BrigadeRole};
 /// text at a glance. A body may still contain a line that starts with it —
 /// `bytes=` in the header is what tells a reader where the body ends.
 pub const ENTRY_MARKER: &str = "@@@";
-
-/// `<data_local>/banto/logs` — the directory the log lives in.
-pub fn default_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|dir| dir.join("banto").join("logs"))
-}
 
 /// A member as the header names it: its token (the address), and its display
 /// name when it has one and the caller had it to hand.

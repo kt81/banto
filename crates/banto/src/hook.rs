@@ -335,6 +335,7 @@ mod tests {
             db_path,
             claude_home: None,
             codex_home: None,
+            data_dir: None,
         }
     }
 

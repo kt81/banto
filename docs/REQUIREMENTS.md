@@ -325,6 +325,7 @@ crates/
 │  ├─ store/            # rusqlite: groups/pins/archived, brigades, session<->pane map
 │  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
 │  ├─ watch/            # filesystem watching (notify) for live TUI updates
+│  ├─ data_dir.rs       # banto's own data directory: where each working file lives, and the sweep of ended members' files
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
@@ -782,8 +783,9 @@ dismissal a Worker's pane has. Both end in the same store operation
 next tick finding the row gone, while the operator's path also unstages the
 pane at once and forgets what the core kept for the token — the tick's later
 `NoGoinkyo` still releases the one-shot spawn guard and asks to kill a pane that
-is already gone (a no-op). Neither removes the consultation's request file; the
-next consultation overwrites it.
+is already gone (a no-op). Neither removes the consultation's request file at
+once; the data directory sweep does (see "Working files of ended members"
+below), and the next consultation overwrites it in the meantime.
 
 That dialog decides in two separate stages, not one, both role-based now:
 *whether the confirm dismisses* anything reads the focused pane's member token
@@ -1064,9 +1066,12 @@ pointing at `banto _mcp --brigade <id> --member <token> --role <role>
 JSON-RPC 2.0 to it (newline-delimited, no Content-Length framing — requests
 carry an `id` and get a response, notifications don't). Because banto controls
 the launch argv, the config file lives under banto's own data directory
-(`dirs::data_local_dir()/banto/mcp/<brigade_id>-<token>.json`) and is never
+(`<data dir>/mcp/<brigade_id>-<token>.json`, the data directory being
+`dirs::data_local_dir()/banto` unless handed down — below) and is never
 installed into Claude Code's own configuration (`crates/banto/src/mcp.rs`
 module doc; `crates/banto/src/embedded/emporium.rs`'s `write_mcp_config`).
+Every path under the data directory is named in one place,
+`crates/banto-io/src/data_dir.rs` (`DataDir`); nothing else joins one.
 
 **Child processes find the parent's files.** banto starts other banto processes
 — `_mcp` (Claude: the MCP config file; Codex: the `-c mcp_servers.banto.args`
@@ -1083,20 +1088,26 @@ any path when the working directory cannot be read, is left as given — except
 that an empty `db_path` is a startup error for every command that opens the store,
 naming the key and the config file, rather than a silently non-persistent session;
 `_hook` then runs as it does with no store: no briefing, nothing recorded) and
-hands the result on. `_mcp` and `_wrap` take it as hidden global flags straight after the
+hands the result on. The data directory is resolved the same way, once, and is
+what the default database (`<data dir>/banto.db`) hangs off, so a database named
+elsewhere does not move it. `_mcp` and `_wrap` take it as hidden global flags straight after the
 subcommand name: `--parent-config <file>` (the file the parent loaded, loaded the
-same way) or `--parent-no-config` (it loaded none), `--db-path`, `--claude-home`
-and, when it has one, `--codex-home` — each path absolute and a single argument
+same way) or `--parent-no-config` (it loaded none), `--db-path`, `--data-dir`,
+`--claude-home` and, when it has one, `--codex-home` — each path absolute and a single argument
 (spaces and backslashes survive the MCP JSON, the Codex TOML array and the split
 backends' argv like the executable's own path does). A child given them uses
 exactly those and does not look at its own environment or working directory for
 them — and a child that carries the hand-off but no `--codex-home` has none,
-because the parent had none. `--config` is refused next to the hand-off flags.
+because the parent had none; the same goes for `--data-dir`: a parent with no data
+directory passes none, and its child has none rather than finding one of its own
+(`consult_goinkyo` then says so, and no message log is written). `--config` is
+refused next to the hand-off flags.
 `_hook` cannot: Codex trusts the hook by a hash of its literal command
 string, and that string cannot be quoted, so it carries no argument, and the
 values travel as environment variables on the member's launch, beside its
 identity — `BANTO_PARENT_CONFIG` (or `BANTO_PARENT_NO_CONFIG`) and
-`BANTO_PARENT_DB` (the hook reads no agent home). A hook without them (one an
+`BANTO_PARENT_DB` (the hook reads no agent home and no file under the data
+directory, so it is not told one). A hook without them (one an
 older banto launched) resolves for itself, as does a child started by hand or from
 an MCP config written by an older banto. Only banto's own variables are set;
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched — where an agent
@@ -1105,11 +1116,77 @@ the server it was launched with; the next time its pane is opened (re-staging th
 brigade, a relaunch, a new member) the MCP config file is rewritten and the
 launch argv rebuilt with the hand-off.
 
+**Working files of ended members.** The data directory holds two kinds of
+file per member that nothing used to delete: the MCP config
+(`mcp/<brigade_id>-<token>.json`, rewritten by the emporium every time it opens
+the member) and, for a Goinkyo, the consultation request
+(`mcp/goinkyo/<brigade_id>.txt`, written by the `_mcp` process before the member's
+row exists). The **emporium** sweeps them, and only the emporium — the `_mcp`
+processes write files but never delete one, and the chōba starts no members.
+Immediacy is not a goal: a file is removed some time after its member ended.
+
+*What is deleted.* A file, and only a file, for which all of these hold:
+
+1. its name is exactly one banto writes, for a token banto issues:
+   `<id>-director.json`, `<id>-goinkyo.json` or `<id>-worker-<n>.json` in `mcp/`
+   (`<id>` a decimal brigade id from 1 and `<n>` a Worker number from 1, neither
+   with a leading zero), or `<id>.txt` in `mcp/goinkyo/`. The one function family
+   that writes these names is the parser's only grammar, and a token outside that
+   set gets no file at all (a Claude member with such a token fails to spawn;
+   a Codex member has no config file and is unaffected). Everything else —
+   `7-evil.json`, `07-worker-1.json`, `7-worker-01.json`, `7-Worker-1.json`,
+   `7-worker-1.JSON`, the message logs, the database — is never a candidate;
+2. `mcp/` and `mcp/goinkyo/` are real directories: if either is a symbolic link,
+   junction or other reparse point it is skipped whole, and a candidate that is
+   itself a link or a directory is skipped;
+3. the store has no member that owns it: for a config, no member row with that
+   brigade and token; for a request, no member row `goinkyo` in that brigade. Only
+   the bare `(brigade, token)` of every row is compared, whatever the row's role or
+   agent say, and a row that cannot be read at all stops the sweep;
+4. the file was last written at least thirty minutes ago, read just before the
+   deletion (an unreadable time, or one in the future, is "not old").
+
+*What decides to sweep.* Only a data directory whose own database this process
+has open: the resolved database path must equal `<data dir>/banto.db` (compared
+as written after both were made absolute; an unknown or relative one, or any
+other database — a test profile, a `db_path` in the config — means no sweep).
+The store is the whole of the authority, so an instance with another store never
+deletes anything, however it shares the directory. This is checked at the edge,
+where the emporium runs the command (`Resolved::sweepable_data_dir`).
+
+*When.* Sixty seconds after the emporium's first tick and every ten minutes
+after that, and at no other time: ending a member or disbanding a brigade does not
+ask for a sweep, since what it just ended is younger than the grace and could not
+be deleted. The directories are listed **before** the store is read, then each
+candidate's age is read, then it is deleted. A file that cannot be deleted (in
+use, no permission, already gone) is counted and tried again next time, never an
+error, and a store that cannot be read deletes nothing.
+
+*Why that is enough.* A consultation request exists before its Goinkyo's row, and
+a Goinkyo's file names are fixed (`7-goinkyo.json`, `7.txt`) and so reused by the
+next consultation: the store alone cannot tell a request about to be adopted, or
+a name about to be reused, from a leftover. The age test can, because banto
+rewrites a member's config every time it opens the member and writes a request
+when it is filed — a file about to be used is minutes old, not half an hour. A
+config written while the store is being read is not in the listing at all.
+
+*What this does not guard against.* A wall clock that jumps forward by more than
+thirty minutes, or a file restored with an old modification time (either looks
+old); a process suspended for more than thirty minutes between writing a request
+and registering its Goinkyo; the moment between the last look at a file and its
+deletion (there is no "delete only if unchanged"); a data directory whose root is
+itself a link, which is taken as the operator's choice; and another banto with a
+different database writing the same file names in the same directory (nothing
+stops two stores from both using `1-director.json`; only the sweep is safe from
+it). It is also assumed, not measured, that a running Claude has read its config
+at launch and does not need the file again. The logs and the database are never
+deleted.
+
 **Message log (`[brigade] message_log = true`, off by default).** For someone
 developing banto who wants to audit what the agents told each other. Every
 message `send_to_peer` accepts, and every `consult_goinkyo` request (as the text
 the Goinkyo reads), is appended in full to
-`dirs::data_local_dir()/banto/logs/brigade-<brigade_id>.log`, written by the
+`<data dir>/logs/brigade-<brigade_id>.log`, written by the
 `banto _mcp` process that handled the call (`crates/banto-io/src/brigade_log.rs`).
 The location is not configurable, so the file is always inside banto's own data
 directory. An entry is a header line starting with `@@@` — UTC time, `message

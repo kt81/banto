@@ -36,7 +36,7 @@ impl Machine {
         Env {
             home: Some(self.path("home")),
             default_config: Some(self.path("platform/config.toml")),
-            default_db: Some(self.path("platform/banto.db")),
+            data_dir: Some(self.path("platform")),
             ..Env::default()
         }
     }
@@ -180,7 +180,10 @@ fn what_a_parent_handed_over_beats_the_search_and_the_environment() {
     let (config, r) = resolve(&inputs, Strictness::Strict).unwrap();
     assert_eq!(r.config_file, ConfigFile::None);
     assert_eq!(config, Config::default());
-    assert_eq!(r.db_path, Some(m.path("platform/banto.db")));
+    // A parent passes the database and the data directory it has; one handed over
+    // without them had none, so this child finds none for itself.
+    assert_eq!(r.db_path, None);
+    assert_eq!(r.data_dir, None);
 }
 
 #[test]
@@ -248,6 +251,7 @@ fn through_the_command_line(r: &Resolved, cwd: &Path, subcommand: &str) -> Resol
         cli_claude_home: cli.claude_home,
         cli_codex_home: cli.codex_home,
         cli_db_path: cli.db_path,
+        cli_data_dir: cli.data_dir,
         parent_config: cli.parent_config,
         parent_no_config: cli.parent_no_config,
         env: m.env(),
@@ -271,6 +275,7 @@ fn child_args_survive_the_command_line_for_paths_with_spaces_backslashes_and_quo
             db_path: Some(PathBuf::from(format!("{tricky}.db"))),
             claude_home: Some(PathBuf::from(format!("{tricky}-claude"))),
             codex_home: Some(PathBuf::from(format!("{tricky}-codex"))),
+            data_dir: Some(PathBuf::from(format!("{tricky}-data"))),
         };
         let args = r.child_args();
         assert!(args.contains(&tricky.to_string()), "{args:?}");
@@ -292,6 +297,7 @@ fn child_args_and_env_say_the_same_two_things_about_the_config_and_the_database(
         db_path: Some(PathBuf::from("/d/banto.db")),
         claude_home: Some(PathBuf::from("/h/claude")),
         codex_home: None,
+        data_dir: None,
     };
     assert_eq!(
         with_file.child_args(),
@@ -317,6 +323,7 @@ fn child_args_and_env_say_the_same_two_things_about_the_config_and_the_database(
         db_path: None,
         claude_home: None,
         codex_home: None,
+        data_dir: None,
     };
     assert_eq!(without.child_args(), ["--parent-no-config"]);
     assert_eq!(
@@ -333,6 +340,7 @@ fn the_hand_off_never_touches_an_agents_own_variables() {
         db_path: Some(PathBuf::from("/d.db")),
         claude_home: Some(PathBuf::from("/h/claude")),
         codex_home: Some(PathBuf::from("/h/codex")),
+        data_dir: None,
     };
     for (name, _) in r.child_env() {
         assert!(name.starts_with("BANTO_"), "{name}");
@@ -486,6 +494,7 @@ fn a_parent_without_a_codex_home_hands_its_child_none_end_to_end() {
         db_path: Some(m.path("d.db")),
         claude_home: Some(m.path("claude")),
         codex_home: None,
+        data_dir: Some(m.path("data")),
     };
     assert!(!parent.child_args().iter().any(|arg| arg == "--codex-home"));
     // The child's environment would give it one; it does not take it.
@@ -499,6 +508,7 @@ fn a_parent_without_a_codex_home_hands_its_child_none_end_to_end() {
         cli_claude_home: cli.claude_home,
         cli_codex_home: cli.codex_home,
         cli_db_path: cli.db_path,
+        cli_data_dir: cli.data_dir,
         parent_config: cli.parent_config,
         parent_no_config: cli.parent_no_config,
         env,
@@ -517,7 +527,7 @@ fn a_parent_that_starts_children_always_has_a_claude_home_and_a_database() {
     let m = Machine::new();
     let mut inputs = m.inputs();
     inputs.env.home = None;
-    inputs.env.default_db = None;
+    inputs.env.data_dir = None;
     let r = resolved(&inputs);
     assert!(r.claude_home().is_err());
     assert!(r.db_path().is_err());
@@ -531,7 +541,7 @@ fn the_platform_defaults_and_the_home_derived_ones_are_made_absolute_too() {
     m.write("cwd/plat/config.toml", "db_path = \"from-platform.db\"\n");
     let mut inputs = m.inputs();
     inputs.env.default_config = Some(PathBuf::from("plat/config.toml"));
-    inputs.env.default_db = Some(PathBuf::from("plat/banto.db"));
+    inputs.env.data_dir = Some(PathBuf::from("plat"));
     inputs.env.home = Some(PathBuf::from("rel home"));
     let r = resolved(&inputs);
     // The relative platform config location is the file that was found and read.
@@ -590,6 +600,7 @@ fn a_childs_arguments_never_carry_the_parents_own_config_flag() {
             db_path: Some(PathBuf::from("/d.db")),
             claude_home: Some(PathBuf::from("/h")),
             codex_home: Some(PathBuf::from("/x")),
+            data_dir: None,
         };
         assert!(!r.child_args().iter().any(|arg| arg == "--config"));
     }
@@ -693,4 +704,129 @@ fn a_valid_relative_or_absolute_db_path_is_unaffected() {
         resolved(&m.inputs()).db_path().unwrap(),
         m.path("platform/banto.db")
     );
+}
+
+// --- the data directory -----------------------------------------------------------
+
+#[test]
+fn the_data_directory_is_resolved_once_made_absolute_and_the_default_database_hangs_off_it() {
+    let m = Machine::new();
+    let mut inputs = m.inputs();
+    inputs.env.data_dir = Some(PathBuf::from("rel data"));
+    let r = resolved(&inputs);
+    assert_eq!(r.data_dir, Some(m.path("cwd/rel data")));
+    // The default database is `<data dir>/banto.db`: one source, not a second
+    // platform lookup.
+    assert_eq!(r.db_path, Some(m.path("cwd/rel data/banto.db")));
+    // A database named elsewhere does not move the data directory.
+    inputs.cli_db_path = Some(m.path("elsewhere/x.db"));
+    let r = resolved(&inputs);
+    assert_eq!(r.data_dir, Some(m.path("cwd/rel data")));
+    assert_eq!(r.db_path, Some(m.path("elsewhere/x.db")));
+    // The handed-over one wins over the child's own environment.
+    inputs.cli_data_dir = Some(m.path("parents data"));
+    assert_eq!(resolved(&inputs).data_dir, Some(m.path("parents data")));
+}
+
+#[test]
+fn a_handed_child_without_a_data_directory_has_none_whatever_its_own_environment_says() {
+    let m = Machine::new();
+    // Handed over either way: a config file, or "no config".
+    for (parent_config, parent_no_config) in [(Some(m.path("parent.toml")), false), (None, true)] {
+        let mut inputs = m.inputs();
+        inputs.parent_config = parent_config;
+        inputs.parent_no_config = parent_no_config;
+        let r = resolved(&inputs);
+        assert_eq!(r.data_dir, None);
+        assert_eq!(r.data_dir(), None);
+        assert_eq!(r.sweepable_data_dir(), None);
+        // Given one, it uses it: the hand-off wins, as for every other location.
+        inputs.cli_data_dir = Some(m.path("parents data"));
+        assert_eq!(resolved(&inputs).data_dir, Some(m.path("parents data")));
+    }
+}
+
+#[test]
+fn only_a_data_directory_whose_own_database_is_open_is_swept() {
+    let m = Machine::new();
+    let resolved_with = |db: Option<PathBuf>, dir: Option<PathBuf>| Resolved {
+        config_file: ConfigFile::None,
+        db_path: db,
+        data_dir: dir,
+        claude_home: None,
+        codex_home: None,
+    };
+    let dir = m.path("data");
+    let own = DataDir::new(dir.clone());
+    // Its own database: swept.
+    assert_eq!(
+        resolved_with(Some(own.db_path()), Some(dir.clone())).sweepable_data_dir(),
+        Some(own.clone())
+    );
+    // Any other database, in or out of the directory: not.
+    for db in [
+        m.path("data/other.db"),
+        m.path("other/banto.db"),
+        m.path("banto.db"),
+        m.path("data/sub/banto.db"),
+        PathBuf::from("banto.db"),
+        PathBuf::new(),
+    ] {
+        assert_eq!(
+            resolved_with(Some(db.clone()), Some(dir.clone())).sweepable_data_dir(),
+            None,
+            "{}",
+            db.display()
+        );
+    }
+    // Either location unknown: not.
+    assert_eq!(
+        resolved_with(None, Some(dir.clone())).sweepable_data_dir(),
+        None
+    );
+    assert_eq!(
+        resolved_with(Some(own.db_path()), None).sweepable_data_dir(),
+        None
+    );
+    // And it is what resolution produces for the default: the database named by
+    // `db_path` in a config moves out of the directory and stops being swept.
+    let mut inputs = m.inputs();
+    assert!(resolved(&inputs).sweepable_data_dir().is_some());
+    inputs.cli_db_path = Some(m.path("test profile.db"));
+    assert_eq!(resolved(&inputs).sweepable_data_dir(), None);
+}
+
+#[test]
+fn a_child_without_the_hand_off_finds_its_own_data_directory_as_before() {
+    let m = Machine::new();
+    assert_eq!(resolved(&m.inputs()).data_dir, Some(m.path("platform")));
+    let mut none = m.inputs();
+    none.env.data_dir = None;
+    assert_eq!(resolved(&none).data_dir, None);
+}
+
+#[test]
+fn the_data_directory_is_an_argument_for_mcp_and_wrap_and_not_handed_to_the_hook() {
+    let r = Resolved {
+        config_file: ConfigFile::None,
+        db_path: Some(PathBuf::from("/d/banto.db")),
+        data_dir: Some(PathBuf::from("/my data/banto")),
+        claude_home: None,
+        codex_home: None,
+    };
+    let args = r.child_args();
+    let at = args.iter().position(|arg| arg == "--data-dir").unwrap();
+    assert_eq!(args[at + 1], "/my data/banto");
+    // The hook opens the database (its own variable) and reads nothing else of
+    // banto's directory, so no variable names the data directory.
+    assert!(
+        r.child_env()
+            .iter()
+            .all(|(_, value)| !value.contains("/my data")),
+        "{:?}",
+        r.child_env()
+    );
+    // The flag is hidden but real.
+    let cli = Cli::try_parse_from(["banto", "_mcp", "--data-dir", "/my data/banto"]).unwrap();
+    assert_eq!(cli.data_dir, Some(PathBuf::from("/my data/banto")));
 }

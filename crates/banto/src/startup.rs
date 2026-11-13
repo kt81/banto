@@ -28,6 +28,7 @@ use banto_core::config::Config;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::config as io_config;
+use banto_io::data_dir::DataDir;
 
 /// The environment a resolution reads, as plain values — never the process
 /// environment itself, so a test names exactly what it depends on.
@@ -45,8 +46,10 @@ pub struct Env {
     pub codex_home: Option<String>,
     /// The platform's `config.toml` location, the last tier of the search.
     pub default_config: Option<PathBuf>,
-    /// The platform's default database location.
-    pub default_db: Option<PathBuf>,
+    /// The platform's data directory for banto (`<data_local>/banto`): where the
+    /// database lives by default, and where banto keeps its MCP configs,
+    /// consultation requests and message logs whatever the database path is.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Env {
@@ -59,7 +62,7 @@ impl Env {
             claude_config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
             codex_home: std::env::var("CODEX_HOME").ok(),
             default_config: io_config::default_config_path(),
-            default_db: io_config::default_db_path(),
+            data_dir: DataDir::default_root(),
         }
     }
 
@@ -93,6 +96,8 @@ pub struct Inputs {
     pub cli_codex_home: Option<PathBuf>,
     /// `--db-path` (hidden: only a parent banto passes it).
     pub cli_db_path: Option<PathBuf>,
+    /// `--data-dir` (hidden): the data directory the parent resolved.
+    pub cli_data_dir: Option<PathBuf>,
     /// `--parent-config` (hidden): the config file the parent loaded.
     pub parent_config: Option<PathBuf>,
     /// `--parent-no-config` (hidden): the parent loaded no config file.
@@ -120,6 +125,11 @@ pub struct Resolved {
     pub config_file: ConfigFile,
     /// `None` only when no database location can be determined at all.
     pub db_path: Option<PathBuf>,
+    /// banto's own data directory: the one place every working file banto keeps
+    /// outside the database is derived from (see [`DataDir`]). `None` when the
+    /// platform has none — or when this is a child handed over without one,
+    /// because its parent had none.
+    pub data_dir: Option<PathBuf>,
     /// `None` only when no Claude home can be determined at all.
     pub claude_home: Option<PathBuf>,
     /// `None` when no Codex home can be determined: then there are no Codex
@@ -137,6 +147,23 @@ impl Resolved {
 
     pub fn codex_home(&self) -> Option<CodexHome> {
         self.codex_home.clone().map(CodexHome::new)
+    }
+
+    /// The data directory, from which the MCP configs, the consultation requests
+    /// and the message logs are all derived.
+    pub fn data_dir(&self) -> Option<DataDir> {
+        self.data_dir.clone().map(DataDir::new)
+    }
+
+    /// The data directory this process may sweep: its own, and only if the
+    /// database this process opens *is* that directory's database. A banto
+    /// pointed at another database (`db_path` in a config, a test profile) shares
+    /// the data directory with the everyday one but not its store, and the store
+    /// is the sweep's whole authority — it would call the other one's live files
+    /// ownerless. `None` when either location is unknown or not absolute.
+    pub fn sweepable_data_dir(&self) -> Option<DataDir> {
+        let dir = self.data_dir()?;
+        dir.is_database(self.db_path.as_deref()?).then_some(dir)
     }
 
     /// The database to open. An empty path is an error here, before anything is
@@ -174,8 +201,12 @@ impl Resolved {
     /// The command-line flags that make a `banto` child resolve what this
     /// process did. Global flags, so they go anywhere after the subcommand name;
     /// every path is absolute and one argument, spaces and backslashes
-    /// included. Only what this process actually resolved is passed: a location
-    /// it could not determine is left for the child to try for itself.
+    /// included. Only what this process actually resolved is passed. A location
+    /// it could not determine is not passed, and the child — handed over by the
+    /// very flags this returns — does not look for the data directory or the Codex
+    /// home itself. It still falls back to its own search for the Claude home, and
+    /// takes a `db_path` from the config the parent loaded; a parent that starts a
+    /// child has resolved both, so that fallback is only for a child run by hand.
     pub fn child_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         match &self.config_file {
@@ -187,6 +218,7 @@ impl Resolved {
         }
         for (flag, path) in [
             ("--db-path", &self.db_path),
+            ("--data-dir", &self.data_dir),
             ("--claude-home", &self.claude_home),
             ("--codex-home", &self.codex_home),
         ] {
@@ -202,7 +234,9 @@ impl Resolved {
     /// command line is hashed by Codex to decide whether to trust it, so it
     /// cannot carry them (and cannot be quoted, so a path in it would break on a
     /// space), but it inherits the environment of the agent that runs it. Only
-    /// the config file and the database: the hook reads no agent home.
+    /// the config file and the database: the hook reads no agent home and nothing
+    /// in the data directory (it opens the database, which has its own variable),
+    /// so the data directory is not handed to it.
     pub fn child_env(&self) -> Vec<(String, String)> {
         let mut env = Vec::new();
         match &self.config_file {
@@ -266,18 +300,21 @@ pub fn resolve(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Resol
     // parent had none of its own (it could determine no Codex home), the child
     // has none either, rather than finding one the parent did not have.
     let handed_over = inputs.parent_config.is_some() || inputs.parent_no_config;
+    // The same rule as the Codex home: a handed child without `--data-dir` has
+    // none, because its parent had none and passes every directory it has.
+    let data_dir = inputs
+        .cli_data_dir
+        .as_deref()
+        .or((!handed_over)
+            .then_some(inputs.env.data_dir.as_deref())
+            .flatten())
+        .map(|path| absolute(path, cwd));
     let db_path = inputs
         .cli_db_path
         .as_deref()
         .or(config.db_path.as_deref())
         .map(|path| absolute(path, cwd))
-        .or_else(|| {
-            inputs
-                .env
-                .default_db
-                .as_deref()
-                .map(|path| absolute(path, cwd))
-        });
+        .or_else(|| data_dir.clone().map(|dir| DataDir::new(dir).db_path()));
     let claude_home = inputs
         .cli_claude_home
         .as_deref()
@@ -301,6 +338,7 @@ pub fn resolve(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Resol
         Resolved {
             config_file,
             db_path,
+            data_dir,
             claude_home,
             codex_home,
         },

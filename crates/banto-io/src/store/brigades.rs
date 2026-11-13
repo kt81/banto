@@ -326,6 +326,20 @@ impl Store {
         Ok(removed)
     }
 
+    /// Every member row of every brigade as the bare pair `(brigade, token)`, in
+    /// one read. What the data directory's sweep (`crate::data_dir::sweep`) asks
+    /// before it deletes a working file, so it must not know *less* than the store
+    /// does: a row is listed whatever its role or agent say, and a row that cannot
+    /// be read at all fails the whole read (nothing is then deleted) instead of
+    /// being left out — which would make its member's files look ownerless.
+    pub fn all_member_tokens(&self) -> Result<Vec<(BrigadeId, MemberToken)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT brigade_id, member_token FROM brigade_members")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Returns a brigade's members: the Director first, then every other role
     /// ordered by token. This puts `goinkyo` before `worker-1`, and Worker
     /// tokens sort as text (`worker-10` before `worker-2`: a brigade's Worker
@@ -1161,6 +1175,40 @@ mod tests {
             Some(_) => store.name_member(br, token, name).unwrap(),
             None => MemberNaming::NoSuchMember,
         }
+    }
+
+    #[test]
+    fn every_member_row_is_listed_whatever_its_role_says() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("d")))
+            .unwrap();
+        let worker = store.add_worker(br, None).unwrap();
+        // A row another banto (or a hand edit) wrote with a role this one does not
+        // know: the roster readers cannot make sense of it, the sweep's read must
+        // still count it.
+        store
+            .conn
+            .execute(
+                "INSERT INTO brigade_members (brigade_id, member_token, role) VALUES (?1, ?2, ?3)",
+                params![br, "worker-77", "a role from the future"],
+            )
+            .unwrap();
+        assert!(store.brigade_members(br).is_err());
+        let mut listed = store.all_member_tokens().unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                (br, "director".to_string()),
+                (br, worker),
+                (br, "worker-77".to_string())
+            ]
+        );
+        // Once a member is gone, so is its pair.
+        assert!(store.dismiss_worker(br, "worker-77").unwrap());
+        assert_eq!(store.all_member_tokens().unwrap().len(), 2);
     }
 
     #[test]
