@@ -522,7 +522,7 @@ pub struct Config {
     pub claude_home: Option<PathBuf>,
     /// Overrides the provider's default `~/.codex` location (read-only!).
     pub codex_home: Option<PathBuf>,
-    /// Overrides `banto_io::config::default_db_path`.
+    /// Overrides `banto.db` in `banto_io::data_dir::DataDir::default_root`.
     pub db_path: Option<PathBuf>,
 }
 

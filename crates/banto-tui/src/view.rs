@@ -33,26 +33,26 @@
 //!
 //! # Row layout
 //!
-//! One algorithm, driven by the render area's width and whether grouped
-//! view is actually in effect (`App::grouped_view_in_effect`):
-//! `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label][gap>=2][age]`.
+//! A row is two lines (`banto_core::app::ROW_LINES`, which the list's scroll
+//! and click math counts in), driven by the render area's width and whether
+//! grouped view is actually in effect (`App::grouped_view_in_effect`). Line
+//! one is `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`;
+//! line two is the cwd and the agent label, indented to align under the
+//! title rather than starting at column zero — see [`cwd_agent_line`]. Two
+//! lines because the sidebar's width holds the markers and a title but rarely
+//! a cwd beside them.
+//!
 //! The pin slot exists (3 columns) only in flat view — in grouped view
 //! every pinned row's section is "Pinned" (`App::section_name` gives it
 //! top priority), so a pin marker could never render there anyway; the
 //! column is dropped entirely rather than reserved-but-always-blank. The
-//! role slot is unconditional, in flat and grouped view alike. A present marker slot is the
-//! emoji plus one trailing separator space — a glued-together `📌🤝title`
-//! reads as one sticker, not two markers. See [`row_line`] for the exact
+//! role slot is unconditional, in flat and grouped view alike. A present
+//! marker slot is the emoji plus one trailing separator space — a
+//! glued-together `📌🤝title` reads as one sticker, not two markers. See [`row_line`] for the exact
 //! budget arithmetic (title/cwd mutually exclusive truncation, age always
 //! flush at the right edge, saturating throughout with an explicit
 //! narrow-width degradation that drops the age column entirely rather than
 //! ever let it collide into the prefix).
-//!
-//! A row is one line (`App::lines_per_row` 1, its default — the label sits on
-//! that same line, per the formula above) or two (more than 1; the emporium
-//! sidebar uses 2): line one is the formula above minus the label, line two is cwd
-//! plus the label, indented to align under the title rather than starting
-//! at column zero — see [`cwd_agent_line`].
 
 use std::time::SystemTime;
 
@@ -93,10 +93,6 @@ fn fixed_prefix_width(show_pin_slot: bool) -> usize {
 }
 const MIN_GAP_BEFORE_AGE: usize = 2;
 const TITLE_CWD_GAP: usize = 2;
-/// Gap between the title/cwd content and the agent label, when both share
-/// one physical line (`App::lines_per_row` 1; the emporium sidebar puts the label
-/// on its own second line instead, via [`cwd_agent_line`]).
-const LABEL_GAP: usize = 2;
 /// cwd is only shown if at least this many columns remain for it once the
 /// title (at its natural, untruncated width) and the title-cwd gap are
 /// accounted for.
@@ -137,11 +133,10 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
     // See the module doc's "Row layout" section for why the pin slot is
     // conditional on this.
     let show_pin_slot = !app.grouped_view_in_effect();
-    let lines_per_row = app.lines_per_row();
     let items: Vec<ListItem> = app
         .visible()
         .into_iter()
-        .map(|line| list_item(line, area.width, now, show_pin_slot, lines_per_row))
+        .map(|line| list_item(line, area.width, now, show_pin_slot))
         .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
@@ -153,35 +148,21 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
 /// view only), or a row. Each is its own `ListItem`/physical-line-group
 /// rather than a header bundled into its row, matching the index space
 /// `App::click`/`App::scroll`/`App::ensure_visible` all use — see
-/// [`ListLine`] for why that matters for mouse clicks. A row is one line
-/// when `lines_per_row` is 1 (the agent label sharing that line — see
-/// [`row_line`]), or two when it's more (the emporium sidebar:
-/// title/age, then cwd/agent — see [`cwd_agent_line`]); a header is always
-/// one line regardless, matching `App::lines_per_row`'s own accounting.
+/// [`ListLine`] for why that matters for mouse clicks. A row is
+/// `banto_core::app::ROW_LINES` lines — title/age, then cwd/agent (see
+/// [`cwd_agent_line`]); a header is one, matching `App`'s own accounting.
 fn list_item(
     line: ListLine<'_>,
     area_width: u16,
     now: SystemTime,
     show_pin_slot: bool,
-    lines_per_row: usize,
 ) -> ListItem<'static> {
     match line {
         ListLine::Header { name, count } => header_line(&name, count),
         ListLine::Row(visible) => {
-            if lines_per_row > 1 {
-                let top = row_line(&visible, area_width, now, show_pin_slot, None);
-                let bottom = cwd_agent_line(visible.row, area_width, show_pin_slot);
-                ListItem::new(vec![top, bottom])
-            } else {
-                let label = agent_label(visible.row);
-                ListItem::new(row_line(
-                    &visible,
-                    area_width,
-                    now,
-                    show_pin_slot,
-                    Some(&label),
-                ))
-            }
+            let top = row_line(&visible, area_width, now, show_pin_slot);
+            let bottom = cwd_agent_line(visible.row, area_width, show_pin_slot);
+            ListItem::new(vec![top, bottom])
         }
     }
 }
@@ -215,12 +196,11 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
     )))
 }
 
-/// Build one row's first (and, at `lines_per_row` 1, only) physical line:
-/// `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label?][gap>=2][age]`
-/// — see the module doc's "Row layout" section for why the pin slot is
-/// conditional on `show_pin_slot`. `label` is `None` when the emporium
-/// sidebar's second line ([`cwd_agent_line`]) carries it instead; `Some` when
-/// the row stays one line.
+/// Build one row's first physical line:
+/// `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]` — see the
+/// module doc's "Row layout" section for why the pin slot is conditional on
+/// `show_pin_slot`. The agent label is on the second line
+/// ([`cwd_agent_line`]).
 ///
 /// `title` and `cwd` are mutually exclusive truncation targets: cwd is only
 /// shown when the title's *natural* (untruncated) width already leaves at
@@ -232,19 +212,15 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
 /// placement, not separately computed/padded.
 ///
 /// All arithmetic is saturating. If the area is too narrow to fit the fixed
-/// prefix, the minimum gap, `label` (if present), and age all at once, both
-/// `label` and age are dropped together — not one before the other, so this
-/// stays the same single narrow/normal split the row always had rather than
-/// a new three-tier cascade — and the title gets whatever width remains
-/// after the prefix, degrading further to an empty title, then (ratatui's
-/// own area-boundary clipping) to just the prefix, in a pathologically
-/// narrow area. Never panics, never underflows.
+/// prefix, the minimum gap and age all at once, the age is dropped and the
+/// title gets whatever width remains after the prefix, degrading further to
+/// an empty title, then (ratatui's own area-boundary clipping) to just the
+/// prefix, in a pathologically narrow area. Never panics, never underflows.
 fn row_line(
     visible: &VisibleRow<'_>,
     area_width: u16,
     now: SystemTime,
     show_pin_slot: bool,
-    label: Option<&str>,
 ) -> Line<'static> {
     let dot = activity_dot(visible.row.activity);
     // Archived outranks the rest: it is the only class here the operator put
@@ -273,20 +249,17 @@ fn row_line(
     let area_width = area_width as usize;
     let age_str = model::humanize_age_compact(visible.row.mtime, now);
     let age_width = age_str.width();
-    let label_reserved = label.map_or(0, |label| LABEL_GAP + label.width());
 
     let title_full = visible.row.display_title().to_string();
     let title_width = title_full.width();
     let cwd_full = visible.row.cwd_display();
 
-    let max_left_content =
-        area_width.saturating_sub(prefix_width + label_reserved + MIN_GAP_BEFORE_AGE + age_width);
+    let max_left_content = area_width.saturating_sub(prefix_width + MIN_GAP_BEFORE_AGE + age_width);
 
     if max_left_content == 0 {
-        // Narrow-width degradation: no room for prefix + label (if any) +
-        // min gap + age all at once — drop label and age together rather
-        // than let anything collide into the prefix, and give the title
-        // whatever's left after the prefix.
+        // Narrow-width degradation: no room for prefix + min gap + age all
+        // at once — drop the age rather than let anything collide into the
+        // prefix, and give the title whatever's left after the prefix.
         let title_budget = area_width.saturating_sub(prefix_width);
         let title = truncate_to_width(&title_full, title_budget as u16);
         prefix.push(Span::raw(title));
@@ -315,16 +288,6 @@ fn row_line(
         let title = truncate_to_width(&title_full, max_left_content as u16);
         used_width += title.width();
         spans.push(Span::raw(title));
-    }
-
-    if let Some(label) = label {
-        spans.push(Span::raw(" ".repeat(LABEL_GAP)));
-        used_width += LABEL_GAP;
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(agent_label_color(visible.row.agent)),
-        ));
-        used_width += label.width();
     }
 
     // Age, right-flush at the row's literal right edge. `used_width` is
@@ -361,8 +324,7 @@ pub fn agent_label_color(agent: AgentKind) -> Color {
     }
 }
 
-/// The emporium sidebar's second physical line per row (only when
-/// `App::lines_per_row` is more than 1, see [`list_item`]): indented by
+/// A row's second physical line (see [`list_item`]): indented by
 /// [`fixed_prefix_width`] so its content aligns under line one's *title*
 /// rather than starting at column zero — without this a stray path would
 /// appear to hang between every row instead of reading as that row's own
@@ -1114,10 +1076,10 @@ mod tests {
         app.set_viewport_height(10);
 
         // Wide enough that "This Is" (the title's start) survives
-        // truncation and can anchor the line lookup even with the agent
-        // label's own width reserved alongside it, but still well under
+        // truncation and can anchor the line lookup, but still well under
         // MIN_WIDTH_FOR_CWD and short of the full title's length, so cwd
-        // stays dropped and the title still gets truncated.
+        // stays dropped from the title line and the title still gets
+        // truncated.
         let text = draw_list(&app, 40, 10, now);
         let line = text.lines().find(|l| l.contains("This Is")).unwrap();
         assert!(
@@ -1146,55 +1108,16 @@ mod tests {
         );
     }
 
-    // --- agent label (one-line row: same line; sidebar: second line) ------
+    // --- agent label (second line) ----------------------------------------
 
     #[test]
-    fn one_line_row_shows_the_agent_label_after_cwd_and_before_age_for_both_products() {
+    fn a_row_is_as_tall_as_the_scroll_and_click_math_counts_it() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![
-            row("c", "Claude Row", "", now),
-            codex_row("x", "Codex Row", "", now),
-        ]);
+        let mut app = App::new(vec![row("r", "Title", "/some/path", now)]);
+        app.toggle_grouped_view(); // flat: the first visible item is the row
         app.set_viewport_height(10);
-
-        let text = draw_list(&app, 60, 10, now);
-
-        let claude_line = text.lines().find(|l| l.contains("Claude Row")).unwrap();
-        assert!(claude_line.contains("[Claude]"), "{claude_line}");
-        let label_at = claude_line.find("[Claude]").unwrap();
-        let age_at = claude_line.find("now").unwrap();
-        assert!(
-            label_at < age_at,
-            "label should sit before age, not after:\n{claude_line}"
-        );
-
-        let codex_line = text.lines().find(|l| l.contains("Codex Row")).unwrap();
-        assert!(codex_line.contains("[Codex]"), "{codex_line}");
-    }
-
-    #[test]
-    fn one_line_row_at_a_narrow_width_drops_the_label_and_age_together() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![row("r", "A Reasonably Long Title", "", now)]);
-        app.set_viewport_height(10);
-
-        // Too narrow for prefix(8) + label_gap(2) + "[Claude]"(8) +
-        // min_gap(2) + age(3) all at once — both the label and age are
-        // dropped together (the module's single narrow/normal split, not a
-        // new three-tier cascade), leaving just the truncated title.
-        let text = draw_list(&app, 15, 10, now);
-        assert!(
-            !text.contains("[Claude]"),
-            "label should have been dropped:\n{text}"
-        );
-        assert!(
-            !text.contains("now"),
-            "age should have been dropped together with the label:\n{text}"
-        );
-        assert!(
-            text.contains('\u{2026}'),
-            "expected a truncated title:\n{text}"
-        );
+        let item = list_item(app.visible().remove(0), 34, now, true);
+        assert_eq!(item.height(), banto_core::app::ROW_LINES);
     }
 
     #[test]
@@ -1203,8 +1126,7 @@ mod tests {
         let mut app = App::new(vec![
             row("c", "Claude Row", "/work/claude", now),
             codex_row("x", "Codex Row", "/work/codex", now),
-        ])
-        .with_lines_per_row(2);
+        ]);
         app.set_viewport_height(10);
 
         // 34 columns: the emporium sidebar's inner width at its default
@@ -1233,7 +1155,7 @@ mod tests {
     fn sidebar_line_two_leading_truncates_cwd_and_keeps_the_label_flush_right() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let cwd = format!("/head_marker/{}/tail_marker", "x".repeat(40));
-        let mut app = App::new(vec![row("r", "Short", &cwd, now)]).with_lines_per_row(2);
+        let mut app = App::new(vec![row("r", "Short", &cwd, now)]);
         app.set_viewport_height(10);
 
         let text = draw_list(&app, 34, 10, now);
@@ -1256,7 +1178,7 @@ mod tests {
     #[test]
     fn sidebar_line_two_truncates_the_label_itself_in_a_pathologically_narrow_sidebar() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![row("r", "Short", "/some/path", now)]).with_lines_per_row(2);
+        let mut app = App::new(vec![row("r", "Short", "/some/path", now)]);
         app.set_viewport_height(10);
 
         // 6 columns is less than min_gap(2) + "[Claude]"(8) even before cwd
@@ -1276,8 +1198,7 @@ mod tests {
             row("a", "Alpha", "/work/a", now),
             row("b", "Beta", "/work/b", now),
         ])
-        .with_pinned(["a".to_string()].into_iter().collect())
-        .with_lines_per_row(2);
+        .with_pinned(["a".to_string()].into_iter().collect());
         app.set_viewport_height(10);
 
         let title_and_cwd_cols = |text: &str| -> (usize, usize) {

@@ -370,7 +370,7 @@ fn resolve_config(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Co
         .default_config
         .as_deref()
         .map(|path| absolute(path, cwd));
-    let source = io_config::resolve_config_path_with_default(
+    let source = io_config::resolve_config_path(
         cli_override.as_deref(),
         env_override.as_deref(),
         xdg.as_deref(),

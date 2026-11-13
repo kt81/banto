@@ -28,14 +28,6 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("banto").join("config.toml"))
 }
 
-/// `dirs::data_local_dir()/banto/banto.db`
-/// (e.g. `%LOCALAPPDATA%\banto\banto.db` on Windows,
-/// `~/.local/share/banto/banto.db` on Linux).
-pub fn default_db_path() -> Option<PathBuf> {
-    crate::data_dir::DataDir::default_root()
-        .map(|root| crate::data_dir::DataDir::new(root).db_path())
-}
-
 /// Errors from the strict [`load`] and [`load_explicit`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -127,32 +119,14 @@ pub enum ConfigSource {
 ///    `xdg_config_home` is set and non-empty *and* the file exists.
 /// 4. `~/.config/banto/config.toml` (`home`-based), on every platform, if it
 ///    exists.
-/// 5. [`default_config_path`], unconditionally — the current behavior,
-///    unchanged: a missing or broken file there just means defaults.
+/// 5. `default_path` (what [`default_config_path`] returns), unconditionally:
+///    a missing or broken file there just means defaults.
 ///
-/// Takes its environment/home inputs as parameters rather than reading them
-/// itself, so this stays a pure function of its arguments and tests need no
-/// real environment mutation; `main.rs` passes the real
-/// `std::env::var_os`/`dirs::home_dir()` values in.
+/// Takes every input, the final tier's path included, as a parameter rather
+/// than reading it itself, so this stays a pure function of its arguments and
+/// tests need no real environment mutation and never name the real config
+/// directory; `startup::Env::from_process` reads the real values.
 pub fn resolve_config_path(
-    cli_override: Option<&Path>,
-    env_override: Option<&Path>,
-    xdg_config_home: Option<&Path>,
-    home: Option<&Path>,
-) -> ConfigSource {
-    resolve_config_path_with_default(
-        cli_override,
-        env_override,
-        xdg_config_home,
-        home,
-        default_config_path(),
-    )
-}
-
-/// [`resolve_config_path`] with the final tier's path supplied instead of read
-/// from the platform: every input is then a parameter, so a test can resolve a
-/// config without the real config directory being named anywhere.
-pub fn resolve_config_path_with_default(
     cli_override: Option<&Path>,
     env_override: Option<&Path>,
     xdg_config_home: Option<&Path>,
@@ -250,13 +224,10 @@ mod tests {
     }
 
     #[test]
-    fn default_paths_end_in_banto_directory() {
-        // Only inspects the computed paths; never creates or writes them.
+    fn default_config_path_ends_in_banto_directory() {
+        // Only inspects the computed path; never creates or writes it.
         if let Some(path) = default_config_path() {
             assert!(path.ends_with(Path::new("banto").join("config.toml")));
-        }
-        if let Some(path) = default_db_path() {
-            assert!(path.ends_with(Path::new("banto").join("banto.db")));
         }
     }
 
@@ -290,6 +261,27 @@ mod tests {
 
     // -- resolve_config_path -------------------------------------------
 
+    /// The final tier's path in these tests: synthetic, so no test depends on
+    /// (or names) the platform's real config directory.
+    fn synthetic_default() -> Option<PathBuf> {
+        Some(PathBuf::from("/synthetic/default/banto/config.toml"))
+    }
+
+    fn resolve(
+        cli_override: Option<&Path>,
+        env_override: Option<&Path>,
+        xdg_config_home: Option<&Path>,
+        home: Option<&Path>,
+    ) -> ConfigSource {
+        resolve_config_path(
+            cli_override,
+            env_override,
+            xdg_config_home,
+            home,
+            synthetic_default(),
+        )
+    }
+
     fn banto_dir(root: &Path) -> PathBuf {
         root.join("banto")
     }
@@ -305,14 +297,14 @@ mod tests {
     #[test]
     fn explicit_cli_override_wins_over_everything_even_if_nothing_else_exists() {
         let cli = PathBuf::from("/synthetic/cli-config.toml");
-        let source = resolve_config_path(Some(&cli), None, None, None);
+        let source = resolve(Some(&cli), None, None, None);
         assert_eq!(source, ConfigSource::Explicit(cli));
     }
 
     #[test]
     fn explicit_env_override_wins_when_no_cli_override_is_given() {
         let env = PathBuf::from("/synthetic/env-config.toml");
-        let source = resolve_config_path(None, Some(&env), None, None);
+        let source = resolve(None, Some(&env), None, None);
         assert_eq!(source, ConfigSource::Explicit(env));
     }
 
@@ -320,7 +312,7 @@ mod tests {
     fn cli_override_beats_env_override_when_both_are_given() {
         let cli = PathBuf::from("/synthetic/cli-config.toml");
         let env = PathBuf::from("/synthetic/env-config.toml");
-        let source = resolve_config_path(Some(&cli), Some(&env), None, None);
+        let source = resolve(Some(&cli), Some(&env), None, None);
         assert_eq!(source, ConfigSource::Explicit(cli));
     }
 
@@ -329,7 +321,7 @@ mod tests {
         let xdg_root = tempfile::tempdir().unwrap();
         let expected = touch_config(xdg_root.path());
 
-        let source = resolve_config_path(None, None, Some(xdg_root.path()), None);
+        let source = resolve(None, None, Some(xdg_root.path()), None);
         assert_eq!(source, ConfigSource::Discovered(expected));
     }
 
@@ -338,8 +330,8 @@ mod tests {
         let xdg_root = tempfile::tempdir().unwrap();
         // banto/config.toml is never created under xdg_root.
 
-        let source = resolve_config_path(None, None, Some(xdg_root.path()), None);
-        assert_eq!(source, ConfigSource::Default(default_config_path()));
+        let source = resolve(None, None, Some(xdg_root.path()), None);
+        assert_eq!(source, ConfigSource::Default(synthetic_default()));
     }
 
     #[test]
@@ -347,8 +339,8 @@ mod tests {
         let xdg_root = tempfile::tempdir().unwrap();
         touch_config(xdg_root.path());
 
-        let source = resolve_config_path(None, None, Some(Path::new("")), None);
-        assert_eq!(source, ConfigSource::Default(default_config_path()));
+        let source = resolve(None, None, Some(Path::new("")), None);
+        assert_eq!(source, ConfigSource::Default(synthetic_default()));
     }
 
     #[test]
@@ -367,7 +359,7 @@ mod tests {
         )
         .unwrap();
 
-        let source = resolve_config_path(None, None, Some(xdg_root.path()), Some(home_root.path()));
+        let source = resolve(None, None, Some(xdg_root.path()), Some(home_root.path()));
         assert_eq!(source, ConfigSource::Discovered(expected));
     }
 
@@ -380,7 +372,7 @@ mod tests {
         let expected = dir.join("config.toml");
         std::fs::write(&expected, "").unwrap();
 
-        let source = resolve_config_path(None, None, None, Some(home_root.path()));
+        let source = resolve(None, None, None, Some(home_root.path()));
         assert_eq!(source, ConfigSource::Discovered(expected));
     }
 
@@ -389,13 +381,13 @@ mod tests {
         let home_root = tempfile::tempdir().unwrap();
         // ~/.config/banto/config.toml is never created under home_root.
 
-        let source = resolve_config_path(None, None, None, Some(home_root.path()));
-        assert_eq!(source, ConfigSource::Default(default_config_path()));
+        let source = resolve(None, None, None, Some(home_root.path()));
+        assert_eq!(source, ConfigSource::Default(synthetic_default()));
     }
 
     #[test]
-    fn falls_back_to_the_platform_default_when_nothing_else_is_set() {
-        let source = resolve_config_path(None, None, None, None);
-        assert_eq!(source, ConfigSource::Default(default_config_path()));
+    fn falls_back_to_the_supplied_default_when_nothing_else_is_set() {
+        let source = resolve(None, None, None, None);
+        assert_eq!(source, ConfigSource::Default(synthetic_default()));
     }
 }

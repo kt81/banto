@@ -414,10 +414,6 @@ pub fn run(
         .with_hidden_member_ids(hidden)
         .with_directors(directors)
         .with_superseded(superseded)
-        // Two lines per row (title/age, then cwd/agent) — the sidebar has
-        // the width for markers and a title but not a cwd too (see
-        // `banto_tui::view`'s module doc's "Row layout" section).
-        .with_lines_per_row(2)
         .with_enabled_agents(enabled_agents.clone());
     // Both are shown when both apply, the trust notice first: an untrusted hook
     // is a cell about to form with members nothing will ever brief, while an

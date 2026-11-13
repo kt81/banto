@@ -380,13 +380,13 @@ crates/
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
 │  ├─ store/            # rusqlite: groups/pins/archived, brigades, UI preferences
 │  ├─ watch/            # filesystem watching (notify) for live TUI updates — `LiveWatch` (debounced reload trigger) + the raw change source
-│  ├─ data_dir.rs       # banto's own data directory: where each working file lives, and the sweep of ended members' files
+│  ├─ data_dir.rs       # banto's own data directory (default `dirs::data_local_dir()/banto`): where each working file lives, the database included, and the sweep of ended members' files
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
-│  └─ config.rs         # config.toml (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir), DB in dirs::data_local_dir/banto
-├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view/render_modal
+│  └─ config.rs         # config.toml: loading it, and where it is looked for (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir)
+├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view (session list, summary), paint (vt100 screen → buffer cells), render_modal, strip (collapsed stack tile), hints, text
 └─ banto/               # bin: clap subcommands (banto, banto _mcp, banto _hook, banto list, ...), the one UI's event loop and executors
    ├─ main.rs           # clap CLI and dispatch
    ├─ startup.rs        # where config, database, data dir and the agent homes are (and what a child is handed)

@@ -83,19 +83,6 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a session from a group. Removing a non-member is a no-op.
-    pub fn remove_group_member(
-        &self,
-        group_id: GroupId,
-        session_id: &SessionId,
-    ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "DELETE FROM group_members WHERE group_id = ?1 AND session_id = ?2",
-            params![group_id, session_id.0],
-        )?;
-        Ok(())
-    }
-
     /// Returns the session ids in a group, ordered by id.
     pub fn group_members(&self, group_id: GroupId) -> Result<Vec<SessionId>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -203,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_add_remove_list() {
+    fn membership_add_is_idempotent_and_listed_by_session_id() {
         let store = Store::open_in_memory().unwrap();
         let g = store.create_group("work").unwrap();
 
@@ -212,13 +199,6 @@ mod tests {
         // Idempotent add.
         store.add_group_member(g, &sid("a")).unwrap();
         assert_eq!(store.group_members(g).unwrap(), [sid("a"), sid("b")]);
-
-        store.remove_group_member(g, &sid("a")).unwrap();
-        assert_eq!(store.group_members(g).unwrap(), [sid("b")]);
-
-        // Removing a non-member is a no-op.
-        store.remove_group_member(g, &sid("zzz")).unwrap();
-        assert_eq!(store.group_members(g).unwrap(), [sid("b")]);
     }
 
     #[test]

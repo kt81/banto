@@ -21,7 +21,8 @@
 //! Everything under the resolved Claude home, and under the resolved Codex
 //! home, is treated as strictly read-only.
 //! banto's own database (groups, pins, archive, brigades) lives under
-//! `Config.db_path`, falling back to `banto_io::config::default_db_path`.
+//! `Config.db_path`, falling back to `banto.db` in
+//! `banto_io::data_dir::DataDir::default_root`.
 //!
 //! `config.toml` itself is located by `banto_io::config::resolve_config_path`'s
 //! resolution order. A banto that was itself started by another banto (`_mcp`,

@@ -14,6 +14,15 @@ use crate::model::{Activity, AgentKind, SessionRow};
 /// coupling `App` to the store crate's types.
 pub type GroupId = i64;
 
+/// Physical lines one session row occupies in the list: title and age, then
+/// cwd and agent (`banto_tui::view` draws exactly this many). A section
+/// header is always one line, so [`App::offset`]/[`App::viewport_height`]
+/// stay in *item* units (a position in [`App::display_sequence`]) while
+/// everything that compares against physical space — `ensure_visible`,
+/// `click`, `visible`, `selected_in_viewport` — converts through
+/// [`App::line_weight`] instead of assuming one line per item.
+pub const ROW_LINES: usize = 2;
+
 /// Maximum gap between two clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 
@@ -848,16 +857,6 @@ pub struct App {
     offset: usize,
     /// Number of physical lines currently visible.
     viewport_height: usize,
-    /// Physical lines one row's [`ListLine::Row`] renders as — 1 by default, 2
-    /// for the emporium sidebar (see [`Self::with_lines_per_row`] and
-    /// `banto_tui::view`'s module doc's "Row layout" section). A section
-    /// header is always exactly one line regardless — only a row's height
-    /// varies — so [`Self::offset`]/[`Self::viewport_height`] stay in *item*
-    /// units (a position in [`Self::display_sequence`]) while every method
-    /// that compares against physical space (`ensure_visible`/`click`/
-    /// `visible`/`selected_in_viewport`) converts through this weight
-    /// instead of assuming 1:1, via [`Self::line_weight`].
-    lines_per_row: usize,
     /// Last click (filtered index + time) for double-click detection.
     last_click: Option<(usize, Instant)>,
     /// Set once the user asks to quit.
@@ -884,9 +883,8 @@ pub struct VisibleRow<'a> {
 /// seeded in the previous pass, headers were bundled into the following
 /// row's item instead, which under-counted physical rows and misaligned
 /// every click below a header. A header is always exactly one physical
-/// line; a row is [`App::lines_per_row`] (1 by default, 2 for the emporium
-/// sidebar) — see that field's doc for how the index space above
-/// converts between item position and physical line. See
+/// line; a row is [`ROW_LINES`] — see [`App::line_weight`] for how the index
+/// space above converts between item position and physical line. See
 /// [`App::display_sequence`].
 pub enum ListLine<'a> {
     /// `count` is how many rows fall under this section under the current
@@ -938,7 +936,6 @@ impl App {
             selected: 0,
             offset: 0,
             viewport_height: 0,
-            lines_per_row: 1,
             last_click: None,
             should_quit: false,
         };
@@ -1646,25 +1643,6 @@ impl App {
         self.refilter_keeping_selected(selected_id);
     }
 
-    /// Set how many physical lines one row renders as (see
-    /// [`Self::lines_per_row`]'s field doc) — a one-time bootstrap choice
-    /// like [`Self::with_directors`], not a repeating decision, so this is a
-    /// builder rather than a `set_*` — `banto::embedded::emporium::run` calls
-    /// it once with `2`; the default is `1`. Clamped to at least `1` (a zero-line row would never be visible
-    /// at all, unrepresentable in `App`'s own weighted viewport math).
-    pub fn with_lines_per_row(mut self, lines: usize) -> Self {
-        self.lines_per_row = lines.max(1);
-        self
-    }
-
-    /// Physical lines one row renders as — see [`Self::lines_per_row`]'s
-    /// field doc. Read by `banto_tui::view` to decide whether a row needs a
-    /// second physical line for cwd/agent, kept in lockstep with the same
-    /// value this struct's own scroll/click math already uses internally.
-    pub fn lines_per_row(&self) -> usize {
-        self.lines_per_row
-    }
-
     /// Open the emporium's disband confirm dialog for the given brigade
     /// (bound to `B` on a session that is that brigade's Director).
     pub fn open_confirm_disband_modal(&mut self, brigade_id: i64, name: String) {
@@ -1935,14 +1913,11 @@ impl App {
         self.ensure_visible();
     }
 
-    /// Page size for PgUp/PgDn (at least one row): the viewport's physical
-    /// height in rows, ignoring headers entirely — an approximation the
-    /// grouped view already lived with before [`Self::lines_per_row`]
-    /// existed (a page near a section header moves by roughly, not
-    /// exactly, one viewport height), now just also scaled down for a
-    /// multi-line row so it doesn't overshoot by that same factor.
+    /// Page size for PgUp/PgDn (at least one row): the viewport's height in
+    /// rows, ignoring headers entirely — a page near a section header moves
+    /// by roughly, not exactly, one viewport height.
     fn page_step(&self) -> isize {
-        (self.viewport_height / self.lines_per_row).max(1) as isize
+        (self.viewport_height / ROW_LINES).max(1) as isize
     }
 
     /// Move the selection by `delta`, clamped to the filtered range, then
@@ -1978,13 +1953,12 @@ impl App {
     }
 
     /// Physical lines one display item occupies: a header is always one; a
-    /// row is [`Self::lines_per_row`] (see that field's doc) — the seam
-    /// every physical-space computation below converts through instead of
-    /// assuming every item is one line.
+    /// row is [`ROW_LINES`] — the seam every physical-space computation below
+    /// converts through instead of assuming every item is one line.
     fn line_weight(&self, line: &DisplayLine) -> usize {
         match line {
             DisplayLine::Header { .. } => 1,
-            DisplayLine::Row(_) => self.lines_per_row,
+            DisplayLine::Row(_) => ROW_LINES,
         }
     }
 
@@ -2053,8 +2027,8 @@ impl App {
     /// and "where would the bottom-anchored offset be" questions convert
     /// through [`Self::items_fitting`]/[`Self::bottom_anchored_start`] into
     /// physical-line space, so a section header above the selection (one
-    /// line) and a multi-line row (`lines_per_row` lines) are both counted
-    /// correctly rather than assumed uniform.
+    /// line) and a row ([`ROW_LINES`] lines) are both counted correctly
+    /// rather than assumed uniform.
     fn ensure_visible(&mut self) {
         if self.viewport_height == 0 {
             return;
@@ -2080,8 +2054,7 @@ impl App {
     /// The display-line index of the `filtered` position `k`, if it's
     /// present in `display` (it always is, unless `filtered` is empty). An
     /// item-index (position in `display`), not a physical-line position —
-    /// see [`Self::line_weight`] for why those differ once `lines_per_row`
-    /// is more than 1.
+    /// see [`Self::line_weight`] for why those differ.
     fn display_line_of(display: &[DisplayLine], k: usize) -> Option<usize> {
         display
             .iter()
@@ -2095,8 +2068,8 @@ impl App {
     /// line, or on a section header (grouped view only) — headers aren't
     /// selectable. Walks forward from `self.offset` (an item index) summing
     /// each item's physical-line weight, rather than a direct index add, so
-    /// a click landing on either physical line of a multi-line row (see
-    /// [`Self::lines_per_row`]) still resolves to that same row.
+    /// a click landing on either physical line of a row still resolves to
+    /// that same row.
     pub fn click(&mut self, viewport_row: usize, now: Instant) -> Option<ClickOutcome> {
         let display = self.display_sequence();
         let mut remaining = viewport_row;
@@ -2260,8 +2233,8 @@ impl App {
     /// The display items currently visible in the viewport, top to bottom —
     /// real rows and (grouped view only) section headers (see [`ListLine`]/
     /// [`Self::display_sequence`]). A header is always one physical line; a
-    /// row is [`Self::lines_per_row`] — the returned count already accounts
-    /// for that (see [`Self::items_fitting`]), so the caller can render
+    /// row is [`ROW_LINES`] — the returned count already accounts for that
+    /// (see [`Self::items_fitting`]), so the caller can render
     /// every item in order without doing its own height arithmetic. Which
     /// one (if any) is selected is reported separately by
     /// [`Self::selected_in_viewport`].
@@ -2511,7 +2484,7 @@ mod tests {
     #[test]
     fn scroll_window_follows_selection() {
         let mut app = App::new(numbered(10));
-        app.set_viewport_height(3);
+        app.set_viewport_height(3 * ROW_LINES);
         // Jump to the end: offset should reveal the last row.
         app.select_last();
         assert_eq!(app.selected(), 9);
@@ -2531,7 +2504,7 @@ mod tests {
     #[test]
     fn wheel_scroll_moves_offset_without_selection() {
         let mut app = App::new(numbered(10));
-        app.set_viewport_height(3);
+        app.set_viewport_height(3 * ROW_LINES);
         app.scroll(2);
         assert_eq!(app.selected(), 0); // selection unchanged
         assert_eq!(ids(&app), vec!["id2", "id3", "id4"]);
@@ -2546,7 +2519,7 @@ mod tests {
     #[test]
     fn page_navigation_moves_by_viewport_height() {
         let mut app = App::new(numbered(10));
-        app.set_viewport_height(4);
+        app.set_viewport_height(4 * ROW_LINES);
         app.page_down();
         assert_eq!(app.selected(), 4);
         app.page_down();
@@ -2560,29 +2533,31 @@ mod tests {
     #[test]
     fn double_click_activates_only_within_threshold_on_same_row() {
         let mut app = App::new(numbered(5));
-        app.set_viewport_height(5);
+        app.set_viewport_height(5 * ROW_LINES);
         let t0 = test_instant();
+        // The viewport line a row's first physical line sits on.
+        let line_of = |row: usize| row * ROW_LINES;
 
         // First click selects.
-        assert_eq!(app.click(2, t0), Some(ClickOutcome::Selected));
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
         assert_eq!(app.selected(), 2);
 
         // Second quick click on the same row activates.
         let t1 = t0 + Duration::from_millis(200);
-        assert_eq!(app.click(2, t1), Some(ClickOutcome::Activated));
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Activated));
 
         // The pair resets: a third quick click just selects again.
         let t2 = t1 + Duration::from_millis(50);
-        assert_eq!(app.click(2, t2), Some(ClickOutcome::Selected));
+        assert_eq!(app.click(line_of(2), t2), Some(ClickOutcome::Selected));
 
         // A click on a different row never activates.
         let t3 = t2 + Duration::from_millis(50);
-        assert_eq!(app.click(3, t3), Some(ClickOutcome::Selected));
+        assert_eq!(app.click(line_of(3), t3), Some(ClickOutcome::Selected));
         assert_eq!(app.selected(), 3);
 
         // Too slow: not a double click.
         let t4 = t3 + Duration::from_millis(500);
-        assert_eq!(app.click(3, t4), Some(ClickOutcome::Selected));
+        assert_eq!(app.click(line_of(3), t4), Some(ClickOutcome::Selected));
     }
 
     #[test]
@@ -2595,7 +2570,9 @@ mod tests {
     /// Sets up 4 rows spanning 3 grouped-view sections (Pinned / "work" /
     /// Ungrouped), so the display sequence is:
     /// `[Header(Pinned), Row(id3), Header(work), Row(id1), Header(Ungrouped),
-    /// Row(id0), Row(id2)]` — 7 display lines for 4 rows.
+    /// Row(id0), Row(id2)]` — 7 display items for 4 rows, which as physical
+    /// lines (a header is 1, a row is [`ROW_LINES`]) sit at: header 0, id3
+    /// 1–2, header 3, id1 4–5, header 6, id0 7–8, id2 9–10.
     fn grouped_app_for_click_tests() -> App {
         let mut app = App::new(vec![
             row("id0", "zero", ""),
@@ -2608,15 +2585,15 @@ mod tests {
             vec![(1, "work".to_string())],
             [("id1".to_string(), 1)].into_iter().collect(),
         );
-        app.set_viewport_height(10);
+        app.set_viewport_height(11);
         app
     }
 
     #[test]
     fn click_below_a_header_selects_the_right_session() {
         let mut app = grouped_app_for_click_tests();
-        // Display line 3 is Row(id1), just below the "work" header at line 2.
-        assert_eq!(app.click(3, test_instant()), Some(ClickOutcome::Selected));
+        // Line 4 is Row(id1)'s first line, just below the "work" header.
+        assert_eq!(app.click(4, test_instant()), Some(ClickOutcome::Selected));
         assert_eq!(app.selected_row().unwrap().id, "id1");
     }
 
@@ -2626,45 +2603,22 @@ mod tests {
         app.click(1, test_instant()); // select id3 first, as a baseline
         assert_eq!(app.selected_row().unwrap().id, "id3");
 
-        // Display line 2 is the "work" header, not a row.
-        assert_eq!(app.click(2, test_instant()), None);
+        // Line 3 is the "work" header, not a row.
+        assert_eq!(app.click(3, test_instant()), None);
         // Selection untouched by the no-op click.
         assert_eq!(app.selected_row().unwrap().id, "id3");
 
-        // Same for line 0, the "Pinned" header, and line 4, "Ungrouped".
+        // Same for line 0, the "Pinned" header, and line 6, "Ungrouped".
         assert_eq!(app.click(0, test_instant()), None);
-        assert_eq!(app.click(4, test_instant()), None);
+        assert_eq!(app.click(6, test_instant()), None);
         assert_eq!(app.selected_row().unwrap().id, "id3");
     }
 
-    #[test]
-    fn bottom_row_stays_reachable_with_two_sections_in_a_short_viewport() {
-        // 3 rows, 2 sections (Pinned + Ungrouped), so the display sequence
-        // is `[Header(Pinned), Row(pinned), Header(Ungrouped), Row(a),
-        // Row(b)]` — 5 display lines for 3 rows. A naive "viewport_height
-        // rows fit" assumption (ignoring the two header lines) would leave
-        // the last row unreachable in a 2-line viewport.
-        let mut app = App::new(vec![
-            row("a", "A", ""),
-            row("b", "B", ""),
-            row("pinned", "P", ""),
-        ])
-        .with_pinned(["pinned".to_string()].into_iter().collect());
-        app.set_viewport_height(2);
-
-        app.select_last();
-
-        assert_eq!(app.selected_row().unwrap().id, "b");
-        assert_eq!(ids(&app), vec!["a", "b"]);
-        // The last row is on-screen, in the viewport's bottom slot.
-        assert_eq!(app.selected_in_viewport(), Some(1));
-    }
-
-    // --- lines_per_row (emporium sidebar's two-line rows) ----------------
+    // --- two-line rows ----------------------------------------------------
 
     #[test]
-    fn two_line_rows_fit_half_as_many_per_viewport_as_one_line_rows() {
-        let mut app = App::new(numbered(10)).with_lines_per_row(2);
+    fn a_six_line_viewport_fits_three_rows() {
+        let mut app = App::new(numbered(10));
         app.toggle_grouped_view(); // flat: no headers to complicate the count
         app.set_viewport_height(6);
         assert_eq!(ids(&app), vec!["id0", "id1", "id2"]);
@@ -2672,7 +2626,7 @@ mod tests {
 
     #[test]
     fn two_line_rows_scroll_to_keep_the_selection_fully_visible() {
-        let mut app = App::new(numbered(10)).with_lines_per_row(2);
+        let mut app = App::new(numbered(10));
         app.toggle_grouped_view();
         app.set_viewport_height(6); // 3 rows fit
 
@@ -2686,7 +2640,7 @@ mod tests {
 
     #[test]
     fn two_line_rows_click_on_either_physical_line_selects_the_same_row() {
-        let mut app = App::new(numbered(5)).with_lines_per_row(2);
+        let mut app = App::new(numbered(5));
         app.toggle_grouped_view();
         app.set_viewport_height(10); // all 5 rows (10 physical lines) fit
 
@@ -2709,10 +2663,8 @@ mod tests {
         assert_eq!(app.selected_row().unwrap().id, "id1"); // row 1's 2nd line
     }
 
-    /// Same 3-row, 2-section layout as
-    /// `bottom_row_stays_reachable_with_two_sections_in_a_short_viewport`
-    /// (display sequence `[Header(Pinned), Row(pinned), Header(Ungrouped),
-    /// Row(a), Row(b)]`), but with 2-line rows: physical weights
+    /// 3 rows in 2 sections: display sequence `[Header(Pinned),
+    /// Row(pinned), Header(Ungrouped), Row(a), Row(b)]`, physical weights
     /// `[1, 2, 1, 2, 2]`, 8 total. A viewport of 4 physical lines exactly
     /// fits `Header(Pinned) + Row(pinned) + Header(Ungrouped)` (1+2+1) —
     /// proof that a header (weight 1) and a row (weight 2) are counted by
@@ -2724,8 +2676,7 @@ mod tests {
             row("b", "B", ""),
             row("pinned", "P", ""),
         ])
-        .with_pinned(["pinned".to_string()].into_iter().collect())
-        .with_lines_per_row(2);
+        .with_pinned(["pinned".to_string()].into_iter().collect());
         app.set_viewport_height(4);
 
         assert_eq!(ids(&app), vec!["pinned"]);
@@ -2803,7 +2754,7 @@ mod tests {
     #[test]
     fn replace_rows_clamps_scroll_when_the_list_shrinks() {
         let mut app = App::new(numbered(10));
-        app.set_viewport_height(3);
+        app.set_viewport_height(3 * ROW_LINES);
         app.select_last(); // id9, scrolled near the bottom
 
         // id9 no longer exists: selection falls back to the top, and the
@@ -4223,7 +4174,7 @@ mod tests {
             vec![(1, "work".to_string())],
             [("id1".to_string(), 1)].into_iter().collect(),
         );
-        app.set_viewport_height(10);
+        app.set_viewport_height(11);
 
         // Pinned (id3) first, then the "work" group (id1), then Ungrouped
         // (id0, id2) in their original mtime-descending order.

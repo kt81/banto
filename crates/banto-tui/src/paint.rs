@@ -1,15 +1,14 @@
 //! Paint a `vt100` screen into a ratatui buffer, one grid cell to one buffer
 //! cell.
 //!
-//! [`render::screen_to_text`](crate::render) built a `Span` per grid cell and
-//! let ratatui measure each one independently. That put two width authorities
-//! in the same path, and they disagreed: an emoji-presentation sequence was
-//! one column to `vt100` and two to ratatui, so every column after one drifted
-//! and the child's repaints landed on the wrong cells. Here the column count
-//! comes from `vt100` and is handed to ratatui as
-//! [`CellDiffOption::ForcedWidth`], so there is no second opinion left to
-//! disagree with — the contract `render`'s `width_contract` tests assert is
-//! structural here rather than coincidental.
+//! Building a `Span` per grid cell and letting ratatui measure each one
+//! independently put two width authorities in the same path, and they
+//! disagreed: an emoji-presentation sequence was one column to `vt100` and two
+//! to ratatui, so every column after one drifted and the child's repaints
+//! landed on the wrong cells. Here the column count comes from `vt100` and is
+//! handed to ratatui as [`CellDiffOption::ForcedWidth`], so there is no second
+//! opinion left to disagree with — the width contract is structural here
+//! rather than coincidental.
 //!
 //! Painting cells directly is also the only way to carry OSC 8 hyperlinks.
 //! ratatui supports them by placing the escape inside a cell's own symbol
@@ -163,6 +162,16 @@ mod tests {
         assert_eq!(marker_column("\u{E0A0}"), 1, "private use area");
         assert_eq!(marker_column("\u{2591}"), 1, "shade");
         assert_eq!(marker_column("\u{958B}\u{767A}"), 4, "CJK run");
+    }
+
+    #[test]
+    fn sgr_2_dim_reaches_the_buffer_as_the_dim_modifier() {
+        // Claude Code's inline ghost/autosuggest text is rendered with SGR 2
+        // (faint) in a naked terminal; vt100 models it on `Cell::dim`, so it
+        // must survive into the painted cell rather than being dropped.
+        let (buf, _) = painted(b"[2mdim[0mnormal", 10);
+        assert!(buf[(0, 0)].style().add_modifier.contains(Modifier::DIM));
+        assert!(!buf[(3, 0)].style().add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

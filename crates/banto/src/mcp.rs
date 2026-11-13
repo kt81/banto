@@ -75,7 +75,7 @@ pub struct Identity {
 /// checks each product's separate live-state source. `goinkyo_dir` is where
 /// [`tool_consult_goinkyo`] writes a consultation request; `None` when the
 /// platform's data-local directory couldn't be determined (see
-/// `banto_io::config::default_db_path`, the same fallibility). `message_log` is
+/// `banto_io::data_dir::DataDir::default_root`, the same fallibility). `message_log` is
 /// `Some` only when `[brigade] message_log` is on (see [`MessageLog`]).
 struct ServerContext {
     identity: Identity,

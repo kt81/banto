@@ -6,8 +6,6 @@
 //! Module map:
 //! - [`render_modal`] rendering `Modal` as a centered overlay
 //! - [`paint`] `vt100` screen -> ratatui buffer cells (the emporium's panes)
-//! - [`render`] `vt100` screen -> ratatui text, the predecessor `paint`
-//!   replaced; its width tests are the regression net for that swap
 //! - [`view`] the shared session-list / summary panel widgets
 //! - [`strip`] the body of a collapsed stack tile, from a plain data struct
 //! - [`hints`] the emporium's status-bar key hints, as text
@@ -15,7 +13,6 @@
 
 pub mod hints;
 pub mod paint;
-pub mod render;
 pub mod render_modal;
 pub mod strip;
 pub mod text;
