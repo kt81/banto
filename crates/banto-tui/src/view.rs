@@ -36,11 +36,11 @@
 //! A row is two lines (`banto_core::app::ROW_LINES`, which the list's scroll
 //! and click math counts in), driven by the render area's width and whether
 //! grouped view is actually in effect (`App::grouped_view_in_effect`). Line
-//! one is `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]`;
-//! line two is the cwd and the agent label, indented to align under the
-//! title rather than starting at column zero — see [`cwd_agent_line`]. Two
-//! lines because the sidebar's width holds the markers and a title but rarely
-//! a cwd beside them.
+//! one is `[dot 2][pin 0-or-3][role 3][title][gap>=2][age]`; line two is the
+//! cwd and the agent label, indented to align under the title rather than
+//! starting at column zero — see [`cwd_agent_line`]. The cwd is on line two
+//! at every width and never repeated on line one, so the title gets every
+//! column the prefix and the age leave.
 //!
 //! The pin slot exists (3 columns) only in flat view — in grouped view
 //! every pinned row's section is "Pinned" (`App::section_name` gives it
@@ -48,11 +48,11 @@
 //! column is dropped entirely rather than reserved-but-always-blank. The
 //! role slot is unconditional, in flat and grouped view alike. A present
 //! marker slot is the emoji plus one trailing separator space — a
-//! glued-together `📌🤝title` reads as one sticker, not two markers. See [`row_line`] for the exact
-//! budget arithmetic (title/cwd mutually exclusive truncation, age always
-//! flush at the right edge, saturating throughout with an explicit
-//! narrow-width degradation that drops the age column entirely rather than
-//! ever let it collide into the prefix).
+//! glued-together `📌🤝title` reads as one sticker, not two markers. See
+//! [`row_line`] for the exact budget arithmetic (age always flush at the right
+//! edge, saturating throughout with an explicit narrow-width degradation that
+//! drops the age column entirely rather than ever let it collide into the
+//! prefix).
 
 use std::time::SystemTime;
 
@@ -92,17 +92,6 @@ fn fixed_prefix_width(show_pin_slot: bool) -> usize {
     2 + pin_width + 3
 }
 const MIN_GAP_BEFORE_AGE: usize = 2;
-const TITLE_CWD_GAP: usize = 2;
-/// cwd is only shown if at least this many columns remain for it once the
-/// title (at its natural, untruncated width) and the title-cwd gap are
-/// accounted for.
-const MIN_CWD_WIDTH: usize = 8;
-/// cwd is never shown below this render width, regardless of how much room
-/// the title leaves — at sidebar widths (e.g. the emporium's default 34-col list),
-/// a short title's leftover space isn't a genuine invitation to show cwd,
-/// it just produces a cramped, barely-readable fragment. Wide areas keep
-/// the existing [`MIN_CWD_WIDTH`]-based rule unchanged.
-const MIN_WIDTH_FOR_CWD: usize = 60;
 
 /// Render the session list (or a placeholder when nothing matches) into
 /// `area`. `now` drives the right-aligned compact age column — read once by
@@ -197,19 +186,13 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
 }
 
 /// Build one row's first physical line:
-/// `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap>=2][age]` — see the
-/// module doc's "Row layout" section for why the pin slot is conditional on
-/// `show_pin_slot`. The agent label is on the second line
-/// ([`cwd_agent_line`]).
-///
-/// `title` and `cwd` are mutually exclusive truncation targets: cwd is only
-/// shown when the title's *natural* (untruncated) width already leaves at
-/// least [`MIN_CWD_WIDTH`] columns free for it — so whenever cwd is shown,
-/// the title itself is never truncated; whenever the title doesn't fit that
-/// budget (or there's no cwd to show at all), cwd is dropped and the title
-/// gets truncated to whatever's left instead. `age` is always flush at the
-/// row's literal right edge; the gap before it is a consequence of that
-/// placement, not separately computed/padded.
+/// `[dot 2][pin 0-or-3][role 3][title][gap>=2][age]` — see the module doc's
+/// "Row layout" section for why the pin slot is conditional on
+/// `show_pin_slot`. The cwd and the agent label are on the second line
+/// ([`cwd_agent_line`]), so the title gets every column the prefix, the
+/// minimum gap and the age leave. `age` is always flush at the row's literal
+/// right edge; the gap before it is a consequence of that placement, not
+/// separately computed/padded.
 ///
 /// All arithmetic is saturating. If the area is too narrow to fit the fixed
 /// prefix, the minimum gap and age all at once, the age is dropped and the
@@ -251,8 +234,6 @@ fn row_line(
     let age_width = age_str.width();
 
     let title_full = visible.row.display_title().to_string();
-    let title_width = title_full.width();
-    let cwd_full = visible.row.cwd_display();
 
     let max_left_content = area_width.saturating_sub(prefix_width + MIN_GAP_BEFORE_AGE + age_width);
 
@@ -266,33 +247,14 @@ fn row_line(
         return Line::from(prefix);
     }
 
-    let show_cwd = area_width >= MIN_WIDTH_FOR_CWD
-        && !cwd_full.is_empty()
-        && title_width + TITLE_CWD_GAP + MIN_CWD_WIDTH <= max_left_content;
-
+    let title = truncate_to_width(&title_full, max_left_content as u16);
+    let used_width = prefix_width + title.width();
     let mut spans = prefix;
-    let mut used_width = prefix_width;
-    if show_cwd {
-        let cwd_budget = max_left_content - title_width - TITLE_CWD_GAP;
-        used_width += title_width;
-        spans.push(Span::raw(title_full));
-        spans.push(Span::raw("  "));
-        used_width += TITLE_CWD_GAP;
-        let cwd_truncated = truncate_to_width_leading(&cwd_full, cwd_budget as u16);
-        used_width += cwd_truncated.width();
-        spans.push(Span::styled(
-            cwd_truncated,
-            Style::default().fg(Color::DarkGray),
-        ));
-    } else {
-        let title = truncate_to_width(&title_full, max_left_content as u16);
-        used_width += title.width();
-        spans.push(Span::raw(title));
-    }
+    spans.push(Span::raw(title));
 
     // Age, right-flush at the row's literal right edge. `used_width` is
     // bounded (by construction of `max_left_content` and the truncation
-    // helpers' own <= max_width guarantee) so this gap is always >=
+    // helper's own <= max_width guarantee) so this gap is always >=
     // MIN_GAP_BEFORE_AGE — see the function doc.
     let gap = area_width.saturating_sub(used_width + age_width);
     spans.push(Span::raw(" ".repeat(gap)));
@@ -1003,69 +965,134 @@ mod tests {
     }
 
     #[test]
-    fn cwd_is_shown_and_leading_truncated_when_the_title_leaves_room() {
+    fn line_one_is_the_title_and_the_age_however_long_the_cwd_is() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let cwd = format!("/head_marker/{}/tail_marker", "x".repeat(80));
         let mut app = App::new(vec![row("r", "Short", &cwd, now)]);
         app.set_viewport_height(10);
 
         let text = draw_list(&app, 60, 10, now);
-        let line = text.lines().find(|l| l.contains("Short")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let title_line = lines.iter().position(|l| l.contains("Short")).unwrap();
+        let line = lines[title_line];
         assert!(
-            line.contains("Short"),
-            "title should be shown verbatim, untruncated:\n{line}"
+            !line.contains("marker") && !line.contains('\u{2026}'),
+            "the title line carries the title and the age, nothing of the cwd:\n{line}"
         );
         assert!(
-            !line.contains("head_marker"),
-            "cwd's head should have been cut:\n{line}"
+            line.trim_end().ends_with("now"),
+            "the age stays flush right:\n{line}"
+        );
+        // Line two is where the cwd is, cut from the front.
+        let cwd_line = lines[title_line + 1];
+        assert!(
+            !cwd_line.contains("head_marker") && cwd_line.contains("tail_marker"),
+            "line two keeps the cwd's tail:\n{cwd_line}"
         );
         assert!(
-            line.contains("tail_marker"),
-            "cwd's tail should survive (leading truncation):\n{line}"
-        );
-        assert!(
-            line.contains('\u{2026}'),
-            "expected a leading ellipsis:\n{line}"
+            cwd_line.contains('\u{2026}'),
+            "expected a leading ellipsis:\n{cwd_line}"
         );
     }
 
     #[test]
-    fn cwd_still_appears_at_and_above_the_width_floor() {
+    fn the_cwd_is_on_line_two_not_line_one_at_every_width() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let cwd = "/work/project";
         let mut app = App::new(vec![row("r", "Short", cwd, now)]);
         app.set_viewport_height(10);
 
-        // Guards against over-suppression: MIN_WIDTH_FOR_CWD (60) is a
-        // floor, not a ceiling — cwd must still show at and above it,
-        // provided the title otherwise leaves it enough room.
-        for width in [60, 80] {
+        for width in [34, 60, 80] {
             let text = draw_list(&app, width, 10, now);
-            let line = text.lines().find(|l| l.contains("Short")).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let title_line = lines.iter().position(|l| l.contains("Short")).unwrap();
             assert!(
-                line.contains("project"),
-                "cwd should still show at width {width} (>= the floor):\n{line}"
+                !lines[title_line].contains("project"),
+                "line one should not carry the cwd at width {width}:\n{}",
+                lines[title_line]
+            );
+            assert!(
+                lines[title_line + 1].contains("project"),
+                "line two should carry the cwd at width {width}:\n{}",
+                lines[title_line + 1]
             );
         }
     }
 
     #[test]
-    fn cwd_never_shown_below_the_sidebar_width_floor_even_with_room() {
+    fn cwd_is_never_shown_on_line_one_even_with_room_to_spare() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let cwd = "/some/long/project/path";
         let mut app = App::new(vec![row("r", "Short", cwd, now)]);
         app.set_viewport_height(10);
 
-        // 34 cols (the emporium sidebar's inner width at its default) is below MIN_WIDTH_FOR_CWD
-        // — the short title alone would ordinarily
-        // leave more than enough room for cwd under the
-        // title-leaves-room rule, but the floor overrides it here.
+        // 34 cols is the emporium sidebar's inner width at its default; the
+        // short title leaves plenty of room beside it, and the cwd still
+        // belongs to line two.
         let text = draw_list(&app, 34, 10, now);
         let line = text.lines().find(|l| l.contains("Short")).unwrap();
         assert!(
             !line.contains("project"),
-            "cwd should never appear below the sidebar width floor:\n{line}"
+            "cwd should never appear on the title line:\n{line}"
         );
+    }
+
+    #[test]
+    fn at_wide_widths_the_cwd_is_on_line_two_only() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let five_min_ago = now - Duration::from_secs(5 * 60);
+        let cwd = "/work/acme/payments-service/api";
+        let mut app = App::new(vec![row("r", "Fix login redirect", cwd, five_min_ago)]);
+        app.set_viewport_height(10);
+
+        for width in [60, 100] {
+            let text = draw_list(&app, width, 10, now);
+            let lines: Vec<&str> = text.lines().collect();
+            let title_line = lines.iter().position(|l| l.contains("Fix login")).unwrap();
+            assert!(
+                !lines[title_line].contains("payments-service"),
+                "line one must not carry the cwd at width {width}:\n{text}"
+            );
+            assert!(
+                lines[title_line].trim_end().ends_with("5m"),
+                "line one is the title and the age at width {width}:\n{text}"
+            );
+            assert!(
+                lines[title_line + 1].contains(cwd),
+                "line two carries the whole cwd at width {width}:\n{text}"
+            );
+            assert_eq!(
+                text.matches("payments-service").count(),
+                1,
+                "the cwd appears once at width {width}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_title_fills_line_one_up_to_the_age_at_wide_widths() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let five_min_ago = now - Duration::from_secs(5 * 60);
+        let title = "Investigate why the nightly export job silently drops rows \
+                     when the warehouse connection is recycled mid-run";
+        let mut app = App::new(vec![row("r", title, "/work/acme/etl", five_min_ago)]);
+        app.set_viewport_height(10);
+
+        for width in [60, 100] {
+            let text = draw_list(&app, width, 10, now);
+            let line = text.lines().find(|l| l.contains("Investigate")).unwrap();
+            assert!(
+                !line.contains("/work/acme/etl"),
+                "no cwd on line one at width {width}:\n{line}"
+            );
+            // The title is cut with an ellipsis and runs right up to the
+            // age's minimum gap: every column it can have is its own.
+            let before_age = line.trim_end().strip_suffix("5m").unwrap();
+            assert!(
+                before_age.ends_with(&format!("\u{2026}{}", " ".repeat(MIN_GAP_BEFORE_AGE))),
+                "title should end in an ellipsis {MIN_GAP_BEFORE_AGE} columns before the age at width {width}:\n{line:?}"
+            );
+        }
     }
 
     #[test]
@@ -1076,10 +1103,8 @@ mod tests {
         app.set_viewport_height(10);
 
         // Wide enough that "This Is" (the title's start) survives
-        // truncation and can anchor the line lookup, but still well under
-        // MIN_WIDTH_FOR_CWD and short of the full title's length, so cwd
-        // stays dropped from the title line and the title still gets
-        // truncated.
+        // truncation and can anchor the line lookup, but short of the full
+        // title's length, so the title still gets truncated.
         let text = draw_list(&app, 40, 10, now);
         let line = text.lines().find(|l| l.contains("This Is")).unwrap();
         assert!(
