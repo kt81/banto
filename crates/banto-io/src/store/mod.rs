@@ -3,7 +3,6 @@
 //! Responsibilities (docs/REQUIREMENTS.md "Module layout"):
 //! - groups / pins / archived sessions (banto-owned; never written to
 //!   Claude's files)
-//! - session <-> pane mapping for the opener
 //! - brigades: their members (with display names), the message queue between
 //!   them, and the emporium's arrangement preferences (`brigades.rs`,
 //!   `ui_prefs.rs`)
@@ -20,7 +19,6 @@ mod brigades;
 mod groups;
 mod lineage;
 mod migrations;
-mod panes;
 mod pins;
 mod ui_prefs;
 
@@ -29,7 +27,6 @@ pub use banto_core::model::{
 };
 pub use brigades::{MAX_WORKER_NUMBER, MemberNaming, glance_line};
 pub use groups::{Group, GroupId};
-pub use panes::PaneRecord;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,10 +34,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 
 /// How long a connection waits for a lock held by another connection before
-/// giving up with `SQLITE_BUSY`. The TUI process and the `banto _wrap`
-/// process(es) it launches all open the same sqlite file, so without this a
-/// pane-map registration or cleanup could fail silently under contention
-/// instead of just waiting the other side out.
+/// giving up with `SQLITE_BUSY`. The emporium and the `banto _mcp` /
+/// `banto _hook` processes it launches all open the same sqlite file, so
+/// without this a message or member write could fail under contention instead
+/// of just waiting the other side out.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors returned by [`Store`] operations.
@@ -174,8 +171,8 @@ mod tests {
         let store = Store::open(&db).unwrap();
 
         // A second, independent connection holds the write lock for a short
-        // while, simulating `banto _wrap` touching the pane map at the same
-        // time as the TUI. `pin` is a single-statement, implicit-transaction
+        // while, simulating a `banto _mcp` process writing at the same time
+        // as the emporium. `pin` is a single-statement, implicit-transaction
         // write (no held read lock of its own), so it only ever contends on
         // the lock the blocker is holding.
         let blocker_db = db.clone();

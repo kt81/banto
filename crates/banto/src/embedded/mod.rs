@@ -1,8 +1,8 @@
-//! Embedded terminal host: run a child (e.g. `claude --resume <id>`) inside
-//! banto's own ratatui TUI — spawn it in a PTY, parse its output with `vt100`,
-//! render the grid, and forward input. This is the productionised form of the
-//! `docs/notes/embedded-pty-spike.md` case-A spike (banto as a minimal
-//! multiplexer), in its single-pane form.
+//! Embedded terminal host: banto's UI, which runs children (e.g. `claude --resume
+//! <id>`) inside its own ratatui TUI — spawn each in a PTY, parse its output
+//! with `vt100`, render the grid, and forward input. It is the productionised
+//! form of the `docs/notes/embedded-pty-spike.md` case-A spike (banto as a
+//! minimal multiplexer).
 //!
 //! Windows/ConPTY note (from the spike): banto must NOT answer the child's
 //! DSR/DA queries — ConPTY is the child's terminal and passes host input
@@ -14,99 +14,7 @@ mod emporium;
 mod paste_accum;
 mod session;
 
-pub use banto_io::pty::PortablePtyHost;
 pub use emporium::EmporiumSettings;
 pub use emporium::run as run_emporium;
 #[cfg(test)]
 pub(crate) use emporium::{brigade_env, mcp_config_json};
-pub use session::EmbeddedSession;
-
-use std::io::Stdout;
-use std::path::Path;
-use std::time::Duration;
-
-use anyhow::Result;
-use banto_tui::paint::paint_screen;
-use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Position;
-use ratatui::widgets::Block;
-
-/// Host `argv` in a full-screen embedded pane until the user presses F12.
-/// Reached via the hidden `banto _embed` subcommand — the only caller of
-/// [`EmbeddedSession`]; the emporium (`embedded::emporium`) uses
-/// `Screen`/`PtyHandle` directly instead (see `session.rs`'s module doc).
-pub fn run_embedded(argv: &[String], cwd: Option<&Path>) -> Result<()> {
-    enable_raw_mode()?;
-    std::io::stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
-
-    let result = embedded_loop(&mut terminal, argv, cwd);
-
-    disable_raw_mode()?;
-    let _ = std::io::stdout().execute(LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-    result
-}
-
-fn embedded_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    argv: &[String],
-    cwd: Option<&Path>,
-) -> Result<()> {
-    let (w, h) = crossterm::terminal::size()?;
-    let host = PortablePtyHost;
-    let mut session = EmbeddedSession::open(
-        &host,
-        argv,
-        cwd,
-        h.saturating_sub(2).max(1),
-        w.saturating_sub(2).max(1),
-    )?;
-
-    loop {
-        session.pump();
-
-        terminal.draw(|f| {
-            let area = f.area();
-            let block = Block::bordered().title("banto · embedded — F12 to detach");
-            let content = block.inner(area);
-            f.render_widget(block, area);
-            paint_screen(session.screen(), content, f.buffer_mut());
-
-            let screen = session.screen();
-            if !screen.hide_cursor() {
-                let (cr, cc) = screen.cursor_position();
-                let (x, y) = (content.x + cc, content.y + cr);
-                if x < content.x + content.width && y < content.y + content.height {
-                    f.set_cursor_position(Position::new(x, y));
-                }
-            }
-        })?;
-
-        if event::poll(Duration::from_millis(16))? {
-            match event::read()? {
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    if matches!(key.code, KeyCode::F(12)) {
-                        break;
-                    }
-                    if let Some(key) = convert::convert_key(key) {
-                        session.send_key(&key);
-                    }
-                }
-                Event::Resize(nw, nh) => {
-                    session.resize(nh.saturating_sub(2).max(1), nw.saturating_sub(2).max(1));
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}

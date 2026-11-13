@@ -82,9 +82,8 @@ pub trait Hangup: Send {
 }
 
 /// Environment variables banto strips from every agent process it spawns,
-/// on every launch route (embedded PTY, in-place, `_wrap`) — see each
-/// [`PtyHost::open`]/`ProcessRunner` call site for where this is threaded
-/// through.
+/// on every launch — see the [`PtyHost::open`] call site for where this is
+/// threaded through.
 ///
 /// `CLAUDE_CODE_CHILD_SESSION` is the one entry: measured on this machine
 /// against `claude` 2.1.222, 2026-08-05 — inherited (present, value `"1"`)

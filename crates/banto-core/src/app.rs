@@ -1,9 +1,8 @@
 //! TUI application state.
 //!
 //! All filtering, sorting, selection and scroll math lives here as a plain,
-//! UI-free struct so it can be unit-tested without a terminal. The render loop
-//! in `banto::tui` (the chōba list) is a thin shell over this state; the
-//! emporium's `crate::engine` uses it too.
+//! UI-free struct so it can be unit-tested without a terminal. The emporium's
+//! `crate::engine` drives it and `banto-tui` renders it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,11 +16,6 @@ pub type GroupId = i64;
 
 /// Maximum gap between two clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
-
-/// How long a transient status-bar message stays visible before
-/// auto-clearing on its own, even if the user never presses another key
-/// (see [`App::expire_status`]).
-const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of Unicode scalar values in `s` — the unit every text-input cursor
 /// position is counted in, so a cursor index can never land inside a
@@ -73,23 +67,6 @@ pub enum ClickOutcome {
     Activated,
 }
 
-/// Which open path a risky-open confirmation ([`App::confirm_director_open`])
-/// applies to. Enter and double-click both resume in place, so they share
-/// [`Self::Resume`]; `s` (split) is tracked separately so confirming one
-/// never silently authorizes the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenAction {
-    Resume,
-    Split,
-}
-
-/// An armed but unconfirmed risky open — see [`App::confirm_director_open`].
-struct PendingRiskyOpen {
-    session_id: String,
-    action: OpenAction,
-    armed_at: Instant,
-}
-
 /// Which input mode the TUI is in. Letter keys mean different things in
 /// each: `j`/`k`/`p`/`a`/`/`/`q` are commands in [`Mode::Normal`], while any
 /// character types into the query in [`Mode::Search`].
@@ -125,8 +102,7 @@ pub enum Modal {
     ConfirmGroupDelete { group_id: GroupId, name: String },
     /// The emporium's `B`-on-a-Director disband confirm dialog: Enter
     /// disbands the brigade (`brigade_id`), Esc cancels. `name` is the
-    /// Director's title, for the prompt. The chōba never opens this, but
-    /// still has to render/dispatch it since the two share `App`/`render_modal`.
+    /// Director's title, for the prompt.
     ConfirmDisband { brigade_id: i64, name: String },
     /// The emporium's prefix-`x` confirm dialog. Enter confirms, Esc cancels.
     /// What confirming does depends on who the focused pane is:
@@ -142,8 +118,7 @@ pub enum Modal {
     ///
     /// `key` is the pane's `SessionKey` as a plain string (kept a `String` so
     /// `Modal` does not depend on an `embedded`-internal type); `title` is its
-    /// session title, for the plain prompt. The chōba never opens this, for the
-    /// same reason as `ConfirmDisband`.
+    /// session title, for the plain prompt.
     ConfirmKill {
         key: String,
         title: String,
@@ -156,9 +131,7 @@ pub enum Modal {
     /// The emporium's formation-time picker for `[brigade] worker_agent =
     /// "select"`: choose which product this brigade's *Workers* (not the
     /// Director — that's already whatever session was promoted) will run
-    /// as, and their `--model`, before any of them spawn. The chōba never
-    /// opens this either, for the same reason as `ConfirmDisband`/
-    /// `ConfirmKill` — it has no brigade-formation path of its own.
+    /// as, and their `--model`, before any of them spawn.
     WorkerAgentPicker(WorkerAgentPickerState),
     /// Shown instead of forming a brigade (or the `Select` picker above)
     /// when the brigade's resolved Worker product is Codex and banto's
@@ -166,9 +139,7 @@ pub enum Modal {
     /// pane running Codex's own trust-review startup
     /// (`Cmd::OpenCodexTrustPane`), Esc cancels. Either way, forming the
     /// brigade itself is abandoned for this press, not resumed afterward —
-    /// see `crate::engine::update_codex_trust_checked`'s doc for why. The
-    /// chōba never opens this either, for the same reason as
-    /// `ConfirmDisband`/`ConfirmKill`/`WorkerAgentPicker`.
+    /// see `crate::engine::update_codex_trust_checked`'s doc for why.
     ConfirmCodexTrust,
     /// Shown instead of forming a brigade (before either gate above) when
     /// the session about to become Director already has a pane open:
@@ -176,8 +147,7 @@ pub enum Modal {
     /// through a launch's own argv, so a pane opened before formation can't
     /// carry it — Enter kills that pane and reopens it wired once it's
     /// actually gone (`crate::engine::confirm_director_reopen_modal`/
-    /// `update_pty_exited`), Esc cancels and nothing forms. The chōba never
-    /// opens this either, for the same reason as the others.
+    /// `update_pty_exited`), Esc cancels and nothing forms.
     ConfirmDirectorReopen {
         director_row_id: String,
         name: String,
@@ -490,21 +460,6 @@ impl GroupRenameState {
     }
 }
 
-/// Where confirming the new-session modal launches the session — mirrors
-/// the list's own Enter (in-place) / `s` (split) distinction. Chosen up
-/// front by which key opened the modal (`n` = in-place, `N` = split — see
-/// [`App::open_new_session_modal`]/[`App::open_new_session_modal_split`])
-/// rather than toggled inside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewSessionPlacement {
-    /// `n`: hand banto's own terminal to the new session (the default,
-    /// matching Enter on the list).
-    InPlace,
-    /// `N`: launch it in a separate psmux pane / Windows Terminal tab
-    /// (matching `s` on the list).
-    Split,
-}
-
 /// State for the new-session modal: a free-text cwd input plus a
 /// substring-filtered list of previously seen cwds (extracted from the
 /// loaded sessions) to pick from instead of typing a full path.
@@ -528,8 +483,6 @@ pub struct NewSessionState {
     /// Inline validation error from the last confirm attempt (e.g. the typed
     /// path doesn't exist), cleared as soon as the input changes again.
     error: Option<String>,
-    /// Fixed for the lifetime of the modal (see [`NewSessionPlacement`]).
-    placement: NewSessionPlacement,
     /// Set while a `Cmd::CheckNewSessionCwd` round trip is in flight for
     /// this modal (Enter sent it, `Event::NewSessionCwdChecked` hasn't
     /// answered yet) — see `engine::confirm_new_session_modal`'s doc. Gates
@@ -537,14 +490,12 @@ pub struct NewSessionState {
     /// answers.
     checking: bool,
     /// Which agent product confirming would launch, defaulting to
-    /// [`AgentKind::ClaudeCode`] — toggled by [`Self::toggle_agent`], the
-    /// emporium's own binding (the chōba has none: its new-session path is
-    /// feature-frozen, see `banto::opener::new_session_wrap_argv`'s doc).
+    /// [`AgentKind::ClaudeCode`] — toggled by [`Self::toggle_agent`].
     agent: AgentKind,
 }
 
 impl NewSessionState {
-    fn new(rows: &[SessionRow], placement: NewSessionPlacement) -> Self {
+    fn new(rows: &[SessionRow]) -> Self {
         let mut state = Self {
             candidates: unique_cwds(rows),
             input: String::new(),
@@ -552,7 +503,6 @@ impl NewSessionState {
             filtered: Vec::new(),
             selected: 0,
             error: None,
-            placement,
             checking: false,
             agent: AgentKind::ClaudeCode,
         };
@@ -659,12 +609,6 @@ impl NewSessionState {
     /// The inline validation error from the last confirm attempt, if any.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
-    }
-
-    /// Where confirming this modal launches the session (see
-    /// [`NewSessionPlacement`]).
-    pub fn placement(&self) -> NewSessionPlacement {
-        self.placement
     }
 
     /// Which agent product confirming would launch.
@@ -904,9 +848,9 @@ pub struct App {
     offset: usize,
     /// Number of physical lines currently visible.
     viewport_height: usize,
-    /// Physical lines one row's [`ListLine::Row`] renders as — 1 for the
-    /// chōba list, 2 for the emporium sidebar (see [`Self::with_lines_per_row`]
-    /// and `banto_tui::view`'s module doc's "Row layout" section). A section
+    /// Physical lines one row's [`ListLine::Row`] renders as — 1 by default, 2
+    /// for the emporium sidebar (see [`Self::with_lines_per_row`] and
+    /// `banto_tui::view`'s module doc's "Row layout" section). A section
     /// header is always exactly one line regardless — only a row's height
     /// varies — so [`Self::offset`]/[`Self::viewport_height`] stay in *item*
     /// units (a position in [`Self::display_sequence`]) while every method
@@ -916,14 +860,6 @@ pub struct App {
     lines_per_row: usize,
     /// Last click (filtered index + time) for double-click detection.
     last_click: Option<(usize, Instant)>,
-    /// Transient status-bar message (e.g. the phase-2 open notice).
-    status: Option<String>,
-    /// When `status` was posted, so [`Self::expire_status`] can clear it
-    /// after [`STATUS_TIMEOUT`] even if the user never presses another key.
-    status_set_at: Option<Instant>,
-    /// An armed-but-unconfirmed risky open (currently: opening a brigade
-    /// Director from the chōba) — see [`Self::confirm_director_open`].
-    pending_risky_open: Option<PendingRiskyOpen>,
     /// Set once the user asks to quit.
     should_quit: bool,
 }
@@ -948,8 +884,8 @@ pub struct VisibleRow<'a> {
 /// seeded in the previous pass, headers were bundled into the following
 /// row's item instead, which under-counted physical rows and misaligned
 /// every click below a header. A header is always exactly one physical
-/// line; a row is [`App::lines_per_row`] (1 for the chōba list, 2 for the
-/// emporium sidebar) — see that field's doc for how the index space above
+/// line; a row is [`App::lines_per_row`] (1 by default, 2 for the emporium
+/// sidebar) — see that field's doc for how the index space above
 /// converts between item position and physical line. See
 /// [`App::display_sequence`].
 pub enum ListLine<'a> {
@@ -1004,9 +940,6 @@ impl App {
             viewport_height: 0,
             lines_per_row: 1,
             last_click: None,
-            status: None,
-            status_set_at: None,
-            pending_risky_open: None,
             should_quit: false,
         };
         app.resort_rows();
@@ -1076,26 +1009,10 @@ impl App {
         )
     }
 
-    /// Open the `n` new-session modal for an in-place launch, seeding its
-    /// candidate list from every distinct cwd across all loaded sessions
-    /// (bound to `n` in [`Mode::Normal`] — the default placement, matching
-    /// Enter on the list).
+    /// Open the new-session modal, seeding its candidate list from every
+    /// distinct cwd across all loaded sessions.
     pub fn open_new_session_modal(&mut self) {
-        self.open_new_session_modal_as(NewSessionPlacement::InPlace);
-    }
-
-    /// Open the new-session modal for a split launch (bound to `N` in
-    /// [`Mode::Normal`] — matching `s` on the list). Otherwise identical to
-    /// [`Self::open_new_session_modal`].
-    pub fn open_new_session_modal_split(&mut self) {
-        self.open_new_session_modal_as(NewSessionPlacement::Split);
-    }
-
-    fn open_new_session_modal_as(&mut self, placement: NewSessionPlacement) {
-        self.modal = Some(Modal::NewSession(NewSessionState::new(
-            &self.base_rows,
-            placement,
-        )));
+        self.modal = Some(Modal::NewSession(NewSessionState::new(&self.base_rows)));
     }
 
     /// Open the `d` archive confirm modal for the selected session (no-op
@@ -1296,9 +1213,7 @@ impl App {
     }
 
     /// Toggle the open modal's agent choice ([`Modal::NewSession`] or
-    /// [`Modal::WorkerAgentPicker`] — the emporium's own binding on both,
-    /// see [`NewSessionState::agent`]'s doc for why the chōba has neither).
-    /// No-op for every other modal kind.
+    /// [`Modal::WorkerAgentPicker`]). No-op for every other modal kind.
     pub fn modal_toggle_agent(&mut self) {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.toggle_agent(),
@@ -1601,8 +1516,9 @@ impl App {
     /// [`Reveal`] level is hiding: agent-run sessions, superseded
     /// (auto-compaction ancestor) sessions that aren't currently live (see
     /// [`Self::is_hidden_superseded`]), and archived ones. Always `0` at
-    /// [`Reveal::Archived`].
-    pub fn hidden_count(&self) -> usize {
+    /// [`Reveal::Archived`]. Only the tests count what is hidden.
+    #[cfg(test)]
+    fn hidden_count(&self) -> usize {
         rank_indices(&self.query, &self.haystacks)
             .into_iter()
             .filter(|&i| !self.revealed(i))
@@ -1734,8 +1650,7 @@ impl App {
     /// [`Self::lines_per_row`]'s field doc) — a one-time bootstrap choice
     /// like [`Self::with_directors`], not a repeating decision, so this is a
     /// builder rather than a `set_*` — `banto::embedded::emporium::run` calls
-    /// it once with `2`; the chōba never calls it, keeping the default of
-    /// `1`. Clamped to at least `1` (a zero-line row would never be visible
+    /// it once with `2`; the default is `1`. Clamped to at least `1` (a zero-line row would never be visible
     /// at all, unrepresentable in `App`'s own weighted viewport math).
     pub fn with_lines_per_row(mut self, lines: usize) -> Self {
         self.lines_per_row = lines.max(1);
@@ -1982,7 +1897,6 @@ impl App {
         self.rebuild_filtered();
         self.selected = 0;
         self.offset = 0;
-        self.clear_status();
         self.last_click = None;
         self.ensure_visible();
     }
@@ -2222,72 +2136,6 @@ impl App {
 
     // --- actions --------------------------------------------------------
 
-    /// Post a transient status-bar message, timestamped (with the given
-    /// `now`, not read internally — see [`Self::expire_status`]'s doc
-    /// comment for why) for [`Self::expire_status`].
-    pub fn set_status(&mut self, message: String, now: Instant) {
-        self.status = Some(message);
-        self.status_set_at = Some(now);
-    }
-
-    /// Clear any transient status-bar message, restoring the key-hint
-    /// display. Called at the start of key dispatch (see `crate::tui::
-    /// handle_key`) so a notification like "pinned session X" doesn't linger
-    /// once the user has moved on to something else.
-    pub fn clear_status(&mut self) {
-        self.status = None;
-        self.status_set_at = None;
-    }
-
-    /// Clear the status message once it's been showing for
-    /// [`STATUS_TIMEOUT`], given the current time — a notification like
-    /// "pinned session X" would otherwise linger forever if the user simply
-    /// stops touching the keyboard instead of pressing another key (the
-    /// event that normally clears it via [`Self::clear_status`]). Takes an
-    /// injected `now` rather than reading `Instant::now()` itself so this
-    /// stays testable with synthetic timestamps; the render loop calls this
-    /// every tick with the real clock (see `crate::tui::event_loop`).
-    pub fn expire_status(&mut self, now: Instant) {
-        if let Some(set_at) = self.status_set_at
-            && now.saturating_duration_since(set_at) >= STATUS_TIMEOUT
-        {
-            self.clear_status();
-        }
-    }
-
-    /// Arm or confirm a risky open. Director-agnostic on purpose: this only
-    /// tracks "has this exact `(id, action)` been requested twice within the
-    /// freshness window" — the shell decides which sessions/actions the
-    /// guard applies to (currently: opening a brigade Director from the
-    /// chōba, gated on [`Self::is_selected_director`]).
-    ///
-    /// The first call for a given `(id, action)` — or one whose prior arm
-    /// has gone stale — arms it and returns `false`. A second call for the
-    /// *same* `(id, action)` within the freshness window disarms and
-    /// returns `true`. A different id or a different action always re-arms
-    /// rather than confirming, since it isn't a repeat of the last request.
-    ///
-    /// The freshness window matches [`STATUS_TIMEOUT`] rather than a timer
-    /// of its own, so a caller that shows the warning via [`Self::status`]
-    /// at the same `now` it arms with gets a confirm window that expires in
-    /// lockstep with the visible warning — see `banto::tui`'s call sites.
-    pub fn confirm_director_open(&mut self, id: &str, action: OpenAction, now: Instant) -> bool {
-        if let Some(pending) = &self.pending_risky_open
-            && pending.session_id == id
-            && pending.action == action
-            && now.saturating_duration_since(pending.armed_at) < STATUS_TIMEOUT
-        {
-            self.pending_risky_open = None;
-            return true;
-        }
-        self.pending_risky_open = Some(PendingRiskyOpen {
-            session_id: id.to_string(),
-            action,
-            armed_at: now,
-        });
-        false
-    }
-
     /// Request that the render loop exit.
     pub fn request_quit(&mut self) {
         self.should_quit = true;
@@ -2306,10 +2154,6 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
-    }
-
-    pub fn status(&self) -> Option<&str> {
-        self.status.as_deref()
     }
 
     /// Raw selection index into the filtered list. Only the render loop's
@@ -2912,91 +2756,6 @@ mod tests {
         assert_eq!(ids(&app), vec!["a", "b"]);
         assert_eq!(headers(&app), Vec::<String>::new());
         assert_eq!(app.selected_in_viewport(), Some(1));
-    }
-
-    #[test]
-    fn set_status_reflects_the_selected_row() {
-        // The render loop (not App) drives opening; this only checks the two
-        // primitives it composes: reading the selection and posting a message.
-        let mut app = App::new(numbered(3));
-        app.set_viewport_height(10);
-        app.select_next(); // id1
-        let id = app.selected_row().unwrap().id.clone();
-        app.set_status(format!("opened session {id}"), test_instant());
-        assert_eq!(app.status(), Some("opened session id1"));
-    }
-
-    #[test]
-    fn status_expires_after_the_timeout_but_not_before() {
-        let mut app = App::new(numbered(1));
-        let t0 = test_instant();
-        app.set_status("hello".to_string(), t0);
-
-        // Comfortably before the 5s timeout: still showing.
-        app.expire_status(t0 + Duration::from_secs(4));
-        assert_eq!(app.status(), Some("hello"));
-
-        // Comfortably after the 5s timeout: cleared.
-        app.expire_status(t0 + Duration::from_secs(6));
-        assert_eq!(app.status(), None);
-    }
-
-    #[test]
-    fn expire_status_is_a_noop_when_no_status_is_set() {
-        let mut app = App::new(numbered(1));
-        app.expire_status(test_instant() + Duration::from_secs(100));
-        assert_eq!(app.status(), None);
-    }
-
-    #[test]
-    fn confirm_director_open_arms_on_first_call_and_returns_false() {
-        let mut app = App::new(numbered(1));
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, test_instant()));
-    }
-
-    #[test]
-    fn confirm_director_open_confirms_and_disarms_a_matching_repeat_within_the_window() {
-        let mut app = App::new(numbered(1));
-        let t0 = test_instant();
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
-
-        // Comfortably inside the freshness window.
-        assert!(app.confirm_director_open("id0", OpenAction::Resume, t0 + Duration::from_secs(2)));
-
-        // Disarmed: a third call is a fresh arm, not another confirm.
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0 + Duration::from_secs(2)));
-    }
-
-    #[test]
-    fn confirm_director_open_re_arms_instead_of_confirming_once_the_window_has_expired() {
-        let mut app = App::new(numbered(1));
-        let t0 = test_instant();
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
-
-        // Past the same 5s freshness window `expire_status` uses.
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0 + Duration::from_secs(6)));
-    }
-
-    #[test]
-    fn confirm_director_open_a_different_id_re_arms_rather_than_confirming() {
-        let mut app = App::new(numbered(2));
-        let t0 = test_instant();
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
-
-        // Selection moved on to a different session — this looks like a
-        // fresh request, not a repeat of the id0 one.
-        assert!(!app.confirm_director_open("id1", OpenAction::Resume, t0));
-    }
-
-    #[test]
-    fn confirm_director_open_a_different_action_does_not_confirm() {
-        let mut app = App::new(numbered(1));
-        let t0 = test_instant();
-        assert!(!app.confirm_director_open("id0", OpenAction::Resume, t0));
-
-        // Same id, but `s` (Split) was never the thing that warned — an
-        // Enter confirm must not silently authorize a split, or vice versa.
-        assert!(!app.confirm_director_open("id0", OpenAction::Split, t0));
     }
 
     #[test]

@@ -168,8 +168,6 @@ impl World {
 struct Invocations {
     claude_mcp: Vec<String>,
     codex_mcp: Vec<String>,
-    wrap_resume: Vec<String>,
-    wrap_new_session: Vec<String>,
     hook_env: Vec<(String, String)>,
 }
 
@@ -193,7 +191,7 @@ fn invocations(parent: &Resolved) -> Invocations {
         .map(|arg| arg.as_str().unwrap().to_string())
         .collect();
 
-    let codex = crate::opener::CodexBrigade {
+    let codex = crate::launch::CodexBrigade {
         exe: PathBuf::from(exe),
         brigade_id: 7,
         token: "worker-1".to_string(),
@@ -201,7 +199,7 @@ fn invocations(parent: &Resolved) -> Invocations {
         session: Some("sess-1".to_string()),
         child_args: child_args.clone(),
     };
-    let override_ = crate::opener::mcp_server_args_override(&codex);
+    let override_ = crate::launch::mcp_server_args_override(&codex);
     let rhs = override_.strip_prefix("mcp_servers.banto.args=").unwrap();
     let parsed: toml::Table = toml::from_str(&format!("args = {rhs}")).unwrap();
     let codex_mcp = parsed["args"]
@@ -211,28 +209,9 @@ fn invocations(parent: &Resolved) -> Invocations {
         .map(|arg| arg.as_str().unwrap().to_string())
         .collect();
 
-    let binaries = banto_core::config::AgentBinaries::default();
-    let wrap_resume = crate::opener::wrap_argv(
-        Some(exe),
-        &child_args,
-        "sess-1",
-        banto_core::model::AgentKind::ClaudeCode,
-        Path::new("/work"),
-        &binaries,
-    );
-    let wrap_new_session = crate::opener::new_session_wrap_argv(
-        Some(exe),
-        &child_args,
-        Path::new("/work"),
-        banto_io::opener::Backend::Psmux,
-        None,
-        &binaries,
-    );
     Invocations {
         claude_mcp,
         codex_mcp,
-        wrap_resume: wrap_resume[1..].to_vec(),
-        wrap_new_session: wrap_new_session[1..].to_vec(),
         hook_env: crate::embedded::brigade_env(Some(&brigade), Some(parent)),
     }
 }
@@ -347,26 +326,6 @@ fn a_codex_mcp_server_resolves_what_its_parent_did() {
     assert_agrees("codex _mcp", &parent, &child, true);
 }
 
-#[test]
-fn a_wrap_that_resumes_a_session_resolves_what_its_parent_did() {
-    let world = World::new();
-    let (_, parent) = world.parent();
-    let child = world
-        .resolve_argv(&invocations(&parent).wrap_resume, None)
-        .unwrap_or_else(|err| panic!("_wrap resume cannot start: {err:#}"));
-    assert_agrees("_wrap resume", &parent, &child, true);
-}
-
-#[test]
-fn a_wrap_that_starts_a_new_session_resolves_what_its_parent_did() {
-    let world = World::new();
-    let (_, parent) = world.parent();
-    let child = world
-        .resolve_argv(&invocations(&parent).wrap_new_session, None)
-        .unwrap_or_else(|err| panic!("_wrap new-session cannot start: {err:#}"));
-    assert_agrees("_wrap new-session", &parent, &child, true);
-}
-
 /// A parent with no data directory (the platform has none) passes none, and a
 /// child handed anything else must not find one for itself — as with the Codex
 /// home, where the parent had none the child has none. The child's own platform
@@ -388,8 +347,6 @@ fn children_of_a_parent_with_no_data_directory_have_none_either() {
     for (label, argv) in [
         ("claude _mcp", &invocations.claude_mcp),
         ("codex _mcp", &invocations.codex_mcp),
-        ("_wrap resume", &invocations.wrap_resume),
-        ("_wrap new-session", &invocations.wrap_new_session),
     ] {
         let child = world
             .resolve_argv(argv, None)
@@ -425,8 +382,6 @@ fn children_of_a_parent_started_from_a_relative_banto_config_resolve_what_it_did
     for (label, argv) in [
         ("claude _mcp", &invocations.claude_mcp),
         ("codex _mcp", &invocations.codex_mcp),
-        ("_wrap resume", &invocations.wrap_resume),
-        ("_wrap new-session", &invocations.wrap_new_session),
     ] {
         let child = world
             .resolve_argv(argv, inherited)
@@ -441,7 +396,7 @@ fn children_of_a_parent_started_from_a_relative_banto_config_resolve_what_it_did
 /// (a separator on Windows, an ordinary character elsewhere), as far as a
 /// string-level test can take them: nothing here is created on disk. They go
 /// through the real JSON args builder, the real Codex TOML override builder, the
-/// `_wrap` builders and the hook's environment, then back through clap, and must
+/// hook's environment, then back through clap, and must
 /// come out byte for byte.
 #[test]
 fn awkward_paths_come_through_every_builder_and_back_unchanged() {
@@ -470,20 +425,13 @@ fn awkward_paths_come_through_every_builder_and_back_unchanged() {
         }
     }
     // Nothing of the parent's own command line is copied beside them.
-    for argv in [
-        &invocations.claude_mcp,
-        &invocations.codex_mcp,
-        &invocations.wrap_resume,
-        &invocations.wrap_new_session,
-    ] {
+    for argv in [&invocations.claude_mcp, &invocations.codex_mcp] {
         assert!(!argv.iter().any(|arg| arg == "--config"), "{argv:?}");
     }
 
     for (label, argv) in [
         ("claude _mcp", &invocations.claude_mcp),
         ("codex _mcp", &invocations.codex_mcp),
-        ("_wrap resume", &invocations.wrap_resume),
-        ("_wrap new-session", &invocations.wrap_new_session),
     ] {
         let child = world
             .resolve_argv(argv, None)

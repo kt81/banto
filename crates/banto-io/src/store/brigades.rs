@@ -1,6 +1,6 @@
 //! Brigades: an internal operational cell of one Director session and its
 //! Worker sessions (formed with at least one; dismissing Workers can later
-//! leave it with none), hosted together as tiled panes in the emporium mode.
+//! leave it with none), hosted together as tiled panes in the emporium.
 //!
 //! A brigade is a *separate* concept from a group: a group is the user's own
 //! filing (project / phase), while a brigade is a live operational unit — a

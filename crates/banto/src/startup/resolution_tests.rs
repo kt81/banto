@@ -352,15 +352,13 @@ fn the_hand_off_never_touches_an_agents_own_variables() {
 fn the_hidden_flags_are_accepted_anywhere_after_the_subcommand_and_exclude_each_other() {
     let cli = Cli::try_parse_from([
         "banto",
-        "_wrap",
+        "_mcp",
         "--parent-config",
         "/c.toml",
         "--session",
         "s",
         "--db-path",
         "/d.db",
-        "--",
-        "claude",
     ])
     .unwrap();
     assert_eq!(cli.parent_config, Some(PathBuf::from("/c.toml")));
@@ -519,8 +517,8 @@ fn a_parent_without_a_codex_home_hands_its_child_none_end_to_end() {
 
 #[test]
 fn a_parent_that_starts_children_always_has_a_claude_home_and_a_database() {
-    // Both children-launching modes open the store and resolve the Claude home
-    // before they can start anything (`main`'s default arm, `tui::run`,
+    // The one process that starts children opens the store and resolves the
+    // Claude home before it can start anything (`main`'s default arm,
     // `embedded::run_emporium`): a parent without either fails first, so no child
     // ever meets their absence. Pinned here as the resolution's own contract: the
     // two are errors, not silent gaps, when missing.
@@ -577,9 +575,9 @@ fn a_config_flag_next_to_either_parent_flag_is_rejected_wherever_each_is_placed(
         assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
         // One before and one after: parsed apart by clap, refused by the check
         // `main` runs on the result.
-        let mut argv = vec!["banto", "--config", "/mine.toml", "_wrap"];
+        let mut argv = vec!["banto", "--config", "/mine.toml", "_mcp"];
         argv.extend(parent_flag.clone());
-        argv.extend(["--session", "s", "--", "claude"]);
+        argv.extend(["--session", "s"]);
         let cli = Cli::try_parse_from(&argv).expect("clap alone does not see it");
         assert!(cli.check_hand_off_flags().is_err(), "{argv:?}");
     }
@@ -806,7 +804,7 @@ fn a_child_without_the_hand_off_finds_its_own_data_directory_as_before() {
 }
 
 #[test]
-fn the_data_directory_is_an_argument_for_mcp_and_wrap_and_not_handed_to_the_hook() {
+fn the_data_directory_is_an_argument_for_mcp_and_not_handed_to_the_hook() {
     let r = Resolved {
         config_file: ConfigFile::None,
         db_path: Some(PathBuf::from("/d/banto.db")),
@@ -829,4 +827,67 @@ fn the_data_directory_is_an_argument_for_mcp_and_wrap_and_not_handed_to_the_hook
     // The flag is hidden but real.
     let cli = Cli::try_parse_from(["banto", "_mcp", "--data-dir", "/my data/banto"]).unwrap();
     assert_eq!(cli.data_dir, Some(PathBuf::from("/my data/banto")));
+}
+
+// --- what the one UI retired -------------------------------------------------------
+
+/// A config file written when `opener` was a setting still starts banto: through
+/// an explicit `--config` (strict, where a bad file is a startup error), through
+/// the search (lenient), and from a parent's hand-off. The leftover is an unknown
+/// key like any other, and the rest of the file is read as written.
+#[test]
+fn a_config_file_with_a_leftover_opener_section_starts_banto_on_every_path() {
+    let m = Machine::new();
+    for (name, text) in [
+        ("key.toml", "opener = \"psmux\"\ndb_path = \"x.db\"\n"),
+        (
+            "bad-value.toml",
+            "opener = \"no-such-backend\"\ndb_path = \"x.db\"\n",
+        ),
+        (
+            "section.toml",
+            "db_path = \"x.db\"\n[opener]\nmode = \"windows-terminal\"\n",
+        ),
+    ] {
+        let file = m.write(name, text);
+        let expected_db = Some(m.path("cwd/x.db"));
+
+        // Explicit `--config`: strict.
+        let mut inputs = m.inputs();
+        inputs.cli_config = Some(file.clone());
+        let (config, r) = resolve(&inputs, Strictness::Strict).unwrap();
+        assert_eq!(config.db_path, Some(PathBuf::from("x.db")), "{name}");
+        assert_eq!(r.db_path, expected_db, "{name}");
+
+        // Found by the search: lenient, as a normal startup reads it.
+        let mut inputs = m.inputs();
+        inputs.env.banto_config = Some(file.clone());
+        let (_, r) = resolve(&inputs, Strictness::Lenient).unwrap();
+        assert_eq!(r.db_path, expected_db, "{name}");
+
+        // Handed over by a parent: loaded the same way the parent loaded it.
+        let mut inputs = m.inputs();
+        inputs.parent_config = Some(file);
+        let (_, r) = resolve(&inputs, Strictness::Strict).unwrap();
+        assert_eq!(r.db_path, expected_db, "{name}");
+    }
+}
+
+/// banto has one UI: `banto` alone starts it, `--emporium` and `--oodana` (what
+/// used to select it) are still accepted and mean nothing, and neither is
+/// advertised; the subcommand that supervised an external pane is gone.
+#[test]
+fn the_one_ui_starts_without_a_flag_and_the_old_flags_are_accepted_and_hidden() {
+    use clap::CommandFactory as _;
+
+    assert!(Cli::try_parse_from(["banto"]).unwrap().command.is_none());
+    for flag in ["--emporium", "--oodana"] {
+        let cli = Cli::try_parse_from(["banto", flag]).unwrap();
+        assert!(cli.command.is_none(), "{flag}");
+    }
+    let help = Cli::command().render_help().to_string();
+    for word in ["emporium", "oodana", "_wrap", "opener"] {
+        assert!(!help.contains(word), "`{word}` is advertised:\n{help}");
+    }
+    assert!(Cli::try_parse_from(["banto", "_wrap", "--session", "s", "--", "claude"]).is_err());
 }

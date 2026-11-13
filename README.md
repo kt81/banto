@@ -14,9 +14,10 @@ pinning, grouping and archiving layered on top — and the part that refuses
 to open one twice, because resuming a session that is already running forks
 its history.
 
-In its **emporium mode** (大店, *oodana*) it goes further: sessions become
-live embedded panes that keep running while you switch between them, and can
-be wired into Director/Worker cells that talk to each other through banto.
+It is one full-screen terminal UI: the ledger on the left, and on the right
+the sessions you open, hosted by banto itself as live panes that keep running
+while you switch between them — and that can be wired into Director/Worker
+cells that talk to each other through banto.
 
 Claude Desktop makes multi-session work feel like a workspace — sessions
 side by side, their state legible at a glance, panes you arrange to suit the
@@ -40,43 +41,41 @@ in, which are still running, and which of them you filed under what. Picking
 a row does not open a shell that happens to run `claude` — it returns you to
 one specific conversation, or to the process already having it.
 
-They are not rivals. `s` opens into a tmux/psmux pane, and the emporium is
-there for the times you would rather not run a multiplexer at all.
+banto does not drive a multiplexer. It hosts the panes itself, because a
+multiplexer cannot carry what banto does with them: a ledger beside the
+panes, sessions that know which cell they belong to, messages relayed between
+them.
 
 ## What it does
 
-The ledger has a name: the **chōba** (帳場, "the shop counter"), banto's
-default view, built by indexing the session files Claude Code writes under
-`~/.claude` and the session index Codex keeps under `~/.codex` — read-only,
-always; see below. Whatever you pick there
-opens one of three ways:
+The ledger on the left has a name: the **chōba** (帳場, "the shop counter") —
+the list of every session, built by indexing the session files Claude Code
+writes under `~/.claude` and the session index Codex keeps under `~/.codex`
+— read-only, always; see below. Search it, pin, group and archive its
+sessions, start a new one in a directory you pick or type.
 
-- **In-place** (default, `Enter`): banto hands its own terminal to
-  `claude --resume` and takes it back when the session exits. No
-  multiplexer involved, full native fidelity.
-- **Split** (`s`): into a separate tmux/psmux pane or Windows Terminal tab, for
-  multiplexer-layout users.
-- **Emporium** (大店 — `banto --emporium`, alias `--oodana`): banto becomes a
-  minimal embedded multiplexer — a persistent sidebar plus sessions hosted
-  in vt100-parsed panes, Vim-buffer-style swapping, sessions kept alive in
-  the background across switches.
+Whatever you pick there opens in a pane on the right (大店, the *emporium*:
+banto's own hosted-pane view). banto is a minimal embedded multiplexer — a
+persistent sidebar plus sessions hosted in vt100-parsed panes, Vim-buffer-style
+swapping, sessions kept alive in the background across switches.
 
-If a session is already running somewhere — another pane, another banto,
-a bare `claude` in some other window — banto focuses that process instead of
-starting a second one. That is the guarantee from the top of this page, and
-it is enforced on every one of these paths, not just the one you came in by.
+If a session is already open in one of banto's panes, picking it switches to
+that pane. If it is running anywhere else — another banto, a bare `claude` in
+some other window — banto refuses to start a second one and says so. That is
+the guarantee from the top of this page: resuming a session that is already
+running forks its history.
 
-### Director/Worker cells (emporium)
+### Director/Worker cells
 
-![The emporium with a staged cell: the sidebar's ledger on the left — a
+![banto with a staged cell: the ledger on the left — a
 🤝 Director row pinned under a counted header — and three live panes: a
 Director session flanked by two Workers reporting back](docs/assets/emporium-brigade.png)
 
-*A live cell at work (WSL + tmux): the Director reviews and directs; two
+*A live cell at work (on WSL): the Director reviews and directs; two
 Workers implement and report over banto's MCP channel. This screenshot is
 itself dogfooding — the session shown is building banto.*
 
-Inside the emporium, `B` appoints the selected session as a **Director** and
+`B` appoints the selected session as a **Director** and
 auto-spawns fresh **Worker** sessions beside it (count, model, and even
 product all configurable — a brigade's Workers can run Claude Code or Codex
 independently of the Director's own product). banto mediates a message
@@ -110,8 +109,10 @@ trusted.
 ## Status & caveats
 
 - A personal tool, pre-1.0, moving fast. Interfaces and the on-disk schema
-  migrate forward but nothing is promised yet.
-- **No supervisor, by design.** Sessions hosted in the emporium end when
+  migrate forward but nothing is promised yet: banto takes no backup before
+  migrating its database, and an older build cannot open one a newer build has
+  migrated.
+- **No supervisor, by design.** Sessions hosted in banto's panes end when
   banto does. Each one gets an ordinary console-close first, so `claude`
   finalizes its history exactly as it would on any window close and the
   session resumes cleanly next time — but banto is a workbench you sit at,
@@ -120,7 +121,7 @@ trusted.
   change**; banto defends with lenient parsing (unknown records and broken
   lines are skipped, never fatal) and synthetic-fixture tests, but a future
   Claude Code release could still surprise it.
-- The embedded mode speaks ConPTY, which has sharp edges (documented in
+- banto's own pane hosting speaks ConPTY, which has sharp edges (documented in
   [docs/notes/embedded-pty-spike.md](docs/notes/embedded-pty-spike.md):
   never answer DSR/DA, chunk boundaries carry meaning, child exit produces
   no EOF). These are handled — ConPTY is where the sharpest edges lived,
@@ -167,11 +168,8 @@ Requires a recent stable Rust toolchain (edition 2024).
 ```sh
 cargo build --release
 
-# Chōba: the default searchable session list
+# The UI: the session list on the left, banto-hosted panes on the right
 cargo run --
-
-# Emporium (oodana) mode: sidebar + embedded session panes
-cargo run -- --emporium
 
 # Plain-text session listing
 cargo run -- list
@@ -180,37 +178,32 @@ cargo run -- list
 cargo run -- --claude-home /path/to/.claude
 ```
 
+(`--emporium` and its alias `--oodana`, from when banto had two modes, are
+still accepted, do nothing, and will be removed.)
+
 ## Keys
 
-### Chōba (the list)
+One table. The first group is the list; the rest is what the panes add. With
+any session running, `q`/`Esc` takes two presses within 3 seconds (the first
+shows `Esc again to quit — N session(s) running`), since quitting ends every
+hosted process.
 
 | Key | Action |
 |---|---|
 | `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`/`End` | Move selection |
-| `Enter` / double-click | Resume in-place (or focus if already running) |
-| `s` | Resume split into a tmux/psmux pane / WT tab |
-| `n` / `N` | New session, in-place / split (pick or type a cwd) |
+| `Enter` / double-click | Open the session in a pane (switch to it if it is already open); on a Director, stage its whole cell |
+| `n` | New session (pick or type a cwd) |
 | `/` | Search (fuzzy, title + cwd) |
 | `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
 | `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
 | `D` | Restore (un-archive) the selected session, while archived ones are revealed |
-| `q` / `Esc` | Quit |
-
-### Emporium
-
-Everything above (minus split), plus — and with one difference: with any session
-running, `q`/`Esc` takes two presses within 3 seconds (the first shows `Esc again
-to quit — N session(s) running`), since quitting ends every hosted process:
-
-| Key | Action |
-|---|---|
-| `Enter` | Open embedded; on a Director, stage its whole cell |
+| `q` / `Esc` | Quit (two presses while sessions are running, see above) |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
-| `Ctrl+B` … | tmux-style prefix (configurable), from sidebar or pane: |
+| `Ctrl+B` … | tmux-style prefix (configurable), from the list or a pane: |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
 | … `Shift`+`Up`/`Down` | move the focused stack tile one slot up/down (focus stays on it) |
@@ -255,14 +248,6 @@ fallbacks and stay lenient — a missing or broken file there just means
 defaults, same as today.
 
 ```toml
-# "in-place" (default) | "auto" | "tmux" | "psmux" | "windows-terminal"
-# — everything but in-place picks the split backend `s` uses. "auto" reads
-# $TMUX first (real tmux, or psmux on Windows), then $WT_SESSION. Name the
-# multiplexer explicitly for an unusual install: they take the same commands
-# but address panes differently, so banto has to know which one it is
-# talking to.
-opener = "in-place"
-
 claude_home = "C:/Users/you/.claude"   # optional override
 db_path = "..."                        # optional override; an empty value is a startup error
 
@@ -275,7 +260,7 @@ agents = "all"
 today_hours = 24   # activity-dot bucketing
 week_days = 7
 
-[brigade]           # emporium Director/Worker cells
+[brigade]           # Director/Worker cells
 workers = 1         # Workers auto-spawned per cell (1..=8)
 worker_model = "sonnet"   # --model for spawned Workers ("" = inherit)
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
@@ -292,7 +277,7 @@ director_prompt = "..."
 worker_prompt = "..."
 
 [keys]
-prefix = "C-b"      # emporium prefix chord
+prefix = "C-b"      # pane prefix chord
 ```
 
 ## Architecture
@@ -308,7 +293,7 @@ crates/
 ├─ banto-core/  # pure: Event -> State + Cmd. deps: serde, vt100, nucleo — that's the point
 ├─ banto-io/    # the outside world: jsonl provider, sqlite, PTY host, watchers, probes
 ├─ banto-tui/   # rendering from &State (ratatui, no terminal backend)
-└─ banto/       # the bin: event loops, executors, the crossterm boundary
+└─ banto/       # the bin: the event loop, executors, the crossterm boundary
 ```
 
 Part of the boundary is compiler-enforced: `banto-core`'s `Cargo.toml`
@@ -324,7 +309,7 @@ not by sleeping.
 
 Further reading: [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) (design/
 requirements), [docs/notes/](docs/notes/) (on-device verification notes for
-psmux, ConPTY, and MCP).
+the embedded ConPTY host, MCP, and Codex briefing delivery).
 
 ## License
 

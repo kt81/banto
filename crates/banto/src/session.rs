@@ -6,22 +6,25 @@
 //! here writes to disk. Everything under `claude_home` is treated as
 //! strictly read-only.
 
-use std::collections::{BTreeSet, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::{ActivityConfig, ResolvedAgents};
 pub use banto_core::model::SessionRow;
-use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
+use banto_core::model::{Activity, AgeBucket, AgentKind, SessionId, SessionMeta};
 use banto_core::status::{AgeThresholds, age_bucket};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::live_candidate_thread_ids;
 use banto_io::codex_trust::HookTrustState;
+use banto_io::lineage::resolve_lineage;
 use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
 use banto_io::provider::{ProviderError, SessionProvider};
 use banto_io::status::{self, SysinfoProbe};
+use banto_io::store::Store;
 
 /// Number of seconds in one hour.
 const SECS_PER_HOUR: u64 = 60 * 60;
@@ -53,9 +56,8 @@ pub fn activity_tag(activity: Activity) -> &'static str {
 /// The startup notice for `Config.agents`, when [`resolve_agents`] had to
 /// ignore part of it — `None` when every name parsed cleanly (including the
 /// ordinary `all`/unset case, which never has anything to ignore). Shared
-/// by both `crate::tui::run` and `crate::embedded::run_emporium`, the two
-/// entry points with a status line to put this in; the `list` subcommand
-/// has no such line and doesn't call this.
+/// by `crate::embedded::run_emporium`, the entry point with a status line to
+/// put this in; the `list` subcommand has no such line and doesn't call this.
 ///
 /// Fires for a partial drop too, not only the total fallback: even when
 /// some names were recognized and the setting still did something real, a
@@ -159,7 +161,7 @@ pub fn load_rows(
 /// `enabled` (resolved from `Config::agents` by
 /// `banto_core::config::resolve_agents`) gates which provider *runs at
 /// all*, not which of its already-discovered rows get kept — unlike
-/// `App::reveal`/`crate::tui::mark_archived`, which filter or mark
+/// `App::reveal`/[`mark_archived`], which filter or mark
 /// rows banto has already read off disk. That distinction matters here
 /// specifically: `CodexProvider::discover` opens a foreign sqlite database,
 /// under a read-only exception this crate had to earn (see
@@ -203,7 +205,7 @@ pub(crate) fn alive_claude_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<
 /// The conversion half of [`load_rows`] — classify and sort already-
 /// discovered `metas` into [`SessionRow`]s — extracted so a caller that has
 /// its own discover() pass to feed elsewhere too (e.g. lineage resolution —
-/// see `crate::tui::superseded_from_metas`) doesn't need a second discover()
+/// see [`superseded_from_metas`]) doesn't need a second discover()
 /// just for this. `claude_home`/`thresholds` are still needed here: they
 /// drive the live-status read and activity classification, neither of which
 /// discovery itself touches.
@@ -260,7 +262,7 @@ pub fn rows_from_metas(
                 source_archived: meta.source_archived,
                 // Discovery reads `~/.claude` and `~/.codex`; banto's own
                 // archive lives in banto's store, which this never opens.
-                // `crate::tui::mark_archived` fills it in from there.
+                // [`mark_archived`] fills it in from there.
                 archived: false,
             }
         })
@@ -282,6 +284,133 @@ fn activity_from_observations(
         AgentKind::Codex if live_codex.contains(&meta.id.0) => Activity::Alive,
         AgentKind::Codex => Activity::Idle(age_bucket(meta.mtime, now, thresholds)),
     }
+}
+
+/// Drop archived sessions from `rows` — the union of two independent facts:
+/// banto's own archive (soft-hide via `d` — see
+/// `App::open_confirm_archive_modal`/`confirm_modal`), and, for Codex,
+/// `SessionRow::source_archived` (`threads.archived`, set by `codex
+/// archive`). Two facts, not one: banto's archive is per-session-id and
+/// product-neutral, entirely independent of whatever the session's own
+/// product thinks; `source_archived` is the reverse — a fact banto can only
+/// ever read, since `~/.codex` stays read-only to it (never a write, so
+/// never an unarchive from banto's side either). Either one hides the row;
+/// neither is cleared by the other disagreeing. Concretely: unarchiving in
+/// Codex (`codex unarchive`) clears `source_archived` on the next reload,
+/// and the row reappears *unless* the operator separately archived that
+/// same session in banto too, in which case it stays hidden until banto's
+/// own archive is lifted — a real store write, unaffected by anything
+/// Codex reports. A store read failure is tolerated: nothing gets excluded
+/// rather than blocking the TUI.
+pub(crate) fn mark_archived(rows: Vec<SessionRow>, store: &Store) -> Vec<SessionRow> {
+    let archived: HashSet<String> = store
+        .archived_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    rows.into_iter()
+        // `source_archived` is still dropped outright, and always will be:
+        // it is the source product's own flag, banto can only read it, and a
+        // row offering `D` that banto could never carry out would be worse
+        // than one that is simply absent. banto's own archive is a different
+        // fact — carried on the row and hidden by `Reveal`, so `D` can reach
+        // it at the level that shows it.
+        .filter(|row| !row.source_archived)
+        .map(|mut row| {
+            row.archived = archived.contains(&row.id);
+            row
+        })
+        .collect()
+}
+
+/// Load every known group, alphabetical by name. Tolerant: a read failure
+/// just means no groups are known yet, rather than blocking the TUI.
+pub(crate) fn load_groups(store: &Store) -> Vec<(i64, String)> {
+    let mut groups: Vec<(i64, String)> = store
+        .list_groups()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| (g.id, g.name))
+        .collect();
+    groups.sort_by(|a, b| a.1.cmp(&b.1));
+    groups
+}
+
+/// Load the session -> group id map by walking each group's members (fewer
+/// queries than asking per-session). Tolerant: a read failure for one group
+/// just means its members show as ungrouped, rather than blocking the TUI.
+pub(crate) fn load_session_groups(store: &Store, groups: &[(i64, String)]) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    for &(group_id, _) in groups {
+        for session_id in store.group_members(group_id).unwrap_or_default() {
+            map.insert(session_id.0, group_id);
+        }
+    }
+    map
+}
+
+/// Load the currently pinned session ids from the store. Tolerant: a read
+/// failure just means no sessions start out pinned, rather than blocking the
+/// TUI from starting.
+pub(crate) fn load_pinned(store: &Store) -> HashSet<String> {
+    store
+        .pinned_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Load every brigade Worker's or Goinkyo's Claude session id, across every
+/// brigade, that has been assigned one so far — [`App`] hides these from the
+/// list (see `App::hidden`). Tolerant: a read failure just means nothing is
+/// hidden yet, rather than blocking the TUI from starting.
+pub(crate) fn load_hidden_member_ids(store: &Store) -> HashSet<String> {
+    store
+        .brigade_hidden_session_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Load every brigade Director's Claude session id, across every brigade —
+/// [`App`] marks these in the list/summary (see `App::directors`). Tolerant:
+/// a read failure just means no marker shows yet, rather than blocking the
+/// TUI from starting.
+pub(crate) fn load_directors(store: &Store) -> HashSet<String> {
+    store
+        .brigade_director_session_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Spend this reload's lineage-resolution budget against already-discovered
+/// `metas`, then return every session id with a known auto-compaction
+/// continuation — [`App`] hides these (see `App::superseded`). Takes
+/// `metas` rather than discovering its own: `SessionMeta`'s
+/// `continuation_of_uuid` doesn't survive into [`session::load_rows`]'s
+/// `SessionRow`s, but `banto_io::lineage::resolve_lineage` already wants
+/// exactly `&[SessionMeta]`, so every call site — which already needs a
+/// discover() pass for the rows anyway — can hand the same one here instead
+/// of paying for a second. Tolerant: a lineage-resolution failure just means
+/// no progress this pass, not a blocked TUI.
+pub(crate) fn superseded_from_metas(
+    metas: &[SessionMeta],
+    store: &Store,
+    failed: &RefCell<HashSet<SessionId>>,
+) -> HashSet<String> {
+    let mut failed = failed.borrow_mut();
+    let _ = resolve_lineage(store, metas, &mut failed);
+    store
+        .lineage_parent_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -689,5 +818,164 @@ mod tests {
     fn filetime_set(path: &Path, time: SystemTime) {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
+    }
+
+    /// A synthetic row with nothing but the fields the loaders' tests read.
+    fn row(id: &str, title: &str, cwd: &str, activity: Activity) -> SessionRow {
+        SessionRow {
+            id: id.into(),
+            agent: AgentKind::ClaudeCode,
+            title: Some(title.into()),
+            cwd: Some(PathBuf::from(cwd)),
+            activity,
+            is_agent: false,
+            preview: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+            source_archived: false,
+            archived: false,
+        }
+    }
+
+    /// A synthetic [`SessionMeta`] fixture with no continuation.
+    fn plain_meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            id: SessionId(id.to_string()),
+            agent: AgentKind::ClaudeCode,
+            title: None,
+            cwd: None,
+            source_path: PathBuf::from(format!("{id}.jsonl")),
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 0,
+            is_agent: false,
+            preview: None,
+            continuation_of_uuid: None,
+            source_archived: false,
+        }
+    }
+
+    /// Same as [`plain_meta`], but flagged as an auto-compaction
+    /// continuation of `parent_uuid`, at a real `source_path` on disk (so
+    /// `resolve_lineage`'s streaming scan, invoked through
+    /// [`superseded_from_metas`], has a project directory to search).
+    fn continuation_meta(id: &str, source_path: PathBuf, parent_uuid: &str) -> SessionMeta {
+        SessionMeta {
+            continuation_of_uuid: Some(parent_uuid.to_string()),
+            source_path,
+            ..plain_meta(id)
+        }
+    }
+
+    #[test]
+    fn superseded_from_metas_resolves_a_continuation_from_the_shared_discover_pass() {
+        // No independent discover() here: `metas` is handed in directly, the
+        // same way every call site now shares one discover() pass between
+        // rows and lineage — see `superseded_from_metas`'s doc.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("parent.jsonl"),
+            "{\"type\":\"user\",\"uuid\":\"P1\"}\n",
+        )
+        .unwrap();
+        let child_path = dir.path().join("child.jsonl");
+        std::fs::write(&child_path, "{\"type\":\"mode\"}\n").unwrap();
+        let metas = vec![continuation_meta("child", child_path, "P1")];
+
+        let store = Store::open_in_memory().unwrap();
+        let failed = RefCell::new(HashSet::new());
+
+        let superseded = superseded_from_metas(&metas, &store, &failed);
+
+        assert_eq!(superseded, HashSet::from(["parent".to_string()]));
+        assert!(failed.borrow().is_empty());
+    }
+
+    #[test]
+    fn superseded_from_metas_is_empty_for_sessions_without_a_continuation() {
+        let store = Store::open_in_memory().unwrap();
+        let failed = RefCell::new(HashSet::new());
+        let metas = vec![plain_meta("a"), plain_meta("b")];
+
+        let superseded = superseded_from_metas(&metas, &store, &failed);
+
+        assert!(superseded.is_empty());
+        assert!(failed.borrow().is_empty());
+    }
+
+    #[test]
+    fn superseded_from_metas_records_an_unresolvable_continuation_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_path = dir.path().join("child.jsonl");
+        std::fs::write(&child_path, "{\"type\":\"mode\"}\n").unwrap();
+        let metas = vec![continuation_meta(
+            "child",
+            child_path,
+            "nowhere-to-be-found",
+        )];
+
+        let store = Store::open_in_memory().unwrap();
+        let failed = RefCell::new(HashSet::new());
+
+        let superseded = superseded_from_metas(&metas, &store, &failed);
+
+        assert!(superseded.is_empty());
+        assert!(failed.borrow().contains(&SessionId("child".to_string())));
+    }
+
+    #[test]
+    fn mark_archived_marks_a_row_banto_itself_archived() {
+        let store = Store::open_in_memory().unwrap();
+        store.archive_session(&SessionId("a".to_string())).unwrap();
+        let rows = vec![row("a", "A", "", Activity::Alive)];
+
+        let marked = mark_archived(rows, &store);
+        assert_eq!(marked.len(), 1, "banto's own archive keeps the row, marked");
+        assert!(marked[0].archived);
+    }
+
+    #[test]
+    fn mark_archived_still_drops_a_row_only_codex_marked_archived() {
+        let store = Store::open_in_memory().unwrap();
+        // banto's own archive table has nothing for "a" at all — this row's
+        // only reason to be hidden is `source_archived`, set by discovery
+        // from Codex's own `threads.archived` (see `provider::codex`).
+        let rows = vec![SessionRow {
+            source_archived: true,
+            archived: false,
+            ..row("a", "A", "", Activity::Alive)
+        }];
+
+        assert!(mark_archived(rows, &store).is_empty());
+    }
+
+    #[test]
+    fn mark_archived_leaves_an_unarchived_row_unmarked() {
+        let store = Store::open_in_memory().unwrap();
+        let rows = vec![row("a", "A", "", Activity::Alive)];
+
+        let marked = mark_archived(rows, &store);
+        assert_eq!(marked.len(), 1);
+        assert!(!marked[0].archived);
+    }
+
+    #[test]
+    fn mark_archived_marks_via_bantos_own_archive_even_after_codex_unarchives() {
+        // The disagreement case: the operator archived "a" in banto (`d`)
+        // independently of Codex; Codex's own `archived` flag has since
+        // gone back to false (`codex unarchive`, reflected on the next
+        // discovery as `source_archived: false`). The row stays hidden —
+        // banto's own archive is a separate fact banto never clears just
+        // because the source disagrees; only banto's own unarchive would.
+        let store = Store::open_in_memory().unwrap();
+        store.archive_session(&SessionId("a".to_string())).unwrap();
+        let rows = vec![SessionRow {
+            source_archived: false,
+            archived: false,
+            ..row("a", "A", "", Activity::Alive)
+        }];
+
+        let marked = mark_archived(rows, &store);
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].archived);
     }
 }

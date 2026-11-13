@@ -1,10 +1,9 @@
-//! Shared session-list / summary rendering, used by both the chōba list TUI
-//! (`banto::tui`) and the emporium sidebar (`banto::embedded::emporium`).
+//! Session-list / summary rendering for the emporium sidebar
+//! (`banto::embedded::emporium`).
 //!
-//! These are pure `(frame, app, area, now)` widgets so either mode can place
+//! These are pure `(frame, app, area, now)` widgets so the shell can place
 //! them in its own layout; all list/selection/scroll state lives in
-//! `banto_core::app::App`, which both modes drive. Extracted from the chōba
-//! TUI so the two modes render sessions identically rather than drifting.
+//! `banto_core::app::App`.
 //!
 //! # Emoji markers
 //!
@@ -35,13 +34,13 @@
 //! # Row layout
 //!
 //! One algorithm, driven by the render area's width and whether grouped
-//! view is actually in effect (`App::grouped_view_in_effect`), for both
-//! modes: `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label][gap>=2][age]`.
+//! view is actually in effect (`App::grouped_view_in_effect`):
+//! `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label][gap>=2][age]`.
 //! The pin slot exists (3 columns) only in flat view — in grouped view
 //! every pinned row's section is "Pinned" (`App::section_name` gives it
 //! top priority), so a pin marker could never render there anyway; the
 //! column is dropped entirely rather than reserved-but-always-blank. The
-//! role slot is unconditional in both modes. A present marker slot is the
+//! role slot is unconditional, in flat and grouped view alike. A present marker slot is the
 //! emoji plus one trailing separator space — a glued-together `📌🤝title`
 //! reads as one sticker, not two markers. See [`row_line`] for the exact
 //! budget arithmetic (title/cwd mutually exclusive truncation, age always
@@ -49,9 +48,9 @@
 //! narrow-width degradation that drops the age column entirely rather than
 //! ever let it collide into the prefix).
 //!
-//! A row is one line (`App::lines_per_row` 1, the chōba — the label sits on
-//! that same line, per the formula above) or two (more than 1, the emporium
-//! sidebar): line one is the formula above minus the label, line two is cwd
+//! A row is one line (`App::lines_per_row` 1, its default — the label sits on
+//! that same line, per the formula above) or two (more than 1; the emporium
+//! sidebar uses 2): line one is the formula above minus the label, line two is cwd
 //! plus the label, indented to align under the title rather than starting
 //! at column zero — see [`cwd_agent_line`].
 
@@ -95,9 +94,8 @@ fn fixed_prefix_width(show_pin_slot: bool) -> usize {
 const MIN_GAP_BEFORE_AGE: usize = 2;
 const TITLE_CWD_GAP: usize = 2;
 /// Gap between the title/cwd content and the agent label, when both share
-/// one physical line (the chōba — see [`App::lines_per_row`]; the emporium
-/// sidebar puts the label on its own second line instead, via
-/// [`cwd_agent_line`]).
+/// one physical line (`App::lines_per_row` 1; the emporium sidebar puts the label
+/// on its own second line instead, via [`cwd_agent_line`]).
 const LABEL_GAP: usize = 2;
 /// cwd is only shown if at least this many columns remain for it once the
 /// title (at its natural, untruncated width) and the title-cwd gap are
@@ -156,8 +154,8 @@ pub fn render_list(frame: &mut Frame, app: &App, area: Rect, now: SystemTime) {
 /// rather than a header bundled into its row, matching the index space
 /// `App::click`/`App::scroll`/`App::ensure_visible` all use — see
 /// [`ListLine`] for why that matters for mouse clicks. A row is one line
-/// when `lines_per_row` is 1 (the chōba, with the agent label sharing that
-/// line — see [`row_line`]), or two when it's more (the emporium sidebar:
+/// when `lines_per_row` is 1 (the agent label sharing that line — see
+/// [`row_line`]), or two when it's more (the emporium sidebar:
 /// title/age, then cwd/agent — see [`cwd_agent_line`]); a header is always
 /// one line regardless, matching `App::lines_per_row`'s own accounting.
 fn list_item(
@@ -221,8 +219,8 @@ fn header_line(name: &str, count: usize) -> ListItem<'static> {
 /// `[dot 2][pin 0-or-3][role 3][title][gap 2][cwd?][gap][label?][gap>=2][age]`
 /// — see the module doc's "Row layout" section for why the pin slot is
 /// conditional on `show_pin_slot`. `label` is `None` when the emporium
-/// sidebar's second line ([`cwd_agent_line`]) carries it instead; `Some` for
-/// the chōba, where the row stays one line.
+/// sidebar's second line ([`cwd_agent_line`]) carries it instead; `Some` when
+/// the row stays one line.
 ///
 /// `title` and `cwd` are mutually exclusive truncation targets: cwd is only
 /// shown when the title's *natural* (untruncated) width already leaves at
@@ -1148,10 +1146,10 @@ mod tests {
         );
     }
 
-    // --- agent label (chōba: same line; sidebar: second line) -----------
+    // --- agent label (one-line row: same line; sidebar: second line) ------
 
     #[test]
-    fn choba_row_shows_the_agent_label_after_cwd_and_before_age_for_both_products() {
+    fn one_line_row_shows_the_agent_label_after_cwd_and_before_age_for_both_products() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut app = App::new(vec![
             row("c", "Claude Row", "", now),
@@ -1175,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn choba_narrow_width_drops_the_label_and_age_together() {
+    fn one_line_row_at_a_narrow_width_drops_the_label_and_age_together() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut app = App::new(vec![row("r", "A Reasonably Long Title", "", now)]);
         app.set_viewport_height(10);

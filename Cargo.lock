@@ -118,7 +118,6 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
- "thiserror 2.0.19",
  "toml",
  "unicode-width",
  "vt100-psmux",

@@ -19,9 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use banto_core::config::{
-    ActivityConfig, BrigadeConfig, Config, KeysConfig, OpenerMode, RelayMode,
-};
+pub use banto_core::config::{ActivityConfig, BrigadeConfig, Config, KeysConfig, RelayMode};
 
 /// `dirs::config_dir()/banto/config.toml`
 /// (e.g. `%APPDATA%\banto\config.toml` on Windows,
@@ -205,10 +203,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             &dir,
-            "opener = \"psmux\"\n[brigade]\nworkers = 3\nworker_model = \"opus\"\n",
+            "agents = \"codex\"\n[brigade]\nworkers = 3\nworker_model = \"opus\"\n",
         );
         let config = load(&path).unwrap();
-        assert_eq!(config.opener, OpenerMode::Psmux);
+        assert_eq!(config.agents, "codex");
         assert_eq!(config.brigade.workers, 3);
         assert_eq!(config.brigade.worker_model, "opus");
     }
@@ -216,7 +214,7 @@ mod tests {
     #[test]
     fn invalid_toml_errors_strictly_and_defaults_tolerantly() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = [not toml");
+        let path = write_config(&dir, "agents = [not toml");
         assert!(matches!(load(&path), Err(ConfigError::Parse { .. })));
         assert_eq!(load_or_default(&path), Config::default());
     }
@@ -224,9 +222,31 @@ mod tests {
     #[test]
     fn wrong_field_type_is_a_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = \"no-such-backend\"\n");
+        let path = write_config(&dir, "claude_home = 5\n");
         assert!(matches!(load(&path), Err(ConfigError::Parse { .. })));
         assert_eq!(load_or_default(&path), Config::default());
+    }
+
+    /// A config file written when `opener` was a setting still loads, through
+    /// every way of loading one — strict, explicit and tolerant — whatever shape
+    /// the leftover takes, and the rest of the file is read as written.
+    #[test]
+    fn a_leftover_opener_setting_is_not_an_error_on_any_load_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            "opener = \"psmux\"\n[brigade]\nworkers = 3\n",
+            "opener = \"no-such-backend\"\n[brigade]\nworkers = 3\n",
+            "[opener]\nmode = \"windows-terminal\"\n[brigade]\nworkers = 3\n",
+        ] {
+            let path = write_config(&dir, text);
+            for config in [
+                load(&path).unwrap(),
+                load_explicit(&path).unwrap(),
+                load_or_default(&path),
+            ] {
+                assert_eq!(config.brigade.workers, 3, "{text:?}");
+            }
+        }
     }
 
     #[test]
@@ -254,14 +274,14 @@ mod tests {
     #[test]
     fn load_explicit_round_trips_an_existing_file_like_load() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = \"psmux\"\n");
+        let path = write_config(&dir, "agents = \"codex\"\n");
         assert_eq!(load_explicit(&path).unwrap(), load(&path).unwrap());
     }
 
     #[test]
     fn load_explicit_still_surfaces_a_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "opener = [not toml");
+        let path = write_config(&dir, "agents = [not toml");
         assert!(matches!(
             load_explicit(&path),
             Err(ConfigError::Parse { .. })

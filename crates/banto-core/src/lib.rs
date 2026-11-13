@@ -9,7 +9,7 @@
 //! - [`config`] config.toml's types (loading them from disk is `banto_io::config`)
 //! - [`status`] activity age-bucketing math (live-process state is `banto_io::status`)
 //! - [`search`] nucleo fuzzy search
-//! - [`app`]    the chōba list TUI's UI-free state (`App` and friends)
+//! - [`app`]    the session list's UI-free state (`App` and friends)
 //! - [`engine`] the emporium's pure core: `update(state, ev, now) -> Vec<Cmd>`
 //! - [`layout`] the emporium's geometry: tiles, drag handles and the layout
 //!   preferences, as a pure function of the area, the stage and those

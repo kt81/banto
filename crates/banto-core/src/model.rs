@@ -133,7 +133,7 @@ pub struct SessionMeta {
     /// own archive (`Store::archive_session`, bound to `d`): that one is
     /// banto's per-session-id fact, product-neutral and always reversible
     /// from within banto; this one banto can only ever read, never clear —
-    /// `~/.codex` stays read-only (see `banto::tui::mark_archived` for
+    /// `~/.codex` stays read-only (see `banto::session::mark_archived` for
     /// how the two combine into what the list actually hides).
     pub source_archived: bool,
 }
@@ -301,10 +301,9 @@ pub fn humanize_size(bytes: u64) -> String {
     }
 }
 
-/// A session about to be opened or focused — pure data the emporium's
-/// `Cmd::OpenEmbedded` carries; the actual opening (spawning a PTY child,
-/// or in the chōba list, resuming/focusing it in a real terminal backend)
-/// is `banto` (bin) and `banto_io`'s job.
+/// A session about to be opened — pure data the emporium's
+/// `Cmd::OpenEmbedded` carries; the actual opening (spawning a PTY child) is
+/// `banto` (bin) and `banto_io`'s job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToOpen {
     pub id: String,

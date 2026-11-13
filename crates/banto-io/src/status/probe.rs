@@ -49,9 +49,9 @@ impl SysinfoProbe {
     /// [`ProcessProbe`]: it serves a list pass that already knows every PID,
     /// while the trait deliberately stays a small mockable point-query
     /// interface for open/resume and ancestry. Because [`ProcessProbe::is_alive`]
-    /// calls this helper, the `banto` binary crate's `opener::is_live` and
-    /// `opener::open_session` reach it for their no-double-resume guard;
-    /// display-only policy must stay above this helper.
+    /// calls this helper, the `banto` binary crate's `launch::is_live` reaches
+    /// it for its no-double-resume guard; display-only policy must stay above
+    /// this helper.
     ///
     /// Windows deliberately opens each requested PID instead of asking
     /// `sysinfo` for `ProcessesToUpdate::Some`: measured on the operator's
@@ -174,7 +174,7 @@ enum WindowsPidState {
 #[cfg(windows)]
 impl WindowsPidState {
     fn is_alive(self) -> bool {
-        // `Unknown` is deliberately live. This reaches opener's double-resume
+        // `Unknown` is deliberately live. This reaches the double-resume
         // guard, where a mistaken `false` forks session history; a conservative
         // refusal is the only safe outcome when Windows cannot answer.
         !matches!(self, Self::Dead)

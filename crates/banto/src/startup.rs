@@ -12,7 +12,7 @@
 //! An empty path is left as it is (it has never named the working directory), and
 //! so is every relative path when the working directory cannot be read.
 //!
-//! A banto that starts other banto processes (`_mcp`, `_wrap`, `_hook`) hands
+//! A banto that starts other banto processes (`_mcp`, `_hook`) hands
 //! them what it resolved — [`Resolved::child_args`] on their command lines,
 //! [`Resolved::child_env`] for the one that cannot take arguments — and a child
 //! that is given them resolves exactly those, consulting neither its own

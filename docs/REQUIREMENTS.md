@@ -2,9 +2,9 @@
 
 A resident TUI tool that manages local Claude Code and Codex session
 history with Claude-Desktop-like listing and grouping, and resumes a
-selected session — by default **in-place**, in banto's own terminal, with
-resuming in a separate psmux pane / Windows Terminal tab as a first-class
-alternate. Windows-first.
+selected session in a pane banto hosts itself: the session list (the chōba,
+the ledger) on the left, live embedded sessions on the right. One UI, no
+other way of opening a session. Windows-first.
 
 Name origin: 番頭 (bantō) — the head clerk of a traditional Japanese shop, who
 stays on the premises and directs and watches over the guests (sessions).
@@ -15,35 +15,34 @@ stays on the premises and directs and watches over the guests (sessions).
 - Grouping (a session belongs to at most one group), pinning, and archiving
   (soft-hide) — all stored by banto itself, never writing to either agent's
   own files
-- Enter on a search result resumes the session **in-place**: banto tears
-  down its own TUI (leaves the alt screen, disables raw mode and mouse
-  capture), runs the session as a direct child process in the same
-  terminal, waits for it to exit, then reinitializes the TUI and returns to
-  the (reloaded) list. This is the default and primary action; no terminal
-  multiplexer is involved
-- `s` resumes the session in a separate psmux pane / Windows Terminal tab
-  instead, for users who want a multiplexer layout — see Opener spec
+- Enter on a search result opens the session in a pane on the right, hosted by
+  banto itself: banto spawns the agent in a PTY it owns, parses its output
+  with a VT emulator and renders the grid (see "The emporium: hosted panes"). A
+  session that is already open in one of banto's panes is switched to, not
+  opened a second time
 - A dedicated dialog also launches a brand-new session (pick or type a
-  working directory), not just resumes an existing one — `n` opens it
-  in-place, `N` opens it for a split launch, mirroring Enter/`s` on the list
+  working directory), not just resumes an existing one — `n`
 - If a session is already resumed, refuse to start a second one instead
-  (a double resume forks the session history and is therefore forbidden):
-  in-place checks liveness up front and shows "already running"; split mode
-  activates the existing pane/tab instead
+  (a double resume forks the session history and is therefore forbidden): a
+  session open in one of banto's panes is switched to; one running anywhere
+  else (another banto, an agent started by hand) is refused with "already
+  running elsewhere"
 - Activity indicator (colored dot) in the list. Busy sessions get special
   treatment; the rest are bucketed by time since last update
 - Mouse support including wheel scrolling
 - Runs on Windows; keeps a structure that also builds on macOS / Linux
-- The overall default is in-place (`opener = "in-place"`); setting `opener`
-  to `"auto"` / `"tmux"` / `"psmux"` / `"windows-terminal"` instead picks
-  which split backend `s` uses (see Opener spec)
 
 Out of MVP scope: Claude Desktop (claude.ai) history, remote/SSH. ("Built-in
-PTY" was superseded 2026-07-22 by the emporium mode. "Other agents" left the
-list when Codex support landed (`CodexProvider`, `AgentKind::Codex`). Neither
-was an MVP revision; both are later scope layered on top.)
+PTY" was out of the original MVP and came in with the emporium, 2026-07-22.
+"Other agents" left the list when Codex support landed (`CodexProvider`,
+`AgentKind::Codex`). Neither was an MVP revision; both are later scope layered
+on top.)
 
 ## Architecture decision (2026-07-19)
+
+*Status (2026-11-13): superseded by the 2026-07-22 entry (banto became a
+multiplexer after all) and, for its "external terminal control", retired by the
+2026-11-13 entry. Kept as the record of what banto started as.*
 
 **TUI launcher + external terminal control.** No built-in multiplexer.
 banto does no terminal emulation of its own; resuming is delegated to a real
@@ -53,16 +52,26 @@ switcher" built-in view (portable-pty + tui-term) can evolve on the same core.
 
 ## Architecture decision (2026-07-20): in-place as the default action
 
+*Status (2026-11-13): superseded — in-place resume and split-into-a-pane/tab
+no longer exist; see the 2026-11-13 entry below. Kept as the record of why
+they were chosen.*
+
 **In-place resume is the default (Enter); split-into-a-pane/tab remains a
 first-class alternate (`s` / `opener` config), not deprecated.** In-place
 still needs no PTY emulation and no multiplexer, consistent with the
 2026-07-19 decision above — it's the simplest possible case, banto's own
 terminal handed straight to a direct child process. Motivated by psmux's
 non-uniqueness of window/pane ids across sessions
-(docs/notes/psmux-spike.md) making split-mode targeting inherently more
+(the psmux spike note, deleted 2026-11-13 with the code it described; it
+remains in git history) making split-mode targeting inherently more
 fragile than just running the session where banto already is.
 
 ## Architecture decision (2026-07-22): the emporium — banto becomes a multiplexer
+
+*Status (2026-11-13): the wording below that makes the emporium a "mode"
+chosen with a flag, and the paragraph saying that the chōba stays
+in-place-first and that the emporium is a separate, additional top-level mode,
+no longer hold — see the 2026-11-13 entry. The rest stands.*
 
 **An evolution of the 2026-07-19 decision above, not a reversal of it.** That
 entry stays exactly as written above: it records what banto deliberately
@@ -85,7 +94,7 @@ This is the **emporium** mode (大店, *oodana* — `banto --emporium` / `--ooda
 a persistent sidebar plus one or more sessions hosted as live embedded
 panes, up to and including brigade Director/Worker multi-session cells that
 banto itself wires together over its own MCP server and keeps talking via
-an auto-relay (see "Emporium mode", "Brigade (Director/Worker cells)", "MCP
+an auto-relay (see "The emporium: hosted panes", "Brigade (Director/Worker cells)", "MCP
 mediation server", and "Auto-relay" below). The chōba is unaffected and
 stays in-place-first per the 2026-07-20 decision; the emporium is a
 separate, additional top-level mode (`--emporium`), not a replacement for
@@ -100,6 +109,10 @@ four-crate physical split (`banto-core` / `banto-io` / `banto-tui` / `banto`)
 completed 2026-07-25 (`docs/DISCIPLINE.md` §2's own status marker).
 
 ## Architecture decision (2026-07-26): the chōba is feature-frozen
+
+*Status (2026-11-13): moot — there is no chōba mode left to freeze; see the
+2026-11-13 entry below. Kept because it records an incident about how a
+policy sentence was misread.*
 
 **The chōba (formerly the "classic" list mode; `banto` with no flags) takes no
 work done *for the chōba*.** New capability aimed at it belongs in the
@@ -123,6 +136,44 @@ needing the operator's sign-off. It was not one.
 does not work off Windows, not a feature it lacks. The same reading covers
 the input-path fix that preceded it. What is out of scope is work whose
 reason is the chōba — making it do something new, for its own sake.
+
+## Architecture decision (2026-11-13): one UI — the chōba is retired as a mode
+
+**banto has one UI.** `banto` with no subcommand starts the session list on
+the left and banto-hosted panes beside it. The chōba as a mode — the default
+list, which opened a session by handing over banto's own terminal ("in-place"),
+or into a tmux/psmux pane or a Windows Terminal tab through the `_wrap` helper
+— is retired, together with every way of opening a session outside banto's own
+panes. This supersedes the 2026-07-20 decision (in-place as the default
+action), the reading of the 2026-07-22 decision that made the emporium "a
+separate, additional top-level mode", and the 2026-07-26 feature freeze, which
+has nothing left to freeze. Those entries stay above as the record of what
+banto was.
+
+*Gone:* in-place resume; split/tab opening (tmux, psmux, Windows Terminal) and
+the `_wrap` subcommand that supervised those panes; the `[opener]` config
+section and `BANTO_WRAP_LOG`; the `panes` table (dropped by store migration v17: see "Module layout");
+the chōba's key table as a separate thing. *Unchanged:* the list's own features
+(search, grouping, pinning, archive/reveal, new session), everything about
+panes, brigades and MCP, the hand-off of resolved paths to `_mcp` and `_hook`,
+the message log, `banto list` and `banto versions`.
+
+"Chōba" remains only as the nickname of the session list on the left (the
+ledger); "emporium" as the name of the hosted-panes UI. `--emporium` and its
+alias `--oodana` are still accepted, do nothing, are hidden from `--help`, and
+are slated for removal.
+
+*Why* (the operator's reasons, 2026-11-13):
+
+- Tmux-like multiplexers could not carry what the emporium does, so banto ended
+  up hosting panes itself anyway; driving an external multiplexer was a second,
+  weaker road to the same place.
+- In-place resume had no demand: the agents' own pickers already list sessions
+  across projects.
+- banto does not intend to support many agent products, so "one list across
+  every agent" is not a demand it can answer.
+- Nobody used the external paths, and every cross-cutting change had to carry
+  them untested.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -278,10 +329,15 @@ nothing with no visible cause.
 by the operator, or a typo is indistinguishable from `all` with no way to
 find out short of reading the source. `ResolvedAgents.ignored` records every
 unrecognized name (deduplicated, first-seen order); `session::agents_ignored_notice`
-turns that into one line, posted once via `App::set_status` right after
-`App::new` in both `tui::run` and `embedded::run_emporium` — the two
-entry points with a status line to put it in (the `list` subcommand has
-none, and doesn't call this). Fires for a partial drop too, not only the
+turns that into one line. It is one of up to two **startup notices**; the other
+is the Codex hook-trust notice (see "Brigade", formation gate 3). At startup the
+shell computes whichever apply and hands them to the core as one event
+(`Event::StartupNotices`; nothing is sent when neither applies). The core shows
+them on the status line one after the other — each for the status line's normal
+duration, the next taking the line when it becomes free, a notice waiting
+rather than replacing some other status already showing — and they block no
+input. The `list` subcommand has no status line, and computes neither. The
+ignored-name notice fires for a partial drop too, not only the
 total fallback: an operator who kept a real, working filter is still owed
 the fact that part of what they wrote silently did nothing.
 `ResolvedAgents.fell_back_to_all` only changes the wording (naming what's
@@ -289,8 +345,8 @@ still enabled vs. saying the setting had no effect at all) — both cases
 show the notice.
 
 **Applies at discovery, not display — deliberately breaking precedent.**
-Every other row filter in this codebase (`App::show_agents`,
-`crate::tui::exclude_archived`) filters rows already read off disk.
+Every other row filter in this codebase (`App::show_agents`, the
+archive/reveal filter) filters rows already read off disk.
 `enabled_agents` instead gates which `SessionProvider` runs at all, inside
 `session::discover_all` — the one place both providers' `discover()` calls
 live. A disabled product's provider is never constructed, let alone called:
@@ -313,7 +369,7 @@ list to nothing keeps its own unrelated "No matching sessions." message.
 
 Four crates, split along the TEA / sans-IO boundary
 (`docs/DISCIPLINE.md`) — `banto-core` is UI-free *and* I/O-free; the
-provider/status/store/opener/config modules once sketched here as
+provider/status/store/config modules once sketched here as
 `banto-core` submodules live in `banto-io`, not there:
 
 ```
@@ -322,108 +378,50 @@ crates/
 ├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
 │  ├─ provider/         # SessionProvider trait + claude_code impl (JSONL) + codex impl (sqlite)
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
-│  ├─ store/            # rusqlite: groups/pins/archived, brigades, session<->pane map
-│  ├─ opener/           # Opener trait + tmux(psmux) / windows-terminal impls + auto detection
-│  ├─ watch/            # filesystem watching (notify) for live TUI updates
+│  ├─ store/            # rusqlite: groups/pins/archived, brigades, UI preferences
+│  ├─ watch/            # filesystem watching (notify) for live TUI updates — `LiveWatch` (debounced reload trigger) + the raw change source
 │  ├─ data_dir.rs       # banto's own data directory: where each working file lives, and the sweep of ended members' files
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
-│  ├─ process.rs        # resumed-session process spawning
 │  └─ config.rs         # config.toml (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir), DB in dirs::data_local_dir/banto
 ├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view/render_modal
-└─ banto/               # bin: ratatui TUI + clap subcommands (banto, banto _wrap, banto _mcp, ...) — chōba's tui.rs + the emporium's embedded/
+└─ banto/               # bin: clap subcommands (banto, banto _mcp, banto _hook, banto list, ...), the one UI's event loop and executors
+   ├─ main.rs           # clap CLI and dispatch
+   ├─ startup.rs        # where config, database, data dir and the agent homes are (and what a child is handed)
+   ├─ session.rs        # discovery + activity classification into list rows, and the store loaders the list needs (pins, groups, archive, hidden members, Directors)
+   ├─ launch.rs         # how an agent is started: AgentLaunch argv per product, CodexBrigade's `-c` overrides, [agent_binaries] selection, OpenContext, and `is_live` — the double-resume guard
+   ├─ embedded/         # the UI: event loop + executors (emporium.rs), per-pane PTY handling, crossterm conversion, paste synthesis
+   ├─ mcp.rs            # `banto _mcp`, the brigade mediation server
+   ├─ hook.rs           # `banto _hook`, Codex's SessionStart hook (with briefing.rs, the shared role-briefing renderer)
+   └─ codex_trust.rs    # the argv of the one-time approval pane for banto's own Codex hook
 ```
 
-## Opener spec
+**The store's schema** is versioned by `PRAGMA user_version`; `store/migrations.rs`
+holds one script per version (17 today) and every open applies what is pending,
+under the write lock. banto takes **no backup** before migrating, and an older
+build cannot open a database a newer one has migrated: it reports `unsupported
+database schema version <n>` rather than guess. v17 dropped `panes`, the map of
+a session to its external-terminal pane, which nothing records or reads once
+banto opens sessions only in its own panes; any rows went with it.
 
-Two actions, mirrored by a TUI key (Enter = in-place, `s` = split) and by
-`opener` in `config.toml` (default `"in-place"`; `"auto"` / `"tmux"` /
-`"psmux"` / `"windows-terminal"` pick a split backend instead — the exact `s`-vs-`opener`
-interaction when `opener` is left at its `"in-place"` default is an
-implementation detail for the split-mode work, not fixed by this doc):
+## The emporium: hosted panes
 
-### In-place (default)
+Introduced by the 2026-07-22 architecture decision above; since the 2026-11-13
+decision it is the whole UI, not a mode of it. `banto` with no subcommand opens
+a persistent left sidebar (the session list, the chōba) plus a right pane
+hosting the selected session **embedded** — the child's PTY is spawned and read
+by banto itself (`portable-pty-psmux`), its output parsed with a VT emulator
+(`vt100`) into a `Screen` the core owns, and rendered into a ratatui pane.
+banto itself is the terminal the session's output paints into: no session is
+handed banto's own terminal, and none is opened in a pane or tab banto does not
+render.
 
-banto hands its own terminal to the session directly: tear down the TUI
-(leave the alt screen, disable raw mode and mouse capture), run
-`claude --resume <id>` (or plain `claude` in the target cwd for a new
-session) as a direct child process, wait for it to exit, then reinitialize
-ratatui and reload the list. No multiplexer, no pane/tab, no `_wrap`
-wrapper — banto is already the direct parent and observes the exit itself.
-Before spawning, the same liveness check `status` uses elsewhere (PID
-alive?) guards against double-resume: if the session is already running
-somewhere, refuse and show "already running" rather than forking its
-history. Resume always starts in the session's original cwd.
-
-### Split into a pane/tab (`s`)
-
-Not deprecated — fully supported for users who want a multiplexer layout.
-Priority: **1. psmux (tmux-compatible CLI) = primary target** 2. Windows
-Terminal tab 3. future: Ghostty etc.
-Auto detection (`opener = "auto"`) checks environment variables in the
-order **`$TMUX` → `WT_SESSION`** (inside psmux both are set, so the order
-matters). `$TMUX` says only *that* a multiplexer is hosting us, never which
-one — it holds a socket path — so the platform resolves it: `psmux` on
-Windows, real `tmux` everywhere else. That guess is wrong only for a
-deliberately exotic install, which is what the explicit `opener = "psmux"` /
-`"tmux"` values are for.
-
-The two are not interchangeable behind one binary name. Measured against
-tmux 3.6 on 2026-07-26 (docs/notes/psmux-spike.md records both sides): the
-session-qualified pane target psmux *requires* — because it reuses window
-and pane ids across sessions — is **rejected** by tmux, which reads
-`<session>:<pane_id>` as "window `<pane_id>` of that session"
-(`can't find window: %1`). tmux wants the bare, globally-unique
-`<pane_id>`, which is in turn ambiguous on psmux. Each form is wrong on the
-other CLI, so the flavor is carried explicitly
-(`banto_io::opener::TmuxFlavor`), never inferred at call time.
-
-- psmux/tmux: spawn with `split-window` / `new-window`, tag with a
-  session-qualified `select-pane -t '<session>:<pane_id>' -T <title>`,
-  match with `list-panes -F`, focus with a session-qualified
-  `select-pane -t '<session>:<pane_id>'` alone.
-  psmux confirmed to support all required commands
-  ([compatibility.md](https://github.com/psmux/psmux/blob/master/docs/compatibility.md)),
-  but — unlike real tmux — it reuses window/pane ids across sessions, so
-  every target must be session-qualified (docs/notes/psmux-spike.md,
-  2026-07-20). That spike also found `select-window -t 'session:@window_id'`
-  fails outright and `switch-client` corrupted the live server badly enough
-  to destroy a session, so neither is used; focus is a lone session-qualified
-  `select-pane` (banto's own panes are splits within banto's own session, so
-  no window/client switch is needed to surface one).
-  `swap-pane` works, so a Desktop-like "sidebar + main" switcher is possible.
-- Windows Terminal: spawn with `wt -w 0 new-tab`. **There is no API to
-  enumerate or focus tabs**, so activating an existing tab is best-effort.
-- Every split backend goes through
-  `banto _wrap --session <id> -- claude --resume <id>`, which registers the
-  PID, tracks liveness, detects exit, and prevents double resume
-  (`wt.exe` detaches immediately and psmux panes run detached from banto's
-  own process, so the wrapper is mandatory here — in-place needs none of
-  this, see above). Like every banto process banto starts, it is handed the
-  config file, database and homes the parent resolved (see "Child processes"
-  under the MCP section).
-- Resume always starts in the session's original cwd.
-
-## Emporium mode
-
-Introduced by the 2026-07-22 architecture decision above. `banto --emporium`
-(alias `--oodana`) opens a persistent left sidebar (the same session list) plus
-a right pane hosting the selected session **embedded** — the child's PTY is
-spawned and read by banto itself (`portable-pty-psmux`), its output parsed with a VT
-emulator (`vt100`) into a `Screen` the core owns, and rendered into a ratatui
-pane. This differs from both chōba resume paths, which either hand banto's own
-terminal to the child directly (in-place) or spawn it in a separate
-psmux/Windows-Terminal pane/tab banto does not render (split): the emporium is
-the only mode where banto itself is the terminal the session's output actually
-paints into.
-
-Launch dispatch: `crates/banto/src/main.rs` — `--emporium` selects
-`embedded::run_emporium`, otherwise the chōba's `tui::run`. The two share
-`App` (list state), the `view` renderers, the store-load helpers, and
-`render_modal`, but have separate event loops (`crates/banto/src/embedded/`
-vs `crates/banto/src/tui.rs`).
+The sidebar's list state is `App`, drawn by the `view` renderers
+(`banto_tui`); its modals go through `render_modal`. `main` dispatches a bare
+`banto` to the UI's entry point and the other subcommands (`list`, `versions`,
+`_mcp`, `_hook`, …) to theirs.
 
 **Architecture.** The emporium's event loop is a thin shell around
 `engine::update` (`crates/banto-core/src/engine.rs`) — see the TEA / sans-IO
@@ -436,6 +434,23 @@ captures every `Event` fed into `update` as a replay stream (`docs/DISCIPLINE.md
 PTY output, and the first line of each live member's newest brigade messages,
 which the relay `Tick` carries for the collapsed tiles) and must never be
 committed.
+
+`BANTO_INPUT_LOG=<file>` is a lighter diagnostic of the same kind, for
+"what did the terminal hand banto, and what did banto make of it". When the
+variable is set (to a path), the UI opens that file once at startup — created
+if missing, appended to, never truncated or rotated; an open that fails just
+leaves the log off — and writes one line per entry, `<unix ms> emporium:
+<message>`, synchronously on the UI's own thread. Per raw terminal event it logs
+the event as crossterm delivered it — a key as its code, kind and modifiers (so
+every typed character is in the file), a mouse event as its kind and cell, a
+paste as its length only, never its text, a resize as its size, window focus
+gained or lost — and, for a key, a mouse event or a paste, a second line with
+what banto converted it into; and, when a run of keys is joined into a paste
+(the Windows console never reports pastes as pastes), its length and the number
+of Enters. What a child prints and the brigade messages are never written. The path comes only from the variable; there
+is no config key or flag. Nothing in banto reads the file back, and the pure
+core never sees it (`docs/DISCIPLINE.md` §6.2). **It holds the operator's real
+keystrokes: it must never be committed.**
 
 **Layout.** A solo session fills the whole pane. A staged brigade (see
 "Brigade" below) tiles Director left / Workers stacked down the right —
@@ -590,14 +605,23 @@ any other: out-of-range ones read as "no preference", and what is used is
 clamped to the terminal at use, never rewritten. A write that fails is silent,
 as a failed pin is. A Worker added later gets the mean of the others' height.
 
-**Keys** (emporium; everything the chōba has except split, plus):
+**Keys** (one table: the list's keys first, then what the panes add):
 
 | Key | Action |
 |---|---|
-| `Enter` | Open embedded; on a Director, stage its whole cell |
+| `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`/`End` | Move selection |
+| `Enter` / double-click | Open the session in a pane (switch to it if it is already open); on a Director, stage its whole cell |
+| `n` | New session: a dialog to pick or type a working directory |
+| `/` | Search (fuzzy, title + cwd) |
+| `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
+| `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
+| `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
+| `D` | Restore (un-archive) the selected session, while archived ones are revealed |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
-| `q`/`Esc` (list focused) | Quit — with nothing hosted, at once; with any session running (staged or off-stage, collapsed tiles included) the first press only shows `Esc again to quit — N session(s) running` and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. Any other key, a mouse press, the focus leaving the list or the window running out drops it silently. Esc stays one of the two keys because an IME swallows `q`. The chōba quits on one press, as before |
+| `F2` | Move focus between the list and the panes |
+| `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
+| `q`/`Esc` (list focused) | Quit — with nothing hosted, at once; with any session running (staged or off-stage, collapsed tiles included) the first press only shows `Esc again to quit — N session(s) running` and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. Any other key, a mouse press, the focus leaving the list or the window running out drops it silently. Esc stays one of the two keys because an IME swallows `q`. |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
@@ -638,10 +662,10 @@ one dated Unix teardown follow-up (`docs/notes/embedded-pty-spike.md`,
 2026-07-25 addendum — a measured comparison of graceful vs. force-kill
 teardown timing on that platform). Mouse forwarding into children was also on
 that list and has since landed: `Screen::wants_sgr_mouse`
-(`crates/banto-core/src/engine.rs:3610`) gates whether a wheel/click event
+(`crates/banto-core/src/screen.rs`) gates whether a wheel/click event
 reaches the child's own SGR mouse mode instead of banto's own pane-scroll,
 tested by `wheel_over_a_pane_that_wants_sgr_mouse_is_forwarded_not_consumed`
-(`engine.rs:7680`).
+(`crates/banto-core/src/engine.rs`).
 
 **Scrollback** was on that unverified list and turned out to fail outright: a
 Codex pane kept no scrollback at all. Fixed by depending on
@@ -870,7 +894,7 @@ them:
    `Modal::ConfirmDirectorReopen` — Enter kills that pane and re-issues
    formation only once the pane is confirmed gone — `Event::PtyExited`, or
    `Event::PtyOutputLost` for the pane it killed (any
-   sooner risks `banto::opener::decide_inplace_resume` seeing the not-yet-dead
+   sooner risks the double-resume guard seeing the not-yet-dead
    session as still live and refusing the reopen); Esc cancels the whole
    attempt. Placed first, ahead of the other two, because it is both the
    most disruptive of the three (running work in that pane is lost) and the
@@ -1075,12 +1099,11 @@ Every path under the data directory is named in one place,
 
 **Child processes find the parent's files.** banto starts other banto processes
 — `_mcp` (Claude: the MCP config file; Codex: the `-c mcp_servers.banto.args`
-override), `_wrap` (the split backends' wrapper) and `_hook` (Codex's
-`SessionStart` hook) — and each of them would otherwise resolve for itself, from
+override) and `_hook` (Codex's `SessionStart` hook) — and each of them would otherwise resolve for itself, from
 its own environment and from the working directory of the session it serves, which
 is not the parent's: a relative `--config`, `BANTO_CONFIG`, `db_path` or home would
 name another file (or none), `--config`/`--claude-home`/`--codex-home` would never
-be heard of, and agreement through inherited variables is not something psmux,
+be heard of, and agreement through inherited variables is not something
 Claude or Codex guarantee. So the parent resolves its config file, database and
 homes **once** (`crates/banto/src/startup.rs`; a relative input means the
 parent's working directory at startup, and is made absolute; an empty path, or
@@ -1090,12 +1113,12 @@ naming the key and the config file, rather than a silently non-persistent sessio
 `_hook` then runs as it does with no store: no briefing, nothing recorded) and
 hands the result on. The data directory is resolved the same way, once, and is
 what the default database (`<data dir>/banto.db`) hangs off, so a database named
-elsewhere does not move it. `_mcp` and `_wrap` take it as hidden global flags straight after the
+elsewhere does not move it. `_mcp` takes it as hidden global flags straight after the
 subcommand name: `--parent-config <file>` (the file the parent loaded, loaded the
 same way) or `--parent-no-config` (it loaded none), `--db-path`, `--data-dir`,
 `--claude-home` and, when it has one, `--codex-home` — each path absolute and a single argument
-(spaces and backslashes survive the MCP JSON, the Codex TOML array and the split
-backends' argv like the executable's own path does). A child given them uses
+(spaces and backslashes survive the MCP JSON and the Codex TOML array like the
+executable's own path does). A child given them uses
 exactly those and does not look at its own environment or working directory for
 them — and a child that carries the hand-off but no `--codex-home` has none,
 because the parent had none; the same goes for `--data-dir`: a parent with no data
@@ -1121,8 +1144,8 @@ file per member that nothing used to delete: the MCP config
 (`mcp/<brigade_id>-<token>.json`, rewritten by the emporium every time it opens
 the member) and, for a Goinkyo, the consultation request
 (`mcp/goinkyo/<brigade_id>.txt`, written by the `_mcp` process before the member's
-row exists). The **emporium** sweeps them, and only the emporium — the `_mcp`
-processes write files but never delete one, and the chōba starts no members.
+row exists). The **emporium** (banto's own UI process) sweeps them, and only
+it — the `_mcp` processes write files but never delete one.
 Immediacy is not a goal: a file is removed some time after its member ended.
 
 *What is deleted.* A file, and only a file, for which all of these hold:
@@ -1226,7 +1249,7 @@ bypass Codex's own per-tool approval prompt for this server — repeated on
 every single launch rather than written once to `~/.codex/config.toml`, since a
 `-c`-registered server can't persist that trust at all, and (measured
 2026-07-28) the bypass degrades silently, no error and no warning, the
-moment a launch leaves it off (`crates/banto/src/opener.rs`'s
+moment a launch leaves it off (`crates/banto/src/launch.rs`'s
 `CodexBrigade::overrides` and the override functions it calls). This is a
 different Codex prompt from the hook-trust one gated in "Brigade" below —
 tool approval and hook trust are Codex's own two separate mechanisms, solved
@@ -1304,7 +1327,7 @@ consecutive observation ticks with mail waiting, types a fixed line into its
 stdin — `"[banto relay] Your brigade peer sent you a message. Call the
 check_messages tool now."` — followed by a submitting Enter roughly 300ms
 later (`RELAY_SUBMIT_DELAY`; the delay exists because a chunk boundary can
-carry meaning for the embedded PTY — see "Emporium mode" above). A nudge is
+carry meaning for the embedded PTY — see "The emporium: hosted panes" above). A nudge is
 suppressed while the member's pane is focused and has just received forwarded
 keystrokes (`RELAY_INPUT_QUIET_PERIOD`), is subject to
 a cooldown between repeat nudges to the same member, and gives up after a
@@ -1403,18 +1426,24 @@ Unix builds additionally depend on `libc`.
 ## Phases
 
 1. Indexer + search + TUI list (mouse support) — useful on its own — done
-2. Opener (psmux / WT) + `_wrap` + double-resume prevention + focus — done
+2. Opener (psmux / WT) + `_wrap` + double-resume prevention + focus — done;
+   the opener and `_wrap` were retired 2026-11-13 (below), double-resume
+   prevention stays
 3. Activity dots + notify live updates — done
 4. Groups / pins — done
 5. In-place resume as the default action (Enter hands off banto's own
-   terminal directly; `s` still splits into a psmux pane / WT tab) — done
-6. Emporium mode (2026-07-22 decision above): embedded multiplexer, brigade
-   Director/Worker cells, MCP mediation, auto-relay (see "Emporium mode" /
-   "Brigade" / "MCP mediation server" / "Auto-relay" above) — done. Its
+   terminal directly; `s` still splits into a psmux pane / WT tab) — done;
+   retired 2026-11-13 (below)
+6. The emporium (2026-07-22 decision above): embedded multiplexer, brigade
+   Director/Worker cells, MCP mediation, auto-relay (see "The emporium: hosted
+   panes" / "Brigade" / "MCP mediation server" / "Auto-relay" above) — done. Its
    architecture was formalized separately as `docs/DISCIPLINE.md`'s TEA /
    sans-IO discipline — a five-phase migration (Phase 0 through Phase 4;
    Phases 2 and 3 each landed as two commits), all completed 2026-07-24
    through 2026-07-25 (`docs/DISCIPLINE.md` §10) — done.
+7. One UI (2026-11-13 decision above): the chōba as a mode, in-place resume,
+   the external openers and `_wrap` retired; the list and the hosted panes are
+   the only UI.
 
 Delivered alongside groups: a new-session modal (`n`), session archiving
 (`d`, soft-hide only — the real session file on disk is never touched), and
@@ -1423,12 +1452,6 @@ an always-visible summary panel below the list.
 ## Risks
 
 - JSONL format changes → contained by lenient parsing + fixtures
-- WT tab focus limitations → window mode as fallback
-- psmux-specific incompatibilities (claims tmux 3.3.6 compatibility but is an
-  independent implementation) → flush out with spikes and on-device checks.
-  Confirmed so far (docs/notes/psmux-spike.md): non-unique window/pane ids
-  across sessions, and `switch-client` corrupting the live server — both
-  are why split-mode targeting is session-qualified `select-pane` only,
-  never `select-window` or `switch-client`. This non-uniqueness was also
-  the motivation for making in-place the default (2026-07-20 decision
-  above): it sidesteps split-target ambiguity entirely for the common case
+
+(The Windows Terminal tab-focus and psmux-compatibility risks recorded here
+until 2026-11-13 left with the external openers.)

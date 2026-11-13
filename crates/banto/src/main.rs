@@ -1,4 +1,5 @@
-//! banto binary: a clap CLI whose default action launches the TUI.
+//! banto binary: a clap CLI whose default action launches the TUI — the session
+//! list and the hosted panes together (`embedded::run_emporium`).
 //!
 //! Both products' homes resolve in the same shape and priority order
 //! (highest first), so that a flag and a `config.toml` entry always beat
@@ -19,12 +20,12 @@
 //!
 //! Everything under the resolved Claude home, and under the resolved Codex
 //! home, is treated as strictly read-only.
-//! banto's own database (session <-> pane map, groups, pins, brigades) lives under
+//! banto's own database (groups, pins, archive, brigades) lives under
 //! `Config.db_path`, falling back to `banto_io::config::default_db_path`.
 //!
 //! `config.toml` itself is located by `banto_io::config::resolve_config_path`'s
 //! resolution order. A banto that was itself started by another banto (`_mcp`,
-//! `_wrap`, `_hook`) is told what its parent resolved and uses that instead of
+//! `_hook`) is told what its parent resolved and uses that instead of
 //! resolving for itself: see [`startup`].
 //!
 //! `Config.agents` gates which products get discovered at all — resolved
@@ -32,20 +33,17 @@
 //! and passed down to every entry point, since `session::discover_all` (not
 //! any of these) is what actually decides which provider runs.
 //! `ResolvedAgents::ignored` is where a name banto didn't recognize ends up;
-//! `tui::run`/`embedded::run_emporium` are the ones that tell the operator
-//! about it, once, at startup — see `session::agents_ignored_notice`.
+//! `embedded::run_emporium` is what tells the operator about it, once, at
+//! startup — see `session::agents_ignored_notice`.
 
 mod briefing;
 mod codex_trust;
 mod embedded;
 mod hook;
+mod launch;
 mod mcp;
-mod opener;
 mod session;
-mod sgr;
 mod startup;
-mod tui;
-mod wrap;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -63,10 +61,7 @@ use banto_io::agent_versions::{
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, live_thread_ids};
-use banto_io::opener::SystemCommandRunner;
-use banto_io::process::SystemProcessRunner;
 use banto_io::provider::SessionProvider;
-use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
 use banto_io::store::Store;
 
@@ -101,7 +96,7 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Internal: the database path a parent banto resolved. Passed to every
-    /// banto process the parent starts (`_mcp`, `_wrap`), so none of them
+    /// banto process the parent starts (`_mcp`), so none of them
     /// re-resolves it from its own environment and working directory.
     #[arg(long, global = true, hide = true, value_name = "PATH")]
     db_path: Option<PathBuf>,
@@ -127,10 +122,11 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     parent_no_config: bool,
 
-    /// Open the 大店 (emporium) mode: banto as a persistent sidebar plus an
-    /// embedded session pane, instead of the default 帳場 (chōba) list.
-    #[arg(long, visible_alias = "oodana")]
-    emporium: bool,
+    /// Accepted and ignored: banto has one UI, which is what this used to select.
+    /// Kept only so existing launch habits (shortcuts, scripts) keep working;
+    /// to be removed.
+    #[arg(long = "emporium", alias = "oodana", hide = true)]
+    _emporium: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -143,54 +139,6 @@ enum Command {
     /// Pull and print agent version facts retained by Claude Code and Codex.
     /// This never changes banto's session list, tiles, or sidebar.
     Versions,
-    /// Internal: supervises a resumed or brand-new session's process. The
-    /// opener spawns this; it is not meant to be invoked directly.
-    #[command(name = "_wrap", hide = true)]
-    Wrap {
-        /// The session id being resumed (required unless `--new-session`).
-        #[arg(long, required_unless_present = "new_session")]
-        session: Option<String>,
-        /// New-session mode: there is no known session id yet — discover
-        /// the one Claude assigns to `--cwd` and track it so it can later
-        /// be focused instead of double-resumed.
-        #[arg(long, requires = "cwd", conflicts_with = "session")]
-        new_session: bool,
-        /// The new session's launch directory (new-session mode only).
-        #[arg(long, requires = "new_session")]
-        cwd: Option<PathBuf>,
-        /// Which backend this pane was opened with (new-session mode
-        /// only) — `psmux` or `windows-terminal`; the *opener*'s own
-        /// already-resolved choice, passed through explicitly rather than
-        /// re-detected from the environment (e.g. `$TMUX_PANE` could be
-        /// inherited even when banto is configured to open new sessions
-        /// via Windows Terminal, if banto itself happens to be running
-        /// inside an unrelated tmux session).
-        #[arg(long, requires = "new_session", required_if_eq("new_session", "true"))]
-        backend: Option<String>,
-        /// Diagnostic log path for this process's own `WrapLog` (new-session
-        /// mode only), passed explicitly by the opener rather than left for
-        /// this process to read `BANTO_WRAP_LOG` from its own environment: a
-        /// psmux-spawned process does not reliably inherit banto's
-        /// environment (docs/notes/psmux-spike.md) — see
-        /// `crate::wrap::WrapLog::new`.
-        #[arg(long, requires = "new_session")]
-        wrap_log: Option<PathBuf>,
-        /// The command to run, e.g. `claude --resume <id>` (resume mode)
-        /// or plain `claude` (new-session mode).
-        #[arg(last = true, required = true)]
-        argv: Vec<String>,
-    },
-    /// Internal/dev: host a command inside banto's own TUI as an embedded
-    /// terminal (single pane). Exercises the embedded-multiplexer path.
-    #[command(name = "_embed", hide = true)]
-    Embed {
-        /// Working directory for the hosted command (default: inherit banto's).
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// The command to host, e.g. `-- claude --resume <id>`.
-        #[arg(last = true, required = true)]
-        argv: Vec<String>,
-    },
     /// Internal: banto's MCP server on stdio (the brigade Director<->Worker
     /// mediation channel). Spawned by an embedded `claude` via `--mcp-config`;
     /// not meant to be invoked directly.
@@ -290,42 +238,6 @@ fn main() -> Result<()> {
             let codex_home = resolved.codex_home();
             run_versions(&claude_home, codex_home.as_ref())
         }
-        Some(Command::Wrap {
-            session,
-            new_session,
-            cwd,
-            backend,
-            wrap_log,
-            argv,
-        }) => {
-            let store = open_store(&resolved)?;
-            let code = if new_session {
-                let cwd = cwd.expect("clap requires --cwd with --new-session");
-                let backend_key = backend.expect("clap requires --backend with --new-session");
-                let backend = opener::parse_backend_key(&backend_key)
-                    .with_context(|| format!("unknown --backend value: {backend_key}"))?;
-                let claude_home = resolved.claude_home()?;
-                let provider = ClaudeCodeProvider::new(claude_home);
-                wrap::run_new_session(
-                    &store,
-                    &cwd,
-                    &argv,
-                    backend,
-                    wrap_log.as_deref(),
-                    |key| std::env::var(key).ok(),
-                    wrap::NewSessionDeps {
-                        process_runner: &SystemProcessRunner,
-                        command_runner: &SystemCommandRunner,
-                        provider: &provider,
-                    },
-                )?
-            } else {
-                let session = session.expect("clap requires --session unless --new-session");
-                wrap::run(&store, &session, &argv, &SystemProcessRunner)?
-            };
-            std::process::exit(code)
-        }
-        Some(Command::Embed { cwd, argv }) => embedded::run_embedded(&argv, cwd.as_deref()),
         Some(Command::Mcp {
             session,
             brigade,
@@ -365,35 +277,24 @@ fn main() -> Result<()> {
             let claude_home = resolved.claude_home()?;
             let codex_home = resolved.codex_home();
             let thresholds = thresholds_from(&config.activity);
-            // `Store::set_session_group` (the `g` modal) takes `&mut self`
-            // (it wraps a transaction), and the store is shared by both the
-            // chōba TUI and emporium, so a `RefCell` gives interior
-            // mutability without threading `&mut Store` through every handler.
+            // `Store`'s write methods take `&mut self` (they wrap a transaction)
+            // and the store is shared by the event loop and its executors, so a
+            // `RefCell` gives interior mutability without threading `&mut Store`
+            // through every handler.
             let store = std::cell::RefCell::new(open_store(&resolved)?);
-            if cli.emporium {
-                embedded::run_emporium(
-                    &claude_home,
-                    codex_home.as_ref(),
-                    &thresholds,
-                    &store,
-                    &embedded::EmporiumSettings {
-                        brigade: &config.brigade,
-                        keys: &config.keys,
-                        agent_binaries: &config.agent_binaries,
-                        resolved_agents: &resolved_agents,
-                        child: &resolved,
-                    },
-                )
-            } else {
-                tui::run(
-                    &resolved,
-                    config.agent_binaries.clone(),
-                    &thresholds,
-                    config.opener,
-                    &store,
-                    resolved_agents,
-                )
-            }
+            embedded::run_emporium(
+                &claude_home,
+                codex_home.as_ref(),
+                &thresholds,
+                &store,
+                &embedded::EmporiumSettings {
+                    brigade: &config.brigade,
+                    keys: &config.keys,
+                    agent_binaries: &config.agent_binaries,
+                    resolved_agents: &resolved_agents,
+                    child: &resolved,
+                },
+            )
         }
     }
 }

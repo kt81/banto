@@ -89,8 +89,8 @@ impl ProcessStartTime for SysinfoStartTime {
 /// risk this leaves — a session live in that startup window still gets
 /// resumed — is the same class of risk Claude's own live-file check
 /// already carries for a session that hasn't written `sessions/<pid>.json`
-/// yet; both are secondary guards behind the pane-map's own primary one,
-/// not the only line of defense.
+/// yet; both are secondary guards behind the engine's own reuse of a pane
+/// banto already hosts, not the only line of defense.
 pub fn is_thread_alive(
     codex_home: &CodexHome,
     thread_id: &str,

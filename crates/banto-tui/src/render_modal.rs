@@ -1,11 +1,9 @@
 //! Rendering [`Modal`] as a centered overlay — pure `(frame, modal, area)`
-//! rendering shared by both the chōba list TUI (`banto::tui`) and the
-//! emporium (`banto::embedded::emporium`); each imports [`render_modal`]
-//! back rather than rendering modals independently, so both modes render
-//! identically. [`windowed_view`]/[`modal_area`] (and [`crate::text`]'s
-//! truncation helpers) are also reused by each mode's own non-modal
-//! rendering (a search box, a splash screen), so they're `pub` here too
-//! rather than only exposed via `render_modal`.
+//! rendering for the emporium (`banto::embedded::emporium`).
+//! [`windowed_view`]/[`modal_area`] (and [`crate::text`]'s truncation helpers)
+//! are also reused by its own non-modal rendering (a search box, a splash
+//! screen), so they're `pub` here too rather than only exposed via
+//! `render_modal`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
@@ -15,8 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::app::{
-    GroupJoinState, GroupRenameState, Modal, NewSessionPlacement, NewSessionState,
-    WorkerAgentPickerState,
+    GroupJoinState, GroupRenameState, Modal, NewSessionState, WorkerAgentPickerState,
 };
 
 use crate::text::truncate_to_width;
@@ -162,19 +159,11 @@ pub fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 /// there is nothing to blank behind it — the one-column widen is solely to
 /// neutralize a background full-width character straddling the border
 /// itself (see [`modal_clear_area`]).
-/// `agent_choice`: whether the host binds a key to `App::modal_toggle_agent`
-/// (the emporium does; the chōba doesn't — its new-session path is
-/// feature-frozen, see `banto::opener::new_session_wrap_argv`'s doc). Only
-/// [`render_new_session_modal`] reads it, to decide whether to advertise a
-/// key the host wouldn't actually honor — `Modal::WorkerAgentPicker` has no
-/// equivalent parameter because it's never opened anywhere the toggle
-/// wouldn't work in the first place (the chōba has no brigade-formation
-/// path to open it from at all).
-pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_choice: bool) {
+pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
     let area = modal_area(full_area);
     frame.render_widget(Clear, modal_clear_area(full_area));
     match modal {
-        Modal::NewSession(state) => render_new_session_modal(frame, state, area, agent_choice),
+        Modal::NewSession(state) => render_new_session_modal(frame, state, area),
         Modal::ConfirmArchive { title, .. } => render_confirm_archive_modal(frame, title, area),
         Modal::GroupJoin(state) => render_group_join_modal(frame, state, area),
         Modal::GroupRename(state) => render_group_rename_modal(frame, state, area),
@@ -199,31 +188,14 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect, agent_cho
 /// a substring-filtered list of previously seen cwds to pick from instead of
 /// typing a full path (Tab completes the highlighted one into the input).
 /// The title always names the agent it would launch (`NewSessionState::agent`
-/// defaults to Claude and only the emporium can change it — see
-/// `render_modal`'s doc), matching how it already names the placement
-/// regardless of which key opened the modal; the bottom hint only
-/// advertises the toggle key when `agent_choice` says the host actually
-/// binds it, so the chōba never shows a key that would do nothing.
-fn render_new_session_modal(
-    frame: &mut Frame,
-    state: &NewSessionState,
-    area: Rect,
-    agent_choice: bool,
-) {
-    let placement_label = match state.placement() {
-        NewSessionPlacement::InPlace => "in-place",
-        NewSessionPlacement::Split => "split",
-    };
-    let hint = if agent_choice {
-        " Enter launch  Tab complete  Shift-Tab agent  Esc cancel "
-    } else {
-        " Enter launch  Tab complete  Esc cancel "
-    };
+/// defaults to Claude; Shift-Tab changes it).
+fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Rect) {
+    let hint = " Enter launch  Tab complete  Shift-Tab agent  Esc cancel ";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(format!(
-            " New Session ({placement_label}) \u{2014} cwd \u{2014} {} ",
+            " New Session \u{2014} cwd \u{2014} {} ",
             state.agent().label()
         ))
         .title_bottom(hint);
@@ -278,10 +250,7 @@ fn render_new_session_modal(
 /// selected product (same convention as the new-session modal's own title),
 /// and a one-line, editable `--model` input below it, seeded from that
 /// product's own configured default. No candidate list — a model name isn't
-/// drawn from a set of previously seen values the way a cwd is — and no
-/// `agent_choice` parameter either: unlike the new-session modal, this one
-/// is never opened anywhere Shift-Tab wouldn't actually work (the chōba has
-/// no brigade-formation path to open it from at all).
+/// drawn from a set of previously seen values the way a cwd is.
 fn render_worker_agent_picker_modal(frame: &mut Frame, state: &WorkerAgentPickerState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -767,7 +736,7 @@ mod tests {
                 // leave a dangling half-glyph once the border overwrote
                 // only the continuation cell.
                 frame.render_widget(Span::raw("あ"), Rect::new(1, 5, 2, 1));
-                render_modal(frame, &modal, area, false);
+                render_modal(frame, &modal, area);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -794,7 +763,7 @@ mod tests {
                 // `modal_area_shrinks_margin_in_a_narrow_pane_...`:
                 // width 36 starting at x=2 ends at column 37).
                 frame.render_widget(Span::raw("あ"), Rect::new(38, 5, 2, 1));
-                render_modal(frame, &modal, area, false);
+                render_modal(frame, &modal, area);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -817,7 +786,7 @@ mod tests {
         let area = Rect::new(2, 2, 50, 10);
         let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
         terminal
-            .draw(|frame| render_new_session_modal(frame, state, area, false))
+            .draw(|frame| render_new_session_modal(frame, state, area))
             .unwrap();
         let text = buffer_text(terminal.backend().buffer());
 
@@ -857,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_modal_hint_only_advertises_the_agent_toggle_when_available() {
+    fn new_session_modal_hint_advertises_the_agent_toggle() {
         let mut app = App::new(Vec::new());
         app.open_new_session_modal();
         let Some(Modal::NewSession(state)) = app.modal() else {
@@ -868,21 +837,12 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(70, 15)).unwrap();
 
         terminal
-            .draw(|frame| render_new_session_modal(frame, state, area, false))
+            .draw(|frame| render_new_session_modal(frame, state, area))
             .unwrap();
-        let without_toggle = buffer_text(terminal.backend().buffer());
+        let text = buffer_text(terminal.backend().buffer());
         assert!(
-            !without_toggle.contains("Shift-Tab"),
-            "the chōba never binds the toggle, so its hint must not advertise it:\n{without_toggle}"
-        );
-
-        terminal
-            .draw(|frame| render_new_session_modal(frame, state, area, true))
-            .unwrap();
-        let with_toggle = buffer_text(terminal.backend().buffer());
-        assert!(
-            with_toggle.contains("Shift-Tab"),
-            "the emporium binds the toggle, so its hint should advertise it:\n{with_toggle}"
+            text.contains("Shift-Tab"),
+            "the emporium binds the toggle, so its hint should advertise it:\n{text}"
         );
     }
 

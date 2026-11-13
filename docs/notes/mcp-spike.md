@@ -63,7 +63,8 @@ non-interactive `-p` mode.
 - The shared medium can be **banto's existing sqlite store** (a `brigade_messages`
   queue table): `banto _mcp` opens the same DB the TUI does — exactly the
   cross-process sharing the store's `busy_timeout` was already designed for
-  (TUI + `_wrap`). The main TUI process need not be in the MCP transport path.
+  (the TUI and, at the time, `_wrap`, retired 2026-11-13). The main TUI process
+  need not be in the MCP transport path.
 - "Register the pair at launch" = pass `--brigade <id> --role <director|worker>`
   (alongside `--session`) into the `_mcp` args when banto opens a brigade member,
   so the server knows who the caller is and which queue to read/write.

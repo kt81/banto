@@ -30,8 +30,7 @@ impl CodexHome {
 
     /// The default root: `env("CODEX_HOME")` if set and non-empty, else
     /// `~/.codex`, if a home directory exists. `env` is injected — the house
-    /// pattern for testing environment-dependent code (see
-    /// `opener::detect_backend`'s own `env` parameter) — so tests never
+    /// pattern for testing environment-dependent code — so tests never
     /// mutate the real process environment.
     pub fn default_home_from_env(env: impl Fn(&str) -> Option<String>) -> Option<Self> {
         if let Some(from_env) = env("CODEX_HOME").filter(|v| !v.is_empty()) {

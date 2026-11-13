@@ -36,11 +36,8 @@ pub(super) fn from_crossterm(event: crossterm::event::Event) -> Option<InputEven
 }
 
 /// Convert one crossterm key press/repeat, or `None` if its `KeyCode` isn't
-/// one banto recognizes (see [`convert_key_code`]). Also used directly by
-/// `super::run_embedded`'s standalone `banto _embed` demo, which forwards
-/// keys straight to `EmbeddedSession::send_key` without going through a
-/// full `Event`.
-pub(super) fn convert_key(key: crossterm::event::KeyEvent) -> Option<KeyEvent> {
+/// one banto recognizes (see [`convert_key_code`]).
+fn convert_key(key: crossterm::event::KeyEvent) -> Option<KeyEvent> {
     Some(KeyEvent::new(
         convert_key_code(key.code)?,
         convert_modifiers(key.modifiers),

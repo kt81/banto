@@ -19,8 +19,11 @@ const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband
                           F3 next pane · / search · n new · d archive · g group · \
                           Tab grouped/flat · p pin · a reveal · q/Esc quit";
 
-/// Appended only while an archived row is on screen — see the choba's own
-/// `ARCHIVED_HINT` for why it is not in the bar unconditionally.
+/// Appended only while an archived row is on screen. The bar was already tight
+/// enough that the operator named it as the constraint on adding anything at
+/// all, and `D` has nothing to act on at the two reveal levels that show
+/// nothing archived. Discoverability lands at the moment of need instead of
+/// costing width at every other moment.
 const ARCHIVED_HINT: &str = " · D restore";
 
 /// What the idle bar's text depends on.

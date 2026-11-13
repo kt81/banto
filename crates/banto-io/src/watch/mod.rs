@@ -16,9 +16,11 @@
 //! the current time to get the roots that should trigger a re-sync.
 
 mod debounce;
+mod live;
 mod source;
 
 pub use debounce::Debouncer;
+pub use live::LiveWatch;
 pub use source::{ChangeSource, NotifyChangeSource, WatchError};
 
 use std::time::SystemTime;

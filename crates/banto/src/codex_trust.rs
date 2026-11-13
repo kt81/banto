@@ -27,19 +27,19 @@ use std::path::Path;
 use banto_core::config::AgentBinaries;
 use banto_core::model::AgentKind;
 
-use crate::opener::{agent_binary, forward_slash_path, session_start_hook_override};
+use crate::launch::{agent_binary, forward_slash_path, session_start_hook_override};
 
 /// The argv the trust-review pane runs: `codex -c <hook override>`, nothing
 /// else. No `mcp_servers.banto.*` overrides — trust is only ever asked for
 /// the hook; MCP tool approval is solved a different way entirely, per
 /// launch, via `default_tools_approval_mode` (see
-/// `opener::mcp_server_command_override`'s doc) — and no `-C`/`resume`:
+/// `launch::mcp_server_command_override`'s doc) — and no `-C`/`resume`:
 /// this isn't opening any particular session, just Codex's own startup
 /// trust prompt. Reuses [`session_start_hook_override`] rather than
 /// building its own copy of the string — see that function's own doc for
 /// why a second implementation here would be worse than none at all.
 ///
-/// Also no `opener::NOTIFICATION_OVERRIDES`, for the same reason as the MCP
+/// Also no `launch::NOTIFICATION_OVERRIDES`, for the same reason as the MCP
 /// overrides: this pane exists only to show Codex's own startup trust
 /// prompt. There is no turn to complete and no approval to request here, so
 /// a notification has no addressee.
@@ -62,7 +62,7 @@ mod tests {
     use banto_core::model::BrigadeRole;
 
     use super::*;
-    use crate::opener::{AgentLaunch, CodexBrigade};
+    use crate::launch::{AgentLaunch, CodexBrigade};
 
     #[test]
     fn trust_argv_hook_override_matches_a_real_brigade_launch_byte_for_byte() {

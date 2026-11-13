@@ -303,6 +303,13 @@ const MIGRATIONS: &[&str] = &[
           AND substr(member_token, 8) NOT GLOB '*[^0-9]*'
           AND length(substr(member_token, 8)) <= 9
     ), 0);",
+    // v17: drops `panes`, the session -> external-terminal-pane map v1 created.
+    // banto opens sessions only in its own panes now, which live in the process
+    // that hosts them, so nothing records or reads where a session landed. Any
+    // rows go with the table: each pointed at a psmux/tmux/Windows Terminal pane
+    // no banto starts or looks up any more. v1 above still creates `panes` — DO
+    // NOT "clean up" v1, for the reason v11 gives.
+    "DROP TABLE IF EXISTS panes;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -1502,6 +1509,88 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn v16_to_v17_upgrade_drops_the_pane_map_rows_and_all_and_keeps_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v16 code left it: a pane record, a pin, a group and a brigade.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..16] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO panes (session_id, backend, target, pid, opened_at_ms)
+                 VALUES ('s1', 'psmux', 'work:%3', 4242, 1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pins (session_id, pinned_at_ms) VALUES ('s1', 2000)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO groups (id, name) VALUES (1, 'work')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 3000)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 16).unwrap();
+        }
+
+        // It opens: the table and its rows are gone, everything else is as it was.
+        let store = Store::open(&db).unwrap();
+        let tables: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'panes'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(tables.is_empty(), "{tables:?}");
+        assert_eq!(
+            store.pinned_ids().unwrap(),
+            [SessionId("s1".to_string())]
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(store.list_groups().unwrap().len(), 1);
+        assert_eq!(store.list_brigades().unwrap().len(), 1);
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(MIGRATIONS.len() >= 17);
+    }
+
+    #[test]
+    fn a_v16_database_that_already_lacks_the_pane_map_still_upgrades() {
+        // Nothing depends on the table any more, so its absence must not be what
+        // stops a database from opening.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..16] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute_batch("DROP TABLE panes;").unwrap();
+            conn.pragma_update(None, "user_version", 16).unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     #[test]

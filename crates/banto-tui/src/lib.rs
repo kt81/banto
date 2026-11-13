@@ -1,11 +1,10 @@
 //! banto-tui: rendering from `&banto_core::app::App` / `&banto_core::engine`
 //! state. Pure `(frame, state, area)` widgets — no key handling, no event
 //! loop, no terminal setup; that stays in `banto` (bin), which owns raw
-//! crossterm and drives both UI modes (the chōba list, the emporium).
+//! crossterm and drives the UI (the session list and the hosted panes).
 //!
 //! Module map:
-//! - [`render_modal`] rendering `Modal` as a centered overlay — shared by
-//!   both modes (see its own module doc for why)
+//! - [`render_modal`] rendering `Modal` as a centered overlay
 //! - [`paint`] `vt100` screen -> ratatui buffer cells (the emporium's panes)
 //! - [`render`] `vt100` screen -> ratatui text, the predecessor `paint`
 //!   replaced; its width tests are the regression net for that swap

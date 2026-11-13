@@ -3,10 +3,6 @@
 //! model — pure state, fed by output chunks, safe to hold in the emporium's
 //! core `State` — and [`PtyHandle`] is the channels to the PTY child —
 //! input/resize/kill/output, all I/O, held in the shell's own registry.
-//! [`EmbeddedSession`] composes both back into the single handle the
-//! standalone `banto _embed` demo (`super::run_embedded`) still uses; the
-//! emporium (`banto_core::engine`) uses `Screen`/`PtyHandle` directly
-//! instead.
 
 use std::io::Write;
 use std::path::Path;
@@ -14,11 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use banto_core::engine::{Event, SessionKey};
-use banto_core::input::KeyEvent;
-use banto_core::key_encode::key_to_bytes;
 use banto_core::model::PtyExitReason;
-use banto_core::screen::Screen;
-use banto_io::pty::{PtyHost, PtyIo, Resizer, STRIPPED_CHILD_ENV_VARS};
+use banto_io::pty::{PtyHost, PtyIo, Resizer};
 
 /// The result of one non-blocking poll of a [`PtyHandle`]'s output channel.
 pub(crate) enum PtyPoll {
@@ -175,15 +168,6 @@ impl PtyHandle {
         self.exit_reason.clone()
     }
 
-    /// Encode `key` and forward it to the child's stdin.
-    pub(crate) fn send_key(&mut self, key: &KeyEvent) {
-        let bytes = key_to_bytes(key);
-        if !bytes.is_empty() {
-            let _ = self.io.input.write_all(&bytes);
-            let _ = self.io.input.flush();
-        }
-    }
-
     /// Forward raw bytes (mouse report, paste, relay nudge/submit) to the
     /// child's stdin — the single stdin-write path.
     pub(crate) fn send_bytes(&mut self, bytes: &[u8]) {
@@ -278,79 +262,16 @@ pub(crate) fn wait_for_exit_or_deadline(
     }
 }
 
-/// One hosted session: a [`Screen`] plus the [`PtyHandle`] that feeds it.
-/// Kept as a composed convenience type for `super::run_embedded`'s standalone
-/// full-screen demo, which has no `update`/`Cmd` plumbing of its own to split
-/// across; the emporium uses `Screen`/`PtyHandle` separately instead (see the
-/// module doc).
-pub struct EmbeddedSession {
-    screen: Screen,
-    handle: PtyHandle,
-}
-
-impl EmbeddedSession {
-    /// Spawn `argv` via `host` and start modelling its output at `rows`x`cols`.
-    pub fn open(
-        host: &dyn PtyHost,
-        argv: &[String],
-        cwd: Option<&Path>,
-        rows: u16,
-        cols: u16,
-    ) -> Result<Self> {
-        Ok(Self {
-            screen: Screen::new(rows, cols),
-            // No added environment: this is the `_embed` path, which hosts a
-            // bare command rather than a brigade member. Still strips
-            // `STRIPPED_CHILD_ENV_VARS` — that fix applies to every agent
-            // banto starts, not only brigade members.
-            handle: PtyHandle::open(host, argv, cwd, &[], STRIPPED_CHILD_ENV_VARS, rows, cols)?,
-        })
-    }
-
-    /// Drain all currently-available child output into the terminal model.
-    /// Returns whether anything was processed (i.e. a redraw is warranted).
-    pub fn pump(&mut self) -> bool {
-        let mut changed = false;
-        while let PtyPoll::Chunk(bytes) = self.handle.poll() {
-            self.screen.process(&bytes);
-            changed = true;
-        }
-        changed
-    }
-
-    /// Encode `key` and forward it to the child's stdin.
-    pub fn send_key(&mut self, key: &KeyEvent) {
-        self.handle.send_key(key);
-    }
-
-    /// Resize the child's PTY and the terminal model (no-op if unchanged).
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        if self.screen.resize(rows, cols) {
-            self.handle.resize(rows, cols);
-        }
-    }
-
-    /// The current terminal screen, for rendering.
-    pub fn screen(&self) -> &vt100::Screen {
-        self.screen.screen()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use banto_core::engine::{Event, SessionKey};
-    use banto_core::input::{KeyCode, KeyEvent, Modifiers};
     use banto_core::model::PtyExitReason;
     use banto_io::pty::mock::MockPtyHost;
 
-    use super::{EmbeddedSession, PtyHandle, PtyPoll, disconnect_event, wait_for_exit_or_deadline};
-
-    fn open(host: &MockPtyHost) -> EmbeddedSession {
-        EmbeddedSession::open(host, &["child".to_string()], None, 24, 80).unwrap()
-    }
+    use super::{PtyHandle, PtyPoll, disconnect_event, wait_for_exit_or_deadline};
 
     fn open_handle(host: &MockPtyHost) -> PtyHandle {
         PtyHandle::open(host, &["child".to_string()], None, &[], &[], 24, 80).unwrap()
@@ -375,46 +296,6 @@ mod tests {
             "PtyHandle::open must pass its own env_remove argument through to the host \
              unchanged — a call site silently dropping it would be invisible without this"
         );
-    }
-
-    #[test]
-    fn pump_reflects_child_output() {
-        let host = MockPtyHost {
-            script: b"hi".to_vec(),
-            ..Default::default()
-        };
-        let mut session = open(&host);
-        assert!(session.pump());
-        assert_eq!(session.screen().cell(0, 0).unwrap().contents(), "h");
-        assert_eq!(session.screen().cell(0, 1).unwrap().contents(), "i");
-        assert!(!session.pump()); // nothing left to drain
-    }
-
-    #[test]
-    fn send_key_writes_encoded_bytes() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            captured: captured.clone(),
-            ..Default::default()
-        };
-        let mut session = open(&host);
-        session.send_key(&KeyEvent::new(KeyCode::Enter, Modifiers::NONE));
-        session.send_key(&KeyEvent::new(KeyCode::Char('a'), Modifiers::NONE));
-        assert_eq!(&*captured.lock().unwrap(), b"\ra");
-    }
-
-    #[test]
-    fn resize_updates_model_and_forwards_once() {
-        let resizes = Arc::new(Mutex::new(Vec::new()));
-        let host = MockPtyHost {
-            resizes: resizes.clone(),
-            ..Default::default()
-        };
-        let mut session = open(&host);
-        session.resize(10, 40);
-        assert_eq!(session.screen().size(), (10, 40));
-        session.resize(10, 40); // unchanged -> no extra resize
-        assert_eq!(&*resizes.lock().unwrap(), &[(10, 40)]);
     }
 
     // --- PtyHandle::poll: ConPTY active-exit detection ----------------------

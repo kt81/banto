@@ -69,13 +69,14 @@ notes from the migration worth keeping:
   core uses `ratatui-core` (the backend-free layout/buffer subset) and
   banto-tui turns the feature off. The `cargo tree` acceptance check is what
   caught this; keep running it.
-- The chōba's `tui.rs` remains an un-migrated app-layer monolith by design
-  (only the shared `render_modal` was extracted). It searches sessions and
-  hands them to an in-place child or an external terminal; the emporium hosts
-  sessions in embedded PTYs. The unflagged default is the chōba. Whether to
-  migrate its app-layer monolith is a separate decision. Retirement is not:
-  it would remove the default mode's in-place and external-terminal hand-off
-  paths, which embedded PTYs do not provide.
+- Until 2026-11-13 the chōba's loop (`tui.rs`) stayed an un-migrated
+  app-layer monolith by design (only the shared `render_modal` was
+  extracted): it searched sessions and handed them to an in-place child or an
+  external terminal, while the emporium hosted sessions in embedded PTYs. The
+  chōba was retired as a mode that day (`docs/REQUIREMENTS.md`, "Architecture
+  decision (2026-11-13)"), and with it the monolith: the one UI's event loop is
+  the `update` engine this section describes, and no second loop is left to
+  migrate.
 
 The `vt100::Parser` is itself a sans-IO state machine (bytes in, screen
 state out); it lives in core as `State` (`banto_core::screen`), fed by
@@ -158,13 +159,14 @@ choice only for what `Cmd`s cannot express.
    (Store swappability is served by the existing `Store` type boundary;
    `Cmd`-ization buys replay and ordering, not swapping.)
 2. **Diagnostics may bypass.** Existing diagnostic channels
-   (`BANTO_INPUT_LOG`-style logs) are `banto-io` concerns and do not need
+   (`BANTO_INPUT_LOG`-style logs; `docs/REQUIREMENTS.md`, "The emporium: hosted
+   panes", says what each records) are `banto-io` concerns and do not need
    `Cmd` round-trips.
 
 ## 7. Multi-process reality
 
-banto is not one program: the TUI, each `banto _mcp` server, and each
-`banto _wrap` supervisor are separate processes sharing one sqlite file.
+banto is not one program: the UI, each `banto _mcp` server, and each
+`banto _hook` run are separate processes sharing one sqlite file.
 The discipline applies **per process** — each gets its own (possibly tiny)
 core; `mcp::handle_line` is already nearly one. Between processes, the
 **store is the boundary**: cross-process ordering is governed by sqlite
@@ -212,15 +214,15 @@ suite) before the next begins.
   **Status: DONE (2026-07-24, `38146fd` "docs: mark the I/O inventory as
   verified").**
 - **Phase 1 — purity fixes in place.** Remove in-core clock reads (e.g.
-  `App::set_status` currently calls `Instant::now()` internally), thread
+  the app's old status setter called `Instant::now()` internally), thread
   time as arguments. No structural moves.
   **Status: DONE (2026-07-24, `8fd108b` "refactor(core): inject the clock
   into set_status and the summary view").**
 - **Phase 2 — the emporium event loop becomes `update`.** Unify
   key/mouse/paste/relay/discovery handling into `Event` dispatch. One
-  design decision is owed here (flagged by the Phase 0 sweep): `tui.rs`'s
-  `Context` mixes read-only dependencies (store, thresholds, claude_home)
-  with `RefCell`-wrapped mutable state (`last_genuine_esc`, `input_log`,
+  design decision was owed here (flagged by the Phase 0 sweep): the chōba
+  loop's `Context` (retired 2026-11-13) mixed read-only dependencies (store,
+  thresholds, claude_home) with `RefCell`-wrapped mutable state (`last_genuine_esc`, `input_log`,
   `pending_inplace`) behind an `&Context` that reads as configuration —
   that state must either join the real `State` or be explicitly assigned
   to the io layer, not survive the migration disguised as config. This
@@ -255,23 +257,25 @@ adoption plan this section opened with.
 
 ## Appendix A — I/O inventory (verified against code in Phase 0)
 
-Status: verified 2026-07-24 by an exhaustive sweep of both crates. This
-list defines `Event`: there is no I/O beyond it. The sweep found no
+Status: verified 2026-07-24 by an exhaustive sweep of both crates; entries
+for the external openers, in-place resume and `_wrap` were removed on
+2026-11-13 when those paths were retired (`docs/REQUIREMENTS.md`,
+"Architecture decision (2026-11-13)") — that edit was made by reading the
+removal, not by repeating the sweep. This list defines `Event`: there is no I/O
+beyond it. The sweep found no
 randomness, no network, and **no disguised inputs** — notably, session
 mtimes always come from real `fs::metadata().modified()`, never from
 "when banto last read it" (§3's own cautionary example, already done
 right).
 
-Process spawning: opener (psmux/WT via `CommandRunner`), in-place child
-(`ProcessRunner`), `PortablePtyHost` (ConPTY), `_wrap` supervision, worker
-auto-spawn.
+Process spawning: `PortablePtyHost` (ConPTY), worker auto-spawn.
 File reads: session jsonl (head + tail chunks), `sessions/<pid>.json`,
 `config.toml`, dependency-free re-reads on live reload.
 File writes: banto's own sqlite DB, per-member `--mcp-config` files,
-diagnostic logs (`BANTO_WRAP_LOG` / `BANTO_INPUT_LOG`) — all under banto's
+diagnostic logs (`BANTO_INPUT_LOG`) — all under banto's
 own config/data dirs, never `~/.claude`.
 Clocks: `Instant::now()` (event loops, relay ticks, click timing, status
-expiry, the Esc-vs-leaked-SGR disambiguation stamp in `tui.rs`),
+expiry),
 `SystemTime::now()` (store timestamps, discovery `since` — both the
 provider's and the emporium's `PendingNew` instance — live watch, and the
 summary panel's relative-age display, whose read now sits at the draw-loop
@@ -285,8 +289,8 @@ Processes: PID liveness via sysinfo (`ProcessProbe`).
 MCP: stdio JSON-RPC in `_mcp` (per-connection).
 Terminal control: raw mode, alt screen, mouse capture, bracketed paste,
 terminal size.
-Environment: `$TMUX` / `$TMUX_PANE` / `WT_SESSION` detection (already
-injected as a closure in `detect_backend` — with the relay decision
-functions, the house pattern to imitate), `BANTO_*` diagnostics,
-`std::env::current_exe()` (mcp-config and `_wrap` argv construction),
-`std::env::current_dir()` (cwd fallbacks in the emporium).
+Environment: the variables startup reads (`BANTO_CONFIG`, `XDG_CONFIG_HOME`,
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), gathered into plain values before anything
+decides from them — with the relay decision functions, the house pattern to
+imitate; `BANTO_*` diagnostics, `std::env::current_exe()` (mcp-config argv
+construction), `std::env::current_dir()` (cwd fallbacks in the UI).

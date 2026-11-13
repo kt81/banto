@@ -6,6 +6,11 @@ render the grid + forward input — i.e. the "banto becomes a minimal
 multiplexer" architecture (the general case of which in-place mode is the N=1
 degenerate form)?
 
+*(Note, 2026-11-13: in-place mode, the N=1 case named here, and the split
+(psmux/tmux) option named under "Implication for banto" below were retired;
+see `docs/REQUIREMENTS.md`, "Architecture decision (2026-11-13)". This note's
+findings are unchanged.)*
+
 **Verdict: viable on Windows.** A real `claude` session renders inside the
 embedded pane with essentially full fidelity (colors, boxed panels, the status
 bar, wide/CJK glyphs) and multibyte (Japanese) input echoes correctly. One
@@ -113,7 +118,8 @@ user's Windows Terminal:
   advancing; switching back shows the counter has moved on.
 - **Keyboard routes to the focused pane** (in the spike build F4 cycled focus;
   click focused a pane; the focused pane's cursor was mirrored). The shipped
-  keymap is in `docs/REQUIREMENTS.md`'s Emporium keys section.
+  keymap is in `docs/REQUIREMENTS.md`'s "The emporium: hosted panes" Keys
+  table.
 - **Strongest result:** `claude` launched *inside* a hosted shell pane retained
   full session state across repeated context switches — a heavy alt-screen TUI
   in a backgrounded pane survives being hidden and reshown. This is the
@@ -155,10 +161,14 @@ above; both have since landed.
   branch of `update_mouse` in `crates/banto-core/src/engine.rs`, tested by
   `wheel_over_a_pane_that_does_not_want_sgr_mouse_scrolls_its_own_scrollback`
   (same file); the scrollback-*capture* fix this depends on
-  (`portable-pty-psmux`) is in `docs/REQUIREMENTS.md`'s "Emporium mode"
+  (`portable-pty-psmux`) is in `docs/REQUIREMENTS.md`'s "The emporium: hosted panes"
   section.
 
 ## Implication for banto
+
+*(Note, 2026-11-13: the first bullet's "in-place mode is its N=1 case" and the
+last bullet's advice to keep in-place and split no longer apply; both were
+retired.)*
 
 - The embedded-multiplexer direction is de-risked enough to pursue as the path
   to the "left sidebar + swappable session pane" UX that no terminal

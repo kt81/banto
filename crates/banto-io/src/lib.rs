@@ -16,14 +16,12 @@
 //! - [`directory_trust`] advisory-only read of whether Codex/Claude Code has trusted a given cwd
 //! - [`input`] raw terminal events, read and timestamped off their own thread
 //! - [`lineage`] resolving auto-compaction parent links (beside the provider)
-//! - [`opener`]  opening/focusing sessions in a real terminal (psmux, WT)
-//! - [`process`] spawning the resumed session's process
 //! - [`provider`] session discovery + tolerant JSONL parsing (Claude Code) / sqlite (Codex)
 //! - [`pty`]     PTY host abstraction (portable-pty-psmux)
 //! - [`sqlite_ro`] read-only access to a Codex sqlite database Codex may be actively writing
 //! - [`status`]  live-session state (the I/O half; bucketing is core's) — Claude Code only, deliberately
-//! - [`store`]   sqlite: groups/pins/archived, brigades, session<->pane map
-//! - [`watch`]   filesystem watching (notify) for live TUI updates
+//! - [`store`]   sqlite: groups/pins/archived, brigades
+//! - [`watch`]   filesystem watching (notify) for live updates
 
 pub mod agent_versions;
 pub mod brigade_log;
@@ -37,8 +35,6 @@ pub mod data_dir;
 pub mod directory_trust;
 pub mod input;
 pub mod lineage;
-pub mod opener;
-pub mod process;
 pub mod provider;
 pub mod pty;
 pub(crate) mod sqlite_ro;

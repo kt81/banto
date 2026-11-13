@@ -15,28 +15,6 @@ use serde::Deserialize;
 
 use crate::model::{AgentKind, BrigadeRole};
 
-/// Which backend resumes sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum OpenerMode {
-    /// Take over banto's own pane: collapse the TUI and run the session as a
-    /// child process in the same terminal, no terminal multiplexer involved.
-    /// The default — split/tab placement (below) is reserved for the `s`
-    /// key.
-    #[default]
-    InPlace,
-    /// Detect a split/tab backend from the environment: `$TMUX` first
-    /// (resolving to real `tmux`, or to `psmux` on Windows), then
-    /// `WT_SESSION`.
-    Auto,
-    Psmux,
-    /// Real `tmux`, as distinct from `psmux`: the two address panes
-    /// differently (see `banto_io::opener::TmuxFlavor`), so which one is
-    /// driving has to be known, not guessed.
-    Tmux,
-    WindowsTerminal,
-}
-
 /// Thresholds for the activity age buckets (plain numbers here; converted to
 /// `banto_core::status::AgeThresholds` by `banto::session::thresholds_from`,
 /// which feeds `status::age_bucket`).
@@ -71,8 +49,8 @@ pub enum RelayMode {
     Manual,
 }
 
-/// Lenient by design, unlike [`OpenerMode`] (which rejects an unrecognized
-/// value with a parse error): an unrecognized `relay` string falls back to
+/// Lenient by design (a plain enum derive would reject an unrecognized value
+/// with a parse error): an unrecognized `relay` string falls back to
 /// [`RelayMode::Auto`] rather than failing the whole config load, since a
 /// typo silently keeping the relay on is preferable to it silently taking
 /// the rest of `config.toml` down with it.
@@ -144,7 +122,7 @@ impl<'de> Deserialize<'de> for WorkerAgentSetting {
     }
 }
 
-/// Brigade formation settings (emporium mode only).
+/// Brigade formation settings.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct BrigadeConfig {
@@ -453,7 +431,7 @@ impl BrigadeConfig {
 
     /// [`Self::worker_permission_mode`], or `None` for the empty-string
     /// escape hatch. No `agent` parameter, unlike [`Self::worker_model_for`]:
-    /// Codex has no `--permission-mode` counterpart (`opener::AgentLaunch::
+    /// Codex has no `--permission-mode` counterpart (`launch::AgentLaunch::
     /// Codex` carries no such field), so a Codex Worker simply never reaches
     /// anywhere this value would apply.
     pub fn worker_permission_mode(&self) -> Option<&str> {
@@ -528,7 +506,6 @@ impl Default for KeysConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub opener: OpenerMode,
     pub activity: ActivityConfig,
     pub brigade: BrigadeConfig,
     pub keys: KeysConfig,
@@ -539,7 +516,7 @@ pub struct Config {
     /// the raw string here and resolved by [`resolve_agents`] rather than
     /// parsed into a set at deserialize time, so a name this build doesn't
     /// recognize degrades leniently (see that function's doc) instead of
-    /// failing the whole document the way `OpenerMode`'s strict enum would.
+    /// failing the whole document the way a strict enum would.
     pub agents: String,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
@@ -650,7 +627,6 @@ mod tests {
     #[test]
     fn defaults_have_documented_values() {
         let config = Config::default();
-        assert_eq!(config.opener, OpenerMode::InPlace);
         assert_eq!(config.activity.today_hours, 24);
         assert_eq!(config.activity.week_days, 7);
         assert_eq!(config.brigade.workers, 1);
@@ -673,7 +649,7 @@ mod tests {
 
     #[test]
     fn keys_section_missing_yields_the_default_prefix() {
-        let config = parse("opener = \"psmux\"\n");
+        let config = parse("[activity]\ntoday_hours = 12\n");
         assert_eq!(config.keys.prefix, "C-b");
     }
 
@@ -961,8 +937,8 @@ mod tests {
 
     #[test]
     fn partial_toml_fills_remaining_defaults() {
-        let config = parse("opener = \"psmux\"\n");
-        assert_eq!(config.opener, OpenerMode::Psmux);
+        let config = parse("agents = \"codex\"\n");
+        assert_eq!(config.agents, "codex");
         assert_eq!(config.activity, ActivityConfig::default());
         assert_eq!(config.db_path, None);
     }
@@ -975,22 +951,30 @@ mod tests {
     }
 
     #[test]
-    fn all_opener_values_parse() {
-        for (text, expected) in [
-            ("in-place", OpenerMode::InPlace),
-            ("auto", OpenerMode::Auto),
-            ("psmux", OpenerMode::Psmux),
-            ("windows-terminal", OpenerMode::WindowsTerminal),
-        ] {
-            let config = parse(&format!("opener = \"{text}\"\n"));
-            assert_eq!(config.opener, expected);
-        }
+    fn unknown_keys_are_ignored() {
+        let config = parse("future_option = true\n[some_new_section]\nx = 1\n");
+        assert_eq!(config, Config::default());
     }
 
+    /// `opener` was a setting once (how a session was opened outside banto's own
+    /// panes). A config file that still has it, as a key or as a section, in any
+    /// shape — a value it used to reject included — is an unknown key like any
+    /// other: no error, and nothing else in the file is affected.
     #[test]
-    fn unknown_keys_are_ignored() {
-        let config = parse("opener = \"psmux\"\nfuture_option = true\n[some_new_section]\nx = 1\n");
-        assert_eq!(config.opener, OpenerMode::Psmux);
+    fn a_retired_opener_setting_is_ignored_in_every_shape() {
+        for text in [
+            "opener = \"psmux\"\n",
+            "opener = \"in-place\"\n",
+            "opener = \"no-such-backend\"\n",
+            "opener = 3\n",
+            "[opener]\nmode = \"psmux\"\n",
+            "[opener]\n",
+            "[[opener]]\nbackend = \"tmux\"\n",
+        ] {
+            assert_eq!(parse(text), Config::default(), "{text:?}");
+        }
+        let config = parse("[opener.extra]\nx = 1\n[activity]\ntoday_hours = 12\n");
+        assert_eq!(config.activity.today_hours, 12);
     }
 
     #[test]
@@ -1030,7 +1014,7 @@ mod tests {
 
     #[test]
     fn wrong_field_type_is_a_parse_error() {
-        let result: Result<Config, _> = toml::from_str("opener = \"no-such-backend\"\n");
+        let result: Result<Config, _> = toml::from_str("claude_home = 5\n");
         assert!(result.is_err());
     }
 

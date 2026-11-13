@@ -1,7 +1,7 @@
 //! Archived sessions.
 //!
 //! Archiving hides a session from the default list without deleting
-//! anything or touching pins/groups/panes; `unarchive_session` reverses it.
+//! anything or touching pins/groups; `unarchive_session` reverses it.
 //! Mirrors the `pins` table/API shape: a loose reference (no foreign key),
 //! so an archived id survives a source that is temporarily unavailable.
 

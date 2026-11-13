@@ -1,10 +1,11 @@
 # banto
 
 A resident TUI that searches and groups local Claude Code and Codex sessions and
-resumes them — in-place in banto's own terminal by default, or into a psmux pane
-/ Windows Terminal tab. Two UI modes share one core: the chōba (the list,
-`crates/banto/src/tui.rs`) and the emporium (banto hosting the panes itself,
-`crates/banto/src/embedded/emporium.rs`).
+resumes them in panes it hosts itself. There is one UI: the session list on the
+left (the "chōba" is only its nickname — the ledger) and, beside it, the
+sessions as live embedded panes (the "emporium" is the name of that
+hosted-panes side, and of the shop metaphor). banto opens no session outside its
+own panes.
 
 The canonical design/requirements document is `docs/REQUIREMENTS.md`. Always read it before starting work.
 The architecture discipline (TEA / sans-IO: Event → State + Cmd, I/O at the edges) is `docs/DISCIPLINE.md` — new code must land inside it.
@@ -28,11 +29,11 @@ Four crates. The dependency direction is the discipline, not a preference —
   kind, enforced by dependency (`crossterm` / `rusqlite` / `notify` / `sysinfo` /
   `portable-pty` / `dirs` are forbidden here)
 - `crates/banto-io` — the outside world: filesystem, process spawning, sqlite,
-  clock, input events, fs watch, MCP stdio (provider / store / opener / pty)
+  clock, input events, fs watch, MCP stdio (provider / store / pty)
 - `crates/banto-tui` — rendering from `&State`: pure `(frame, state, area)`
   widgets, no key handling and no terminal setup
-- `crates/banto` — bin: clap CLI, raw crossterm, the event loop, and the wiring
-  between the other three
+- `crates/banto` — bin: clap CLI, raw crossterm, the one UI's event loop, and the
+  wiring between the other three
 
 ## Invariants (never violate)
 
@@ -46,7 +47,7 @@ Four crates. The dependency direction is the discipline, not a preference —
 
 - Documentation, commit messages, identifiers, and code comments are all written in English
 - Keep clippy clean with `-D warnings`
-- Put every external process invocation (tmux etc.) behind an abstraction (trait) and mock it in unit tests
+- Put every external process invocation (the agent processes, liveness probes, etc.) behind an abstraction (trait) and mock it in unit tests
 - **Comments earn their place.** Say what the code cannot: why it has this
   shape, a fact measured on a real machine, an incident that happened, a
   constraint an innocent edit would break, a rejected alternative someone

@@ -18,7 +18,7 @@
 //! read that used to block the handler into "ask the shell, wait for the
 //! fact" — see the `StoreIntent`/`Event` variants below.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -584,6 +584,16 @@ impl StatusReminder {
     }
 }
 
+/// Put the next startup notice on the status line, if one is waiting and the
+/// line is free.
+fn show_next_startup_notice(state: &mut EmporiumState, now: Instant) {
+    if state.status.is_none()
+        && let Some(notice) = state.startup_notices.pop_front()
+    {
+        state.set_status(notice, now);
+    }
+}
+
 /// A nudge awaiting its phase-two Enter (see [`update_tick`]).
 struct PendingSubmit {
     key: SessionKey,
@@ -918,6 +928,10 @@ pub struct EmporiumState {
     pub focus: Focus,
     pub status: Option<String>,
     status_set_at: Option<Instant>,
+    /// Notices the shell found at startup and has not shown yet (see
+    /// [`Event::StartupNotices`]); the next goes up whenever the status line is
+    /// free, so two never overwrite each other unseen.
+    startup_notices: VecDeque<String>,
     /// When `Cmd::SweepDataDir` is next due. `None` until the first tick, which
     /// starts the clock without sweeping: a sweep is never the first thing a
     /// freshly started emporium does.
@@ -1034,8 +1048,7 @@ pub struct EmporiumState {
     /// The session id of a Director-to-be whose already-open pane was just
     /// killed (`confirm_director_reopen_modal`), waiting for that pane to be gone
     /// before formation can continue — reopening any sooner would resume a
-    /// session `banto::opener::decide_inplace_resume` still sees as live and
-    /// refuse. `update_pty_exited` takes it once the end of this exact key lands:
+    /// session `banto::launch::is_live` still sees as live and refuse. `update_pty_exited` takes it once the end of this exact key lands:
     /// an `Event::PtyExited`, or an `Event::PtyOutputLost` (which
     /// `update_pty_output_lost` hands to it, since the pane banto killed is gone
     /// either way). Unlike `pending_brigade_formation`/
@@ -1271,6 +1284,7 @@ impl EmporiumState {
             focus: Focus::Sidebar,
             status: None,
             status_set_at: None,
+            startup_notices: VecDeque::new(),
             relay_states: HashMap::new(),
             member_facts: HashMap::new(),
             persisted_layouts: HashMap::new(),
@@ -2520,7 +2534,7 @@ pub enum Cmd {
     /// original launch). `effort` is `--effort <level>`, so far only ever
     /// set for a freshly-spawned Goinkyo (`BrigadeConfig::goinkyo_effort`)
     /// — the shell drops it for a Codex target, which has no such flag; see
-    /// `banto::opener::AgentLaunch::Claude`'s own `effort` field. `permission_mode`
+    /// `banto::launch::AgentLaunch::Claude`'s own `effort` field. `permission_mode`
     /// (`--permission-mode <mode>`, `BrigadeConfig::goinkyo_permission_mode`)
     /// and `disallowed_tools` (`--disallowedTools <tools>`,
     /// `BrigadeConfig::goinkyo_disallowed_tools`) both diverge from `effort`
@@ -2529,7 +2543,7 @@ pub enum Cmd {
     /// properties of the *role*, not of whether this particular launch
     /// happens to be fresh or a resume — so both are set for a Goinkyo
     /// either way, never for a Worker or Director, and never for Codex
-    /// (Claude-only flags; `banto::opener::AgentLaunch::Codex` carries neither
+    /// (Claude-only flags; `banto::launch::AgentLaunch::Codex` carries neither
     /// field at all). The shell answers with `Event::Spawned`/`SpawnFailed`.
     OpenEmbedded {
         key: SessionKey,
@@ -2806,6 +2820,17 @@ pub enum Event {
     /// a width that reached state any other way would size them differently.
     SidebarWidthLoaded {
         width: Option<u16>,
+    },
+    /// What the shell found wrong at startup and wants the operator to see: an
+    /// untrusted Codex hook, an unrecognised `agents` name. Fed once, with the
+    /// stored sidebar width, as an `Event` so a replay shows the same status
+    /// line. Each goes up as a status message, one after another: the next
+    /// when the status line is free (the previous showing timed out, or
+    /// nothing else was on it), so none is overwritten before it was seen.
+    /// Shown messages block nothing. A stream recorded before this event
+    /// existed does not contain it, and replays as before.
+    StartupNotices {
+        notices: Vec<String>,
     },
     /// Answers `Cmd::CheckCodexTrust`: whether banto's `SessionStart` hook
     /// looks trusted right now, and whether it could even fire from this
@@ -3124,6 +3149,11 @@ pub fn update(
             }
             Vec::new()
         }
+        Event::StartupNotices { notices } => {
+            state.startup_notices.extend(notices);
+            show_next_startup_notice(state, now);
+            Vec::new()
+        }
         Event::CodexTrustChecked {
             primed,
             hook_launchable,
@@ -3337,11 +3367,10 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
 
 /// Resize every currently-staged tile's `Screen` to match the current
 /// layout, emitting a `Cmd::ResizePty` only for the ones that actually
-/// changed (matches the pre-migration per-tick unconditional resize, whose
-/// dedup lived inside `EmbeddedSession::resize` — moved here, now pure).
-/// Called once at the end of every `update` regardless of event kind: cheap
-/// (a HashMap lookup per staged tile) and correct without needing every
-/// stage-mutating branch to remember to call it.
+/// changed (`Screen::resize` reports whether it did). Called once at the end of
+/// every `update` regardless of event kind: cheap (a HashMap lookup per staged
+/// tile) and correct without needing every stage-mutating branch to remember to
+/// call it.
 fn resize_staged_tiles(state: &mut EmporiumState) -> Vec<Cmd> {
     let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
     let mut cmds = Vec::new();
@@ -3904,10 +3933,8 @@ fn update_modal_key(
             app.modal_complete_candidate();
             Vec::new()
         }
-        // New-session and Worker-agent-picker modals only (see
-        // `App::modal_toggle_agent`'s doc for why the chōba binds neither);
-        // a no-op for every other modal kind, same as
-        // `modal_complete_candidate` above.
+        // New-session and Worker-agent-picker modals only; a no-op for every
+        // other modal kind, same as `modal_complete_candidate` above.
         KeyCode::BackTab => {
             app.modal_toggle_agent();
             Vec::new()
@@ -3989,7 +4016,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
 /// is the lower-stakes case, and by the time one exists to add to, any
 /// Codex member already spawned would already have gone through this same
 /// gate if one was ever needed (the hook's trust key is one fixed string
-/// per install, not per-member — see `banto::opener::session_start_hook_override`'s
+/// per install, not per-member — see `banto::launch::session_start_hook_override`'s
 /// doc).
 fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let Some(Modal::WorkerAgentPicker(picker)) = app.modal() else {
@@ -6078,9 +6105,11 @@ fn relaunch_member(
     })))
 }
 
-/// `D`: take the selected session back out of banto's archive. No confirm —
-/// see the chōba's own `unarchive_selected` for why burying is guarded and
-/// restoring is not.
+/// `D`: take the selected session back out of banto's archive. No confirm,
+/// unlike `d`'s: burying is what disorients — a row leaves a list the operator
+/// is reading — and that is what the confirm guards. Bringing one back puts a
+/// row where the operator was already looking at its archived form, and `d`
+/// undoes it again in one key.
 fn unarchive_selected(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
     let Some(row) = app.selected_row() else {
         return Vec::new();
@@ -7130,6 +7159,11 @@ fn update_tick(
         state.status_set_at = None;
     }
 
+    // After the expiry above, so a notice that just ran out is followed by the
+    // next one on this very tick; before the reminders below, which wait for a
+    // free line, so a one-time notice is not queued behind a recurring one.
+    show_next_startup_notice(state, now);
+
     // After the expiry above, so a showing that just ran out can be followed
     // by the cycle's own gap rather than waiting out another tick.
     if state
@@ -7553,6 +7587,9 @@ mod data_dir_sweep_tests;
 
 #[cfg(test)]
 mod member_exit_tests;
+
+#[cfg(test)]
+mod startup_notice_tests;
 
 #[cfg(test)]
 mod one_pane_tests;

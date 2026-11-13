@@ -1,6 +1,6 @@
-//! The "emporium" (大店 / `--emporium` / `--oodana`) mode: banto as a
-//! persistent left sidebar (the session list) plus a pane area beside it that
-//! hosts the staged session or a brigade's tiles, embedded.
+//! The "emporium" (大店): banto's one UI — a persistent left sidebar (the
+//! session list, nicknamed the chōba) plus a pane area beside it that hosts the
+//! staged session or a brigade's tiles, embedded.
 //!
 //! Per `docs/DISCIPLINE.md` §4, this module is a thin **shell**: it gathers
 //! facts about the outside world into
@@ -9,10 +9,9 @@
 //! reads/writes, and drawing all live here; none of the *decisions* do (see
 //! `super::engine`, which owns `Stage`/`Focus`/the relay engine/etc.).
 //!
-//! The chōba list TUI (`crate::tui`) owns the shared pieces this reuses —
-//! `App` (list state), the `view` renderers, the store-load helpers, and
-//! `render_modal`. It has its own, separate event loop and is untouched by
-//! this migration.
+//! The pieces this draws on live outside it: `App` (list state), the `view`
+//! renderers and `render_modal` (`banto-tui`), and the store-load helpers
+//! (`crate::session`).
 //!
 //! `BANTO_RECORD_EVENTS=<path>` (see [`EventRecorder`]'s doc for what it
 //! captures and why it must never be committed) captures every `Event` fed
@@ -79,9 +78,9 @@ use banto_tui::paint;
 use banto_tui::strip::{StripData, StripMessage, render_strip};
 use banto_tui::view::{self, WAITING_ACTIVITY_COLOR};
 
-use crate::opener;
+use crate::launch;
 use crate::session;
-use crate::tui::LiveWatch;
+use banto_io::watch::LiveWatch;
 
 use super::convert;
 use super::paste_accum::{PasteAccumulator, is_in_scope};
@@ -333,7 +332,7 @@ impl<B: Backend> Backend for TimedBackend<B> {
 
 /// The `config.toml`-derived settings [`run`] needs, bundled into one
 /// parameter once a fourth one (`enabled_agents`) pushed the plain arg list
-/// past clippy's `too_many_arguments` limit — mirrors `crate::opener::OpenContext`'s
+/// past clippy's `too_many_arguments` limit — mirrors `crate::launch::OpenContext`'s
 /// role for the same problem there.
 pub struct EmporiumSettings<'a> {
     /// `[brigade]`: how many fresh Workers `B` auto-spawns when forming a
@@ -342,10 +341,10 @@ pub struct EmporiumSettings<'a> {
     pub brigade: &'a BrigadeConfig,
     /// `[keys]`: the tmux-style prefix chord for pane operations.
     pub keys: &'a KeysConfig,
-    /// `[agent_binaries]` — see `crate::opener::agent_binary`.
+    /// `[agent_binaries]` — see `crate::launch::agent_binary`.
     pub agent_binaries: &'a AgentBinaries,
-    /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
-    /// The whole [`ResolvedAgents`], not just its `enabled` set, so [`run`]
+    /// `Config.agents`, resolved. The whole [`ResolvedAgents`], not just its
+    /// `enabled` set, so [`run`]
     /// can also post the startup notice for a name it had to ignore (see
     /// `session::agents_ignored_notice`).
     pub resolved_agents: &'a ResolvedAgents,
@@ -355,7 +354,7 @@ pub struct EmporiumSettings<'a> {
     pub child: &'a crate::startup::Resolved,
 }
 
-/// Run the emporium mode until the user quits (`q`/Esc from the sidebar; a
+/// Run the emporium until the user quits (`q`/Esc from the sidebar; a
 /// second press while sessions are running).
 pub fn run(
     claude_home: &ClaudeHome,
@@ -380,25 +379,25 @@ pub fn run(
     let meta_cache = MetaCache::new();
     let metas = session::discover_all(claude_home, codex_home, enabled_agents, Some(&meta_cache))?;
     // In-memory only, for this process's lifetime — see
-    // `crate::tui::superseded_from_metas`'s doc. Created once here and
+    // `crate::session::superseded_from_metas`'s doc. Created once here and
     // threaded through every reload (the bootstrap below and every later
     // `gather_reload`) rather than per-call, so a permanently-unresolvable
     // continuation is scanned at most once per banto run.
     let superseded_failed = RefCell::new(HashSet::new());
-    // Same store-backed state the chōba list builds, so grouping / pins /
-    // archived-hiding / brigade hiding show identically in the sidebar. This
+    // The store-backed state the sidebar shows: grouping, pins, archived-hiding
+    // and brigade hiding. This
     // one-time bootstrap stays outside `update`: `App::with_*` are
     // construction-only builders, not a repeating decision.
     let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
         let store = store.borrow();
-        let superseded = crate::tui::superseded_from_metas(&metas, &store, &superseded_failed);
+        let superseded = crate::session::superseded_from_metas(&metas, &store, &superseded_failed);
         let rows = session::rows_from_metas(metas, claude_home, codex_home, thresholds);
-        let rows = crate::tui::mark_archived(rows, &store);
-        let pinned = crate::tui::load_pinned(&store);
-        let groups = crate::tui::load_groups(&store);
-        let session_groups = crate::tui::load_session_groups(&store, &groups);
-        let hidden = crate::tui::load_hidden_member_ids(&store);
-        let directors = crate::tui::load_directors(&store);
+        let rows = crate::session::mark_archived(rows, &store);
+        let pinned = crate::session::load_pinned(&store);
+        let groups = crate::session::load_groups(&store);
+        let session_groups = crate::session::load_session_groups(&store, &groups);
+        let hidden = crate::session::load_hidden_member_ids(&store);
+        let directors = crate::session::load_directors(&store);
         (
             rows,
             pinned,
@@ -417,13 +416,12 @@ pub fn run(
         .with_superseded(superseded)
         // Two lines per row (title/age, then cwd/agent) — the sidebar has
         // the width for markers and a title but not a cwd too (see
-        // `banto_tui::view`'s module doc's "Row layout" section); the chōba
-        // stays the default of 1.
+        // `banto_tui::view`'s module doc's "Row layout" section).
         .with_lines_per_row(2)
         .with_enabled_agents(enabled_agents.clone());
-    // The trust notice wins the status line when both apply: an unknown agent
-    // name is a typo in a setting, while an untrusted hook is a cell about to
-    // form with members nothing will ever brief.
+    // Both are shown when both apply, the trust notice first: an untrusted hook
+    // is a cell about to form with members nothing will ever brief, while an
+    // unknown agent name is a typo in a setting.
     let trust_notice = codex_home
         .filter(|_| enabled_agents.contains(&AgentKind::Codex))
         .and_then(|home| {
@@ -436,7 +434,7 @@ pub fn run(
             // space nothing has established is there would be worse than
             // leaving the trust question to speak for itself.
             let hook_launchable = match std::env::current_exe() {
-                Ok(exe) => opener::hook_command_is_launchable(&opener::forward_slash_path(&exe)),
+                Ok(exe) => launch::hook_command_is_launchable(&launch::forward_slash_path(&exe)),
                 Err(_) => true,
             };
             session::codex_trust_notice(
@@ -446,11 +444,13 @@ pub fn run(
                 hook_launchable,
             )
         });
-    if let Some(notice) =
-        trust_notice.or_else(|| session::agents_ignored_notice(settings.resolved_agents))
-    {
-        app.set_status(notice, Instant::now());
-    }
+    let startup_notices: Vec<String> = [
+        trust_notice,
+        session::agents_ignored_notice(settings.resolved_agents),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     let deps = Deps {
         claude_home,
@@ -467,7 +467,14 @@ pub fn run(
         child: Some(settings.child),
     };
     let (mut terminal, mut frame_output) = setup_terminal()?;
-    let result = event_loop(&mut terminal, &mut frame_output, &mut app, &deps, keys);
+    let result = event_loop(
+        &mut terminal,
+        &mut frame_output,
+        &mut app,
+        &deps,
+        keys,
+        startup_notices,
+    );
     let restored = restore_terminal();
     result.and(restored)
 }
@@ -510,18 +517,16 @@ struct DiscoveryTracker {
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read-only shell dependencies that don't change across an [`event_loop`]
-/// iteration — bundled (mirroring `crate::tui::Context`'s role in the
-/// chōba list) so `event_loop`/`execute_cmd`/`gather_reload`'s argument
+/// iteration — bundled so `event_loop`/`execute_cmd`/`gather_reload`'s argument
 /// lists don't keep growing one-by-one as more reload-path state (like
 /// [`Self::superseded_failed`]) gets threaded through.
 struct Deps<'a> {
     claude_home: &'a ClaudeHome,
-    /// `None` degrades to no Codex sessions in the sidebar, not an error —
-    /// same contract as `crate::tui::Context::codex_home`.
+    /// `None` degrades to no Codex sessions in the sidebar, not an error.
     codex_home: Option<&'a CodexHome>,
     thresholds: &'a AgeThresholds,
     store: &'a RefCell<Store>,
-    /// See [`crate::tui::superseded_from_metas`]'s doc: in-memory only, for
+    /// See [`crate::session::superseded_from_metas`]'s doc: in-memory only, for
     /// this process's lifetime.
     superseded_failed: &'a RefCell<HashSet<SessionId>>,
     /// Transcript parses carried between reloads (`banto_io::provider::cache`).
@@ -551,9 +556,9 @@ struct Deps<'a> {
     /// member's launch argv carries its role briefing — see
     /// [`member_briefing`]).
     brigade: &'a BrigadeConfig,
-    /// `[agent_binaries]` from config.toml — see `opener::agent_binary`.
+    /// `[agent_binaries]` from config.toml — see `launch::agent_binary`.
     agent_binaries: &'a AgentBinaries,
-    /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
+    /// `Config.agents`, resolved.
     enabled_agents: &'a BTreeSet<AgentKind>,
     /// What a brigade member's banto children are told to resolve (see
     /// [`EmporiumSettings::child`]); `None` in a test, which then builds the
@@ -567,6 +572,7 @@ fn event_loop(
     app: &mut App,
     deps: &Deps,
     keys: &KeysConfig,
+    startup_notices: Vec<String>,
 ) -> Result<()> {
     let brigade = deps.brigade;
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
@@ -580,6 +586,10 @@ fn event_loop(
     // iteration (see the loop) so it is part of the recorded stream.
     let mut stored_sidebar_width = Some(Event::SidebarWidthLoaded {
         width: deps.store.borrow().sidebar_width().ok().flatten(),
+    });
+    // Fed right after it, for the same reason: as part of the recorded stream.
+    let mut startup_notices = (!startup_notices.is_empty()).then_some(Event::StartupNotices {
+        notices: startup_notices,
     });
     // Opened once, off this thread — see `banto_io::input`'s module doc for
     // why the read no longer happens inline here: a slow iteration
@@ -608,6 +618,7 @@ fn event_loop(
         // `events` below; the viewport height it sets does not depend on the
         // sidebar's width, so the order between the two does not matter.)
         events.extend(stored_sidebar_width.take());
+        events.extend(startup_notices.take());
 
         // Geometry is cached from startup, native resize input, and the
         // once-a-second fallback below. `Terminal::draw` used to perform a
@@ -1188,7 +1199,7 @@ fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
             == banto_io::codex_trust::HookTrustState::Primed
     });
     let hook_launchable = match std::env::current_exe() {
-        Ok(exe) => opener::hook_command_is_launchable(&opener::forward_slash_path(&exe)),
+        Ok(exe) => launch::hook_command_is_launchable(&launch::forward_slash_path(&exe)),
         Err(_) => true,
     };
     vec![Event::CodexTrustChecked {
@@ -1275,9 +1286,9 @@ fn execute_open_codex_trust_pane(
     }
 }
 
-/// Build the [`opener::AgentLaunch`] for opening `target`: resuming it via
-/// [`opener::decide_inplace_resume`] when a real id is already known (`None`
-/// if a live pane elsewhere refuses the resume), or a fresh unresumed launch
+/// Build the [`launch::AgentLaunch`] for opening `target`: resuming it when a
+/// real id is already known (`None` if [`launch::is_live`] finds it already
+/// running somewhere, so a resume would fork its history), or a fresh unresumed launch
 /// otherwise — either way with `model`/`briefing` carried on the result.
 /// `target.agent` picks the variant; `briefing` only ever reaches the
 /// `Claude` one, because only Claude takes a briefing as launch argv; a
@@ -1307,22 +1318,21 @@ fn build_open_launch(
     permission_mode: Option<&str>,
     disallowed_tools: Option<&str>,
     briefing: Option<&str>,
-    ctx: &opener::OpenContext,
-) -> Option<opener::AgentLaunch> {
+    ctx: &launch::OpenContext,
+) -> Option<launch::AgentLaunch> {
     let resume = if target.id.is_empty() {
         None
     } else {
-        // Called for its refusal, not its value: this is the no-double-resume
-        // guard (AGENTS.md invariant 4), and `?` is what turns a session that
-        // is already live somewhere else into `None`. The `InPlaceLaunch` it
-        // hands back is dropped because its argv is by construction
-        // `inplace_argv(target.agent, Some(&target.id), ...)` — the same id
-        // we resume below.
-        opener::decide_inplace_resume(target, ctx)?;
+        // The no-double-resume guard (AGENTS.md invariant 4): a session that
+        // is already running somewhere else — another banto, or an agent
+        // started by hand — is never resumed a second time.
+        if launch::is_live(target, ctx) {
+            return None;
+        }
         Some(target.id.clone())
     };
     Some(match target.agent {
-        AgentKind::ClaudeCode => opener::AgentLaunch::Claude {
+        AgentKind::ClaudeCode => launch::AgentLaunch::Claude {
             resume,
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
@@ -1341,7 +1351,7 @@ fn build_open_launch(
         // same reason `AgentLaunch::Codex` carries no field for any of them
         // — a Goinkyo (the only source of any today) is Claude-only, so
         // this arm never actually receives one; see that variant's own doc.
-        AgentKind::Codex => opener::AgentLaunch::Codex {
+        AgentKind::Codex => launch::AgentLaunch::Codex {
             resume,
             model: model.map(str::to_string),
             cwd: target.cwd.clone(),
@@ -1365,10 +1375,9 @@ struct OpenEmbeddedRequest {
     disallowed_tools: Option<String>,
 }
 
-/// Spawn `target` under `key`, enforcing the no-double-resume guard for a
-/// known (non-empty) id — reusing the chōba in-place decision — or
-/// skipping it entirely for a fresh (empty-id) spawn, which has no existing
-/// session to double-resume. `brigade` wires the launch to banto's own MCP
+/// Spawn `target` under `key`, enforcing the no-double-resume guard
+/// ([`launch::is_live`]) for a known (non-empty) id, or skipping it entirely for
+/// a fresh (empty-id) spawn, which has no existing session to double-resume. `brigade` wires the launch to banto's own MCP
 /// server; a write failure there now refuses the spawn outright
 /// (`Event::SpawnFailed`) rather than the pre-migration behavior of
 /// spawning anyway, without the flag. That silent degrade was measured live:
@@ -1403,10 +1412,9 @@ fn execute_open_embedded(
     let briefing = brigade
         .as_ref()
         .and_then(|(brigade_id, token, role)| member_briefing(deps, *brigade_id, token, *role));
-    let open_ctx = opener::OpenContext {
+    let open_ctx = launch::OpenContext {
         probe: &SysinfoProbe,
         live: &live,
-        binaries: deps.agent_binaries,
         codex_home: deps.codex_home,
         start_time: &SysinfoStartTime,
     };
@@ -1436,7 +1444,7 @@ fn execute_open_embedded(
             .map(|child| child.child_args())
             .unwrap_or_default();
         let wiring = match &mut launch {
-            opener::AgentLaunch::Claude { mcp_config, .. } => data_dir_of(deps)
+            launch::AgentLaunch::Claude { mcp_config, .. } => data_dir_of(deps)
                 .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))
                 .and_then(|data_dir| {
                     write_mcp_config(&data_dir, *brigade_id, token, *role, known_id, &child_args)
@@ -1444,10 +1452,10 @@ fn execute_open_embedded(
                 .map(|path| {
                     *mcp_config = Some(path);
                 }),
-            opener::AgentLaunch::Codex { brigade: slot, .. } => std::env::current_exe()
+            launch::AgentLaunch::Codex { brigade: slot, .. } => std::env::current_exe()
                 .map_err(anyhow::Error::from)
                 .map(|exe| {
-                    *slot = Some(opener::CodexBrigade {
+                    *slot = Some(launch::CodexBrigade {
                         exe,
                         brigade_id: *brigade_id,
                         token: token.clone(),
@@ -1464,7 +1472,7 @@ fn execute_open_embedded(
             }];
         }
     }
-    let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
+    let argv = launch.argv(&launch::agent_binary(target.agent, deps.agent_binaries));
     let env = brigade_env(brigade.as_ref(), deps.child);
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(
@@ -1695,8 +1703,8 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .map_err(|err| err.to_string())
                 .map(|()| {
                     (
-                        crate::tui::load_hidden_member_ids(&store),
-                        crate::tui::load_directors(&store),
+                        crate::session::load_hidden_member_ids(&store),
+                        crate::session::load_directors(&store),
                     )
                 });
             vec![Event::Disbanded { brigade_id, result }]
@@ -1708,8 +1716,8 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .map_err(|err| err.to_string())
                 .map(|_| {
                     (
-                        crate::tui::load_hidden_member_ids(&store),
-                        crate::tui::load_directors(&store),
+                        crate::session::load_hidden_member_ids(&store),
+                        crate::session::load_directors(&store),
                     )
                 });
             vec![Event::WorkerDismissed { brigade_id, result }]
@@ -1729,8 +1737,8 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .map(|removed| {
                     (
                         removed,
-                        crate::tui::load_hidden_member_ids(&store),
-                        crate::tui::load_directors(&store),
+                        crate::session::load_hidden_member_ids(&store),
+                        crate::session::load_directors(&store),
                     )
                 });
             vec![Event::ExitedWorkerDismissed {
@@ -1748,8 +1756,8 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let mut store = store.borrow_mut();
             let _ = store.set_member_session(brigade_id, &token, &SessionId(session_id));
             vec![Event::MemberSessionRecorded {
-                hidden: crate::tui::load_hidden_member_ids(&store),
-                directors: crate::tui::load_directors(&store),
+                hidden: crate::session::load_hidden_member_ids(&store),
+                directors: crate::session::load_directors(&store),
             }]
         }
         StoreIntent::ClearMemberSession { brigade_id, token } => {
@@ -1759,8 +1767,8 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             // just left (or, if it had none, stayed out of) the hidden set,
             // so the sidebar's own filter needs to catch up either way.
             vec![Event::MemberSessionRecorded {
-                hidden: crate::tui::load_hidden_member_ids(&store),
-                directors: crate::tui::load_directors(&store),
+                hidden: crate::session::load_hidden_member_ids(&store),
+                directors: crate::session::load_directors(&store),
             }]
         }
     }
@@ -1854,7 +1862,7 @@ fn add_worker_store(
 /// event, keeping the previous rows) rather than erroring the whole loop out
 /// over a transient filesystem hiccup. Also spends this reload's
 /// lineage-resolution budget against the same discover() pass (see
-/// [`crate::tui::superseded_from_metas`]).
+/// [`crate::session::superseded_from_metas`]).
 fn gather_reload(deps: &Deps) -> Vec<Event> {
     let Ok(metas) = session::discover_all(
         deps.claude_home,
@@ -1865,11 +1873,11 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
         return Vec::new();
     };
     let store = deps.store.borrow();
-    let superseded = crate::tui::superseded_from_metas(&metas, &store, deps.superseded_failed);
+    let superseded = crate::session::superseded_from_metas(&metas, &store, deps.superseded_failed);
     let rows = session::rows_from_metas(metas, deps.claude_home, deps.codex_home, deps.thresholds);
-    let rows = crate::tui::mark_archived(rows, &store);
-    let hidden = crate::tui::load_hidden_member_ids(&store);
-    let directors = crate::tui::load_directors(&store);
+    let rows = crate::session::mark_archived(rows, &store);
+    let hidden = crate::session::load_hidden_member_ids(&store);
+    let directors = crate::session::load_directors(&store);
     vec![Event::RowsLoaded {
         rows,
         hidden,
@@ -2885,7 +2893,7 @@ fn draw(
     if let Some(modal) = app.modal() {
         // `true`: the emporium binds Shift-Tab to `App::modal_toggle_agent`
         // (see `engine::update_modal_key`) — see `render_modal`'s doc.
-        banto_tui::render_modal::render_modal(frame, modal, full_area, true);
+        banto_tui::render_modal::render_modal(frame, modal, full_area);
     }
 
     frame_cursor
@@ -3088,8 +3096,7 @@ fn pane_title(text: &str, focused: bool) -> Span<'static> {
 /// here as an ordinary machine-pace key burst, and it re-derives "that was a
 /// paste" from inter-key timing alone. This call is kept regardless — it
 /// costs nothing on the platform where it doesn't help, and is what makes
-/// Unix backends behave correctly. The chōba list TUI (`crate::tui`) is
-/// untouched: it has its own, separate `setup_terminal`.
+/// Unix backends behave correctly.
 fn setup_terminal() -> Result<(Tui, FrameOutputHandle<Stdout>)> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -3121,14 +3128,10 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-/// Open the diagnostic input-event log when `BANTO_INPUT_LOG` is set —
-/// mirrors `crate::tui`'s own instrumentation (same env var, same
-/// `{ms} <prefix>: <message>` line format) line-for-line except for the
-/// `emporium:` prefix in place of `tui:`, so a log the two modes happen to
-/// share (they never run in the same process, but an operator may point
-/// both at one file across separate runs) still says which mode wrote which
-/// line. Diagnostic plumbing only: never read by anything in this crate,
-/// and `engine.rs` (the pure core) never sees it.
+/// Open the diagnostic input-event log when `BANTO_INPUT_LOG` is set: one
+/// `{ms} emporium: <message>` line per entry. Diagnostic plumbing only: never
+/// read by anything in this crate, and `engine.rs` (the pure core) never sees
+/// it.
 fn open_input_log() -> Option<std::fs::File> {
     let path = std::env::var_os("BANTO_INPUT_LOG")?;
     std::fs::OpenOptions::new()
@@ -3610,9 +3613,11 @@ fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
     }
 }
 
-/// Compact, payload-free description of one raw crossterm event, logged
-/// before conversion — deliberately a paste's length, never its text (the
-/// diagnostic log is meant to be safe to paste into a bug report).
+/// Compact description of one raw crossterm event, logged before conversion.
+/// A paste is logged as its length, never its text; a key is logged as its code,
+/// kind and modifiers, so the log holds the operator's keystrokes — typed
+/// characters included — and is not something to paste into a bug report
+/// unread.
 fn describe_raw_event(event: &crossterm::event::Event) -> String {
     match event {
         crossterm::event::Event::Key(key) => format!(
@@ -3865,6 +3870,65 @@ mod tests {
     fn status_row(buffer: &Buffer) -> String {
         let bottom = buffer.area.height - 1;
         text_at(buffer, 0, bottom, buffer.area.width)
+    }
+
+    /// Feed `event` to the core at `now` and draw the result's bottom line.
+    fn status_after(
+        state: &mut EmporiumState,
+        app: &mut App,
+        event: Event,
+        now: Instant,
+    ) -> String {
+        engine::update(state, app, &BrigadeConfig::default(), event, now);
+        status_row(&render(state, app))
+    }
+
+    #[test]
+    fn startup_notices_reach_the_status_bar_one_after_the_other_and_then_the_hints_return() {
+        let mut app = App::new(Vec::new());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let t0 = Instant::now();
+        let notices = vec![
+            "codex: brigade briefings need a one-time approval".to_string(),
+            "agents: ignored unknown name(s) \"codx\"".to_string(),
+        ];
+
+        // Both apply: the first is up at once and the second is not lost, only
+        // waiting for the line.
+        let first = status_after(&mut state, &mut app, Event::StartupNotices { notices }, t0);
+        assert!(first.contains("one-time approval"), "{first:?}");
+        assert!(!first.contains("codx"), "{first:?}");
+
+        // The first has had its time: the second takes the line on that tick.
+        let tick = || Event::Tick {
+            relay: Vec::new(),
+            brigades: Vec::new(),
+        };
+        let second = status_after(&mut state, &mut app, tick(), t0 + Duration::from_secs(6));
+        assert!(
+            second.contains("ignored unknown name(s) \"codx\""),
+            "{second:?}"
+        );
+        assert!(!second.contains("one-time approval"), "{second:?}");
+
+        // And when that has run out too, the key guidance is back.
+        let after = status_after(&mut state, &mut app, tick(), t0 + Duration::from_secs(12));
+        assert!(after.contains("j/k move"), "{after:?}");
+    }
+
+    #[test]
+    fn with_no_startup_notice_the_status_bar_shows_the_hints() {
+        let mut app = App::new(Vec::new());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let line = status_after(
+            &mut state,
+            &mut app,
+            Event::StartupNotices {
+                notices: Vec::new(),
+            },
+            Instant::now(),
+        );
+        assert!(line.contains("j/k move"), "{line:?}");
     }
 
     #[test]
@@ -7474,18 +7538,16 @@ mod tests {
         }
     }
 
-    /// An [`opener::OpenContext`] for tests that don't care about Codex
+    /// An [`launch::OpenContext`] for tests that don't care about Codex
     /// liveness (`codex_home: None` degrades every Codex check to "not
     /// live" — see `codex_liveness::is_thread_alive`'s doc).
     fn test_ctx<'a>(
         probe: &'a dyn ProcessProbe,
         live: &'a [LiveSession],
-        binaries: &'a AgentBinaries,
-    ) -> opener::OpenContext<'a> {
-        opener::OpenContext {
+    ) -> launch::OpenContext<'a> {
+        launch::OpenContext {
             probe,
             live,
-            binaries,
             codex_home: None,
             start_time: &SysinfoStartTime,
         }
@@ -7496,7 +7558,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
@@ -7504,7 +7565,7 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7518,7 +7579,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target(""),
             Some("fable"),
@@ -7526,7 +7586,7 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7541,7 +7601,7 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7555,7 +7615,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target(""),
             Some("fable"),
@@ -7563,7 +7622,7 @@ mod tests {
             Some("auto"),
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7587,7 +7646,7 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7602,7 +7661,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target(""),
             Some("fable"),
@@ -7610,7 +7668,7 @@ mod tests {
             Some("auto"),
             Some("Edit,Write,NotebookEdit"),
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7636,7 +7694,7 @@ mod tests {
             Some("auto"),
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7659,7 +7717,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target(""),
             Some("opus"),
@@ -7667,7 +7724,7 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7681,7 +7738,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             None,
@@ -7689,7 +7745,7 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7713,7 +7769,6 @@ mod tests {
             proc_start: None,
             version: None,
         }];
-        let binaries = AgentBinaries::default();
         assert!(
             build_open_launch(
                 &open_target("sess-1"),
@@ -7722,9 +7777,40 @@ mod tests {
                 None,
                 None,
                 None,
-                &test_ctx(&probe, &live, &binaries),
+                &test_ctx(&probe, &live),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn build_open_launch_ignores_a_live_session_that_is_a_different_one() {
+        // The guard refuses a resume of the session that is running, not any
+        // resume while something is.
+        let probe = MockProbe {
+            alive: HashSet::from([4242]),
+        };
+        let live = [LiveSession {
+            pid: 4242,
+            session_id: Some("some-other-session".to_string()),
+            cwd: None,
+            status: None,
+            kind: None,
+            name: None,
+            proc_start: None,
+            version: None,
+        }];
+        assert!(
+            build_open_launch(
+                &open_target("sess-1"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &test_ctx(&probe, &live),
+            )
+            .is_some()
         );
     }
 
@@ -7735,7 +7821,6 @@ mod tests {
         };
         let mut target = open_target("codex-uuid-1");
         target.agent = AgentKind::Codex;
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &target,
             Some("o3"),
@@ -7755,7 +7840,7 @@ mod tests {
             // `SessionStart` hook's `additionalContext` (`crate::hook`'s
             // module doc), never through argv at all.
             Some("you are the Director"),
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7791,7 +7876,6 @@ mod tests {
         };
         let mut target = open_target("codex-uuid-1");
         target.agent = AgentKind::Codex;
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &target,
             Some("o3"),
@@ -7799,7 +7883,7 @@ mod tests {
             Some("auto"),
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert!(
@@ -7817,7 +7901,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
@@ -7825,7 +7908,7 @@ mod tests {
             None,
             None,
             Some("you are the Director"),
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         assert_eq!(
@@ -7848,7 +7931,6 @@ mod tests {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let binaries = AgentBinaries::default();
         let launch = build_open_launch(
             &open_target("sess-1"),
             None,
@@ -7856,12 +7938,12 @@ mod tests {
             None,
             None,
             None,
-            &test_ctx(&probe, &[], &binaries),
+            &test_ctx(&probe, &[]),
         )
         .unwrap();
         match launch {
-            opener::AgentLaunch::Claude { mcp_config, .. } => assert_eq!(mcp_config, None),
-            opener::AgentLaunch::Codex { .. } => panic!("expected a Claude launch"),
+            launch::AgentLaunch::Claude { mcp_config, .. } => assert_eq!(mcp_config, None),
+            launch::AgentLaunch::Codex { .. } => panic!("expected a Claude launch"),
         }
     }
 
