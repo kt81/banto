@@ -250,21 +250,21 @@ pub struct SweepReport {
 /// link, a junction or any other reparse point is not: deleting "inside" one
 /// would delete in whatever it points to.
 fn is_real_directory(path: &Path) -> bool {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !meta.is_dir() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    true
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && !is_reparse_point(&meta))
+}
+
+/// A Windows junction reports itself as a directory, not as a symlink, so the
+/// file type alone does not rule it out there.
+#[cfg(windows)]
+fn is_reparse_point(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &fs::Metadata) -> bool {
+    false
 }
 
 /// The banto-named entries of `dir`, by name only (their age is read later, just
