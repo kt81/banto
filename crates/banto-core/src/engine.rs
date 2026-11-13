@@ -497,6 +497,24 @@ pub struct RelayObservation {
     /// up in a recorded stream (`BANTO_RECORD_EVENTS`).
     #[serde(default)]
     pub glance: Option<MemberGlance>,
+    /// What the member's live file says it is doing, as this tick read it:
+    /// `None` when the file named no running process for it (or the member is
+    /// not a Claude one). Replaces what the core held for the member every tick,
+    /// absence included: it is what the tick observed and nothing older.
+    #[serde(default)]
+    pub live: Option<LiveStatus>,
+}
+
+/// What a Claude member's live file said this tick, classified as the session
+/// list classifies it ([`Activity::Busy`], [`Activity::Waiting`], [`Activity::Alive`]),
+/// and whether a `waiting` is only a dialog the operator opened (still shown as
+/// Waiting, left out of the bell). Gathered shell-side, so a member that has not
+/// run its first turn, and so has no transcript and no session-list row, can still
+/// show its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveStatus {
+    pub activity: Activity,
+    pub dialog_open: bool,
 }
 
 /// What banto knows about a live member that is neither on its screen nor in
@@ -509,6 +527,10 @@ pub struct MemberFacts {
     pub agent: Option<AgentKind>,
     pub inbound: Option<MessageGlance>,
     pub sent: Option<MessageGlance>,
+    /// The member's live file as the latest tick read it; see
+    /// [`RelayObservation::live`]. The display's fallback after the session-list
+    /// row, for a member that has none yet.
+    pub live: Option<LiveStatus>,
 }
 
 /// A brigade's Goinkyo member row that exists but has neither a session id
@@ -2166,6 +2188,23 @@ impl EmporiumState {
             ReportedState::Working => Some(Activity::Busy),
             _ => None,
         }
+    }
+
+    /// The activity every surface shows for `key`'s pane, `None` when nothing is
+    /// known: a hosted Codex pane's believed report, else the session list's row,
+    /// else what the member's live file said this tick (a Claude Worker that has
+    /// not run a turn has a live file and no row). The one decision behind the
+    /// strip, the title, the marks, the count and the bell edge, so they cannot
+    /// disagree.
+    pub fn displayed_activity(&self, app: &App, key: &SessionKey) -> Option<Activity> {
+        self.reported_activity(app, key)
+            .or_else(|| app.row_for_id(key.as_str()).map(|row| row.activity))
+            .or_else(|| self.member_live(key).map(|live| live.activity))
+    }
+
+    /// The member's live file as the latest tick read it.
+    fn member_live(&self, key: &SessionKey) -> Option<LiveStatus> {
+        self.member_facts(key)?.live
     }
 
     /// Whether the session in `key`'s pane is known to be idle: the ONE place
@@ -3890,15 +3929,26 @@ fn ring_host_bell(state: &mut EmporiumState, now: Instant) -> Option<Cmd> {
 /// being known to be Codex is. Nothing is laid over a pane that has reported
 /// nothing.
 fn sync_reported_activity(state: &EmporiumState, app: &mut App) {
-    let reported: HashMap<String, Activity> = state
-        .screens
-        .keys()
-        .filter_map(|key| {
-            let activity = state.reported_activity(app, key)?;
-            Some((key.as_str().to_string(), activity))
-        })
-        .collect();
-    app.set_reported_activity(reported);
+    let mut reported: HashMap<String, Activity> = HashMap::new();
+    let mut dialogs: HashSet<String> = HashSet::new();
+    for key in state.screens.keys() {
+        let id = key.as_str().to_string();
+        if let Some(activity) = state.reported_activity(app, key) {
+            reported.insert(id, activity);
+        } else if app.row_for_id(key.as_str()).is_none()
+            && let Some(live) = state.member_live(key)
+        {
+            // No row to carry it: a Claude member that has not run a turn. Its
+            // live file is laid over the (absent) list the same way, so it is
+            // marked, counted and rung for like a member that has a row; a row,
+            // once there, says it itself and this stops.
+            if live.dialog_open {
+                dialogs.insert(id.clone());
+            }
+            reported.insert(id, live.activity);
+        }
+    }
+    app.set_reported_activity(reported, dialogs);
 }
 
 /// Refresh the one fact behind both attention views: a mark is on screen when
@@ -6396,19 +6446,35 @@ fn commit_drag(state: &mut EmporiumState, boundary: &Boundary, position: u16) {
 }
 
 /// Drop a drag whose gesture can no longer be completed: a modal opened over
-/// it, or the boundary it holds is not in the current geometry (the stage
-/// changed — a pane closed, another brigade staged). Run at the end of every
-/// `update`, so no event handler has to remember to cancel it.
+/// it, the boundary it holds is not in the current geometry (the stage
+/// changed — a pane closed, another brigade staged), or the tile being moved has
+/// no rows left. Run at the end of every `update`, so no event handler has to
+/// remember to cancel it.
+///
+/// Every operation that resizes tiles on purpose (a resize, collapse, solo,
+/// reset) ends the gesture itself. What reaches here is a pane ARRIVING while the
+/// button is held (a relaunch, an added Worker): each takes at most a row from a
+/// tile, so a stack with more tiles than rows can leave the tile in the operator's
+/// hand with none after a few of them. A tile with no rows draws nothing, so its
+/// ghost and the drop line would point at nothing and the release would still
+/// move it. (A resize drag needs no such check: a boundary beside an empty tile is
+/// not in the geometry, which cancels it below.)
 fn validate_drag(state: &mut EmporiumState, app: &App) {
     if let Some(moving) = &state.move_drag {
         // A tile being moved must still be a stack tile, in a stack that has
-        // somewhere to put it.
+        // somewhere to put it, and be on screen.
         let still_movable = matches!(
             &state.stage,
             Stage::Brigade { panes, .. }
                 if panes.len() >= 3 && panes[1..].contains(&moving.key)
         );
-        if app.modal().is_some() || !still_movable {
+        let on_screen = still_movable
+            && state
+                .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+                .tiles
+                .iter()
+                .any(|(key, rect)| *key == moving.key && !crate::layout::is_empty(*rect));
+        if app.modal().is_some() || !on_screen {
             state.move_drag = None;
         }
     }
@@ -7659,11 +7725,18 @@ fn update_tick(
     // could not resolve this tick does not erase one it could before.
     // What the bell may know this tick: exactly what was observed in it.
     let observed = TickObservations::from_relay(&relay, state);
+    // What a member's live file said is only what THIS tick saw: a member the
+    // tick did not observe (a roster that could not be read, a member without a
+    // session yet) has no word until one is seen, rather than the last one.
+    for facts in state.member_facts.values_mut() {
+        facts.live = None;
+    }
     for observation in &relay {
         let facts = state
             .member_facts
             .entry((observation.brigade_id, observation.token.clone()))
             .or_default();
+        facts.live = observation.live;
         if observation.agent.is_some() {
             facts.agent = observation.agent;
         }
@@ -11989,6 +12062,7 @@ mod tests {
         let mut now = test_instant();
 
         let observation = || RelayObservation {
+            live: None,
             glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
@@ -12096,6 +12170,7 @@ mod tests {
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
         let observation = || RelayObservation {
+            live: None,
             glance: None,
             brigade_id: 2,
             token: DIRECTOR_TOKEN.to_string(),
@@ -12814,6 +12889,7 @@ mod tests {
             *focused = 1;
         }
         let observation = || RelayObservation {
+            live: None,
             glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
@@ -12872,6 +12948,7 @@ mod tests {
         );
 
         let observation = || RelayObservation {
+            live: None,
             glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),
@@ -12947,6 +13024,7 @@ mod tests {
                 brigade,
                 Event::Tick {
                     relay: vec![RelayObservation {
+                        live: None,
                         glance: None,
                         brigade_id: 1,
                         token: token.to_string(),
@@ -13387,6 +13465,7 @@ mod tests {
             brigade,
             Event::Tick {
                 relay: vec![RelayObservation {
+                    live: None,
                     glance: None,
                     brigade_id: 1,
                     token: token.to_string(),
@@ -13734,6 +13813,7 @@ mod tests {
             brigade,
             Event::Tick {
                 relay: vec![RelayObservation {
+                    live: None,
                     glance: None,
                     brigade_id: 1,
                     token: "director".to_string(),
@@ -15623,10 +15703,19 @@ mod tests {
         let strip = tile_of(&state, "w2");
         let before = (state.focus, focused_name(&state));
 
+        // A collapsed tile is four rows: the title row, two body rows, the bottom
+        // border. The status the title row carries is border cells, which are
+        // as inert on a collapsed tile as they were.
+        assert_eq!(strip.height, COLLAPSED_TILE_HEIGHT);
+        let (label_start, label_end) =
+            crate::layout::title_columns(strip, &state.tile_label(&key_of("w2")));
+        assert!(label_end > label_start);
         for (column, row) in [
-            (strip.x + 5, strip.y + 2),  // body
+            (strip.x + 5, strip.y + 1),  // first body row
+            (strip.x + 5, strip.y + 2),  // second body row
             (strip.x, strip.y + 2),      // left border (a boundary's cell? no: master handle)
-            (strip.x + 20, strip.y + 4), // bottom border
+            (strip.x + 20, strip.y + 3), // bottom border
+            (label_end + 2, strip.y),    // the status cells of the title row
         ] {
             let cmds = mouse_event(
                 &mut state,
@@ -15660,6 +15749,17 @@ mod tests {
             now,
         );
         assert!(cmds.is_empty());
+
+        // The buttons are where they were, on the title row.
+        let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
+        let buttons: Vec<_> = geometry
+            .buttons()
+            .iter()
+            .filter(|button| button.key == key_of("w2"))
+            .collect();
+        assert_eq!(buttons.len(), 2);
+        assert!(buttons.iter().all(|button| button.rect.y == strip.y));
+        assert_eq!(buttons[1].text, "[+]");
 
         // Its label starts a move without focusing it.
         let (column, row) = label_cell(&state, "w2");
@@ -18049,6 +18149,7 @@ mod tests {
                         has_unseen: true,
                         is_idle_this_tick: Some(true),
                         agent: CLAUDE,
+                        live: None,
                         glance: Some(said_by(Some("worker-3"), "stage 2 is done")),
                     }],
                     // The roster's names, as the gather sends them: the sender's,
@@ -18373,6 +18474,7 @@ mod tests {
             brigade,
             Event::Tick {
                 relay: vec![RelayObservation {
+                    live: None,
                     glance,
                     brigade_id: 1,
                     token: "director".to_string(),
@@ -18579,6 +18681,7 @@ mod tests {
             let obs: Vec<RelayObservation> = panes
                 .iter()
                 .map(|(key, token, brigade_id)| RelayObservation {
+                    live: None,
                     glance: None,
                     brigade_id: *brigade_id,
                     token: token.to_string(),
@@ -18884,6 +18987,7 @@ mod tests {
             has_unseen: false,
             is_idle_this_tick: None,
             agent,
+            live: None,
             glance,
         }
     }
@@ -20890,6 +20994,7 @@ mod tests {
         let mut now = test_instant();
 
         let observation = || RelayObservation {
+            live: None,
             glance: None,
             brigade_id: 1,
             token: "worker-1".to_string(),

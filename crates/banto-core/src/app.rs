@@ -782,6 +782,8 @@ pub struct App {
     /// [`Self::set_reported_activity`]). Laid over `base_rows`' own activity
     /// whenever `rows` is rebuilt, so a reload of the list cannot lose it.
     reported_activity: HashMap<String, Activity>,
+    /// Which of the ids in `reported_activity` are Waiting for a dialog.
+    reported_dialogs: HashSet<String>,
     /// Ids of the rows that are Waiting only because a dialog is open
     /// ([`SessionRow::dialog_open`]), after what hosted panes reported is laid
     /// over: such a row is displayed as Waiting like any other but is not one the
@@ -932,6 +934,7 @@ impl App {
             pinned: HashSet::new(),
             waiting_rows: HashSet::new(),
             reported_activity: HashMap::new(),
+            reported_dialogs: HashSet::new(),
             row_index: HashMap::new(),
             dialog_rows: HashSet::new(),
             hidden: HashSet::new(),
@@ -1750,11 +1753,21 @@ impl App {
     /// list, the Waiting count and the attention marks, which all read the rows —
     /// until it is left out of a later call. Nothing changes when `reported` is
     /// what it already was, so calling this on every update costs a comparison.
-    pub fn set_reported_activity(&mut self, reported: HashMap<String, Activity>) {
-        if self.reported_activity == reported {
+    ///
+    /// `dialogs` names, among the ids that are Waiting here, those that are
+    /// Waiting only because a dialog is open (a row-less member's live file said
+    /// so): shown and counted, left out of what rings the bell, like a row that
+    /// says it.
+    pub fn set_reported_activity(
+        &mut self,
+        reported: HashMap<String, Activity>,
+        dialogs: HashSet<String>,
+    ) {
+        if self.reported_activity == reported && self.reported_dialogs == dialogs {
             return;
         }
         self.reported_activity = reported;
+        self.reported_dialogs = dialogs;
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.resort_rows();
         self.refilter_keeping_selected(selected_id);
@@ -1817,6 +1830,12 @@ impl App {
             .filter(|row| row.activity == Activity::Waiting && row.dialog_open)
             .map(|row| row.id.clone())
             .collect();
+        self.dialog_rows.extend(
+            self.reported_dialogs
+                .iter()
+                .filter(|id| self.reported_activity.get(*id) == Some(&Activity::Waiting))
+                .cloned(),
+        );
     }
 
     /// Recompute `filtered` from the current query/haystacks, then re-select
@@ -2477,6 +2496,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            HashSet::new(),
         );
         assert_eq!(activity_of(&app, "a"), Activity::Waiting);
         assert_eq!(activity_of(&app, "b"), Activity::Busy);
@@ -2498,11 +2518,15 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            HashSet::new(),
         );
         assert_eq!(app.filtered_waiting_generation(), generation);
 
         // Leaving a session out takes the overlay off it.
-        app.set_reported_activity([("b".to_string(), Activity::Busy)].into_iter().collect());
+        app.set_reported_activity(
+            [("b".to_string(), Activity::Busy)].into_iter().collect(),
+            HashSet::new(),
+        );
         assert_eq!(activity_of(&app, "a"), Activity::Idle(AgeBucket::Older));
         assert!(!app.is_waiting_id("a"));
         assert_eq!(app.filtered_waiting_count(), 0);
@@ -2542,7 +2566,7 @@ mod tests {
 
         // What a hosted pane reports is in the row it returns, and gone again.
         let reported = [("c".to_string(), Activity::Busy)].into_iter().collect();
-        app.set_reported_activity(reported);
+        app.set_reported_activity(reported, HashSet::new());
         assert_eq!(
             app.row_for_id("c").map(|row| row.activity),
             Some(Activity::Busy)
@@ -2551,7 +2575,7 @@ mod tests {
             app.row_for_id("d").map(|row| row.activity),
             Some(Activity::Idle(AgeBucket::Older))
         );
-        app.set_reported_activity(HashMap::new());
+        app.set_reported_activity(HashMap::new(), HashSet::new());
         assert_eq!(
             app.row_for_id("c").map(|row| row.activity),
             Some(Activity::Idle(AgeBucket::Older))
@@ -2580,9 +2604,12 @@ mod tests {
         assert!(app.is_dialog_open_id("a"));
         assert!(!app.is_dialog_open_id("b") && !app.is_dialog_open_id("c"));
         // What a pane reported over the row replaces the whole picture.
-        app.set_reported_activity([("a".to_string(), Activity::Busy)].into_iter().collect());
+        app.set_reported_activity(
+            [("a".to_string(), Activity::Busy)].into_iter().collect(),
+            HashSet::new(),
+        );
         assert!(!app.is_dialog_open_id("a") && !app.is_waiting_id("a"));
-        app.set_reported_activity(HashMap::new());
+        app.set_reported_activity(HashMap::new(), HashSet::new());
         assert!(app.is_dialog_open_id("a"));
     }
 

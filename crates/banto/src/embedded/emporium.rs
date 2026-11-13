@@ -47,8 +47,8 @@ use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
     self, Axis, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
-    GoinkyoObservation, GoinkyoSpawnCandidate, GroupJoinTargetData, PrefixKey, RelayObservation,
-    SessionKey, Stage, StoreIntent,
+    GoinkyoObservation, GoinkyoSpawnCandidate, GroupJoinTargetData, LiveStatus, PrefixKey,
+    RelayObservation, SessionKey, Stage, StoreIntent,
 };
 use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
@@ -71,7 +71,7 @@ use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
     LiveSession, SysinfoProbe, ancestry_reaches, claude_nudgeable, claude_quiescence,
-    read_live_sessions,
+    live_activity, read_live_sessions, waiting_on_a_dialog,
 };
 use banto_io::store::Store;
 use banto_tui::paint;
@@ -2307,6 +2307,19 @@ fn gather_relay_observations(
             };
             samples.push((key.clone(), quiescence));
             sampled.insert(key.clone());
+            // What the same live file says the member is doing, classified as the
+            // session list classifies it, for the tile of a member that has no
+            // row yet (no transcript before its first turn). Display only: the
+            // relay and the watch read the file through the two functions above.
+            let live_status = match agent {
+                Some(AgentKind::ClaudeCode) => live_activity(&live, &session_id.0, &alive_claude)
+                    .map(|activity| LiveStatus {
+                        activity,
+                        dialog_open: activity == banto_core::model::Activity::Waiting
+                            && waiting_on_a_dialog(&live, &session_id.0, &alive_claude),
+                    }),
+                Some(AgentKind::Codex) | None => None,
+            };
             let glance_start = Instant::now();
             let glance = glance_gate.read(
                 &store.borrow(),
@@ -2329,6 +2342,7 @@ fn gather_relay_observations(
                 has_unseen,
                 is_idle_this_tick,
                 agent,
+                live: live_status,
                 glance,
             });
         }
@@ -2886,6 +2900,12 @@ fn draw(
             let Some(screen) = state.screens.get(key) else {
                 continue;
             };
+            // A tile with no rows or no columns is not on screen: it draws no
+            // border, label, status, buttons, strip or pane, and writes nothing
+            // onto the tile placed at the same row.
+            if banto_core::layout::is_empty(*rect) {
+                continue;
+            }
             let collapsed = geometry.collapsed[index];
             // A collapsed tile is never the focused one (the core keeps focus
             // off it), so its border carries attention only.
@@ -2893,17 +2913,22 @@ fn draw(
                 !collapsed && focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let waiting = state.attention_panes().contains(key);
             let marked = marked_tile == Some(key);
-            let block = tile_block(&state.tile_label(key), focused_tile, waiting, marked);
-            let content = block.inner(*rect);
-            frame.render_widget(block, *rect);
-            paint_tile_buttons(
+            let mut status = tile_status(state, app, key, tick);
+            // The one place a tile's title row is drawn, collapsed or open.
+            let content = paint_tile_title(
                 frame.buffer_mut(),
                 &geometry,
-                key,
-                tile_border_color(focused_tile, waiting, marked),
-                state.soloed_key() == Some(key),
+                &TitleRow {
+                    key,
+                    rect: *rect,
+                    label: &state.tile_label(key),
+                    status: &status,
+                    focused: focused_tile,
+                    waiting,
+                    marked,
+                    soloed: state.soloed_key() == Some(key),
+                },
             );
-            let mut status = tile_status(state, app, key, tick);
             if collapsed {
                 // The child keeps running untouched; only its facts are shown.
                 let facts = state.member_facts(key);
@@ -2916,20 +2941,6 @@ fn draw(
                 render_strip(frame.buffer_mut(), content, &status, now);
                 continue;
             }
-            // An expanded tile carries the same status in its title row, after
-            // the label and clear of the buttons: the free stretch of the
-            // border between them. Also while the tile is being dragged: the
-            // gesture colours the border and the label, and the status keeps its
-            // own colours on top of that; the drop line and the ghost label are
-            // painted over the finished frame, so where they cross it they win.
-            paint_title_status(
-                frame.buffer_mut(),
-                &geometry,
-                key,
-                *rect,
-                &state.tile_label(key),
-                &status,
-            );
             let cursor = paint_pane(
                 frame.buffer_mut(),
                 pane_render_cache,
@@ -3037,15 +3048,15 @@ fn paint_tile_buttons(
     }
 }
 
-/// What a staged tile says about its pane's state, as the collapsed strip and
-/// the expanded tile's title row both draw it: the one place the product, the
-/// activity and the output age are decided, so the two cannot disagree. The
-/// activity is what a hosted Codex pane has reported about itself when that is
-/// believed (`EmporiumState::reported_activity`, the decision the quit question
-/// and the bell read too), else the session list's row for the pane, else none;
-/// the product is that row's, else the one the relay resolved before there is a
-/// row. A pane with no row still shows what it reported. Computed per staged
-/// tile on every frame, by a few map lookups.
+/// What a staged tile says about its pane's state, as its title row draws it
+/// (and a collapsed tile's body adds the messages): the one place the product,
+/// the activity and the output age are decided, so no two tiles or states can
+/// disagree. The activity is `EmporiumState::displayed_activity`, the decision
+/// the marks, the count and the bell read too: a hosted Codex pane's believed
+/// report, else the session list's row for the pane, else what the member's live
+/// file said this tick, else none; the product is the row's, else the one the
+/// relay resolved before there is a row. Computed per staged tile on every
+/// frame, by a few map lookups.
 fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant) -> StripData {
     let row = app.row_for_id(key.as_str());
     let facts = state.member_facts(key);
@@ -3053,15 +3064,60 @@ fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant
         agent: row
             .map(|row| row.agent)
             .or_else(|| facts.and_then(|facts| facts.agent)),
-        activity: state
-            .reported_activity(app, key)
-            .or_else(|| row.map(|row| row.activity)),
+        activity: state.displayed_activity(app, key),
         output_age: state
             .last_output_at(key)
             .map(|at| tick.saturating_duration_since(at)),
         inbound: None,
         sent: None,
     }
+}
+
+/// Everything that decides how one tile's title row looks.
+struct TitleRow<'a> {
+    key: &'a SessionKey,
+    rect: Rect,
+    label: &'a str,
+    status: &'a StripData,
+    focused: bool,
+    waiting: bool,
+    marked: bool,
+    soloed: bool,
+}
+
+/// Draw a tile's title row — the border, the label, the status and the buttons —
+/// for every staged tile, collapsed or open, and return the tile's content area
+/// (inside the border). The only place that does it, so the two states cannot
+/// look different: the label (reversed only when focused, which a collapsed tile
+/// never is), then `Agent · word · age` as far as there is room, then `[S]` and
+/// `[_]` or `[+]`. Also while the tile is being dragged: the gesture colours the
+/// border and the label, and the status keeps its own colours on top of that;
+/// the drop line and the ghost label are painted over the finished frame, so
+/// where they cross it they win.
+fn paint_tile_title(
+    buffer: &mut Buffer,
+    geometry: &banto_core::layout::Geometry,
+    title: &TitleRow,
+) -> Rect {
+    let block = tile_block(title.label, title.focused, title.waiting, title.marked);
+    let content = block.inner(title.rect);
+    ratatui::widgets::Widget::render(block, title.rect, buffer);
+    paint_tile_buttons(
+        buffer,
+        geometry,
+        title.key,
+        tile_border_color(title.focused, title.waiting, title.marked),
+        title.soloed,
+    );
+    paint_title_status(
+        buffer,
+        geometry,
+        title.key,
+        title.rect,
+        title.label,
+        title.status,
+    );
+    content
 }
 
 /// Draw `status` on `key`'s title row between its label and its buttons. The
@@ -3940,6 +3996,13 @@ mod tests {
     fn staged_brigade_of_two_workers_with_rows(
         extra_rows: Vec<SessionRow>,
     ) -> (EmporiumState, App, BrigadeConfig) {
+        staged_brigade_of_workers_with_rows(2, extra_rows)
+    }
+
+    fn staged_brigade_of_workers_with_rows(
+        workers: usize,
+        extra_rows: Vec<SessionRow>,
+    ) -> (EmporiumState, App, BrigadeConfig) {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut rows = vec![test_row("dir", AgentKind::ClaudeCode)];
         rows.extend(extra_rows);
@@ -3956,7 +4019,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::ClaudeCode,
                 worker_model: "sonnet".to_string(),
-                result: Ok((1, vec!["worker-1".to_string(), "worker-2".to_string()])),
+                result: Ok((1, (1..=workers).map(|n| format!("worker-{n}")).collect())),
             },
             now,
         );
@@ -4912,7 +4975,7 @@ mod tests {
     const REPORT_IDLE: &[u8] = b"\x1b]7501;state=idle:app=codex\x1b\\";
 
     #[test]
-    fn an_expanded_tiles_title_says_what_the_strip_would_for_every_state_and_product() {
+    fn a_collapsed_and_an_expanded_tile_render_the_same_title_row_for_every_state_and_product() {
         use banto_core::model::AgeBucket::Today;
         // What it is, the row's activity, what the Codex pane reported, and the
         // status the title and the strip both show.
@@ -5012,18 +5075,33 @@ mod tests {
                 said(&mut state, &mut app, &brigade, id, bytes, now);
             }
             let buffer = render_at(&state, &app, 160, now);
-            let (row, _) = title_row(&state, &buffer, id, 160);
+            let (row, open_tile) = title_row(&state, &buffer, id, 160);
             assert!(
                 row.contains(&format!(" {expected} ")),
                 "{what}: the title row is {row:?}"
             );
-            // And the collapsed strip of the same pane says the same.
+            // Collapsed, the same tile has the same title row, cell for cell,
+            // but for the button that now opens it.
             let key = SessionKey::from_id(id);
             toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
-            let buffer = render_at(&state, &app, 160, now);
-            let (_, strip) = title_row(&state, &buffer, id, 160);
-            let status = text_at(&buffer, strip.x + 1, strip.y + 1, strip.width - 2);
-            assert_eq!(status.trim_end(), expected, "{what}: the strip");
+            let collapsed_buffer = render_at(&state, &app, 160, now);
+            let (collapsed_row, strip) = title_row(&state, &collapsed_buffer, id, 160);
+            assert_eq!(strip.height, banto_core::engine::COLLAPSED_TILE_HEIGHT);
+            assert_eq!(
+                collapsed_row,
+                row.replace("[_]", "[+]"),
+                "{what}: collapsed or open, one title row"
+            );
+            for x in strip.x..strip.x + strip.width {
+                let (open, shut) = (&buffer[(x, open_tile.y)], &collapsed_buffer[(x, strip.y)]);
+                if open.symbol() != "_" && open.symbol() != "+" {
+                    assert_eq!(
+                        (open.fg, open.modifier),
+                        (shut.fg, shut.modifier),
+                        "{what}: column {x}"
+                    );
+                }
+            }
         }
     }
 
@@ -5050,6 +5128,24 @@ mod tests {
             button.rect.x,
             button.rect.y,
         );
+    }
+
+    /// The colour of the first cell of `word` on the title row of pane `id`.
+    fn word_colour(
+        state: &EmporiumState,
+        buffer: &Buffer,
+        id: &str,
+        width: u16,
+        word: &str,
+    ) -> Color {
+        let (row, rect) = title_row(state, buffer, id, width);
+        let cells: Vec<char> = row.chars().collect();
+        let needle: Vec<char> = format!("{word} ").chars().collect();
+        let at = cells
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .expect("the word is on the title row") as u16;
+        buffer[(rect.x + at, rect.y)].fg
     }
 
     /// What a tile's title row says between its label and its buttons, trimmed.
@@ -5110,10 +5206,362 @@ mod tests {
                 "busy \u{b7} output now"
             ]
         );
-        // 32 wide: the age has gone too; the word stays.
-        assert_eq!(segments_at(100), ["busy", "waiting", "busy"]);
+        // 32 wide: the age is shortened to a bare duration, as far as it fits
+        // beside the word.
+        assert_eq!(
+            segments_at(100),
+            ["busy \u{b7} now", "waiting", "busy \u{b7} now"]
+        );
         // 22 wide: no room even for the word, so none of it: never half a word.
         assert_eq!(segments_at(80), ["", "", ""]);
+    }
+
+    /// A staged brigade of the Claude Director, a named Claude Worker and a
+    /// Codex Worker, `width` columns wide, whose Claude Worker is alive and wrote
+    /// `output 2m ago`; with its label `実装 (worker-1)` (15 cells) when `named`,
+    /// else `worker-1` (8). The stack column is `(width - 36) / 2` wide.
+    fn aged_pair(width: u16, named: bool) -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, mut app, brigade, now) =
+            scene(width, [Activity::Alive, Activity::Alive, Activity::Alive]);
+        if named {
+            engine::update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Tick {
+                    relay: Vec::new(),
+                    brigades: vec![banto_core::engine::BrigadeNameFacts {
+                        brigade_id: 1,
+                        name: "cell".to_string(),
+                        director_session: None,
+                        member_names: vec![(
+                            "worker-1".to_string(),
+                            "\u{5b9f}\u{88c5}".to_string(),
+                        )],
+                    }],
+                },
+                now,
+            );
+        }
+        (state, app, brigade, now + Duration::from_secs(125))
+    }
+
+    #[test]
+    fn the_title_status_steps_happen_at_these_tile_widths_for_an_8_and_a_15_cell_label() {
+        // The status needs the tile width minus the label's cells and 14 for the
+        // corners, the padding and the buttons: the word at label + 14 + 5 for
+        // "alive", the short age (`alive · 2m`, 10) at label + 24, the long age
+        // without the agent (21) at label + 35, the agent too (30) at label + 44.
+        let steps = |label: u16| -> Vec<(u16, &'static str)> {
+            let full = "Claude \u{b7} alive \u{b7} output 2m ago";
+            let no_agent = "alive \u{b7} output 2m ago";
+            let short = "alive \u{b7} 2m";
+            vec![
+                (label + 44, full),
+                (label + 43, no_agent),
+                (label + 35, no_agent),
+                (label + 34, short),
+                (label + 24, short),
+                (label + 23, "alive"),
+                (label + 19, "alive"),
+                (label + 18, ""),
+            ]
+        };
+        for (named, label) in [(false, 8u16), (true, 15)] {
+            for (tile_width, expected) in steps(label) {
+                let terminal = 2 * tile_width + 36;
+                let (state, app, _, tick) = aged_pair(terminal, named);
+                let buffer = render_at(&state, &app, terminal, tick);
+                let (row, rect) = title_row(&state, &buffer, W1, terminal);
+                assert_eq!(
+                    rect.width, tile_width,
+                    "the stack column at terminal {terminal}"
+                );
+                assert_eq!(
+                    status_segment(&state, &buffer, W1, terminal),
+                    expected,
+                    "label of {label} cells, tile {tile_width} wide: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn at_the_default_collapsed_width_a_named_tile_keeps_the_word_and_a_plain_one_the_age() {
+        // All collapsed, terminal 120: the stack column is 36 wide.
+        for (named, expected) in [(false, "alive \u{b7} 2m"), (true, "alive")] {
+            let (mut state, mut app, brigade, tick) = aged_pair(120, named);
+            for id in [W1, W2] {
+                toggle_minimize_for_test_at(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    &SessionKey::from_id(id),
+                    120,
+                );
+            }
+            let buffer = render_at(&state, &app, 120, tick);
+            let (_, rect) = title_row(&state, &buffer, W1, 120);
+            assert_eq!(
+                rect.width,
+                banto_core::layout::DEFAULT_COLLAPSED_STACK_WIDTH
+            );
+            assert_eq!(
+                status_segment(&state, &buffer, W1, 120),
+                expected,
+                "named {named}"
+            );
+        }
+    }
+
+    fn toggle_minimize_for_test_at(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        width: u16,
+    ) {
+        use banto_core::input::{MouseButton, MouseEventKind};
+        let button = state
+            .geometry(Rect::new(0, 0, width, 40))
+            .buttons()
+            .iter()
+            .find(|b| &b.key == key && b.kind == ButtonKind::Minimize)
+            .cloned()
+            .unwrap();
+        mouse(
+            state,
+            app,
+            brigade,
+            MouseEventKind::Down(MouseButton::Left),
+            button.rect.x,
+            button.rect.y,
+        );
+    }
+
+    /// A staged brigade of `workers` Workers on a `width` x `height` terminal,
+    /// every pane hosted, drawn once.
+    fn crowded_brigade(
+        workers: usize,
+        width: u16,
+        height: u16,
+    ) -> (EmporiumState, App, BrigadeConfig, Instant) {
+        let (mut state, mut app, brigade) =
+            staged_brigade_of_workers_with_rows(workers, Vec::new());
+        let now = Instant::now();
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized { width, height },
+            now,
+        );
+        (state, app, brigade, now)
+    }
+
+    fn render_sized(
+        state: &EmporiumState,
+        app: &App,
+        width: u16,
+        height: u16,
+        tick: Instant,
+    ) -> Buffer {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut cache = HashMap::new();
+        terminal
+            .draw(|frame| {
+                let _ = draw(frame, app, state, SystemTime::now(), tick, &mut cache);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_tile_with_no_rows_draws_nothing_and_leaves_its_neighbours_buttons_clickable() {
+        for (workers, width, height) in [
+            (24usize, 120u16, 24u16),
+            (40, 120, 24),
+            (6, 120, 3),
+            (3, 120, 2),
+        ] {
+            let (mut state, app, _brigade, now) = crowded_brigade(workers, width, height);
+            let area = Rect::new(0, 0, width, height);
+            let geometry = state.geometry(area);
+            let empty: Vec<SessionKey> = geometry
+                .tiles
+                .iter()
+                .filter(|(_, rect)| banto_core::layout::is_empty(*rect))
+                .map(|(key, _)| key.clone())
+                .collect();
+            assert!(
+                !empty.is_empty(),
+                "{workers} workers on {height} rows: a tile with no rows"
+            );
+
+            // Nothing of an empty tile is drawn: the frame is the same cell for
+            // cell as one where those panes are not hosted at all.
+            let with = render_sized(&state, &app, width, height, now);
+            for key in &empty {
+                state.screens.remove(key);
+            }
+            let without = render_sized(&state, &app, width, height, now);
+            assert_eq!(with, without, "{workers} workers on {height} rows");
+
+            // Every button belongs to a tile that has rows, sits inside it, is
+            // painted there, and is what a press on its cells finds.
+            for button in geometry.buttons() {
+                let tile = geometry
+                    .tiles
+                    .iter()
+                    .find(|(k, _)| *k == button.key)
+                    .unwrap()
+                    .1;
+                assert!(!banto_core::layout::is_empty(tile), "{button:?}");
+                assert!(tile.contains(button.rect.as_position()));
+                assert_eq!(
+                    text_at(&with, button.rect.x, button.rect.y, button.rect.width),
+                    button.text
+                );
+                for x in button.rect.x..button.rect.right() {
+                    let hit = geometry.button_at(x, button.rect.y).unwrap();
+                    assert_eq!((&hit.key, hit.kind), (&button.key, button.kind));
+                }
+            }
+            // And the empty tiles own none, nor the move handle.
+            for key in &empty {
+                assert!(geometry.buttons().iter().all(|b| &b.key != key));
+                for y in 0..height {
+                    for x in 0..width {
+                        assert_ne!(geometry.label_at(x, y), Some(key), "({x},{y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_solo_pane_at_degenerate_sizes_draws_without_panicking() {
+        for width in 0..=3u16 {
+            for height in 0..=3u16 {
+                let mut state = EmporiumState::new(PrefixKey::default());
+                let mut app = App::new(vec![test_row("solo", AgentKind::ClaudeCode)]);
+                let key = SessionKey::from_id("solo");
+                state.screens.insert(key.clone(), Screen::new(24, 80));
+                state.stage = Stage::Solo(key);
+                state.focus = Focus::Pane;
+                let now = Instant::now();
+                engine::update(
+                    &mut state,
+                    &mut app,
+                    &BrigadeConfig::default(),
+                    Event::Resized { width, height },
+                    now,
+                );
+                let buffer = render_sized(&state, &app, width, height, now);
+                assert_eq!((buffer.area.width, buffer.area.height), (width, height));
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_panics_or_is_drawn_outside_the_terminal_at_degenerate_sizes() {
+        for workers in [0usize, 1, 2, 6] {
+            for width in 0..=3u16 {
+                for height in 0..=3u16 {
+                    let (state, app, _brigade, now) = crowded_brigade(workers, width, height);
+                    let buffer = render_sized(&state, &app, width, height, now);
+                    assert_eq!(
+                        (buffer.area.width, buffer.area.height),
+                        (width, height),
+                        "{workers} workers at {width}x{height}"
+                    );
+                    // Hit tests at every cell, empty or not.
+                    let geometry = state.geometry(Rect::new(0, 0, width, height));
+                    for y in 0..=height {
+                        for x in 0..=width {
+                            let _ = (
+                                geometry.button_at(x, y),
+                                geometry.label_at(x, y),
+                                geometry.drop_slot(y),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_degraded_stack_gives_a_collapsed_tile_three_two_or_one_row_and_never_loses_its_title_row()
+    {
+        // Workers collapsed on a 24-row terminal (23 stack rows): 7 get 3 or 4
+        // rows each, 11 get 2 or 3, 23 get 1.
+        for (workers, smallest) in [(5usize, 4u16), (7, 3), (11, 2), (23, 1)] {
+            let (mut state, mut app, brigade) =
+                staged_brigade_of_workers_with_rows(workers, Vec::new());
+            let area = Rect::new(0, 0, 120, 24);
+            let now = Instant::now();
+            engine::update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Resized {
+                    width: 120,
+                    height: 24,
+                },
+                now,
+            );
+            for n in 1..=workers {
+                let key = SessionKey::from_id(&format!("new-worker::1::worker-{n}"));
+                let button = state
+                    .geometry(area)
+                    .buttons()
+                    .iter()
+                    .find(|b| b.key == key && b.kind == ButtonKind::Minimize)
+                    .cloned();
+                if let Some(button) = button {
+                    mouse(
+                        &mut state,
+                        &mut app,
+                        &brigade,
+                        banto_core::input::MouseEventKind::Down(
+                            banto_core::input::MouseButton::Left,
+                        ),
+                        button.rect.x,
+                        button.rect.y,
+                    );
+                }
+            }
+            let geometry = state.geometry(area);
+            assert!(geometry.all_collapsed, "{workers} workers");
+            let heights: Vec<u16> = geometry.tiles[1..].iter().map(|(_, r)| r.height).collect();
+            assert_eq!(
+                *heights.iter().min().unwrap(),
+                smallest,
+                "{workers}: {heights:?}"
+            );
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+            let mut cache = HashMap::new();
+            terminal
+                .draw(|frame| {
+                    let _ = draw(frame, &app, &state, SystemTime::now(), now, &mut cache);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (key, rect) in &geometry.tiles[1..] {
+                let title = text_at(buffer, rect.x, rect.y, rect.width);
+                assert!(
+                    title.contains(" worker-"),
+                    "{workers} workers, {} rows: the title row of {} is {title:?}",
+                    rect.height,
+                    key.as_str()
+                );
+                if rect.height >= 2 {
+                    assert!(title.contains("[S][+]"), "{title:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5193,6 +5641,7 @@ mod tests {
                     has_unseen: false,
                     is_idle_this_tick: None,
                     agent: Some(AgentKind::Codex),
+                    live: None,
                     glance: None,
                 }],
                 brigades: Vec::new(),
@@ -5243,9 +5692,8 @@ mod tests {
         // The strip of the same pane says the same.
         toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
         let buffer = render_at(&state, &app, 160, now);
-        let (_, strip) = title_row(&state, &buffer, W1, 160);
         assert_eq!(
-            text_at(&buffer, strip.x + 1, strip.y + 1, 40).trim_end(),
+            status_segment(&state, &buffer, W1, 160),
             "Codex \u{b7} waiting \u{b7} output now"
         );
 
@@ -5266,7 +5714,7 @@ mod tests {
         );
         let buffer = render_at(&state, &app, 160, now);
         assert_eq!(
-            text_at(&buffer, strip.x + 1, strip.y + 1, 40).trim_end(),
+            status_segment(&state, &buffer, W1, 160),
             "Codex \u{b7} waiting \u{b7} output now"
         );
         assert_eq!(state.visible_waiting_count(), 1);
@@ -5363,6 +5811,7 @@ mod tests {
                     has_unseen: false,
                     is_idle_this_tick: None,
                     agent: Some(AgentKind::Codex),
+                    live: None,
                     glance: None,
                 }],
                 brigades: Vec::new(),
@@ -5385,20 +5834,13 @@ mod tests {
         };
         let both = |state: &EmporiumState, app: &App| {
             let buffer = render_at(state, app, 160, now);
-            let (_, tile) = title_row(state, &buffer, W1, 160);
             let collapsed = state
                 .geometry(Rect::new(0, 0, 160, 40))
                 .is_collapsed(&SessionKey::from_id(W1));
-            let strip = if collapsed {
-                Some(
-                    text_at(&buffer, tile.x + 1, tile.y + 1, 40)
-                        .trim_end()
-                        .to_string(),
-                )
-            } else {
-                None
-            };
-            (status_segment(state, &buffer, W1, 160), strip)
+            let title = status_segment(state, &buffer, W1, 160);
+            // A collapsed tile's status is the same title row's.
+            let strip = collapsed.then(|| title.clone());
+            (title, strip)
         };
         let waiting = "Codex \u{b7} waiting \u{b7} output now";
         let claude_alive = "Claude \u{b7} alive \u{b7} output now";
@@ -5432,6 +5874,109 @@ mod tests {
         update(&mut state, &mut app, loaded(vec![codex]));
         assert_eq!(both(&state, &app).1.as_deref(), Some(waiting));
         assert_eq!(state.visible_waiting_count(), 1);
+    }
+
+    #[test]
+    fn a_claude_worker_with_no_row_yet_shows_what_its_live_file_says_on_both_surfaces() {
+        // The operator saw `Claude · output 2m ago` with no word on a Worker added
+        // minutes before: no transcript, so no row, but a live file.
+        use banto_core::model::Activity::{Alive, Busy, Waiting};
+        let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
+        let key = SessionKey::from_id(W1);
+        let now = Instant::now();
+        let observe = |state: &mut EmporiumState, app: &mut App, live: Option<LiveStatus>| {
+            engine::update(
+                state,
+                app,
+                &BrigadeConfig::default(),
+                Event::Tick {
+                    relay: live
+                        .map(|live| {
+                            vec![RelayObservation {
+                                brigade_id: 1,
+                                token: "worker-1".to_string(),
+                                key: SessionKey::from_id(W1),
+                                has_unseen: false,
+                                is_idle_this_tick: None,
+                                agent: Some(AgentKind::ClaudeCode),
+                                live: Some(live),
+                                glance: None,
+                            }]
+                        })
+                        .unwrap_or_default(),
+                    brigades: Vec::new(),
+                },
+                now,
+            )
+        };
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Resized {
+                width: 160,
+                height: 40,
+            },
+            now,
+        );
+        said(&mut state, &mut app, &brigade, W1, b"x", now);
+        assert!(app.row_for_id(W1).is_none());
+        let title = |state: &EmporiumState, app: &App| {
+            let buffer = render_at(state, app, 160, now);
+            status_segment(state, &buffer, W1, 160)
+        };
+        // Nothing seen yet: the agent and the age, no word.
+        observe(&mut state, &mut app, None);
+        assert_eq!(title(&state, &app), "output now");
+        for (live, expected) in [
+            (
+                LiveStatus {
+                    activity: Alive,
+                    dialog_open: false,
+                },
+                "Claude \u{b7} alive \u{b7} output now",
+            ),
+            (
+                LiveStatus {
+                    activity: Busy,
+                    dialog_open: false,
+                },
+                "Claude \u{b7} busy \u{b7} output now",
+            ),
+        ] {
+            observe(&mut state, &mut app, Some(live));
+            assert_eq!(title(&state, &app), expected, "{live:?}");
+        }
+        // Waiting: the word, the mark, and one in the count.
+        let cmds = observe(
+            &mut state,
+            &mut app,
+            Some(LiveStatus {
+                activity: Waiting,
+                dialog_open: false,
+            }),
+        );
+        assert_eq!(
+            title(&state, &app),
+            "Claude \u{b7} waiting \u{b7} output now"
+        );
+        assert!(state.attention_panes().contains(&key), "marked");
+        assert_eq!(state.visible_waiting_count(), 1);
+        assert!(
+            cmds.iter().any(|cmd| matches!(cmd, Cmd::RingHostBell)),
+            "rung for"
+        );
+        // The strip says the same once it is collapsed.
+        toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
+        assert_eq!(
+            title(&state, &app),
+            "Claude \u{b7} waiting \u{b7} output now"
+        );
+        // A tick that observed nothing leaves no word (the product it was
+        // resolved as is kept, as before).
+        observe(&mut state, &mut app, None);
+        assert_eq!(title(&state, &app), "Claude \u{b7} output now");
+        assert!(!state.attention_panes().contains(&key));
     }
 
     #[test]
@@ -5480,9 +6025,8 @@ mod tests {
         let key = SessionKey::from_id(W1);
         toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
         let buffer = render_at(&state, &app, 160, now);
-        let (_, strip) = title_row(&state, &buffer, W1, 160);
         assert_eq!(
-            text_at(&buffer, strip.x + 1, strip.y + 1, 40).trim_end(),
+            status_segment(&state, &buffer, W1, 160),
             "Claude \u{b7} waiting \u{b7} output now"
         );
     }
@@ -5521,86 +6065,63 @@ mod tests {
 
     #[test]
     fn a_collapsed_codex_tile_shows_what_the_pane_reports_not_the_rows_alive() {
-        use banto_core::input::{MouseButton, MouseEventKind};
         // The session list says "alive" for a live Codex session (its rollout
-        // cannot say more); the pane's own report is what the strip must show.
-        let codex = test_row("new-worker::1::worker-2", AgentKind::Codex);
+        // cannot say more); the pane's own report is what the tile must show.
+        let codex = test_row(W2, AgentKind::Codex);
         assert_eq!(codex.activity, Activity::Alive);
         let (mut state, mut app, brigade) = staged_brigade_of_two_workers_with_rows(vec![codex]);
-        let area = Rect::new(0, 0, 120, 40);
-        let w2_key = SessionKey::from_id("new-worker::1::worker-2");
-        let said = |state: &mut EmporiumState, app: &mut App, bytes: &[u8]| {
-            engine::update(
-                state,
-                app,
-                &BrigadeConfig::default(),
-                Event::PtyOutput {
-                    key: w2_key.clone(),
-                    chunk: bytes.to_vec(),
-                },
-                Instant::now(),
-            );
-        };
-        said(
-            &mut state,
-            &mut app,
-            b"\x1b]7501;state=working:app=codex\x1b\\",
-        );
-
-        let minimize = state
-            .geometry(area)
-            .buttons()
-            .iter()
-            .find(|b| b.key == w2_key && b.kind == ButtonKind::Minimize)
-            .cloned()
-            .unwrap();
-        mouse(
+        let now = Instant::now();
+        engine::update(
             &mut state,
             &mut app,
             &brigade,
-            MouseEventKind::Down(MouseButton::Left),
-            minimize.rect.x,
-            minimize.rect.y,
+            Event::Resized {
+                width: 160,
+                height: 40,
+            },
+            now,
         );
-        let geometry = state.geometry(area);
-        let strip = geometry
-            .tiles
-            .iter()
-            .find(|(key, _)| *key == w2_key)
-            .map(|(_, rect)| *rect)
-            .unwrap();
-        assert!(geometry.is_collapsed(&w2_key));
-        let status_row = |state: &EmporiumState, app: &App| {
-            let buffer = render(state, app);
+        let w2_key = SessionKey::from_id(W2);
+        said(&mut state, &mut app, &brigade, W2, b"x", now);
+        said(&mut state, &mut app, &brigade, W2, REPORT_WORKING, now);
+        toggle_minimize_for_test(&mut state, &mut app, &brigade, &w2_key);
+        assert!(
+            state
+                .geometry(Rect::new(0, 0, 160, 40))
+                .is_collapsed(&w2_key)
+        );
+        let status_row = |state: &EmporiumState, app: &App, word: &str| {
+            let buffer = render_at(state, app, 160, now);
             (
-                text_at(&buffer, strip.x + 1, strip.y + 1, 32)
-                    .trim_end()
-                    .to_string(),
-                buffer[(strip.x + 1 + 8, strip.y + 1)].fg,
+                status_segment(state, &buffer, W2, 160),
+                word_colour(state, &buffer, W2, 160, word),
             )
         };
-        let (text, color) = status_row(&state, &app);
+        let (text, colour) = status_row(&state, &app, "busy");
         assert_eq!(text, "Codex \u{b7} busy \u{b7} output now");
-        assert_eq!(color, banto_tui::view::activity_color(Activity::Busy));
+        assert_eq!(colour, banto_tui::view::activity_color(Activity::Busy));
+
+        said(&mut state, &mut app, &brigade, W2, REPORT_BLOCKED, now);
+        let (text, colour) = status_row(&state, &app, "waiting");
+        assert_eq!(text, "Codex \u{b7} waiting \u{b7} output now");
+        assert_eq!(colour, WAITING_ACTIVITY_COLOR);
 
         said(
             &mut state,
             &mut app,
-            b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
+            &brigade,
+            W2,
+            b"\x1b]7501;state=clear\x1b\\",
+            now,
         );
-        let (text, color) = status_row(&state, &app);
-        assert_eq!(text, "Codex \u{b7} waiting \u{b7} output now");
-        assert_eq!(color, WAITING_ACTIVITY_COLOR);
-
-        said(&mut state, &mut app, b"\x1b]7501;state=clear\x1b\\");
         assert_eq!(
-            status_row(&state, &app).0,
+            status_row(&state, &app, "alive").0,
             "Codex \u{b7} alive \u{b7} output now"
         );
     }
 
     #[test]
-    fn a_collapsed_tile_shows_its_title_buttons_and_status_row_and_shows_waiting() {
+    fn a_collapsed_tile_is_a_title_row_and_two_body_rows_and_shows_waiting() {
         use banto_core::input::{MouseButton, MouseEventKind};
         let mut waiting = test_row("new-worker::1::worker-1", AgentKind::ClaudeCode);
         waiting.activity = Activity::Waiting;
@@ -5650,16 +6171,17 @@ mod tests {
         assert_eq!(text_at(&buffer, strip.x + 1, strip.y, 10), " worker-1 ");
         let right = strip.x + strip.width - 1;
         assert_eq!(text_at(&buffer, right - 6, strip.y, 6), "[S][+]");
-        // Status row: agent, activity (waiting, in the waiting colour), and
-        // the honest "no output yet" for a pane that has not written.
-        let row = strip.y + 1;
+        // The status is on that same row: the activity word, in the waiting
+        // colour, and as much more as fits between the label and the buttons (a
+        // 42-column tile has room for the bare word only, for a pane that has
+        // not written and so has no age to keep).
+        assert_eq!(status_segment(&state, &buffer, W1, 120), "waiting");
         assert_eq!(
-            text_at(&buffer, strip.x + 1, row, 32).trim_end(),
-            "Claude \u{b7} waiting \u{b7} no output yet"
+            word_colour(&state, &buffer, W1, 120, "waiting"),
+            WAITING_ACTIVITY_COLOR
         );
-        assert_eq!(buffer[(strip.x + 1 + 9, row)].fg, WAITING_ACTIVITY_COLOR);
-        // Rows two and three are blank in part A.
-        for y in [strip.y + 2, strip.y + 3] {
+        // The two body rows are the messages, blank here, and then the border.
+        for y in [strip.y + 1, strip.y + 2] {
             assert_eq!(text_at(&buffer, strip.x + 1, y, 30).trim_end(), "");
         }
         // A tile waiting for the operator is the one case he must not miss:
@@ -6312,6 +6834,7 @@ mod tests {
             has_unseen: false,
             is_idle_this_tick: None,
             agent,
+            live: None,
             glance,
         };
         let now_ms = i64::try_from(
@@ -6365,14 +6888,17 @@ mod tests {
 
         let buffer = render(&state, &app);
 
-        // The agent comes from the relay's facts: the list has no row for it.
-        assert!(text_at(&buffer, strip.x + 1, strip.y + 1, 12).starts_with("Codex"));
-        let inbound = text_at(&buffer, strip.x + 1, strip.y + 2, inner);
+        // The title row says what is known of a pane the list has no row for and
+        // that has written nothing: not an agent or a word, and at this width not
+        // the agent label either, just the honest "no output yet".
+        assert_eq!(status_segment(&state, &buffer, W1, 120), "no output yet");
+        // The two body rows are the messages, the first row the inbound one.
+        let inbound = text_at(&buffer, strip.x + 1, strip.y + 1, inner);
         assert!(
             inbound.starts_with("\u{2190} 5m run the whole suite and report"),
             "{inbound:?}"
         );
-        let sent = text_at(&buffer, strip.x + 1, strip.y + 3, inner);
+        let sent = text_at(&buffer, strip.x + 1, strip.y + 2, inner);
         // A wide character's second cell reads as a space in the buffer.
         let compact: String = sent.chars().filter(|c| *c != ' ').collect();
         assert!(
@@ -6383,7 +6909,7 @@ mod tests {
         // included, and nothing spills onto the border.
         assert!(compact.ends_with('\u{2026}'), "{sent:?}");
         let right = strip.x + strip.width - 1;
-        assert_eq!(buffer[(right, strip.y + 3)].symbol(), "\u{2502}");
+        assert_eq!(buffer[(right, strip.y + 2)].symbol(), "\u{2502}");
 
         // An observation that re-read nothing leaves the rows as they are.
         engine::update(
@@ -6398,7 +6924,7 @@ mod tests {
         );
         let buffer = render(&state, &app);
         assert!(
-            text_at(&buffer, strip.x + 1, strip.y + 2, 20).starts_with("\u{2190} 5m run the whole")
+            text_at(&buffer, strip.x + 1, strip.y + 1, 20).starts_with("\u{2190} 5m run the whole")
         );
     }
 
@@ -6775,7 +7301,6 @@ mod tests {
             minimize.rect.x,
             minimize.rect.y,
         );
-        let strip = state.geometry(area).tiles[1].1;
 
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         let mut cache = HashMap::new();
@@ -6785,27 +7310,18 @@ mod tests {
                     let _ = draw(frame, &app, &state, SystemTime::now(), tick, &mut cache);
                 })
                 .unwrap();
-            text_at(terminal.backend().buffer(), strip.x + 1, strip.y + 1, 40)
+            status_segment(&state, terminal.backend().buffer(), W1, 120)
         };
         let just_now = Instant::now();
         // Nothing is known of a pane the list has no row for and that has
         // reported nothing (the relay's facts here name no product): no agent and
         // no activity; the output age is still there.
-        assert!(row_at(just_now).trim_end().ends_with("output now"));
-        assert!(
-            row_at(just_now + Duration::from_secs(25))
-                .trim_end()
-                .ends_with("output 20s ago")
-        );
-        assert!(
-            row_at(just_now + Duration::from_secs(130))
-                .trim_end()
-                .ends_with("output 2m ago")
-        );
-        assert!(
-            row_at(just_now + Duration::from_secs(7300))
-                .trim_end()
-                .ends_with("output 2h ago")
+        assert_eq!(row_at(just_now), "output now");
+        assert_eq!(row_at(just_now + Duration::from_secs(25)), "output 20s ago");
+        assert_eq!(row_at(just_now + Duration::from_secs(130)), "output 2m ago");
+        assert_eq!(
+            row_at(just_now + Duration::from_secs(7300)),
+            "output 2h ago"
         );
     }
 
@@ -9172,6 +9688,86 @@ mod tests {
                 .map(|(_, sample)| *sample);
             assert_eq!(sampled, Some(quiescence), "{waiting_for:?}");
         }
+    }
+
+    #[test]
+    fn a_claude_member_with_a_live_file_and_no_row_carries_its_live_status() {
+        // A Worker that has not run a turn has a live file and no transcript, so
+        // no session-list row; the product is the store's recorded choice. What
+        // its file says is classified as the list does (shell is busy, a dialog
+        // is still Waiting but told apart), and only for a Claude member.
+        use banto_core::model::Activity::{Alive, Busy, Waiting};
+        for (status, reason, expected) in [
+            ("busy", None, Some((Busy, false))),
+            ("waiting", None, Some((Waiting, false))),
+            ("waiting", Some("input needed"), Some((Waiting, false))),
+            ("waiting", Some("dialog open"), Some((Waiting, true))),
+            ("shell", None, Some((Busy, false))),
+            ("idle", None, Some((Alive, false))),
+        ] {
+            let claude_home = tempfile::tempdir().unwrap();
+            let (store, state, app) = staged_worker("w1", None);
+            let brigade_id = match &state.stage {
+                Stage::Brigade { id, .. } => *id,
+                other => panic!("{other:?}"),
+            };
+            store
+                .borrow_mut()
+                .set_member_agent(brigade_id, "worker-1", AgentKind::ClaudeCode)
+                .unwrap();
+            assert!(app.row_for_id("w1").is_none(), "no row");
+            let dir = claude_home.path().join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            let pid = std::process::id();
+            let reason = reason
+                .map(|reason| format!(r#","waitingFor":"{reason}""#))
+                .unwrap_or_default();
+            std::fs::write(
+                dir.join(format!("{pid}.json")),
+                format!(r#"{{"pid":{pid},"sessionId":"w1","status":"{status}"{reason}}}"#),
+            )
+            .unwrap();
+            let observations = gather_relay_observations(
+                &state,
+                &store,
+                &ClaudeHome::new(claude_home.path().to_path_buf()),
+                None,
+                &app,
+                None,
+                &mut GlanceGate::default(),
+            );
+            let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+            assert_eq!(
+                worker.live,
+                expected.map(|(activity, dialog_open)| LiveStatus {
+                    activity,
+                    dialog_open
+                }),
+                "{status} {reason}"
+            );
+        }
+        // No live file: nothing to say.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", None);
+        let brigade_id = match &state.stage {
+            Stage::Brigade { id, .. } => *id,
+            other => panic!("{other:?}"),
+        };
+        store
+            .borrow_mut()
+            .set_member_agent(brigade_id, "worker-1", AgentKind::ClaudeCode)
+            .unwrap();
+        let observations = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+            None,
+            &mut GlanceGate::default(),
+        );
+        let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.live, None);
     }
 
     #[test]

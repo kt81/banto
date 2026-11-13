@@ -178,7 +178,7 @@ are slated for removal.
 ## Decision (2026-11-13): quitting asks about what could be lost; a quiet brigade rings
 
 Three decisions of the operator, made the same day, about when banto speaks up, and the steps that
-followed them (4 to 9).
+followed them (4 to 12).
 Their behaviour is written out in "The emporium: hosted panes" ("Is it idle? (the
 quit question)", "The closing line", "Attention", "The quiet brigade's bell"); this
 entry records what was decided and why.
@@ -255,19 +255,20 @@ and the plan-implementation prompt ring too, not only an approval.
    in "Codex data sources" ("What the markers mean, and where the signal stops").
 5. **Later the same day: an expanded tile says what its pane is doing.** Its title
    row shows `Agent · word · output age` after the label, in the strip's own words
-   and colours ("Status on an expanded tile"). *Why:* the operator asked: the clear
+   and colours ("The title row of a tile"). *Why:* the operator asked: the clear
    status word was visible only on a minimised tile.
 6. **Every surface reads the same activity, from one source.** For a hosted pane it
    is a believed Codex report first (`working` is busy, `blocked` is waiting), else
-   the pane's list row, else none (`EmporiumState::reported_activity`). The list
-   rows, the counts and the marks get the report laid over the rows; the strip and
-   the title row read it directly. So a hosted pane with no row in the list yet (a
-   member the list has not picked up) still shows what it reported, and a `blocked`
-   one is marked, counted once and rung for once like a pane with a row. *Why:* the
-   collapsed strip first read the raw rows and showed "alive" for a Codex pane
-   reporting `working` (found in the operator's trial); then the strip and the title
-   took the activity only from the row, so a row-less Codex pane showed no word
-   while the quit question already treated it as not idle (found in review).
+   the pane's list row, else what the member's live file said this tick (item 12),
+   else none (`EmporiumState::displayed_activity`). The list rows, the counts and
+   the marks get the report laid over the rows; the strip and the title row read it
+   directly. So a hosted pane with no row in the list yet still shows what it
+   reported, and a `blocked` one is marked, counted once and rung for once like a
+   pane with a row. *Why:* the collapsed strip first read the raw rows and showed
+   "alive" for a Codex pane reporting `working` (found in the operator's trial);
+   then the strip and the title took the activity only from the row, so a row-less
+   Codex pane showed no word while the quit question already treated it as not idle
+   (found in review).
 7. **A pane's screen and PTY are never smaller than 2 rows × 2 columns.** A smaller
    tile keeps a floor-sized screen and child and is drawn clipped ("Size floor").
    *Why, measured:* the pinned vt100 panics on wrapped text in a one-row screen, in
@@ -291,11 +292,41 @@ and the plan-implementation prompt ring too, not only an approval.
    *Why:* banto rang for the dialog the operator opened, and opening and closing
    `/model` in an idle brigade rang the quiet bell five seconds later. Known limit:
    a brigade with a dialog left open cannot go quiet until it is closed.
+10. **One title row for every tile.** The operator showed a screenshot in which a
+    collapsed tile had its status on a row of its own under the title and an
+    expanded tile had it on the title row: "inconsistent, and for no reason; unify
+    the code path and the look", and he noted it would free a precious row per
+    collapsed tile when there are many Workers. Now one function
+    (`paint_tile_title`) draws the title row of every staged tile, collapsed or
+    open: label, status, buttons. The collapsed strip's status row is gone; its body
+    is only the two message rows, and a collapsed tile is four rows instead of five
+    (`COLLAPSED_TILE_HEIGHT`; on a 24-row terminal 5 collapsed Workers fit instead
+    of 4, on 40 rows 9 instead of 7). Nothing persisted depends on the height.
+11. **The status sheds the same way in both states, and the age outlives the
+    agent.** Full `Agent · word · output 2m ago`, then without the agent, then the
+    age shortened (`word · 2m`), then the word alone, then nothing; the word is
+    never cut and the label never sheds ("The title row of a tile"). *Why the short
+    age:* on a collapsed tile the pane cannot be seen, and for Codex the output age
+    is the only liveness signal, so it should outlive narrow tiles. *Cost, stated
+    plainly:* the label never sheds, so at the default collapsed width (36 columns)
+    a long display-named label leaves room for the word only.
+12. **A member with no list row yet shows its live file's word.** A Claude member
+    that has not run a turn has no transcript and so no session-list row; its tile
+    showed no status word (the operator saw it on a freshly added Worker). The
+    display's decision is now a believed Codex report, else the list row, else what
+    the member's live file says as the relay observed it this tick (the list's own
+    classification), else nothing. A row-less member that is waiting is marked,
+    counted and rung for like any other; one waiting only on a dialog is shown and
+    counted, not rung (item 9). The word is replaced every tick, absence included: a
+    tick that did not observe the member leaves it no word. The quit question, the
+    brigade watch and the relay do not read it.
 
-*Not done:* answering the `?` query of the same protocol (which is what would make
-Claude Code report over it too — from the 2.1.323 bundle, read and not run); keeping
-sub-records (reports naming an `id=` are parsed and dropped); and sub-agent activity
-is not tracked.
+*Not done:* a new member's "last message received" on its collapsed tile can show a
+broadcast that was sent before it joined (display only; the fix needs a stored join
+point, so it waits for the next schema change); answering the `?` query of the same
+protocol (which is what would make Claude Code report over it too — from the 2.1.323
+bundle, read and not run); keeping sub-records (reports naming an `id=` are parsed
+and dropped); and sub-agent activity is not tracked.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -598,7 +629,7 @@ crates/
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
 │  └─ config.rs         # config.toml: loading it, and where it is looked for (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir)
-├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view (session list, summary), paint (vt100 screen → buffer cells), render_modal, strip (collapsed stack tile), hints, text
+├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view (session list, summary), paint (vt100 screen → buffer cells), render_modal, strip (the title status of every tile; the message rows of a collapsed one), hints, text
 └─ banto/               # bin: clap subcommands (banto, banto _mcp, banto _hook, banto list, ...), the one UI's event loop and executors
    ├─ main.rs           # clap CLI and dispatch
    ├─ startup.rs        # where config, database, data dir and the agent homes are (and what a child is handed)
@@ -741,103 +772,119 @@ brigade that predates schema v7 has the order that migration wrote — Director,
 then Workers numbered by their old session ids — because the order the members
 had joined was not kept when the table was rebuilt; the rows come out in that
 numbering order in the bundled SQLite, which SQLite does not promise.
-A stack tile can be collapsed to a five-row strip (border, three content rows,
+A stack tile can be collapsed to a four-row strip (its title row, two message rows,
 border) that shows status-like facts instead of the session's screen, which keeps
 running untouched: the `[_]` button in its title row (or `m`), `[+]` to open it
-again. The strip's first content row reads agent · activity · output age, from the
-one function (`tile_status`) that also fills the title row of every expanded tile
-("Status on an expanded tile", below). The activity word is one of four, in the
-sidebar dot's colours: **busy** (a turn or a command is running: a Claude session
-whose live file says `busy` or `shell`, or a Codex pane that reports `working`),
-**waiting** (a person is needed: Claude `waiting`, whatever it waits for, or a Codex
-pane that reports `blocked`), **alive** (a live process with nothing running: Claude
-`idle` or a status banto does not know, a Codex session that has not reported busy
-or waiting), **idle** (no live process; the dot's brightness says how long ago).
-Every surface that shows a pane's activity — the list row and its dot, the Waiting
-count, the attention marks, the strip, the title row — reads the same value, and a
+again. The strip's title row is the one every tile has ("The title row of a tile",
+below): the label, then agent · activity · output age, then the buttons, from one
+function (`tile_status`) and one painter (`paint_tile_title`); the strip itself is
+only the two message rows under it. The activity word is one of four, in the sidebar
+dot's colours: **busy** (a turn or a command is running: a Claude session whose live
+file says `busy` or `shell`, or a Codex pane that reports `working`), **waiting** (a
+person is needed: Claude `waiting`, whatever it waits for, or a Codex pane that
+reports `blocked`), **alive** (a live process with nothing running: Claude `idle` or
+a status banto does not know, a Codex session that has not reported busy or
+waiting), **idle** (no live process; the dot's brightness says how long ago). Every
+surface that shows a pane's activity — the list row and its dot, the Waiting count,
+the attention marks, the title row of every tile — reads the same value, and a
 hosted pane has one source for it: what the pane reported, when it is a Codex pane
 and the report is believed (`working` is busy, `blocked` is waiting); else its list
-row's activity; else none (`EmporiumState::reported_activity`; the quit question and
-the bell are decided from the same report). The list rows, the counts and the marks
-get the report laid over the rows (`App::row_for_id` returns the displayed row, not
-the raw one); the strip and the title row ask `reported_activity` directly, so a
-hosted pane with no row in the list yet still shows what it reported, and a
-`blocked` one is marked, counted once and rung for once like one with a row. The
+row's activity; else, for a Claude member with no row yet, what its live file said
+this tick as the relay observed it; else none (`EmporiumState::displayed_activity`,
+which starts from `reported_activity`; the quit question and the bell are decided
+from the same Codex report, and none of them read the live word). The list rows, the
+counts and the marks get the report laid over the rows (`App::row_for_id` returns
+the displayed row, not the raw one); the title row asks `displayed_activity`
+directly, so a hosted pane with no row in the list yet still shows what it reported
+or its live file's word, and a `blocked` or `waiting` one is marked, counted once
+and rung for once like one with a row (a dialog is shown and counted, not rung). The
 strip once read the raw rows and showed "alive" for a Codex pane that was reporting
 `working`, found in the operator's trial; later it and the title took the activity
 only from the row, so a row-less Codex pane showed no word while the quit question
-already treated it as not idle, found in review. The product shown is the row's,
-else the one the relay resolved for the member. Output age is "output now", then in
-ten-second steps to a minute, then minutes, then hours; for Codex, whose session
-files record neither busy nor waiting, the activity word comes from the pane's own
-report once it has made one (`blocked` reads waiting, `working` busy; "Codex data
-sources"), and until then the output age is the only liveness signal and is the last
-thing dropped on a narrow row. The next two rows read `← <age> <first line of the
-last message sent to this member>` and `→ <age> <first line of the last message this
-member sent>`, from banto's own brigade message store, read without touching any
-read cursor (a glance is not a delivery) and re-read only when a message has been
-appended; each is reduced at the store to its first non-empty line with control
-characters removed and cut to 200 characters, then clipped to the row by display
-width, and blank when there is none. A collapsed tile that is waiting for the
-operator still shows the waiting colour on its border. A tile's `[S]` button (or
-`z`) *solos* it, as on an audio mixer: every other stack tile is shown collapsed
-until the solo is turned off (the master tile has an `[S]` button too, and no
-collapse button: soloing it collapses the whole stack, which then narrows as
-described below). Turning the solo off brings back exactly what had been collapsed
-one by one (the solo is an overlay on those choices, never a rewrite; it is
-unrelated to the single-session "solo" stage). `M` clears both. Both buttons sit
-right-aligned in every stack tile's title row, only where the row has room for the
-label, a gap and both. When every stack tile is collapsed the stack stays the
-right-hand column but narrows to a width of its own (the "collapsed stack width", 36
-columns until moved, per brigade; a width in columns, not a share, since a strip
-needs a fixed amount of room to be readable on any terminal) and the master takes
-the rest; the strips stack from the top in order and the space below them is left
-empty. The master is never narrower there than in the ordinary split at the same
-width (the strips can be narrower than the ordinary stack, never wider), so whatever
-fit on it before — its title with its `[S]` button — still fits. Opening any tile
-returns to the ordinary master share. Dragging the master/stack edge sets whichever
-of the two preferences is in force (the collapsed width while every tile is
-collapsed, the master's share otherwise); the master's PTY is resized once on
-entering and once on leaving that state. A collapsed tile is not focusable (the
-focus ring, F3 and the arrows skip it; the pane number opens it first); its label
-still moves it. A collapsed tile's child is not resized, since a repaint into a
-three-row grid would wreck the screen the operator comes back to; it is sized when
-it opens. The row resize handle lies between expanded neighbours and rewrites only
-their weights. **Putting the sizes back** (prefix + `=`, from the sidebar or a pane,
-on a staged brigade). Forgets every row weight the layout holds for the brigade —
-staged members' and off-stage ones' alike, so a member reopened later brings no old
-height back — and returns the master share and the collapsed stack width to their
-defaults. It leaves the arrangement alone: stack order, collapsed flags, solo,
-display names and join order are not sizes, and the sidebar width is a window-level
-preference of a different layer, not part of any brigade. Like the other layout
-operations it ends a drag or move in progress; the panes are resized once, only
-where a tile's size really changes, and one layout save is written when something
-changed. A brigade already at its defaults changes and saves nothing and says so
-(`sizes already at their defaults`); with no brigade staged, or a single session, it
-is refused (`prefix: no brigade layout to reset`). The case that prompted it: a
-Worker added later takes the mean of the others' heights, so weights set when a
-brigade had two Workers leave one tile much smaller than the rest once it has four.
-**What is kept across a restart.** Everything arranged above, and the brigade bell's
-switch, is stored in banto's own sqlite store and comes back the next time banto
-runs: the sidebar width (table `ui_prefs`, key `sidebar_width`) and, in the same
-table, the brigade bell's switch (key `bell_when_focused`, `1` or `0`; any other
-stored value reads as no preference, which is off — see "The quiet brigade's bell");
-per brigade, the master share, the collapsed stack width and the soloed member
-(columns on `brigades`); per member, its place in the stack order, its row weight
-and its collapsed flag (columns on `brigade_members`). NULL means "no preference,
-use the default". The per-member values live on the member's own row on purpose: a
-dismissed member's row is deleted, so its arrangement goes with it, which bounds
-what is kept and keeps a later member under the same token (only the Goinkyo's is
-reused, by its next consultation) from inheriting it; disbanding the brigade deletes
-the rest. A brigade's arrangement is read together with its roster when it is
-staged, so the first PTY sizes are already the stored ones; it is written (the whole
-snapshot, one transaction) at the moment it actually changes — a committed resize or
-move, a collapse, a solo, restore-all, a size reset — and never for a gesture that
-changed nothing, and never from a draw or a tick. What the run already holds wins
-over a read of the store. Stored values are preferences like any other: out-of-range
-ones read as "no preference", and what is used is clamped to the terminal at use,
-never rewritten. A write that fails is silent, as a failed pin is. A Worker added
-later gets the mean of the others' height.
+already treated it as not idle, found in review; a Claude Worker that had not run a
+turn showed none either, until its live file became the third source. The product
+shown is the row's, else the one the relay resolved for the member. Output age is
+"output now", then in ten-second steps to a minute, then minutes, then hours; for
+Codex, whose session files record neither busy nor waiting, the activity word comes
+from the pane's own report once it has made one (`blocked` reads waiting, `working`
+busy; "Codex data sources"), and until then the output age is the only liveness
+signal, which is why it is shortened (`2m`) before it is dropped on a narrow tile.
+The two body rows read `← <age> <first line of the last message sent to this
+member>` and `→ <age> <first line of the last message this member sent>`, from
+banto's own brigade message store, read without touching any read cursor (a glance
+is not a delivery) and re-read only when a message has been appended; each is
+reduced at the store to its first non-empty line with control characters removed and
+cut to 200 characters, then clipped to the row by display width, and blank when
+there is none. A collapsed tile that is waiting for the operator still shows the
+waiting colour on its border. A tile's `[S]` button (or `z`) *solos* it, as on an
+audio mixer: every other stack tile is shown collapsed until the solo is turned off
+(the master tile has an `[S]` button too, and no collapse button: soloing it
+collapses the whole stack, which then narrows as described below). Turning the solo
+off brings back exactly what had been collapsed one by one (the solo is an overlay
+on those choices, never a rewrite; it is unrelated to the single-session "solo"
+stage). `M` clears both. Both buttons sit right-aligned in every stack tile's title
+row, only where the row has room for the label, a gap and both. When every stack
+tile is collapsed the stack stays the right-hand column but narrows to a width of
+its own (the "collapsed stack width", 36 columns until moved, per brigade; a width
+in columns, not a share, since a strip needs a fixed amount of room to be readable
+on any terminal) and the master takes the rest; the strips stack from the top in
+order and the space below them is left empty (at four rows each a 24-row terminal
+holds 5 collapsed Workers and a 40-row one 9, the stack being the terminal's rows
+less the status bar's one; one more and every strip gives a little rather than the
+last being dropped, down to the title row alone at one row; below one row a tile is
+not drawn at all: a tile with no rows or no columns, which a stack with more tiles
+than rows has, draws nothing and owns no button, label or drop slot
+(`layout::is_empty`), and keeps its place in the order and in the focus ring. *Why:*
+found in review: such a tile was placed on the next tile's top row and its buttons
+were still built, so a press on a visible tile's `[S]` or minimise button could
+resolve to the invisible one, and with the status on the title row it would also
+have painted over its neighbour. Known and not fixed: focus cycling (F3) can land on
+such an invisible tile). The master is never narrower there than in the ordinary
+split at the same width (the strips can be narrower than the ordinary stack, never
+wider), so whatever fit on it before — its title with its `[S]` button — still fits.
+Opening any tile returns to the ordinary master share. Dragging the master/stack
+edge sets whichever of the two preferences is in force (the collapsed width while
+every tile is collapsed, the master's share otherwise); the master's PTY is resized
+once on entering and once on leaving that state. A collapsed tile is not focusable
+(the focus ring, F3 and the arrows skip it; the pane number opens it first); its
+label still moves it. A collapsed tile's child is not resized, since a repaint into
+a grid of a row or two would wreck the screen the operator comes back to; it is
+sized when it opens. The row resize handle lies between expanded neighbours and
+rewrites only their weights. **Putting the sizes back** (prefix + `=`, from the
+sidebar or a pane, on a staged brigade). Forgets every row weight the layout holds
+for the brigade — staged members' and off-stage ones' alike, so a member reopened
+later brings no old height back — and returns the master share and the collapsed
+stack width to their defaults. It leaves the arrangement alone: stack order,
+collapsed flags, solo, display names and join order are not sizes, and the sidebar
+width is a window-level preference of a different layer, not part of any brigade.
+Like the other layout operations it ends a drag or move in progress; the panes are
+resized once, only where a tile's size really changes, and one layout save is
+written when something changed. A brigade already at its defaults changes and saves
+nothing and says so (`sizes already at their defaults`); with no brigade staged, or
+a single session, it is refused (`prefix: no brigade layout to reset`). The case
+that prompted it: a Worker added later takes the mean of the others' heights, so
+weights set when a brigade had two Workers leave one tile much smaller than the rest
+once it has four. **What is kept across a restart.** Everything arranged above, and
+the brigade bell's switch, is stored in banto's own sqlite store and comes back the
+next time banto runs: the sidebar width (table `ui_prefs`, key `sidebar_width`) and,
+in the same table, the brigade bell's switch (key `bell_when_focused`, `1` or `0`;
+any other stored value reads as no preference, which is off — see "The quiet
+brigade's bell"); per brigade, the master share, the collapsed stack width and the
+soloed member (columns on `brigades`); per member, its place in the stack order, its
+row weight and its collapsed flag (columns on `brigade_members`). NULL means "no
+preference, use the default". The per-member values live on the member's own row on
+purpose: a dismissed member's row is deleted, so its arrangement goes with it, which
+bounds what is kept and keeps a later member under the same token (only the
+Goinkyo's is reused, by its next consultation) from inheriting it; disbanding the
+brigade deletes the rest. A brigade's arrangement is read together with its roster
+when it is staged, so the first PTY sizes are already the stored ones; it is written
+(the whole snapshot, one transaction) at the moment it actually changes — a
+committed resize or move, a collapse, a solo, restore-all, a size reset — and never
+for a gesture that changed nothing, and never from a draw or a tick. What the run
+already holds wins over a read of the store. Stored values are preferences like any
+other: out-of-range ones read as "no preference", and what is used is clamped to the
+terminal at use, never rewritten. A write that fails is silent, as a failed pin is.
+A Worker added later gets the mean of the others' height.
 
 **Keys** (one table: the list's keys first, then what the panes add):
 
@@ -889,22 +936,35 @@ way first, then the counts, then the badge's tail.
 Multiline paste and file drag&drop into panes are synthesized into bracketed
 pastes host-side, since the Windows console never reports pastes as pastes.
 
-**Status on an expanded tile.** An expanded tile's title row shows `Agent · word ·
-output age` after the label: the collapsed strip's own words and colours, from the
-one function `tile_status`, so a tile and its strip cannot disagree. It is drawn in
-the stretch of the top border between the label and the buttons: the label and the
-buttons did not move, no hit-test changed, and one border cell stays free on each
-side of it. It is drawn while the tile is being dragged too, in its own colours on
-the border and label the gesture colours; the drop line and the ghost label are
-painted over the finished frame, so where they cross it they win; hit-testing is the
-same. When the room is short it gives way in this order: the agent label, then the
-output age, then the whole status; the word is never cut (a title row has room for
-one thing, and "busy" or "alive" is what it is read for; the strip keeps the age
-over the word because its three rows have room for both). Only the label is reversed
-on a focused tile; the status is not. A pane whose activity is not known shows what
-is known: its agent and output age, then the age alone, and "no output yet" when it
-has produced none. *Why:* the operator asked for it: the clear status word was
-visible only on a minimised tile.
+**The title row of a tile.** Every staged tile, collapsed or open, has the same
+title row, drawn by one function (`paint_tile_title`): the border, the label, the
+status `Agent · word · output 2m ago`, then `[S]` and `[_]` (`[+]` on a collapsed
+tile). The status is the list's words and colours, from the one function
+`tile_status`, so a collapsed and an open tile cannot look different (a test renders
+the same pane both ways and compares the rows cell for cell, but for the button that
+now opens instead of collapsing). It is drawn in the stretch of the top border
+between the label and the buttons: the label and the buttons did not move, no
+hit-test changed, and one border cell stays free on each side of it. It is drawn
+while the tile is being dragged too, in its own colours on the border and label the
+gesture colours; the drop line and the ghost label are painted over the finished
+frame, so where they cross it they win; hit-testing is the same. When the room is
+short it gives way in this order, the same for both states: the agent label first
+(`word · output 2m ago`); then the age is shortened to a bare duration (`word · 2m`;
+"now", "20s", "3m", "2h", in the long form's steps); then the age goes (`word`); and
+when not even the word fits, the whole status. The word is never cut or shortened
+and the label never sheds, so at the default collapsed width (36 columns) a plain
+label such as `worker-1` still leaves room for a short word and the short age, but a
+long display-named label leaves room for the word only. The widths at which the
+steps fall are in the tests, not here. A pane whose activity is not known keeps a
+form that still says what the age measures: `Agent · output 2m ago`, `output 2m
+ago`, `output 2m` (a bare `2m` beside nothing would not say), then nothing; a pane
+that has produced nothing shows "no output yet" in place of the age, which has no
+short form. Only the label is reversed on a focused tile (a collapsed tile is never
+focused); the status is not. *Why:* the operator asked for the status on the open
+tile's title, then for the collapsed tile to use the same row ("One title row for
+every tile" in the decision entry); the age is shortened before it is dropped
+because on a collapsed tile the pane cannot be seen and, for Codex, the output age
+is the only liveness signal.
 
 **Size floor.** A hosted pane's screen and its PTY are never smaller than 2 rows × 2
 columns (`MIN_ROWS`/`MIN_COLS` in `banto-core`'s `screen.rs`; a freshly spawned pane
@@ -1019,7 +1079,8 @@ are not quits in this sense and draw nothing of the kind.
 comes with the second. A *mark*: a staged pane is in the mark set, and its border is
 drawn in the waiting colour (magenta) unless it is the focused tile (below), while
 the session list shows its session as Waiting — a Claude Code session whose live
-file says `waiting` (for any reason), or a hosted Codex pane that reports `blocked`
+file says `waiting` (for any reason; for a member with no list row yet, the live
+file as the relay read it this tick), or a hosted Codex pane that reports `blocked`
 (OSC 7501, "Codex data sources"; the row, the count and the mark all read the same
 report, which holds exactly as long as the report, the pane or its being Codex does,
 whether or not the list has a row for the pane yet; a Codex pane reporting `working`
@@ -2003,7 +2064,7 @@ themselves.
 5. Otherwise bucket by jsonl mtime: today / this week / older
    (thresholds and colors configurable)
 
-This is the display (the list row, the strip, the title row, the counts and marks
+This is the display (the list row, the title row of every tile, the counts and marks
 all read it; `banto_core::model::Activity`). The stricter question "is this session
 known to be doing nothing?" — asked by the quit confirmation and the brigade bell
 (see "The emporium: hosted panes") — reads the same file the other way round: only
@@ -2013,7 +2074,11 @@ operator restarted banto without knowing a command was still running in a pane t
 said "alive".) The relay, which asks whether a member can be nudged, still treats
 `shell` as idle enough: the turn has ended and the member can take a message; it
 never nudges a `waiting` session, `dialog open` included, since a nudge's Enter
-would choose something in the dialog. The raw status stays visible in one place: the
+would choose something in the dialog. The same classification without its last step, the transcript's age
+(`live_activity`), is what the tile of a member with no list row shows: a Claude
+Worker that has not run a turn has a live file and no transcript, so its word comes
+from the file as the relay read it this tick, and goes with the tick that does not
+see it. The raw status stays visible in one place: the
 `brigade_status` MCP tool prints the live file's own word (`busy`, `waiting`,
 `idle`, `shell`) for a Claude peer.
 

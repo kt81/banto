@@ -52,6 +52,7 @@ fn observed(state: &EmporiumState, relay: Vec<RelayObservation>) -> Vec<RelayObs
                 return None;
             }
             Some(RelayObservation {
+                live: None,
                 glance: None,
                 brigade_id,
                 token: state.member_tokens.get(pane)?.clone(),
@@ -1640,6 +1641,7 @@ fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
         at,
     );
     let observation = || RelayObservation {
+        live: None,
         glance: None,
         brigade_id: 1,
         token: "worker-1".to_string(),
@@ -1967,6 +1969,7 @@ fn the_retry_enter_of_a_kickoff_counts_the_pane_for_the_quit_question() {
 /// The relay's view of `member` with unread mail, idle this tick.
 fn mail_for(brigade: BrigadeId, token: &str, member: &SessionKey) -> RelayObservation {
     RelayObservation {
+        live: None,
         glance: None,
         brigade_id: brigade,
         token: token.to_string(),
@@ -4699,6 +4702,7 @@ fn observed_as(
     agent: Option<crate::model::AgentKind>,
 ) -> RelayObservation {
     RelayObservation {
+        live: None,
         glance: None,
         brigade_id: state.member_brigades[pane],
         token: state.member_tokens[pane].clone(),
@@ -5714,4 +5718,230 @@ fn the_brigade_watch_and_the_quit_question_follow_the_same_decision_when_a_confl
         conflict_at + 3 * BRIGADE_QUIET_SETTLE,
     );
     assert!(rang_at.is_some(), "the watch completes on the sample");
+}
+
+// --- a Claude member that has no row yet shows what its live file says -------------------------------
+
+/// Brigade 1 staged with a Claude Director (a row) and a Worker with no row,
+/// whose live file the relay read this tick as `live`.
+fn rowless_claude_worker(
+    live: Option<crate::engine::LiveStatus>,
+) -> (EmporiumState, App, SessionKey, Instant) {
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![row_for("dir")]);
+    app.set_viewport_height(20);
+    let relay = vec![RelayObservation {
+        live,
+        ..observed_as(&state, &worker, Some(crate::model::AgentKind::ClaudeCode))
+    }];
+    sample_with_relay(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        relay,
+        at + SECOND,
+    );
+    assert!(app.row_for_id("w1").is_none());
+    (state, app, worker, at + 10 * SECOND)
+}
+
+fn live(activity: crate::model::Activity, dialog_open: bool) -> Option<crate::engine::LiveStatus> {
+    Some(crate::engine::LiveStatus {
+        activity,
+        dialog_open,
+    })
+}
+
+/// A tick that observes the Worker as `live` (or not at all with `None` and an
+/// empty relay), as the shell sends it.
+fn observe(
+    state: &mut EmporiumState,
+    app: &mut App,
+    worker: &SessionKey,
+    live: Option<crate::engine::LiveStatus>,
+    at: Instant,
+) -> Vec<Cmd> {
+    let relay = live
+        .map(|live| {
+            vec![RelayObservation {
+                live: Some(live),
+                ..observed_as(state, worker, Some(crate::model::AgentKind::ClaudeCode))
+            }]
+        })
+        .unwrap_or_default();
+    let brigades = listed(state);
+    send(state, app, Event::Tick { relay, brigades }, at)
+}
+
+#[test]
+fn a_row_less_claude_member_shows_the_word_its_live_file_gives_it() {
+    use crate::model::Activity::{Alive, Busy, Waiting};
+    for (live, expected) in [
+        (live(Alive, false), Some(Alive)),
+        (live(Busy, false), Some(Busy)),
+        (live(Waiting, false), Some(Waiting)),
+        (live(Waiting, true), Some(Waiting)),
+        (None, None),
+    ] {
+        let (state, app, worker, _) = rowless_claude_worker(live);
+        assert_eq!(
+            state.displayed_activity(&app, &worker),
+            expected,
+            "{live:?}"
+        );
+    }
+}
+
+#[test]
+fn a_row_less_claude_member_that_is_waiting_is_marked_counted_once_and_rung_for_once() {
+    use crate::model::Activity::Waiting;
+    let (mut state, mut app, worker, at) = rowless_claude_worker(None);
+    let cmds = observe(&mut state, &mut app, &worker, live(Waiting, false), at);
+    assert!(state.attention_panes().contains(&worker), "marked");
+    assert_eq!(state.visible_waiting_count(), 1, "counted once");
+    assert_eq!(rings(&cmds), 1, "rung for");
+    for secs in 1..=5 {
+        let cmds = observe(
+            &mut state,
+            &mut app,
+            &worker,
+            live(Waiting, false),
+            at + secs * SECOND,
+        );
+        assert_eq!(rings(&cmds), 0, "once");
+    }
+    // It stops waiting: the mark and the count go.
+    observe(
+        &mut state,
+        &mut app,
+        &worker,
+        live(crate::model::Activity::Alive, false),
+        at + 10 * SECOND,
+    );
+    assert!(!state.attention_panes().contains(&worker));
+    assert_eq!(state.visible_waiting_count(), 0);
+}
+
+#[test]
+fn a_row_less_member_on_a_dialog_is_shown_waiting_and_not_rung_until_the_reason_changes() {
+    use crate::model::Activity::Waiting;
+    let (mut state, mut app, worker, at) = rowless_claude_worker(None);
+    let cmds = observe(&mut state, &mut app, &worker, live(Waiting, true), at);
+    assert!(state.attention_panes().contains(&worker), "marked");
+    assert_eq!(state.visible_waiting_count(), 1, "counted");
+    assert_eq!(rings(&cmds), 0, "a dialog does not ring");
+    let cmds = observe(
+        &mut state,
+        &mut app,
+        &worker,
+        live(Waiting, false),
+        at + 10 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 1, "the reason changed while waiting: once");
+}
+
+#[test]
+fn a_row_arriving_later_for_a_waiting_row_less_member_changes_nothing_and_rings_nothing() {
+    use crate::model::Activity::{Alive, Waiting};
+    let (mut state, mut app, worker, at) = rowless_claude_worker(None);
+    assert_eq!(
+        rings(&observe(
+            &mut state,
+            &mut app,
+            &worker,
+            live(Waiting, false),
+            at
+        )),
+        1
+    );
+    // The row says waiting too (the same live file, read by the list).
+    let cmds = send(
+        &mut state,
+        &mut app,
+        rows_loaded(vec![row_for("dir"), waiting_row("w1", false)]),
+        at + 10 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 0);
+    assert!(state.attention_panes().contains(&worker));
+    assert_eq!(state.visible_waiting_count(), 1);
+    // And a row that says otherwise is the one that counts, as for any pane.
+    let cmds = send(
+        &mut state,
+        &mut app,
+        rows_loaded(vec![row_for("dir"), row_for("w1")]),
+        at + 20 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 0);
+    assert!(!state.attention_panes().contains(&worker));
+    assert_eq!(state.displayed_activity(&app, &worker), Some(Alive));
+}
+
+#[test]
+fn the_word_comes_from_the_report_then_the_row_then_the_live_file() {
+    use crate::model::Activity::{Alive, Busy, Waiting};
+    // A Codex pane's believed report beats its row, which beats the facts.
+    let (mut state, mut app, worker, at) = rowless_claude_worker(live(Waiting, false));
+    assert_eq!(
+        state.displayed_activity(&app, &worker),
+        Some(Waiting),
+        "facts"
+    );
+    send(
+        &mut state,
+        &mut app,
+        rows_loaded(vec![row_for("dir"), row_for("w1")]),
+        at,
+    );
+    assert_eq!(state.displayed_activity(&app, &worker), Some(Alive), "row");
+    // A Codex member: its report decides over both.
+    let (mut state, mut app, worker, at) = rowless_codex_worker();
+    send(
+        &mut state,
+        &mut app,
+        rows_loaded(vec![row_for("dir"), codex_row("w1")]),
+        at,
+    );
+    said(&mut state, &mut app, &worker, REPORT_WORKING, at + SECOND);
+    assert_eq!(
+        state.displayed_activity(&app, &worker),
+        Some(Busy),
+        "report"
+    );
+}
+
+#[test]
+fn a_tick_that_did_not_observe_the_member_leaves_no_word_for_it() {
+    use crate::model::Activity::Waiting;
+    let (mut state, mut app, worker, at) = rowless_claude_worker(live(Waiting, false));
+    assert_eq!(state.displayed_activity(&app, &worker), Some(Waiting));
+    assert!(state.attention_panes().contains(&worker));
+    // A roster that could not be read: the tick observes nobody. What the last
+    // tick saw is not carried over; the tile shows no word until one is seen.
+    observe(&mut state, &mut app, &worker, None, at + 10 * SECOND);
+    assert_eq!(state.displayed_activity(&app, &worker), None);
+    assert!(!state.attention_panes().contains(&worker));
+    // The agent it was resolved as is kept, as before.
+    assert_eq!(
+        state.member_facts(&worker).and_then(|facts| facts.agent),
+        Some(crate::model::AgentKind::ClaudeCode)
+    );
+    // And the next good tick brings it back.
+    observe(
+        &mut state,
+        &mut app,
+        &worker,
+        live(Waiting, false),
+        at + 20 * SECOND,
+    );
+    assert_eq!(state.displayed_activity(&app, &worker), Some(Waiting));
+}
+
+#[test]
+fn the_live_word_of_a_member_never_feeds_the_quit_question_or_the_watch() {
+    use crate::model::Activity::Waiting;
+    // The word is display; idleness is the sample's: a row-less Worker whose
+    // file says waiting but whose sample says idle is idle for both.
+    let (state, app, worker, _) = rowless_claude_worker(live(Waiting, false));
+    assert_eq!(state.quiescence_of(&app, &worker), Idle);
+    assert_eq!(state.not_idle_count(&app, t0()), 0);
 }

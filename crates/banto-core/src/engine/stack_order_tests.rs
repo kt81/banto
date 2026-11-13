@@ -193,6 +193,7 @@ impl Scene {
                     has_unseen: false,
                     is_idle_this_tick: None,
                     agent: None,
+                    live: None,
                     glance: None,
                 })
             })

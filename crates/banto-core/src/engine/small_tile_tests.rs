@@ -312,3 +312,182 @@ fn a_freshly_spawned_pane_starts_above_the_floor_with_the_size_its_pty_is_opened
     send(&mut state, &mut app, Event::Spawned { key: pane.clone() });
     assert_eq!(state.screens[&pane].size(), (SPAWN_ROWS, SPAWN_COLS));
 }
+
+/// The height of every stack tile on a 24-row terminal with `workers` Workers.
+fn stack_heights_with(workers: usize) -> Vec<(SessionKey, u16)> {
+    let (state, _app, _panes) = brigade_in_a_terminal(workers, 120, 24);
+    state.geometry(Rect::new(0, 0, 120, 24)).tiles[1..]
+        .iter()
+        .map(|(key, rect)| (key.clone(), rect.height))
+        .collect()
+}
+
+#[test]
+fn a_held_move_ends_when_pane_arrivals_leave_the_dragged_tile_with_no_rows() {
+    use crate::input::{InputEvent, MouseButton, MouseEvent, MouseEventKind};
+    let area = Rect::new(0, 0, 120, 24);
+    // One arrival takes at most a row from a tile, and a one-row tile cannot be
+    // picked up (its label is under the row boundary), so the source is a tile
+    // of two rows that arrivals while the button is held shrink to none.
+    // Found on dry runs: (Workers at the press, arrivals, the tile).
+    let (start, arrivals, source) = (10..=23usize)
+        .flat_map(|start| (1..=12usize).map(move |arrivals| (start, arrivals)))
+        .find_map(|(start, arrivals)| {
+            let before = stack_heights_with(start);
+            let steps: Vec<_> = (1..=arrivals)
+                .map(|k| stack_heights_with(start + k))
+                .collect();
+            before
+                .iter()
+                .find(|(key, height)| {
+                    *height >= 2
+                        && steps.iter().enumerate().all(|(at, heights)| {
+                            let now = heights.iter().find(|(k, _)| k == key).unwrap().1;
+                            if at + 1 == arrivals {
+                                now == 0
+                            } else {
+                                now >= 1
+                            }
+                        })
+                })
+                .map(|(key, _)| (start, arrivals, key.clone()))
+        })
+        .expect("some tile of two rows is left with none by arrivals");
+
+    let (mut state, mut app, _panes) = brigade_in_a_terminal(start, 120, 24);
+    let geometry = state.geometry(area);
+    let (column, row) = (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .find(|(x, y)| geometry.label_at(*x, *y) == Some(&source))
+        .expect("the tile has a label to hold");
+    let mouse = |state: &mut EmporiumState, app: &mut App, kind, column, row| {
+        send(
+            state,
+            app,
+            Event::Input(InputEvent::Mouse(MouseEvent { kind, column, row })),
+        )
+    };
+    mouse(
+        &mut state,
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    );
+    assert!(state.move_drag.is_some(), "held");
+    let order_before: Vec<SessionKey> = match &state.stage {
+        Stage::Brigade { panes, .. } => panes.clone(),
+        other => panic!("{other:?}"),
+    };
+
+    // Member panes arrive while the button is held (relaunches, added Workers).
+    for n in 1..=arrivals {
+        let arriving = key(&format!("w{}", start + n));
+        state
+            .member_tokens
+            .insert(arriving.clone(), format!("worker-{}", start + n));
+        state.member_brigades.insert(arriving.clone(), 1);
+        state.pending_opens.insert(
+            arriving.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false,
+                cwd: PathBuf::from("."),
+            },
+        );
+        state.screens.insert(arriving.clone(), Screen::new(24, 80));
+        send(&mut state, &mut app, Event::Spawned { key: arriving });
+        let tile = state
+            .geometry(area)
+            .tiles
+            .iter()
+            .find(|(key, _)| *key == source)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        if n < arrivals {
+            assert!(
+                tile.height >= 1 && state.move_drag.is_some(),
+                "still held after {n}"
+            );
+        } else {
+            assert_eq!(tile.height, 0, "the dragged tile has no rows now");
+        }
+    }
+
+    // The gesture goes in that update: no ghost, no drop line, and the release
+    // moves nothing.
+    assert!(state.move_drag.is_none(), "cancelled");
+    assert!(state.drag_overlay(area).is_none(), "no ghost or line");
+    let cmds = mouse(
+        &mut state,
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row + 3,
+    );
+    assert!(cmds.is_empty(), "{cmds:?}");
+    let order_after: Vec<SessionKey> = match &state.stage {
+        Stage::Brigade { panes, .. } => panes.clone(),
+        other => panic!("{other:?}"),
+    };
+    let mut expected = order_before;
+    expected.extend((1..=arrivals).map(|n| key(&format!("w{}", start + n))));
+    assert_eq!(order_after, expected, "nothing was moved");
+}
+
+#[test]
+fn a_held_resize_ends_when_pane_arrivals_leave_a_neighbour_with_no_rows() {
+    use crate::input::{InputEvent, MouseButton, MouseEvent, MouseEventKind};
+    let area = Rect::new(0, 0, 120, 24);
+    // The boundary between w12 and w13 with 13 Workers; 11 arrivals later w13
+    // has no rows (see the move test above), and a boundary beside an empty tile
+    // is not in the geometry.
+    let (mut state, mut app, _panes) = brigade_in_a_terminal(13, 120, 24);
+    let boundary = Boundary::Stack {
+        brigade: 1,
+        above: key("w12"),
+        below: key("w13"),
+    };
+    let cell = {
+        let geometry = state.geometry(area);
+        let handle = geometry.handle_for(&boundary).expect("a row boundary");
+        let hit = handle.hits()[0];
+        (hit.x + 1, hit.y)
+    };
+    send(
+        &mut state,
+        &mut app,
+        Event::Input(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cell.0,
+            row: cell.1,
+        })),
+    );
+    assert!(state.drag.is_some(), "held");
+    for n in 14..=24 {
+        let arriving = key(&format!("w{n}"));
+        state
+            .member_tokens
+            .insert(arriving.clone(), format!("worker-{n}"));
+        state.member_brigades.insert(arriving.clone(), 1);
+        state.pending_opens.insert(
+            arriving.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 1,
+                needs_codex_kickoff: false,
+                cwd: PathBuf::from("."),
+            },
+        );
+        state.screens.insert(arriving.clone(), Screen::new(24, 80));
+        send(&mut state, &mut app, Event::Spawned { key: arriving });
+    }
+    let w13 = state
+        .geometry(area)
+        .tiles
+        .iter()
+        .find(|(k, _)| *k == key("w13"))
+        .map(|(_, r)| *r)
+        .unwrap();
+    assert_eq!(w13.height, 0);
+    assert!(state.drag.is_none(), "the resize is cancelled too");
+}

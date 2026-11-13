@@ -43,9 +43,10 @@ pub const MIN_STACK_TILE_HEIGHT: u16 = 4;
 /// The master tile's default share of the pane area's width, in permille.
 pub const DEFAULT_MASTER_PERMILLE: u16 = 500;
 
-/// Rows a collapsed stack tile takes: its border, three content rows, its
-/// border.
-pub const COLLAPSED_TILE_HEIGHT: u16 = 5;
+/// Rows a collapsed stack tile takes: its title row (the top border, which
+/// carries the label, the status and the buttons exactly as an open tile's
+/// does), the two message rows, and its bottom border.
+pub const COLLAPSED_TILE_HEIGHT: u16 = 4;
 
 /// The stack column's default width while every stack tile is collapsed, in
 /// columns. A width, not a share: a strip needs a fixed amount of room to be
@@ -491,7 +492,7 @@ fn place(
                         })
                         .collect()
                 } else if all_collapsed && stack.height >= fixed {
-                    // All strips and room for them: five rows each from the
+                    // All strips and room for them: four rows each from the
                     // top, the rest of the column left empty.
                     vec![COLLAPSED_TILE_HEIGHT; n]
                 } else if collapsed_count == 0 {
@@ -690,15 +691,21 @@ impl Geometry {
     /// `None` when there is no stack to drop into.
     pub fn drop_slot(&self, row: u16) -> Option<usize> {
         let stack = self.tiles.get(1..).filter(|stack| stack.len() >= 2)?;
-        let last = stack.len();
-        if row < stack[0].1.y {
-            return Some(1);
+        // Only a tile that is on screen can be dropped onto: one with no rows
+        // is not there to point at, and the slots past the last visible tile
+        // are "below" it.
+        let visible: Vec<usize> = (0..stack.len())
+            .filter(|at| !is_empty(stack[*at].1))
+            .collect();
+        let (first, last) = (*visible.first()?, *visible.last()?);
+        if row < stack[first].1.y {
+            return Some(first + 1);
         }
-        let index = stack
+        let index = visible
             .iter()
-            .position(|(_, rect)| row < rect.y + rect.height)
-            .map_or(last, |at| at + 1);
-        Some(index)
+            .find(|at| row < stack[**at].1.y + stack[**at].1.height)
+            .map_or(last, |at| *at);
+        Some(index + 1)
     }
 
     /// The line that previews moving the tile at `from` to the slot `to`: the
@@ -865,9 +872,17 @@ pub fn geometry(
     // Buttons first: the stack row handles keep off them. Every stack tile
     // gets solo and collapse; the master gets solo alone (it cannot be
     // collapsed), and only where there is a stack to collapse.
+    //
+    // A tile that has no rows or no columns (a stack with more tiles than rows
+    // gives some none; they are placed on the next tile's top row) is not on
+    // screen, so it owns no button and no label: a press on the cell it is
+    // placed at belongs to the tile that is drawn there.
     let mut buttons = Vec::new();
     if matches!(stage, Stage::Brigade { .. }) && tiles.len() >= 2 {
         for (index, (key, tile)) in tiles.iter().enumerate() {
+            if is_empty(*tile) {
+                continue;
+            }
             let (_, label_end) = title_columns(*tile, &label_of(key));
             if index == 0 {
                 if master_soloable {
@@ -984,6 +999,9 @@ pub fn geometry(
     let mut labels = Vec::new();
     if matches!(stage, Stage::Brigade { .. }) && tiles.len() >= 3 {
         for (key, tile) in &tiles[1..] {
+            if is_empty(*tile) {
+                continue;
+            }
             let (start, end) = title_columns(*tile, &label_of(key));
             if end > start {
                 labels.push((key.clone(), Rect::new(start, tile.y, end - start, 1)));
@@ -1000,6 +1018,12 @@ pub fn geometry(
         all_collapsed,
         buttons,
     }
+}
+
+/// A tile with no rows or no columns: nothing of it is drawn, and no pointer
+/// target belongs to it.
+pub fn is_empty(tile: Rect) -> bool {
+    tile.width == 0 || tile.height == 0
 }
 
 /// The title-row buttons of a tile — solo and collapse for a stack tile, solo
@@ -1460,10 +1484,20 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_tile_keeps_its_place_at_five_rows_and_the_rest_share_what_is_left() {
+    fn a_collapsed_tile_keeps_its_place_at_four_rows_and_the_rest_share_what_is_left() {
+        assert_eq!(
+            COLLAPSED_TILE_HEIGHT, 4,
+            "border, title row's two body rows, border"
+        );
         let g = geo_collapsed(120, 40, &["d", "w1", "w2", "w3"], &[false, true, false]);
-        // 39 stack rows: 5 for the strip, 34 shared by two equal weights.
-        assert_eq!(heights(&g), vec![17, COLLAPSED_TILE_HEIGHT, 17]);
+        // 39 stack rows: 4 for the strip, 35 shared by two equal weights.
+        assert_eq!(heights(&g).iter().sum::<u16>(), 39);
+        assert_eq!(heights(&g)[1], COLLAPSED_TILE_HEIGHT);
+        assert!(
+            heights(&g)[0].abs_diff(heights(&g)[2]) <= 1,
+            "{:?}",
+            heights(&g)
+        );
         assert_eq!(g.collapsed, vec![false, false, true, false]);
         assert!(g.is_collapsed(&key("w2")) && !g.is_collapsed(&key("w1")));
         // In order, touching, filling the stack.
@@ -1480,6 +1514,137 @@ mod tests {
         );
     }
 
+    /// `n` collapsed Workers under a Director, on a terminal `height` rows tall.
+    fn collapsed_workers(height: u16, n: usize) -> Vec<u16> {
+        let names: Vec<String> = std::iter::once("d".to_string())
+            .chain((1..=n).map(|i| format!("w{i}")))
+            .collect();
+        let panes: Vec<&str> = names.iter().map(String::as_str).collect();
+        let g = geo_collapsed(120, height, &panes, &vec![true; n]);
+        assert!(g.all_collapsed);
+        heights(&g)
+    }
+
+    #[test]
+    fn how_many_collapsed_workers_fit_before_they_shrink() {
+        // The stack has the terminal's rows less the status bar's one, and a
+        // collapsed tile is four rows: 5 fit on 24 rows, 9 on 40.
+        assert_eq!(collapsed_workers(24, 5), vec![COLLAPSED_TILE_HEIGHT; 5]);
+        assert_eq!(collapsed_workers(40, 9), vec![COLLAPSED_TILE_HEIGHT; 9]);
+        // One more and every strip gives a little rather than the last being
+        // dropped (they still sum to the rows there are).
+        for (height, n) in [(24, 6), (40, 10)] {
+            let h = collapsed_workers(height, n);
+            assert_eq!(h.iter().sum::<u16>(), height - 1, "{n} on {height}");
+            assert!(h.iter().min().unwrap() < &COLLAPSED_TILE_HEIGHT, "{h:?}");
+        }
+        // The terminal height N collapsed Workers need is 4N + 1.
+        for n in 1..=12usize {
+            let need = 4 * n as u16 + 1;
+            assert_eq!(collapsed_workers(need, n), vec![COLLAPSED_TILE_HEIGHT; n]);
+            assert!(collapsed_workers(need - 1, n).iter().any(|h| *h < 4), "{n}");
+        }
+    }
+
+    /// A brigade of a Director and `workers` Workers on a `width` x `height`
+    /// terminal, `collapsed` of them (the first ones) collapsed.
+    fn crowded(width: u16, height: u16, workers: usize, collapsed: usize) -> Geometry {
+        let names: Vec<String> = std::iter::once("d".to_string())
+            .chain((1..=workers).map(|i| format!("w{i}")))
+            .collect();
+        let panes: Vec<&str> = names.iter().map(String::as_str).collect();
+        let flags: Vec<bool> = (0..workers).map(|i| i < collapsed).collect();
+        geo_collapsed(width, height, &panes, &flags)
+    }
+
+    #[test]
+    fn a_tile_with_no_rows_or_columns_owns_no_hit_target_of_any_kind() {
+        // More tiles than rows: some tiles get no row at all. The tile list still
+        // has them (focus, order and the minimise/expand keys address tiles by
+        // key), but nothing a pointer can land on belongs to them.
+        let mut saw_empty_tile = false;
+        for (width, height, workers, collapsed) in [
+            (120, 24, 24, 0),
+            (120, 24, 40, 0),
+            (120, 24, 24, 24),
+            (120, 24, 40, 12),
+            (120, 3, 3, 0),
+            (120, 3, 6, 0),
+            (120, 2, 2, 0),
+            (120, 2, 6, 2),
+            (120, 1, 2, 0),
+            (36, 24, 6, 0),
+            (36, 3, 6, 3),
+        ] {
+            let g = crowded(width, height, workers, collapsed);
+            for (key, rect) in &g.tiles {
+                let empty = rect.width == 0 || rect.height == 0;
+                saw_empty_tile |= empty;
+                let buttons: Vec<_> = g.buttons().iter().filter(|b| &b.key == key).collect();
+                let labelled = (rect.x..rect.right())
+                    .chain(rect.right()..g.areas.pane.right())
+                    .any(|x| g.label_at(x, rect.y) == Some(key));
+                let case = format!("{width}x{height}, {workers} workers: {key:?} {rect:?}");
+                if empty {
+                    assert!(buttons.is_empty(), "buttons for an empty tile: {case}");
+                    for y in 0..=height {
+                        for x in 0..width {
+                            assert!(
+                                g.label_at(x, y) != Some(key),
+                                "label cell ({x},{y}) of an empty tile: {case}"
+                            );
+                        }
+                    }
+                } else {
+                    // A tile that has rows keeps its buttons inside its own rect.
+                    for button in &buttons {
+                        assert!(
+                            rect.contains(button.rect.as_position())
+                                && button.rect.right() <= rect.right(),
+                            "{case}: {button:?}"
+                        );
+                    }
+                    let _ = labelled;
+                    // And a press on a button's cell finds that tile's button,
+                    // never an empty tile's placed at the same row.
+                    for button in &buttons {
+                        let hit = g.button_at(button.rect.x, button.rect.y).unwrap();
+                        assert_eq!(&hit.key, key, "{case}: {button:?}");
+                    }
+                }
+            }
+        }
+        assert!(saw_empty_tile, "the cases must reach a tile with no rows");
+    }
+
+    #[test]
+    fn a_tile_with_no_rows_is_never_a_drop_slot() {
+        for (height, workers) in [(24u16, 24usize), (24, 40), (3, 6), (2, 2)] {
+            let g = crowded(120, height, workers, 0);
+            let first = g.tiles[1..]
+                .iter()
+                .position(|(_, r)| !is_empty(*r))
+                .map(|at| at + 1);
+            let last = g.tiles[1..]
+                .iter()
+                .rposition(|(_, r)| !is_empty(*r))
+                .map(|at| at + 1);
+            for row in 0..=height + 3 {
+                let slot = g.drop_slot(row);
+                if g.tiles[1..].len() < 2 {
+                    assert_eq!(slot, None);
+                    continue;
+                }
+                let slot = slot.expect("a stack to drop into");
+                assert!(
+                    !is_empty(g.tiles[slot].1),
+                    "{workers} workers on {height} rows, row {row}: slot {slot} has no rows"
+                );
+                assert!(Some(slot) >= first && Some(slot) <= last);
+            }
+        }
+    }
+
     #[test]
     fn expanded_tiles_share_the_remaining_rows_by_their_weights() {
         let g = geo_collapsed_weighted(
@@ -1489,8 +1654,11 @@ mod tests {
             &[false, true, false],
             &[1, 50, 3],
         );
-        // The collapsed tile's weight is nothing to anyone: 34 rows by 1:3.
-        assert_eq!(heights(&g), vec![9, COLLAPSED_TILE_HEIGHT, 25]);
+        // The collapsed tile's weight is nothing to anyone: 35 rows by 1:3.
+        let h = heights(&g);
+        assert_eq!(h[1], COLLAPSED_TILE_HEIGHT);
+        assert_eq!(h[0] + h[2], 35);
+        assert!(h[2] > 2 * h[0], "{h:?}");
     }
 
     #[test]
@@ -1534,7 +1702,7 @@ mod tests {
         }
         assert_eq!(master.width, pane.width - DEFAULT_COLLAPSED_STACK_WIDTH);
         assert_eq!(master.height, pane.height, "the master is as tall as ever");
-        // Strips: five rows each, stacked from the top in stack order.
+        // Strips: four rows each, stacked from the top in stack order.
         let mut y = pane.y;
         for (key, tile) in &g.tiles[1..] {
             assert_eq!(tile.y, y, "{key:?} follows the previous strip");
@@ -1764,16 +1932,19 @@ mod tests {
 
     #[test]
     fn more_strips_than_rows_degrade_proportionally_and_nothing_panics() {
-        // Eight strips want 40 rows; the pane has 39. Every strip shrinks a
+        // Ten strips want 40 rows; the pane has 39. Every strip shrinks a
         // little rather than the last being dropped or clipped.
-        let panes: Vec<&str> = ["d", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8"].to_vec();
-        let g = geo_collapsed(120, 40, &panes, &[true; 8]);
+        let panes: Vec<&str> = [
+            "d", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "w10",
+        ]
+        .to_vec();
+        let g = geo_collapsed(120, 40, &panes, &[true; 10]);
         assert!(g.all_collapsed);
         assert_eq!(heights(&g).iter().sum::<u16>(), g.areas.pane.height);
-        assert!(heights(&g).iter().all(|h| *h >= 4), "{:?}", heights(&g));
-        // Enough rows for all of them: five each from the top, the rest empty.
-        let roomy = geo_collapsed(120, 50, &panes, &[true; 8]);
-        assert_eq!(heights(&roomy), vec![COLLAPSED_TILE_HEIGHT; 8]);
+        assert!(heights(&g).iter().all(|h| *h >= 3), "{:?}", heights(&g));
+        // Enough rows for all of them: four each from the top, the rest empty.
+        let roomy = geo_collapsed(120, 50, &panes, &[true; 10]);
+        assert_eq!(heights(&roomy), vec![COLLAPSED_TILE_HEIGHT; 10]);
         for height in 0..14 {
             for width in 0..60 {
                 let _ = geo_collapsed(width, height, &["d", "w1", "w2"], &[true, true]);

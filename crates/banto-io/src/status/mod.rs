@@ -244,11 +244,30 @@ pub fn classify_from_alive_pids(
     now: SystemTime,
     thresholds: &AgeThresholds,
 ) -> Activity {
+    live_activity(live, &meta.id.0, alive_pids)
+        .unwrap_or_else(|| Activity::Idle(age_bucket(meta.mtime, now, thresholds)))
+}
+
+/// What the live files say a session is doing now, or `None` when no live entry
+/// with a running process names it. The whole of the list's classification but
+/// its fallback to the session file's age, and so the one decision for anything
+/// that shows a session's state without a list row (a member that has not run its
+/// first turn has no transcript, hence no row, but does have a live file).
+///
+/// Precedence: `"busy"` wins ([`Activity::Busy`]), then `"waiting"` (any reason,
+/// [`Activity::Waiting`]; whether it is a dialog is [`waiting_on_a_dialog`]'s),
+/// then `"shell"` ([`Activity::Busy`], see [`LIVE_STATUS_SHELL`]), then any other
+/// entry with a live process ([`Activity::Alive`]).
+pub fn live_activity(
+    live: &[LiveSession],
+    session_id: &str,
+    alive_pids: &HashSet<u32>,
+) -> Option<Activity> {
     let mut any_alive = false;
     let mut any_waiting = false;
     let mut any_shell = false;
     for entry in live {
-        if entry.session_id.as_deref() != Some(meta.id.0.as_str()) {
+        if entry.session_id.as_deref() != Some(session_id) {
             continue;
         }
         if !alive_pids.contains(&entry.pid) {
@@ -258,7 +277,7 @@ pub fn classify_from_alive_pids(
             // Busy wins over Waiting: multiple live entries are anomalous, and
             // under-reporting a stale waiting entry preserves today's behavior
             // while over-reporting would train the operator to distrust it.
-            return Activity::Busy;
+            return Some(Activity::Busy);
         }
         if entry.status.as_deref() == Some(LIVE_STATUS_WAITING) {
             any_waiting = true;
@@ -270,13 +289,13 @@ pub fn classify_from_alive_pids(
     }
     if any_waiting {
         // A person is needed, which outranks a command still running.
-        Activity::Waiting
+        Some(Activity::Waiting)
     } else if any_shell {
-        Activity::Busy
+        Some(Activity::Busy)
     } else if any_alive {
-        Activity::Alive
+        Some(Activity::Alive)
     } else {
-        Activity::Idle(age_bucket(meta.mtime, now, thresholds))
+        None
     }
 }
 
@@ -780,5 +799,82 @@ mod tests {
             "a dead process is not idle"
         );
         assert_eq!(claude_nudgeable(&[], SESSION_ID, &alive), None);
+    }
+
+    #[test]
+    fn what_the_live_files_say_of_a_session_is_the_lists_classification_without_the_age() {
+        let alive: HashSet<u32> = [100, 200].into_iter().collect();
+        let meta = meta_with_age(Duration::from_secs(60));
+        let probe = MockProbe::with_alive(&[100, 200]);
+        for (status, reason, expected) in [
+            (Some("busy"), None, Some(Activity::Busy)),
+            (Some("waiting"), None, Some(Activity::Waiting)),
+            (
+                Some("waiting"),
+                Some("dialog open"),
+                Some(Activity::Waiting),
+            ),
+            (
+                Some("waiting"),
+                Some("input needed"),
+                Some(Activity::Waiting),
+            ),
+            (Some("shell"), None, Some(Activity::Busy)),
+            (Some("idle"), None, Some(Activity::Alive)),
+            (
+                Some("a status nobody has seen"),
+                None,
+                Some(Activity::Alive),
+            ),
+            (None, None, Some(Activity::Alive)),
+        ] {
+            let live = [LiveSession {
+                waiting_for: reason.map(str::to_string),
+                ..live_entry(100, Some(SESSION_ID), status)
+            }];
+            assert_eq!(
+                live_activity(&live, SESSION_ID, &alive),
+                expected,
+                "{status:?} {reason:?}"
+            );
+            // The one decision: the list's classification is this, or its age.
+            assert_eq!(
+                classify_default(&meta, &live, &probe),
+                expected.unwrap(),
+                "{status:?} {reason:?}"
+            );
+        }
+        // Nothing live to say: no entry, another session's, a dead process.
+        assert_eq!(live_activity(&[], SESSION_ID, &alive), None);
+        let other = [live_entry(100, Some("another-session"), Some("busy"))];
+        assert_eq!(live_activity(&other, SESSION_ID, &alive), None);
+        let dead = [live_entry(300, Some(SESSION_ID), Some("busy"))];
+        assert_eq!(live_activity(&dead, SESSION_ID, &alive), None);
+        assert_eq!(
+            classify_default(&meta, &dead, &probe),
+            Activity::Idle(AgeBucket::Today),
+            "where the list falls back to the file's age"
+        );
+    }
+
+    #[test]
+    fn live_activity_has_the_same_precedence_as_the_list_among_several_entries() {
+        let alive: HashSet<u32> = [100, 200].into_iter().collect();
+        let shell = live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_SHELL));
+        let waiting = live_entry(200, Some(SESSION_ID), Some("waiting"));
+        let busy = live_entry(200, Some(SESSION_ID), Some("busy"));
+        let idle = live_entry(200, Some(SESSION_ID), Some("idle"));
+        assert_eq!(
+            live_activity(&[shell.clone(), waiting], SESSION_ID, &alive),
+            Some(Activity::Waiting)
+        );
+        assert_eq!(
+            live_activity(&[shell.clone(), busy], SESSION_ID, &alive),
+            Some(Activity::Busy)
+        );
+        assert_eq!(
+            live_activity(&[shell, idle], SESSION_ID, &alive),
+            Some(Activity::Busy)
+        );
     }
 }
