@@ -264,7 +264,7 @@ defaults, same as today.
 opener = "in-place"
 
 claude_home = "C:/Users/you/.claude"   # optional override
-db_path = "..."                        # optional override
+db_path = "..."                        # optional override; an empty value is a startup error
 
 # "all" (default) | "claude" | "codex" | "claude,codex" — which agent
 # products banto discovers sessions for. A disabled product's own files

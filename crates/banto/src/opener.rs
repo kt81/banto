@@ -126,6 +126,7 @@ pub fn open_new_session<R: CommandRunner + 'static>(
     anchor_pane: Option<&str>,
     wrap_log: Option<&str>,
     binaries: &AgentBinaries,
+    child_args: &[String],
 ) -> Result<OpenOutcome, OpenError> {
     let Some(backend) = backend else {
         return Ok(OpenOutcome::NoBackendDetected);
@@ -140,7 +141,7 @@ pub fn open_new_session<R: CommandRunner + 'static>(
     let cmd = ResumeCommand {
         // Unused: there is no pane-map record for this launch to key.
         session_id: String::new(),
-        argv: new_session_wrap_argv(exe.as_deref(), cwd, backend, wrap_log, binaries),
+        argv: new_session_wrap_argv(exe.as_deref(), child_args, cwd, backend, wrap_log, binaries),
         cwd: cwd.to_path_buf(),
         title,
     };
@@ -185,6 +186,7 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
     runner: R,
     anchor_pane: Option<&str>,
     ctx: &OpenContext,
+    child_args: &[String],
 ) -> Result<OpenOutcome, SessionOpenError> {
     let id = SessionId(session.id.clone());
 
@@ -217,7 +219,15 @@ pub fn open_session<R: CommandRunner + Clone + 'static>(
         None => {}
     }
 
-    open_fresh(store, backend, session, runner, anchor_pane, ctx.binaries)
+    open_fresh(
+        store,
+        backend,
+        session,
+        runner,
+        anchor_pane,
+        ctx.binaries,
+        child_args,
+    )
 }
 
 /// Whether `session` is currently running somewhere banto can't already see
@@ -388,6 +398,10 @@ pub(crate) struct CodexBrigade {
     /// freshly-spawned Worker still awaiting one (mirrors
     /// `embedded::emporium::write_mcp_config`'s `--session` fallback).
     pub(crate) session: Option<String>,
+    /// What the parent banto resolved (`startup::Resolved::child_args`), so the
+    /// MCP server it starts reads the same config, database and homes rather
+    /// than finding its own.
+    pub(crate) child_args: Vec<String>,
 }
 
 /// Resolve the binary to invoke for `agent`: the operator's own
@@ -503,16 +517,17 @@ fn mcp_server_command_override(exe: &str) -> String {
 /// `embedded::emporium::write_mcp_config`'s existing `--role` spelling
 /// (`"director"`/`"worker"`) so a Codex member's identity resolves through
 /// [`crate::mcp`] the same way a Claude one's does.
-fn mcp_server_args_override(brigade: &CodexBrigade) -> String {
-    let mut args = vec![
-        "_mcp".to_string(),
+pub(crate) fn mcp_server_args_override(brigade: &CodexBrigade) -> String {
+    let mut args = vec!["_mcp".to_string()];
+    args.extend(brigade.child_args.iter().cloned());
+    args.extend([
         "--brigade".to_string(),
         brigade.brigade_id.to_string(),
         "--member".to_string(),
         brigade.token.clone(),
         "--role".to_string(),
         brigade.role.as_token().to_string(),
-    ];
+    ]);
     if let Some(session) = &brigade.session {
         args.push("--session".to_string());
         args.push(session.clone());
@@ -833,6 +848,7 @@ fn open_fresh<R: CommandRunner + 'static>(
     runner: R,
     anchor_pane: Option<&str>,
     binaries: &AgentBinaries,
+    child_args: &[String],
 ) -> Result<OpenOutcome, SessionOpenError> {
     let Some(backend) = backend else {
         return Ok(OpenOutcome::NoBackendDetected);
@@ -845,6 +861,7 @@ fn open_fresh<R: CommandRunner + 'static>(
         session_id: session.id.clone(),
         argv: wrap_argv(
             exe.as_deref(),
+            child_args,
             &session.id,
             session.agent,
             &session.cwd,
@@ -885,21 +902,22 @@ fn open_fresh<R: CommandRunner + 'static>(
 /// deterministic in tests) so the spawned pane/tab can find it even when it
 /// isn't on `$PATH` (e.g. a dev build); `None` falls back to the bare name
 /// `banto` (relies on `$PATH`).
-fn wrap_argv(
+pub(crate) fn wrap_argv(
     exe: Option<&str>,
+    child_args: &[String],
     session_id: &str,
     agent: AgentKind,
     cwd: &Path,
     binaries: &AgentBinaries,
 ) -> Vec<String> {
     let banto_exe = exe.unwrap_or("banto").to_string();
-    let mut argv = vec![
-        banto_exe,
-        "_wrap".to_string(),
+    let mut argv = vec![banto_exe, "_wrap".to_string()];
+    argv.extend(child_args.iter().cloned());
+    argv.extend([
         "--session".to_string(),
         session_id.to_string(),
         "--".to_string(),
-    ];
+    ]);
     let launch = match agent {
         AgentKind::ClaudeCode => AgentLaunch::Claude {
             resume: Some(session_id.to_string()),
@@ -946,23 +964,24 @@ fn wrap_argv(
 /// only the emporium's key dispatch can ever move off the default) is out of
 /// scope here, not an oversight. `binaries` still resolves which `claude`
 /// binary, for the same configurability every other launch site gets.
-fn new_session_wrap_argv(
+pub(crate) fn new_session_wrap_argv(
     exe: Option<&str>,
+    child_args: &[String],
     cwd: &Path,
     backend: Backend,
     wrap_log: Option<&str>,
     binaries: &AgentBinaries,
 ) -> Vec<String> {
     let banto_exe = exe.unwrap_or("banto").to_string();
-    let mut argv = vec![
-        banto_exe,
-        "_wrap".to_string(),
+    let mut argv = vec![banto_exe, "_wrap".to_string()];
+    argv.extend(child_args.iter().cloned());
+    argv.extend([
         "--new-session".to_string(),
         "--cwd".to_string(),
         cwd.display().to_string(),
         "--backend".to_string(),
         backend_key(backend).to_string(),
-    ];
+    ]);
     if let Some(path) = wrap_log {
         argv.push("--wrap-log".to_string());
         argv.push(path.to_string());
@@ -1252,6 +1271,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -1615,6 +1635,7 @@ mod tests {
                 token: "worker-1".to_string(),
                 role: BrigadeRole::Worker,
                 session: None,
+                child_args: Vec::new(),
             }),
         };
         assert_eq!(
@@ -1682,6 +1703,7 @@ mod tests {
             token: "director".to_string(),
             role: BrigadeRole::Director,
             session: None,
+            child_args: Vec::new(),
         };
         let overrides = brigade.overrides();
         assert_eq!(
@@ -1707,6 +1729,7 @@ mod tests {
             token: "director".to_string(),
             role: BrigadeRole::Director,
             session: None,
+            child_args: Vec::new(),
         };
         let overrides = brigade.overrides();
         assert_eq!(overrides.len(), 3);
@@ -1736,6 +1759,7 @@ mod tests {
             token: "director".to_string(),
             role: BrigadeRole::Director,
             session: Some("dir-session".to_string()),
+            child_args: Vec::new(),
         };
         let worker = CodexBrigade {
             exe: PathBuf::from("/opt/banto/banto"),
@@ -1743,6 +1767,7 @@ mod tests {
             token: "worker-1".to_string(),
             role: BrigadeRole::Worker,
             session: None,
+            child_args: Vec::new(),
         };
         assert_eq!(director.overrides()[0], worker.overrides()[0]);
         // The MCP `command` override shares the same reasoning, even though
@@ -1761,6 +1786,7 @@ mod tests {
             token: "worker-1".to_string(),
             role: BrigadeRole::Worker,
             session: None,
+            child_args: Vec::new(),
         };
         let with_session = CodexBrigade {
             session: Some("w1-session".to_string()),
@@ -1947,6 +1973,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &live, &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -1979,6 +2006,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &live, &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -1998,6 +2026,7 @@ mod tests {
             runner.clone(),
             Some("%7"),
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2022,6 +2051,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2055,6 +2085,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2089,6 +2120,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2117,6 +2149,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2152,6 +2185,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2186,6 +2220,7 @@ mod tests {
             runner.clone(),
             None,
             &test_ctx(&probe, &[], &AgentBinaries::default()),
+            &[],
         )
         .unwrap();
 
@@ -2205,6 +2240,7 @@ mod tests {
             None,
             None,
             &AgentBinaries::default(),
+            &[],
         )
         .unwrap();
 
@@ -2248,6 +2284,7 @@ mod tests {
             Some("%7"),
             None,
             &AgentBinaries::default(),
+            &[],
         )
         .unwrap();
 
@@ -2271,6 +2308,7 @@ mod tests {
             None,
             None,
             &AgentBinaries::default(),
+            &[],
         )
         .unwrap();
 
@@ -2292,6 +2330,7 @@ mod tests {
             None,
             None,
             &AgentBinaries::default(),
+            &[],
         )
         .unwrap();
 
@@ -2310,6 +2349,7 @@ mod tests {
             None,
             Some("C:/logs/wrap.log"),
             &AgentBinaries::default(),
+            &[],
         )
         .unwrap();
 
@@ -2420,6 +2460,7 @@ mod tests {
         assert_eq!(
             wrap_argv(
                 Some("C:/dev/banto.exe"),
+                &[],
                 "sess-1",
                 AgentKind::ClaudeCode,
                 Path::new("/work/alpha"),
@@ -2444,6 +2485,7 @@ mod tests {
         assert_eq!(
             wrap_argv(
                 None,
+                &[],
                 "sess-1",
                 AgentKind::ClaudeCode,
                 Path::new("/work/alpha"),
@@ -2458,6 +2500,7 @@ mod tests {
         assert_eq!(
             wrap_argv(
                 None,
+                &[],
                 "codex-uuid-1",
                 AgentKind::Codex,
                 Path::new("/work/alpha"),
@@ -2490,6 +2533,7 @@ mod tests {
         assert_eq!(
             new_session_wrap_argv(
                 Some("C:/dev/banto.exe"),
+                &[],
                 Path::new("/work/alpha"),
                 Backend::Psmux,
                 None,
@@ -2515,6 +2559,7 @@ mod tests {
         assert_eq!(
             new_session_wrap_argv(
                 None,
+                &[],
                 Path::new("/work/alpha"),
                 Backend::Psmux,
                 None,
@@ -2528,6 +2573,7 @@ mod tests {
     fn new_session_wrap_argv_passes_the_windows_terminal_backend_key() {
         let argv = new_session_wrap_argv(
             None,
+            &[],
             Path::new("/work/alpha"),
             Backend::WindowsTerminal,
             None,
@@ -2544,6 +2590,7 @@ mod tests {
     fn new_session_wrap_argv_appends_wrap_log_before_the_trailing_claude_argv() {
         let argv = new_session_wrap_argv(
             None,
+            &[],
             Path::new("/work/alpha"),
             Backend::Psmux,
             Some("C:/logs/wrap.log"),
@@ -2562,6 +2609,7 @@ mod tests {
     fn new_session_wrap_argv_omits_wrap_log_when_not_given() {
         let argv = new_session_wrap_argv(
             None,
+            &[],
             Path::new("/work/alpha"),
             Backend::Psmux,
             None,
@@ -2578,6 +2626,7 @@ mod tests {
         };
         let argv = wrap_argv(
             None,
+            &[],
             "codex-uuid-1",
             AgentKind::Codex,
             Path::new("/work/alpha"),
@@ -2631,5 +2680,104 @@ mod tests {
             Some(Backend::Tmux)
         );
         assert_eq!(resolve_backend(OpenerMode::InPlace, |_| None, false), None);
+    }
+
+    // --- what the parent banto hands its children ----------------------------
+
+    fn parent_args() -> Vec<String> {
+        vec![
+            "--parent-config".to_string(),
+            "/my config/banto.toml".to_string(),
+            "--db-path".to_string(),
+            r"C:\Users\me\My Data\banto.db".to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_wrap_that_resumes_gets_the_parents_resolution_before_its_own_arguments() {
+        let argv = wrap_argv(
+            Some("/opt/banto/banto"),
+            &parent_args(),
+            "sess-1",
+            AgentKind::ClaudeCode,
+            Path::new("/work"),
+            &AgentBinaries::default(),
+        );
+        assert_eq!(
+            argv[..9],
+            [
+                "/opt/banto/banto",
+                "_wrap",
+                "--parent-config",
+                "/my config/banto.toml",
+                "--db-path",
+                r"C:\Users\me\My Data\banto.db",
+                "--session",
+                "sess-1",
+                "--",
+            ]
+        );
+        // Nothing of it leaks into the agent's own command.
+        assert!(!argv[9..].iter().any(|arg| arg.contains("banto.toml")));
+    }
+
+    #[test]
+    fn a_wrap_that_starts_a_session_gets_the_parents_resolution_too() {
+        let argv = new_session_wrap_argv(
+            Some("/opt/banto/banto"),
+            &parent_args(),
+            Path::new("/work"),
+            Backend::Psmux,
+            None,
+            &AgentBinaries::default(),
+        );
+        assert_eq!(argv[1], "_wrap");
+        assert_eq!(argv[2..6], parent_args()[..]);
+        assert_eq!(argv[6], "--new-session");
+    }
+
+    #[test]
+    fn a_codex_members_mcp_server_gets_the_parents_resolution_and_its_hook_is_unchanged() {
+        let plain = CodexBrigade {
+            exe: PathBuf::from("/opt/banto/banto"),
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            role: BrigadeRole::Worker,
+            session: None,
+            child_args: Vec::new(),
+        };
+        let handed = CodexBrigade {
+            child_args: parent_args(),
+            ..plain.clone()
+        };
+        // Codex trusts the hook by a hash of this exact string: it must not depend
+        // on anything the parent hands over.
+        assert_eq!(handed.overrides()[0], plain.overrides()[0]);
+        assert_eq!(handed.overrides()[1], plain.overrides()[1]);
+        let args = handed.overrides()[2].clone();
+        let rhs = args.strip_prefix("mcp_servers.banto.args=").unwrap();
+        let parsed: toml::Table = toml::from_str(&format!("args = {rhs}")).unwrap();
+        let args: Vec<&str> = parsed["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        // Every value comes back whole and byte for byte, backslashes and spaces
+        // included, and the server's own flags follow.
+        assert_eq!(
+            args[..5],
+            [
+                "_mcp",
+                "--parent-config",
+                "/my config/banto.toml",
+                "--db-path",
+                r"C:\Users\me\My Data\banto.db"
+            ]
+        );
+        assert_eq!(
+            args[5..],
+            ["--brigade", "1", "--member", "worker-1", "--role", "worker"]
+        );
     }
 }

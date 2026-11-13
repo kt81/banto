@@ -140,6 +140,10 @@ struct Context<'a> {
     /// `RefCell`-wrapped — see `main`'s construction site for why.
     store: &'a RefCell<Store>,
     opener_mode: OpenerMode,
+    /// What a banto child this mode starts (`_wrap`) is told to resolve — where
+    /// this process found its config, database and homes
+    /// (`startup::Resolved::child_args`).
+    child_args: Vec<String>,
     /// Diagnostic input-event log, enabled via the `BANTO_INPUT_LOG` env var
     /// (its value is the file path). Records every raw crossterm event and
     /// every escape-resolution decision with a millisecond timestamp, for
@@ -238,14 +242,16 @@ impl LiveWatch {
 }
 
 pub fn run(
-    claude_home: &ClaudeHome,
-    codex_home: Option<CodexHome>,
+    resolved: &crate::startup::Resolved,
     agent_binaries: AgentBinaries,
     thresholds: &AgeThresholds,
     opener_mode: OpenerMode,
     store: &RefCell<Store>,
     resolved_agents: ResolvedAgents,
 ) -> Result<()> {
+    let claude_home_owned = resolved.claude_home()?;
+    let claude_home = &claude_home_owned;
+    let codex_home = resolved.codex_home();
     // Computed before `resolved_agents.enabled` moves below.
     let agents_notice = session::agents_ignored_notice(&resolved_agents);
     let enabled_agents = resolved_agents.enabled;
@@ -298,6 +304,7 @@ pub fn run(
         thresholds,
         store,
         opener_mode,
+        child_args: resolved.child_args(),
         input_log: std::cell::RefCell::new(open_input_log()),
         last_genuine_esc: RefCell::new(None),
         pending_inplace: RefCell::new(None),
@@ -965,6 +972,7 @@ fn confirm_new_session_modal(app: &mut App, ctx: &Context) {
                 anchor.as_deref(),
                 wrap_log.as_deref(),
                 &ctx.agent_binaries,
+                &ctx.child_args,
             );
             ctx.log(&format!(
                 "confirm_new_session_modal (split) cwd={} outcome={outcome:?}",
@@ -1778,6 +1786,7 @@ fn activate_split(app: &mut App, ctx: &Context) {
             codex_home: ctx.codex_home.as_ref(),
             start_time: &SysinfoStartTime,
         },
+        &ctx.child_args,
     );
     ctx.log(&format!("activate_split open_session outcome={outcome:?}"));
     if let Ok(record) = ctx.store.borrow().get_pane(&SessionId(id.clone())) {
@@ -2205,6 +2214,7 @@ mod tests {
             thresholds,
             store,
             opener_mode: OpenerMode::Auto,
+            child_args: Vec::new(),
             input_log: std::cell::RefCell::new(None),
             last_genuine_esc: RefCell::new(None),
             pending_inplace: RefCell::new(None),

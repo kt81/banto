@@ -348,6 +348,10 @@ pub struct EmporiumSettings<'a> {
     /// can also post the startup notice for a name it had to ignore (see
     /// `session::agents_ignored_notice`).
     pub resolved_agents: &'a ResolvedAgents,
+    /// Where this banto found its config, database and agent homes — handed on to
+    /// every banto process it starts for a brigade member (`_mcp`, `_hook`), so
+    /// they read the same ones.
+    pub child: &'a crate::startup::Resolved,
 }
 
 /// Run the emporium mode until the user quits (`q`/Esc from the sidebar; a
@@ -459,6 +463,7 @@ pub fn run(
         brigade,
         agent_binaries,
         enabled_agents,
+        child: Some(settings.child),
     };
     let (mut terminal, mut frame_output) = setup_terminal()?;
     let result = event_loop(&mut terminal, &mut frame_output, &mut app, &deps, keys);
@@ -549,6 +554,10 @@ struct Deps<'a> {
     agent_binaries: &'a AgentBinaries,
     /// `Config.agents`, resolved — see `crate::tui::Context::enabled_agents`.
     enabled_agents: &'a BTreeSet<AgentKind>,
+    /// What a brigade member's banto children are told to resolve (see
+    /// [`EmporiumSettings::child`]); `None` in a test, which then builds the
+    /// argv and environment a hand-started child would get.
+    child: Option<&'a crate::startup::Resolved>,
 }
 
 fn event_loop(
@@ -1397,9 +1406,13 @@ fn execute_open_embedded(
     // this function's own doc for why).
     if let Some((brigade_id, token, role)) = &brigade {
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
+        let child_args = deps
+            .child
+            .map(|child| child.child_args())
+            .unwrap_or_default();
         let wiring = match &mut launch {
             opener::AgentLaunch::Claude { mcp_config, .. } => {
-                write_mcp_config(*brigade_id, token, *role, known_id).map(|path| {
+                write_mcp_config(*brigade_id, token, *role, known_id, &child_args).map(|path| {
                     *mcp_config = Some(path);
                 })
             }
@@ -1412,6 +1425,7 @@ fn execute_open_embedded(
                         token: token.clone(),
                         role: *role,
                         session: known_id.map(str::to_string),
+                        child_args: child_args.clone(),
                     });
                 }),
         };
@@ -1423,7 +1437,7 @@ fn execute_open_embedded(
         }
     }
     let argv = launch.argv(&opener::agent_binary(target.agent, deps.agent_binaries));
-    let env = brigade_env(brigade.as_ref());
+    let env = brigade_env(brigade.as_ref(), deps.child);
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(
         deps.pty_host,
@@ -2495,15 +2509,23 @@ fn goinkyo_request_path(brigade_id: BrigadeId) -> Option<String> {
 /// Set for Claude members too, though nothing reads it there yet: one launch
 /// path is easier to reason about than two, and a member knowing its own
 /// token is useful regardless of product.
-fn brigade_env(brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>) -> Vec<(String, String)> {
+pub(crate) fn brigade_env(
+    brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>,
+    child: Option<&crate::startup::Resolved>,
+) -> Vec<(String, String)> {
     let Some((brigade_id, token, role)) = brigade else {
         return Vec::new();
     };
-    vec![
+    let mut env = vec![
         ("BANTO_BRIGADE".to_string(), brigade_id.to_string()),
         ("BANTO_MEMBER".to_string(), token.clone()),
         ("BANTO_ROLE".to_string(), role.as_token().to_string()),
-    ]
+    ];
+    // The same channel carries where this banto found its config and database:
+    // the hook's command line can hold neither a path (it is hashed, and cannot
+    // be quoted) nor a flag, so it reads them from here.
+    env.extend(child.map(|child| child.child_env()).unwrap_or_default());
+    env
 }
 
 /// Write a per-member `--mcp-config` file wiring the embedded claude to
@@ -2517,29 +2539,10 @@ fn write_mcp_config(
     token: &str,
     role: BrigadeRole,
     session_id: Option<&str>,
+    child_args: &[String],
 ) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let mut args = vec![
-        "_mcp".to_string(),
-        "--brigade".to_string(),
-        brigade_id.to_string(),
-        "--member".to_string(),
-        token.to_string(),
-        "--role".to_string(),
-        role.as_token().to_string(),
-    ];
-    if let Some(session_id) = session_id {
-        args.push("--session".to_string());
-        args.push(session_id.to_string());
-    }
-    let config = serde_json::json!({
-        "mcpServers": {
-            "banto": {
-                "command": exe.to_string_lossy(),
-                "args": args,
-            }
-        }
-    });
+    let config = mcp_config_json(&exe, child_args, brigade_id, token, role, session_id);
     let dir = dirs::data_local_dir()
         .map(|base| base.join("banto").join("mcp"))
         .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))?;
@@ -2547,6 +2550,40 @@ fn write_mcp_config(
     let path = dir.join(format!("{brigade_id}-{}.json", sanitize_filename(token)));
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     Ok(path)
+}
+
+/// The `--mcp-config` file's content: banto's own executable as the `banto`
+/// MCP server, with this member's brigade identity on its argv.
+pub(crate) fn mcp_config_json(
+    exe: &Path,
+    child_args: &[String],
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let mut args = vec!["_mcp".to_string()];
+    args.extend(child_args.iter().cloned());
+    args.extend([
+        "--brigade".to_string(),
+        brigade_id.to_string(),
+        "--member".to_string(),
+        token.to_string(),
+        "--role".to_string(),
+        role.as_token().to_string(),
+    ]);
+    if let Some(session_id) = session_id {
+        args.push("--session".to_string());
+        args.push(session_id.to_string());
+    }
+    serde_json::json!({
+        "mcpServers": {
+            "banto": {
+                "command": exe.to_string_lossy(),
+                "args": args,
+            }
+        }
+    })
 }
 
 /// Keep a token safe as a filename component (tokens are `director`/`worker-N`,
@@ -5997,6 +6034,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            child: None,
         };
         let mut handles = HashMap::new();
 
@@ -6064,6 +6102,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            child: None,
         };
 
         let events = execute_cmd(
@@ -6117,6 +6156,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            child: None,
         };
 
         let events = execute_cmd(
@@ -6166,6 +6206,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            child: None,
         };
 
         let events = execute_cmd(
@@ -7805,7 +7846,10 @@ mod tests {
     #[test]
     fn brigade_env_carries_the_identity_the_hook_command_must_not() {
         assert_eq!(
-            brigade_env(Some(&(7, "worker-1".to_string(), BrigadeRole::Worker))),
+            brigade_env(
+                Some(&(7, "worker-1".to_string(), BrigadeRole::Worker)),
+                None
+            ),
             vec![
                 ("BANTO_BRIGADE".to_string(), "7".to_string()),
                 ("BANTO_MEMBER".to_string(), "worker-1".to_string()),
@@ -7816,7 +7860,77 @@ mod tests {
 
     #[test]
     fn brigade_env_is_empty_outside_a_brigade() {
-        assert!(brigade_env(None).is_empty());
+        let parent = crate::startup::Resolved {
+            config_file: crate::startup::ConfigFile::None,
+            db_path: None,
+            claude_home: None,
+            codex_home: None,
+        };
+        assert!(brigade_env(None, None).is_empty());
+        // Nothing to say to a process that is not a brigade member's.
+        assert!(brigade_env(None, Some(&parent)).is_empty());
+    }
+
+    #[test]
+    fn a_members_environment_also_names_the_config_and_database_its_parent_resolved() {
+        let parent = crate::startup::Resolved {
+            config_file: crate::startup::ConfigFile::File(PathBuf::from("/c dir/banto.toml")),
+            db_path: Some(PathBuf::from("/d dir/banto.db")),
+            claude_home: Some(PathBuf::from("/h/claude")),
+            codex_home: Some(PathBuf::from("/h/codex")),
+        };
+        let env = brigade_env(
+            Some(&(7, "worker-1".to_string(), BrigadeRole::Worker)),
+            Some(&parent),
+        );
+        assert_eq!(env.len(), 5, "{env:?}");
+        assert!(env.contains(&(
+            "BANTO_PARENT_CONFIG".to_string(),
+            "/c dir/banto.toml".to_string()
+        )));
+        assert!(env.contains(&("BANTO_PARENT_DB".to_string(), "/d dir/banto.db".to_string())));
+        // Banto's own variables only: an agent's home is the agent's to decide.
+        assert!(env.iter().all(|(name, _)| name.starts_with("BANTO_")));
+    }
+
+    #[test]
+    fn the_claude_mcp_config_carries_the_parents_resolution_between_the_subcommand_and_the_identity()
+     {
+        let json = mcp_config_json(
+            Path::new("/opt/banto/banto"),
+            &[
+                "--parent-no-config".to_string(),
+                "--db-path".to_string(),
+                "/d dir/banto.db".to_string(),
+            ],
+            7,
+            "worker-1",
+            BrigadeRole::Worker,
+            Some("sess-1"),
+        );
+        let args: Vec<&str> = json["mcpServers"]["banto"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "_mcp",
+                "--parent-no-config",
+                "--db-path",
+                "/d dir/banto.db",
+                "--brigade",
+                "7",
+                "--member",
+                "worker-1",
+                "--role",
+                "worker",
+                "--session",
+                "sess-1"
+            ]
+        );
     }
 
     #[test]
@@ -7865,6 +7979,7 @@ mod tests {
             brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            child: None,
         };
 
         assert_eq!(
@@ -7935,6 +8050,7 @@ mod tests {
             brigade: &config,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            child: None,
         };
 
         let goinkyo_briefing = member_briefing(&deps, brigade_id, "goinkyo", BrigadeRole::Goinkyo)
@@ -8868,6 +8984,7 @@ mod tests {
                 brigade: &self.brigade,
                 agent_binaries: &self.agent_binaries,
                 enabled_agents: &self.enabled_agents,
+                child: None,
             }
         }
 

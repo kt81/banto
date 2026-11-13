@@ -17,6 +17,8 @@ mod session;
 pub use banto_io::pty::PortablePtyHost;
 pub use emporium::EmporiumSettings;
 pub use emporium::run as run_emporium;
+#[cfg(test)]
+pub(crate) use emporium::{brigade_env, mcp_config_json};
 pub use session::EmbeddedSession;
 
 use std::io::Stdout;

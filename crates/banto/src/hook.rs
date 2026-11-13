@@ -25,11 +25,17 @@
 //! a store that won't open, an empty or disabled briefing template,
 //! malformed stdin) degrades to "no briefing", never to a non-zero exit or a
 //! hung process. `main.rs` dispatches `Command::Hook` to [`run`] before its
-//! own `load_config(...)?`, specifically so a broken `--config`/`BANTO_
+//! own strict config load, specifically so a broken `--config`/`BANTO_
 //! CONFIG` the operator has set for unrelated reasons can't fail the hook
 //! either — this module resolves and loads its own config independently,
 //! always leniently, even for an explicit override that `main.rs`'s own
 //! resolution would treat as a hard error.
+//!
+//! Where the config file and the database are comes from the banto that
+//! launched the agent, through the environment (`BANTO_PARENT_CONFIG`,
+//! `BANTO_PARENT_NO_CONFIG`, `BANTO_PARENT_DB`) for the same reason identity
+//! does: the command line can carry nothing. Without them (an older banto
+//! launched this agent) the hook resolves both for itself, as it always did.
 
 use std::io::{Read, Write};
 use std::time::SystemTime;
@@ -38,7 +44,6 @@ use serde_json::{Value, json};
 
 use banto_core::config::Config;
 use banto_core::model::{BrigadeId, BrigadeRole, SessionId};
-use banto_io::config as io_config;
 use banto_io::store::Store;
 
 /// Member identity as read from the environment. Every field is optional
@@ -98,34 +103,36 @@ fn build_briefing(
     Some(crate::briefing::with_codex_addendum(&rendered))
 }
 
-/// Resolves and loads banto's own config, always leniently — see the module
-/// doc for why this deliberately doesn't reuse `main.rs`'s stricter
-/// `load_config` (which fails outright on a broken explicit override).
-fn load_config_leniently() -> Config {
-    let env_override = std::env::var_os("BANTO_CONFIG").map(std::path::PathBuf::from);
-    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
-    let home = dirs::home_dir();
-
-    let path = match io_config::resolve_config_path(
-        None,
-        env_override.as_deref(),
-        xdg_config_home.as_deref(),
-        home.as_deref(),
-    ) {
-        io_config::ConfigSource::Explicit(path) => Some(path),
-        io_config::ConfigSource::Discovered(path) => Some(path),
-        io_config::ConfigSource::Default(path) => path,
+/// Resolves banto's own config and database, always leniently — see the module
+/// doc for why this deliberately doesn't use the strict load `main.rs` does for
+/// the other commands (it fails outright on a broken explicit override). `None`
+/// for the store on any failure (unresolvable path, unopenable file): never an
+/// error the hook has to propagate.
+fn load_leniently() -> (Config, Option<Store>) {
+    let mut inputs = crate::startup::Inputs {
+        env: crate::startup::Env::from_process(),
+        cwd: std::env::current_dir().ok(),
+        ..Default::default()
     };
-
-    path.map(|path| io_config::load_or_default(&path))
-        .unwrap_or_default()
+    // The parent banto's own answer, when it gave one: the config file and
+    // database it resolved, through the environment because this command line
+    // can carry nothing. Absent (a hook an older banto launched), the hook
+    // resolves for itself.
+    inputs.apply_parent_env(|key| std::env::var(key).ok());
+    let Ok((config, resolved)) =
+        crate::startup::resolve(&inputs, crate::startup::Strictness::Lenient)
+    else {
+        return (Config::default(), None);
+    };
+    (config, open_store_leniently(&resolved))
 }
 
-/// Opens banto's own store, or `None` on any failure (unresolvable path,
-/// unopenable file) — never an error the hook has to propagate.
-fn open_store_leniently(config: &Config) -> Option<Store> {
-    let path = config.db_path.clone().or_else(io_config::default_db_path)?;
-    Store::open(&path).ok()
+/// The store, or `None` when there is none to open — no database location, an
+/// empty one (refused by [`crate::startup::Resolved::db_path`], so nothing is
+/// opened or created), or a file that will not open. The hook then runs exactly
+/// as it does without a store: no briefing, nothing recorded, `{}` on stdout.
+fn open_store_leniently(resolved: &crate::startup::Resolved) -> Option<Store> {
+    Store::open(resolved.db_path().ok()?).ok()
 }
 
 /// Entry point for `banto _hook`. Always exits 0 (falls off the end of
@@ -136,8 +143,7 @@ pub fn run() {
     let stdin_json: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
 
     let identity = read_identity(|key| std::env::var(key).ok());
-    let config = load_config_leniently();
-    let store = open_store_leniently(&config);
+    let (config, store) = load_leniently();
 
     let briefing = build_briefing(&identity, &config, store.as_ref());
 
@@ -321,5 +327,39 @@ mod tests {
             role: None,
         };
         assert_eq!(build_briefing(&missing_role, &config, Some(&store)), None);
+    }
+
+    fn resolved_with_db(db_path: Option<std::path::PathBuf>) -> crate::startup::Resolved {
+        crate::startup::Resolved {
+            config_file: crate::startup::ConfigFile::None,
+            db_path,
+            claude_home: None,
+            codex_home: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_database_path_means_no_store_so_no_briefing_and_nothing_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        // The hook stays lenient: no store, never an error.
+        assert!(open_store_leniently(&resolved_with_db(Some(std::path::PathBuf::new()))).is_none());
+        assert!(open_store_leniently(&resolved_with_db(None)).is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // With no store the briefing is `None`, i.e. the hook prints `{}` and
+        // records nothing (`build_briefing_is_none_without_a_store`).
+        let identity = HookIdentity {
+            brigade_id: Some(1),
+            token: Some("worker-1".to_string()),
+            role: Some(BrigadeRole::Worker),
+        };
+        assert_eq!(build_briefing(&identity, &Config::default(), None), None);
+    }
+
+    #[test]
+    fn a_valid_database_path_still_opens_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        assert!(open_store_leniently(&resolved_with_db(Some(path.clone()))).is_some());
+        assert!(path.exists());
     }
 }

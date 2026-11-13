@@ -12,18 +12,20 @@
 //!    `$CODEX_HOME`),
 //! 4. the provider default (`~/.claude` / `~/.codex`).
 //!
-//! See [`resolve_claude_home`] and [`resolve_codex_home`]. They differ only
-//! in failure mode: no Claude home is a startup error (`--claude-home` is
-//! the escape hatch), while no Codex home just means no Codex sessions —
-//! Codex support is optional, Claude's is not.
+//! All of this, and where `config.toml` and banto's own database are, is decided
+//! once in [`startup`]. The two homes differ only in failure mode: no Claude home
+//! is a startup error (`--claude-home` is the escape hatch), while no Codex home
+//! just means no Codex sessions — Codex support is optional, Claude's is not.
 //!
 //! Everything under the resolved Claude home, and under the resolved Codex
 //! home, is treated as strictly read-only.
 //! banto's own database (session <-> pane map, groups, pins, brigades) lives under
-//! `Config.db_path`, falling back to [`config::default_db_path`].
+//! `Config.db_path`, falling back to `banto_io::config::default_db_path`.
 //!
-//! `config.toml` itself is located by [`config::resolve_config_path`]'s
-//! resolution order (see [`load_config`]).
+//! `config.toml` itself is located by `banto_io::config::resolve_config_path`'s
+//! resolution order. A banto that was itself started by another banto (`_mcp`,
+//! `_wrap`, `_hook`) is told what its parent resolved and uses that instead of
+//! resolving for itself: see [`startup`].
 //!
 //! `Config.agents` gates which products get discovered at all — resolved
 //! once here via `banto_core::config::resolve_agents` into `resolved_agents`
@@ -41,17 +43,17 @@ mod mcp;
 mod opener;
 mod session;
 mod sgr;
+mod startup;
 mod tui;
 mod wrap;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use banto_core::config::Config;
 use banto_core::model::{AgentKind, BrigadeRole};
 use banto_core::status::AgeThresholds;
 use banto_io::agent_versions::{
@@ -61,7 +63,6 @@ use banto_io::agent_versions::{
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, live_thread_ids};
-use banto_io::config;
 use banto_io::opener::SystemCommandRunner;
 use banto_io::process::SystemProcessRunner;
 use banto_io::provider::SessionProvider;
@@ -91,8 +92,34 @@ struct Cli {
     /// $BANTO_CONFIG and the XDG/~/.config/platform-default search — and
     /// unlike those, the file must exist and parse (a bad path is a
     /// startup error, not a silent fallback to defaults).
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        conflicts_with_all = ["parent_config", "parent_no_config"]
+    )]
     config: Option<PathBuf>,
+
+    /// Internal: the database path a parent banto resolved. Passed to every
+    /// banto process the parent starts (`_mcp`, `_wrap`), so none of them
+    /// re-resolves it from its own environment and working directory.
+    #[arg(long, global = true, hide = true, value_name = "PATH")]
+    db_path: Option<PathBuf>,
+
+    /// Internal: the config file a parent banto loaded, loaded again the same
+    /// way. Passed like `--db-path`.
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        value_name = "PATH",
+        conflicts_with = "parent_no_config"
+    )]
+    parent_config: Option<PathBuf>,
+
+    /// Internal: the parent banto loaded no config file (defaults).
+    #[arg(long, global = true, hide = true)]
+    parent_no_config: bool,
 
     /// Open the 大店 (emporium) mode: banto as a persistent sidebar plus an
     /// embedded session pane, instead of the default 帳場 (chōba) list.
@@ -192,8 +219,27 @@ enum Command {
     Hook,
 }
 
+impl Cli {
+    /// `--config` next to a parent's hand-off is a contradiction (banto never
+    /// generates it). clap rejects it when both flags sit on the same side of the
+    /// subcommand name; a global flag given before the subcommand and another
+    /// after it are parsed separately, so this covers that placement too.
+    fn check_hand_off_flags(&self) -> std::result::Result<(), &'static str> {
+        if self.config.is_some() && (self.parent_config.is_some() || self.parent_no_config) {
+            return Err("--config cannot be used with --parent-config or --parent-no-config");
+        }
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Err(message) = cli.check_hand_off_flags() {
+        use clap::CommandFactory;
+        Cli::command()
+            .error(clap::error::ErrorKind::ArgumentConflict, message)
+            .exit();
+    }
     // `Command::Hook` is dispatched before `load_config(...)?` runs at all
     // (and before it can fail): this process is spawned mid-startup of the
     // *operator's own* unrelated Codex session, so a broken --config/
@@ -204,14 +250,26 @@ fn main() -> Result<()> {
         hook::run();
         return Ok(());
     }
-    let config = load_config(cli.config.as_deref())?;
+    let inputs = startup::Inputs {
+        cli_config: cli.config.clone(),
+        cli_claude_home: cli.claude_home.clone(),
+        cli_codex_home: cli.codex_home.clone(),
+        cli_db_path: cli.db_path.clone(),
+        parent_config: cli.parent_config.clone(),
+        parent_no_config: cli.parent_no_config,
+        env: startup::Env::from_process(),
+        // Optional: a working directory that cannot be read only leaves relative
+        // paths as they were given, as before.
+        cwd: std::env::current_dir().ok(),
+    };
+    let (config, resolved) = startup::resolve(&inputs, startup::Strictness::Strict)?;
 
     let resolved_agents = banto_core::config::resolve_agents(&config.agents);
 
     match cli.command {
         Some(Command::List) => {
-            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-            let codex_home = resolve_codex_home(cli.codex_home, &config);
+            let claude_home = resolved.claude_home()?;
+            let codex_home = resolved.codex_home();
             let thresholds = thresholds_from(&config.activity);
             run_list(
                 &claude_home,
@@ -221,8 +279,8 @@ fn main() -> Result<()> {
             )
         }
         Some(Command::Versions) => {
-            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-            let codex_home = resolve_codex_home(cli.codex_home, &config);
+            let claude_home = resolved.claude_home()?;
+            let codex_home = resolved.codex_home();
             run_versions(&claude_home, codex_home.as_ref())
         }
         Some(Command::Wrap {
@@ -233,13 +291,13 @@ fn main() -> Result<()> {
             wrap_log,
             argv,
         }) => {
-            let store = open_store(&config)?;
+            let store = open_store(&resolved)?;
             let code = if new_session {
                 let cwd = cwd.expect("clap requires --cwd with --new-session");
                 let backend_key = backend.expect("clap requires --backend with --new-session");
                 let backend = opener::parse_backend_key(&backend_key)
                     .with_context(|| format!("unknown --backend value: {backend_key}"))?;
-                let claude_home = resolve_claude_home(cli.claude_home, &config)?;
+                let claude_home = resolved.claude_home()?;
                 let provider = ClaudeCodeProvider::new(claude_home);
                 wrap::run_new_session(
                     &store,
@@ -267,9 +325,9 @@ fn main() -> Result<()> {
             member,
             role,
         }) => {
-            let store = open_store(&config)?;
-            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-            let codex_home = resolve_codex_home(cli.codex_home, &config);
+            let store = open_store(&resolved)?;
+            let claude_home = resolved.claude_home()?;
+            let codex_home = resolved.codex_home();
             // Same base as `embedded::emporium::write_mcp_config`'s
             // `dirs::data_local_dir()/banto/mcp/`, one level further down: a
             // consultation request isn't an `--mcp-config` file, so it gets
@@ -300,14 +358,14 @@ fn main() -> Result<()> {
         }
         Some(Command::Hook) => unreachable!("Command::Hook returns before load_config runs"),
         None => {
-            let claude_home = resolve_claude_home(cli.claude_home, &config)?;
-            let codex_home = resolve_codex_home(cli.codex_home, &config);
+            let claude_home = resolved.claude_home()?;
+            let codex_home = resolved.codex_home();
             let thresholds = thresholds_from(&config.activity);
             // `Store::set_session_group` (the `g` modal) takes `&mut self`
             // (it wraps a transaction), and the store is shared by both the
             // chōba TUI and emporium, so a `RefCell` gives interior
             // mutability without threading `&mut Store` through every handler.
-            let store = std::cell::RefCell::new(open_store(&config)?);
+            let store = std::cell::RefCell::new(open_store(&resolved)?);
             if cli.emporium {
                 embedded::run_emporium(
                     &claude_home,
@@ -319,12 +377,12 @@ fn main() -> Result<()> {
                         keys: &config.keys,
                         agent_binaries: &config.agent_binaries,
                         resolved_agents: &resolved_agents,
+                        child: &resolved,
                     },
                 )
             } else {
                 tui::run(
-                    &claude_home,
-                    codex_home,
+                    &resolved,
                     config.agent_binaries.clone(),
                     &thresholds,
                     config.opener,
@@ -336,59 +394,9 @@ fn main() -> Result<()> {
     }
 }
 
-/// Load banto's own config via [`config::resolve_config_path`]'s resolution
-/// order. An explicit override (`--config` / `BANTO_CONFIG`) must exist and
-/// parse, or startup fails with a plain one-line error; every other tier
-/// (XDG/`~/.config` discovery, the platform default) is lenient — a missing
-/// or broken file there just means defaults.
-fn load_config(cli_override: Option<&Path>) -> Result<Config> {
-    let env_override = std::env::var_os("BANTO_CONFIG").map(PathBuf::from);
-    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let home = dirs::home_dir();
-
-    let source = config::resolve_config_path(
-        cli_override,
-        env_override.as_deref(),
-        xdg_config_home.as_deref(),
-        home.as_deref(),
-    );
-
-    match source {
-        config::ConfigSource::Explicit(path) => config::load_explicit(&path)
-            .with_context(|| format!("failed to load config file {}", path.display())),
-        config::ConfigSource::Discovered(path) => Ok(config::load_or_default(&path)),
-        config::ConfigSource::Default(Some(path)) => Ok(config::load_or_default(&path)),
-        config::ConfigSource::Default(None) => Ok(Config::default()),
-    }
-}
-
-/// Resolve the Claude home directory per the documented priority order.
-fn resolve_claude_home(flag: Option<PathBuf>, config: &Config) -> Result<ClaudeHome> {
-    flag.or_else(|| config.claude_home.clone())
-        .map(ClaudeHome::new)
-        .or_else(ClaudeHome::default_home)
-        .context("could not determine the Claude home directory; pass --claude-home <PATH>")
-}
-
-/// Resolve the Codex home directory per the same priority order as
-/// [`resolve_claude_home`], except that failing to resolve one is not a
-/// startup error: Codex support is optional, so no Codex home just means no
-/// Codex sessions to show.
-fn resolve_codex_home(flag: Option<PathBuf>, config: &Config) -> Option<CodexHome> {
-    flag.or_else(|| config.codex_home.clone())
-        .map(CodexHome::new)
-        .or_else(CodexHome::default_home)
-}
-
-/// Open (creating if needed) banto's own sqlite database at
-/// `Config.db_path`, falling back to [`config::default_db_path`].
-fn open_store(config: &Config) -> Result<Store> {
-    let path = config
-        .db_path
-        .clone()
-        .or_else(config::default_db_path)
-        .context("could not determine banto's database path")?;
-    Store::open(&path).context("failed to open banto's database")
+/// Open (creating if needed) banto's own sqlite database at the resolved path.
+fn open_store(resolved: &startup::Resolved) -> Result<Store> {
+    Store::open(resolved.db_path()?).context("failed to open banto's database")
 }
 
 /// `banto list`: one line per session — activity tag, id, title, cwd.

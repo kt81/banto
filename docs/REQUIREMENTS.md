@@ -400,7 +400,9 @@ other CLI, so the flavor is carried explicitly
   PID, tracks liveness, detects exit, and prevents double resume
   (`wt.exe` detaches immediately and psmux panes run detached from banto's
   own process, so the wrapper is mandatory here — in-place needs none of
-  this, see above).
+  this, see above). Like every banto process banto starts, it is handed the
+  config file, database and homes the parent resolved (see "Child processes"
+  under the MCP section).
 - Resume always starts in the session's original cwd.
 
 ## Emporium mode
@@ -1065,6 +1067,43 @@ the launch argv, the config file lives under banto's own data directory
 (`dirs::data_local_dir()/banto/mcp/<brigade_id>-<token>.json`) and is never
 installed into Claude Code's own configuration (`crates/banto/src/mcp.rs`
 module doc; `crates/banto/src/embedded/emporium.rs`'s `write_mcp_config`).
+
+**Child processes find the parent's files.** banto starts other banto processes
+— `_mcp` (Claude: the MCP config file; Codex: the `-c mcp_servers.banto.args`
+override), `_wrap` (the split backends' wrapper) and `_hook` (Codex's
+`SessionStart` hook) — and each of them would otherwise resolve for itself, from
+its own environment and from the working directory of the session it serves, which
+is not the parent's: a relative `--config`, `BANTO_CONFIG`, `db_path` or home would
+name another file (or none), `--config`/`--claude-home`/`--codex-home` would never
+be heard of, and agreement through inherited variables is not something psmux,
+Claude or Codex guarantee. So the parent resolves its config file, database and
+homes **once** (`crates/banto/src/startup.rs`; a relative input means the
+parent's working directory at startup, and is made absolute; an empty path, or
+any path when the working directory cannot be read, is left as given — except
+that an empty `db_path` is a startup error for every command that opens the store,
+naming the key and the config file, rather than a silently non-persistent session;
+`_hook` then runs as it does with no store: no briefing, nothing recorded) and
+hands the result on. `_mcp` and `_wrap` take it as hidden global flags straight after the
+subcommand name: `--parent-config <file>` (the file the parent loaded, loaded the
+same way) or `--parent-no-config` (it loaded none), `--db-path`, `--claude-home`
+and, when it has one, `--codex-home` — each path absolute and a single argument
+(spaces and backslashes survive the MCP JSON, the Codex TOML array and the split
+backends' argv like the executable's own path does). A child given them uses
+exactly those and does not look at its own environment or working directory for
+them — and a child that carries the hand-off but no `--codex-home` has none,
+because the parent had none. `--config` is refused next to the hand-off flags.
+`_hook` cannot: Codex trusts the hook by a hash of its literal command
+string, and that string cannot be quoted, so it carries no argument, and the
+values travel as environment variables on the member's launch, beside its
+identity — `BANTO_PARENT_CONFIG` (or `BANTO_PARENT_NO_CONFIG`) and
+`BANTO_PARENT_DB` (the hook reads no agent home). A hook without them (one an
+older banto launched) resolves for itself, as does a child started by hand or from
+an MCP config written by an older banto. Only banto's own variables are set;
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched — where an agent
+keeps its home is not banto's to decide. A member that is already running keeps
+the server it was launched with; the next time its pane is opened (re-staging the
+brigade, a relaunch, a new member) the MCP config file is rewritten and the
+launch argv rebuilt with the hand-off.
 
 **Message log (`[brigade] message_log = true`, off by default).** For someone
 developing banto who wants to audit what the agents told each other. Every

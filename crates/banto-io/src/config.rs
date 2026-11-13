@@ -141,6 +141,25 @@ pub fn resolve_config_path(
     xdg_config_home: Option<&Path>,
     home: Option<&Path>,
 ) -> ConfigSource {
+    resolve_config_path_with_default(
+        cli_override,
+        env_override,
+        xdg_config_home,
+        home,
+        default_config_path(),
+    )
+}
+
+/// [`resolve_config_path`] with the final tier's path supplied instead of read
+/// from the platform: every input is then a parameter, so a test can resolve a
+/// config without the real config directory being named anywhere.
+pub fn resolve_config_path_with_default(
+    cli_override: Option<&Path>,
+    env_override: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+    default_path: Option<PathBuf>,
+) -> ConfigSource {
     if let Some(path) = cli_override {
         return ConfigSource::Explicit(path.to_path_buf());
     }
@@ -159,7 +178,7 @@ pub fn resolve_config_path(
             return ConfigSource::Discovered(candidate);
         }
     }
-    ConfigSource::Default(default_config_path())
+    ConfigSource::Default(default_path)
 }
 
 #[cfg(test)]

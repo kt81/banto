@@ -23,3 +23,4 @@ vt100 = { version = "0.16.9", package = "vt100-psmux" }
 [dev-dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 tempfile = "3"
+toml = "0.9.8"

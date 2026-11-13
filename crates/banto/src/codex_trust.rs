@@ -84,6 +84,7 @@ mod tests {
                 token: "worker-1".to_string(),
                 role: BrigadeRole::Worker,
                 session: None,
+                child_args: Vec::new(),
             }),
         };
 
