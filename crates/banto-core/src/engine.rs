@@ -39,7 +39,7 @@ use crate::key_encode::{
 use crate::member_name;
 use crate::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
-    MessageGlance, PtyExitReason, SessionRow, SessionToOpen, StoredLayout,
+    MessageGlance, PtyExitReason, Quiescence, SessionRow, SessionToOpen, StoredLayout,
 };
 
 pub use crate::layout::{
@@ -263,6 +263,24 @@ const STATUS_REMINDER_GAP: Duration = Duration::from_secs(25);
 /// a policy throttle, not a measured terminal limit: an arrival remains
 /// prompt, while a burst of panes cannot turn into an alarm.
 const ATTENTION_BELL_COOLDOWN: Duration = Duration::from_secs(3);
+
+/// How long every hosted member of a brigade has to have been idle, without a
+/// break, before the brigade counts as having gone quiet.
+///
+/// A Worker that reports ends its own turn before the relay has nudged the
+/// Director with that report, so for a moment the whole brigade is idle with
+/// work still in flight between two of its members. Firing the instant
+/// everyone is idle would ring in that gap on every report; waiting out a
+/// few seconds lets the nudge turn the Director busy first. Sampling is about
+/// once a second, so the wait is met between this and one sample later.
+const BRIGADE_QUIET_SETTLE: Duration = Duration::from_secs(5);
+
+/// How long after banto last wrote input into a pane the quit question counts
+/// that pane as not idle whatever its sample says. The sample is up to a tick
+/// plus the product's own report lag behind a turn that input has only just
+/// started, so without this a prompt submitted a moment ago still reads
+/// "idle" and one `q` quits on it.
+const QUIT_RECENT_INPUT_WINDOW: Duration = Duration::from_secs(3);
 
 /// How soon after the first tick the data directory is swept for the first time,
 /// and then how often. Purely periodic: the sweep only deletes files that have
@@ -983,6 +1001,22 @@ pub struct EmporiumState {
     stated_names: HashMap<(BrigadeId, MemberToken), String>,
     /// The same for the sidebar width.
     persisted_sidebar_width: u16,
+    /// Whether the brigade-quiet bell also rings while the Director's pane is
+    /// effectively focused (a runtime switch, F4; the operator's to turn on).
+    /// Off by default and when the store holds nothing usable.
+    bell_when_focused: bool,
+    /// The same for the switch.
+    persisted_bell_when_focused: bool,
+    /// When banto last wrote into each pane something that can start or
+    /// continue a turn — a relay nudge and its submitting Enter, a Codex
+    /// Worker's or a Goinkyo's kickoff and its retry — stamped at the moment of
+    /// the write. The quit question reads it beside [`Self::last_forwarded_input`]
+    /// (the operator's keys, mouse reports and pastes), and the brigade-quiet
+    /// stretch counts from it ([`update_brigade_quiet`]). Its own map rather than
+    /// another entry in that one: the relay reads that map to stay out of the
+    /// operator's way, and a nudge must not silence the next one. Focus reports
+    /// are written too but start nothing, and are not stamped.
+    last_prompted: HashMap<SessionKey, Instant>,
     /// When real operator input was last forwarded to each pane, keyed by
     /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
     /// only ever suppresses a nudge for the pane the operator is actually
@@ -1121,10 +1155,10 @@ pub struct EmporiumState {
     /// can show the pending-prefix hint while armed (reading state for
     /// drawing is legal; only `update` may write it).
     pub prefix_armed: Option<Instant>,
-    /// A first quit key on the list that has to be confirmed because hosted
-    /// sessions are running, and whose window has not passed. Dropped by any
-    /// other key, a mouse press, the focus leaving the list, the sessions all
-    /// ending, or the window running out.
+    /// A first quit key on the list that has to be confirmed because a hosted
+    /// session is not known to be idle, and whose window has not passed.
+    /// Dropped by any other key, a mouse press, the focus leaving the list,
+    /// every session being known idle (or gone), or the window running out.
     pending_quit: Option<PendingQuit>,
     /// The next discriminator [`Self::mint_plain_key`] hands out. Only ever
     /// increments, even past a closed pane's key going out of scope — a
@@ -1217,8 +1251,29 @@ pub struct EmporiumState {
     /// while its border set can only contain panes.
     visible_waiting_count: usize,
     /// Panes whose child rang BEL while they were not effectively focused.
-    /// Folded into `attention_panes`, never drawn separately.
+    /// Folded into `attention_panes`, never drawn separately. A brigade that
+    /// has gone quiet latches its Director here too ([`update_brigade_quiet`]),
+    /// which is why that mark, its bell and its clearing on focus are the same
+    /// ones a BEL gets.
     latched_attention_panes: HashSet<SessionKey>,
+    /// The latest sample of whether each hosted pane is known to be idle, as
+    /// the shell last reported it ([`Event::QuiescenceSampled`]). Read only
+    /// for panes in [`Self::screens`]; a pane with no entry is
+    /// [`Quiescence::Unknown`], so a pane opened between two samples asks the
+    /// operator rather than being taken for idle.
+    quiescence: HashMap<SessionKey, Quiescence>,
+    /// Per brigade with hosted members: what [`update_brigade_quiet`] needs to
+    /// tell "has gone quiet" from "has always been quiet".
+    brigade_quiet: HashMap<BrigadeId, QuietWatch>,
+    /// The processes ([`Self::spawn_order`] numbers) that have been sampled
+    /// idle at least once since they were hosted. A reading of "not idle" from
+    /// one that has never been idle may be nothing but the process starting up,
+    /// and does not arm the brigade-quiet bell ([`update_brigade_quiet`]).
+    seen_idle: HashSet<u64>,
+    /// When each hosted process was started — the moment its pane was spawned —
+    /// so input written into the pane before that, by an earlier process under
+    /// the same key, is not taken for work this one was given.
+    process_started: HashMap<SessionKey, Instant>,
     /// Cached list-visible Waiting ids as pane keys, refreshed only when
     /// App's matching cache generation changes. Discovery imposes no bound on
     /// these ids, so the edge diff must not rebuild this set for every PTY
@@ -1293,6 +1348,9 @@ impl EmporiumState {
             member_names: HashMap::new(),
             stated_names: HashMap::new(),
             persisted_sidebar_width: SIDEBAR_WIDTH,
+            bell_when_focused: false,
+            persisted_bell_when_focused: false,
+            last_prompted: HashMap::new(),
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
@@ -1333,6 +1391,10 @@ impl EmporiumState {
             attention_panes: HashSet::new(),
             visible_waiting_count: 0,
             latched_attention_panes: HashSet::new(),
+            quiescence: HashMap::new(),
+            brigade_quiet: HashMap::new(),
+            seen_idle: HashSet::new(),
+            process_started: HashMap::new(),
             ring_list_waiting: HashSet::new(),
             ring_list_generation: 0,
             previous_ring_set: None,
@@ -1399,6 +1461,12 @@ impl EmporiumState {
         if let Some(value) = self.last_forwarded_input.remove(old_key) {
             self.last_forwarded_input.insert(new_key.clone(), value);
         }
+        if let Some(value) = self.last_prompted.remove(old_key) {
+            self.last_prompted.insert(new_key.clone(), value);
+        }
+        if let Some(value) = self.process_started.remove(old_key) {
+            self.process_started.insert(new_key.clone(), value);
+        }
         if self.unsent_operator_input.remove(old_key) {
             self.unsent_operator_input.insert(new_key.clone());
         }
@@ -1413,6 +1481,9 @@ impl EmporiumState {
         }
         if self.latched_attention_panes.remove(old_key) {
             self.latched_attention_panes.insert(new_key.clone());
+        }
+        if let Some(value) = self.quiescence.remove(old_key) {
+            self.quiescence.insert(new_key.clone(), value);
         }
         if self.ring_list_waiting.remove(old_key) {
             self.ring_list_waiting.insert(new_key.clone());
@@ -1490,6 +1561,8 @@ impl EmporiumState {
             self.relay_states.remove(&(brigade_id, token));
         }
         self.last_forwarded_input.remove(key);
+        self.last_prompted.remove(key);
+        self.process_started.remove(key);
         self.unsent_operator_input.remove(key);
         self.last_output_at.remove(key);
         self.latched_attention_panes.remove(key);
@@ -2041,6 +2114,144 @@ impl EmporiumState {
         }
     }
 
+    /// How many hosted panes (staged or not) are not known to be idle: running
+    /// something, waiting on the operator, unread, or given input by banto
+    /// within [`QUIT_RECENT_INPUT_WINDOW`] (a turn that input started may not
+    /// show in the sample yet). What a quit would end that is worth asking
+    /// about. Only the quit question reads the recent-input part: the relay
+    /// decides from the sample alone, and the brigade-quiet bell reads only
+    /// banto's own writes ([`EmporiumState::last_prompted`]), never the
+    /// operator's input.
+    fn not_idle_count(&self, now: Instant) -> usize {
+        self.screens
+            .keys()
+            .filter(|key| {
+                self.quiescence.get(key) != Some(&Quiescence::Idle)
+                    || self.took_input_recently(key, now)
+            })
+            .count()
+    }
+
+    /// Whether banto still intends to type a kickoff into `key`'s pane: a Codex
+    /// Worker's or a Goinkyo's first line, which is what starts its first turn.
+    /// Read from the kickoff tracking the core already keeps. Owed, and so
+    /// blocking the brigade-quiet bell, from the moment the pane is hosted until
+    /// the entry is dropped — acknowledged (a discovered session, a session row),
+    /// the pane gone, or the briefing reported unconfirmed — through every state
+    /// in between: waiting for the boot output to go quiet, the trust check in
+    /// flight, typed and awaiting its acknowledgement, a retry pending.
+    ///
+    /// Not owed, though the entry stays: the directory was reported untrusted
+    /// and nothing has been typed (banto re-checks every tick but the operator
+    /// has to answer the pane's prompt); the operator has an unsent draft in the
+    /// pane (the retry waits for them); and the last allowed attempt was typed
+    /// and its acknowledgement window has run out (banto reports the failure).
+    /// In each of those the brigade really is waiting on the operator, which is
+    /// what the bell is for. Panes that get no typed kickoff — a Claude Worker,
+    /// the Director, a resumed member — have no entry and are never owed.
+    fn kickoff_owed(&self, key: &SessionKey, now: Instant) -> bool {
+        if self.has_unsent_operator_input(key) {
+            return false;
+        }
+        let outstanding = |sent_at: Option<Instant>, attempts: u32, untrusted: bool| {
+            if attempts >= KICKOFF_MAX_ATTEMPTS {
+                sent_at.is_some_and(|at| now.saturating_duration_since(at) < KICKOFF_ACK_TIMEOUT)
+            } else {
+                !(sent_at.is_none() && untrusted)
+            }
+        };
+        self.pending_kickoffs
+            .iter()
+            .filter(|pending| &pending.key == key)
+            .any(|pending| {
+                outstanding(
+                    pending.sent_at,
+                    pending.attempts,
+                    pending.notified_untrusted,
+                )
+            })
+            || self
+                .pending_goinkyo_kickoffs
+                .iter()
+                .filter(|pending| &pending.key == key)
+                .any(|pending| {
+                    outstanding(
+                        pending.sent_at,
+                        pending.attempts,
+                        pending.notified_untrusted,
+                    )
+                })
+    }
+
+    /// Whether anything was written into `key`'s pane to start or continue a
+    /// turn since its process started: banto's own writes, or the operator's
+    /// input forwarded to it. Read only by the brigade-quiet arming decision.
+    fn was_given_work(&self, key: &SessionKey) -> bool {
+        let started = self.process_started.get(key);
+        [
+            self.last_forwarded_input.get(key),
+            self.last_prompted.get(key),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|at| started.is_none_or(|started| at >= started))
+    }
+
+    /// Whether `key`'s member has unread brigade mail that the relay is still
+    /// going to deliver by itself: this tick's observation of the member says it
+    /// has some, the relay is automatic and has not used up its attempts on this
+    /// batch. Whatever is holding the nudge back right now (an unsent draft, the
+    /// operator's recent input, the idle streak, the cooldown, a member that is
+    /// not idle) does not matter — it will go out when that passes. Mail the
+    /// relay will not deliver (relay off, attempts exhausted) is not counted: the
+    /// brigade is then waiting on the operator. A member this tick did not
+    /// observe has no mail as far as the bell knows.
+    fn mail_pending(
+        &self,
+        key: &SessionKey,
+        relay_auto: bool,
+        observed: &TickObservations,
+    ) -> bool {
+        relay_auto
+            && observed.unread.get(key).is_some_and(|(brigade_id, token)| {
+                self.relay_states
+                    .get(&(*brigade_id, token.clone()))
+                    .is_none_or(|relay| relay.nudge.attempts < RELAY_MAX_ATTEMPTS)
+            })
+    }
+
+    /// `last_forwarded_input` is stamped for every key forwarded from pane
+    /// focus, including one that encodes to no bytes and so reaches the child as
+    /// nothing; that stamp is also the relay's "the operator is typing" signal
+    /// and keeps its timing, so such a key counts here too. It can only make the
+    /// quit prompt ask.
+    fn took_input_recently(&self, key: &SessionKey, now: Instant) -> bool {
+        [
+            self.last_forwarded_input.get(key),
+            self.last_prompted.get(key),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
+    }
+
+    /// Whether the brigade-quiet bell rings with the Director's pane focused
+    /// too. The shell draws a standing indicator while this is on.
+    pub fn bell_when_focused(&self) -> bool {
+        self.bell_when_focused
+    }
+
+    /// The status line once quitting has been decided: it has priority over
+    /// everything else that line can show, and is the one text for every way
+    /// of getting here. The count is every hosted session, idle or not — all
+    /// of them are about to be ended.
+    pub fn closing_text(&self) -> String {
+        match self.screens.len() {
+            0 => "Closing\u{2026}".to_string(),
+            hosted => format!("Closing \u{2014} ending {hosted} session(s)\u{2026}"),
+        }
+    }
+
     /// The derived staged panes currently marked as needing operator attention.
     /// [`refresh_waiting_display`] is its sole writer.
     pub fn attention_panes(&self) -> &HashSet<SessionKey> {
@@ -2059,23 +2270,23 @@ impl EmporiumState {
 const PREFIX_ARM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a first quit key on the session list waits for its second while
-/// hosted sessions are running. A separate matter from the prefix's timeout —
-/// that one is a half-typed chord, this one is a confirmation — and the two are
-/// free to differ.
+/// a hosted session is not known to be idle. A separate matter from the
+/// prefix's timeout — that one is a half-typed chord, this one is a
+/// confirmation — and the two are free to differ.
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 /// A first quit key that has not been confirmed yet (see [`update_key`]'s list
 /// arm). The prompt is kept here, rebuilt at the end of every update from the
-/// live count, so what the operator reads is current and `displayed_status` can
-/// hand it out as text.
+/// not-idle count, so what the operator reads is current and `displayed_status`
+/// can hand it out as text.
 #[derive(Debug)]
 struct PendingQuit {
     at: Instant,
     prompt: String,
 }
 
-fn quit_prompt(live: usize) -> String {
-    format!("Esc again to quit \u{2014} {live} session(s) running")
+fn quit_prompt(not_idle: usize) -> String {
+    format!("Esc again to quit \u{2014} {not_idle} session(s) not idle")
 }
 
 /// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
@@ -2409,6 +2620,11 @@ pub enum StoreIntent {
     /// Persist the sidebar width (`Store::set_sidebar_width`).
     SaveSidebarWidth {
         width: u16,
+    },
+    /// Persist the "ring even when the Director is focused" switch
+    /// (`Store::set_bell_when_focused`).
+    SaveBellWhenFocused {
+        on: bool,
     },
     FormBrigade {
         director_row_id: String,
@@ -2821,6 +3037,13 @@ pub enum Event {
     SidebarWidthLoaded {
         width: Option<u16>,
     },
+    /// Whether the store held the "ring even when the Director is focused"
+    /// switch as on at startup (`false` when it held nothing usable). Fed once
+    /// beside [`Self::SidebarWidthLoaded`], for the same reason: a replay has to
+    /// get the preference from the stream.
+    BellWhenFocusedLoaded {
+        on: bool,
+    },
     /// What the shell found wrong at startup and wants the operator to see: an
     /// untrusted Codex hook, an unrecognised `agents` name. Fed once, with the
     /// stored sidebar width, as an `Event` so a replay shows the same status
@@ -2935,6 +3158,17 @@ pub enum Event {
         /// this field existed.
         #[serde(default)]
         brigades: Vec<BrigadeNameFacts>,
+    },
+    /// ~1/s, just ahead of [`Event::Tick`]: for every hosted pane the shell
+    /// could ask about, whether it is known to be idle. Gathered shell-side from
+    /// reads the tick already makes (the live-session files for Claude, the
+    /// rollout's last turn marker for Codex) and decided here, so the quit
+    /// confirmation and the brigade's going-quiet bell share one answer. Its
+    /// own event, not a field on `Tick`, for the reason `GoinkyoAwaitingSpawn`
+    /// gives. Replaces the previous sample as a whole: a pane left out reads as
+    /// [`Quiescence::Unknown`].
+    QuiescenceSampled {
+        samples: Vec<(SessionKey, Quiescence)>,
     },
     /// ~1/s: what the shell observed about the staged brigade's Goinkyo —
     /// gathered shell-side alongside `Tick`'s own observations, but its own
@@ -3140,6 +3374,12 @@ pub fn update(
             }
             update_membership_resolved(state, app, brigade, session_id, membership, members, layout)
         }
+        Event::BellWhenFocusedLoaded { on } => {
+            // The store's own value: not written back.
+            state.bell_when_focused = on;
+            state.persisted_bell_when_focused = on;
+            Vec::new()
+        }
         Event::SidebarWidthLoaded { width } => {
             if let Some(width) = width {
                 // A preference like any other: clamped wherever it is used,
@@ -3226,6 +3466,12 @@ pub fn update(
             new_id,
         } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
         Event::Tick { relay, brigades } => update_tick(state, app, brigade, relay, brigades, now),
+        Event::QuiescenceSampled { samples } => {
+            // Only stored: the brigade-quiet decision is made by the tick that
+            // follows it, once the relay has decided what to type this second.
+            state.quiescence = samples.into_iter().collect();
+            Vec::new()
+        }
         Event::GoinkyoAwaitingSpawn { observation } => {
             update_goinkyo_awaiting_spawn(state, brigade, observation, now)
         }
@@ -3253,23 +3499,305 @@ pub fn update(
 }
 
 /// Keep a waiting quit honest: gone once its window has run out, once the focus
-/// has left the list (the Esc it asks for would go to a pane), or once nothing
-/// is running any more (one press quits then); otherwise its prompt carries the
-/// current count. Run at the end of every update, so the window ends on the
-/// first event after it, and a key that lands exactly on its edge is judged by
-/// the key handler, which treats the edge as expired.
+/// has left the list (the Esc it asks for would go to a pane), or once every
+/// session is known idle or gone (one press quits then); otherwise its prompt
+/// carries the current count. Run at the end of every update, so the window
+/// ends on the first event after it, and a key that lands exactly on its edge
+/// is judged by the key handler, which treats the edge as expired.
 fn settle_pending_quit(state: &mut EmporiumState, now: Instant) {
-    let live = state.screens.len();
+    if state.pending_quit.is_none() {
+        return;
+    }
+    let not_idle = state.not_idle_count(now);
     let Some(pending) = &mut state.pending_quit else {
         return;
     };
     if state.focus != Focus::Sidebar
-        || live == 0
+        || not_idle == 0
         || now.saturating_duration_since(pending.at) >= QUIT_CONFIRM_WINDOW
     {
         state.pending_quit = None;
     } else {
-        pending.prompt = quit_prompt(live);
+        pending.prompt = quit_prompt(not_idle);
+    }
+}
+
+/// What one tick's relay observations say, as far as the bell may use it.
+#[derive(Default)]
+struct TickObservations {
+    /// Members observed with unread mail, with the roster identity the relay
+    /// keys its state by.
+    unread: HashMap<SessionKey, (BrigadeId, MemberToken)>,
+    /// Brigades whose Director was observed.
+    directors: HashSet<BrigadeId>,
+}
+
+impl TickObservations {
+    /// Only an observation about the pane the core itself holds for that member
+    /// counts: the key is hosted, and the core's membership for it is the same
+    /// brigade and the same token the observation says. Anything else (a tick
+    /// gathered just before a rekey, relaunch or re-formation the core has already
+    /// applied, a stray or replayed event) is ignored by the bell, for "the
+    /// Director was observed" and for "has unread mail" alike, and only delays:
+    /// the next tick's observation, gathered from the store as it now is, matches.
+    /// The relay has no such rule and keeps treating observations as before.
+    fn from_relay(relay: &[RelayObservation], state: &EmporiumState) -> Self {
+        let mut observed = Self::default();
+        for observation in relay {
+            let is_that_member = state.screens.contains_key(&observation.key)
+                && state.member_brigades.get(&observation.key) == Some(&observation.brigade_id)
+                && state
+                    .member_tokens
+                    .get(&observation.key)
+                    .map(String::as_str)
+                    == Some(observation.token.as_str());
+            if !is_that_member {
+                continue;
+            }
+            if observation.has_unseen {
+                observed.unread.insert(
+                    observation.key.clone(),
+                    (observation.brigade_id, observation.token.clone()),
+                );
+            }
+            if observation.token == DIRECTOR_TOKEN {
+                observed.directors.insert(observation.brigade_id);
+            }
+        }
+        observed
+    }
+}
+
+/// What [`update_brigade_quiet`] keeps about one brigade between samples.
+#[derive(Debug, Default)]
+struct QuietWatch {
+    /// A member has not been idle since the brigade last fired (or since banto
+    /// started watching it) — what makes the next all-idle stretch a brigade
+    /// going quiet rather than one that never did anything.
+    active: bool,
+    /// When the current unbroken all-idle stretch began.
+    idle_since: Option<Instant>,
+    /// Which processes the stretch was counted for: the spawn number of every
+    /// hosted member ([`EmporiumState::spawn_order`]). A stretch is a statement
+    /// about these members, so when the set changes — one joins, one ends, one
+    /// is relaunched under the same key (a new process, a new number) — it
+    /// starts over. A key that merely changes (discovery, a compaction fork)
+    /// moves the number with it and is the same member.
+    members: HashSet<u64>,
+}
+
+/// Tell the operator a brigade has gone quiet: every hosted member (Director,
+/// Workers, a Goinkyo) idle without a break for [`BRIGADE_QUIET_SETTLE`], after
+/// at least one of them was not idle since the last time this fired. Fires by
+/// latching the Director's attention mark, the one a BEL leaves, so the mark,
+/// the bell under its cooldown and the clearing on focus are exactly that
+/// mechanism's.
+///
+/// The Director, because that is the pane the operator answers in; and not when
+/// the operator is already in it ([`effective_focused_pane`], the rule a BEL
+/// follows), because there every turn the Director ends would otherwise ring.
+/// A fired brigade is spent either way: being in the Director's pane does not
+/// save the ring for when the operator leaves it. The operator can turn on
+/// [`EmporiumState::bell_when_focused`] to have that case ring after all — the
+/// bell only, under the usual cooldown: a focused pane still carries no mark.
+///
+/// The settle runs from the later of the stretch's start and the last time
+/// banto itself wrote into one of the brigade's hosted members to start or
+/// continue a turn (`last_prompted`: a relay nudge and its Enter, a kickoff and
+/// its retry). A Worker that reports ends its turn before the relay has typed
+/// the nudge into the Director, and the Director only reads busy in a later
+/// sample; counting from the write gives it the whole settle to be seen busy.
+/// This runs at the end of the tick, after the relay's decision, so a brigade is
+/// not called quiet in the very tick in which a nudge is typed into it.
+///
+/// A member with unread brigade mail that the relay will still deliver by itself
+/// ([`EmporiumState::mail_pending`]) reads as unknown while it sits idle, however
+/// long the nudge is being held back (an unsent draft, the operator's recent
+/// input, the cooldown): the work is not finished until that mail has been read.
+/// Mail the relay will not deliver — relay off, attempts used up — does not hold
+/// it: the brigade is then waiting on the operator.
+///
+/// The stretch is the hosted members' as a set: it starts over whenever a
+/// member joins, ends or is relaunched ([`QuietWatch::members`]), so a member
+/// that has only just been seen idle is not covered by the time the others have
+/// been. Whether someone was busy since the last ring is a fact about the
+/// brigade, not about that set, and a change of members neither sets nor clears
+/// it: a member that has never been busy does not by itself arm a ring.
+///
+/// Arming takes real work. A member reading not idle while its process is still
+/// starting up — a resumed session does for a second or two — keeps the brigade
+/// from being quiet and breaks the stretch like any other reading, but does not
+/// by itself make the brigade one that has done something. A not-idle reading
+/// arms it only from a process that has been read idle before
+/// ([`EmporiumState::seen_idle`]) or that was given work since it started
+/// ([`EmporiumState::was_given_work`]: banto's own writes, or operator input
+/// forwarded to it). Per process, so a relaunch starts over and a key change
+/// does not.
+///
+/// The bell decides only from what was observed in the tick: a brigade is
+/// judged only in a tick that carried a relay observation for its Director, and
+/// mail counts as pending only if that tick's observation of the member says so.
+/// A tick that observed nothing (a roster that could not be read), or no longer
+/// observes a brigade (something deleted it, or a disband was reported), judges
+/// nobody and breaks every stretch; no cached fact about mail or about a
+/// brigade's existence stands in for it. A brigade being disbanded is skipped
+/// with its watch kept, and the disband drops the watch; the watch of a brigade
+/// that stops being observed is inert and is pruned once none of its panes is
+/// hosted.
+///
+/// A member that banto still owes its kickoff ([`EmporiumState::kickoff_owed`])
+/// reads as unknown while it sits idle: the brigade is not quiet while banto
+/// intends to start one of its members. The stretch then runs from after the
+/// kickoff's acknowledgement (or from when it stops being owed), or from its
+/// last write, whichever is later — the first by the break, the second by
+/// `last_prompted`.
+///
+/// A member that is [`Quiescence::Unknown`] blocks firing and breaks the
+/// stretch: silence is not claimed on missing information. A member that is
+/// waiting reads as not idle here (it has its own mark). A brigade whose
+/// Director is not hosted is not watched; there is no pane to mark.
+///
+/// An off-stage brigade is watched and marked like any other, but only a staged
+/// pane draws an attention mark ([`refresh_waiting_display`] looks at the stage
+/// alone), so its Director's mark, and the bell with it, wait until the
+/// brigade is staged.
+fn update_brigade_quiet(
+    state: &mut EmporiumState,
+    now: Instant,
+    relay_auto: bool,
+    observed: &TickObservations,
+) -> Vec<Cmd> {
+    #[derive(Default)]
+    struct Hosted {
+        director: Option<SessionKey>,
+        members: Vec<Quiescence>,
+        processes: HashSet<u64>,
+        last_prompted: Option<Instant>,
+        /// A member read not idle that is past its start-up: it has been idle
+        /// before, or was given work.
+        real_work: bool,
+    }
+    let mut hosted: HashMap<BrigadeId, Hosted> = HashMap::new();
+    let mut idle_now: Vec<u64> = Vec::new();
+    for key in state.screens.keys() {
+        let Some(&brigade_id) = state.member_brigades.get(key) else {
+            continue;
+        };
+        let brigade = hosted.entry(brigade_id).or_default();
+        let sampled = state
+            .quiescence
+            .get(key)
+            .copied()
+            .unwrap_or(Quiescence::Unknown);
+        // A member that reads idle while banto still owes it its kickoff, or
+        // while mail is waiting that the relay will deliver, is not idle in the
+        // sense that matters: it is about to be started.
+        brigade.members.push(
+            if sampled == Quiescence::Idle
+                && (state.kickoff_owed(key, now) || state.mail_pending(key, relay_auto, observed))
+            {
+                Quiescence::Unknown
+            } else {
+                sampled
+            },
+        );
+        let process = state.spawn_order.get(key).copied();
+        brigade.processes.extend(process);
+        if sampled == Quiescence::Idle {
+            idle_now.extend(process);
+        }
+        if sampled == Quiescence::NotIdle
+            && (process.is_some_and(|id| state.seen_idle.contains(&id))
+                || state.was_given_work(key))
+        {
+            brigade.real_work = true;
+        }
+        brigade.last_prompted = brigade
+            .last_prompted
+            .max(state.last_prompted.get(key).copied());
+        if state.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN) {
+            brigade.director = Some(key.clone());
+        }
+    }
+
+    // After the readings above were judged: a process idle in this sample has
+    // been seen idle from the next one on. Forgotten with the process.
+    state.seen_idle.extend(idle_now);
+    let running: HashSet<u64> = state.spawn_order.values().copied().collect();
+    state.seen_idle.retain(|id| running.contains(id));
+
+    let mut fired = Vec::new();
+    state
+        .brigade_quiet
+        .retain(|id, _| hosted.get(id).is_some_and(|b| b.director.is_some()));
+    for (brigade_id, brigade) in hosted {
+        let Some(director) = brigade.director else {
+            continue;
+        };
+        // One that is being disbanded is left alone and its watch kept as it was,
+        // in case the disband fails.
+        if state.disbanding.contains(&brigade_id) {
+            continue;
+        }
+        // A brigade is judged only in a tick that observed its Director: that
+        // means the store was read, still has the brigade, and its Director is
+        // hosted with a session. Whatever the per-pane maps say about a former
+        // Director left open on its own, or a brigade something else deleted, it
+        // is not observed and is not judged. Without that observation the
+        // stretch is broken, as by an unknown member, and the armed flag kept.
+        if !observed.directors.contains(&brigade_id) {
+            if let Some(watch) = state.brigade_quiet.get_mut(&brigade_id) {
+                watch.idle_since = None;
+            }
+            continue;
+        }
+        let watch = state.brigade_quiet.entry(brigade_id).or_default();
+        if watch.members != brigade.processes {
+            // Not `active`: whether anyone was busy since the last ring says
+            // nothing about who is hosted now.
+            watch.members = brigade.processes;
+            watch.idle_since = None;
+        }
+        if brigade.members.contains(&Quiescence::NotIdle) {
+            watch.active |= brigade.real_work;
+            watch.idle_since = None;
+        } else if brigade.members.contains(&Quiescence::Unknown) {
+            watch.idle_since = None;
+        } else {
+            let idle_since = *watch.idle_since.get_or_insert(now);
+            // The stretch is also counted from the last time banto typed into
+            // a member: that member is about to turn busy, and the samples say
+            // so a second or two later.
+            let since = brigade
+                .last_prompted
+                .map_or(idle_since, |at| at.max(idle_since));
+            if watch.active && now.saturating_duration_since(since) >= BRIGADE_QUIET_SETTLE {
+                watch.active = false;
+                fired.push(director);
+            }
+        }
+    }
+    let mut cmds = Vec::new();
+    for director in fired {
+        if effective_focused_pane(state).as_ref() != Some(&director) {
+            state.latched_attention_panes.insert(director);
+        } else if state.bell_when_focused {
+            cmds.extend(ring_host_bell(state, now));
+        }
+    }
+    cmds
+}
+
+/// The host bell, under the cooldown every attention bell shares.
+fn ring_host_bell(state: &mut EmporiumState, now: Instant) -> Option<Cmd> {
+    if state
+        .last_attention_bell
+        .is_none_or(|last| now.saturating_duration_since(last) >= ATTENTION_BELL_COOLDOWN)
+    {
+        state.last_attention_bell = Some(now);
+        Some(Cmd::RingHostBell)
+    } else {
+        None
     }
 }
 
@@ -3353,13 +3881,8 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
         }
     }
 
-    if gained
-        && state
-            .last_attention_bell
-            .is_none_or(|last| now.saturating_duration_since(last) >= ATTENTION_BELL_COOLDOWN)
-    {
-        state.last_attention_bell = Some(now);
-        vec![Cmd::RingHostBell]
+    if gained {
+        ring_host_bell(state, now).into_iter().collect()
     } else {
         Vec::new()
     }
@@ -3605,6 +4128,23 @@ fn update_key(
         };
         return Vec::new();
     }
+    // Like F2/F3, whatever the modifiers and from either focus, and never
+    // forwarded to a pane's child: one keystroke from anywhere, because the
+    // operator reaches for this while looking at something else. A modal, the
+    // search box and an armed prefix each take the key first (above), as they
+    // do for F2/F3.
+    if code == KeyCode::F(4) {
+        state.bell_when_focused = !state.bell_when_focused;
+        state.set_status(
+            if state.bell_when_focused {
+                "brigade bell: on, it rings even while the Director's pane is focused"
+            } else {
+                "brigade bell: off, it stays silent while the Director's pane is focused"
+            },
+            now,
+        );
+        return Vec::new();
+    }
     if code == KeyCode::F(3) {
         let collapsed = state.pane_collapsed();
         if let Stage::Brigade { panes, focused, .. } = &mut state.stage
@@ -3648,19 +4188,22 @@ fn update_key(
             // must never also fire `b`'s add-worker).
             match (code, mods) {
                 (KeyCode::Char('q'), Modifiers::NONE) | (KeyCode::Esc, _) => {
-                    // Quitting ends every hosted process, so with any running it
-                    // takes a second quit key (Esc or `q`, whichever the operator
-                    // has to hand — an IME swallows `q`) inside the window.
-                    let live = state.screens.len();
+                    // Quitting ends every hosted process, so with any not known to
+                    // be idle it takes a second quit key (Esc or `q`, whichever
+                    // the operator has to hand — an IME swallows `q`) inside the
+                    // window. The decision uses the last sample, so it can be
+                    // about a tick (plus the product's own report lag) behind a
+                    // turn that has only just begun.
+                    let not_idle = state.not_idle_count(now);
                     let confirmed = pending_quit.is_some_and(|pending| {
                         now.saturating_duration_since(pending.at) < QUIT_CONFIRM_WINDOW
                     });
-                    if live == 0 || confirmed {
+                    if not_idle == 0 || confirmed {
                         app.request_quit();
                     } else {
                         state.pending_quit = Some(PendingQuit {
                             at: now,
-                            prompt: quit_prompt(live),
+                            prompt: quit_prompt(not_idle),
                         });
                     }
                     Vec::new()
@@ -5282,7 +5825,8 @@ fn adopt_stored_layout(
 
 /// The writes that keep the store matching what the operator has arranged:
 /// one `SaveBrigadeLayout` for each brigade whose layout differs from what the
-/// store last held, one `SaveSidebarWidth` if the width does. Run at the end
+/// store last held, one `SaveSidebarWidth` if the width does, one
+/// `SaveBellWhenFocused` if the bell switch does. Run at the end
 /// of every `update`; since it only compares, a draw-only or tick-only event
 /// writes nothing, and neither does a gesture that committed nothing, a
 /// refused key, or a "restore all" with nothing to restore.
@@ -5292,6 +5836,12 @@ fn persist_preferences(state: &mut EmporiumState) -> Vec<Cmd> {
         state.persisted_sidebar_width = state.sidebar_width;
         cmds.push(Cmd::Store(StoreIntent::SaveSidebarWidth {
             width: state.sidebar_width,
+        }));
+    }
+    if state.bell_when_focused != state.persisted_bell_when_focused {
+        state.persisted_bell_when_focused = state.bell_when_focused;
+        cmds.push(Cmd::Store(StoreIntent::SaveBellWhenFocused {
+            on: state.bell_when_focused,
         }));
     }
     let mut brigades: Vec<BrigadeId> = state.brigade_layouts.keys().copied().collect();
@@ -5832,6 +6382,10 @@ fn update_spawned(
     // otherwise leave its record behind to suppress the first genuine crash
     // of whatever opens under this key next.
     state.expected_exits.remove(&key);
+    // A new process starts with nothing known about it, whatever the pane that
+    // held this key before was last read as.
+    state.quiescence.remove(&key);
+    state.process_started.insert(key.clone(), now);
     state
         .screens
         .insert(key.clone(), crate::screen::Screen::new(24, 80));
@@ -6071,6 +6625,7 @@ fn relaunch_member(
     }
     state.last_relaunch.insert(key.clone(), now);
     state.screens.remove(key);
+    state.quiescence.remove(key);
     // The process that held any draft is gone; the restarted one starts with
     // an empty input line.
     state.unsent_operator_input.remove(key);
@@ -6145,6 +6700,7 @@ fn update_pty_exited(
         None => false,
     };
     state.screens.remove(&key);
+    state.quiescence.remove(&key);
     state.unstage(&key);
     // A Goinkyo pane can close this way without ever being dismissed (its
     // process just dies) — `goinkyo_pane`'s own doc: still discoverable, so a
@@ -6750,6 +7306,11 @@ fn update_disbanded(
             state.member_names.retain(|(id, _), _| *id != brigade_id);
             state.stated_names.retain(|(id, _), _| *id != brigade_id);
             state.member_facts.retain(|(id, _), _| *id != brigade_id);
+            // The Director's pane stays open on its own and keeps the membership
+            // maps it was staged with; the watch the brigade-quiet decision kept
+            // for this brigade goes here, with the brigade (nothing observes it
+            // any more, so it would be inert anyway).
+            state.brigade_quiet.remove(&brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
                 .into_iter()
@@ -6961,6 +7522,8 @@ fn update_tick(
     // What each observed member's collapsed tile shows. A member the shell did
     // not re-read (`glance: None`) keeps what it had; an agent the shell
     // could not resolve this tick does not erase one it could before.
+    // What the bell may know this tick: exactly what was observed in it.
+    let observed = TickObservations::from_relay(&relay, state);
     for observation in &relay {
         let facts = state
             .member_facts
@@ -6988,6 +7551,7 @@ fn update_tick(
             // ([`cancel_pending_submit_on_input`]); this is for a draft that
             // was already there.
             if !state.has_unsent_operator_input(&entry.key) {
+                state.last_prompted.insert(entry.key.clone(), now);
                 cmds.push(Cmd::WritePty {
                     key: entry.key,
                     bytes: b"\r".to_vec(),
@@ -7110,6 +7674,7 @@ fn update_tick(
                 obs.has_unseen,
             );
             if nudge {
+                state.last_prompted.insert(obs.key.clone(), now);
                 cmds.push(Cmd::WritePty {
                     key: obs.key.clone(),
                     bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
@@ -7250,6 +7815,15 @@ fn update_tick(
     {
         state.prefix_armed = None;
     }
+
+    // Last, after everything above has typed what it was going to type this
+    // tick: a brigade is not called quiet in the second its relay wakes a member.
+    cmds.extend(update_brigade_quiet(
+        state,
+        now,
+        brigade.relay == RelayMode::Auto,
+        &observed,
+    ));
 
     cmds
 }
@@ -7496,6 +8070,7 @@ fn update_worker_directory_trust_checked(
     let entry = &mut state.pending_kickoffs[pos];
     entry.sent_at = Some(now);
     entry.attempts += 1;
+    state.last_prompted.insert(entry.key.clone(), now);
     let cmds = vec![Cmd::WritePty {
         key: entry.key.clone(),
         bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
@@ -7562,6 +8137,7 @@ fn update_goinkyo_directory_trust_checked(
     let entry = &mut state.pending_goinkyo_kickoffs[pos];
     entry.sent_at = Some(now);
     entry.attempts += 1;
+    state.last_prompted.insert(entry.key.clone(), now);
     if sentence_still_typed {
         return vec![Cmd::WritePty {
             key: entry.key.clone(),
@@ -7590,6 +8166,9 @@ mod member_exit_tests;
 
 #[cfg(test)]
 mod startup_notice_tests;
+
+#[cfg(test)]
+mod quiescence_tests;
 
 #[cfg(test)]
 mod one_pane_tests;
@@ -12956,7 +13535,7 @@ mod tests {
     /// attributes) or a dim placeholder, a rule, a footer row, and the cursor
     /// after what is on the prompt row. The shape `crate::input_line` reads;
     /// hand-made, nothing recorded.
-    fn draw_prompt_on(screen: &mut Screen, typed: Option<&str>) {
+    pub(super) fn draw_prompt_on(screen: &mut Screen, typed: Option<&str>) {
         let (rows, cols) = screen.screen().size();
         let rule = "\u{2500}".repeat(cols as usize);
         let p = rows - 3; // 1-based prompt row; the footer is the last row but one
@@ -13363,7 +13942,7 @@ mod tests {
 
     // --- Goinkyo kickoff retry: Enter alone when the sentence is still typed -
 
-    fn goinkyo_kickoff_retry_state(
+    pub(super) fn goinkyo_kickoff_retry_state(
         screen_setup: impl FnOnce(&mut Screen),
         sent: bool,
     ) -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
@@ -13386,7 +13965,7 @@ mod tests {
         (state, app, brigade, key, t0)
     }
 
-    fn goinkyo_trust_answer(
+    pub(super) fn goinkyo_trust_answer(
         state: &mut EmporiumState,
         app: &mut App,
         brigade: &BrigadeConfig,
@@ -24902,7 +25481,7 @@ mod tests {
         assert_eq!(layout_of(&state).master_permille, DEFAULT_MASTER_PERMILLE);
     }
 
-    // --- quitting with sessions running takes a second key ------------------------
+    // --- quitting with sessions not known to be idle takes a second key -----------
 
     fn quit_key(
         state: &mut EmporiumState,
@@ -24915,6 +25494,9 @@ mod tests {
     }
 
     /// The fixture's brigade of `workers` + 1 hosted panes, the list focused.
+    /// Nothing has been sampled, so every pane reads as unknown and counts
+    /// towards the prompt (the cases that vary the samples are in
+    /// `quiescence_tests`).
     fn list_focused(workers: usize) -> (EmporiumState, App, BrigadeConfig, Instant) {
         let (mut state, app, brigade, now) = drag_fixture(workers);
         state.focus = Focus::Sidebar;
@@ -24939,7 +25521,7 @@ mod tests {
             assert!(!app.should_quit(), "{first:?}: not yet");
             assert_eq!(
                 prompt(&state).as_deref(),
-                Some("Esc again to quit \u{2014} 3 session(s) running"),
+                Some("Esc again to quit \u{2014} 3 session(s) not idle"),
                 "{first:?}"
             );
 
@@ -24977,7 +25559,7 @@ mod tests {
         quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
         assert_eq!(
             prompt(&state).as_deref(),
-            Some("Esc again to quit \u{2014} 5 session(s) running")
+            Some("Esc again to quit \u{2014} 5 session(s) not idle")
         );
 
         // One ends during the window: the prompt is rebuilt, not stale.
@@ -24993,7 +25575,7 @@ mod tests {
         );
         assert_eq!(
             prompt(&state).as_deref(),
-            Some("Esc again to quit \u{2014} 4 session(s) running")
+            Some("Esc again to quit \u{2014} 4 session(s) not idle")
         );
     }
 

@@ -161,6 +161,39 @@ pub enum AgeBucket {
     Older,
 }
 
+/// Whether a hosted session is known to be doing nothing — the one answer to
+/// "would ending this lose work in flight", asked by the quit confirmation and
+/// by the brigade's going-quiet bell.
+///
+/// Three-valued on purpose: "no information" is its own answer, never folded
+/// into either of the others. Both questions this answers fail safe on it (a
+/// quit asks; a bell stays silent), so a reader that cannot tell must say so.
+/// Deliberately not [`Activity`]: that is what the session list draws and keeps
+/// `Alive` for every status it does not name; this one is decided from the
+/// product's own report and never guessed toward `Idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Quiescence {
+    /// Reported idle: nothing running, nothing waiting on the operator.
+    Idle,
+    /// Reported busy, waiting, running background work, or anything else that
+    /// is not the idle report.
+    NotIdle,
+    /// Nothing usable was read.
+    Unknown,
+}
+
+impl Quiescence {
+    /// From a probe that answers "idle?" with `None` for "could not tell" (the
+    /// Codex rollout's last turn marker is the one such source).
+    pub fn from_probe(idle: Option<bool>) -> Self {
+        match idle {
+            Some(true) => Self::Idle,
+            Some(false) => Self::NotIdle,
+            None => Self::Unknown,
+        }
+    }
+}
+
 /// One session as shown in the list: its metadata plus computed activity.
 /// `banto::session` owns discovering these (`session::load_rows`, which
 /// needs `banto_io`'s provider/status); the plain-text `session::activity_tag`

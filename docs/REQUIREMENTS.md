@@ -175,6 +175,66 @@ are slated for removal.
 - Nobody used the external paths, and every cross-cutting change had to carry
   them untested.
 
+## Decision (2026-11-13): quitting asks about what could be lost; a quiet brigade rings
+
+Three decisions of the operator, made the same day, about when banto speaks up.
+Their behaviour is written out in "The emporium: hosted panes" ("Is it idle? (the
+quit question)", "The closing line", "Attention", "The quiet brigade's bell"); this
+entry records what was decided and why.
+
+1. **Quitting from the list asks only when a hosted session is not known to be
+   idle.** `q`/`Esc` quits on the first press when every hosted session is known
+   to be idle, or none is hosted; otherwise the prompt is `Esc again to quit — N
+   session(s) not idle`, counting sessions that are working, waiting, of unknown
+   state, or given input in the last 3 seconds. The window, the second key and the
+   ways the prompt is dropped are unchanged. This replaces the earlier rule (ask
+   whenever any session is hosted, `N session(s) running`). *Why:* he quits when
+   everything is idle and was made to press twice every time. Unknown asks rather
+   than quits, since the question fails safe.
+2. **Once quitting is decided, the status line says so.** `Closing — ending N
+   session(s)…` (`Closing…` with none), with priority over everything else on the
+   line, for every quit path, until the process exits. *Why:* the shutdown sweep
+   closes each pane and waits for the children (up to 5 s) with no further frame
+   drawn, and until now the line had already returned to its hints, so for that
+   second nothing on screen said banto was closing.
+3. **A brigade that has gone quiet marks its Director and rings.** When every live
+   hosted member has been idle for 5 seconds after real work (a member still
+   starting up does not count), and no member has unread mail the relay will still
+   deliver — counted
+   from the last member going idle or banto last prompting one — banto marks
+   the Director's pane and rings the host bell through the existing attention
+   mechanism, except while the Director's pane is effectively focused (it marks and
+   rings with banto's window unfocused). *Why:* a brigade going quiet is the moment
+   his input is wanted, and it is rare enough to deserve a sound. A runtime switch
+   (the function key `F4`, badge `BELL ALWAYS`, persisted as `bell_when_focused`, off by
+   default) makes the bell ring even with the Director's pane focused. *Why a
+   runtime switch and not a config key:* whether he wants the sound depends on what
+   he is doing, and he wants to change it while running. *Why F4 and not a
+   prefix chord:* he wants to flip it casually, in one keystroke, while working.
+
+Alongside, banto now asks Codex to BEL for `async-question` and `plan-mode-prompt`
+as well as `approval-requested` ("Attention"), so that a question the model asks
+and the plan-implementation prompt ring too, not only an approval.
+
+*What "idle" means, per agent* (the facts behind decision 1 and 3):
+
+- **Claude Code:** the live file's `status` is `idle`. `busy`, `waiting`, `shell`
+  and anything else are not idle; no usable live entry is unknown. `shell` was
+  measured on Claude Code 2.1.323 on 2026-11-13: the turn has ended but a
+  background shell command is still running (see "Data sources").
+- **Codex:** the last turn marker in the rollout says the turn ended
+  (`task_complete`, `turn_aborted`, and the `turn_*` alias spellings); a started
+  turn is not idle; no marker is unknown. These marker names are from the Codex
+  source at tag `rust-v0.168.0`, not measured here (see "Codex data sources").
+  **Known limit, measured 2026-11-13** (installed `codex-cli 0.168.0`): Codex
+  records nothing about a command it left running after the turn ended — the
+  process was alive for 108 s after `task_complete`, with no rollout or sqlite
+  change and no re-invocation of the model at its end — so such a Codex session
+  reads as idle, and a quit can end it without asking.
+
+*Not done:* nothing in this change reads Codex's terminal escape sequences, and
+sub-agent activity is not tracked.
+
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
 | Source | Content |
@@ -182,7 +242,7 @@ are slated for removal.
 | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | Session body. One JSON per line |
 | First few records of the jsonl | `{"type":"custom-title","customTitle":...}` / `{"type":"ai-title","aiTitle":...}` — the title can be extracted by reading only the head chunk. Older formats fall back to the first user message |
 | First record of the jsonl | `{"type":"agent-setting",...}` marks a session run by a spawned agent (subagent / Agent-Teams teammate); interactive sessions open with a `mode` record instead. Sets `SessionMeta.is_agent`, persisted in the store (schema v2) |
-| `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` ("busy" etc.), `kind` ("interactive"/"bg"), `name`, `updatedAt` — observed present on both Windows and Linux/WSL. `procStart` is the process's own kernel-reported start time: Linux/WSL records `/proc/<pid>/stat`'s raw `starttime` ticks, while Windows records the raw creation FILETIME (each matched directly against a live process on this machine, 2026-11-10). `RawLiveSession` carries it as optional, so an absent or unrecognized value falls back to bare pid liveness; when it is comparable, banto rejects a recycled PID that belongs to a different process. (Observed directly on this machine's installed Claude Code version; not claimed for every version or platform.) |
+| `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` (`busy`, `waiting`, `idle`; and, measured on Claude Code 2.1.323, 2026-11-13, `shell` — the turn has ended but a background shell command of the session, or of one of its sub-agents, is still running; when that work ends Claude is re-invoked, reads `busy` again and then `idle`), `kind` ("interactive"/"bg"), `name`, `updatedAt` — observed present on both Windows and Linux/WSL. `procStart` is the process's own kernel-reported start time: Linux/WSL records `/proc/<pid>/stat`'s raw `starttime` ticks, while Windows records the raw creation FILETIME (each matched directly against a live process on this machine, 2026-11-10). `RawLiveSession` carries it as optional, so an absent or unrecognized value falls back to bare pid liveness; when it is comparable, banto rejects a recycled PID that belongs to a different process. (Observed directly on this machine's installed Claude Code version; not claimed for every version or platform.) |
 | `~/.claude/history.jsonl` and others | Unused in the MVP |
 
 **Timing (measured 2026-07-25, Claude Code 2.1.219).** The session-body and
@@ -288,6 +348,38 @@ since a `task_complete` record was observed re-embedding the turn's full
 final message on one line north of 11KB — a small fixed tail can land
 entirely inside that one line and misreport idle right when the answer
 matters most.
+
+**What the markers mean, and where the signal stops.** The same tail is what
+the emporium's "is it idle?" question asks of a hosted Codex session (see "The
+emporium: hosted panes" below). A started turn is `task_started` (alias
+`turn_started`); a turn that ended is `task_complete` (alias `turn_complete`) or
+`turn_aborted` (an interrupt, a replaced turn, an ended review, a budget stop);
+the last such record in the tail decides (a start after an abort is mid-turn
+again; what follows a `replaced` abort is not among the facts below, so nothing
+is assumed about it), and no marker at all is "unknown", never "idle". The
+relay's Codex-side reading is the same function, so an interrupted Codex member
+now counts as idle for nudging too; before, it read as mid-turn until its next
+turn. *Read in the Codex source at tag
+`rust-v0.168.0` (not measured here):* all three are written to the rollout in
+both of Codex's history modes; an errored turn ends in a `task_complete` that
+carries an `error`; the requests that block a turn on the operator (approvals,
+questions, elicitations) are never written to it; and a process that dies
+mid-turn leaves a `task_started` with no end. **Known limit:** Codex records
+nothing about a command it left running after the turn ended. *Read in the same
+source:* a background terminal survives the end of the turn and is stopped only
+by `/stop` or at session shutdown, its exit is not durable in the legacy
+history mode, and nothing re-invokes the model when it ends. *Measured
+2026-11-13 on this machine's installed Codex (`codex-cli 0.168.0`):* a command
+left running stayed alive for 108 s after `task_complete`, with no rollout or
+sqlite change and no re-invocation at its end. Such a session therefore reads as
+idle here. Two things banto does not do about it: it reads none of the terminal
+escape sequences the Codex TUI writes (the source shows an OSC 7501 lifecycle
+state, `working` while a background terminal exists; *measured 2026-11-13* from
+an event recording on Windows, the hosted Codex pane's output as banto's reader
+receives it contains `ESC ] 7501 ; state=working:app=codex` and
+`state=idle:app=codex`, so ConPTY passes the sequence through — banto still does
+not read it, it is not implemented), and it does not track sub-agent
+activity (a Codex parent's turn ends without waiting for its children).
 
 **Directory trust** (`crate::directory_trust`, advisory-only, read-only):
 before typing anything into a freshly-spawned Codex Worker's pane (see
@@ -585,9 +677,12 @@ session, it is refused (`prefix: no brigade layout to reset`). The case that
 prompted it: a Worker added later takes the mean of the others' heights, so weights
 set when a brigade had two Workers leave one tile much smaller than the rest once it
 has four.
-**What is kept across a restart.** Everything arranged above is stored in banto's
-own sqlite store and comes back the next time banto runs: the
-sidebar width (table `ui_prefs`, key `sidebar_width`); per brigade, the master
+**What is kept across a restart.** Everything arranged above, and the brigade bell's
+switch, is stored in banto's own sqlite store and comes back the next time banto runs: the
+sidebar width (table `ui_prefs`, key `sidebar_width`) and, in the same table, the
+brigade bell's switch (key `bell_when_focused`, `1` or `0`; any other stored
+value reads as no preference, which is off — see "The quiet brigade's bell");
+per brigade, the master
 share, the collapsed stack width and the soloed member (columns on `brigades`);
 per member, its place in the stack order, its row weight and its collapsed flag
 (columns on `brigade_members`). NULL means "no preference, use the default".
@@ -621,7 +716,8 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 | `b` | Spawn one more Worker into the staged cell |
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
-| `q`/`Esc` (list focused) | Quit — with nothing hosted, at once; with any session running (staged or off-stage, collapsed tiles included) the first press only shows `Esc again to quit — N session(s) running` and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. Any other key, a mouse press, the focus leaving the list or the window running out drops it silently. Esc stays one of the two keys because an IME swallows `q`. |
+| `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
+| `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows `Esc again to quit — N session(s) not idle` and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
@@ -639,14 +735,251 @@ as a failed pin is. A Worker added later gets the mean of the others' height.
 While the prefix is armed, the status bar shows the full binding table.
 Otherwise its idle hints follow the focus, because that is where keys go: with
 the session list focused, the list keys (`Tab grouped/flat`, `F2 pane`, `F3 next
-pane`, …, plus `D restore` while an archived row is on screen); with a pane
+pane`, `F4 bell`, …, plus `D restore` while an archived row is on screen); with a pane
 focused, only what banto itself takes there — the configured prefix chord as the
-operator would name it (`Ctrl+B`, or a bare character), `F2 list`, and `F3 next
-pane` when the staged brigade has more than one tile that is not collapsed; while
+operator would name it (`Ctrl+B`, or a bare character), `F2 list`, `F3 next
+pane` when the staged brigade has more than one tile that is not collapsed, and
+`F4 bell` always; while
 searching, the search keys. A transient status replaces the hints. The text is
-built by one pure function (`banto_tui::hints`).
+built by one pure function (`banto_tui::hints`). While the brigade bell's switch
+is on, the badge `BELL ALWAYS` stands in the right-hand segment of the bar, left
+of the match counts, whichever focus and whichever left-hand text (hints, a
+status, the quit prompt, the closing line) the bar has; a switch that is off
+shows nothing. On a terminal too narrow for everything, the left-hand text gives
+way first, then the counts, then the badge's tail.
 Multiline paste and file drag&drop into panes are synthesized into bracketed
 pastes host-side, since the Windows console never reports pastes as pastes.
+
+**Is it idle? (the quit question).** Quitting ends every hosted process, but the
+operator quits when everything is idle and, with the old rule (ask whenever
+anything is hosted), was made to press twice every time. So the question is not
+"is anything hosted" but "could ending a session lose work in flight", and it is
+asked of each hosted pane (staged or off-stage, collapsed or not) as a
+three-valued fact, `banto_core::model::Quiescence`: **idle**, **not idle**,
+**unknown**. Unknown is its own answer, never folded into idle: both readers of
+it fail safe on it (a quit asks; the brigade bell stays silent). The shell
+gathers it about once a second, just ahead of the tick, from reads the tick
+already makes, and hands it to the core as `Event::QuiescenceSampled`, which
+replaces the previous sample as a whole; the core decides, so a replay of the
+recorded stream gets the same answers. Every tick produces a complete sample:
+when the brigade roster cannot be read, the panes that can still be observed
+without it (what the live files and the session list say) keep their fresh
+answer, and only what needed the roster to be understood reads unknown. Nothing
+older than the tick survives into the next one.
+
+- *Claude Code:* the session's live file (`sessions/<pid>.json`, PID alive) says
+  `status: idle` → idle. `busy`, `waiting`, `shell` (see "Data sources") and any
+  other or missing status → not idle, since each means something is running or
+  waiting that ending the session would lose; with several live entries for the
+  session any one that is not idle decides. No live entry with a live PID →
+  unknown (a fresh session publishes its file a moment after it starts).
+- *Codex:* the rollout's last turn marker (see "Codex data sources", "What the
+  markers mean"): ended → idle; started → not idle; no marker, no such thread,
+  no readable rollout or no Codex home → unknown. Known limit, stated there: a
+  command Codex left running after its turn ended is invisible to it, so such a
+  session reads as idle.
+- *A pane the sample does not cover* (opened since the last sample, a brigade
+  member with no session id yet) → unknown, so a new pane asks rather than being
+  taken for idle. A pane whose process ended is gone and counts for nothing.
+- *Recent input:* a pane also counts as not idle for 3 seconds
+  (`QUIT_RECENT_INPUT_WINDOW`) after anything was typed into it — the operator's
+  keys, a mouse report or a paste forwarded to it (a key from pane focus that
+  encodes to no bytes still counts), or something banto wrote itself to start or
+  continue a turn: the relay's nudge line and its delayed submitting Enter, a
+  Codex Worker's or a Goinkyo's kickoff line and its retries (an Enter-only retry
+  included) — whatever its sample says. The focus reports banto writes to a pane
+  start nothing and do not count. The sample is up to a tick plus the product's own report lag behind a turn
+  that input has only just started; without this, a prompt submitted a moment ago
+  still reads idle and one `q` quits on it. The quit question reads all of this; the
+  brigade bell reads only banto's own writes (never the operator's input, see
+  "The quiet brigade's bell"), and the relay decides from the sample alone.
+
+One `q`/`Esc` quits when no hosted pane is counted; otherwise the first press arms
+the prompt `Esc again to quit — N session(s) not idle`, N the number counted, and
+the window, the second key and the ways it is dropped are as in the key table. The
+prompt is rebuilt from the current count at every update and goes when the count
+reaches zero. The decision uses the last sample, so it can be about a tick (plus
+the product's report lag) behind a turn that has only just begun. Cost: a Claude
+pane adds no read (the live-file scan and process snapshot are the relay's); a
+Codex brigade member adds none (the relay already tails its rollout every tick);
+a hosted Codex pane outside any brigade adds one sqlite lookup and one rollout
+tail per tick (`docs/DISCIPLINE.md`, Appendix A).
+
+**The closing line.** The shutdown sweep that runs once quitting is decided
+closes each hosted pane in turn and then waits for the children, up to 5 seconds
+in all (`SHUTDOWN_GRACE`); no further frame is drawn while it runs, so before this
+nothing on screen said that banto was closing, and the status line had already
+gone back to its hints. Once `App::should_quit()` is set the status line therefore
+shows `Closing — ending N session(s)…` — `Closing…` when nothing is hosted — with
+priority over everything else the line can show (the quit prompt, a status, the
+armed-prefix hint, a startup notice), until the process exits. It is the same
+text for every way of quitting (one press or two), N counts every hosted session,
+idle or not, since all of them are about to be ended, and the last frame is always
+presented, never skipped as unchanged. Terminal close, a fatal error and a panic
+are not quits in this sense and draw nothing of the kind.
+
+**Attention.** Two things tell the operator that a pane wants him, and a host
+bell comes with the second. A *mark*: a staged pane's border is drawn in the
+waiting colour (magenta) while the session list shows its session as Waiting
+(Claude Code only), or after its child rang BEL while the pane was not
+*effectively focused* — the focus on the panes, the pane selected, and banto's own
+window focused (the same rule DECSET 1004 focus reports use; before the terminal
+has said anything the window counts as focused). A mark from a BEL clears when the
+pane becomes effectively focused. The sidebar's title counts the visible Waiting
+Claude sessions. The *host bell* (a BEL written to banto's own terminal) rings
+when the set of visible Waiting rows and marked panes gains a member, at most once
+per 3 seconds (`ATTENTION_BELL_COOLDOWN`, shared by every cause below). Only a
+staged pane draws a mark. Codex has no Waiting report; banto launches it with
+`tui.notifications` set to `approval-requested`, `async-question` and
+`plan-mode-prompt` (with `bel` as the method and `always` as the condition), so
+that a prompt waiting on the operator rings the child's BEL, which the mark and
+bell above pick up. *Read in the Codex source at tag `rust-v0.168.0`:* those three
+are TUI notification types (exec/edit/elicitation approvals; a question the model
+asks; the plan-implementation prompt), and the fourth, `agent-turn-complete`, is
+left out on purpose — the bell is meant to be rarer than every turn. *Measured
+2026-08-06 on `codex-cli` 0.146.1 (see `crate::launch`), with the list as it was
+then, `approval-requested` alone:* a plain turn rang nothing; a turn forced to
+request approval rang exactly one bare BEL with the condition `always` and none
+with Codex's default `unfocused` (Codex counts a banto-hosted pane as focused
+whatever the operator is looking at). The two names added since were not part of
+that measurement, and Codex's own approval heuristics decide how often an
+approval is asked at all.
+
+**The quiet brigade's bell.** The operator's reason: a brigade going quiet is the
+moment his input is wanted, and it is rare enough to deserve a sound. It uses the
+mechanism above rather than a new one.
+
+- *Watched:* every brigade whose Director is hosted; its members are every hosted
+  member (the Director, the Workers, a Goinkyo).
+- *Fires* when every member's sample is idle and has been for 5 seconds
+  (`BRIGADE_QUIET_SETTLE`), counted from the later of two moments: (a) the start of
+  the unbroken all-idle stretch — the last member becoming idle, or the set of
+  hosted members last changing (a member hosted, gone, or relaunched under the same
+  key restarts it; a key that merely changes for the same process, as discovery or a
+  compaction fork do, does not); and (b) the last time banto itself wrote into a
+  hosted member of that brigade to start or continue a turn (the relay's nudge line
+  and its submitting Enter, a kickoff line, a kickoff retry). It also needs the
+  brigade to have been *armed* by real work since it last fired or since banto began
+  watching it (next bullet), so a brigade that never did anything does not ring and
+  one that fired does not ring again until someone works; a change of members
+  neither sets nor clears that. The decision is made at the end of the tick, after
+  the relay has decided what to type, so it never fires in a tick in which banto
+  types into a member of that brigade; sampling is about once a second, so the wait
+  is met between 5 and 6 seconds after its start. Why: a Worker that reports ends
+  its own turn before the relay has typed the nudge into the Director, and the
+  Director only reads busy in a later sample, so for a moment the whole brigade is
+  idle with work still in flight; the bell must not ring just before the brigade
+  starts working again. A nudge the relay holds back writes nothing and so moves
+  this counting not at all; what keeps the bell from ringing while it is held back
+  is the unread mail itself ("Mail on the way", below).
+- *Armed by real work:* a member reading not idle while its process is still
+  starting up delays the bell like any not-idle reading (it breaks the stretch) but
+  does not arm it. A not-idle reading arms the brigade only from a process that has
+  been sampled idle before (from the next sample on), or that was given work at or
+  after its start — by the operator's input forwarded to it, or by banto's own nudge
+  or kickoff; input written under the same key before this process started does not
+  count. Per process, so a relaunch under the same key starts over and a key rename
+  keeps what the process had. *Why, measured:* in the operator's trial on 2026-11-13
+  (event recording), opening a brigade of resumed sessions rang the bell about 5
+  seconds later with no work done: resumed Claude sessions read not idle for one to
+  two seconds while starting (run A: all idle 6.1 s after a spawn at 2.1 s; run B:
+  all idle 3.2 s after a spawn at 0.9 s). *Known consequence:* a resumed member that
+  starts working on its own, never touched and never seen idle, does not arm the
+  bell that first time.
+- A member whose state is *unknown* blocks it and breaks the idle stretch: silence
+  is not claimed on missing information. A *waiting* member is not idle.
+- *Mail on the way:* a brigade is not quiet while one of its hosted members has
+  unread brigade mail that the relay will still deliver on its own — the relay is
+  automatic (`[brigade].relay = "auto"`) and has not used up its nudge attempts (3,
+  `RELAY_MAX_ATTEMPTS`) on that batch. While such mail is pending, a member whose
+  sample reads idle counts like an unknown one (blocks firing, breaks the stretch),
+  however long the nudge is held back, whatever the hold reason (an unsent draft in
+  the recipient, the operator's recent input in the pane, the idle streak, the
+  cooldown, a member that is not idle). Why (reversed after the operator's trial on
+  2026-11-13): he had scrolled and clicked in the Director's pane, so the relay held
+  the nudge for a Worker's report for about 30 s (its input quiet period — wheel and
+  mouse events forwarded to a Claude pane count as operator input), every member
+  sampled idle meanwhile, and the bell rang 5 s in with the report still unread; to
+  him the work was not finished. Mail the relay will not deliver — relay not
+  automatic, or attempts exhausted — does not hold the bell: the brigade is then
+  waiting on the operator. Consequences: a nudge delivered but never read keeps the
+  bell held through the relay's retries, and an operator's draft left in a Worker's
+  pane holds that Worker's mail and so the bell. In detail, for a nudge typed but
+  not answered: the bell stays held through the relay's retries (a cooldown of 60 s
+  between nudges, up to 3 attempts); once the last attempt has been written the mail
+  no longer counts, and the bell rings 5 s after that nudge's submitting Enter
+  unless the mail is read first. Switching the relay to manual ends the hold, and
+  the brigade rings after a normal settle from then. Mail counts as pending only if
+  *this tick's* observation of that member says it has some (relay automatic,
+  attempts not used up); nothing is carried over from an earlier tick, and a member
+  the tick did not observe has no mail as far as the bell knows.
+- *A kickoff still owed:* only a freshly added Codex Worker and a freshly summoned
+  Goinkyo are given a first line typed by banto to start their first turn (see
+  "Brigade"); a Claude Worker, the Director and a resumed member are not, and are
+  never owed one. From the moment such a pane is hosted until banto's kickoff
+  tracking drops it — the kickoff acknowledged (a session discovered for the pane,
+  or its session row), the pane gone, or the failure reported — a member whose
+  sample reads idle counts like an unknown one: it blocks firing and breaks the
+  stretch. That covers every state in between (waiting for the boot output to go
+  quiet, the trust check in flight, the line typed and awaiting its acknowledgement,
+  a retry pending). Why: a newly summoned member can sit idle at its prompt for
+  longer than the settle time before banto types its kickoff, and the bell must not
+  ring while banto itself is about to start it. The stretch then runs from after the
+  kickoff stops being owed, or from banto's last write into the member, whichever is
+  later. Not owed, though the tracking entry stays — the brigade then really is
+  waiting on the operator, which is what the bell is for: the directory was reported
+  not trusted and nothing has been typed (the operator has to answer the pane's
+  prompt); the operator has an unsent draft in that pane (the retry waits for them);
+  the last allowed attempt (three) was typed and its 15-second acknowledgement
+  window has run out.
+- *Effect:* it marks the Director's pane and, through the bell's edge, rings (under
+  the 3-second cooldown). Not while the Director's pane is effectively focused (the
+  selected pane and banto's window focused) — there every turn the Director ends
+  would otherwise ring; with the window in the background it marks and rings. A
+  fired brigade is spent either way: being in the Director's pane does not save the
+  ring for when the operator leaves it. An off-stage brigade is watched and latches
+  the mark, but only a staged pane draws one, so the mark and the bell wait until
+  the brigade is staged. A brigade whose Director is not hosted is not watched. A
+  brigade is judged only in a tick whose relay observations include its Director
+  (the store was read this tick and still has the brigade, and the Director is
+  hosted with a session), and the observation is about the pane banto itself holds
+  for that member: the pane is hosted and banto's own membership for it is the same
+  brigade and the same member token. Any other observation is ignored by the bell —
+  for "Director observed" and for "unread mail" alike — and so only delays it; the
+  reason, found in review, is that one taken at face value could mark a brigade as
+  observed, or mail as unread, through a pane that is not that member (a tick
+  gathered just before a session-id change the core has already applied). In a tick
+  without that observation — a roster that could not be read, or the brigade gone
+  from the store by any path, another banto on the same database included — nothing
+  fires and the quiet stretch starts over; the armed state is kept. A disband in
+  flight does not fire and its watch is kept as it was; a successful disband ends
+  the watch (what was kept for it is dropped with it); a failed one leaves it
+  watched; and a former Director left open on its own never rings for the brigade
+  that is gone (its pane keeps the membership maps it was staged with, which is why
+  the test is observation, not those maps). A brigade formed again around the same
+  Director is a new brigade and starts fresh. Consequences: during a roster outage
+  of any length nothing rings, and the count starts over when observations return; a
+  Director hosted before its session is discovered is not observed, so its brigade
+  is not judged until discovery completes.
+- *The principle:* the bell decides only from what the tick observed. Why: a
+  remembered "unread" or "exists" could hold or ring forever once the thing it
+  described could no longer be checked (found in review).
+- *The switch:* the function key `F4` — one keystroke from the list or from a pane,
+  taken by banto like `F2`/`F3` and not forwarded to the agent — toggles "ring even
+  while the Director's pane is focused" — the bell only, under the usual cooldown,
+  no mark (a focused pane never carries one); every other case is unchanged. The
+  status line says which way it went (`brigade bell: on, it rings even while the
+  Director's pane is focused` / `brigade bell: off, it stays silent while the
+  Director's pane is focused`), and while it is on the badge `BELL ALWAYS` stands on
+  the status bar. It is persisted (`ui_prefs`, key `bell_when_focused`; see "What is
+  kept across a restart") and is off by default and when the stored value is
+  unusable. It is deliberately a runtime switch and not a `config.toml` key: whether
+  the operator wants the sound depends on what he is doing, and he wants to change
+  it while running. It is a function key rather than a prefix chord because he wants
+  to flip it casually, in one keystroke, while working.
+- *Known limits:* the rule trusts each product's own report, so a Codex member
+  running a command left over from its turn reads idle (above); and sub-agent
+  activity is not tracked.
 
 **ConPTY caveats** (`docs/notes/embedded-pty-spike.md`, 2026-07-22 spike plus
 2026-07-24 dogfooding, all on Windows): never answer the outer terminal's own
@@ -1406,9 +1739,17 @@ themselves.
    (special color, highest priority)
 2. `sessions/<pid>.json` exists, PID alive, and `status=waiting` → **waiting**
    (Claude Code only; human input is required)
-3. PID alive with any other status → **active** (idle). Unknown upstream
-   statuses deliberately degrade here.
+3. PID alive with any other status → **active** (idle) — `idle` itself, and
+   `shell` (the turn ended with a background shell command still running).
+   Unknown upstream statuses deliberately degrade here.
 4. Otherwise bucket by jsonl mtime: today / this week / older
+
+This is the list's drawing only. The stricter question "is this session known
+to be doing nothing?" — asked by the quit confirmation and the brigade bell
+(see "The emporium: hosted panes") — reads the same file the other way round:
+only `idle` is idle, `shell` is not, and an unrecognised status is not either.
+The relay, which asks whether a member can be nudged, still treats `shell` as
+idle enough: it is neither busy nor waiting for the operator.
    (thresholds and colors configurable)
 
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,

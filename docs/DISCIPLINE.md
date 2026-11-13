@@ -270,7 +270,15 @@ right).
 
 Process spawning: `PortablePtyHost` (ConPTY), worker auto-spawn.
 File reads: session jsonl (head + tail chunks), `sessions/<pid>.json`,
-`config.toml`, dependency-free re-reads on live reload.
+`config.toml`, dependency-free re-reads on live reload. Codex's reads (its
+`threads` sqlite lookup, read-only, and a tail of the rollout `.jsonl` for the
+last turn marker) postdate this sweep and were added to the list on 2026-11-13
+by reading the code, not by repeating it: once a tick the relay reads them for
+every Codex brigade member, and the "is it idle?" sample for the quit question
+and the brigade bell (`Event::QuiescenceSampled`) now reads them for every other
+hosted Codex pane too — one sqlite lookup and one rollout tail per such pane per
+tick. A hosted Claude pane adds no read of its own: the live-file scan and the
+process snapshot are shared with the relay.
 File writes: banto's own sqlite DB, per-member `--mcp-config` files,
 diagnostic logs (`BANTO_INPUT_LOG`) — all under banto's
 own config/data dirs, never `~/.claude`.
@@ -288,7 +296,8 @@ is already a pure function of injected timestamps).
 Processes: PID liveness via sysinfo (`ProcessProbe`).
 MCP: stdio JSON-RPC in `_mcp` (per-connection).
 Terminal control: raw mode, alt screen, mouse capture, bracketed paste,
-terminal size.
+terminal size, the host bell (`Cmd::RingHostBell`, a bare BEL — also what a
+brigade going quiet rings through).
 Environment: the variables startup reads (`BANTO_CONFIG`, `XDG_CONFIG_HOME`,
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`), gathered into plain values before anything
 decides from them — with the relay decision functions, the house pattern to

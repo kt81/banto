@@ -331,18 +331,33 @@ impl CodexBrigade {
     }
 }
 
-/// `-c tui.notifications=["approval-requested"]`: opts a Codex launch into
-/// its own approval-pending notification event — the one Codex fires when a
-/// tool call is waiting on the operator. This is the most fragile of the
-/// three overrides below, and the one that breaks with no local edit
-/// whatsoever: `--strict-config` (Codex's own config-validation flag)
-/// rejects an unknown config *key*, but does not validate the strings
-/// inside a list *value* — a typo here, or an upstream rename of the event
-/// itself, passes validation silently. The launch still succeeds, nothing
-/// warns, and the bell simply stops existing. See [`NOTIFICATION_OVERRIDES`]
-/// for the build/date this was last checked against, and why nothing in
-/// this repository can catch it going stale.
-const NOTIFICATION_EVENT_OVERRIDE: &str = "tui.notifications=[\"approval-requested\"]";
+/// `-c tui.notifications=[...]`: the Codex notification events a launch opts
+/// into, three of the four its TUI knows. Per Codex's source at tag
+/// `rust-v0.168.0` (read, not measured here):
+///
+/// - `approval-requested`: a tool call waiting on the operator — exec
+///   approvals, edit approvals and MCP elicitations.
+/// - `async-question`: a question the model asks the user (`request_user_input`).
+/// - `plan-mode-prompt`: the plan-implementation prompt.
+///
+/// All three are moments the session is waiting for a person, which is what a
+/// bell here means (the engine turns a BEL from a pane that is not focused into
+/// an attention mark). `agent-turn-complete`, the turn-end event, stays out:
+/// measured on 0.146.1 (see [`NOTIFICATION_OVERRIDES`]), a plain turn rang
+/// nothing with this list as it was, and the bell is meant to be rarer than every
+/// turn.
+///
+/// This is the most fragile of the three overrides below, and the one that
+/// breaks with no local edit whatsoever: `--strict-config` (Codex's own
+/// config-validation flag) rejects an unknown config *key*, but does not
+/// validate the strings inside a list *value* — a typo here, or an upstream
+/// rename of an event, passes validation silently. The launch still succeeds,
+/// nothing warns, and that prompt simply stops ringing. See
+/// [`NOTIFICATION_OVERRIDES`] for the build/date this was last checked
+/// against, and why nothing in this repository can catch it going stale; the two
+/// names added later were not part of that measurement.
+const NOTIFICATION_EVENT_OVERRIDE: &str =
+    "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]";
 
 /// `-c tui.notification_method="bel"`: the transport for the event above.
 /// Breaks in two different shapes, neither of them a single obvious tidy:
@@ -857,7 +872,7 @@ mod tests {
             [
                 "codex",
                 "-c",
-                "tui.notifications=[\"approval-requested\"]",
+                "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
                 "-c",
                 "tui.notification_method=\"bel\"",
                 "-c",
@@ -886,7 +901,7 @@ mod tests {
                 "-m",
                 "o3",
                 "-c",
-                "tui.notifications=[\"approval-requested\"]",
+                "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
                 "-c",
                 "tui.notification_method=\"bel\"",
                 "-c",
@@ -919,7 +934,7 @@ mod tests {
             [
                 "codex",
                 "-c",
-                "tui.notifications=[\"approval-requested\"]",
+                "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
                 "-c",
                 "tui.notification_method=\"bel\"",
                 "-c",

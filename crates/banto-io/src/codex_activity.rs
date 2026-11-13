@@ -46,6 +46,21 @@
 //! `task_complete` yet, so it never misreads as idle no matter how long a
 //! retry backoff runs. [`is_thread_idle`] reads exactly this.
 //!
+//! # What closes a turn
+//!
+//! Besides `task_complete`, Codex writes `turn_aborted` (payload `reason`:
+//! `interrupted`, `replaced`, `review_ended` or `budget_limited`) when a turn is
+//! aborted — the operator pressing Esc, say — and accepts `turn_started` /
+//! `turn_complete` as aliases of the other two. These come from reading Codex's
+//! source at tag `rust-v0.168.0`, not from a measurement made here; the
+//! `task_*` pair and its 1:1 pairing below are the ones that were measured. A
+//! turn that dies with the process writes no end record at all, so a start with
+//! no end still reads as mid-turn; and an aborted turn must read as ended, or an
+//! interrupted member would look busy until its next turn. What a `replaced`
+//! abort is followed by is not among those facts, so the scan does not assume
+//! anything: it reads the last lifecycle record, a start after the abort as
+//! mid-turn and an abort with nothing after it as ended.
+//!
 //! # A trap this module works around
 //!
 //! `task_complete`'s own record can be large — it was observed re-embedding
@@ -79,11 +94,14 @@ const TAIL_START_BYTES: u64 = 8 * 1024;
 /// ever reading a whole multi-megabyte rollout just to answer one query.
 const TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The two rollout markers this module distinguishes — see the module doc
-/// for why they're a reliable 1:1 pair rather than a name banto invented.
+/// What the rollout's last turn-lifecycle record says — see the module doc for
+/// why this is a state read and which record types it covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnMarker {
+    /// A turn began and no record has ended it.
     TaskStarted,
+    /// The turn ended: completed (with or without an error) or aborted. The
+    /// name is the common case's.
     TaskComplete,
 }
 
@@ -205,9 +223,12 @@ fn last_turn_marker_in(buf: &[u8], leading_may_be_partial: bool) -> Option<TurnM
         .find_map(|line| parse_turn_marker(line.trim()))
 }
 
-/// Parses one rollout JSONL line, returning `Some` only for
-/// `{"type":"event_msg","payload":{"type":"task_started"|"task_complete"}}`.
-/// Every other record shape (malformed JSON, a different `type`, a
+/// Parses one rollout JSONL line, returning `Some` only for an `event_msg`
+/// whose payload type is one of the turn-lifecycle records: `task_started`
+/// (alias `turn_started`) opens a turn; `task_complete` (alias
+/// `turn_complete`, which also carries an `error` when the turn ended on one)
+/// and `turn_aborted` (written when a turn is aborted, whatever the `reason`)
+/// end it. Every other record shape (malformed JSON, a different `type`, a
 /// different `event_msg` payload) is `None` — leniently, the same contract
 /// as every other rollout/log reader in this crate.
 fn parse_turn_marker(line: &str) -> Option<TurnMarker> {
@@ -219,8 +240,8 @@ fn parse_turn_marker(line: &str) -> Option<TurnMarker> {
         return None;
     }
     match value.get("payload")?.get("type")?.as_str()? {
-        "task_started" => Some(TurnMarker::TaskStarted),
-        "task_complete" => Some(TurnMarker::TaskComplete),
+        "task_started" | "turn_started" => Some(TurnMarker::TaskStarted),
+        "task_complete" | "turn_complete" | "turn_aborted" => Some(TurnMarker::TaskComplete),
         _ => None,
     }
 }
@@ -228,6 +249,7 @@ fn parse_turn_marker(line: &str) -> Option<TurnMarker> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_core::model::Quiescence;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -358,6 +380,102 @@ mod tests {
         assert_eq!(tail_turn_marker(&path), Some(TurnMarker::TaskStarted));
     }
 
+    fn turn_aborted(reason: &str) -> String {
+        format!(r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","reason":"{reason}"}}}}"#)
+    }
+
+    fn lifecycle(kind: &str) -> String {
+        format!(r#"{{"type":"event_msg","payload":{{"type":"{kind}"}}}}"#)
+    }
+
+    fn marker_of(lines: &[String]) -> Option<TurnMarker> {
+        let dir = TempDir::new().unwrap();
+        let path = write_rollout(dir.path(), "r.jsonl", lines);
+        tail_turn_marker(&path)
+    }
+
+    #[test]
+    fn a_turn_that_was_aborted_after_it_started_is_idle() {
+        let lines = [task_started(), user_message(), turn_aborted("interrupted")];
+        assert_eq!(marker_of(&lines), Some(TurnMarker::TaskComplete));
+    }
+
+    #[test]
+    fn every_abort_reason_ends_the_turn() {
+        for reason in ["interrupted", "replaced", "review_ended", "budget_limited"] {
+            let lines = [task_started(), turn_aborted(reason)];
+            assert_eq!(
+                marker_of(&lines),
+                Some(TurnMarker::TaskComplete),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_started_after_an_abort_is_mid_turn_again() {
+        let lines = [
+            task_started(),
+            turn_aborted("interrupted"),
+            task_started(),
+            user_message(),
+        ];
+        assert_eq!(marker_of(&lines), Some(TurnMarker::TaskStarted));
+        // A replaced turn followed by the turn that replaced it.
+        let lines = [task_started(), turn_aborted("replaced"), task_started()];
+        assert_eq!(marker_of(&lines), Some(TurnMarker::TaskStarted));
+    }
+
+    #[test]
+    fn the_turn_spellings_are_the_same_markers_as_the_task_ones() {
+        assert_eq!(
+            marker_of(&[lifecycle("turn_started")]),
+            Some(TurnMarker::TaskStarted)
+        );
+        assert_eq!(
+            marker_of(&[lifecycle("turn_started"), lifecycle("turn_complete")]),
+            Some(TurnMarker::TaskComplete)
+        );
+        // Mixed spellings pair like any other.
+        assert_eq!(
+            marker_of(&[lifecycle("task_started"), lifecycle("turn_complete")]),
+            Some(TurnMarker::TaskComplete)
+        );
+        assert_eq!(
+            marker_of(&[
+                lifecycle("turn_started"),
+                lifecycle("task_complete"),
+                lifecycle("turn_started")
+            ]),
+            Some(TurnMarker::TaskStarted)
+        );
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_an_error_is_idle() {
+        let complete_with_error =
+            r#"{"type":"event_msg","payload":{"type":"turn_complete","error":"stream closed"}}"#
+                .to_string();
+        assert_eq!(
+            marker_of(&[task_started(), complete_with_error]),
+            Some(TurnMarker::TaskComplete)
+        );
+    }
+
+    #[test]
+    fn a_start_with_no_end_stays_mid_turn_and_nothing_readable_stays_unknown() {
+        // A process that died mid-turn wrote no end: still mid-turn.
+        assert_eq!(
+            marker_of(&[task_started(), user_message()]),
+            Some(TurnMarker::TaskStarted)
+        );
+        // An abort-shaped record that is not an `event_msg` is no marker.
+        let not_an_event =
+            r#"{"type":"response_item","payload":{"type":"turn_aborted"}}"#.to_string();
+        assert_eq!(marker_of(&[not_an_event]), None);
+        assert_eq!(marker_of(&[user_message()]), None);
+    }
+
     // -- rollout_path_for -----------------------------------------------
 
     fn threads_db(dir: &TempDir) -> CodexHome {
@@ -429,6 +547,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(is_thread_idle(&home, "t1", None), Some(true));
+    }
+
+    #[test]
+    fn a_hosted_codex_threads_quiescence_follows_its_last_turn_marker() {
+        let dir = TempDir::new().unwrap();
+        let home = threads_db(&dir);
+        let rollout = write_rollout(dir.path(), "r.jsonl", &[task_started()]);
+        Connection::open(home.threads_db_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES ('t1', ?1)",
+                [rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        let quiescence = || Quiescence::from_probe(is_thread_idle(&home, "t1", None));
+
+        assert_eq!(quiescence(), Quiescence::NotIdle, "task_started: mid-turn");
+
+        std::fs::write(
+            &rollout,
+            format!("{}\n{}\n", task_started(), task_complete()),
+        )
+        .unwrap();
+        assert_eq!(quiescence(), Quiescence::Idle, "task_complete: turn ended");
+
+        // Nothing usable is Unknown, never Idle: no marker, no such thread,
+        // an unreadable rollout.
+        std::fs::write(&rollout, format!("{}\n", user_message())).unwrap();
+        assert_eq!(quiescence(), Quiescence::Unknown, "no marker");
+        assert_eq!(
+            Quiescence::from_probe(is_thread_idle(&home, "nope", None)),
+            Quiescence::Unknown,
+            "no such thread"
+        );
+        std::fs::remove_file(&rollout).unwrap();
+        assert_eq!(quiescence(), Quiescence::Unknown, "rollout gone");
+    }
+
+    #[test]
+    fn an_interrupted_thread_reads_idle_end_to_end() {
+        let dir = TempDir::new().unwrap();
+        let home = threads_db(&dir);
+        let rollout = write_rollout(
+            dir.path(),
+            "r.jsonl",
+            &[task_started(), user_message(), turn_aborted("interrupted")],
+        );
+        Connection::open(home.threads_db_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES ('t1', ?1)",
+                [rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        assert_eq!(is_thread_idle(&home, "t1", None), Some(true));
+        assert_eq!(
+            Quiescence::from_probe(is_thread_idle(&home, "t1", None)),
+            Quiescence::Idle
+        );
     }
 
     #[test]

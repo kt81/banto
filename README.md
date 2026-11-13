@@ -100,6 +100,22 @@ members with unread messages and wakes them by typing a short fixed nudge
 into their stdin — so a Director→Worker→Director round trip needs no human
 ferrying at all. This repository was largely built through that loop.
 
+When every live member of a brigade (the Director, the Workers, a Goinkyo) has
+been idle for 5 seconds after any of them did real work (starting up is not
+work) — counted from the
+last member going idle or banto last prompting one — the brigade has
+gone quiet — the moment your input is wanted. banto then marks the Director's
+pane (the magenta border a waiting session gets) and rings the terminal bell.
+It stays silent while you are looking at the Director's pane (that pane
+selected and banto's window focused); with the window in the background it
+marks and rings. A member whose state banto cannot read keeps it quiet, as does a
+new Codex Worker or Goinkyo that banto has yet to start, as does a member with an
+unread report still on its way, and a
+brigade that is not on screen shows the mark, and rings, once you stage it.
+`F4` switches on "ring even while the Director's pane is focused" (the
+bell only, no mark); the status bar shows `BELL ALWAYS` left of the counts
+while it is on, and the setting is remembered across restarts.
+
 Forming your first Codex brigade needs one thing from you: Codex reviews
 banto's own hook for trust at its own startup, once — not per launch — so
 banto opens a one-time approval pane for you to clear before that first cell
@@ -183,10 +199,19 @@ still accepted, do nothing, and will be removed.)
 
 ## Keys
 
-One table. The first group is the list; the rest is what the panes add. With
-any session running, `q`/`Esc` takes two presses within 3 seconds (the first
-shows `Esc again to quit — N session(s) running`), since quitting ends every
-hosted process.
+One table. The first group is the list; the rest is what the panes add.
+
+`q`/`Esc` quits at once when every hosted session is known to be idle, or none
+is hosted. Otherwise it asks first: the status bar shows `Esc again to quit —
+N session(s) not idle`, and a second `q`/`Esc` within 3 seconds quits, since
+quitting ends every hosted process. N counts the sessions that are working,
+waiting on you, of unknown state, or that were typed into (by you, or by banto
+itself) within the last 3 seconds. A Claude Code session reports its own state;
+a Codex session is idle once its last turn has ended — Codex records nothing
+about a command it left running in the background after that, so such a
+session reads as idle. Once quitting is decided the status bar reads `Closing —
+ending N session(s)…` (`Closing…` with none) until banto exits: each session
+is closed in turn and given up to 5 seconds to finish.
 
 | Key | Action |
 |---|---|
@@ -198,11 +223,12 @@ hosted process.
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
 | `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
 | `D` | Restore (un-archive) the selected session, while archived ones are revealed |
-| `q` / `Esc` | Quit (two presses while sessions are running, see above) |
+| `q` / `Esc` | Quit (a second press is needed while a session is not idle, see above) |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
+| `F4` | Switch the brigade bell (see "Director/Worker cells") between silent-while-you-watch and ringing even while the Director's pane is focused; one keystroke from the list or from a pane, taken by banto and not sent to the agent; the status bar shows `BELL ALWAYS` while the second is on |
 | `Ctrl+B` … | tmux-style prefix (configurable), from the list or a pane: |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
@@ -219,7 +245,7 @@ hosted process.
 
 While the prefix is armed, the status bar shows the full binding table —
 nothing to memorize; otherwise its hints follow the focus (the list keys when the
-list is focused, just the prefix chord and `F2`/`F3` when a pane is). Multiline paste and file drag&drop into panes work
+list is focused, just the prefix chord and `F2`/`F3`/`F4` when a pane is). Multiline paste and file drag&drop into panes work
 (synthesized into bracketed pastes host-side, since the Windows console
 never reports pastes as pastes).
 

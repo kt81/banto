@@ -9,6 +9,12 @@
 use banto_core::app::Mode;
 use banto_core::engine::Focus;
 
+/// The standing badge on the status bar's right while the brigade-quiet bell is
+/// set to ring even with the Director's pane focused. Shown only while on: a
+/// mode that is off says nothing. The word BELL names the thing and ALWAYS what
+/// differs from the default (focus no longer silences it).
+pub const BELL_BADGE: &str = "BELL ALWAYS";
+
 /// Shown while the search box is open, whichever side has the focus.
 pub const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
 
@@ -16,7 +22,7 @@ pub const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
 pub const PREFIX_HINTS: &str = "prefix: Esc cancel · o/Tab cycle · arrows move · Shift+Up/Down reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x close";
 
 const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
-                          F3 next pane · / search · n new · d archive · g group · \
+                          F3 next pane · F4 bell · / search · n new · d archive · g group · \
                           Tab grouped/flat · p pin · a reveal · q/Esc quit";
 
 /// Appended only while an archived row is on screen. The bar was already tight
@@ -59,6 +65,7 @@ pub fn idle_hints(input: &IdleHintsInput<'_>) -> String {
             if input.focusable_tiles > 1 {
                 hints.push_str(" · F3 next pane");
             }
+            hints.push_str(" · F4 bell");
             hints
         }
     }
@@ -99,7 +106,7 @@ mod tests {
         assert_eq!(
             hints,
             "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
-             F3 next pane · / search · n new · d archive · g group · \
+             F3 next pane · F4 bell · / search · n new · d archive · g group · \
              Tab grouped/flat · p pin · a reveal · q/Esc quit"
         );
         assert!(!hints.contains("Tab view"));
@@ -121,7 +128,7 @@ mod tests {
     #[test]
     fn pane_focus_offers_only_what_banto_takes_there() {
         let hints = idle_hints(&input(Focus::Pane, Mode::Normal));
-        assert_eq!(hints, "Ctrl+B prefix · F2 list · F3 next pane");
+        assert_eq!(hints, "Ctrl+B prefix · F2 list · F3 next pane · F4 bell");
         for key in LIST_ONLY_KEYS {
             assert!(!hints.contains(key), "{key:?} in {hints:?}");
         }
@@ -141,7 +148,7 @@ mod tests {
         // A non-brigade session: nothing for F3 to step through.
         let mut solo = input(Focus::Pane, Mode::Normal);
         solo.focusable_tiles = 0;
-        assert_eq!(idle_hints(&solo), "Ctrl+B prefix · F2 list");
+        assert_eq!(idle_hints(&solo), "Ctrl+B prefix · F2 list · F4 bell");
     }
 
     #[test]
@@ -166,5 +173,6 @@ mod tests {
         assert!(PREFIX_HINTS.starts_with("prefix: Esc cancel"));
         assert!(!PREFIX_HINTS.contains("kill"));
         assert!(PREFIX_HINTS.contains("Shift+Up/Down reorder"));
+        assert!(!PREFIX_HINTS.contains("bell"), "F4 is not a prefix key");
     }
 }

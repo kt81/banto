@@ -12,6 +12,10 @@
 //! degrade to [`Activity::Alive`], preserving today's behavior if upstream
 //! adds another state.
 //!
+//! The same live file also answers a second, stricter question —
+//! [`claude_quiescence`], "is this session known to be doing nothing?" — where
+//! the degradation runs the other way: only the `idle` report is idle.
+//!
 //! PID liveness sits behind [`ProcessProbe`] so tests can mock it (no real
 //! processes in tests). Bucketing itself lives in `banto_core::status`, a
 //! pure function of (mtime, now, thresholds).
@@ -25,7 +29,7 @@ pub use probe::{ProcessProbe, SysinfoProbe, ancestry_reaches};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use banto_core::model::{Activity, SessionMeta};
+use banto_core::model::{Activity, Quiescence, SessionMeta};
 use banto_core::status::{AgeThresholds, age_bucket};
 
 /// The two [`LiveSession::status`] values compared against anywhere in this
@@ -57,8 +61,51 @@ use banto_core::status::{AgeThresholds, age_bucket};
 /// change to one (upstream renaming this field's value, say) from silently
 /// moving the other. Nothing here would catch that if they were unified —
 /// renaming a shared constant compiles cleanly either way.
+///
+/// A fourth value, `"shell"`, was reported on 2.1.323, 2026-11-13, by another
+/// member's measurement (not re-measured here): the turn has ended but a
+/// background shell command of the session, or of one of its sub-agents, is
+/// still running; when that work ends Claude is re-invoked (`"busy"`) and then
+/// goes `"idle"`. The list keeps drawing it as [`Activity::Alive`] — the
+/// catch-all it already fell into — and the relay still counts it as idle
+/// enough to nudge, since it is neither busy nor waiting for the operator; only
+/// [`claude_quiescence`] tells it apart from `"idle"`.
 pub const LIVE_STATUS_BUSY: &str = "busy";
 pub const LIVE_STATUS_WAITING: &str = "waiting";
+pub const LIVE_STATUS_IDLE: &str = "idle";
+pub const LIVE_STATUS_SHELL: &str = "shell";
+
+/// Whether the Claude session `session_id` is known to be idle, from the live
+/// files in `live` and the set of PIDs that are alive.
+///
+/// `Idle` only when a live entry for the session has a live PID and every such
+/// entry reports `"idle"` — the other values (`busy`, `waiting`, `shell`, an
+/// absent or unrecognised one) are all `NotIdle`, because each means something
+/// is running or waiting that ending the session would lose. No entry with a
+/// live PID is `Unknown`: the caller asks about a pane whose process is
+/// running, so an absent file is missing information, not idleness (a fresh
+/// session publishes its file only a moment after it starts).
+pub fn claude_quiescence(
+    live: &[LiveSession],
+    session_id: &str,
+    alive_pids: &HashSet<u32>,
+) -> Quiescence {
+    let mut seen = false;
+    for entry in live {
+        if entry.session_id.as_deref() != Some(session_id) || !alive_pids.contains(&entry.pid) {
+            continue;
+        }
+        if entry.status.as_deref() != Some(LIVE_STATUS_IDLE) {
+            return Quiescence::NotIdle;
+        }
+        seen = true;
+    }
+    if seen {
+        Quiescence::Idle
+    } else {
+        Quiescence::Unknown
+    }
+}
 
 /// Classify one session's activity from live state and file age.
 ///
@@ -366,5 +413,72 @@ mod tests {
         ];
         let probe = MockProbe::with_alive(&[200]);
         assert_eq!(classify_default(&meta, &live, &probe), Activity::Alive);
+    }
+
+    // -- claude_quiescence ------------------------------------------------
+
+    fn quiescence_of(live: &[LiveSession], alive: &[u32]) -> Quiescence {
+        let alive: HashSet<u32> = alive.iter().copied().collect();
+        claude_quiescence(live, SESSION_ID, &alive)
+    }
+
+    #[test]
+    fn only_the_idle_report_of_a_live_session_is_idle() {
+        let idle = [live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_IDLE))];
+        assert_eq!(quiescence_of(&idle, &[100]), Quiescence::Idle);
+    }
+
+    #[test]
+    fn every_other_status_of_a_live_session_is_not_idle() {
+        for status in [
+            Some(LIVE_STATUS_BUSY),
+            Some(LIVE_STATUS_WAITING),
+            Some(LIVE_STATUS_SHELL),
+            Some("some-state-from-a-later-release"),
+            Some(""),
+            None,
+        ] {
+            let live = [live_entry(100, Some(SESSION_ID), status)];
+            assert_eq!(
+                quiescence_of(&live, &[100]),
+                Quiescence::NotIdle,
+                "status {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_usable_live_entry_is_unknown_never_idle() {
+        // No file at all, a file for another session, a file with no session
+        // id, and a file whose process is gone: nothing was read about a
+        // session whose pane is running.
+        assert_eq!(quiescence_of(&[], &[]), Quiescence::Unknown);
+        let other = [live_entry(100, Some("another-session"), Some("idle"))];
+        assert_eq!(quiescence_of(&other, &[100]), Quiescence::Unknown);
+        let anonymous = [live_entry(100, None, Some("idle"))];
+        assert_eq!(quiescence_of(&anonymous, &[100]), Quiescence::Unknown);
+        let dead = [live_entry(100, Some(SESSION_ID), Some("idle"))];
+        assert_eq!(quiescence_of(&dead, &[]), Quiescence::Unknown);
+    }
+
+    #[test]
+    fn a_stale_entry_with_a_dead_pid_cannot_make_a_live_one_look_idle_or_busy() {
+        let live = [
+            live_entry(100, Some(SESSION_ID), Some("busy")),
+            live_entry(200, Some(SESSION_ID), Some("idle")),
+        ];
+        assert_eq!(quiescence_of(&live, &[200]), Quiescence::Idle);
+        assert_eq!(quiescence_of(&live, &[100, 200]), Quiescence::NotIdle);
+    }
+
+    #[test]
+    fn shell_is_alive_in_the_list_and_not_idle_for_quiescence() {
+        // What the session list draws for a `shell` session is what it drew
+        // for any status it does not name: the catch-all `Alive`.
+        let meta = meta_with_age(Duration::from_secs(60));
+        let live = [live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_SHELL))];
+        let probe = MockProbe::with_alive(&[100]);
+        assert_eq!(classify_default(&meta, &live, &probe), Activity::Alive);
+        assert_eq!(quiescence_of(&live, &[100]), Quiescence::NotIdle);
     }
 }

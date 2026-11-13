@@ -40,7 +40,7 @@ use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use banto_core::app::{App, Mode};
@@ -54,7 +54,7 @@ use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
 use banto_core::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberGlance, MemberToken, MessageGlance,
-    SessionId, SessionToOpen,
+    Quiescence, SessionId, SessionToOpen,
 };
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::screen::Screen;
@@ -71,7 +71,7 @@ use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
     LIVE_STATUS_BUSY, LIVE_STATUS_WAITING, LiveSession, SysinfoProbe, ancestry_reaches,
-    read_live_sessions,
+    claude_quiescence, read_live_sessions,
 };
 use banto_io::store::Store;
 use banto_tui::paint;
@@ -355,7 +355,7 @@ pub struct EmporiumSettings<'a> {
 }
 
 /// Run the emporium until the user quits (`q`/Esc from the sidebar; a
-/// second press while sessions are running).
+/// second press while a session is not known to be idle).
 pub fn run(
     claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
@@ -583,6 +583,17 @@ fn event_loop(
     let mut stored_sidebar_width = Some(Event::SidebarWidthLoaded {
         width: deps.store.borrow().sidebar_width().ok().flatten(),
     });
+    // The bell switch is a preference of the same kind, loaded the same way; a
+    // missing or unreadable value is off.
+    let mut stored_bell_switch = Some(Event::BellWhenFocusedLoaded {
+        on: deps
+            .store
+            .borrow()
+            .bell_when_focused()
+            .ok()
+            .flatten()
+            .unwrap_or(false),
+    });
     // Fed right after it, for the same reason: as part of the recorded stream.
     let mut startup_notices = (!startup_notices.is_empty()).then_some(Event::StartupNotices {
         notices: startup_notices,
@@ -614,6 +625,7 @@ fn event_loop(
         // `events` below; the viewport height it sets does not depend on the
         // sidebar's width, so the order between the two does not matter.)
         events.extend(stored_sidebar_width.take());
+        events.extend(stored_bell_switch.take());
         events.extend(startup_notices.take());
 
         // Geometry is cached from startup, native resize input, and the
@@ -798,6 +810,14 @@ fn event_loop(
                 &mut glance_gate,
             );
             let brigades = std::mem::take(&mut glance_gate.brigades);
+            // Ahead of the tick: the core decides the brigade-quiet bell on
+            // the sample, but only in the tick that follows it (the same
+            // instant), after the relay has decided what to type. Sent
+            // every tick, even when the roster could not be read: the core
+            // replaces its last sample with it, so nothing it was told earlier
+            // outlives a tick that could not confirm it.
+            let samples = std::mem::take(&mut glance_gate.quiescence);
+            events.push_back(Event::QuiescenceSampled { samples });
             events.push_back(Event::Tick { relay, brigades });
             let observation =
                 gather_goinkyo_observation(&state, deps.store, app, Some(&mut tick_timings));
@@ -848,6 +868,13 @@ fn event_loop(
 
         let draw_start = Instant::now();
         let mut draw_timings = DrawTimings::default();
+        if app.should_quit() {
+            // The frame about to be drawn is the one the operator watches while
+            // the sweep below runs. A comparison against the previous frame
+            // could in principle find nothing new to send; this one is always
+            // sent.
+            presented = None;
+        }
         let cached_size = terminal.backend().cached_size();
         if cached_size != terminal_size {
             terminal.resize(Rect::new(0, 0, cached_size.width, cached_size.height))?;
@@ -1651,6 +1678,10 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let _ = store.borrow().set_sidebar_width(width);
             Vec::new()
         }
+        StoreIntent::SaveBellWhenFocused { on } => {
+            let _ = store.borrow().set_bell_when_focused(on);
+            Vec::new()
+        }
         StoreIntent::FormBrigade {
             director_row_id,
             director_agent,
@@ -2133,9 +2164,14 @@ fn gather_relay_observations(
     // would be handed to the core again, and named in a status, a second late.
     glance_gate.begin_tick();
     let roster_start = Instant::now();
-    let brigades = match store.borrow().list_brigades() {
-        Ok(brigades) => brigades,
-        Err(_) => return Vec::new(),
+    // A roster that cannot be read leaves nothing to observe about brigade
+    // members, but still the panes' own state: what the live files and the
+    // session list say about a pane does not depend on it. So the rest runs
+    // with no brigades, and each hosted pane is sampled from what is left; one
+    // that needed the roster to be understood reads as unknown.
+    let (brigades, roster_read) = match store.borrow().list_brigades() {
+        Ok(brigades) => (brigades, true),
+        Err(_) => (Vec::new(), false),
     };
     if let Some(t) = timings.as_deref_mut() {
         t.relay_roster += roster_start.elapsed();
@@ -2165,6 +2201,14 @@ fn gather_relay_observations(
         t.relay_claude_snapshot += claude_snapshot_start.elapsed();
     }
     let mut observations = Vec::new();
+    // What this same pass learns about whether each hosted pane is idle, for
+    // the quit confirmation and the brigade-quiet bell. It adds no read of its
+    // own for a Claude pane — the live-file scan and the process snapshot above
+    // are shared — and none for a Codex brigade member, whose rollout tail the
+    // relay already reads every tick; only a hosted Codex pane outside any
+    // brigade costs one (sqlite lookup plus rollout tail) per tick.
+    let mut samples: Vec<(SessionKey, Quiescence)> = Vec::new();
+    let mut sampled: HashSet<SessionKey> = HashSet::new();
     // One rowid lookup per tick: while no message has been appended, no
     // member's glance can have a new answer, so none is re-read.
     let glance_start = Instant::now();
@@ -2258,6 +2302,16 @@ fn gather_relay_observations(
                 },
                 None => None,
             };
+            let quiescence = match agent {
+                Some(AgentKind::Codex) => Quiescence::from_probe(is_idle_this_tick),
+                // No product on record and no live file is `Unknown` too, so
+                // an unresolved member is never read as idle.
+                Some(AgentKind::ClaudeCode) | None => {
+                    claude_quiescence(&live, &session_id.0, &alive_claude)
+                }
+            };
+            samples.push((key.clone(), quiescence));
+            sampled.insert(key.clone());
             let glance_start = Instant::now();
             let glance = glance_gate.read(
                 &store.borrow(),
@@ -2284,7 +2338,45 @@ fn gather_relay_observations(
             });
         }
     }
-    glance_gate.end_tick();
+    // Every other hosted pane: a session opened on its own, or a brigade
+    // member with no session id yet (a placeholder key — nothing to look up).
+    for key in state.screens.keys() {
+        if sampled.contains(key) {
+            continue;
+        }
+        let quiescence = if key.is_synthetic() {
+            Quiescence::Unknown
+        } else {
+            match app.row_for_id(key.as_str()).map(|row| row.agent) {
+                Some(AgentKind::Codex) => match codex_home {
+                    Some(home) => {
+                        let mut codex_timing = codex_activity::CodexActivityTiming::default();
+                        let idle = codex_activity::is_thread_idle(
+                            home,
+                            key.as_str(),
+                            Some(&mut codex_timing),
+                        );
+                        if let Some(t) = timings.as_deref_mut() {
+                            t.relay_activity_codex_sqlite += codex_timing.sqlite;
+                            t.relay_activity_codex_rollout += codex_timing.rollout;
+                        }
+                        Quiescence::from_probe(idle)
+                    }
+                    None => Quiescence::Unknown,
+                },
+                Some(AgentKind::ClaudeCode) | None => {
+                    claude_quiescence(&live, key.as_str(), &alive_claude)
+                }
+            }
+        };
+        samples.push((key.clone(), quiescence));
+    }
+    glance_gate.quiescence = samples;
+    // A failed roster visited no member: ending the tick would drop every
+    // remembered glance, to be read again for nothing next tick.
+    if roster_read {
+        glance_gate.end_tick();
+    }
     observations
 }
 
@@ -3005,14 +3097,29 @@ fn paint_drag_line(buffer: &mut Buffer, line: Rect, axis: Axis) {
 
 /// Bottom status bar: emporium key hints (or a transient status, or — while
 /// a prefix chord is armed — the pending-prefix hint) on the left, the match
-/// count on the right.
+/// count on the right. Once quitting has been decided the closing message
+/// replaces all of those, whatever else the line had to say.
 fn render_status_bar(frame: &mut ratatui::Frame, app: &App, state: &EmporiumState, area: Rect) {
     let counts = format!("[{}/{}]", app.filtered_len(), app.total_len());
+    // The badge shares the right-hand segment with the counts, never the left
+    // one the status text uses, so no message can displace it. On a terminal too
+    // narrow for both, the left text has already shrunk to nothing and the
+    // segment is clipped from its right end: the counts go first, then the
+    // badge's tail.
+    let badge = state
+        .bell_when_focused()
+        .then_some(banto_tui::hints::BELL_BADGE);
+    let badge_width = badge.map_or(0, |text| text.chars().count() as u16 + 1);
     let counts_width = counts.chars().count() as u16;
-    let [left, right] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(counts_width)]).areas(area);
+    let [left, right] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(badge_width + counts_width),
+    ])
+    .areas(area);
 
-    let (text, color) = if state.prefix_armed.is_some() {
+    let (text, color) = if app.should_quit() {
+        (state.closing_text(), Color::Yellow)
+    } else if state.prefix_armed.is_some() {
         (banto_tui::hints::PREFIX_HINTS.to_string(), Color::Cyan)
     } else {
         match state.displayed_status() {
@@ -3033,13 +3140,21 @@ fn render_status_bar(frame: &mut ratatui::Frame, app: &App, state: &EmporiumStat
         Paragraph::new(Span::styled(text, Style::default().fg(color))),
         left,
     );
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            counts,
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        right,
-    );
+    let mut right_spans = Vec::new();
+    if let Some(badge) = badge {
+        right_spans.push(Span::styled(
+            badge,
+            Style::default()
+                .fg(WAITING_ACTIVITY_COLOR)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+        right_spans.push(Span::raw(" "));
+    }
+    right_spans.push(Span::styled(
+        counts,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(right_spans)), right);
 }
 
 fn border_style(focused: bool, waiting: bool) -> Style {
@@ -3255,6 +3370,10 @@ struct GlanceGate {
     /// because this is the one value `gather_relay_observations` already
     /// threads through for the tick's own memory.
     brigades: Vec<BrigadeNameFacts>,
+    /// Whether each hosted pane is known to be idle, as this tick's gather read
+    /// it, for [`Event::QuiescenceSampled`]. Complete for every hosted pane the
+    /// gather could say anything about, whether or not the roster could be read.
+    quiescence: Vec<(SessionKey, Quiescence)>,
 }
 
 /// What [`GlanceGate`] remembers of one member's last read.
@@ -3283,6 +3402,7 @@ impl GlanceGate {
     fn begin_tick(&mut self) {
         self.visited.clear();
         self.brigades.clear();
+        self.quiescence.clear();
     }
 
     /// Drop every entry for a member this tick did not visit — dismissed,
@@ -3927,6 +4047,490 @@ mod tests {
         assert!(line.contains("j/k move"), "{line:?}");
     }
 
+    // --- quitting: the prompt and the closing line ---------------------------------
+
+    /// `hosted` plain sessions with screens, the list focused, and the bar drawn
+    /// once so `previous_ring_set` and friends are seeded.
+    fn quitting_fixture(hosted: usize) -> (EmporiumState, App, Instant) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(Vec::new());
+        let at = Instant::now();
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::Resized {
+                width: 120,
+                height: 40,
+            },
+            at,
+        );
+        for i in 0..hosted {
+            state
+                .screens
+                .insert(SessionKey::from_id(&format!("s{i}")), Screen::new(24, 80));
+        }
+        state.focus = Focus::Sidebar;
+        (state, app, at)
+    }
+
+    fn press_esc(state: &mut EmporiumState, app: &mut App, at: Instant) -> String {
+        status_after(
+            state,
+            app,
+            key_event(
+                banto_core::input::KeyCode::Esc,
+                banto_core::input::Modifiers::NONE,
+            ),
+            at,
+        )
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_quit_prompt_while_it_is_armed() {
+        let (mut state, mut app, at) = quitting_fixture(2);
+        let bar = press_esc(&mut state, &mut app, at);
+        assert!(
+            bar.contains("Esc again to quit \u{2014} 2 session(s) not idle"),
+            "{bar:?}"
+        );
+        assert!(!bar.contains("Closing"), "{bar:?}");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn the_status_bar_says_closing_with_the_count_once_quitting_is_decided() {
+        let (mut state, mut app, at) = quitting_fixture(2);
+        press_esc(&mut state, &mut app, at);
+        let bar = press_esc(&mut state, &mut app, at + Duration::from_secs(1));
+        assert!(app.should_quit());
+        assert!(
+            bar.contains("Closing \u{2014} ending 2 session(s)\u{2026}"),
+            "{bar:?}"
+        );
+        assert!(!bar.contains("Esc again"), "the prompt is gone: {bar:?}");
+        assert!(!bar.contains("j/k move"), "so are the hints: {bar:?}");
+    }
+
+    #[test]
+    fn with_nothing_hosted_the_closing_line_is_the_bare_message() {
+        let (mut state, mut app, at) = quitting_fixture(0);
+        let bar = press_esc(&mut state, &mut app, at);
+        assert!(app.should_quit(), "one press quits when nothing is hosted");
+        assert!(bar.contains("Closing\u{2026}"), "{bar:?}");
+        assert!(!bar.contains("ending"), "{bar:?}");
+    }
+
+    #[test]
+    fn idle_sessions_close_on_the_first_press_and_the_line_counts_them_all() {
+        let (mut state, mut app, at) = quitting_fixture(2);
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::QuiescenceSampled {
+                samples: vec![
+                    (SessionKey::from_id("s0"), Quiescence::Idle),
+                    (SessionKey::from_id("s1"), Quiescence::Idle),
+                ],
+            },
+            at,
+        );
+        let bar = press_esc(&mut state, &mut app, at);
+        assert!(app.should_quit());
+        assert!(
+            bar.contains("Closing \u{2014} ending 2 session(s)\u{2026}"),
+            "{bar:?}"
+        );
+    }
+
+    #[test]
+    fn the_closing_line_wins_over_every_other_thing_the_bar_can_show() {
+        let (mut state, mut app, at) = quitting_fixture(1);
+        press_esc(&mut state, &mut app, at);
+        let bar = press_esc(&mut state, &mut app, at + Duration::from_secs(1));
+        assert!(app.should_quit());
+        assert!(bar.contains("Closing"), "{bar:?}");
+
+        // Things that arrive once quitting is decided (a session that ends
+        // while the sweep runs, a notice) and a prefix chord armed on top: the
+        // status would show and the prefix hint would normally outrank it.
+        let notice = Event::StartupNotices {
+            notices: vec!["agents: ignored unknown name(s) \"codx\"".to_string()],
+        };
+        let bar = status_after(&mut state, &mut app, notice, at + Duration::from_secs(2));
+        assert!(bar.contains("Closing"), "{bar:?}");
+        assert!(!bar.contains("codx"), "{bar:?}");
+        state.prefix_armed = Some(at);
+        let bar = status_row(&render(&state, &app));
+        assert!(bar.contains("Closing"), "{bar:?}");
+        assert!(!bar.contains("prefix"), "{bar:?}");
+    }
+
+    #[test]
+    fn without_a_quit_the_same_competitors_do_show() {
+        // The counterpart of the test above: the line is only taken over once
+        // quitting is decided.
+        let (mut state, mut app, at) = quitting_fixture(1);
+        let notice = Event::StartupNotices {
+            notices: vec!["agents: ignored unknown name(s) \"codx\"".to_string()],
+        };
+        let bar = status_after(&mut state, &mut app, notice, at);
+        assert!(bar.contains("codx"), "{bar:?}");
+        assert!(!bar.contains("Closing"), "{bar:?}");
+        state.prefix_armed = Some(at);
+        let bar = status_row(&render(&state, &app));
+        assert!(!bar.contains("Closing"), "{bar:?}");
+    }
+
+    #[test]
+    fn the_closing_frame_is_never_equal_to_the_frame_before_it() {
+        // The loop forces the final frame out regardless; this is the other
+        // half of the guarantee: the comparison would not have skipped it
+        // either, because the line it carries is new.
+        let (mut state, mut app, at) = quitting_fixture(1);
+        press_esc(&mut state, &mut app, at);
+        let armed = render(&state, &app);
+        press_esc(&mut state, &mut app, at + Duration::from_secs(1));
+        let closing = render(&state, &app);
+        let previous = PresentedFrame {
+            buffer: armed,
+            cursor: None,
+        };
+        assert!(should_present(Some(&previous), &closing, None));
+    }
+
+    // --- the brigade-bell switch: its badge and its persistence ---------------------
+
+    fn bell_switch(on: bool) -> Event {
+        Event::BellWhenFocusedLoaded { on }
+    }
+
+    #[test]
+    fn the_badge_is_on_the_bar_in_list_focus_and_in_pane_focus_while_the_switch_is_on() {
+        for focus in [Focus::Sidebar, Focus::Pane] {
+            let (mut state, mut app, at) = quitting_fixture(0);
+            state.focus = focus;
+            let bar = status_after(&mut state, &mut app, bell_switch(true), at);
+            assert!(
+                bar.contains(banto_tui::hints::BELL_BADGE),
+                "{focus:?}: {bar:?}"
+            );
+            // Right-aligned beside the counts, in the segment the left-hand
+            // text never uses.
+            assert!(
+                bar.trim_end()
+                    .ends_with(&format!("{} [0/0]", banto_tui::hints::BELL_BADGE)),
+                "{bar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn while_the_switch_is_off_the_bar_says_nothing_about_it() {
+        for focus in [Focus::Sidebar, Focus::Pane] {
+            let (mut state, mut app, at) = quitting_fixture(0);
+            state.focus = focus;
+            let bar = status_after(&mut state, &mut app, bell_switch(false), at);
+            assert!(!bar.contains("BELL"), "{focus:?}: {bar:?}");
+            assert!(!bar.to_lowercase().contains("off"), "{bar:?}");
+        }
+    }
+
+    #[test]
+    fn transient_text_cannot_displace_the_badge() {
+        let (mut state, mut app, at) = quitting_fixture(1);
+        status_after(&mut state, &mut app, bell_switch(true), at);
+        // A status message, the armed prefix hint, the quit prompt and the
+        // closing line each take the left-hand text.
+        let notice = Event::StartupNotices {
+            notices: vec!["agents: ignored unknown name(s) \"codx\"".to_string()],
+        };
+        let bar = status_after(&mut state, &mut app, notice, at);
+        assert!(
+            bar.contains("codx") && bar.contains("BELL ALWAYS"),
+            "{bar:?}"
+        );
+
+        state.prefix_armed = Some(at);
+        let bar = status_row(&render(&state, &app));
+        assert!(
+            bar.contains("prefix:") && bar.contains("BELL ALWAYS"),
+            "{bar:?}"
+        );
+        state.prefix_armed = None;
+
+        let bar = press_esc(&mut state, &mut app, at);
+        assert!(
+            bar.contains("Esc again") && bar.contains("BELL ALWAYS"),
+            "{bar:?}"
+        );
+        let bar = press_esc(&mut state, &mut app, at + Duration::from_secs(1));
+        assert!(
+            bar.contains("Closing") && bar.contains("BELL ALWAYS"),
+            "{bar:?}"
+        );
+    }
+
+    /// The bar's row at an arbitrary terminal width.
+    fn status_row_at_width(state: &EmporiumState, app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+        let mut cache = HashMap::new();
+        terminal
+            .draw(|frame| {
+                let _ = draw(
+                    frame,
+                    app,
+                    state,
+                    SystemTime::now(),
+                    Instant::now(),
+                    &mut cache,
+                );
+            })
+            .unwrap();
+        status_row(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn at_a_narrow_width_the_hints_give_way_before_the_badge_and_the_counts() {
+        let (mut state, mut app, at) = quitting_fixture(0);
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            bell_switch(true),
+            at,
+        );
+        // Wide enough for the badge and the counts and a little of the hints.
+        let bar = status_row_at_width(&state, &app, 24);
+        assert!(bar.trim_end().ends_with("BELL ALWAYS [0/0]"), "{bar:?}");
+        // Too narrow for both: the segment is clipped from its right end, the
+        // badge survives whole and the hints are gone.
+        let bar = status_row_at_width(&state, &app, 14);
+        assert_eq!(bar.trim_end(), "BELL ALWAYS [0", "{bar:?}");
+        assert!(!bar.contains("move"), "{bar:?}");
+    }
+
+    #[test]
+    fn the_switch_survives_a_restart_through_the_store() {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let (mut state, mut app, at) = quitting_fixture(0);
+        // Nothing stored: off.
+        assert_eq!(store.borrow().bell_when_focused().unwrap(), None);
+
+        // The operator turns it on with F4; the core asks for the write and the
+        // executor performs it.
+        let f4 = key_event(
+            banto_core::input::KeyCode::F(4),
+            banto_core::input::Modifiers::NONE,
+        );
+        let cmds = engine::update(&mut state, &mut app, &BrigadeConfig::default(), f4, at);
+        let mut written = 0;
+        for cmd in cmds {
+            if let Cmd::Store(intent) = cmd {
+                written += 1;
+                execute_store_intent(intent, &store);
+            }
+        }
+        assert_eq!(written, 1);
+        assert_eq!(store.borrow().bell_when_focused().unwrap(), Some(true));
+
+        // A new run reads it back the way the loop does.
+        let mut restarted = EmporiumState::new(PrefixKey::default());
+        let on = store
+            .borrow()
+            .bell_when_focused()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        engine::update(
+            &mut restarted,
+            &mut app,
+            &BrigadeConfig::default(),
+            bell_switch(on),
+            at,
+        );
+        assert!(restarted.bell_when_focused());
+    }
+
+    // --- sampling whether each hosted pane is idle -------------------------------
+
+    /// The tick's samples as a map, from a gather over `state`.
+    fn quiescence_of(
+        state: &EmporiumState,
+        store: &RefCell<Store>,
+        claude_home: &Path,
+        codex_home: Option<&Path>,
+        app: &App,
+    ) -> HashMap<String, Quiescence> {
+        let mut gate = GlanceGate::default();
+        let codex_home = codex_home.map(|path| CodexHome::new(path.to_path_buf()));
+        gather_relay_observations(
+            state,
+            store,
+            &ClaudeHome::new(claude_home.to_path_buf()),
+            codex_home.as_ref(),
+            app,
+            None,
+            &mut gate,
+        );
+        gate.quiescence
+            .into_iter()
+            .map(|(key, quiescence)| (key.as_str().to_string(), quiescence))
+            .collect()
+    }
+
+    #[test]
+    fn a_claude_panes_sample_follows_its_live_status() {
+        for (status, expected) in [
+            ("idle", Quiescence::Idle),
+            ("busy", Quiescence::NotIdle),
+            ("waiting", Quiescence::NotIdle),
+            ("shell", Quiescence::NotIdle),
+            ("something-new", Quiescence::NotIdle),
+        ] {
+            let claude_home = tempfile::tempdir().unwrap();
+            let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+            write_live_state_with_status(
+                claude_home.path(),
+                std::process::id(),
+                "w1",
+                Path::new("/work"),
+                status,
+            );
+            let samples = quiescence_of(&state, &store, claude_home.path(), None, &app);
+            assert_eq!(samples["w1"], expected, "status {status:?}");
+            // The Director has no live file: nothing read, so unknown.
+            assert_eq!(samples["dir"], Quiescence::Unknown, "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn a_pane_with_no_usable_live_file_is_unknown_never_idle() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        // A file for a process that is gone, and none at all for the Director.
+        write_live_state(claude_home.path(), 4_000_000_000, "w1", Path::new("/work"));
+        let samples = quiescence_of(&state, &store, claude_home.path(), None, &app);
+        assert_eq!(samples["w1"], Quiescence::Unknown);
+        assert_eq!(samples["dir"], Quiescence::Unknown);
+    }
+
+    #[test]
+    fn a_member_in_the_shell_state_is_still_nudgeable_and_yet_not_idle() {
+        // The relay's own notion of idle enough to nudge is untouched: `shell`
+        // is neither busy nor waiting. The quiescence answer is a separate one.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        write_live_state_with_status(
+            claude_home.path(),
+            std::process::id(),
+            "w1",
+            Path::new("/work"),
+            "shell",
+        );
+        let mut gate = GlanceGate::default();
+        let relay = gather_relay_observations(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+            &app,
+            None,
+            &mut gate,
+        );
+        let worker = relay.iter().find(|o| o.token == "worker-1").unwrap();
+        assert_eq!(worker.is_idle_this_tick, Some(true));
+        let samples: HashMap<_, _> = gate.quiescence.into_iter().collect();
+        assert_eq!(samples[&SessionKey::from_id("w1")], Quiescence::NotIdle);
+    }
+
+    #[test]
+    fn a_hosted_codex_pane_samples_from_its_last_turn_marker_in_or_out_of_a_brigade() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let codex_home = tempfile::tempdir().unwrap();
+        let (store, mut state, mut app) = staged_worker("w1", Some(AgentKind::Codex));
+        write_codex_rollout(codex_home.path(), "w1", &["task_started"]);
+        // A hosted Codex session that belongs to no brigade.
+        state
+            .screens
+            .insert(SessionKey::from_id("solo"), Screen::new(24, 80));
+        write_codex_rollout(
+            codex_home.path(),
+            "solo",
+            &["task_started", "task_complete"],
+        );
+        app.replace_rows(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1", AgentKind::Codex),
+            test_row("solo", AgentKind::Codex),
+        ]);
+
+        let samples = quiescence_of(
+            &state,
+            &store,
+            claude_home.path(),
+            Some(codex_home.path()),
+            &app,
+        );
+        assert_eq!(samples["w1"], Quiescence::NotIdle, "task_started");
+        assert_eq!(samples["solo"], Quiescence::Idle, "task_complete");
+
+        // No marker, and no Codex home at all: unknown, never idle.
+        write_codex_rollout(codex_home.path(), "none", &[]);
+        state
+            .screens
+            .insert(SessionKey::from_id("none"), Screen::new(24, 80));
+        app.replace_rows(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1", AgentKind::Codex),
+            test_row("solo", AgentKind::Codex),
+            test_row("none", AgentKind::Codex),
+        ]);
+        let samples = quiescence_of(
+            &state,
+            &store,
+            claude_home.path(),
+            Some(codex_home.path()),
+            &app,
+        );
+        assert_eq!(samples["none"], Quiescence::Unknown);
+        let samples = quiescence_of(&state, &store, claude_home.path(), None, &app);
+        assert_eq!(samples["solo"], Quiescence::Unknown);
+        assert_eq!(samples["w1"], Quiescence::Unknown);
+    }
+
+    #[test]
+    fn a_session_opened_on_its_own_and_a_placeholder_key_are_sampled_too() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, mut state, mut app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        app.replace_rows(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1", AgentKind::ClaudeCode),
+            test_row("solo", AgentKind::ClaudeCode),
+        ]);
+        state
+            .screens
+            .insert(SessionKey::from_id("solo"), Screen::new(24, 80));
+        // A pane still awaiting its session id has nothing to look up.
+        let placeholder = SessionKey::from_id("new::/work::0");
+        assert!(placeholder.is_synthetic());
+        state
+            .screens
+            .insert(placeholder.clone(), Screen::new(24, 80));
+        write_live_state_with_status(
+            claude_home.path(),
+            std::process::id(),
+            "solo",
+            Path::new("/work"),
+            "idle",
+        );
+
+        let samples = quiescence_of(&state, &store, claude_home.path(), None, &app);
+        assert_eq!(samples["solo"], Quiescence::Idle);
+        assert_eq!(samples[placeholder.as_str()], Quiescence::Unknown);
+    }
+
     #[test]
     fn the_empty_pane_placeholder_offers_enter_brigade_and_quit_but_not_f2() {
         // Shown only while nothing is staged, when the list has the focus: F2 has
@@ -4551,6 +5155,180 @@ mod tests {
             format!("brigade {brigade_id}"),
             "the disbanded brigade's name stays gone"
         );
+    }
+
+    /// What the loop does with a gather's samples: hand them to the core.
+    fn dispatch_samples(
+        state: &mut EmporiumState,
+        app: &mut App,
+        gate: &mut GlanceGate,
+        now: Instant,
+    ) {
+        let samples = std::mem::take(&mut gate.quiescence);
+        engine::update(
+            state,
+            app,
+            &BrigadeConfig::default(),
+            Event::QuiescenceSampled { samples },
+            now,
+        );
+    }
+
+    /// A session read idle on a good tick, then a tick whose roster read fails
+    /// while its live file says `status_after`; returns the app and the bar after
+    /// one quit key.
+    fn quit_key_after_a_failed_roster_read(status_after: &str) -> (App, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        let mut store = Store::open(&db).unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "director",
+                BrigadeRole::Director,
+                Some(&SessionId("dir".to_string())),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("solo", AgentKind::ClaudeCode),
+        ]);
+        let now = Instant::now();
+        state
+            .screens
+            .insert(SessionKey::from_id("solo"), Screen::new(24, 80));
+        state.focus = Focus::Sidebar;
+        let mut gate = GlanceGate::default();
+
+        // A good tick: the session reads idle.
+        write_live_state_with_status(
+            claude_home.path(),
+            std::process::id(),
+            "solo",
+            Path::new("/work"),
+            "idle",
+        );
+        gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        dispatch_samples(&mut state, &mut app, &mut gate, now);
+
+        // The next tick cannot list brigades (the table is gone from under it),
+        // and in the meantime the session started a turn.
+        let other = rusqlite::Connection::open(&db).unwrap();
+        other
+            .execute_batch("ALTER TABLE brigades RENAME TO brigades_gone")
+            .unwrap();
+        assert!(
+            store.borrow().list_brigades().is_err(),
+            "the failure is real"
+        );
+        write_live_state_with_status(
+            claude_home.path(),
+            std::process::id(),
+            "solo",
+            Path::new("/work"),
+            status_after,
+        );
+        gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        dispatch_samples(
+            &mut state,
+            &mut app,
+            &mut gate,
+            now + Duration::from_secs(1),
+        );
+
+        let bar = press_esc(&mut state, &mut app, now + Duration::from_secs(5));
+        (app, bar)
+    }
+
+    #[test]
+    fn a_tick_that_cannot_read_the_roster_does_not_leave_an_old_idle_standing() {
+        // The session started a turn meanwhile: one press must not quit on the
+        // idle it was read as before.
+        let (app, bar) = quit_key_after_a_failed_roster_read("busy");
+        assert!(!app.should_quit(), "{bar:?}");
+        assert!(bar.contains("1 session(s) not idle"), "{bar:?}");
+    }
+
+    #[test]
+    fn a_session_that_can_still_be_read_keeps_its_answer_through_a_failed_roster_read() {
+        // Its live file does not depend on the roster, so it is not made
+        // unknown for nothing.
+        let (app, bar) = quit_key_after_a_failed_roster_read("idle");
+        assert!(app.should_quit(), "{bar:?}");
+    }
+
+    #[test]
+    fn what_needed_the_roster_to_be_understood_reads_unknown_until_a_tick_that_can_read_it() {
+        // A Codex Worker whose product only the store records (no session row):
+        // with the roster unreadable nothing says it is a Codex session, so the
+        // tick cannot call it idle, and the next good tick can again.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        let mut store = Store::open(&db).unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(
+                brigade_id,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("w1".to_string())),
+            )
+            .unwrap();
+        store
+            .set_member_agent(brigade_id, "worker-1", AgentKind::Codex)
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let codex_dir = tempfile::tempdir().unwrap();
+        write_codex_rollout(codex_dir.path(), "w1", &["task_started", "task_complete"]);
+        let codex_home = CodexHome::new(codex_dir.path().to_path_buf());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id("w1"), Screen::new(24, 80));
+        let mut app = App::new(Vec::new());
+        let now = Instant::now();
+        let other = rusqlite::Connection::open(&db).unwrap();
+        let sample_at = |state: &mut EmporiumState, app: &mut App, at: Instant| {
+            let mut gate = GlanceGate::default();
+            gather_relay_observations(
+                state,
+                &store,
+                &home,
+                Some(&codex_home),
+                app,
+                None,
+                &mut gate,
+            );
+            dispatch_samples(state, app, &mut gate, at);
+        };
+
+        sample_at(&mut state, &mut app, now);
+
+        other
+            .execute_batch("ALTER TABLE brigades RENAME TO brigades_gone")
+            .unwrap();
+        assert!(store.borrow().list_brigades().is_err());
+        sample_at(&mut state, &mut app, now + Duration::from_secs(1));
+        state.focus = Focus::Sidebar;
+        let bar = press_esc(&mut state, &mut app, now + Duration::from_secs(5));
+        assert!(!app.should_quit(), "{bar:?}");
+        assert!(bar.contains("1 session(s) not idle"), "{bar:?}");
+
+        // The roster is back: the next tick reads it again, and one press
+        // quits again.
+        other
+            .execute_batch("ALTER TABLE brigades_gone RENAME TO brigades")
+            .unwrap();
+        sample_at(&mut state, &mut app, now + Duration::from_secs(6));
+        let bar = press_esc(&mut state, &mut app, now + Duration::from_secs(20));
+        assert!(app.should_quit(), "{bar:?}");
     }
 
     #[test]
@@ -7848,7 +8626,7 @@ mod tests {
                 "-m",
                 "o3",
                 "-c",
-                "tui.notifications=[\"approval-requested\"]",
+                "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
                 "-c",
                 "tui.notification_method=\"bel\"",
                 "-c",
