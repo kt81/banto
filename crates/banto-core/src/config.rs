@@ -83,9 +83,12 @@ pub enum WorkerAgentSetting {
     /// it symmetrically rather than silently defaulting to Claude anyway.
     #[default]
     Inherit,
-    /// Ask at formation time (a picker, the same axis the new-session modal
-    /// already offers for a plain session — decided in the UI layer, not
-    /// here).
+    /// Ask whenever Workers are about to be created — forming a brigade and
+    /// adding a Worker (a picker: the agent, the model and the effort, the same
+    /// axis the new-session modal already offers for a plain session — decided
+    /// in the UI layer, not here). It opens on the agent confirmed last time
+    /// with that agent's defaults, and what is confirmed is what those Workers
+    /// start with.
     Select,
     /// Always Claude Code, regardless of the Director's own product.
     Claude,
@@ -130,11 +133,17 @@ pub struct BrigadeConfig {
     /// Clamped to 1..=8 wherever it's consumed — a raw, unclamped value here
     /// lets a config round-trip losslessly even if it's out of range.
     pub workers: u32,
-    /// `--model` passed to an auto-spawned Claude Worker's `claude`
-    /// invocation. An empty string is the escape hatch: no `--model` flag is
-    /// passed, so the Worker inherits the operator's default model. Not
-    /// validated here — an invalid model name is `claude`'s problem,
-    /// surfaced in the Worker's own pane.
+    /// `--model` a Claude Worker launches with **when its session is first
+    /// created** — never on a resume: a flag-less `claude --resume` restores
+    /// the transcript's last model, including one the operator changed inside
+    /// the session, and a `--model` here would put it back (read in Claude
+    /// Code's docs for 2.1.323, not measured by running it). An empty string
+    /// is the escape hatch: no `--model` flag at all, so a new Worker starts
+    /// on the operator's own default. Not validated here — an unknown model
+    /// fails at the first API call, in the Worker's own pane.
+    ///
+    /// The built-in is the family word `sonnet`, never a version: Claude
+    /// resolves the alias itself, so it cannot go stale in this file.
     ///
     /// Named without a product suffix because it predates
     /// [`Self::worker_model_codex`] and every config.toml that already sets
@@ -144,12 +153,31 @@ pub struct BrigadeConfig {
     /// [`Self::worker_model_for`] for how the two fields combine once a
     /// brigade can have either product as Worker.
     pub worker_model: String,
-    /// `--model` an auto-spawned Codex Worker launches with — the Codex
-    /// sibling of [`Self::worker_model`], same empty-string escape hatch,
-    /// independent default (Codex and Claude Code do not share a model
-    /// namespace, so one shared field could never default sensibly for
-    /// both at once).
+    /// `--effort <level>` a Claude Worker launches with when its session is
+    /// first created (`low`/`medium`/`high`/`xhigh`/`max`), built-in `high`;
+    /// empty passes no flag. Not validated here: Claude warns about an
+    /// invalid level and ignores it. Never passed on a resume — the effort
+    /// then comes from the operator's own Claude settings, which Claude saves
+    /// per model (read in its docs, not measured by running it).
+    pub worker_effort: String,
+    /// The model a Codex Worker launches with when its session is first
+    /// created — the Codex sibling of [`Self::worker_model`], same
+    /// empty-string escape hatch, independent default (the products share no
+    /// model namespace).
+    ///
+    /// Either a slug or a family word. Codex has no alias for `-m`: the string
+    /// must be a catalog slug, and an unknown one is sent to the API as it
+    /// stands. So a family word (the built-in `terra`) is resolved to the
+    /// newest slug of that family from the installed binary's own catalog at
+    /// the moment the session is created (`crate::codex_model`); a string
+    /// holding a digit that the catalog does not know is passed untouched.
     pub worker_model_codex: String,
+    /// `-c model_reasoning_effort="<level>"` a Codex Worker launches with when
+    /// its session is first created, built-in `high`; empty passes nothing.
+    /// Never on a resume: a `-c model_reasoning_effort` on a resume switches
+    /// Codex to "override" mode and drops the thread's own model (read in
+    /// Codex's source at tag `rust-v0.168.0`, not measured by running it).
+    pub worker_effort_codex: String,
     /// See [`WorkerAgentSetting`].
     pub worker_agent: WorkerAgentSetting,
     /// `--permission-mode <mode>` an auto-spawned Worker launches with,
@@ -191,13 +219,15 @@ pub struct BrigadeConfig {
     /// plus `{request}` (the consultation request file's path — see
     /// `crate::briefing::render`), and the same empty-string escape hatch.
     pub goinkyo_prompt: String,
-    /// `--model` an auto-spawned Goinkyo launches with, default `"fable"`.
-    /// Same empty-string escape hatch as [`Self::worker_model`]. Claude
-    /// only — a Goinkyo is always Claude (see [`Self::goinkyo_effort`]'s
-    /// doc for why this build never gives it a Codex counterpart).
+    /// `--model` a Goinkyo is created with, built-in `"fable"` (a family
+    /// word, no version). Only when its session is first created, never on a
+    /// resume — [`Self::worker_model`]'s doc says why. Same empty-string escape
+    /// hatch. Claude only — a Goinkyo is always Claude (see
+    /// [`Self::goinkyo_effort`]'s doc for why this build never gives it a Codex
+    /// counterpart).
     pub goinkyo_model: String,
-    /// `--effort <level>` an auto-spawned Goinkyo launches with, default
-    /// `"max"` — Claude's own reasoning-effort flag (`claude --help`,
+    /// `--effort <level>` a Goinkyo is created with, built-in `"max"`, on
+    /// creation only like the model above — Claude's own reasoning-effort flag (`claude --help`,
     /// accepts `low`/`medium`/`high`/`xhigh`/`max`), not a general
     /// per-product setting: a Goinkyo is Claude-only in this build (see
     /// `AgentLaunch::Claude`'s own `effort` field), so there is no
@@ -382,7 +412,9 @@ impl Default for BrigadeConfig {
         Self {
             workers: 1,
             worker_model: "sonnet".to_string(),
-            worker_model_codex: "gpt-5.6-terra".to_string(),
+            worker_effort: "high".to_string(),
+            worker_model_codex: "terra".to_string(),
+            worker_effort_codex: "high".to_string(),
             worker_agent: WorkerAgentSetting::default(),
             worker_permission_mode: "auto".to_string(),
             relay: RelayMode::Auto,
@@ -396,6 +428,17 @@ impl Default for BrigadeConfig {
             message_log: false,
         }
     }
+}
+
+/// The one rule for every model and effort value, whichever path it arrives on
+/// (the config file, a built-in, the picker; a Worker of either product or the
+/// Goinkyo): trimmed, and if nothing is left no flag is passed; otherwise the
+/// trimmed text is passed as it is, unvalidated. Text inside the value is the
+/// operator's own. Every reader goes through this, so the paths cannot disagree
+/// about what whitespace means.
+pub fn flag_value(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 impl BrigadeConfig {
@@ -415,18 +458,27 @@ impl BrigadeConfig {
         (!template.is_empty()).then_some(template.as_str())
     }
 
-    /// The `--model` value an auto-spawned Worker running `agent` should
-    /// launch with, or `None` for "pass no `--model` flag at all" (either
-    /// product's own empty-string escape hatch). Read by `crate::engine`'s
-    /// `RoleLaunch::of` (fresh spawn and resume alike) and by
-    /// `stage_brigade`'s fresh-Worker branch, which passes the same string
-    /// on to `open_worker`.
+    /// The model a Worker running `agent` is created with, or `None` for "pass
+    /// no model flag at all" (either product's own empty-string escape
+    /// hatch). Read when a Worker's session is first created, and by the
+    /// picker as its pre-filled text; never when one is resumed.
     pub fn worker_model_for(&self, agent: AgentKind) -> Option<&str> {
         let raw = match agent {
             AgentKind::ClaudeCode => &self.worker_model,
             AgentKind::Codex => &self.worker_model_codex,
         };
-        (!raw.is_empty()).then_some(raw.as_str())
+        flag_value(raw)
+    }
+
+    /// The effort a Worker running `agent` is created with, or `None` for
+    /// "pass no effort flag at all". Same reading rule as
+    /// [`Self::worker_model_for`].
+    pub fn worker_effort_for(&self, agent: AgentKind) -> Option<&str> {
+        let raw = match agent {
+            AgentKind::ClaudeCode => &self.worker_effort,
+            AgentKind::Codex => &self.worker_effort_codex,
+        };
+        flag_value(raw)
     }
 
     /// [`Self::worker_permission_mode`], or `None` for the empty-string
@@ -442,12 +494,12 @@ impl BrigadeConfig {
     /// No `agent` parameter, unlike [`Self::worker_model_for`]: a Goinkyo is
     /// always Claude.
     pub fn goinkyo_model(&self) -> Option<&str> {
-        (!self.goinkyo_model.is_empty()).then_some(self.goinkyo_model.as_str())
+        flag_value(&self.goinkyo_model)
     }
 
     /// [`Self::goinkyo_effort`], or `None` for the empty-string escape hatch.
     pub fn goinkyo_effort(&self) -> Option<&str> {
-        (!self.goinkyo_effort.is_empty()).then_some(self.goinkyo_effort.as_str())
+        flag_value(&self.goinkyo_effort)
     }
 
     /// [`Self::goinkyo_permission_mode`], or `None` for the empty-string
@@ -631,7 +683,7 @@ mod tests {
         assert_eq!(config.activity.week_days, 7);
         assert_eq!(config.brigade.workers, 1);
         assert_eq!(config.brigade.worker_model, "sonnet");
-        assert_eq!(config.brigade.worker_model_codex, "gpt-5.6-terra");
+        assert_eq!(config.brigade.worker_model_codex, "terra");
         assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
         assert_eq!(config.brigade.relay, RelayMode::Auto);
         assert_eq!(config.keys.prefix, "C-b");
@@ -659,7 +711,7 @@ mod tests {
         assert_eq!(config.brigade.workers, 3);
         assert_eq!(config.brigade.worker_count(), 3);
         assert_eq!(config.brigade.worker_model, "sonnet");
-        assert_eq!(config.brigade.worker_model_codex, "gpt-5.6-terra");
+        assert_eq!(config.brigade.worker_model_codex, "terra");
         assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
         assert_eq!(config.brigade.relay, RelayMode::Auto);
     }
@@ -699,7 +751,7 @@ mod tests {
         // both silently taking their own defaults.
         let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
         assert_eq!(config.brigade.worker_model, "sonnet");
-        assert_eq!(config.brigade.worker_model_codex, "gpt-5.6-terra");
+        assert_eq!(config.brigade.worker_model_codex, "terra");
         assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
     }
 
@@ -708,7 +760,7 @@ mod tests {
         let config = parse("[brigade]\nworker_model = \"opus\"\n");
         assert_eq!(config.brigade.worker_model, "opus");
         assert_eq!(
-            config.brigade.worker_model_codex, "gpt-5.6-terra",
+            config.brigade.worker_model_codex, "terra",
             "an override for the Claude field must not leak into the Codex one"
         );
     }
@@ -748,9 +800,154 @@ mod tests {
             brigade.worker_model_for(AgentKind::ClaudeCode),
             Some("sonnet")
         );
+        assert_eq!(brigade.worker_model_for(AgentKind::Codex), Some("terra"));
+    }
+
+    #[test]
+    fn built_in_model_and_effort_defaults_name_no_version() {
+        let brigade = BrigadeConfig::default();
+        assert_eq!(brigade.worker_model, "sonnet");
+        assert_eq!(brigade.worker_effort, "high");
+        assert_eq!(brigade.worker_model_codex, "terra");
+        assert_eq!(brigade.worker_effort_codex, "high");
+        assert_eq!(brigade.goinkyo_model, "fable");
+        assert_eq!(brigade.goinkyo_effort, "max");
+        // A pinned version is how a built-in goes stale (the Codex one named
+        // a build that later stopped being the newest of its family): none of
+        // the model words may carry a digit.
+        for model in [
+            &brigade.worker_model,
+            &brigade.worker_model_codex,
+            &brigade.goinkyo_model,
+        ] {
+            assert!(
+                !model.chars().any(|c| c.is_ascii_digit()),
+                "a built-in model must be a family word, not a version: {model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_is_the_config_value_if_set_else_the_built_in() {
+        // Absent keys: every one is the built-in, whatever else the file sets.
+        let absent = parse(
+            "[brigade]
+workers = 2
+",
+        );
         assert_eq!(
-            brigade.worker_model_for(AgentKind::Codex),
-            Some("gpt-5.6-terra")
+            absent.brigade.worker_effort_for(AgentKind::ClaudeCode),
+            Some("high")
+        );
+        assert_eq!(
+            absent.brigade.worker_effort_for(AgentKind::Codex),
+            Some("high")
+        );
+        assert_eq!(
+            absent.brigade.worker_model_for(AgentKind::Codex),
+            Some("terra")
+        );
+
+        // Set keys win, each product's independently of the other's.
+        let set = parse(
+            "[brigade]
+worker_model = \"opus\"
+worker_effort = \"low\"
+             worker_model_codex = \"gpt-6-astra\"
+worker_effort_codex = \"xhigh\"
+",
+        );
+        assert_eq!(
+            set.brigade.worker_model_for(AgentKind::ClaudeCode),
+            Some("opus")
+        );
+        assert_eq!(
+            set.brigade.worker_effort_for(AgentKind::ClaudeCode),
+            Some("low")
+        );
+        assert_eq!(
+            set.brigade.worker_model_for(AgentKind::Codex),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(
+            set.brigade.worker_effort_for(AgentKind::Codex),
+            Some("xhigh")
+        );
+
+        // Setting one product's key leaves the other product's built-in alone.
+        let one = parse(
+            "[brigade]
+worker_effort_codex = \"low\"
+",
+        );
+        assert_eq!(
+            one.brigade.worker_effort_for(AgentKind::ClaudeCode),
+            Some("high")
+        );
+        assert_eq!(one.brigade.worker_effort_for(AgentKind::Codex), Some("low"));
+    }
+
+    #[test]
+    fn an_explicitly_empty_effort_passes_no_flag_for_that_product_only() {
+        let cleared = parse(
+            "[brigade]
+worker_effort = \"\"
+",
+        );
+        assert_eq!(
+            cleared.brigade.worker_effort_for(AgentKind::ClaudeCode),
+            None
+        );
+        assert_eq!(
+            cleared.brigade.worker_effort_for(AgentKind::Codex),
+            Some("high")
+        );
+        let cleared = parse(
+            "[brigade]
+worker_effort_codex = \"\"
+",
+        );
+        assert_eq!(cleared.brigade.worker_effort_for(AgentKind::Codex), None);
+        assert_eq!(
+            cleared.brigade.worker_effort_for(AgentKind::ClaudeCode),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn every_model_and_effort_value_is_trimmed_and_nothing_left_passes_no_flag() {
+        // Whitespace-only for each of the six keys: no flag.
+        let blank = parse(
+            "[brigade]\nworker_model = \"  \"\nworker_effort = \"\\t\"\n\
+             worker_model_codex = \" \"\nworker_effort_codex = \"  \"\n\
+             goinkyo_model = \"   \"\ngoinkyo_effort = \" \"\n",
+        );
+        let b = &blank.brigade;
+        assert_eq!(b.worker_model_for(AgentKind::ClaudeCode), None);
+        assert_eq!(b.worker_effort_for(AgentKind::ClaudeCode), None);
+        assert_eq!(b.worker_model_for(AgentKind::Codex), None);
+        assert_eq!(b.worker_effort_for(AgentKind::Codex), None);
+        assert_eq!(b.goinkyo_model(), None);
+        assert_eq!(b.goinkyo_effort(), None);
+
+        // Padded: the trimmed text, otherwise as given.
+        let padded = parse(
+            "[brigade]\nworker_model = \" opus \"\nworker_effort = \"\\tlow\"\n\
+             worker_model_codex = \"  terra\"\nworker_effort_codex = \"xhigh  \"\n\
+             goinkyo_model = \" haiku\"\ngoinkyo_effort = \"max \"\n",
+        );
+        let p = &padded.brigade;
+        assert_eq!(p.worker_model_for(AgentKind::ClaudeCode), Some("opus"));
+        assert_eq!(p.worker_effort_for(AgentKind::ClaudeCode), Some("low"));
+        assert_eq!(p.worker_model_for(AgentKind::Codex), Some("terra"));
+        assert_eq!(p.worker_effort_for(AgentKind::Codex), Some("xhigh"));
+        assert_eq!(p.goinkyo_model(), Some("haiku"));
+        assert_eq!(p.goinkyo_effort(), Some("max"));
+        // Text inside the value is the operator's, untouched.
+        let inner = parse("[brigade]\nworker_model = \"a b\"\n");
+        assert_eq!(
+            inner.brigade.worker_model_for(AgentKind::ClaudeCode),
+            Some("a b")
         );
     }
 

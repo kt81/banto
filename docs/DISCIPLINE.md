@@ -275,7 +275,32 @@ mtimes always come from real `fs::metadata().modified()`, never from
 "when banto last read it" (§3's own cautionary example, already done
 right).
 
-Process spawning: `PortablePtyHost` (ConPTY), worker auto-spawn.
+Process spawning: `PortablePtyHost` (ConPTY), worker auto-spawn, and `codex debug
+models --bundled` (`banto_io::codex_catalog`, behind the `CodexCatalogSource` trait;
+added to the list on 2026-11-14 by reading the code, not by repeating the sweep).
+*When:* only when a Codex Worker is being created with a non-empty model, so that a
+family word such as `terra` can become a slug (`banto_core::codex_model`) — never
+for a resume, which passes no model — and once for all the Workers waiting on it,
+each of which is carried out only if it is still wanted when the answer arrives (the
+brigade exists and is not being disbanded, the member is on its roster and is not
+open or being opened under any key; otherwise it is dropped with its bookkeeping,
+and a successful disband drops its held creations at once). No creation is issued
+for a member that is already open or being opened: a pane under any key, or an open
+in flight (a creation or a resume, issued or held). *By whom:* the core emits
+`Cmd::ReadCodexCatalog { round }` (each read a round, which the answer echoes and
+which alone releases the creations waiting for it; an answer for a round with
+nothing waiting changes nothing); the shell's executor runs the command through the
+same binary a launch would use (`[agent_binaries]`, else `codex` on the path) and
+answers with `Event::CodexCatalogRead { round, result }`, the output or the reason
+there is none; the choice is made in the core from that text, so a replay re-decides
+from the same event. *Bounds:* standard input closed, standard error dropped,
+`CATALOG_TIMEOUT` (5 s) and 8 MiB of output, the child killed at the timeout; no
+answer at all within 15 s (`CODEX_CATALOG_GIVE_UP`, counted by ticks, so a replay
+that omitted the answer still finishes) is treated as an unreadable catalog; nothing
+is cached. *Where:* on the event loop's thread, like a PTY spawn, so a hung binary
+stands the screen still for up to the timeout and no longer. It takes about 0.1 s
+and needs no network or auth; Codex itself creates and removes a temporary directory
+under its own home on every start, as it does for every launch banto makes.
 File reads: session jsonl (head + tail chunks), `sessions/<pid>.json`,
 `config.toml`, dependency-free re-reads on live reload. Codex's reads (its
 `threads` sqlite lookup, read-only, and a tail of the rollout `.jsonl` for the

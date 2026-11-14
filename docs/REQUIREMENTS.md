@@ -328,6 +328,109 @@ protocol (which is what would make Claude Code report over it too — from the 2
 bundle, read and not run); keeping sub-records (reports naming an `id=` are parsed
 and dropped); and sub-agent activity is not tracked.
 
+## Decision (2026-11-14): a model and an effort are given only when a session is created
+
+Decisions of the operator, 2026-11-14, about what banto tells an agent to run on.
+Their behaviour is written out under "Brigade" ("Formation", "Config": "Model and
+effort: only when a session is created"); this entry records what was decided, why,
+and what it replaces.
+
+*What prompted it.* He changes the model inside his Codex sessions to a newer one,
+and every banto restart put them back on `gpt-5.6-terra`: banto passed `-m` on every
+launch, a resume of an existing session included, from a default
+(`worker_model_codex`) written into its code in August.
+
+1. **A default value has two levels:** the config file's value if the file sets one,
+   else banto's built-in. Each key stands alone: setting one product's key leaves
+   the other product's built-in as it was.
+2. **A model and an effort are passed only when a member's session is created.**
+   Re-opening an existing session passes neither, for either product, without
+   exception. *Why:* a flag-less resume restores what the session last used,
+   including what he changed inside it, and a flag on a resume would overwrite that.
+   He considered an exception for Claude's effort (Claude does not remember it per
+   session) and decided against it after learning that an Enter in Claude's
+   `/effort` or `/model` picker saves to his own Claude settings: what a session is
+   on is then his to say, not banto's.
+3. **The built-ins name no version.** Claude Worker `sonnet` / `high`, Codex Worker
+   `terra` (the family) / `high`, Goinkyo `fable` / `max`; the Director gets nothing
+   (`BrigadeConfig` has no `director_*` setting: that session is the operator's own,
+   started and restarted outside banto's control). *Why:* a version written into the
+   code goes stale, as `gpt-5.6-terra` did when 6.1 came out. A test keeps a digit
+   out of the three model built-ins.
+4. **A Codex model may be given as a family word,** and banto resolves it to the
+   newest slug of that family when the Worker is created. *Why:* Codex has no alias
+   or "latest" for `-m` (below), so without this a family could only be named by a
+   version.
+5. **With `worker_agent = "select"` the picker (agent, model, effort) opens on the
+   agent chosen last time, with that agent's defaults,** and its words say whether a
+   brigade is being formed or a Worker added. With any other value there is no
+   picker.
+
+*Status (2026-11-14): the rule quoted here is superseded by this entry, as far as
+the model and the effort go.* It was recorded in the commit messages of `46f2b8a`
+(2026-07-25, "worker model on resume") and `c34512f` (2026-08-06, "let a resumed
+member keep the model and effort its role is given") and in a comment on the
+engine's `RoleLaunch`, not in this document; the sentence is kept as `c34512f` wrote
+it: "Both are properties of the role, and banto's configuration is authoritative for
+what a member is on every launch, the same as `permission_mode` and
+`disallowed_tools` already were." What prompted it: on 2026-07-25 a resumed Worker
+came up on the operator's own default model instead of the brigade's configured one
+(Opus 5 Workers on WSL), and on 2026-08-06 a Goinkyo configured for `max` reported
+`xhigh` after a restart, because nothing passed its effort again. Measured then,
+claude 2.1.223: `--effort low` once, then resumed with no flag, reverted to the
+operator's global effort setting; `--model haiku` once, then resumed with no flag,
+stayed on Haiku. `permission_mode` and `disallowed_tools` are not superseded: they
+are the role's, are still passed on every launch, a resume included.
+
+*Facts behind it, by where they come from.*
+
+- *Read in Codex's source at tag `rust-v0.168.0` (not run):* a flag-less `codex
+  resume` restores the model and the reasoning effort recorded for the thread (the
+  `threads` row, `model` and `reasoning_effort`); `-m` on a resume overrides that,
+  and core then writes the new settings into the rollout at once, so the in-session
+  choice is gone from the record; an effort-only `-c model_reasoning_effort` on a
+  resume also counts as an override and drops the thread's model; there is no alias,
+  family name or "latest" for `-m`: the string must start with a slug in Codex's
+  model catalog, and an unknown one is sent to the API as it stands (a warning in
+  Codex's log, no error at start); `/model`'s Enter writes Codex's own config.toml
+  (`model` and `model_reasoning_effort`, a new global default), while `s` in the
+  picker and `/model <name>` change the session only.
+- *Stated in Claude Code's docs and read in its 2.1.323 bundle (not run):* a resumed
+  session keeps the model its transcript last used (the bundle's resume module
+  exports `lastTranscriptModel` and `restoreModelFromSession`); effort is not
+  restored from the session: it comes from the user's own Claude settings, saved per
+  model, then the model's default; an Enter in `/effort` or the `/model` picker
+  saves the level to those settings, `s` applies it to the session only, and
+  `--effort` is for one run. The one measurement already in the repo (the paragraph
+  above) agrees.
+- *Measured on this machine, 2026-11-14:* `codex debug models --bundled` exits 0 in
+  about 50 ms (84 to 107 ms in four later runs, one of them with an empty
+  `CODEX_HOME` and an unreachable proxy and the same output, so it needs no network
+  and no auth) and prints one line of JSON, a `models` array of 12 objects carrying
+  `slug`, `visibility` and `priority` among many other fields; with it `terra`
+  resolves to `gpt-6.1-terra`. And after this build was started, every member of the
+  running brigade was resumed with no model flag and no effort flag (seen in the
+  process list).
+
+*Consequences, stated plainly.*
+
+- A Goinkyo resumed after a banto restart no longer gets `--effort max`: its effort
+  then comes from the operator's own Claude settings, as the session's model comes
+  from its transcript. The `max` it is created with lasts as long as the process.
+- The picker's choice is used once and is not stored (only the agent is). A Worker
+  whose process died before its session existed is created again from the configured
+  defaults, not from what the picker once said.
+- Members that existed before this build keep whatever their own records say until
+  it is changed in the session: nothing resets them.
+- The 2026-07-25 incident above (a resumed Worker on the operator's own default
+  model) is not re-tested by this change. Whether Claude Code restores the creation
+  model for every session that is resumed is unknown; the docs say a resume keeps
+  the transcript's model.
+
+*Not done:* banto keeps no record of what a member was created with, so there is
+nothing for a recreated Worker to be recreated from but the configuration; and the
+Director has no model or effort setting.
+
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
 | Source | Content |
@@ -617,7 +720,7 @@ provider/status/store/config modules once sketched here as
 
 ```
 crates/
-├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/program_state/search/replay
+├─ banto-core/          # pure: Event -> State + Cmd (TEA/sans-IO), no I/O — app/engine/model/status/screen/program_state/codex_model (a family word → a Codex slug)/search/replay
 ├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
 │  ├─ provider/         # SessionProvider trait + claude_code impl (JSONL) + codex impl (sqlite)
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
@@ -626,6 +729,7 @@ crates/
 │  ├─ data_dir.rs       # banto's own data directory (default `dirs::data_local_dir()/banto`): where each working file lives, the database included, and the sweep of ended members' files
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
+│  ├─ codex_catalog.rs  # the model catalog compiled into the installed Codex: `codex debug models --bundled` behind a trait, bounded by a timeout
 │  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
 │  └─ config.rs         # config.toml: loading it, and where it is looked for (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir)
@@ -634,7 +738,7 @@ crates/
    ├─ main.rs           # clap CLI and dispatch
    ├─ startup.rs        # where config, database, data dir and the agent homes are (and what a child is handed)
    ├─ session.rs        # discovery + activity classification into list rows, and the store loaders the list needs (pins, groups, archive, hidden members, Directors)
-   ├─ launch.rs         # how an agent is started: AgentLaunch argv per product, CodexBrigade's `-c` overrides, [agent_binaries] selection, OpenContext, and `is_live` — the double-resume guard
+   ├─ launch.rs         # how an agent is started: AgentLaunch argv per product (`SessionStart`: a resume carries no model or effort, a creation may), CodexBrigade's `-c` overrides, [agent_binaries] selection, OpenContext, and `is_live` — the double-resume guard
    ├─ embedded/         # the UI: event loop + executors (emporium.rs), per-pane PTY handling, crossterm conversion, paste synthesis
    ├─ mcp.rs            # `banto _mcp`, the brigade mediation server
    ├─ hook.rs           # `banto _hook`, Codex's SessionStart hook (with briefing.rs, the shared role-briefing renderer)
@@ -869,7 +973,10 @@ the brigade bell's switch, is stored in banto's own sqlite store and comes back 
 next time banto runs: the sidebar width (table `ui_prefs`, key `sidebar_width`) and,
 in the same table, the brigade bell's switch (key `bell_when_focused`, `1` or `0`;
 any other stored value reads as no preference, which is off — see "The quiet
-brigade's bell"); per brigade, the master share, the collapsed stack width and the
+brigade's bell") and the agent the Worker picker was last confirmed with (key
+`last_worker_agent`, `claude` or `codex`; any other stored value, a product a newer
+build wrote included, reads as none stored, and the picker then opens on the
+Director's own product; no schema change: it is one more row of `ui_prefs`); per brigade, the master share, the collapsed stack width and the
 soloed member (columns on `brigades`); per member, its place in the stack order, its
 row weight and its collapsed flag (columns on `brigade_members`). NULL means "no
 preference, use the default". The per-member values live on the member's own row on
@@ -1350,7 +1457,8 @@ MCP tool (see "MCP mediation server" below), which files a written
 consultation request and creates the member row; once a tick observes that
 row with no session id yet, it is auto-spawned the same way a fresh Worker
 is (Claude only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`/
-`goinkyo_disallowed_tools` below), briefed from `goinkyo_prompt` with
+`goinkyo_disallowed_tools` below; the model and the effort only because this is a
+creation, see "Model and effort: only when a session is created"), briefed from `goinkyo_prompt` with
 `{request}` substituted for the consultation file's path. The spawn is
 attempted at most once per consultation (`EmporiumState::goinkyo_pane`, one
 guard per brigade, mapped
@@ -1367,18 +1475,28 @@ adding at once get different numbers). Formation goes through the same counter (
 Workers leave it at N), as does the emporium's add-worker, and numbers stop at nine
 digits — the largest the parser reads back — after which adding is refused ("this
 brigade has run out of Worker numbers"), a stored counter outside the range being
-clamped to it (negative reads as 0, above reads as the bound); they are the only paths
-that create a Worker row. So dismissing the highest-numbered Worker, or every
+clamped to it (negative reads as 0, above reads as the bound); they are the only
+paths that create a Worker row. So dismissing the highest-numbered Worker, or every
 Worker, does not hand a number back, and a dismissed middle Worker leaves a gap that
 stays. A brigade older than the counter has it backfilled with the highest
-`worker-<n>` among its current members; the numbers of Workers dismissed before
-that were never recorded, so such a brigade can hand one of those out once. A
-disbanded brigade's counter goes with it; a new brigade has a new id and starts at
-1. The Goinkyo's token is the fixed `goinkyo` and *is* reused, by each consultation
+`worker-<n>` among its current members; the numbers of Workers dismissed before that
+were never recorded, so such a brigade can hand one of those out once. A disbanded
+brigade's counter goes with it; a new brigade has a new id and starts at 1. Between
+them these keep apart the placeholder keys that creations are made under,
+`new-worker::<brigade>::<token>`: brigade ids are never reused (`brigades.id` is
+`AUTOINCREMENT`, and a store test pins that a deleted brigade's id is not issued
+again) and a Worker's number is not handed out twice within a brigade, so two
+Workers never share a placeholder key. The exceptions are the ones named here: a
+brigade older than the counter can hand out, once, a number that a Worker dismissed
+before the counter existed held (the Worker it belonged to is gone, so it is a reuse
+of a number, not of a live key — inferred, not tested), and a hand-edited store. The
+Goinkyo's `new-worker::<brigade>::goinkyo` is the same key for each consultation,
+one after another, never at once: there is one spawn guard per brigade. The
+Goinkyo's token is the fixed `goinkyo` and *is* reused, by each consultation
 (`dismiss_goinkyo`, then consult again, is a new member under the same token), so
 everything filed under a dismissed member's token — layout, order, names, mail — is
-still forgotten on dismissal: that bounds what is kept and keeps the next
-`goinkyo` from inheriting it.
+still forgotten on dismissal: that bounds what is kept and keeps the next `goinkyo`
+from inheriting it.
 
 **Display names.** A member's token is its identifier and never changes. On top of it a Worker can have a *display name*, given by the
 Director whenever it likes and changeable at any time (`name_member`, below), so
@@ -1487,14 +1605,17 @@ id is never staged (and so never observed) again. **Reopening a
 brigade around an already-discovered Goinkyo (one that already has a
 session id, resolvable to a real row) already works**, for free, through
 the same resumed-member path a Director's or Worker's own closed pane
-reopens through (`stage_brigade`) — both `--model` and `--permission-mode`
-carry on a resume as on a fresh spawn; `--permission-mode` does so because it
-answers "who's here to click 'allow'", not "what should this session think
-with" — unrelated to fresh-vs-resumed. A Goinkyo that was never discovered
+reopens through (`stage_brigade`) — `--permission-mode` and
+`--disallowedTools` carry on a resume as on a fresh spawn, because they answer
+"who's here to click 'allow'" and "what may this role attempt", not "what should
+this session think with"; `--model` and `--effort` do not (2026-11-14: a session
+keeps what it last used, so a Goinkyo reopened after a restart is on its own
+model and the effort from the operator's Claude settings, no longer `max`;
+"Decision (2026-11-14)"). A Goinkyo that was never discovered
 (its pane died before it had a session id) does *not* reopen through that
 path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
 stays a fresh-spawn candidate for the ordinary tick mechanism above for as
-long as the brigade remains staged.
+long as the brigade remains staged (a creation, so it gets its model and effort).
 
 **A third case — a stranded Goinkyo — sits between those two.** A Goinkyo
 can have a session id (its own discovery already ran once) that still
@@ -1548,9 +1669,23 @@ them:
    cheapest to abort (nothing has been picked or written yet) — asking the
    operator to pick a Worker product first, only to then say the pane is
    about to restart anyway, would be backwards.
-2. **`[brigade] worker_agent = "select"`.** `Modal::WorkerAgentPicker` asks
-   which product (and model) the Workers run as before there is anything to
-   form.
+2. **`[brigade] worker_agent = "select"`.** `Modal::WorkerAgentPicker` asks, before
+   there is anything to form or add, which product the Workers about to be created
+   run as, and which model and effort they are created with; both `B` (forming) and
+   `b` (adding one) open it, and its title says which: ` New Brigade — Workers —
+   Claude ` / ` Add Worker — Codex `, with `Enter form` or `Enter add` in its hint
+   (`Enter form|add Tab field Shift-Tab agent Esc cancel`). It opens on the agent
+   confirmed last time, stored in `ui_prefs` (`last_worker_agent`; one value for
+   both pickers and every brigade, written once, when it changes), or on the
+   Director's own product when none is stored, with that agent's defaults in two
+   one-line fields, Model and Effort. Tab (or Up/Down) moves between them; Shift-Tab
+   changes the agent and refills both fields from the new agent's defaults,
+   discarding what was typed; a field that is empty or only spaces passes no flag,
+   any other text is trimmed and passed as typed, unvalidated. A Codex model stays
+   as typed (`terra`): it is resolved to a slug when the session is created.
+   Confirming creates those Workers with what the fields hold, once: only the agent
+   is stored. With any other `worker_agent` there is no picker and the Workers get
+   the resolved product's configured defaults.
 3. **The resolved Worker product is Codex, and banto's own hook doesn't look
    trusted.** `Modal::ConfirmCodexTrust` — Enter opens a solo pane running
    Codex's own trust-review startup and abandons this formation attempt
@@ -1656,28 +1791,37 @@ evidence alone.
 ```rust
 pub struct BrigadeConfig {
     pub workers: u32,               // auto-spawned per cell, clamped 1..=8, default 1
-    pub worker_model: String,       // --model for an auto-spawned Claude Worker; "" = inherit; default "sonnet"
-    pub worker_model_codex: String, // --model for an auto-spawned Codex Worker; independent default and escape hatch
+    pub worker_model: String,       // --model for a NEW Claude Worker only (never a resume); "" = no flag; default "sonnet"
+    pub worker_effort: String,      // --effort for a NEW Claude Worker only; "" = no flag; default "high"
+    pub worker_model_codex: String, // -m for a NEW Codex Worker only, a slug or a family word; "" = no flag; default "terra"
+    pub worker_effort_codex: String, // -c model_reasoning_effort for a NEW Codex Worker only; "" = no flag; default "high"
     pub worker_agent: WorkerAgentSetting, // Inherit (default) | Select | Claude | Codex — see below
     pub worker_permission_mode: String, // --permission-mode for an auto-spawned Worker; "" = no flag; default "auto"; Claude only
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub director_prompt: String,    // role briefing template for the Director
     pub worker_prompt: String,      // role briefing template for each Worker
     pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
-    pub goinkyo_model: String,      // --model for an auto-spawned Goinkyo; "" = no flag; default "fable"; Claude only
-    pub goinkyo_effort: String,     // --effort for an auto-spawned Goinkyo; "" = no flag; default "max"; Claude only
+    pub goinkyo_model: String,      // --model for a NEW Goinkyo only; "" = no flag; default "fable"; Claude only
+    pub goinkyo_effort: String,     // --effort for a NEW Goinkyo only; "" = no flag; default "max"; Claude only
     pub goinkyo_permission_mode: String, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; default "auto"; Claude only
     pub goinkyo_disallowed_tools: String, // --disallowedTools for an auto-spawned Goinkyo; "" = no flag; default "Edit,Write,NotebookEdit"; Claude only
     pub message_log: bool,          // append every brigade message to a plain-text file under banto's data dir (see "Message log" below); default false
 }
 ```
 
-`worker_agent` decides which product a brigade's Workers run as, independent
-of the Director's own product: `Inherit` (default) matches the Director's;
-`Claude`/`Codex` fix it regardless; `Select` defers the choice to formation
-gate 2 above. `worker_model`/`worker_model_codex` are two independent
-`--model` overrides, since the two products don't share a model namespace —
-one shared field could never default sensibly for both at once.
+`worker_agent` decides which product a brigade's Workers run as, independent of the
+Director's own product: `Inherit` (default) matches the Director's; `Claude`/`Codex`
+fix it regardless; `Select` defers the choice to formation gate 2 above. The model
+and effort settings come in pairs per product, `worker_model`/`worker_effort` for
+Claude and `worker_model_codex`/`worker_effort_codex` for Codex, independent of each
+other, since the two products don't share a model namespace or an effort vocabulary:
+one shared field could never default sensibly for both at once. A key absent from
+the file is banto's built-in for that key alone (the built-ins name no version:
+`sonnet`/`high`, `terra`/`high`, and the Goinkyo's `fable`/`max`); every model and
+effort value is trimmed (`config::flag_value`, the one rule for the file, the
+built-ins, the picker, either product's Worker and the Goinkyo alike): empty or only
+spaces passes no flag, so a new member starts on the operator's own default for that
+product, and anything else is passed as the trimmed text, unvalidated.
 
 `worker_permission_mode` defaults to `"auto"`, same flag and same rationale
 as `goinkyo_permission_mode` above — a Worker's own operator is no more
@@ -1685,11 +1829,120 @@ watching every pane than an unattended Goinkyo's — carried on a resume too,
 not just a fresh spawn, for the same reason. Unlike the Goinkyo, a Worker has
 no `worker_disallowed_tools` counterpart: editing the working tree is what a
 Worker is for, so there is nothing here for a denylist to guard against.
-Codex has no `--permission-mode` equivalent, so this only ever reaches a
-Claude Worker's argv — a Codex Worker's `worker_permission_mode` is computed
-the same as any other Worker's (`RoleLaunch::of` does not gate it by
-product) but is dropped downstream, in `build_open_launch`, the same place
-that already drops `effort`/`disallowed_tools` for Codex.
+Codex has no `--permission-mode` equivalent, so this only ever reaches a Claude
+Worker's argv — a Codex Worker's `worker_permission_mode` is computed the same as
+any other Worker's (`RoleLaunch::of` does not gate it by product) but is dropped
+downstream, in `build_open_launch`, the same place that already drops
+`disallowed_tools` for Codex. (A Codex Worker does get its effort, at creation, as
+`-c model_reasoning_effort`; that is not a `--permission-mode`-style role flag and
+is not computed there.)
+
+**Model and effort: only when a session is created.** `worker_model`,
+`worker_effort`, `worker_model_codex`, `worker_effort_codex`, `goinkyo_model` and
+`goinkyo_effort` apply when a member's session is created, and never when one is
+reopened (decision 2026-11-14 above). In the code `launch::SessionStart` is either
+`Resume(id)`, which has no field for either, or `Create { model, effort }`; the
+emporium's `build_open_launch` drops them for a resume whatever its caller hands it.
+The creation sites are forming a brigade, adding a Worker (`b`), a Worker whose
+process died before its session was discovered (created again from the configured
+defaults, not from the picker), and a Goinkyo's spawn. The resume sites pass
+neither: staging a brigade again, relaunching a member, reopening a solo session or
+a Director. For Claude the flags are `--model <model>` and `--effort <level>`,
+neither checked here (an unknown model fails at the first API call, in the Worker's
+own pane; Claude warns about an invalid effort and ignores it); for Codex `-m
+<slug>` and `-c model_reasoning_effort="<level>"`, the level quoted as a TOML string
+and not checked (Codex knows its levels), among the `-c` overrides, ahead of the
+brigade's own. An empty or whitespace-only value passes nothing; any other is
+trimmed and passed as it is.
+
+**A Codex model as a family word.** `worker_model_codex` (and the picker's Model
+field) is a slug or a family word, and a word has to meet the installed Codex's
+catalog before it can be passed, because Codex has no alias for `-m`. The core holds
+the Worker's `Cmd::OpenEmbedded`, asks the shell for the catalog
+(`Cmd::ReadCodexCatalog { round }`: `codex debug models --bundled`, run through the
+`[agent_binaries]` entry or `codex` on the path, standard input closed, standard
+error dropped, at most 5 s and 8 MiB of output, on the event loop's thread, so the
+screen can stand still for as long as that bound), and releases it when
+`Event::CodexCatalogRead { round, result }` answers with the output or the reason
+there is none. Nothing is kept between reads, because the catalog belongs to a
+binary that replaces itself when Codex updates.
+
+Each read is a round, counted from 1, and its answer echoes the round and releases
+only the creations waiting for that round. A creation requested while a round is
+waiting joins it, so a formation's Workers still share one read; a new round starts
+only when nothing is held, so at most one round is waiting at a time. An answer for
+a round with nothing waiting changes nothing: one given up, one a disband emptied,
+one already answered, one never asked for, or one carrying no round at all (a
+recording from before the field existed loads it as 0). *Why (found in review):*
+without the round, a late answer to an abandoned read released the next read's
+creations with the wrong result.
+
+No creation is issued, held or released for a member that is already open or being
+opened (`member_open_or_opening`): a hosted pane under any key mapped to it, decided
+by brigade and member token (`member_has_pane`), not by the placeholder key the
+creation was made for; or an open in flight under any such key, issued and not yet
+answered by `Spawned` or `SpawnFailed`, or held (`opening_member`: a brigade
+member's is named by the ownership maps, written before the open is issued, a
+Director's by its pending entry). A resume in flight counts, not only a creation.
+The one question is asked by `open_worker`, by the release of a held creation (not
+counting that creation's own pending entry), by the Workers a Director's arrival
+opens, and by staging. Staging does not issue again a resume whose key is already in
+flight: the shell refuses to resume a session that is already running, and its
+refusal would clear the first open's pending entry; that member arrives as an
+ordinary spawn. A roster that knows the member's session still resumes it even when
+a fresh creation is held, and the held creation is then dropped at its answer. *Why
+(found in review):* first, a member whose pane had been re-keyed to its session id
+looked pane-less to a check made under the placeholder key and would have been
+created a second time; then, a held creation was released beside a resume whose pane
+had not arrived yet.
+
+A held creation is carried out only if it is still wanted when its round's answer
+arrives (`creation_still_wanted`): the brigade exists and is not being disbanded,
+the member is still on its roster, and it is not open or being opened under any
+key. Otherwise it is dropped,
+silently, together with what opening it would have registered. A successful disband
+drops that brigade's held creations at once, without waiting for the answer. *Why
+(found in review):* the answer used to release every held creation unconditionally,
+so a brigade disbanded in between got a Worker opened for it. The Director's spawn,
+which opens the Workers of a brigade just formed, asks the same question before it
+opens them. A round that gets no answer within 15 s (`CODEX_CATALOG_GIVE_UP`,
+counted from the first tick that sees a creation held, and started afresh with each
+new round; three times the command's own bound) is treated as unreadable, case 5
+below, and the status says `no answer after 15s`: an answer that late is one that is
+not coming, and without the bound the held Workers would stay held for the rest of
+the run, since a read is asked for only when none is held.
+
+The command's output is read leniently: a leading byte-order mark (Windows tools
+write one), blank lines and log lines before the JSON are tolerated, and of each
+model only `slug`, `visibility` and `priority` are read, the other fields ignored.
+`banto_core::codex_model::resolve` decides, by five cases, and the status bar says
+what happened:
+
+1. A model that is empty or only spaces: no `-m`, no read, nothing said.
+2. The catalog lists exactly that slug: passed as it is, nothing said.
+3. The word is one whole `-`-separated token of one or more visible slugs, ignoring
+   case (`terra` is in `gpt-6.1-terra` and not in `gpt-6.1-terrain`): the newest of
+   them is passed. Newest means the highest version (the first token made of digits
+   and dots, compared as numbers, so `10.0 > 9.9 > 6.1 > 6 = 6.0`), then the lower
+   catalog `priority`, then the slug itself; a model the catalog hides never wins a
+   family match, though it can still be asked for by its exact slug. The status says
+   `codex worker: terra → gpt-6.1-terra`.
+4. Nothing matches: passed as given, since he may know a slug this binary's catalog
+   lacks, and the API then decides. The status says `codex worker: "X" is not in
+   Codex's model list — passed as given`.
+5. The catalog could not be read (no Codex found, a non-zero exit, a timeout, output
+   that is not a catalog, or no answer within 15 s). A request holding a digit is
+   taken for a slug and passed as it is (`codex worker: could not read Codex's model
+   list (<why>) — "X" passed as given`); a bare family word is not passed at all, so
+   Codex uses its own default model (`… "X" not resolved, so no -m: Codex uses its
+   own default model`). By Codex's own rule that default is the first picker-visible
+   model of its catalog, which in the catalog read on 2026-11-14 is `gpt-6.1-sol`,
+   not Terra.
+
+Several Workers created together with different words are each resolved and each
+said, joined with `; `. The picker's Codex model is shown as typed in all of this.
+The effort has no resolution step: whatever the fields or the config hold goes into
+the `-c` as it is.
 
 **Role briefing delivery differs by product.** `director_prompt`,
 `worker_prompt`, and `goinkyo_prompt` all render the same template,

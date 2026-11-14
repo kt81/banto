@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use ratatui_core::layout::{Position, Rect};
 use serde::{Deserialize, Serialize};
 
-use crate::app::{App, ClickOutcome, GroupId, GroupJoinTarget, Modal, Mode};
+use crate::app::{
+    App, ClickOutcome, GroupId, GroupJoinTarget, Modal, Mode, WorkerDefaults, WorkerPickerFor,
+};
 use crate::config::{BrigadeConfig, RelayMode, WorkerAgentSetting};
 use crate::display_text::{display_name, shorten_to_columns};
 use crate::input::{
@@ -292,6 +294,13 @@ const QUIT_RECENT_INPUT_WINDOW: Duration = Duration::from_secs(3);
 /// directory listings and one store read.
 const DATA_DIR_FIRST_SWEEP_DELAY: Duration = Duration::from_secs(60);
 const DATA_DIR_SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// How long Codex Workers wait for the catalog read to be answered before they
+/// are opened as for an unreadable catalog. The shell answers in the same
+/// iteration (and its own command gives up after five seconds), so an answer
+/// this late is one that is not coming: a lost event, or a replay that omitted
+/// it. Three times that bound, so a slow but real answer is never pre-empted.
+const CODEX_CATALOG_GIVE_UP: Duration = Duration::from_secs(15);
 
 /// How long a freshly-spawned Codex Worker pane's own output must have been
 /// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it
@@ -789,6 +798,8 @@ enum PendingOpen {
         /// `update_spawned` never needs `&BrigadeConfig` just to look this
         /// up again.
         worker_model: String,
+        /// Same again, for the reasoning effort each of them is created with.
+        worker_effort: String,
     },
     /// One member (Director or Worker) of a brigade whose `Stage` already
     /// exists (or is being built alongside this open): on success, append
@@ -876,6 +887,7 @@ struct PendingCodexTrustFormation {
     worker_count: usize,
     worker_agent: AgentKind,
     worker_model: String,
+    worker_effort: String,
 }
 
 /// Everything needed to open a freshly-formed brigade's Director wired
@@ -893,6 +905,17 @@ struct PendingDirectorWiring {
     cwd: PathBuf,
     worker_agent: AgentKind,
     worker_model: String,
+    worker_effort: String,
+}
+
+/// A Codex Worker's creation held back until the read of the installed Codex's
+/// model catalog it waits for has been answered.
+struct HeldCreation {
+    /// The `Cmd::ReadCodexCatalog` round this waits for; only that round's
+    /// answer releases it.
+    round: u64,
+    /// The `Cmd::OpenEmbedded`, its model still the word the operator wrote.
+    open: Cmd,
 }
 
 /// A boundary drag in progress: which boundary, where the pointer took hold
@@ -1031,6 +1054,15 @@ pub struct EmporiumState {
     bell_when_focused: bool,
     /// The same for the switch.
     persisted_bell_when_focused: bool,
+    /// The agent the Worker picker was last confirmed with, which the next
+    /// picker opens on (with that agent's defaults). `None` until one is
+    /// confirmed and when the store held nothing usable: the picker then opens
+    /// on the Director's own product.
+    last_worker_agent: Option<AgentKind>,
+    /// What the store holds for [`Self::last_worker_agent`], so a write happens
+    /// only when the two differ and a value loaded at start is never written
+    /// back.
+    persisted_last_worker_agent: Option<AgentKind>,
     /// When banto last wrote into each pane something that can start or
     /// continue a turn — a relay nudge and its submitting Enter, a Codex
     /// Worker's or a Goinkyo's kickoff and its retry — stamped at the moment of
@@ -1103,6 +1135,19 @@ pub struct EmporiumState {
     pending_brigade_formation: Option<PendingBrigadeFormation>,
     pending_worker_addition: Option<PendingWorkerAddition>,
     pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
+    /// `Cmd::OpenEmbedded`s for Codex Workers being created whose model is
+    /// still the word the operator configured or typed, waiting for the
+    /// installed Codex's model catalog to turn it into a slug
+    /// ([`Cmd::ReadCodexCatalog`], answered by [`Event::CodexCatalogRead`]).
+    /// One read answers every Worker queued behind it: a formation creates
+    /// several at once. Empty whenever no read is in flight.
+    codex_opens_awaiting_catalog: Vec<HeldCreation>,
+    /// The round the next `Cmd::ReadCodexCatalog` will carry. Counts from 1.
+    next_catalog_round: u64,
+    /// The first tick that saw [`Self::codex_opens_awaiting_catalog`] non-empty,
+    /// the clock [`CODEX_CATALOG_GIVE_UP`] runs from. `None` while nothing is
+    /// held.
+    codex_catalog_waiting_since: Option<Instant>,
     /// The session id of a Director-to-be whose already-open pane was just
     /// killed (`confirm_director_reopen_modal`), waiting for that pane to be gone
     /// before formation can continue — reopening any sooner would resume a
@@ -1374,6 +1419,8 @@ impl EmporiumState {
             persisted_sidebar_width: SIDEBAR_WIDTH,
             bell_when_focused: false,
             persisted_bell_when_focused: false,
+            last_worker_agent: None,
+            persisted_last_worker_agent: None,
             last_prompted: HashMap::new(),
             last_forwarded_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
@@ -1391,6 +1438,9 @@ impl EmporiumState {
             pending_brigade_formation: None,
             pending_worker_addition: None,
             pending_codex_trust_formation: None,
+            codex_opens_awaiting_catalog: Vec::new(),
+            next_catalog_round: 1,
+            codex_catalog_waiting_since: None,
             pending_director_reopen: None,
             pending_director_wiring: None,
             pending_dismiss: None,
@@ -2736,6 +2786,11 @@ pub enum StoreIntent {
     SaveBellWhenFocused {
         on: bool,
     },
+    /// Persist the agent the Worker picker was last confirmed with
+    /// (`Store::set_last_worker_agent`).
+    SaveLastWorkerAgent {
+        agent: AgentKind,
+    },
     FormBrigade {
         director_row_id: String,
         director_agent: AgentKind,
@@ -2758,6 +2813,12 @@ pub enum StoreIntent {
         /// nothing downstream needs `&BrigadeConfig` just to look this up
         /// again.
         worker_model: String,
+        /// The reasoning effort those Workers are created with, resolved the
+        /// same way and empty for the same "pass nothing" meaning. Neither
+        /// this nor `worker_model` is stored anywhere: a Worker that dies
+        /// before its session exists is created again from the configured
+        /// defaults, not from what the picker once said.
+        worker_effort: String,
     },
     AddWorker {
         brigade_id: BrigadeId,
@@ -2774,6 +2835,8 @@ pub enum StoreIntent {
         worker_agent: AgentKind,
         /// Same reasoning as `FormBrigade`'s own `worker_model`.
         worker_model: String,
+        /// Same reasoning as `FormBrigade`'s own `worker_effort`.
+        worker_effort: String,
     },
     Disband {
         brigade_id: BrigadeId,
@@ -2854,23 +2917,21 @@ pub enum Cmd {
         cwd: PathBuf,
     },
     /// Spawn (or, if already running elsewhere, refuse) `target` under
-    /// `key`. `brigade` wires the launch to banto's own MCP server; `model`
-    /// is `--model <model>` for a freshly-spawned Worker or Goinkyo (never
-    /// set for a resume — the model was already fixed at the session's
-    /// original launch). `effort` is `--effort <level>`, so far only ever
-    /// set for a freshly-spawned Goinkyo (`BrigadeConfig::goinkyo_effort`)
-    /// — the shell drops it for a Codex target, which has no such flag; see
-    /// `banto::launch::AgentLaunch::Claude`'s own `effort` field. `permission_mode`
-    /// (`--permission-mode <mode>`, `BrigadeConfig::goinkyo_permission_mode`)
-    /// and `disallowed_tools` (`--disallowedTools <tools>`,
-    /// `BrigadeConfig::goinkyo_disallowed_tools`) both diverge from `effort`
-    /// the same way and for the same reason: unlike a model or a reasoning
-    /// level, who may approve a tool call and which tools exist to call are
-    /// properties of the *role*, not of whether this particular launch
-    /// happens to be fresh or a resume — so both are set for a Goinkyo
-    /// either way, never for a Worker or Director, and never for Codex
-    /// (Claude-only flags; `banto::launch::AgentLaunch::Codex` carries neither
-    /// field at all). The shell answers with `Event::Spawned`/`SpawnFailed`.
+    /// `key`. `brigade` wires the launch to banto's own MCP server.
+    ///
+    /// `model` and `effort` are for a session being **created** (`target.id`
+    /// empty) and are `None` for every resume, a Director's included: a resumed
+    /// session keeps the model and effort it last used, and a flag would
+    /// overwrite what the operator changed inside it (`RoleLaunch`'s doc). For
+    /// Claude they are `--model <model>` and `--effort <level>`; for Codex
+    /// `-m <slug>` (already resolved from a family word by
+    /// `Event::CodexCatalogRead`) and `-c model_reasoning_effort="<level>"`.
+    /// `permission_mode` (`--permission-mode <mode>`) and `disallowed_tools`
+    /// (`--disallowedTools <tools>`) are the opposite: properties of the *role*,
+    /// set for a Goinkyo, and a Worker's `permission_mode`, whether the launch
+    /// is fresh or a resume, never for a Director, and ignored for Codex
+    /// (Claude-only flags; `banto::launch::AgentLaunch::Codex` carries neither).
+    /// The shell answers with `Event::Spawned`/`SpawnFailed`.
     OpenEmbedded {
         key: SessionKey,
         target: SessionToOpen,
@@ -2910,6 +2971,19 @@ pub enum Cmd {
     /// a [`PendingCodexTrustFormation`] alongside it. The shell answers with
     /// `Event::CodexTrustChecked`.
     CheckCodexTrust,
+    /// Read the model catalog compiled into the installed Codex
+    /// (`banto_io::codex_catalog`), so the family word a Codex Worker is to be
+    /// created with can become a slug. Issued when a Codex Worker's creation
+    /// needs it and only then — never for a resume, which passes no model.
+    /// The shell answers with `Event::CodexCatalogRead`, carrying the
+    /// command's output or why there is none, and the same `round`: which
+    /// request an answer is for is the core's to tell, since a late answer to
+    /// an earlier round must not release the creations of a later one. Nothing
+    /// is kept from one read to the next: the catalog belongs to a binary that
+    /// replaces itself when Codex updates.
+    ReadCodexCatalog {
+        round: u64,
+    },
     /// Delete the working files (MCP configs, consultation requests) that no
     /// member in the store owns and that have sat unwritten for the grace period —
     /// see `banto_io::data_dir::sweep`. Issued once [`DATA_DIR_FIRST_SWEEP_DELAY`]
@@ -3154,6 +3228,13 @@ pub enum Event {
     BellWhenFocusedLoaded {
         on: bool,
     },
+    /// The agent the Worker picker was last confirmed with, as the store held
+    /// it at startup (`None` when it held nothing usable). Fed once beside
+    /// [`Self::BellWhenFocusedLoaded`] for the same reason, and likewise not
+    /// written back.
+    LastWorkerAgentLoaded {
+        agent: Option<AgentKind>,
+    },
     /// What the shell found wrong at startup and wants the operator to see: an
     /// untrusted Codex hook, an unrecognised `agents` name. Fed once, with the
     /// stored sidebar width, as an `Event` so a replay shows the same status
@@ -3191,6 +3272,19 @@ pub enum Event {
         key: SessionKey,
         trusted: bool,
     },
+    /// The shell's answer to `Cmd::ReadCodexCatalog`: the command's standard
+    /// output, or the plain reason it could not be had (not found, a non-zero
+    /// exit, a timeout). The core parses it (`crate::codex_model`) so the
+    /// decision sits in the pure half and a replay re-decides from the same
+    /// text.
+    CodexCatalogRead {
+        /// The `round` of the `Cmd::ReadCodexCatalog` this answers. Rounds count
+        /// from 1, so a capture recorded without the field (it loads as 0) names
+        /// no round and releases nothing.
+        #[serde(default)]
+        round: u64,
+        result: Result<String, String>,
+    },
     BrigadeFormed {
         director_row_id: String,
         name: String,
@@ -3201,6 +3295,10 @@ pub enum Event {
         /// Echoed straight through from `StoreIntent::FormBrigade` — see
         /// its own doc.
         worker_model: String,
+        /// Echoed straight through from `StoreIntent::FormBrigade` — see
+        /// its own doc. Absent in a stream recorded before it existed.
+        #[serde(default)]
+        worker_effort: String,
         result: Result<(BrigadeId, Vec<MemberToken>), String>,
     },
     WorkerAdded {
@@ -3212,6 +3310,10 @@ pub enum Event {
         /// Echoed straight through from `StoreIntent::AddWorker` — see its
         /// own doc.
         worker_model: String,
+        /// Echoed straight through from `StoreIntent::AddWorker`. Absent in a
+        /// stream recorded before it existed.
+        #[serde(default)]
+        worker_effort: String,
         result: Result<MemberToken, String>,
     },
     Disbanded {
@@ -3500,6 +3602,12 @@ pub fn update(
             state.persisted_bell_when_focused = on;
             Vec::new()
         }
+        Event::LastWorkerAgentLoaded { agent } => {
+            // The store's own value: not written back.
+            state.last_worker_agent = agent;
+            state.persisted_last_worker_agent = agent;
+            Vec::new()
+        }
         Event::SidebarWidthLoaded { width } => {
             if let Some(width) = width {
                 // A preference like any other: clamped wherever it is used,
@@ -3518,6 +3626,9 @@ pub fn update(
             primed,
             hook_launchable,
         } => update_codex_trust_checked(state, app, primed, hook_launchable, now),
+        Event::CodexCatalogRead { round, result } => {
+            update_codex_catalog_read(state, round, result, now)
+        }
         Event::WorkerDirectoryTrustChecked { key, trusted } => {
             update_worker_directory_trust_checked(state, app, key, trusted, now)
         }
@@ -3530,6 +3641,7 @@ pub fn update(
             cwd,
             worker_agent,
             worker_model,
+            worker_effort,
             result,
         } => update_brigade_formed(
             state,
@@ -3540,6 +3652,7 @@ pub fn update(
                 cwd,
                 worker_agent,
                 worker_model,
+                worker_effort,
             },
             result,
             now,
@@ -3549,6 +3662,7 @@ pub fn update(
             cwd,
             worker_agent,
             worker_model,
+            worker_effort,
             result,
         } => update_worker_added(
             state,
@@ -3558,6 +3672,7 @@ pub fn update(
                 cwd,
                 worker_agent,
                 worker_model,
+                worker_effort,
             },
             result,
             now,
@@ -4750,21 +4865,31 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
         return Vec::new();
     };
     let worker_agent = picker.agent();
+    // Untrimmed: `config::flag_value` is the one place whitespace is decided,
+    // and `open_worker` applies it.
     let worker_model = picker.model_input().to_string();
+    let worker_effort = picker.effort_input().to_string();
     app.close_modal();
 
     if let Some(addition) = state.pending_worker_addition.take() {
+        // What the operator confirmed is what these Workers start with, once:
+        // the model and effort are not stored. The agent is, so the next picker
+        // opens on it with its defaults; and a Worker that dies before its
+        // session exists is created again from the configured defaults.
+        state.last_worker_agent = Some(worker_agent);
         return vec![Cmd::Store(StoreIntent::AddWorker {
             brigade_id: addition.brigade_id,
             cwd: addition.cwd,
             worker_agent,
             worker_model,
+            worker_effort,
         })];
     }
 
     let Some(formation) = state.pending_brigade_formation.take() else {
         return Vec::new();
     };
+    state.last_worker_agent = Some(worker_agent);
     if worker_agent == AgentKind::Codex {
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
             director_row_id: formation.director_row_id,
@@ -4774,6 +4899,7 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
             worker_count: formation.worker_count,
             worker_agent,
             worker_model,
+            worker_effort,
         });
         return vec![Cmd::CheckCodexTrust];
     }
@@ -4785,6 +4911,7 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
         worker_count: formation.worker_count,
         worker_agent,
         worker_model,
+        worker_effort,
     })]
 }
 
@@ -5128,15 +5255,19 @@ fn begin_brigade_formation(
             worker_count: brigade.worker_count(),
         });
         app.open_worker_agent_modal(
-            row.agent,
-            brigade.worker_model.clone(),
-            brigade.worker_model_codex.clone(),
+            WorkerPickerFor::FormBrigade,
+            state.last_worker_agent.unwrap_or(row.agent),
+            WorkerDefaults::of(brigade),
         );
         return Vec::new();
     }
     let worker_agent = resolve_worker_agent(brigade.worker_agent, row.agent);
     let worker_model = brigade
         .worker_model_for(worker_agent)
+        .unwrap_or("")
+        .to_string();
+    let worker_effort = brigade
+        .worker_effort_for(worker_agent)
         .unwrap_or("")
         .to_string();
     if worker_agent == AgentKind::Codex {
@@ -5148,6 +5279,7 @@ fn begin_brigade_formation(
             worker_count: brigade.worker_count(),
             worker_agent,
             worker_model,
+            worker_effort,
         });
         return vec![Cmd::CheckCodexTrust];
     }
@@ -5159,6 +5291,7 @@ fn begin_brigade_formation(
         worker_count: brigade.worker_count(),
         worker_agent,
         worker_model,
+        worker_effort,
     })]
 }
 
@@ -5211,6 +5344,7 @@ fn update_codex_trust_checked(
             worker_count: formation.worker_count,
             worker_agent: formation.worker_agent,
             worker_model: formation.worker_model,
+            worker_effort: formation.worker_effort,
         })];
     }
     if primed {
@@ -5222,6 +5356,7 @@ fn update_codex_trust_checked(
             worker_count: formation.worker_count,
             worker_agent: formation.worker_agent,
             worker_model: formation.worker_model,
+            worker_effort: formation.worker_effort,
         })];
     }
     app.open_confirm_codex_trust_modal();
@@ -5290,69 +5425,46 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
     }]
 }
 
-/// What a role is launched with, by role and product — everything about a
-/// member that banto's configuration decides rather than the session itself.
+/// What a role is launched with on *every* launch, fresh or resumed —
+/// everything about a member that banto's configuration decides for the role
+/// rather than for the session.
 ///
-/// All four are properties of the *role*, on every launch, fresh or resumed,
-/// which is why they are computed in one place from the role alone and not
-/// at each site that happens to start a member.
+/// Two things, both Claude-only flags: who may approve a tool call
+/// (`permission_mode`) and which tools exist to call (`disallowed_tools`). A
+/// Worker's own operator is no more watching every pane than the Goinkyo's, so
+/// a Worker gets the non-default `permission_mode` too. `disallowed_tools` stays
+/// Goinkyo-only: it answers "what may this role even attempt", which only needs
+/// guarding for a role meant to be called holding nothing of its own — a
+/// Worker's whole job is the editing that setting exists to deter (see
+/// `BrigadeConfig::goinkyo_disallowed_tools`'s own doc). Closing a
+/// consultation's pane mid-conversation and re-staging the brigade brings the
+/// Goinkyo right back to an unattended prompt (or an editable working tree) if
+/// one comes up, same as a fresh spawn.
 ///
-/// `model` used to look like a launch property instead, passed only for a
-/// resumed Worker, because of an incident: before `46f2b8a8` (2026-07-25)
-/// added that branch, a resumed Worker silently ran on the operator's own
-/// default model instead of the brigade's configured one, observed live as
-/// Opus 5 Workers on WSL. The Goinkyo role didn't exist yet when that landed
-/// (added 2026-08-04, adf9a27/26a3987), and nobody made the equivalent trip
-/// for it afterward — not a decision that a Goinkyo's model should be fixed
-/// at birth, just a branch written before the role it was missing even
-/// existed. Two launch sites drifting apart is the whole failure mode; there
-/// is one now.
+/// The model and the reasoning effort are *not* here. They are decided once,
+/// when a session is created, and never again: a resumed member passes neither
+/// (`Cmd::OpenEmbedded { model: None, effort: None }`), so it keeps whatever the
+/// operator last set inside it. A flag-less `codex resume` and `claude --resume`
+/// restore the model the session last used, and `-m` on a Codex resume
+/// overrides it and rewrites the thread's record at once (read in Codex's source
+/// at tag `rust-v0.168.0` and in Claude Code's docs for 2.1.323; not measured by
+/// running either). An earlier rule passed the configured model on every launch
+/// because a resumed Worker once came up on the operator's own default instead
+/// of the brigade's; that was a consequence of a configuration that was the
+/// authority on what a member runs, and the operator's decision since is that
+/// the session is.
 ///
-/// Measured (claude 2.1.223, 2026-08-06, one scratch session resumed
-/// repeatedly) that Claude Code remembers a session's model without being
-/// told again — `--model haiku` once, then resumed with no `--model` at all,
-/// stayed on Haiku — while it does *not* remember effort the same way:
-/// `--effort low` once, then resumed with no `--effort` at all, reverted
-/// straight to the operator's own global `effortLevel` setting, not to `low`.
-/// That difference does not mean model may be omitted; it means giving it
-/// again is usually a no-op, and "usually" is exactly how the Goinkyo's own
-/// missing case went unnoticed for two days — the value happened to already
-/// be right.
-///
-/// `permission_mode` answers "who's here to click 'allow'", not "what
-/// should this session think with" — a Worker's own operator is no more
-/// watching every pane than the Goinkyo's, so it gets the same non-default.
-/// `disallowed_tools` stays Goinkyo-only: it answers "what may this role
-/// even attempt", which only needs guarding for a role meant to be called
-/// holding nothing of its own — a Worker's whole job is the editing that
-/// setting exists to deter (see `BrigadeConfig::goinkyo_disallowed_tools`'s
-/// own doc). Closing a consultation's pane mid-conversation and re-staging
-/// the brigade brings the Goinkyo right back to an unattended prompt (or an
-/// editable working tree) if one comes up, same as a fresh spawn.
-///
-/// The Director gets none of them: `BrigadeConfig` has no `director_model`
-/// or `director_effort` field at all — that session is the operator's own,
-/// launched (and re-launched) entirely outside banto's control.
+/// The Director gets none of it: `BrigadeConfig` has no `director_*` setting at
+/// all — that session is the operator's own, launched (and re-launched)
+/// entirely outside banto's control.
 struct RoleLaunch {
-    model: Option<String>,
-    effort: Option<String>,
     permission_mode: Option<String>,
     disallowed_tools: Option<String>,
 }
 
 impl RoleLaunch {
-    fn of(role: BrigadeRole, agent: AgentKind, brigade: &BrigadeConfig) -> Self {
+    fn of(role: BrigadeRole, brigade: &BrigadeConfig) -> Self {
         Self {
-            model: match role {
-                BrigadeRole::Worker => brigade.worker_model_for(agent),
-                BrigadeRole::Goinkyo => brigade.goinkyo_model(),
-                BrigadeRole::Director => None,
-            }
-            .map(str::to_string),
-            effort: (role == BrigadeRole::Goinkyo)
-                .then(|| brigade.goinkyo_effort())
-                .flatten()
-                .map(str::to_string),
             permission_mode: match role {
                 BrigadeRole::Worker => brigade.worker_permission_mode(),
                 BrigadeRole::Goinkyo => brigade.goinkyo_permission_mode(),
@@ -5384,6 +5496,50 @@ fn live_panes_of(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> V
         .collect();
     keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     keys
+}
+
+/// Whether any hosted pane belongs to the member `(brigade_id, token)`, under
+/// whatever key it is held ([`live_panes_of`]). A pane is the member's wherever
+/// discovery or a compaction fork has renamed it to, so looking for it only
+/// under the placeholder key a creation was made for would miss it.
+fn member_has_pane(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> bool {
+    !live_panes_of(state, brigade_id, token).is_empty()
+}
+
+/// The member an open issued and not yet answered by `Spawned`/`SpawnFailed` is
+/// for, whatever key it was issued under: a brigade member's is named by the
+/// ownership maps (written before the open is issued), a Director's by its
+/// pending entry. A held creation is such an open — its pending entry is
+/// registered when it is held.
+fn opening_member<'a>(state: &'a EmporiumState, key: &SessionKey) -> Option<(BrigadeId, &'a str)> {
+    match state.pending_opens.get(key)? {
+        PendingOpen::Solo => None,
+        PendingOpen::BrigadeDirector { brigade_id, .. } => Some((*brigade_id, DIRECTOR_TOKEN)),
+        PendingOpen::BrigadeMember { brigade_id, .. } => state
+            .member_tokens
+            .get(key)
+            .map(|token| (*brigade_id, token.as_str())),
+    }
+}
+
+/// Whether the member is already open or being opened: a hosted pane under any
+/// key mapped to it ([`member_has_pane`]), or an open in flight — issued and not
+/// answered, or held — under any key ([`opening_member`]). The one question
+/// every decision to open a member asks, so that none of them starts a second
+/// session for a member that has one or is getting one: the guard in
+/// [`open_worker`], the release of a held creation, the Workers a Director's
+/// arrival opens, and staging. `except` is a key whose own pending open is not
+/// counted: a held creation asking about itself.
+fn member_open_or_opening(
+    state: &EmporiumState,
+    brigade_id: BrigadeId,
+    token: &str,
+    except: Option<&SessionKey>,
+) -> bool {
+    member_has_pane(state, brigade_id, token)
+        || state.pending_opens.keys().any(|key| {
+            Some(key) != except && opening_member(state, key) == Some((brigade_id, token))
+        })
 }
 
 /// Which of several live panes for one member survives: the one whose key is the
@@ -5458,6 +5614,9 @@ fn stage_brigade(
     let mut cmds = Vec::new();
     let mut missing = 0;
     let mut duplicates = 0;
+    // Members whose resume is already in flight: not issued again, and they
+    // arrive as ordinary spawns.
+    let mut opening = 0;
     for (token, role, session_id) in members {
         // First, whatever the member's roster entry or session list say: if core
         // already holds a live pane for this member, that pane is its tile and
@@ -5499,6 +5658,19 @@ fn stage_brigade(
         match resolved_row {
             Some(row) => {
                 let key = SessionKey::from_id(&row.id);
+                // The same resume already issued and not yet answered: not
+                // issued twice. The shell refuses to resume a session that is
+                // already running, and its refusal would clear the first's
+                // pending entry out from under that open's arrival, which
+                // `update_spawned` then appends to this stage.
+                if state.pending_opens.contains_key(&key) {
+                    opening += 1;
+                    continue;
+                }
+                // The maps are overwritten before the screen under `key` is
+                // looked at: a session id is one member's (the shell refuses
+                // to resume a session that is already running, and a session
+                // joins one brigade), so no other member's pane is under it.
                 state.member_tokens.insert(key.clone(), token.clone());
                 state.member_brigades.insert(key.clone(), brigade_id);
                 // Seeded here, ahead of the resume's own success or failure:
@@ -5528,7 +5700,7 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                     );
-                    let launch = RoleLaunch::of(*role, row.agent, brigade);
+                    let launch = RoleLaunch::of(*role, brigade);
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -5538,8 +5710,10 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                         brigade: Some((brigade_id, token.clone(), *role)),
-                        model: launch.model,
-                        effort: launch.effort,
+                        // The session exists: neither a model nor an effort
+                        // (`RoleLaunch`'s doc).
+                        model: None,
+                        effort: None,
                         permission_mode: launch.permission_mode,
                         disallowed_tools: launch.disallowed_tools,
                     });
@@ -5562,15 +5736,22 @@ fn stage_brigade(
                 if state.screens.contains_key(&key) {
                     panes.push(key);
                 } else {
-                    let model = brigade.worker_model_for(fresh_worker_agent).unwrap_or("");
+                    // A Worker whose process died before its session was ever
+                    // discovered has nothing to resume, so this creates one: it
+                    // gets the configured defaults. What a picker said when the
+                    // Worker was first added is not kept anywhere, so it cannot
+                    // be reapplied here.
                     cmds.extend(open_worker(
                         state,
                         brigade_id,
                         token,
                         &cwd,
-                        model,
+                        WorkerChoice {
+                            agent: fresh_worker_agent,
+                            model: brigade.worker_model_for(fresh_worker_agent).unwrap_or(""),
+                            effort: brigade.worker_effort_for(fresh_worker_agent).unwrap_or(""),
+                        },
                         brigade.worker_permission_mode(),
-                        fresh_worker_agent,
                     ));
                 }
             }
@@ -5637,7 +5818,7 @@ fn stage_brigade(
             None => missing += 1,
         }
     }
-    if panes.is_empty() && cmds.is_empty() {
+    if panes.is_empty() && cmds.is_empty() && opening == 0 {
         state.status = Some("no brigade members could be opened".to_string());
         return Vec::new();
     }
@@ -5700,9 +5881,9 @@ fn add_worker(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig)
     if brigade.worker_agent == WorkerAgentSetting::Select {
         state.pending_worker_addition = Some(PendingWorkerAddition { brigade_id, cwd });
         app.open_worker_agent_modal(
-            director_agent,
-            brigade.worker_model.clone(),
-            brigade.worker_model_codex.clone(),
+            WorkerPickerFor::AddWorker,
+            state.last_worker_agent.unwrap_or(director_agent),
+            WorkerDefaults::of(brigade),
         );
         return Vec::new();
     }
@@ -5712,11 +5893,16 @@ fn add_worker(state: &mut EmporiumState, app: &mut App, brigade: &BrigadeConfig)
         .worker_model_for(worker_agent)
         .unwrap_or("")
         .to_string();
+    let worker_effort = brigade
+        .worker_effort_for(worker_agent)
+        .unwrap_or("")
+        .to_string();
     vec![Cmd::Store(StoreIntent::AddWorker {
         brigade_id,
         cwd,
         worker_agent,
         worker_model,
+        worker_effort,
     })]
 }
 
@@ -6010,7 +6196,8 @@ fn adopt_stored_layout(
 /// The writes that keep the store matching what the operator has arranged:
 /// one `SaveBrigadeLayout` for each brigade whose layout differs from what the
 /// store last held, one `SaveSidebarWidth` if the width does, one
-/// `SaveBellWhenFocused` if the bell switch does. Run at the end
+/// `SaveBellWhenFocused` if the bell switch does, one `SaveLastWorkerAgent` if
+/// the agent last chosen in the Worker picker does. Run at the end
 /// of every `update`; since it only compares, a draw-only or tick-only event
 /// writes nothing, and neither does a gesture that committed nothing, a
 /// refused key, or a "restore all" with nothing to restore.
@@ -6027,6 +6214,12 @@ fn persist_preferences(state: &mut EmporiumState) -> Vec<Cmd> {
         cmds.push(Cmd::Store(StoreIntent::SaveBellWhenFocused {
             on: state.bell_when_focused,
         }));
+    }
+    if let Some(agent) = state.last_worker_agent
+        && state.last_worker_agent != state.persisted_last_worker_agent
+    {
+        state.persisted_last_worker_agent = state.last_worker_agent;
+        cmds.push(Cmd::Store(StoreIntent::SaveLastWorkerAgent { agent }));
     }
     let mut brigades: Vec<BrigadeId> = state.brigade_layouts.keys().copied().collect();
     brigades.sort_unstable();
@@ -6607,6 +6800,7 @@ fn update_spawned(
             cwd,
             worker_agent,
             worker_model,
+            worker_effort,
         } => {
             state
                 .member_tokens
@@ -6619,6 +6813,12 @@ fn update_spawned(
                 focused: 0,
             };
             state.focus = Focus::Pane;
+            // The brigade can have been disbanded between asking for this
+            // Director and its spawn being reported.
+            let worker_tokens: Vec<MemberToken> = worker_tokens
+                .into_iter()
+                .filter(|token| creation_still_wanted(state, brigade_id, token))
+                .collect();
             worker_tokens
                 .into_iter()
                 .flat_map(|token| {
@@ -6627,9 +6827,12 @@ fn update_spawned(
                         brigade_id,
                         &token,
                         &cwd,
-                        &worker_model,
+                        WorkerChoice {
+                            agent: worker_agent,
+                            model: &worker_model,
+                            effort: &worker_effort,
+                        },
                         brigade.worker_permission_mode(),
-                        worker_agent,
                     )
                 })
                 .collect()
@@ -6695,27 +6898,63 @@ fn resolve_worker_agent(setting: WorkerAgentSetting, director_agent: AgentKind) 
     }
 }
 
+/// What a Worker about to be created is launched with. All three are decided by
+/// the caller — from the configuration, or from what the operator confirmed in
+/// the picker — and an empty string means "pass nothing".
+struct WorkerChoice<'a> {
+    agent: AgentKind,
+    model: &'a str,
+    effort: &'a str,
+}
+
 /// Emit the `Cmd::OpenEmbedded` for one auto-spawned Worker, wired to the
 /// brigade's MCP channel, tracked as a `BrigadeMember` open.
 ///
-/// `agent` is always the caller's own, already-resolved choice (see
-/// [`resolve_worker_agent`]) — this function never re-derives it. Whenever
-/// that choice is `AgentKind::Codex`,
+/// This is a *creation*: the Worker has no session id, so it carries its model
+/// and its effort, the only launches that do (`RoleLaunch`'s doc says why a
+/// resume must not). `choice.agent` is always the caller's own,
+/// already-resolved choice (see [`resolve_worker_agent`]) — this function never
+/// re-derives it. Whenever that choice is `AgentKind::Codex`,
 /// [`PendingOpen::BrigadeMember::needs_codex_kickoff`] picks it up
 /// automatically: this function is the *only* place that ever sets it
 /// `true`, since every call here is a fresh, id-less spawn — a resumed
 /// member with a known id (`stage_brigade`'s own `Some(row)` branch) never
 /// calls this at all.
+///
+/// A Codex model is the word the operator wrote, which may be a family: it has
+/// to meet the installed Codex's catalog before it can be passed
+/// (`crate::codex_model`). The open is held back for that
+/// ([`EmporiumState::codex_opens_awaiting_catalog`]) and the read is asked for
+/// once, by whichever open finds the queue empty; [`update_codex_catalog_read`]
+/// releases them all. With no model there is nothing to resolve and the open
+/// goes out at once.
 fn open_worker(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
     token: &str,
     cwd: &std::path::Path,
-    worker_model: &str,
+    choice: WorkerChoice<'_>,
     permission_mode: Option<&str>,
-    agent: AgentKind,
 ) -> Vec<Cmd> {
+    let WorkerChoice {
+        agent,
+        model,
+        effort,
+    } = choice;
     let key = SessionKey::new_worker(brigade_id, token);
+    // Never a second creation: a member with a pane or an open in flight, under
+    // any key, has its session or is getting one.
+    if member_open_or_opening(state, brigade_id, token, None) {
+        return Vec::new();
+    }
+    // The ownership maps are written for the placeholder key before its screen
+    // is looked at, which is safe because no other member's pane can sit under
+    // it: the key is built from the brigade id and the token, a brigade id is
+    // never reused (`brigades.id` is AUTOINCREMENT), and a Worker token is never
+    // reused within a brigade (`Store::add_worker`'s counter remembers the
+    // highest ever issued). The Goinkyo's token is reused by each consultation,
+    // but it is the same member, and one consultation at a time
+    // (`goinkyo_pane`).
     state.member_tokens.insert(key.clone(), token.to_string());
     state.member_brigades.insert(key.clone(), brigade_id);
     state.pending_opens.insert(
@@ -6726,7 +6965,11 @@ fn open_worker(
             cwd: cwd.to_path_buf(),
         },
     );
-    vec![Cmd::OpenEmbedded {
+    let (model, effort) = (
+        crate::config::flag_value(model).unwrap_or(""),
+        crate::config::flag_value(effort).unwrap_or(""),
+    );
+    let open = Cmd::OpenEmbedded {
         key,
         target: SessionToOpen {
             id: String::new(),
@@ -6735,11 +6978,202 @@ fn open_worker(
             cwd: cwd.to_path_buf(),
         },
         brigade: Some((brigade_id, token.to_string(), BrigadeRole::Worker)),
-        model: (!worker_model.is_empty()).then(|| worker_model.to_string()),
-        effort: None,
+        model: (!model.is_empty()).then(|| model.to_string()),
+        effort: (!effort.is_empty()).then(|| effort.to_string()),
         permission_mode: permission_mode.map(str::to_string),
         disallowed_tools: None,
-    }]
+    };
+    if agent == AgentKind::Codex && !model.is_empty() {
+        // Joins the round already waiting, if there is one: its one read serves
+        // every creation requested meanwhile, and a round that has creations
+        // held is one that will be answered or given up. Otherwise a new round.
+        let waiting = state
+            .codex_opens_awaiting_catalog
+            .last()
+            .map(|held| held.round);
+        let round = waiting.unwrap_or(state.next_catalog_round);
+        if waiting.is_none() {
+            // Wraps past the end to 1, never to 0, which names no round.
+            state.next_catalog_round = state.next_catalog_round.checked_add(1).unwrap_or(1);
+            // The give-up clock starts at the next tick that sees it, not from
+            // whatever an earlier round left.
+            state.codex_catalog_waiting_since = None;
+        }
+        state
+            .codex_opens_awaiting_catalog
+            .push(HeldCreation { round, open });
+        return if waiting.is_none() {
+            vec![Cmd::ReadCodexCatalog { round }]
+        } else {
+            Vec::new()
+        };
+    }
+    vec![open]
+}
+
+/// Whether a creation of `token` in `brigade_id`, decided earlier and carried
+/// out later, is still wanted when its turn comes: the brigade is not being
+/// disbanded (and was not — a disbanded brigade forgets its join order), the
+/// member is still on its roster, and it is not open or being opened under any
+/// key ([`member_open_or_opening`], not counting the creation's own pending
+/// entry). The roster is the core's own record
+/// (`EmporiumState::member_order`): what it is told of — a formation, a join,
+/// a staging from the store's roster, a dismissal, a disband — and not a
+/// removal made behind its back. Asked where a
+/// launch waits on an answer: the catalog read, and the Director's spawn that
+/// opens the Workers. Between the request and the answer the operator can
+/// disband the brigade, and an answer that opened a Worker for a brigade that
+/// is gone would start an agent nothing owns.
+fn creation_still_wanted(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> bool {
+    !state.disbanding.contains(&brigade_id)
+        && state
+            .member_order
+            .get(&brigade_id)
+            .is_some_and(|joined| joined.iter().any(|listed| listed == token))
+        && !member_open_or_opening(
+            state,
+            brigade_id,
+            token,
+            Some(&SessionKey::new_worker(brigade_id, token)),
+        )
+}
+
+/// Undo exactly what [`open_worker`] registered for a creation that will not be
+/// carried out: the maps and the pending open under the placeholder key it was
+/// made for. (Its kickoff and its discovery are only registered once the pane
+/// spawns, so there is nothing of either to undo.) Only that key's: a pane of
+/// the same member under any other key has maps of its own, which are not
+/// touched, and one under this very key is left whole. The store's member row is
+/// the store's: a disband deletes it with the brigade, a dismissal with the
+/// member, and one left otherwise is a Worker with no session id and no pane,
+/// which staging creates afresh.
+fn forget_unopened_worker(state: &mut EmporiumState, brigade_id: BrigadeId, token: &str) {
+    let key = SessionKey::new_worker(brigade_id, token);
+    if state.screens.contains_key(&key) {
+        return;
+    }
+    state.member_tokens.remove(&key);
+    state.member_brigades.remove(&key);
+    state.pending_opens.remove(&key);
+}
+
+/// The member a held `Cmd::OpenEmbedded` creates, if it is a brigade member's.
+fn held_creation_member(held: &HeldCreation) -> Option<(BrigadeId, &str)> {
+    match &held.open {
+        Cmd::OpenEmbedded {
+            brigade: Some((brigade_id, token, _)),
+            ..
+        } => Some((*brigade_id, token.as_str())),
+        _ => None,
+    }
+}
+
+/// Drop what a disband leaves held: the brigade's creations waiting for the
+/// catalog, with their bookkeeping, at once rather than when the answer comes.
+fn drop_held_creations_of(state: &mut EmporiumState, brigade_id: BrigadeId) {
+    let held = std::mem::take(&mut state.codex_opens_awaiting_catalog);
+    for creation in held {
+        match held_creation_member(&creation) {
+            Some((id, token)) if id == brigade_id => {
+                let token = token.to_string();
+                forget_unopened_worker(state, brigade_id, &token);
+            }
+            _ => state.codex_opens_awaiting_catalog.push(creation),
+        }
+    }
+}
+
+/// Answers `Cmd::ReadCodexCatalog`: every Codex Worker waiting on it that is
+/// still wanted ([`creation_still_wanted`]) gets its model resolved
+/// (`crate::codex_model::resolve`, which has the rules and the wording) and its
+/// open goes out; one that is not is dropped with its bookkeeping, silently —
+/// whoever made it unwanted (a disband) said so already. A word several Workers
+/// share is resolved once and said once. The read is not kept: the next creation
+/// asks again. An answer releases only the creations of its own `round`; one for
+/// a round with nothing waiting — a late one, after the give-up in `update_tick`
+/// or after a disband emptied the round, or one for a round nobody asked for
+/// (including 0, what a capture without the field loads as) — changes nothing,
+/// so it can never release the creations of a round that asked after it.
+fn update_codex_catalog_read(
+    state: &mut EmporiumState,
+    round: u64,
+    result: Result<String, String>,
+    now: Instant,
+) -> Vec<Cmd> {
+    let (waiting, kept): (Vec<HeldCreation>, Vec<HeldCreation>) =
+        std::mem::take(&mut state.codex_opens_awaiting_catalog)
+            .into_iter()
+            .partition(|held| held.round == round);
+    state.codex_opens_awaiting_catalog = kept;
+    if waiting.is_empty() {
+        return Vec::new();
+    }
+    if state.codex_opens_awaiting_catalog.is_empty() {
+        state.codex_catalog_waiting_since = None;
+    }
+    let mut resolved: Vec<(String, crate::codex_model::Resolved)> = Vec::new();
+    let mut opens = Vec::with_capacity(waiting.len());
+    for creation in waiting {
+        let mut open = creation.open.clone();
+        if let Some((brigade_id, token)) = held_creation_member(&creation) {
+            let token = token.to_string();
+            if !creation_still_wanted(state, brigade_id, &token) {
+                forget_unopened_worker(state, brigade_id, &token);
+                continue;
+            }
+        }
+        if let Cmd::OpenEmbedded { model, .. } = &mut open
+            && let Some(requested) = model.take()
+        {
+            let at = match resolved.iter().position(|(word, _)| *word == requested) {
+                Some(at) => at,
+                None => {
+                    let answer = crate::codex_model::resolve(&requested, &result);
+                    resolved.push((requested, answer));
+                    resolved.len() - 1
+                }
+            };
+            *model = resolved[at].1.model.clone();
+        }
+        opens.push(open);
+    }
+    let notices: Vec<&str> = resolved
+        .iter()
+        .filter_map(|(_, answer)| answer.notice.as_deref())
+        .collect();
+    if !notices.is_empty() {
+        state.set_status(notices.join("; "), now);
+    }
+    opens
+}
+
+/// Codex Workers held for a catalog read that has not been answered for
+/// [`CODEX_CATALOG_GIVE_UP`] are opened as for an unreadable catalog, which says
+/// so. What the operator would otherwise see is nothing: a Worker with a store
+/// row, no pane and no tile, indefinitely, and — because the next creation asks
+/// for a read only when none is held — no Codex Worker could be created again
+/// for the rest of the run. The clock starts at the first tick that sees them
+/// held.
+fn give_up_on_codex_catalog(state: &mut EmporiumState, now: Instant) -> Vec<Cmd> {
+    if state.codex_opens_awaiting_catalog.is_empty() {
+        state.codex_catalog_waiting_since = None;
+        return Vec::new();
+    }
+    let since = *state.codex_catalog_waiting_since.get_or_insert(now);
+    if now.saturating_duration_since(since) < CODEX_CATALOG_GIVE_UP {
+        return Vec::new();
+    }
+    // The round that has been waiting: the oldest held creation's.
+    let round = state.codex_opens_awaiting_catalog[0].round;
+    update_codex_catalog_read(
+        state,
+        round,
+        Err(format!(
+            "no answer after {}s",
+            CODEX_CATALOG_GIVE_UP.as_secs()
+        )),
+        now,
+    )
 }
 
 fn update_spawn_failed(
@@ -6842,7 +7276,7 @@ fn relaunch_member(
             cwd: cwd.clone(),
         },
     );
-    let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
+    let launch = RoleLaunch::of(BrigadeRole::Worker, brigade);
     let call = state.member_call(Some(brigade_id), &token);
     state.set_status(format!("worker {call} exited — restarting"), now);
     Some(ExitHandling::Relaunch(Box::new(Cmd::OpenEmbedded {
@@ -6854,8 +7288,9 @@ fn relaunch_member(
             cwd,
         },
         brigade: Some((brigade_id, token, BrigadeRole::Worker)),
-        model: launch.model,
-        effort: launch.effort,
+        // A resume (`RoleLaunch`'s doc): the session keeps what it last used.
+        model: None,
+        effort: None,
         permission_mode: launch.permission_mode,
         disallowed_tools: launch.disallowed_tools,
     })))
@@ -7260,6 +7695,7 @@ struct FormedBrigade {
     cwd: PathBuf,
     worker_agent: AgentKind,
     worker_model: String,
+    worker_effort: String,
 }
 
 fn update_brigade_formed(
@@ -7275,6 +7711,7 @@ fn update_brigade_formed(
         cwd,
         worker_agent,
         worker_model,
+        worker_effort,
     } = formed;
     let (brigade_id, worker_tokens) = match result {
         Ok(pair) => pair,
@@ -7310,6 +7747,7 @@ fn update_brigade_formed(
         cwd,
         worker_agent,
         worker_model,
+        worker_effort,
     };
     let cmds = if state.screens.contains_key(&director_key) {
         // The interactive gate (`begin_brigade_formation`'s caller,
@@ -7356,6 +7794,7 @@ fn open_director_with_wiring(
         cwd,
         worker_agent,
         worker_model,
+        worker_effort,
     } = wiring;
     let director_key = SessionKey::from_id(&director_row_id);
     state.pending_opens.insert(
@@ -7366,6 +7805,7 @@ fn open_director_with_wiring(
             cwd: cwd.clone(),
             worker_agent,
             worker_model,
+            worker_effort,
         },
     );
     let Some(row) = app.row_for_id(&director_row_id) else {
@@ -7412,6 +7852,7 @@ struct AddedWorker {
     cwd: PathBuf,
     worker_agent: AgentKind,
     worker_model: String,
+    worker_effort: String,
 }
 
 fn update_worker_added(
@@ -7426,6 +7867,7 @@ fn update_worker_added(
         cwd,
         worker_agent,
         worker_model,
+        worker_effort,
     } = added;
     match result {
         Ok(token) => {
@@ -7439,9 +7881,12 @@ fn update_worker_added(
                 brigade_id,
                 &token,
                 &cwd,
-                &worker_model,
+                WorkerChoice {
+                    agent: worker_agent,
+                    model: &worker_model,
+                    effort: &worker_effort,
+                },
                 brigade.worker_permission_mode(),
-                worker_agent,
             )
         }
         Err(err) => {
@@ -7500,6 +7945,7 @@ fn update_disbanded(
                 None => Stage::Empty,
             };
             state.disbanding.insert(brigade_id);
+            drop_held_creations_of(state, brigade_id);
             state.brigade_layouts.remove(&brigade_id);
             state.persisted_layouts.remove(&brigade_id);
             state.brigade_names.remove(&brigade_id);
@@ -7698,6 +8144,8 @@ fn update_tick(
     now: Instant,
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
+
+    cmds.extend(give_up_on_codex_catalog(state, now));
 
     match state.sweep_due {
         None => state.sweep_due = Some(now + DATA_DIR_FIRST_SWEEP_DELAY),
@@ -8388,6 +8836,8 @@ mod one_pane_duplicates_tests;
 #[cfg(test)]
 mod stack_order_tests;
 
+#[cfg(test)]
+mod launch_choice_tests;
 #[cfg(test)]
 mod small_tile_tests;
 
@@ -9619,74 +10069,7 @@ mod tests {
         );
     }
 
-    // --- model on resume ------------------------------------------------------
-
-    #[test]
-    fn stage_brigade_passes_the_configured_model_to_a_resumed_worker_and_goinkyo_but_never_to_the_director()
-     {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
-        let brigade = brigade_config(); // worker_model "sonnet", goinkyo_model "fable"
-        let now = test_instant();
-        state.pending_membership = Some(PendingMembership::Activate);
-
-        let roster = vec![
-            (
-                "director".to_string(),
-                BrigadeRole::Director,
-                Some("dir".to_string()),
-            ),
-            (
-                "worker-1".to_string(),
-                BrigadeRole::Worker,
-                Some("w1".to_string()),
-            ),
-            (
-                "goinkyo".to_string(),
-                BrigadeRole::Goinkyo,
-                Some("g1".to_string()),
-            ),
-        ];
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::MembershipResolved {
-                session_id: "dir".to_string(),
-                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
-                members: Some(roster),
-                layout: None,
-                names: Vec::new(),
-            },
-            now,
-        );
-
-        let models: Vec<(String, Option<String>)> = cmds
-            .iter()
-            .filter_map(|cmd| match cmd {
-                Cmd::OpenEmbedded { target, model, .. } => Some((target.id.clone(), model.clone())),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            models
-                .iter()
-                .any(|(id, model)| id == "dir" && model.is_none()),
-            "the Director must never carry --model: {models:?}"
-        );
-        assert!(
-            models
-                .iter()
-                .any(|(id, model)| id == "w1" && model.as_deref() == Some("sonnet")),
-            "a resumed Worker must carry the configured worker_model: {models:?}"
-        );
-        assert!(
-            models
-                .iter()
-                .any(|(id, model)| id == "g1" && model.as_deref() == Some("fable")),
-            "a resumed Goinkyo must carry the configured goinkyo_model: {models:?}"
-        );
-    }
+    // --- role flags on resume (model and effort: `launch_choice_tests`) ---------
 
     /// Shared by the `permission_mode`/`disallowed_tools` resume tests below:
     /// stage a Director/Worker/Goinkyo trio, each already resolved to a row,
@@ -9804,132 +10187,6 @@ mod tests {
                 .iter()
                 .any(|(id, _, tools)| id == "g1" && tools.as_deref() == Some("Bash")),
             "a resumed Goinkyo must carry the configured goinkyo_disallowed_tools: {modes:?}"
-        );
-    }
-
-    #[test]
-    fn stage_brigade_passes_the_configured_effort_to_a_resumed_goinkyo_but_never_to_worker_or_director()
-     {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
-        let brigade = BrigadeConfig {
-            goinkyo_effort: "low".to_string(),
-            ..BrigadeConfig::default()
-        };
-        let now = test_instant();
-        state.pending_membership = Some(PendingMembership::Activate);
-
-        let roster = vec![
-            (
-                "director".to_string(),
-                BrigadeRole::Director,
-                Some("dir".to_string()),
-            ),
-            (
-                "worker-1".to_string(),
-                BrigadeRole::Worker,
-                Some("w1".to_string()),
-            ),
-            (
-                "goinkyo".to_string(),
-                BrigadeRole::Goinkyo,
-                Some("g1".to_string()),
-            ),
-        ];
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::MembershipResolved {
-                session_id: "dir".to_string(),
-                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
-                members: Some(roster),
-                layout: None,
-                names: Vec::new(),
-            },
-            now,
-        );
-
-        let efforts: Vec<(String, Option<String>)> = cmds
-            .iter()
-            .filter_map(|cmd| match cmd {
-                Cmd::OpenEmbedded { target, effort, .. } => {
-                    Some((target.id.clone(), effort.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(
-            efforts
-                .iter()
-                .any(|(id, effort)| id == "dir" && effort.is_none()),
-            "the Director must never carry --effort: {efforts:?}"
-        );
-        assert!(
-            efforts
-                .iter()
-                .any(|(id, effort)| id == "w1" && effort.is_none()),
-            "a resumed Worker must never carry --effort: {efforts:?}"
-        );
-        assert!(
-            efforts
-                .iter()
-                .any(|(id, effort)| id == "g1" && effort.as_deref() == Some("low")),
-            "a resumed Goinkyo must carry the configured effort: {efforts:?}"
-        );
-    }
-
-    #[test]
-    fn stage_brigade_resumed_goinkyo_carries_no_effort_when_the_config_value_is_the_empty_escape_hatch()
-     {
-        // The same accessor (`BrigadeConfig::goinkyo_effort`) backs both the
-        // fresh-spawn path (`update_goinkyo_awaiting_spawn`) and this resume
-        // path, so an empty-string config value can't mean "pass nothing" on
-        // one and something else on the other — this pins that down for the
-        // resume path specifically.
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("dir"), row("g1")]);
-        let brigade = BrigadeConfig {
-            goinkyo_effort: String::new(),
-            ..BrigadeConfig::default()
-        };
-        let now = test_instant();
-        state.pending_membership = Some(PendingMembership::Activate);
-
-        let roster = vec![
-            (
-                "director".to_string(),
-                BrigadeRole::Director,
-                Some("dir".to_string()),
-            ),
-            (
-                "goinkyo".to_string(),
-                BrigadeRole::Goinkyo,
-                Some("g1".to_string()),
-            ),
-        ];
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::MembershipResolved {
-                session_id: "dir".to_string(),
-                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
-                members: Some(roster),
-                layout: None,
-                names: Vec::new(),
-            },
-            now,
-        );
-
-        let goinkyo_effort = cmds.iter().find_map(|cmd| match cmd {
-            Cmd::OpenEmbedded { target, effort, .. } if target.id == "g1" => Some(effort.clone()),
-            _ => None,
-        });
-        assert_eq!(
-            goinkyo_effort,
-            Some(None),
-            "expected no --effort: {goinkyo_effort:?}"
         );
     }
 
@@ -10162,6 +10419,14 @@ mod tests {
             },
             test_instant(),
         );
+        // A Codex Worker's creation meets the catalog first.
+        let cmds = launch_choice_tests::answer_catalog(
+            &mut state,
+            &mut app,
+            &brigade,
+            cmds,
+            &launch_choice_tests::catalog(),
+        );
 
         let worker_target = cmds.iter().find_map(|cmd| match cmd {
             Cmd::OpenEmbedded { target, .. } if target.id.is_empty() => Some(target),
@@ -10199,6 +10464,7 @@ mod tests {
                 // `update_brigade_formed` does with it, not how it got resolved.
                 worker_agent: AgentKind::Codex,
                 worker_model: "gpt-5.6-terra".to_string(),
+                worker_effort: String::new(),
                 result: Ok((1, vec!["worker-1".to_string()])),
             },
             test_instant(),
@@ -10266,6 +10532,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::Codex,
                 worker_model: "gpt-5.6-terra".to_string(),
+                worker_effort: String::new(),
                 result: Ok((1, vec!["worker-1".to_string()])),
             },
             test_instant(),
@@ -10279,6 +10546,13 @@ mod tests {
                 key: SessionKey::from_id("dir"),
             },
             test_instant(),
+        );
+        let cmds = launch_choice_tests::answer_catalog(
+            &mut state,
+            &mut app,
+            &brigade,
+            cmds,
+            &launch_choice_tests::catalog(),
         );
 
         let worker = cmds.iter().find_map(|cmd| match cmd {
@@ -10318,6 +10592,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::Codex,
                 worker_model: "gpt-5.6-terra".to_string(),
+                worker_effort: String::new(),
                 result: Ok((1, vec!["worker-1".to_string()])),
             },
             test_instant(),
@@ -10361,6 +10636,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::Codex,
                 worker_model: "gpt-5.6-terra".to_string(),
+                worker_effort: String::new(),
                 result: Ok((1, vec!["worker-1".to_string()])),
             },
             test_instant(),
@@ -10373,6 +10649,13 @@ mod tests {
                 key: SessionKey::from_id("dir"),
             },
             test_instant(),
+        );
+        let worker_cmds = launch_choice_tests::answer_catalog(
+            &mut state,
+            &mut app,
+            &brigade,
+            worker_cmds,
+            &launch_choice_tests::catalog(),
         );
         let worker_permission_mode = worker_cmds.iter().find_map(|cmd| match cmd {
             Cmd::OpenEmbedded {
@@ -10469,9 +10752,17 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::Codex,
                 worker_model: "gpt-5.6-terra".to_string(),
+                worker_effort: String::new(),
                 result: Ok("worker-2".to_string()),
             },
             test_instant(),
+        );
+        let cmds = launch_choice_tests::answer_catalog(
+            &mut state,
+            &mut app,
+            &brigade,
+            cmds,
+            &launch_choice_tests::catalog(),
         );
 
         match cmds.as_slice() {
@@ -10773,9 +11064,14 @@ mod tests {
             worker_count: 2,
         });
         app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
             AgentKind::Codex,
-            "sonnet".to_string(),
-            "gpt-5.6-terra".to_string(),
+            WorkerDefaults {
+                claude_model: "sonnet".to_string(),
+                claude_effort: "high".to_string(),
+                codex_model: "gpt-5.6-terra".to_string(),
+                codex_effort: "high".to_string(),
+            },
         );
         app.modal_toggle_agent(); // Codex -> Claude, re-seeds the model input
         app.modal_push_char('!'); // then the operator edits it further
@@ -10820,9 +11116,14 @@ mod tests {
             worker_count: 2,
         });
         app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
             AgentKind::ClaudeCode,
-            "sonnet".to_string(),
-            "gpt-5.6-terra".to_string(),
+            WorkerDefaults {
+                claude_model: "sonnet".to_string(),
+                claude_effort: "high".to_string(),
+                codex_model: "gpt-5.6-terra".to_string(),
+                codex_effort: "high".to_string(),
+            },
         );
         app.modal_toggle_agent(); // Claude -> Codex
 
@@ -10843,6 +11144,7 @@ mod tests {
             worker_count: 2,
             worker_agent: AgentKind::Codex,
             worker_model: "gpt-5.6-terra".to_string(),
+            worker_effort: String::new(),
         }
     }
 
@@ -10958,7 +11260,16 @@ mod tests {
             cwd: PathBuf::from("/work"),
             worker_count: 1,
         });
-        app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
+        app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
+            AgentKind::Codex,
+            WorkerDefaults {
+                claude_model: String::new(),
+                claude_effort: String::new(),
+                codex_model: String::new(),
+                codex_effort: String::new(),
+            },
+        );
 
         let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
 
@@ -10974,7 +11285,16 @@ mod tests {
     fn backtab_toggles_the_worker_agent_modals_agent() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
-        app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
+        app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
+            AgentKind::ClaudeCode,
+            WorkerDefaults {
+                claude_model: String::new(),
+                claude_effort: String::new(),
+                codex_model: String::new(),
+                codex_effort: String::new(),
+            },
+        );
 
         update_modal_key(&mut state, &mut app, KeyCode::BackTab, Modifiers::NONE);
 
@@ -11015,9 +11335,14 @@ mod tests {
             cwd: PathBuf::from("/work"),
         });
         app.open_worker_agent_modal(
+            WorkerPickerFor::AddWorker,
             AgentKind::ClaudeCode,
-            "sonnet".to_string(),
-            "gpt-5.6-terra".to_string(),
+            WorkerDefaults {
+                claude_model: "sonnet".to_string(),
+                claude_effort: "high".to_string(),
+                codex_model: "gpt-5.6-terra".to_string(),
+                codex_effort: "high".to_string(),
+            },
         );
         app.modal_push_char('!'); // edit the seeded Claude default, no toggle
 
@@ -11031,7 +11356,10 @@ mod tests {
                     cwd,
                     worker_agent: AgentKind::ClaudeCode,
                     worker_model,
-                })] if cwd == &PathBuf::from("/work") && worker_model == "sonnet!"
+                    worker_effort,
+                })] if cwd == &PathBuf::from("/work")
+                    && worker_model == "sonnet!"
+                    && worker_effort == "high"
             ),
             "expected an AddWorker carrying the picker's own final state: {cmds:?}"
         );
@@ -11053,7 +11381,16 @@ mod tests {
             brigade_id: 7,
             cwd: PathBuf::from("/work"),
         });
-        app.open_worker_agent_modal(AgentKind::ClaudeCode, String::new(), String::new());
+        app.open_worker_agent_modal(
+            WorkerPickerFor::AddWorker,
+            AgentKind::ClaudeCode,
+            WorkerDefaults {
+                claude_model: String::new(),
+                claude_effort: String::new(),
+                codex_model: String::new(),
+                codex_effort: String::new(),
+            },
+        );
         app.modal_toggle_agent(); // Claude -> Codex
 
         let cmds = confirm_worker_agent_modal(&mut state, &mut app);
@@ -11076,7 +11413,16 @@ mod tests {
             brigade_id: 7,
             cwd: PathBuf::from("/work"),
         });
-        app.open_worker_agent_modal(AgentKind::Codex, String::new(), String::new());
+        app.open_worker_agent_modal(
+            WorkerPickerFor::AddWorker,
+            AgentKind::Codex,
+            WorkerDefaults {
+                claude_model: String::new(),
+                claude_effort: String::new(),
+                codex_model: String::new(),
+                codex_effort: String::new(),
+            },
+        );
 
         let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
 
@@ -12224,9 +12570,12 @@ mod tests {
             1,
             "worker-1",
             std::path::Path::new("/work"),
-            "",
+            WorkerChoice {
+                agent: AgentKind::Codex,
+                model: "",
+                effort: "",
+            },
             None,
-            AgentKind::Codex,
         );
         let key = SessionKey::new_worker(1, "worker-1");
         assert!(matches!(
@@ -12246,9 +12595,12 @@ mod tests {
             1,
             "worker-1",
             std::path::Path::new("/work"),
-            "",
+            WorkerChoice {
+                agent: AgentKind::ClaudeCode,
+                model: "",
+                effort: "",
+            },
             None,
-            AgentKind::ClaudeCode,
         );
         let key = SessionKey::new_worker(1, "worker-1");
         assert!(matches!(
@@ -16181,9 +16533,12 @@ mod tests {
             1,
             "worker-3",
             std::path::Path::new("/work"),
-            "",
+            WorkerChoice {
+                agent: AgentKind::ClaudeCode,
+                model: "",
+                effort: "",
+            },
             None,
-            AgentKind::ClaudeCode,
         );
         update(
             &mut state,
@@ -16515,9 +16870,12 @@ mod tests {
             1,
             "worker-3",
             std::path::Path::new("/work"),
-            "",
+            WorkerChoice {
+                agent: AgentKind::ClaudeCode,
+                model: "",
+                effort: "",
+            },
             None,
-            AgentKind::ClaudeCode,
         );
         update(
             &mut state,
@@ -18004,6 +18362,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::ClaudeCode,
                 worker_model: String::new(),
+                worker_effort: String::new(),
                 result: Ok((9, vec!["worker-1".to_string()])),
             },
             test_instant(),
@@ -19686,9 +20045,12 @@ mod tests {
                 1,
                 token,
                 std::path::Path::new("/work"),
-                "",
+                WorkerChoice {
+                    agent: AgentKind::ClaudeCode,
+                    model: "",
+                    effort: "",
+                },
                 None,
-                AgentKind::ClaudeCode,
             );
         }
         for token in ["worker-1", "worker-2", "worker-3"] {
@@ -21887,9 +22249,12 @@ mod tests {
             1,
             "worker-1",
             &PathBuf::from("/work"),
-            "",
+            WorkerChoice {
+                agent: AgentKind::ClaudeCode,
+                model: "",
+                effort: "",
+            },
             None,
-            AgentKind::ClaudeCode,
         );
 
         assert!(state.pending_goinkyo_kickoffs.is_empty());

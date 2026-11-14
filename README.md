@@ -78,7 +78,9 @@ itself dogfooding — the session shown is building banto.*
 `B` appoints the selected session as a **Director** and
 auto-spawns fresh **Worker** sessions beside it (count, model, and even
 product all configurable — a brigade's Workers can run Claude Code or Codex
-independently of the Director's own product). banto mediates a message
+independently of the Director's own product). A Worker's model and reasoning effort
+are given when its session is created and never when it is reopened, so a change you
+make inside a session survives banto's restarts. banto mediates a message
 channel between them over MCP: it wires every member back to `banto _mcp` on
 its own launch — Claude Code via `--mcp-config`, Codex via `-c
 mcp_servers.banto.*` overrides — so members get `send_to_peer` /
@@ -307,7 +309,15 @@ week_days = 7
 
 [brigade]           # Director/Worker cells
 workers = 1         # Workers auto-spawned per cell (1..=8)
-worker_model = "sonnet"   # --model for spawned Workers ("" = inherit)
+worker_agent = "inherit"   # "inherit" (the Director's product) | "claude" | "codex" | "select" (a picker: agent, model, effort)
+# Model and effort of a NEW Worker. They are passed only when a Worker's session is
+# created, never when it is reopened: a reopened session keeps what it last used,
+# including what you changed inside it. Values are trimmed; "" (or only spaces)
+# passes no flag. The defaults shown name no version.
+worker_model = "sonnet"          # Claude: --model
+worker_effort = "high"           # Claude: --effort (low | medium | high | xhigh | max)
+worker_model_codex = "terra"     # Codex: a slug, or a family word resolved to its newest slug
+worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
 # For banto developers: append every brigade message, in full, to
 # <data dir>/banto/logs/brigade-<id>.log. Off by default. The file holds real

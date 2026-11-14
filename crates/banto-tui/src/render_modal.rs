@@ -14,6 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::app::{
     GroupJoinState, GroupRenameState, Modal, NewSessionState, WorkerAgentPickerState,
+    WorkerPickerField, WorkerPickerFor,
 };
 
 use crate::text::truncate_to_width;
@@ -245,39 +246,85 @@ fn render_new_session_modal(frame: &mut Frame, state: &NewSessionState, area: Re
     frame.render_stateful_widget(list, list_area, &mut list_state);
 }
 
-/// Render the emporium's formation-time Worker-agent picker
-/// (`[brigade] worker_agent = "select"`): a title naming the currently
-/// selected product (same convention as the new-session modal's own title),
-/// and a one-line, editable `--model` input below it, seeded from that
-/// product's own configured default. No candidate list — a model name isn't
-/// drawn from a set of previously seen values the way a cwd is.
+/// The Worker picker's title and hint, by the operation it belongs to. The two
+/// dialogs used to read the same, and the one that forms a brigade was taken for
+/// the one that adds a Worker, so each names its own operation and the verb
+/// Enter carries out.
+fn worker_picker_words(purpose: WorkerPickerFor, agent: &str) -> (String, &'static str) {
+    match purpose {
+        WorkerPickerFor::FormBrigade => (
+            format!(" New Brigade \u{2014} Workers \u{2014} {agent} "),
+            " Enter form  Tab field  Shift-Tab agent  Esc cancel ",
+        ),
+        WorkerPickerFor::AddWorker => (
+            format!(" Add Worker \u{2014} {agent} "),
+            " Enter add  Tab field  Shift-Tab agent  Esc cancel ",
+        ),
+    }
+}
+
+/// Render the emporium's Worker picker (`[brigade] worker_agent = "select"`),
+/// shown when a brigade is formed and when a Worker is added: a title naming the
+/// operation and the currently selected product (same convention as the
+/// new-session modal's own title), then two editable one-line fields, the model
+/// and the reasoning effort, seeded from that product's configured defaults.
+/// What is shown is what was written: a Codex family word such as `terra` stays
+/// as typed here and is resolved to a slug only when the session is created.
+/// No candidate list — a model name isn't drawn from a set of previously seen
+/// values the way a cwd is. The field with the cursor has its label lit.
 fn render_worker_agent_picker_modal(frame: &mut Frame, state: &WorkerAgentPickerState, area: Rect) {
+    let (title, hint) = worker_picker_words(state.purpose(), state.agent().label());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(
-            " Brigade Workers \u{2014} {} ",
-            state.agent().label()
-        ))
-        .title_bottom(" Enter form  Shift-Tab agent  Esc cancel ");
+        .title(title)
+        .title_bottom(hint);
     let inner = pad_horizontal(block.inner(area));
     frame.render_widget(block, area);
 
-    let [label_area, input_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let [model_label, model_input, effort_label, effort_input] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
 
-    frame.render_widget(
-        Paragraph::new("Model (blank passes no --model flag):")
-            .style(Style::default().fg(Color::DarkGray)),
-        label_area,
-    );
-
-    let (visible_input, cursor_col) =
-        windowed_view(state.model_input(), state.cursor(), input_area.width);
-    frame.render_widget(Paragraph::new(visible_input.as_str()), input_area);
-    if input_area.width > 0 {
-        let cursor_x = (input_area.x + cursor_col).min(input_area.x + input_area.width - 1);
-        frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+    let fields = [
+        (
+            WorkerPickerField::Model,
+            "Model (blank passes no model flag):",
+            state.model_input(),
+            model_label,
+            model_input,
+        ),
+        (
+            WorkerPickerField::Effort,
+            "Effort (blank passes no effort flag):",
+            state.effort_input(),
+            effort_label,
+            effort_input,
+        ),
+    ];
+    for (field, label, text, label_area, input_area) in fields {
+        let active = state.field() == field;
+        let style = if active {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(Paragraph::new(label).style(style), label_area);
+        if active {
+            let (visible, cursor_col) = windowed_view(text, state.cursor(), input_area.width);
+            frame.render_widget(Paragraph::new(visible.as_str()), input_area);
+            if input_area.width > 0 {
+                let cursor_x = (input_area.x + cursor_col).min(input_area.x + input_area.width - 1);
+                frame.set_cursor_position(Position::new(cursor_x, input_area.y));
+            }
+        } else {
+            let (visible, _) = windowed_view(text, 0, input_area.width);
+            frame.render_widget(Paragraph::new(visible.as_str()), input_area);
+        }
     }
 }
 
@@ -796,33 +843,108 @@ mod tests {
         );
     }
 
+    fn picker_defaults() -> banto_core::app::WorkerDefaults {
+        banto_core::app::WorkerDefaults {
+            claude_model: "sonnet".to_string(),
+            claude_effort: "high".to_string(),
+            codex_model: "terra".to_string(),
+            codex_effort: "high".to_string(),
+        }
+    }
+
+    /// The picker as drawn, one line of text per row with the trailing blanks
+    /// and the border columns kept, in a 60x8 box.
+    fn drawn_picker(purpose: WorkerPickerFor, agent: AgentKind) -> String {
+        let mut app = App::new(Vec::new());
+        app.open_worker_agent_modal(purpose, agent, picker_defaults());
+        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
+            panic!("expected an open worker picker");
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| render_worker_agent_picker_modal(frame, state, Rect::new(0, 0, 60, 8)))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+            .lines()
+            .take(8)
+            .map(|line| line.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn worker_agent_picker_modal_names_the_agent_and_shows_its_seeded_model() {
+    fn the_picker_for_forming_a_brigade_says_so_and_shows_both_fields() {
+        let text = drawn_picker(WorkerPickerFor::FormBrigade, AgentKind::Codex);
+        println!("{text}");
+        assert!(
+            text.contains(" New Brigade \u{2014} Workers \u{2014} Codex "),
+            "{text}"
+        );
+        assert!(
+            text.contains(" Enter form  Tab field  Shift-Tab agent  Esc cancel "),
+            "{text}"
+        );
+        assert!(
+            text.contains("Model (blank passes no model flag):"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Effort (blank passes no effort flag):"),
+            "{text}"
+        );
+        // The Codex model is the family word as written, not a slug.
+        assert!(text.contains(" terra"), "{text}");
+        assert!(text.contains(" high"), "{text}");
+    }
+
+    #[test]
+    fn the_picker_for_adding_a_worker_says_so_and_does_not_read_like_the_other_one() {
+        let adding = drawn_picker(WorkerPickerFor::AddWorker, AgentKind::ClaudeCode);
+        let forming = drawn_picker(WorkerPickerFor::FormBrigade, AgentKind::ClaudeCode);
+        println!("{adding}");
+        assert!(adding.contains(" Add Worker \u{2014} Claude "), "{adding}");
+        assert!(
+            adding.contains(" Enter add  Tab field  Shift-Tab agent  Esc cancel "),
+            "{adding}"
+        );
+        assert!(adding.contains(" sonnet"), "{adding}");
+        assert!(
+            !adding.contains("Brigade") && !adding.contains("Enter form"),
+            "{adding}"
+        );
+        assert!(
+            !forming.contains("Add Worker") && !forming.contains("Enter add"),
+            "{forming}"
+        );
+        assert_ne!(adding, forming);
+    }
+
+    #[test]
+    fn the_picker_shows_empty_fields_as_empty_and_the_cursor_in_the_active_one() {
         let mut app = App::new(Vec::new());
         app.open_worker_agent_modal(
+            WorkerPickerFor::AddWorker,
             AgentKind::Codex,
-            "sonnet".to_string(),
-            "gpt-5.6-terra".to_string(),
+            banto_core::app::WorkerDefaults {
+                codex_model: String::new(),
+                codex_effort: "xhigh".to_string(),
+                ..picker_defaults()
+            },
         );
         let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
-            panic!("expected an open worker-agent picker modal");
+            panic!("expected an open worker picker");
         };
-
-        let area = Rect::new(2, 2, 50, 10);
-        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
-            .draw(|frame| render_worker_agent_picker_modal(frame, state, area))
+            .draw(|frame| render_worker_agent_picker_modal(frame, state, Rect::new(0, 0, 60, 8)))
             .unwrap();
         let text = buffer_text(terminal.backend().buffer());
-
-        assert!(
-            text.contains("Codex"),
-            "expected the selected agent named in the title:\n{text}"
-        );
-        assert!(
-            text.contains("gpt-5.6-terra"),
-            "expected Codex's own seeded model in the input:\n{text}"
-        );
+        assert!(text.contains("xhigh"), "{text}");
+        // The model field has the cursor and is empty: it sits at the start of
+        // the input row, one row below the model label.
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(2, 2));
     }
 
     #[test]

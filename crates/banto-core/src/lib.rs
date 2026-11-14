@@ -6,6 +6,8 @@
 //! Module map (see docs/REQUIREMENTS.md for the design):
 //! - [`model`]  shared domain types (pure data)
 //! - [`input`]  pure key/mouse/paste/resize event types (no terminal backend)
+//! - [`codex_model`] resolving a Codex model family word to a catalog slug (the
+//!   catalog itself is read by `banto_io::codex_catalog`)
 //! - [`config`] config.toml's types (loading them from disk is `banto_io::config`)
 //! - [`status`] activity age-bucketing math (live-process state is `banto_io::status`)
 //! - [`search`] nucleo fuzzy search
@@ -22,6 +24,7 @@
 //! - [`replay`] the record/replay event-stream format (`docs/DISCIPLINE.md` §8)
 
 pub mod app;
+pub mod codex_model;
 pub mod config;
 pub mod display_text;
 pub mod engine;

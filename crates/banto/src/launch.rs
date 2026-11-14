@@ -72,6 +72,30 @@ pub(crate) fn is_live(session: &SessionToOpen, ctx: &OpenContext) -> bool {
     }
 }
 
+/// Whether a launch continues a session that exists or starts one — and the
+/// only place a model or a reasoning effort can ride on a launch.
+///
+/// A resume has no field for either, so no caller can pass one. The reason is
+/// what each product does with them (read in Codex's source at tag
+/// `rust-v0.168.0` and in Claude Code's docs for 2.1.323; not measured by
+/// running either): a flag-less `codex resume` and a flag-less `claude
+/// --resume` restore the model the session last used, including one the
+/// operator changed inside it, while `-m` on a Codex resume overrides that and
+/// rewrites the thread's record at once, and `-c model_reasoning_effort` alone
+/// on one switches Codex to "override" mode and drops the thread's model. A
+/// flag given on a resume is therefore not a harmless repeat: it overwrites a
+/// choice the operator made after the session began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionStart {
+    /// Continue the session with this id, with nothing else decided here.
+    Resume(String),
+    /// Start a session. `None` leaves the choice to the product's own default.
+    Create {
+        model: Option<String>,
+        effort: Option<String>,
+    },
+}
+
 /// A pending agent invocation, turned into argv by [`Self::argv`]. This is the
 /// single place in the workspace that knows which flags each agent product
 /// takes and in what order.
@@ -89,34 +113,23 @@ pub(crate) fn is_live(session: &SessionToOpen, ctx: &OpenContext) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentLaunch {
     Claude {
-        resume: Option<String>,
-        model: Option<String>,
+        /// `--resume <id>`, or, for a new session, `--model <model>` and
         /// `--effort <level>` (`claude --help`: `low`/`medium`/`high`/
-        /// `xhigh`/`max`) — so far only ever set for an auto-spawned
-        /// Goinkyo (`BrigadeConfig::goinkyo_effort`). No Codex counterpart
-        /// on [`Self::Codex`]: Claude's reasoning-effort flag has no
-        /// equivalent there (Codex's nearest is `-c
-        /// model_reasoning_effort`, a `-c` override like the rest of
-        /// [`CodexBrigade`], not a bare flag) — giving `Self::Codex` a
-        /// field this build never fills would be exactly the "unused field
-        /// nobody remembers to leave `None`" risk this enum's own doc says
-        /// the per-variant split exists to avoid.
-        effort: Option<String>,
+        /// `xhigh`/`max`) — see [`SessionStart`].
+        start: SessionStart,
         /// `--permission-mode <mode>` (`claude --help`: `manual`/
         /// `acceptEdits`/`plan`/`auto`/`dontAsk`/`bypassPermissions`) —
-        /// unlike `effort` above, set for a Goinkyo
-        /// (`BrigadeConfig::goinkyo_permission_mode`) on a resume too, not
-        /// just a fresh spawn: who may approve a tool call is a property of
-        /// the role, not of whether this particular launch is fresh. Same
-        /// "no Codex counterpart on `Self::Codex`" reasoning as `effort`.
+        /// unlike a [`SessionStart::Create`]'s model and effort, set for a
+        /// Goinkyo on a resume too, not just a fresh spawn: who may approve a
+        /// tool call is a property of the role, not of whether this
+        /// particular launch is fresh.
         permission_mode: Option<String>,
         /// `--disallowedTools <tools>` (`claude --help`: comma- or
         /// space-separated tool names to deny) —
         /// `BrigadeConfig::goinkyo_disallowed_tools`, same scope as
         /// `permission_mode` just above (Goinkyo, fresh spawn or resume
         /// alike — which tools exist to call is as much a role property as
-        /// who approves them) and the same "no Codex counterpart" reasoning
-        /// as `effort`.
+        /// who approves them).
         disallowed_tools: Option<String>,
         append_system_prompt: Option<String>,
         mcp_config: Option<PathBuf>,
@@ -127,8 +140,9 @@ pub(crate) enum AgentLaunch {
     /// `cwd` lives on the launch here, even though [`Self::Claude`]'s own
     /// rendering keeps ignoring it in favor of the spawner.
     Codex {
-        resume: Option<String>,
-        model: Option<String>,
+        /// `resume <id>`, or, for a new session, `-m <model>` and
+        /// `-c model_reasoning_effort="<level>"` — see [`SessionStart`].
+        start: SessionStart,
         cwd: PathBuf,
         /// `None` outside brigade context (an ordinary resume/new session);
         /// `Some` adds the `-c` overrides that make this launch a brigade
@@ -436,36 +450,39 @@ impl AgentLaunch {
     /// Render as `binary`'s own argv (see [`agent_binary`] for resolving
     /// it). Claude's fixed order is the one every existing call site already
     /// agreed on before this type existed, `effort` slotted in right after
-    /// `--model` since `claude --help` groups the two: `--resume`, then
-    /// `--model`, then `--effort`, then `--append-system-prompt`, then
-    /// `--mcp-config`. Codex's: the `resume <uuid>` subcommand (or nothing,
-    /// for a fresh launch), then `-m`, then the notification `-c` overrides
-    /// (always present — see [`NOTIFICATION_OVERRIDES`]), then brigade `-c`
-    /// overrides (if any — see [`CodexBrigade::overrides`]), then `-C <cwd>`
-    /// last, always present.
+    /// `--model` since `claude --help` groups the two: `--resume`, or `--model`
+    /// then `--effort`, then `--permission-mode`, `--disallowedTools`,
+    /// `--append-system-prompt`, `--mcp-config`. Codex's: the `resume <uuid>`
+    /// subcommand (or nothing, for a fresh launch), then `-m`, then the
+    /// notification `-c` overrides (always present — see
+    /// [`NOTIFICATION_OVERRIDES`]), then `-c model_reasoning_effort` (a new
+    /// session with an effort), then brigade `-c` overrides (if any — see
+    /// [`CodexBrigade::overrides`]), then `-C <cwd>` last, always present.
     pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
         let mut argv = vec![binary.to_string()];
         match self {
             AgentLaunch::Claude {
-                resume,
-                model,
-                effort,
+                start,
                 permission_mode,
                 disallowed_tools,
                 append_system_prompt,
                 mcp_config,
             } => {
-                if let Some(id) = resume {
-                    argv.push("--resume".to_string());
-                    argv.push(id.clone());
-                }
-                if let Some(model) = model {
-                    argv.push("--model".to_string());
-                    argv.push(model.clone());
-                }
-                if let Some(effort) = effort {
-                    argv.push("--effort".to_string());
-                    argv.push(effort.clone());
+                match start {
+                    SessionStart::Resume(id) => {
+                        argv.push("--resume".to_string());
+                        argv.push(id.clone());
+                    }
+                    SessionStart::Create { model, effort } => {
+                        if let Some(model) = model {
+                            argv.push("--model".to_string());
+                            argv.push(model.clone());
+                        }
+                        if let Some(effort) = effort {
+                            argv.push("--effort".to_string());
+                            argv.push(effort.clone());
+                        }
+                    }
                 }
                 if let Some(mode) = permission_mode {
                     argv.push("--permission-mode".to_string());
@@ -485,22 +502,31 @@ impl AgentLaunch {
                 }
             }
             AgentLaunch::Codex {
-                resume,
-                model,
+                start,
                 cwd,
                 brigade,
             } => {
-                if let Some(id) = resume {
-                    argv.push("resume".to_string());
-                    argv.push(id.clone());
-                }
-                if let Some(model) = model {
-                    argv.push("-m".to_string());
-                    argv.push(model.clone());
+                let mut effort_override = None;
+                match start {
+                    SessionStart::Resume(id) => {
+                        argv.push("resume".to_string());
+                        argv.push(id.clone());
+                    }
+                    SessionStart::Create { model, effort } => {
+                        if let Some(model) = model {
+                            argv.push("-m".to_string());
+                            argv.push(model.clone());
+                        }
+                        effort_override = effort.as_deref().map(model_reasoning_effort_override);
+                    }
                 }
                 for value in NOTIFICATION_OVERRIDES {
                     argv.push("-c".to_string());
                     argv.push(value.to_string());
+                }
+                if let Some(value) = effort_override {
+                    argv.push("-c".to_string());
+                    argv.push(value);
                 }
                 if let Some(brigade) = brigade {
                     for value in brigade.overrides() {
@@ -514,6 +540,13 @@ impl AgentLaunch {
         }
         argv
     }
+}
+
+/// `-c model_reasoning_effort="<level>"`, for a Codex session being created.
+/// The level is whatever the operator configured or typed, quoted as a TOML
+/// string and not checked here: Codex is the one that knows its levels.
+fn model_reasoning_effort_override(effort: &str) -> String {
+    format!("model_reasoning_effort=\"{}\"", toml_basic_string(effort))
 }
 
 #[cfg(test)]
@@ -664,9 +697,10 @@ mod tests {
 
     fn blank_claude() -> AgentLaunch {
         AgentLaunch::Claude {
-            resume: None,
-            model: None,
-            effort: None,
+            start: SessionStart::Create {
+                model: None,
+                effort: None,
+            },
             permission_mode: None,
             disallowed_tools: None,
             append_system_prompt: None,
@@ -685,9 +719,10 @@ mod tests {
     #[test]
     fn agent_launch_appends_mcp_config_last_on_its_own() {
         let launch = AgentLaunch::Claude {
-            resume: None,
-            model: None,
-            effort: None,
+            start: SessionStart::Create {
+                model: None,
+                effort: None,
+            },
             permission_mode: None,
             disallowed_tools: None,
             append_system_prompt: None,
@@ -707,9 +742,10 @@ mod tests {
     #[test]
     fn agent_launch_effort_renders_right_after_model_and_is_absent_when_none() {
         let launch = AgentLaunch::Claude {
-            resume: None,
-            model: Some("fable".to_string()),
-            effort: Some("max".to_string()),
+            start: SessionStart::Create {
+                model: Some("fable".to_string()),
+                effort: Some("max".to_string()),
+            },
             permission_mode: None,
             disallowed_tools: None,
             append_system_prompt: None,
@@ -721,9 +757,10 @@ mod tests {
         );
 
         let no_effort = AgentLaunch::Claude {
-            resume: None,
-            model: Some("fable".to_string()),
-            effort: None,
+            start: SessionStart::Create {
+                model: Some("fable".to_string()),
+                effort: None,
+            },
             permission_mode: None,
             disallowed_tools: None,
             append_system_prompt: None,
@@ -738,9 +775,10 @@ mod tests {
     #[test]
     fn agent_launch_permission_mode_renders_right_after_effort_and_is_absent_when_none() {
         let launch = AgentLaunch::Claude {
-            resume: None,
-            model: Some("fable".to_string()),
-            effort: Some("max".to_string()),
+            start: SessionStart::Create {
+                model: Some("fable".to_string()),
+                effort: Some("max".to_string()),
+            },
             permission_mode: Some("auto".to_string()),
             disallowed_tools: None,
             append_system_prompt: None,
@@ -761,9 +799,10 @@ mod tests {
         );
 
         let no_permission_mode = AgentLaunch::Claude {
-            resume: None,
-            model: Some("fable".to_string()),
-            effort: Some("max".to_string()),
+            start: SessionStart::Create {
+                model: Some("fable".to_string()),
+                effort: Some("max".to_string()),
+            },
             permission_mode: None,
             disallowed_tools: None,
             append_system_prompt: None,
@@ -778,9 +817,10 @@ mod tests {
     #[test]
     fn agent_launch_disallowed_tools_renders_right_after_permission_mode_and_is_absent_when_none() {
         let launch = AgentLaunch::Claude {
-            resume: None,
-            model: Some("fable".to_string()),
-            effort: Some("max".to_string()),
+            start: SessionStart::Create {
+                model: Some("fable".to_string()),
+                effort: Some("max".to_string()),
+            },
             permission_mode: Some("auto".to_string()),
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             append_system_prompt: None,
@@ -803,9 +843,10 @@ mod tests {
         );
 
         let no_disallowed_tools = AgentLaunch::Claude {
-            resume: None,
-            model: Some("fable".to_string()),
-            effort: Some("max".to_string()),
+            start: SessionStart::Create {
+                model: Some("fable".to_string()),
+                effort: Some("max".to_string()),
+            },
             permission_mode: Some("auto".to_string()),
             disallowed_tools: None,
             append_system_prompt: None,
@@ -826,23 +867,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_launch_combines_every_flag_in_the_fixed_order() {
-        let launch = AgentLaunch::Claude {
-            resume: Some("sess-1".to_string()),
-            model: Some("opus".to_string()),
-            effort: Some("high".to_string()),
+    fn every_claude_flag(start: SessionStart) -> AgentLaunch {
+        AgentLaunch::Claude {
+            start,
             permission_mode: Some("auto".to_string()),
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
-        };
+        }
+    }
+
+    #[test]
+    fn agent_launch_combines_every_flag_of_a_new_session_in_the_fixed_order() {
+        let launch = every_claude_flag(SessionStart::Create {
+            model: Some("opus".to_string()),
+            effort: Some("high".to_string()),
+        });
         assert_eq!(
             launch.argv("claude"),
             [
                 "claude",
-                "--resume",
-                "sess-1",
                 "--model",
                 "opus",
                 "--effort",
@@ -861,10 +905,38 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_claude_session_carries_no_model_and_no_effort_but_keeps_its_role_flags() {
+        // The role's own flags (who approves, which tools exist, the briefing,
+        // the brigade channel) are the role's on every launch; the model and
+        // the effort are the operator's once the session exists.
+        let argv = every_claude_flag(SessionStart::Resume("sess-1".to_string())).argv("claude");
+        assert_eq!(
+            argv,
+            [
+                "claude",
+                "--resume",
+                "sess-1",
+                "--permission-mode",
+                "auto",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit",
+                "--append-system-prompt",
+                "you are the Director",
+                "--mcp-config",
+                "C:/data/banto/mcp/1-director.json",
+            ]
+            .map(str::to_string)
+        );
+        assert!(!argv.iter().any(|arg| arg == "--model" || arg == "--effort"));
+    }
+
+    #[test]
     fn agent_launch_codex_fresh_launch_carries_the_notification_overrides_plus_cwd() {
         let launch = AgentLaunch::Codex {
-            resume: None,
-            model: None,
+            start: SessionStart::Create {
+                model: None,
+                effort: None,
+            },
             cwd: PathBuf::from("/work/alpha"),
             brigade: None,
         };
@@ -886,21 +958,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_codex_resume_renders_the_subcommand_then_model_then_notifications_then_cwd() {
+    fn agent_launch_codex_resume_renders_the_subcommand_then_notifications_then_cwd_and_no_model() {
         let launch = AgentLaunch::Codex {
-            resume: Some("codex-uuid-1".to_string()),
-            model: Some("o3".to_string()),
+            start: SessionStart::Resume("codex-uuid-1".to_string()),
             cwd: PathBuf::from("/work/alpha"),
             brigade: None,
         };
+        let argv = launch.argv("codex");
         assert_eq!(
-            launch.argv("codex"),
+            argv,
             [
                 "codex",
                 "resume",
                 "codex-uuid-1",
-                "-m",
-                "o3",
                 "-c",
                 "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
                 "-c",
@@ -911,6 +981,97 @@ mod tests {
                 "/work/alpha",
             ]
             .map(str::to_string)
+        );
+        // Spelled out because these are the two flags that overwrite what the
+        // thread recorded (`SessionStart`'s doc).
+        assert!(!argv.iter().any(|arg| arg == "-m"));
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains("model_reasoning_effort"))
+        );
+    }
+
+    #[test]
+    fn a_new_codex_session_renders_model_then_notifications_then_effort_then_cwd() {
+        let launch = AgentLaunch::Codex {
+            start: SessionStart::Create {
+                model: Some("gpt-6.1-terra".to_string()),
+                effort: Some("high".to_string()),
+            },
+            cwd: PathBuf::from("/work/alpha"),
+            brigade: None,
+        };
+        assert_eq!(
+            launch.argv("codex"),
+            [
+                "codex",
+                "-m",
+                "gpt-6.1-terra",
+                "-c",
+                "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
+                "-c",
+                "tui.notification_method=\"bel\"",
+                "-c",
+                "tui.notification_condition=\"always\"",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "-C",
+                "/work/alpha",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn a_new_codex_session_with_an_effort_puts_it_among_the_c_overrides_ahead_of_the_brigade_ones()
+    {
+        let launch = AgentLaunch::Codex {
+            start: SessionStart::Create {
+                model: None,
+                effort: Some("xhigh".to_string()),
+            },
+            cwd: PathBuf::from("/work/alpha"),
+            brigade: Some(CodexBrigade {
+                exe: PathBuf::from("/opt/banto/banto"),
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                role: BrigadeRole::Worker,
+                session: None,
+                child_args: Vec::new(),
+            }),
+        };
+        let argv = launch.argv("codex");
+        let effort_at = argv
+            .iter()
+            .position(|arg| arg == "model_reasoning_effort=\"xhigh\"")
+            .expect("the effort override is present");
+        assert_eq!(argv[effort_at - 1], "-c");
+        let hook_at = argv
+            .iter()
+            .position(|arg| arg.starts_with("hooks.SessionStart="))
+            .unwrap();
+        assert!(effort_at < hook_at, "{argv:?}");
+        assert!(!argv.iter().any(|arg| arg == "-m"), "no model, no -m");
+    }
+
+    #[test]
+    fn a_codex_effort_is_quoted_as_a_toml_string_and_an_absent_one_adds_nothing() {
+        let launch = |effort: Option<&str>| AgentLaunch::Codex {
+            start: SessionStart::Create {
+                model: None,
+                effort: effort.map(str::to_string),
+            },
+            cwd: PathBuf::from("/work/alpha"),
+            brigade: None,
+        };
+        let quoted = launch(Some("hi\"gh")).argv("codex");
+        assert!(quoted.contains(&"model_reasoning_effort=\"hi\\\"gh\"".to_string()));
+        let none = launch(None).argv("codex");
+        assert!(
+            !none
+                .iter()
+                .any(|arg| arg.contains("model_reasoning_effort"))
         );
     }
 
@@ -918,8 +1079,10 @@ mod tests {
     fn agent_launch_codex_brigade_inserts_notification_then_brigade_overrides_between_model_and_cwd()
      {
         let launch = AgentLaunch::Codex {
-            resume: None,
-            model: None,
+            start: SessionStart::Create {
+                model: None,
+                effort: None,
+            },
             cwd: PathBuf::from("/work/alpha"),
             brigade: Some(CodexBrigade {
                 exe: PathBuf::from("/opt/banto/banto"),
@@ -962,8 +1125,7 @@ mod tests {
         // exactly the three notification overrides, and nothing else that
         // brigade context would have added (no hook, no MCP server).
         let launch = AgentLaunch::Codex {
-            resume: Some("codex-uuid-1".to_string()),
-            model: Some("o3".to_string()),
+            start: SessionStart::Resume("codex-uuid-1".to_string()),
             cwd: PathBuf::from("/work/alpha"),
             brigade: None,
         };
@@ -1121,8 +1283,7 @@ mod tests {
             codex: Some(PathBuf::from("C:/tools/codex.exe")),
         };
         let launch = AgentLaunch::Codex {
-            resume: Some("codex-uuid-1".to_string()),
-            model: None,
+            start: SessionStart::Resume("codex-uuid-1".to_string()),
             cwd: PathBuf::from("/work/alpha"),
             brigade: None,
         };

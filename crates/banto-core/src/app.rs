@@ -137,10 +137,12 @@ pub enum Modal {
         /// plain kill prompt (see above).
         dismisses: Option<String>,
     },
-    /// The emporium's formation-time picker for `[brigade] worker_agent =
-    /// "select"`: choose which product this brigade's *Workers* (not the
+    /// The emporium's Worker picker for `[brigade] worker_agent = "select"`:
+    /// choose which product the *Workers* about to be created (not the
     /// Director — that's already whatever session was promoted) will run
-    /// as, and their `--model`, before any of them spawn.
+    /// as, and their model and reasoning effort, before any of them spawn.
+    /// Shown when a brigade is formed and when a Worker is added; which of the
+    /// two is in [`WorkerAgentPickerState::purpose`], and the dialog says so.
     WorkerAgentPicker(WorkerAgentPickerState),
     /// Shown instead of forming a brigade (or the `Select` picker above)
     /// when the brigade's resolved Worker product is Codex and banto's
@@ -640,43 +642,112 @@ impl NewSessionState {
     }
 }
 
+/// Which operation a Worker picker belongs to. The two used to be the same
+/// dialog, byte for byte, and the one that forms a brigade was taken for the
+/// one that adds a Worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPickerFor {
+    /// `B` on a session that is not yet a Director: a brigade is about to be
+    /// formed, with this many Workers (the `workers` setting).
+    FormBrigade,
+    /// `b` in a staged brigade: one more Worker is about to be added.
+    AddWorker,
+}
+
+/// The configured model and effort for each product — what the picker opens
+/// with for whichever agent it shows, and what toggling the agent puts back.
+/// A configuration value if the file sets one, else banto's built-in
+/// (`BrigadeConfig`'s own doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerDefaults {
+    pub claude_model: String,
+    pub claude_effort: String,
+    pub codex_model: String,
+    pub codex_effort: String,
+}
+
+impl WorkerDefaults {
+    pub fn of(brigade: &crate::config::BrigadeConfig) -> Self {
+        // Through the accessors, so a padded or blank value opens the picker as
+        // it will be launched: trimmed, or empty.
+        let text = |value: Option<&str>| value.unwrap_or("").to_string();
+        Self {
+            claude_model: text(brigade.worker_model_for(AgentKind::ClaudeCode)),
+            claude_effort: text(brigade.worker_effort_for(AgentKind::ClaudeCode)),
+            codex_model: text(brigade.worker_model_for(AgentKind::Codex)),
+            codex_effort: text(brigade.worker_effort_for(AgentKind::Codex)),
+        }
+    }
+
+    fn model_for(&self, agent: AgentKind) -> &str {
+        match agent {
+            AgentKind::ClaudeCode => &self.claude_model,
+            AgentKind::Codex => &self.codex_model,
+        }
+    }
+
+    fn effort_for(&self, agent: AgentKind) -> &str {
+        match agent {
+            AgentKind::ClaudeCode => &self.claude_effort,
+            AgentKind::Codex => &self.codex_effort,
+        }
+    }
+}
+
+/// Which of the picker's two text fields has the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPickerField {
+    Model,
+    Effort,
+}
+
 /// State for [`Modal::WorkerAgentPicker`]: an [`AgentKind`] toggle (same
-/// binding and vocabulary as [`NewSessionState::agent`]) plus a free-text
-/// `--model` input for whichever product is currently selected.
+/// binding and vocabulary as [`NewSessionState::agent`]) plus two free-text
+/// fields, the model and the reasoning effort, for whichever product is
+/// currently selected.
 ///
 /// Unlike [`NewSessionState`], there's no candidate list to pick from — a
 /// model name isn't drawn from a set of previously seen values the way a
-/// cwd is — so this only ever has the one text field, always in scope
-/// (no [`Modal::ConfirmArchive`]-style "no text input" case to gate on).
+/// cwd is — so there are only the two text fields, always in scope (no
+/// [`Modal::ConfirmArchive`]-style "no text input" case to gate on). The
+/// Codex model is shown as typed, a family word such as `terra`: it is
+/// resolved to a slug only when the session is created, so what the operator
+/// sees is what they wrote.
 pub struct WorkerAgentPickerState {
+    purpose: WorkerPickerFor,
     agent: AgentKind,
     model_input: String,
-    /// Char-index position of the text cursor within `model_input`
+    effort_input: String,
+    field: WorkerPickerField,
+    /// Char-index position of the text cursor within the active field
     /// (0..=its char length); see [`Self::push_char`]/[`Self::move_cursor_left`]
     /// etc. — same convention as every other modal's text field.
     cursor: usize,
-    /// This brigade's own configured `--model` default for each product
-    /// (`worker_model`/`worker_model_codex`), captured once at construction
-    /// so [`Self::toggle_agent`] can re-seed `model_input` without needing
-    /// the config again.
-    claude_default_model: String,
-    codex_default_model: String,
+    /// This brigade's configured defaults, captured once at construction so
+    /// [`Self::toggle_agent`] can refill the fields without needing the
+    /// config again.
+    defaults: WorkerDefaults,
 }
 
 impl WorkerAgentPickerState {
-    fn new(agent: AgentKind, claude_default_model: String, codex_default_model: String) -> Self {
-        let model_input = match agent {
-            AgentKind::ClaudeCode => claude_default_model.clone(),
-            AgentKind::Codex => codex_default_model.clone(),
-        };
+    fn new(purpose: WorkerPickerFor, agent: AgentKind, defaults: WorkerDefaults) -> Self {
+        let model_input = defaults.model_for(agent).to_string();
+        let effort_input = defaults.effort_for(agent).to_string();
         let cursor = char_len(&model_input);
         Self {
+            purpose,
             agent,
             model_input,
+            effort_input,
+            field: WorkerPickerField::Model,
             cursor,
-            claude_default_model,
-            codex_default_model,
+            defaults,
         }
+    }
+
+    /// Which operation confirming would carry out.
+    pub fn purpose(&self) -> WorkerPickerFor {
+        self.purpose
     }
 
     /// Which product confirming would spawn every fresh Worker as.
@@ -684,47 +755,82 @@ impl WorkerAgentPickerState {
         self.agent
     }
 
-    /// The `--model` value confirming would use (empty means "pass no
-    /// `--model` flag at all", the same escape hatch `worker_model`/
+    /// The model confirming would create the Workers with (empty means "pass
+    /// no model flag at all", the same escape hatch `worker_model`/
     /// `worker_model_codex` already have in config.toml).
     pub fn model_input(&self) -> &str {
         &self.model_input
     }
 
+    /// The reasoning effort confirming would create the Workers with (empty
+    /// means "pass no effort flag at all").
+    pub fn effort_input(&self) -> &str {
+        &self.effort_input
+    }
+
+    pub fn field(&self) -> WorkerPickerField {
+        self.field
+    }
+
+    /// Cursor position within the active field.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
-    /// Switch product and re-seed [`Self::model_input`] from *that*
-    /// product's own configured default, discarding whatever was typed for
-    /// the one just left: Claude and Codex share no model namespace, so
+    fn active(&mut self) -> &mut String {
+        match self.field {
+            WorkerPickerField::Model => &mut self.model_input,
+            WorkerPickerField::Effort => &mut self.effort_input,
+        }
+    }
+
+    fn active_len(&self) -> usize {
+        match self.field {
+            WorkerPickerField::Model => char_len(&self.model_input),
+            WorkerPickerField::Effort => char_len(&self.effort_input),
+        }
+    }
+
+    /// Move to the other field, the cursor going to the end of its text.
+    fn switch_field(&mut self) {
+        self.field = match self.field {
+            WorkerPickerField::Model => WorkerPickerField::Effort,
+            WorkerPickerField::Effort => WorkerPickerField::Model,
+        };
+        self.cursor = self.active_len();
+    }
+
+    /// Switch product and refill *both* fields from *that* product's own
+    /// defaults, discarding whatever was typed for the one just left: Claude
+    /// and Codex share no model namespace and no effort vocabulary, so
     /// carrying an edit across the toggle would show a stale, wrong-shaped
     /// string for the newly selected product rather than a clean default to
-    /// start editing from again.
+    /// start editing from again. The field with the cursor stays the same.
     fn toggle_agent(&mut self) {
         self.agent = self.agent.toggle();
-        self.model_input = match self.agent {
-            AgentKind::ClaudeCode => self.claude_default_model.clone(),
-            AgentKind::Codex => self.codex_default_model.clone(),
-        };
-        self.cursor = char_len(&self.model_input);
+        self.model_input = self.defaults.model_for(self.agent).to_string();
+        self.effort_input = self.defaults.effort_for(self.agent).to_string();
+        self.cursor = self.active_len();
     }
 
     fn push_char(&mut self, c: char) {
-        insert_at_cursor(&mut self.model_input, self.cursor, c);
+        let cursor = self.cursor;
+        insert_at_cursor(self.active(), cursor, c);
         self.cursor += 1;
     }
 
     // Same as GroupJoinState::backspace/delete_forward, minus the refilter
     // (nothing to filter here).
     fn backspace(&mut self) {
-        if remove_before_cursor(&mut self.model_input, self.cursor) {
+        let cursor = self.cursor;
+        if remove_before_cursor(self.active(), cursor) {
             self.cursor -= 1;
         }
     }
 
     fn delete_forward(&mut self) {
-        remove_at_cursor(&mut self.model_input, self.cursor);
+        let cursor = self.cursor;
+        remove_at_cursor(self.active(), cursor);
     }
 
     fn move_cursor_left(&mut self) {
@@ -732,7 +838,7 @@ impl WorkerAgentPickerState {
     }
 
     fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(char_len(&self.model_input));
+        self.cursor = (self.cursor + 1).min(self.active_len());
     }
 
     fn move_cursor_home(&mut self) {
@@ -740,7 +846,7 @@ impl WorkerAgentPickerState {
     }
 
     fn move_cursor_end(&mut self) {
-        self.cursor = char_len(&self.model_input);
+        self.cursor = self.active_len();
     }
 }
 
@@ -1183,6 +1289,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_selection(-1),
             Some(Modal::GroupJoin(state)) => state.move_selection(-1),
+            Some(Modal::WorkerAgentPicker(state)) => state.switch_field(),
             _ => {}
         }
     }
@@ -1193,6 +1300,7 @@ impl App {
         match &mut self.modal {
             Some(Modal::NewSession(state)) => state.move_selection(1),
             Some(Modal::GroupJoin(state)) => state.move_selection(1),
+            Some(Modal::WorkerAgentPicker(state)) => state.switch_field(),
             _ => {}
         }
     }
@@ -1201,8 +1309,11 @@ impl App {
     /// to Tab). No-op when no modal is open or nothing is highlighted (only
     /// the new-session modal supports this).
     pub fn modal_complete_candidate(&mut self) {
-        if let Some(Modal::NewSession(state)) = &mut self.modal {
-            state.complete_candidate();
+        match &mut self.modal {
+            Some(Modal::NewSession(state)) => state.complete_candidate(),
+            // The picker has no candidates; its Tab moves to the other field.
+            Some(Modal::WorkerAgentPicker(state)) => state.switch_field(),
+            _ => {}
         }
     }
 
@@ -1708,23 +1819,21 @@ impl App {
         });
     }
 
-    /// Open the emporium's formation-time Worker-agent picker (bound where
-    /// brigade formation would otherwise proceed directly, when `[brigade]
-    /// worker_agent = "select"`). `initial_agent` seeds the toggle — the
-    /// Director's own product, the same starting point `Inherit` would
-    /// resolve to; `claude_default_model`/`codex_default_model` seed the
-    /// editable model text for whichever product ends up selected
-    /// (`worker_model`/`worker_model_codex` from config.toml).
+    /// Open the emporium's Worker picker (bound where brigade formation or
+    /// adding a Worker would otherwise proceed directly, when `[brigade]
+    /// worker_agent = "select"`). `purpose` says which of the two, so the
+    /// dialog can. `agent` seeds the toggle — the agent chosen last time, or
+    /// with none stored the Director's own product, the same starting point
+    /// `Inherit` would resolve to; `defaults` seed the editable model and
+    /// effort text for whichever product ends up selected.
     pub fn open_worker_agent_modal(
         &mut self,
-        initial_agent: AgentKind,
-        claude_default_model: String,
-        codex_default_model: String,
+        purpose: WorkerPickerFor,
+        agent: AgentKind,
+        defaults: WorkerDefaults,
     ) {
         self.modal = Some(Modal::WorkerAgentPicker(WorkerAgentPickerState::new(
-            initial_agent,
-            claude_default_model,
-            codex_default_model,
+            purpose, agent, defaults,
         )));
     }
 
@@ -3401,72 +3510,189 @@ mod tests {
         assert_eq!(app.modal_new_session_agent(), AgentKind::ClaudeCode);
     }
 
-    #[test]
-    fn worker_agent_picker_seeds_and_toggle_reseeds_the_model_from_each_products_own_default() {
-        let mut app = App::new(vec![]);
-        app.open_worker_agent_modal(
-            AgentKind::ClaudeCode,
-            "sonnet".to_string(),
-            "gpt-5.6-terra".to_string(),
-        );
-        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
-            panic!("expected the worker-agent picker to be open");
-        };
-        assert_eq!(state.agent(), AgentKind::ClaudeCode);
-        assert_eq!(state.model_input(), "sonnet");
+    fn defaults() -> WorkerDefaults {
+        WorkerDefaults {
+            claude_model: "sonnet".to_string(),
+            claude_effort: "high".to_string(),
+            codex_model: "terra".to_string(),
+            codex_effort: "medium".to_string(),
+        }
+    }
 
-        app.modal_toggle_agent();
-        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
-            panic!("expected the worker-agent picker to still be open");
-        };
-        assert_eq!(state.agent(), AgentKind::Codex);
-        assert_eq!(state.model_input(), "gpt-5.6-terra");
-
-        app.modal_toggle_agent();
-        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
-            panic!("expected the worker-agent picker to still be open");
-        };
-        assert_eq!(state.agent(), AgentKind::ClaudeCode);
-        assert_eq!(state.model_input(), "sonnet");
+    fn picker(app: &App) -> &WorkerAgentPickerState {
+        match app.modal() {
+            Some(Modal::WorkerAgentPicker(state)) => state,
+            _ => panic!("expected the worker picker to be open"),
+        }
     }
 
     #[test]
-    fn worker_agent_picker_toggle_discards_an_edit_made_under_the_previous_product() {
+    fn worker_picker_opens_on_the_given_agent_with_that_agents_defaults() {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(WorkerPickerFor::FormBrigade, AgentKind::Codex, defaults());
+        let state = picker(&app);
+        assert_eq!(state.agent(), AgentKind::Codex);
+        assert_eq!(state.model_input(), "terra");
+        assert_eq!(state.effort_input(), "medium");
+        assert_eq!(state.purpose(), WorkerPickerFor::FormBrigade);
+        assert_eq!(state.field(), WorkerPickerField::Model);
+
+        app.open_worker_agent_modal(
+            WorkerPickerFor::AddWorker,
+            AgentKind::ClaudeCode,
+            defaults(),
+        );
+        let state = picker(&app);
+        assert_eq!(state.agent(), AgentKind::ClaudeCode);
+        assert_eq!(state.model_input(), "sonnet");
+        assert_eq!(state.effort_input(), "high");
+        assert_eq!(state.purpose(), WorkerPickerFor::AddWorker);
+    }
+
+    #[test]
+    fn worker_picker_toggle_refills_model_and_effort_from_each_products_own_defaults() {
         let mut app = App::new(vec![]);
         app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
             AgentKind::ClaudeCode,
-            "sonnet".to_string(),
-            "gpt-5.6-terra".to_string(),
+            defaults(),
         );
-        app.modal_push_char('!'); // edit while Claude is selected
+        app.modal_toggle_agent();
+        let state = picker(&app);
+        assert_eq!(state.agent(), AgentKind::Codex);
+        assert_eq!(state.model_input(), "terra");
+        assert_eq!(state.effort_input(), "medium");
+
+        app.modal_toggle_agent();
+        let state = picker(&app);
+        assert_eq!(state.agent(), AgentKind::ClaudeCode);
+        assert_eq!(state.model_input(), "sonnet");
+        assert_eq!(state.effort_input(), "high");
+    }
+
+    #[test]
+    fn worker_picker_toggle_discards_an_edit_to_either_field() {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
+            AgentKind::ClaudeCode,
+            defaults(),
+        );
+        app.modal_push_char('!'); // edit the model while Claude is selected
+        app.modal_complete_candidate(); // Tab: to the effort field
+        app.modal_push_char('?'); // edit the effort too
 
         app.modal_toggle_agent(); // switch to Codex
-        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
-            panic!("expected the worker-agent picker to be open");
-        };
+        let state = picker(&app);
         assert_eq!(
             state.model_input(),
-            "gpt-5.6-terra",
-            "the Claude-side edit must not leak into Codex's own default"
+            "terra",
+            "the Claude-side model edit must not leak into Codex's own default"
         );
+        assert_eq!(
+            state.effort_input(),
+            "medium",
+            "nor the effort edit into Codex's"
+        );
+        assert_eq!(
+            state.field(),
+            WorkerPickerField::Effort,
+            "the cursor stays on the field it was on"
+        );
+        assert_eq!(state.cursor(), 6, "at the end of the refilled text");
     }
 
     #[test]
-    fn worker_agent_picker_text_editing_moves_the_cursor_and_edits_in_place() {
+    fn worker_picker_empty_defaults_open_empty_fields() {
         let mut app = App::new(vec![]);
-        app.open_worker_agent_modal(AgentKind::Codex, String::new(), "gpt".to_string());
-        let cursor = |app: &App| match app.modal() {
-            Some(Modal::WorkerAgentPicker(state)) => state.cursor(),
-            _ => panic!("expected the worker-agent picker to be open"),
-        };
-        assert_eq!(cursor(&app), 3); // cursor starts at the end of the seeded "gpt"
+        app.open_worker_agent_modal(
+            WorkerPickerFor::AddWorker,
+            AgentKind::Codex,
+            WorkerDefaults {
+                claude_model: String::new(),
+                claude_effort: String::new(),
+                codex_model: String::new(),
+                codex_effort: String::new(),
+            },
+        );
+        let state = picker(&app);
+        assert_eq!((state.model_input(), state.effort_input()), ("", ""));
+    }
+
+    #[test]
+    fn worker_picker_tab_and_up_down_move_between_the_two_fields_and_typing_goes_to_the_active_one()
+    {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(WorkerPickerFor::FormBrigade, AgentKind::Codex, defaults());
+        app.modal_push_char('X'); // model field: "terraX"
+        assert_eq!(picker(&app).model_input(), "terraX");
+        assert_eq!(picker(&app).effort_input(), "medium");
+
+        app.modal_complete_candidate(); // Tab
+        assert_eq!(picker(&app).field(), WorkerPickerField::Effort);
+        assert_eq!(picker(&app).cursor(), 6, "at the end of \"medium\"");
+        app.modal_push_char('Y');
+        assert_eq!(picker(&app).effort_input(), "mediumY");
+        assert_eq!(
+            picker(&app).model_input(),
+            "terraX",
+            "the other field is untouched"
+        );
+
+        app.modal_select_prev(); // Up
+        assert_eq!(picker(&app).field(), WorkerPickerField::Model);
+        app.modal_select_next(); // Down
+        assert_eq!(picker(&app).field(), WorkerPickerField::Effort);
+        app.modal_backspace();
+        assert_eq!(picker(&app).effort_input(), "medium");
+    }
+
+    #[test]
+    fn worker_picker_text_editing_moves_the_cursor_and_edits_in_place_in_each_field() {
+        let mut app = App::new(vec![]);
+        app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
+            AgentKind::Codex,
+            WorkerDefaults {
+                codex_model: "gpt".to_string(),
+                codex_effort: "hi".to_string(),
+                ..defaults()
+            },
+        );
+        assert_eq!(picker(&app).cursor(), 3); // at the end of the seeded "gpt"
 
         app.modal_cursor_left();
         app.modal_push_char('X');
-        let Some(Modal::WorkerAgentPicker(state)) = app.modal() else {
-            panic!("expected the worker-agent picker to be open");
+        assert_eq!(picker(&app).model_input(), "gpXt");
+
+        app.modal_complete_candidate();
+        assert_eq!(picker(&app).cursor(), 2);
+        app.modal_cursor_home();
+        app.modal_push_char('o');
+        app.modal_delete_forward();
+        assert_eq!(picker(&app).effort_input(), "oi");
+        assert_eq!(picker(&app).model_input(), "gpXt");
+    }
+
+    #[test]
+    fn worker_defaults_read_each_products_model_and_effort_from_the_brigade_config() {
+        let brigade = crate::config::BrigadeConfig {
+            worker_model: "opus".to_string(),
+            worker_effort: "low".to_string(),
+            worker_model_codex: "gpt-9".to_string(),
+            worker_effort_codex: String::new(),
+            ..Default::default()
         };
-        assert_eq!(state.model_input(), "gpXt");
+        let defaults = WorkerDefaults::of(&brigade);
+        assert_eq!(
+            (
+                defaults.claude_model.as_str(),
+                defaults.claude_effort.as_str(),
+                defaults.codex_model.as_str(),
+                defaults.codex_effort.as_str()
+            ),
+            ("opus", "low", "gpt-9", "")
+        );
     }
 
     #[test]

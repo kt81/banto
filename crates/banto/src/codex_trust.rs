@@ -75,8 +75,10 @@ mod tests {
         let trust_hook = trust_argv(&exe, &binaries)[2].clone();
 
         let launch = AgentLaunch::Codex {
-            resume: None,
-            model: None,
+            start: crate::launch::SessionStart::Create {
+                model: None,
+                effort: None,
+            },
             cwd: PathBuf::from("/work/anywhere"),
             brigade: Some(CodexBrigade {
                 exe: exe.clone(),

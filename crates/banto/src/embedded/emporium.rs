@@ -61,6 +61,7 @@ use banto_core::screen::{SPAWN_COLS, SPAWN_ROWS, Screen};
 use banto_core::status::AgeThresholds;
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity;
+use banto_io::codex_catalog::{CodexCatalogSource, CodexCli};
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::data_dir::DataDir;
@@ -460,6 +461,7 @@ pub fn run(
         brigade,
         agent_binaries,
         enabled_agents,
+        codex_catalog: &CodexCli,
         child: Some(settings.child),
     };
     let (mut terminal, mut frame_output) = setup_terminal()?;
@@ -556,6 +558,10 @@ struct Deps<'a> {
     agent_binaries: &'a AgentBinaries,
     /// `Config.agents`, resolved.
     enabled_agents: &'a BTreeSet<AgentKind>,
+    /// What reads the installed Codex's model catalog: `&CodexCli` in a real
+    /// run, a mock in a test — an external process like the PTY host, so no
+    /// test of the emporium runs Codex.
+    codex_catalog: &'a dyn CodexCatalogSource,
     /// What a brigade member's banto children are told to resolve (see
     /// [`EmporiumSettings::child`]); `None` in a test, which then builds the
     /// argv and environment a hand-started child would get.
@@ -594,6 +600,11 @@ fn event_loop(
             .flatten()
             .unwrap_or(false),
     });
+    // The agent the Worker picker was last confirmed with, the same way; none
+    // stored, or a value this build cannot read, is "none".
+    let mut stored_worker_agent = Some(Event::LastWorkerAgentLoaded {
+        agent: deps.store.borrow().last_worker_agent().ok().flatten(),
+    });
     // Fed right after it, for the same reason: as part of the recorded stream.
     let mut startup_notices = (!startup_notices.is_empty()).then_some(Event::StartupNotices {
         notices: startup_notices,
@@ -626,6 +637,7 @@ fn event_loop(
         // sidebar's width, so the order between the two does not matter.)
         events.extend(stored_sidebar_width.take());
         events.extend(stored_bell_switch.take());
+        events.extend(stored_worker_agent.take());
         events.extend(startup_notices.take());
 
         // Geometry is cached from startup, native resize input, and the
@@ -1138,6 +1150,7 @@ fn execute_cmd(
             discovery,
         ),
         Cmd::CheckCodexTrust => execute_check_codex_trust(deps),
+        Cmd::ReadCodexCatalog { round } => execute_read_codex_catalog(round, deps),
         Cmd::SweepDataDir => execute_sweep_data_dir(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
         Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
@@ -1231,6 +1244,19 @@ fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
     }]
 }
 
+/// Ask the installed Codex which models it ships with
+/// (`banto_io::codex_catalog`), through the same binary a launch would use
+/// (`[agent_binaries]` or `codex` on the path). Whatever comes back, or why
+/// nothing did, goes to the core as it is: the choice of model is its to make
+/// (`banto_core::codex_model`).
+fn execute_read_codex_catalog(round: u64, deps: &Deps) -> Vec<Event> {
+    let binary = launch::agent_binary(AgentKind::Codex, deps.agent_binaries);
+    vec![Event::CodexCatalogRead {
+        round,
+        result: deps.codex_catalog.bundled_catalog(&binary),
+    }]
+}
+
 /// Read whether Codex has been told to trust `cwd` — freshly, not cached,
 /// since the operator may answer its prompt in the pane at any moment while
 /// `engine::update_tick` keeps re-asking. `deps.codex_home` absent reads as
@@ -1311,17 +1337,20 @@ fn execute_open_codex_trust_pane(
 
 /// Build the [`launch::AgentLaunch`] for opening `target`: resuming it when a
 /// real id is already known (`None` if [`launch::is_live`] finds it already
-/// running somewhere, so a resume would fork its history), or a fresh unresumed launch
-/// otherwise — either way with `model`/`briefing` carried on the result.
+/// running somewhere, so a resume would fork its history), or creating a
+/// session otherwise.
+///
+/// `model` and `effort` reach the argv only for a creation. A resume drops them
+/// here whatever the caller passed (`launch::SessionStart`'s doc says why: the
+/// product restores what the session last used, and a flag would overwrite a
+/// choice the operator made inside it), so the rule holds even for a producer
+/// that forgets it. `permission_mode`, `disallowed_tools` and `briefing` are the
+/// role's, and ride on both.
 /// `target.agent` picks the variant; `briefing` only ever reaches the
 /// `Claude` one, because only Claude takes a briefing as launch argv; a
 /// Codex member gets the same text from the `banto _hook` process the
 /// injected `SessionStart` hook spawns
-/// (docs/notes/codex-briefing-spike.md). `--model` applies the same way to a resume as to a
-/// fresh spawn: a Worker resumed without it falls back to the operator's
-/// own default model instead of the brigade's configured one
-/// (`engine::stage_brigade` never sets it for the Director, so this is
-/// never reached for one).
+/// (docs/notes/codex-briefing-spike.md).
 ///
 /// `briefing` is the member's already-rendered role briefing
 /// (`--append-system-prompt`, see [`crate::briefing::render`]) — rendered by
@@ -1343,8 +1372,11 @@ fn build_open_launch(
     briefing: Option<&str>,
     ctx: &launch::OpenContext,
 ) -> Option<launch::AgentLaunch> {
-    let resume = if target.id.is_empty() {
-        None
+    let start = if target.id.is_empty() {
+        launch::SessionStart::Create {
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+        }
     } else {
         // The no-double-resume guard (AGENTS.md invariant 4): a session that
         // is already running somewhere else — another banto, or an agent
@@ -1352,13 +1384,11 @@ fn build_open_launch(
         if launch::is_live(target, ctx) {
             return None;
         }
-        Some(target.id.clone())
+        launch::SessionStart::Resume(target.id.clone())
     };
     Some(match target.agent {
         AgentKind::ClaudeCode => launch::AgentLaunch::Claude {
-            resume,
-            model: model.map(str::to_string),
-            effort: effort.map(str::to_string),
+            start,
             permission_mode: permission_mode.map(str::to_string),
             disallowed_tools: disallowed_tools.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
@@ -1369,14 +1399,12 @@ fn build_open_launch(
         // by the `banto _hook` process the injected SessionStart hook spawns,
         // not passed on the argv. `brigade` is left `None` for the caller to
         // fill for the same reason `mcp_config` is — it needs the running
-        // executable's own path, which is I/O this stays free of. `effort`,
-        // `permission_mode`, and `disallowed_tools` are all dropped for the
-        // same reason `AgentLaunch::Codex` carries no field for any of them
-        // — a Goinkyo (the only source of any today) is Claude-only, so
-        // this arm never actually receives one; see that variant's own doc.
+        // executable's own path, which is I/O this stays free of.
+        // `permission_mode` and `disallowed_tools` are dropped:
+        // `AgentLaunch::Codex` has no field for either (Claude-only flags),
+        // and a Codex Worker does arrive with `permission_mode` set.
         AgentKind::Codex => launch::AgentLaunch::Codex {
-            resume,
-            model: model.map(str::to_string),
+            start,
             cwd: target.cwd.clone(),
             brigade: None,
         },
@@ -1682,6 +1710,11 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let _ = store.borrow().set_bell_when_focused(on);
             Vec::new()
         }
+        // A failed write loses a preference, not the brigade.
+        StoreIntent::SaveLastWorkerAgent { agent } => {
+            let _ = store.borrow().set_last_worker_agent(agent);
+            Vec::new()
+        }
         StoreIntent::FormBrigade {
             director_row_id,
             director_agent,
@@ -1690,6 +1723,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             worker_count,
             worker_agent,
             worker_model,
+            worker_effort,
         } => {
             let result = form_brigade_store(
                 store,
@@ -1705,6 +1739,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 cwd,
                 worker_agent,
                 worker_model,
+                worker_effort,
                 result,
             }]
         }
@@ -1713,6 +1748,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             cwd,
             worker_agent,
             worker_model,
+            worker_effort,
         } => {
             let result = add_worker_store(store, brigade_id, worker_agent);
             vec![Event::WorkerAdded {
@@ -1720,6 +1756,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 cwd,
                 worker_agent,
                 worker_model,
+                worker_effort,
                 result,
             }]
         }
@@ -3921,6 +3958,30 @@ mod tests {
 
     use super::*;
 
+    /// A Codex that is not there: what every test of the emporium that is not
+    /// about the catalog gets, so none of them can run the real one.
+    struct NoCatalog;
+
+    impl CodexCatalogSource for NoCatalog {
+        fn bundled_catalog(&self, _binary: &str) -> Result<String, String> {
+            Err("no Codex in tests".to_string())
+        }
+    }
+
+    /// A Codex that answers from a script and records which binary it was asked
+    /// for.
+    struct ScriptedCatalog {
+        answer: Result<String, String>,
+        asked: RefCell<Vec<String>>,
+    }
+
+    impl CodexCatalogSource for ScriptedCatalog {
+        fn bundled_catalog(&self, binary: &str) -> Result<String, String> {
+            self.asked.borrow_mut().push(binary.to_string());
+            self.answer.clone()
+        }
+    }
+
     #[test]
     fn the_drag_line_replaces_what_the_frame_had_under_it_and_nothing_beside_it() {
         let area = Rect::new(0, 0, 6, 4);
@@ -4019,6 +4080,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::ClaudeCode,
                 worker_model: "sonnet".to_string(),
+                worker_effort: "high".to_string(),
                 result: Ok((1, (1..=workers).map(|n| format!("worker-{n}")).collect())),
             },
             now,
@@ -4468,6 +4530,107 @@ mod tests {
             at,
         );
         assert!(restarted.bell_when_focused());
+    }
+
+    #[test]
+    fn the_agent_the_worker_picker_was_confirmed_with_survives_a_restart_through_the_store() {
+        use banto_core::input::{KeyCode, Modifiers};
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let brigade = BrigadeConfig {
+            worker_agent: banto_core::config::WorkerAgentSetting::Select,
+            ..BrigadeConfig::default()
+        };
+        let mut app = App::new(vec![banto_core::model::SessionRow {
+            id: "dir".to_string(),
+            agent: AgentKind::ClaudeCode,
+            title: Some("dir".to_string()),
+            cwd: Some(PathBuf::from("/work")),
+            dialog_open: false,
+            activity: banto_core::model::Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            source_archived: false,
+            archived: false,
+        }]);
+        let at = Instant::now();
+        // Press `B` and let the store answer the membership question, as the
+        // loop does.
+        let open_picker = |state: &mut EmporiumState, app: &mut App| {
+            let mut cmds = engine::update(
+                state,
+                app,
+                &brigade,
+                key_event(KeyCode::Char('B'), Modifiers::SHIFT),
+                at,
+            );
+            while let Some(cmd) = cmds.pop() {
+                if let Cmd::Store(intent) = cmd {
+                    for event in execute_store_intent(intent, &store) {
+                        cmds.extend(engine::update(state, app, &brigade, event, at));
+                    }
+                }
+            }
+        };
+        let picked = |app: &App| match app.modal() {
+            Some(banto_core::app::Modal::WorkerAgentPicker(picker)) => picker.agent(),
+            other => panic!("expected the picker, got {}", other.is_some()),
+        };
+
+        // Nothing stored: the picker opens on the Director's own product.
+        assert_eq!(store.borrow().last_worker_agent().unwrap(), None);
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.focus = Focus::Sidebar;
+        open_picker(&mut state, &mut app);
+        assert_eq!(picked(&app), AgentKind::ClaudeCode);
+
+        // Toggle to Codex and confirm: the core asks for the write once, and the
+        // executor performs it.
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            key_event(KeyCode::BackTab, Modifiers::SHIFT),
+            at,
+        );
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            key_event(KeyCode::Enter, Modifiers::NONE),
+            at,
+        );
+        let saves: Vec<Cmd> = cmds
+            .into_iter()
+            .filter(|cmd| matches!(cmd, Cmd::Store(StoreIntent::SaveLastWorkerAgent { .. })))
+            .collect();
+        assert_eq!(saves.len(), 1, "{saves:?}");
+        for cmd in saves {
+            if let Cmd::Store(intent) = cmd {
+                execute_store_intent(intent, &store);
+            }
+        }
+        assert_eq!(
+            store.borrow().last_worker_agent().unwrap(),
+            Some(AgentKind::Codex)
+        );
+
+        // A new run reads it back the way the loop does, and the picker opens
+        // on it.
+        let mut restarted = EmporiumState::new(PrefixKey::default());
+        restarted.focus = Focus::Sidebar;
+        engine::update(
+            &mut restarted,
+            &mut app,
+            &brigade,
+            Event::LastWorkerAgentLoaded {
+                agent: store.borrow().last_worker_agent().ok().flatten(),
+            },
+            at,
+        );
+        open_picker(&mut restarted, &mut app);
+        assert_eq!(picked(&app), AgentKind::Codex);
     }
 
     // --- sampling whether each hosted pane is idle -------------------------------
@@ -8299,6 +8462,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            codex_catalog: &NoCatalog,
             child: None,
         };
         let mut handles = HashMap::new();
@@ -8367,6 +8531,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            codex_catalog: &NoCatalog,
             child: None,
         };
 
@@ -8421,6 +8586,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            codex_catalog: &NoCatalog,
             child: None,
         };
 
@@ -8471,6 +8637,7 @@ mod tests {
             brigade: &brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            codex_catalog: &NoCatalog,
             child: None,
         };
 
@@ -9820,7 +9987,7 @@ mod tests {
         assert_eq!(worker.is_idle_this_tick, None);
     }
 
-    // --- worker model on resume: build_open_launch -------------------------
+    // --- model and effort only on creation: build_open_launch -------------
 
     struct MockProbe {
         alive: HashSet<u32>,
@@ -9865,14 +10032,16 @@ mod tests {
     }
 
     #[test]
-    fn build_open_launch_appends_model_to_a_resumed_sessions_argv() {
+    fn build_open_launch_drops_a_model_and_an_effort_handed_to_a_resume_for_either_product() {
+        // The rule lives at the seam as well as in the core's producers: a
+        // producer that forgot it would still not reach the argv.
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(
+        let claude = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
-            None,
+            Some("max"),
             None,
             None,
             None,
@@ -9880,9 +10049,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            launch.argv("claude"),
-            ["claude", "--resume", "sess-1", "--model", "opus"].map(str::to_string)
+            claude.argv("claude"),
+            ["claude", "--resume", "sess-1"].map(str::to_string)
         );
+
+        let mut codex_target = open_target("codex-uuid-1");
+        codex_target.agent = AgentKind::Codex;
+        let codex = build_open_launch(
+            &codex_target,
+            Some("gpt-6.1-terra"),
+            Some("high"),
+            None,
+            None,
+            None,
+            &test_ctx(&probe, &[]),
+        )
+        .unwrap()
+        .argv("codex");
+        assert_eq!(&codex[..3], ["codex", "resume", "codex-uuid-1"]);
+        assert!(!codex.iter().any(|arg| arg == "-m"), "{codex:?}");
+        assert!(
+            !codex
+                .iter()
+                .any(|arg| arg.contains("model_reasoning_effort")),
+            "{codex:?}"
+        );
+    }
+
+    #[test]
+    fn build_open_launch_gives_a_new_codex_session_its_model_and_effort() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        let mut target = open_target("");
+        target.agent = AgentKind::Codex;
+        let argv = build_open_launch(
+            &target,
+            Some("gpt-6.1-terra"),
+            Some("high"),
+            None,
+            None,
+            None,
+            &test_ctx(&probe, &[]),
+        )
+        .unwrap()
+        .argv("codex");
+        assert_eq!(&argv[..3], ["codex", "-m", "gpt-6.1-terra"]);
+        assert!(argv.contains(&"model_reasoning_effort=\"high\"".to_string()));
+        assert!(!argv.contains(&"resume".to_string()));
     }
 
     #[test]
@@ -10136,10 +10350,13 @@ mod tests {
         target.agent = AgentKind::Codex;
         let launch = build_open_launch(
             &target,
+            // A resume carries no model whatever the caller hands it — see
+            // `build_open_launch`'s doc.
             Some("o3"),
-            // `effort`/`permission_mode`/`disallowed_tools` are all
-            // Claude-only (`AgentLaunch::Claude`'s own doc); dropped here
-            // for the same reason the briefing below is.
+            // `effort` is dropped on a resume too, and `permission_mode`/
+            // `disallowed_tools` are Claude-only (`AgentLaunch::Claude`'s
+            // own doc); dropped here for the same reason the briefing below
+            // is.
             None,
             None,
             None,
@@ -10162,8 +10379,6 @@ mod tests {
                 "codex",
                 "resume",
                 "codex-uuid-1",
-                "-m",
-                "o3",
                 "-c",
                 "tui.notifications=[\"approval-requested\",\"async-question\",\"plan-mode-prompt\"]",
                 "-c",
@@ -10210,11 +10425,34 @@ mod tests {
     // --- role briefings (--append-system-prompt) -------------------------
 
     #[test]
-    fn build_open_launch_appends_the_briefing_after_the_model() {
+    fn build_open_launch_appends_the_briefing_after_the_model_of_a_new_session_and_after_resume_on_a_resume()
+     {
         let probe = MockProbe {
             alive: HashSet::new(),
         };
-        let launch = build_open_launch(
+        let created = build_open_launch(
+            &open_target(""),
+            Some("opus"),
+            None,
+            None,
+            None,
+            Some("you are the Director"),
+            &test_ctx(&probe, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            created.argv("claude"),
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "you are the Director",
+            ]
+            .map(str::to_string)
+        );
+        // The briefing is the role's, so it rides on a resume — unlike the model.
+        let resumed = build_open_launch(
             &open_target("sess-1"),
             Some("opus"),
             None,
@@ -10225,13 +10463,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            launch.argv("claude"),
+            resumed.argv("claude"),
             [
                 "claude",
                 "--resume",
                 "sess-1",
-                "--model",
-                "opus",
                 "--append-system-prompt",
                 "you are the Director",
             ]
@@ -10398,6 +10634,7 @@ mod tests {
             brigade,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            codex_catalog: &NoCatalog,
             child: None,
         };
 
@@ -10469,6 +10706,7 @@ mod tests {
             brigade: &config,
             agent_binaries: &agent_binaries,
             enabled_agents: &enabled_agents,
+            codex_catalog: &NoCatalog,
             child: None,
         };
 
@@ -10820,6 +11058,7 @@ mod tests {
                 cwd: PathBuf::from("/work"),
                 worker_agent: AgentKind::ClaudeCode,
                 worker_model: "sonnet".to_string(),
+                worker_effort: "high".to_string(),
                 result: Ok((1, vec!["worker-1".to_string()])),
             },
             now,
@@ -11392,6 +11631,7 @@ mod tests {
                 brigade: &self.brigade,
                 agent_binaries: &self.agent_binaries,
                 enabled_agents: &self.enabled_agents,
+                codex_catalog: &NoCatalog,
                 child: None,
             }
         }
@@ -11528,6 +11768,132 @@ mod tests {
             fixture.launches()
         );
         assert!(handles.is_empty());
+    }
+
+    /// `cmd` with a model and an effort, for `agent`, resuming `id` (empty for a
+    /// new session).
+    fn open_with_model_and_effort(agent: AgentKind, id: &str, cwd: &Path) -> Cmd {
+        let Cmd::OpenEmbedded {
+            key,
+            target,
+            brigade,
+            permission_mode,
+            disallowed_tools,
+            ..
+        } = open_embedded_cmd(agent, id, cwd)
+        else {
+            unreachable!()
+        };
+        Cmd::OpenEmbedded {
+            key,
+            target,
+            brigade,
+            model: Some("the-model".to_string()),
+            effort: Some("the-effort".to_string()),
+            permission_mode,
+            disallowed_tools,
+        }
+    }
+
+    #[test]
+    fn a_new_session_is_launched_with_its_model_and_effort_and_a_resumed_one_with_neither_for_both_products()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        for (agent, id) in [
+            (AgentKind::ClaudeCode, ""),
+            (AgentKind::ClaudeCode, "claude-session"),
+            (AgentKind::Codex, ""),
+            (AgentKind::Codex, "codex-session"),
+        ] {
+            let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+            let events = execute_cmd(
+                open_with_model_and_effort(agent, id, dir.path()),
+                &fixture.deps(),
+                &mut HashMap::new(),
+                &mut Vec::new(),
+            );
+            assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+            let argv = fixture.launches()[0].argv.clone();
+            let has = |needle: &str| argv.iter().any(|arg| arg.contains(needle));
+            let created = id.is_empty();
+            match agent {
+                AgentKind::ClaudeCode => {
+                    assert_eq!(has("--model"), created, "{agent:?} {id:?}: {argv:?}");
+                    assert_eq!(has("--effort"), created, "{agent:?} {id:?}: {argv:?}");
+                    assert_eq!(has("--resume"), !created, "{agent:?} {id:?}: {argv:?}");
+                }
+                AgentKind::Codex => {
+                    assert_eq!(has("the-model"), created, "{agent:?} {id:?}: {argv:?}");
+                    assert_eq!(
+                        has("model_reasoning_effort=\"the-effort\""),
+                        created,
+                        "{agent:?} {id:?}: {argv:?}"
+                    );
+                    assert_eq!(argv.contains(&"-m".to_string()), created, "{argv:?}");
+                    assert_eq!(has("resume"), !created, "{agent:?} {id:?}: {argv:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reading_the_codex_catalog_asks_the_binary_a_launch_would_use_and_hands_the_answer_over_as_it_is()
+     {
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let answered = ScriptedCatalog {
+            answer: Ok("{\"models\":[]}".to_string()),
+            asked: RefCell::new(Vec::new()),
+        };
+        let events = execute_cmd(
+            Cmd::ReadCodexCatalog { round: 7 },
+            &Deps {
+                codex_catalog: &answered,
+                ..fixture.deps()
+            },
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            events,
+            vec![Event::CodexCatalogRead {
+                round: 7,
+                result: Ok("{\"models\":[]}".to_string())
+            }],
+            "the answer carries the round it is for"
+        );
+        assert_eq!(
+            *answered.asked.borrow(),
+            ["codex"],
+            "the bare name by default"
+        );
+
+        // The operator's own `[agent_binaries]` entry, as for a launch.
+        let binaries = AgentBinaries {
+            claude: None,
+            codex: Some(PathBuf::from("C:/tools/codex.exe")),
+        };
+        let failing = ScriptedCatalog {
+            answer: Err("timed out after 5s".to_string()),
+            asked: RefCell::new(Vec::new()),
+        };
+        let events = execute_cmd(
+            Cmd::ReadCodexCatalog { round: 8 },
+            &Deps {
+                codex_catalog: &failing,
+                agent_binaries: &binaries,
+                ..fixture.deps()
+            },
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            events,
+            vec![Event::CodexCatalogRead {
+                round: 8,
+                result: Err("timed out after 5s".to_string())
+            }]
+        );
+        assert_eq!(*failing.asked.borrow(), ["C:/tools/codex.exe"]);
     }
 
     #[test]

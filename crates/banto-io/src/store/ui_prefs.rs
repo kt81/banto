@@ -1,14 +1,17 @@
 //! Window-wide interface preferences: a small key/value table for what
 //! belongs to the whole emporium rather than to one brigade. Today that is
-//! the sidebar width and the brigade-quiet bell switch; brigade arrangement
+//! the sidebar width, the brigade-quiet bell switch and the agent the Worker
+//! picker was last confirmed with; brigade arrangement
 //! lives on the brigade's own rows (`brigades.rs`, migration v15).
 
+use banto_core::model::AgentKind;
 use rusqlite::{OptionalExtension, params};
 
 use super::{Store, StoreError};
 
 const SIDEBAR_WIDTH_KEY: &str = "sidebar_width";
 const BELL_WHEN_FOCUSED_KEY: &str = "bell_when_focused";
+const LAST_WORKER_AGENT_KEY: &str = "last_worker_agent";
 
 impl Store {
     /// The stored sidebar width in columns, if there is a usable one. A value
@@ -68,6 +71,35 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// The agent the Worker picker was last confirmed with, if there is a
+    /// usable value: a product token this build knows. Anything else (a token a
+    /// newer banto wrote, an empty or mangled value) reads as "none stored",
+    /// which opens the picker on the Director's own product as before.
+    pub fn last_worker_agent(&self) -> Result<Option<AgentKind>, StoreError> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM ui_prefs WHERE key = ?1",
+                [LAST_WORKER_AGENT_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value
+            .as_deref()
+            .map(str::trim)
+            .and_then(AgentKind::from_token))
+    }
+
+    /// Stores the agent the picker was confirmed with. Idempotent.
+    pub fn set_last_worker_agent(&self, agent: AgentKind) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO ui_prefs (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![LAST_WORKER_AGENT_KEY, agent.as_token()],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +131,48 @@ mod tests {
         assert_eq!(store.bell_when_focused().unwrap(), Some(false));
         // Its own key: the width is untouched.
         assert_eq!(store.sidebar_width().unwrap(), None);
+    }
+
+    #[test]
+    fn the_last_worker_agent_round_trips_and_defaults_to_none_stored() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.last_worker_agent().unwrap(), None);
+
+        store.set_last_worker_agent(AgentKind::Codex).unwrap();
+        assert_eq!(store.last_worker_agent().unwrap(), Some(AgentKind::Codex));
+        store.set_last_worker_agent(AgentKind::Codex).unwrap();
+        store.set_last_worker_agent(AgentKind::ClaudeCode).unwrap();
+        assert_eq!(
+            store.last_worker_agent().unwrap(),
+            Some(AgentKind::ClaudeCode)
+        );
+        // Its own key: the other preferences are untouched.
+        assert_eq!(store.sidebar_width().unwrap(), None);
+        assert_eq!(store.bell_when_focused().unwrap(), None);
+    }
+
+    #[test]
+    fn an_unknown_or_mangled_stored_worker_agent_reads_as_none_stored() {
+        let store = Store::open_in_memory().unwrap();
+        for bad in ["", "gemini", "Claude", "claude code", "1"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO ui_prefs (key, value) VALUES ('last_worker_agent', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [bad],
+                )
+                .unwrap();
+            assert_eq!(store.last_worker_agent().unwrap(), None, "{bad:?}");
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE ui_prefs SET value = ' codex ' WHERE key = 'last_worker_agent'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.last_worker_agent().unwrap(), Some(AgentKind::Codex));
     }
 
     #[test]

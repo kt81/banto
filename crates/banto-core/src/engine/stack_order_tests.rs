@@ -322,6 +322,7 @@ impl Scene {
             cwd: PathBuf::from("/work/alpha"),
             worker_agent: AgentKind::ClaudeCode,
             worker_model: String::new(),
+            worker_effort: String::new(),
             result: Ok(member.0.to_string()),
         })
     }
@@ -745,6 +746,7 @@ fn a_freshly_formed_brigade_shows_its_workers_in_the_order_they_were_numbered() 
             cwd: PathBuf::from("/work/alpha"),
             worker_agent: AgentKind::ClaudeCode,
             worker_model: String::new(),
+            worker_effort: String::new(),
             result: Ok((1, vec!["worker-1".to_string(), "worker-2".to_string()])),
         });
         scene.settle(cmds, arrival);
