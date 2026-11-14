@@ -145,43 +145,60 @@ fn run_for_stdout(program: &Path, args: &[&str], timeout: Duration) -> Result<St
 mod tests {
     use super::*;
 
-    /// A program that prints `text` and exits `code`, and one that outlives any
-    /// timeout: stand-ins for Codex, written for the platform the tests run on.
+    /// Run a stand-in for Codex whose behaviour is `body`, in the shell script
+    /// language of the platform the tests run on.
+    ///
+    /// On Unix the stand-in is the system shell given the body (`sh -c`): no file
+    /// is written and then executed. That is deliberate. A test that writes an
+    /// executable and runs it at once races with every other test thread that
+    /// forks: `std` opens files close-on-exec, but a child forked by another
+    /// thread holds a copy of our still-open write descriptor until *its* exec,
+    /// and `exec` of a file open for writing anywhere fails with ETXTBSY ("Text
+    /// file busy"). It failed on CI that way. Windows has no such rule, and a
+    /// `.cmd` is the one thing it can run without a shell argument.
     #[cfg(windows)]
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(format!("{name}.cmd"));
-        std::fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
-        path
+    fn run_stand_in(body: &str, timeout: Duration) -> Result<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.cmd");
+        std::fs::write(
+            &path,
+            format!(
+                "@echo off
+{body}
+"
+            ),
+        )
+        .unwrap();
+        run_for_stdout(&path, &["debug"], timeout)
     }
 
     #[cfg(unix)]
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    fn run_stand_in(body: &str, timeout: Duration) -> Result<String, String> {
+        run_for_stdout(Path::new("/bin/sh"), &["-c", body, "debug"], timeout)
     }
 
+    /// A body that outlives any timeout. On Unix it replaces the shell with the
+    /// sleep, so killing the process at the timeout kills the sleep itself.
     #[cfg(windows)]
     const SLEEP_A_WHILE: &str = "ping -n 8 127.0.0.1 > nul";
     #[cfg(unix)]
-    const SLEEP_A_WHILE: &str = "sleep 8";
+    const SLEEP_A_WHILE: &str = "exec sleep 8";
 
     #[test]
     fn a_program_that_exits_zero_gives_its_standard_output_and_not_its_standard_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = script(dir.path(), "fake", "echo catalog-line\necho warning 1>&2");
-        let out = run_for_stdout(&program, &["debug"], Duration::from_secs(20)).unwrap();
+        let out = run_stand_in(
+            "echo catalog-line
+echo warning 1>&2",
+            Duration::from_secs(20),
+        )
+        .unwrap();
         assert!(out.contains("catalog-line"), "{out:?}");
         assert!(!out.contains("warning"), "{out:?}");
     }
 
     #[test]
     fn a_non_zero_exit_is_an_error_naming_the_status() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = script(dir.path(), "fake", "exit 3");
-        let err = run_for_stdout(&program, &[], Duration::from_secs(20)).unwrap_err();
+        let err = run_stand_in("exit 3", Duration::from_secs(20)).unwrap_err();
         assert_eq!(err, "exit status 3");
     }
 
@@ -199,10 +216,8 @@ mod tests {
 
     #[test]
     fn a_program_that_hangs_is_killed_at_the_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = script(dir.path(), "fake", SLEEP_A_WHILE);
         let started = Instant::now();
-        let err = run_for_stdout(&program, &[], Duration::from_millis(300)).unwrap_err();
+        let err = run_stand_in(SLEEP_A_WHILE, Duration::from_millis(300)).unwrap_err();
         assert!(err.starts_with("timed out after"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(6),
