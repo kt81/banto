@@ -34,6 +34,9 @@ Four crates. The dependency direction is the discipline, not a preference —
   widgets, no key handling and no terminal setup
 - `crates/banto` — bin: clap CLI, raw crossterm, the one UI's event loop, and the
   wiring between the other three
+- `tools/measure` — not a crate: stdlib-only Python scripts that measure token use
+  and review quality from transcripts and git, with synthetic-fixture tests; see
+  `tools/measure/README.md` before running them, since they read real transcripts
 
 ## Invariants (never violate)
 

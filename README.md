@@ -386,6 +386,9 @@ the decision that rang it (ids and counts only, no session text).
 Further reading: [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) (design/
 requirements), [docs/notes/](docs/notes/) (on-device verification notes for
 the embedded ConPTY host, MCP, and Codex briefing delivery).
+[tools/measure/](tools/measure/README.md) holds Python scripts that measure how
+much a team of agents spends and how its changes fare in review; they are not part
+of the build.
 
 ## License
 

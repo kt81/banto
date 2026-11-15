@@ -30,3 +30,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # The measurement scripts are Python with the standard library only, so
+      # one platform is enough to catch a regression in them.
+      - name: Measurement tools tests
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 -m unittest discover -s tools/measure/tests

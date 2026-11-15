@@ -11,3 +11,6 @@
 # contain real session content; repo fixtures are hand-written synthetic only).
 *.log
 *.events.jsonl
+
+# Python bytecode from the measurement tools (tools/measure).
+__pycache__/
