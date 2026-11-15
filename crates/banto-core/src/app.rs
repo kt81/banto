@@ -888,6 +888,9 @@ pub struct App {
     /// [`Self::set_reported_activity`]). Laid over `base_rows`' own activity
     /// whenever `rows` is rebuilt, so a reload of the list cannot lose it.
     reported_activity: HashMap<String, Activity>,
+    /// Directors whose brigade wants the operator ([`Self::set_brigade_marks`]):
+    /// shown as Waiting on their rows and counted, nothing else.
+    brigade_marks: HashSet<String>,
     /// Which of the ids in `reported_activity` are Waiting for a dialog.
     reported_dialogs: HashSet<String>,
     /// Ids of the rows that are Waiting only because a dialog is open
@@ -989,6 +992,9 @@ pub struct VisibleRow<'a> {
     pub row: &'a SessionRow,
     pub pinned: bool,
     pub director: bool,
+    /// The row's brigade wants the operator ([`App::set_brigade_marks`]): the dot
+    /// reads Waiting whatever the session's own state is.
+    pub brigade_mark: bool,
     /// True when this session has a known auto-compaction continuation —
     /// shown regardless of *why* the row is visible (still live, or the
     /// `a` cycle has revealed what banto hid).
@@ -1040,6 +1046,7 @@ impl App {
             pinned: HashSet::new(),
             waiting_rows: HashSet::new(),
             reported_activity: HashMap::new(),
+            brigade_marks: HashSet::new(),
             reported_dialogs: HashSet::new(),
             row_index: HashMap::new(),
             dialog_rows: HashSet::new(),
@@ -1882,6 +1889,29 @@ impl App {
         self.refilter_keeping_selected(selected_id);
     }
 
+    /// The Directors whose brigade wants the operator — it went quiet, or one of
+    /// its members off stage is waiting — laid over the list as a mark: the
+    /// row's dot reads Waiting and the row is counted, which is all it does. It
+    /// is deliberately not laid into `rows`' activity the way
+    /// [`Self::set_reported_activity`] is: a row's activity is the session's own
+    /// state and the tile's word, the quit question and the relay's reading of
+    /// it must stay that, so this is a separate set that only the Waiting sets
+    /// and the row's dot read.
+    pub fn set_brigade_marks(&mut self, marks: HashSet<String>) {
+        if self.brigade_marks == marks {
+            return;
+        }
+        self.brigade_marks = marks;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.resort_rows();
+        self.refilter_keeping_selected(selected_id);
+    }
+
+    /// Whether `id` is a Director whose brigade is marked ([`Self::set_brigade_marks`]).
+    pub fn has_brigade_mark(&self, id: &str) -> bool {
+        self.brigade_marks.contains(id)
+    }
+
     /// Replace the session list (e.g. after a filesystem-change reload),
     /// re-applying the current query unchanged. The previously selected
     /// session stays selected if it still exists, by id rather than index
@@ -1932,6 +1962,9 @@ impl App {
                 .filter(|(_, activity)| **activity == Activity::Waiting)
                 .map(|(id, _)| id.clone()),
         );
+        // A brigade's mark is Waiting for the sets that count and ring, and for
+        // nothing else: the row's own activity is untouched.
+        self.waiting_rows.extend(self.brigade_marks.iter().cloned());
         // Read after the overlay: a row a pane reported over is not a dialog.
         self.dialog_rows = self
             .rows
@@ -1970,7 +2003,7 @@ impl App {
             .filtered
             .iter()
             .map(|&i| &self.rows[i])
-            .filter(|row| row.activity == Activity::Waiting)
+            .filter(|row| row.activity == Activity::Waiting || self.brigade_marks.contains(&row.id))
             .map(|row| row.id.clone())
             .collect();
         self.filtered_waiting_generation = self.filtered_waiting_generation.wrapping_add(1);
@@ -2452,6 +2485,7 @@ impl App {
                         row,
                         pinned: self.pinned.contains(&row.id),
                         director: self.directors.contains(&row.id),
+                        brigade_mark: self.brigade_marks.contains(&row.id),
                         superseded: self.superseded.contains(&row.id),
                     })
                 }

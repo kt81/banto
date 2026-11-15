@@ -46,7 +46,7 @@ use ratatui::widgets::{Block, Paragraph};
 use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
-    self, Axis, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
+    self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
     GoinkyoObservation, GoinkyoSpawnCandidate, GroupJoinTargetData, LiveStatus, PrefixKey,
     RelayObservation, SessionKey, Stage, StoreIntent,
 };
@@ -617,6 +617,7 @@ fn event_loop(
     let input_rx = deps.input_reader.open();
     let mut input_log = open_input_log();
     let mut stage_log = open_stage_log();
+    let mut bell_log = open_bell_log();
     let mut paste_acc = PasteAccumulator::new();
     let run_start = Instant::now();
     let mut event_recorder = open_event_recorder(run_start);
@@ -847,8 +848,19 @@ fn event_loop(
             if let Some(recorder) = &mut event_recorder {
                 recorder.record(&ev, now);
             }
+            // Named before the event is consumed, and only when the log will use it.
+            let produced_by = bell_log.is_some().then(|| variant_name(&ev));
             let cmds = engine::update(&mut state, app, brigade, ev, now);
             for cmd in cmds {
+                if let Cmd::RingHostBell { cause } = &cmd {
+                    let entry = bell_log.as_mut().map(|file| BellEntry {
+                        file,
+                        since_start: now.saturating_duration_since(run_start),
+                        event: produced_by.as_deref().unwrap_or(""),
+                    });
+                    ring_host_bell_to(&mut io::stdout(), cause, entry);
+                    continue;
+                }
                 events.extend(execute_cmd(cmd, deps, &mut handles, &mut discovery));
             }
         }
@@ -1179,15 +1191,75 @@ fn execute_cmd(
             let _ = stdout.write_all(&bytes).and_then(|()| stdout.flush());
             Vec::new()
         }
-        Cmd::RingHostBell => {
-            // Like OSC 52 above, BEL changes neither cells nor cursor, so
-            // emitting it before draw cannot desynchronize ratatui's model.
-            // It is deliberately a fixed byte, not child-controlled payload.
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(b"\x07").and_then(|()| stdout.flush());
+        Cmd::RingHostBell { cause } => {
+            // The event loop rings through here too, with its log; this arm is
+            // for a caller that has none.
+            ring_host_bell_to(&mut std::io::stdout(), &cause, None);
             Vec::new()
         }
     }
+}
+
+/// One executed bell, as the diagnostic log wants it written down.
+struct BellEntry<'a> {
+    file: &'a mut std::fs::File,
+    /// Time since the run started, counted from the same instant the event
+    /// recorder counts `offset_ms` from, so a line here can be laid against a
+    /// recording.
+    since_start: Duration,
+    /// Which event's update produced the bell ([`variant_name`]).
+    event: &'a str,
+}
+
+/// Write the host bell and, when `log` is given, one line saying why and
+/// whether the write worked. Like OSC 52 forwarding, BEL changes neither cells
+/// nor cursor, so emitting it before draw cannot desynchronize ratatui's model;
+/// it is deliberately a fixed byte, never child-controlled payload. A failed
+/// write or log is no error: a diagnostic must never break the run, and a
+/// bell nobody heard is not worth stopping for.
+fn ring_host_bell_to<W: io::Write>(host: &mut W, cause: &BellCause, log: Option<BellEntry<'_>>) {
+    let written = host.write_all(b"\x07").and_then(|()| host.flush());
+    let Some(entry) = log else {
+        return;
+    };
+    let wall_ms = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let outcome = match written {
+        Ok(()) => "written".to_string(),
+        Err(error) => format!("failed={:?}", error.kind()),
+    };
+    // Ids, tokens and counts only (`BellCause`'s own contract): never a title,
+    // a message or anything from a screen.
+    let _ = writeln!(
+        entry.file,
+        "{wall_ms} emporium: bell +{}ms cause={cause} event={} {outcome}",
+        entry.since_start.as_millis(),
+        entry.event,
+    );
+}
+
+/// The name of an event's variant. It stops the `Debug` formatting at the first
+/// character that is not part of the name, so a chunk of terminal output is not
+/// walked to say it is one.
+fn variant_name(event: &Event) -> String {
+    use std::fmt::Write as _;
+    struct NameOnly(String);
+    impl std::fmt::Write for NameOnly {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            for c in text.chars() {
+                if !(c.is_alphanumeric() || c == '_') {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(c);
+            }
+            Ok(())
+        }
+    }
+    let mut name = NameOnly(String::new());
+    let _ = write!(name, "{event:?}");
+    name.0
 }
 
 /// Writes a bare OSC 8 close (`ESC ] 8 ; ; ESC \`) into the current frame
@@ -3433,6 +3505,24 @@ fn open_stage_log() -> Option<std::fs::File> {
         .ok()
 }
 
+/// Open the diagnostic bell log when `BANTO_BELL_LOG` is set: one line per bell
+/// that was executed, saying what the core rang for. The same house pattern as
+/// [`open_stage_log`]: the env var names the file, append mode, best-effort
+/// open. A ring the core's cooldown swallowed is never a `Cmd` and so is not in
+/// it.
+///
+/// Like the other diagnostic logs it is opened and written on the UI thread, so
+/// the path should name a regular file: a FIFO with no reader would block the
+/// event loop.
+fn open_bell_log() -> Option<std::fs::File> {
+    let path = std::env::var_os("BANTO_BELL_LOG")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 /// One iteration's non-poll stage durations — the measuring (`Instant::now()`
 /// deltas around each stage) is unconditional and negligible, no different
 /// in cost from the loop's own existing per-iteration clock reads; only the
@@ -5138,6 +5228,38 @@ mod tests {
     const REPORT_IDLE: &[u8] = b"\x1b]7501;state=idle:app=codex\x1b\\";
 
     #[test]
+    fn a_directors_tile_title_keeps_its_own_state_word_while_its_row_carries_a_brigade_mark() {
+        use banto_core::model::AgeBucket::Today;
+        // The mark is the row's dot and the tile's colour, never the session's
+        // state: an idle Director marked for a quiet brigade still draws "idle",
+        // and a busy one "busy", never "waiting".
+        for (activity, word) in [
+            (Activity::Idle(Today), "idle"),
+            (Activity::Busy, "busy"),
+            (Activity::Alive, "alive"),
+        ] {
+            let (state, mut app, _, now) = scene(160, [activity, Activity::Alive, Activity::Alive]);
+            let unmarked = {
+                let buffer = render_at(&state, &app, 160, now);
+                title_row(&state, &buffer, DIR, 160).0
+            };
+            app.set_brigade_marks([DIR.to_string()].into_iter().collect());
+            assert!(app.has_brigade_mark(DIR), "the row is marked");
+            let buffer = render_at(&state, &app, 160, now);
+            let (marked, _) = title_row(&state, &buffer, DIR, 160);
+            assert!(
+                marked.contains(&format!(" Claude \u{b7} {word} \u{b7} output now ")),
+                "{word}: the marked Director's title row is {marked:?}"
+            );
+            assert!(
+                !marked.contains("waiting"),
+                "{word}: a mark is not a waiting word: {marked:?}"
+            );
+            assert_eq!(marked, unmarked, "{word}: the title row does not change");
+        }
+    }
+
+    #[test]
     fn a_collapsed_and_an_expanded_tile_render_the_same_title_row_for_every_state_and_product() {
         use banto_core::model::AgeBucket::Today;
         // What it is, the row's activity, what the Codex pane reported, and the
@@ -6020,7 +6142,11 @@ mod tests {
         assert_eq!(both(&state, &app).0, claude_alive, "the title");
         assert!(!state.attention_panes().contains(&key), "no mark");
         assert_eq!(state.visible_waiting_count(), 0, "no count");
-        assert!(!cmds.iter().any(|cmd| matches!(cmd, Cmd::RingHostBell)));
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RingHostBell { .. }))
+        );
         // The strip of the same pane says the same.
         toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
         assert_eq!(both(&state, &app).1.as_deref(), Some(claude_alive));
@@ -6126,7 +6252,8 @@ mod tests {
         assert!(state.attention_panes().contains(&key), "marked");
         assert_eq!(state.visible_waiting_count(), 1);
         assert!(
-            cmds.iter().any(|cmd| matches!(cmd, Cmd::RingHostBell)),
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::RingHostBell { .. })),
             "rung for"
         );
         // The strip says the same once it is collapsed.
@@ -6981,6 +7108,114 @@ mod tests {
                 .map(|g| g.line.as_str()),
             Some("[31mdo it"),
             "reduced to its first line with the escape removed"
+        );
+    }
+
+    #[test]
+    fn a_member_that_joined_after_a_broadcast_does_not_show_it_as_its_last_message() {
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        // A broadcast to the Workers, queued while only worker-1 existed...
+        store
+            .borrow()
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "before worker-2")
+            .unwrap();
+        // ...and a second Worker that joins after it, hosted in a pane of its own.
+        let second = store
+            .borrow_mut()
+            .add_worker(1, Some(AgentKind::ClaudeCode))
+            .unwrap();
+        assert_eq!(second, "worker-2");
+        store
+            .borrow_mut()
+            .set_member_session(1, &second, &SessionId("w2".to_string()))
+            .unwrap();
+        let mut state = state;
+        state
+            .screens
+            .insert(SessionKey::from_id("w2"), Screen::new(24, 80));
+
+        let inbound_line = |observations: &[RelayObservation], token: &str| {
+            observations
+                .iter()
+                .find(|o| o.token == token)
+                .unwrap_or_else(|| panic!("{token} was not observed"))
+                .glance
+                .as_ref()
+                .and_then(|g| g.inbound.as_ref())
+                .map(|g| g.line.clone())
+        };
+
+        // The first tick of a fresh gate reads both members. Worker-2 has no mail
+        // of its own yet; worker-1 still shows the broadcast it was there for.
+        let mut gate = GlanceGate::default();
+        let first = gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        let new_member = first.iter().find(|o| o.token == "worker-2").unwrap();
+        assert_eq!(
+            new_member.glance.as_ref().map(|g| g.inbound.clone()),
+            Some(None),
+            "read, and nothing was addressed to it after it joined"
+        );
+        assert_eq!(
+            inbound_line(&first, "worker-1"),
+            Some("before worker-2".to_string())
+        );
+
+        // The next tick: nothing new for worker-2 (no message appended, nothing
+        // unseen, same session), so the gate reads nothing and hands the core no
+        // glance at all. That is different from a read that found nothing, which
+        // the first tick and the fresh gate below assert; a stale pre-join line
+        // could only come out of a read, and would be a `Some` here.
+        let second_tick =
+            gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        assert!(
+            second_tick
+                .iter()
+                .find(|o| o.token == "worker-2")
+                .unwrap()
+                .glance
+                .is_none(),
+            "the gate skipped the read: it kept what the first tick found"
+        );
+        assert_eq!(
+            inbound_line(&second_tick, "worker-1"),
+            Some("before worker-2".to_string())
+        );
+
+        // A gate that remembers nothing reads it again with the same answer.
+        let mut fresh_gate = GlanceGate::default();
+        let fresh =
+            gather_relay_observations(&state, &store, &home, None, &app, None, &mut fresh_gate);
+        assert_eq!(
+            fresh
+                .iter()
+                .find(|o| o.token == "worker-2")
+                .unwrap()
+                .glance
+                .as_ref()
+                .map(|g| g.inbound.clone()),
+            Some(None),
+            "read again from the store, and still nothing before the join"
+        );
+        assert_eq!(
+            inbound_line(&fresh, "worker-1"),
+            Some("before worker-2".to_string())
+        );
+
+        // A broadcast sent after the join reaches both tiles.
+        store
+            .borrow()
+            .enqueue_brigade_message(1, "director", BrigadeRole::Worker, None, "after worker-2")
+            .unwrap();
+        let after = gather_relay_observations(&state, &store, &home, None, &app, None, &mut gate);
+        assert_eq!(
+            inbound_line(&after, "worker-2"),
+            Some("after worker-2".to_string())
+        );
+        assert_eq!(
+            inbound_line(&after, "worker-1"),
+            Some("after worker-2".to_string())
         );
     }
 
@@ -11293,6 +11528,154 @@ mod tests {
     // itself, which takes a real `Terminal<CrosstermBackend<Stdout>>` and
     // has no test anywhere in this file driving it directly (a barrier
     // that predates this change).
+
+    // --- the bell log ---------------------------------------------------------
+
+    fn quiet_cause() -> banto_core::engine::BellCause {
+        banto_core::engine::BellCause::QuietRecorded {
+            brigade: 1,
+            director: SessionKey::from_id("dir"),
+        }
+    }
+
+    /// A sink that fails every write, as a terminal that went away would.
+    struct BrokenSink;
+
+    impl io::Write for BrokenSink {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn log_lines(file: &mut std::fs::File) -> Vec<String> {
+        use std::io::{Read as _, Seek as _};
+        file.rewind().unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_variant_is_named_without_formatting_what_it_carries() {
+        let key = SessionKey::from_id("a");
+        // A megabyte of output must not be walked to find out which event it is.
+        let output = Event::PtyOutput {
+            key,
+            chunk: vec![7; 1 << 20],
+        };
+        assert_eq!(variant_name(&output), "PtyOutput");
+        assert_eq!(
+            variant_name(&Event::Resized {
+                width: 80,
+                height: 24
+            }),
+            "Resized"
+        );
+        assert_eq!(
+            variant_name(&Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new()
+            }),
+            "Tick"
+        );
+    }
+
+    #[test]
+    fn a_bell_is_written_once_and_logged_with_its_cause_and_the_event_behind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.path().join("bell.log"))
+            .unwrap();
+        let mut host = Vec::new();
+        ring_host_bell_to(
+            &mut host,
+            &quiet_cause(),
+            Some(BellEntry {
+                file: &mut file,
+                since_start: Duration::from_millis(5123),
+                event: "QuiescenceSampled",
+            }),
+        );
+        assert_eq!(host, b"\x07", "one BEL and nothing else");
+        let lines = log_lines(&mut file);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (wall, rest) = lines[0].split_once(' ').unwrap();
+        assert!(wall.chars().all(|c| c.is_ascii_digit()), "{}", lines[0]);
+        assert_eq!(
+            rest,
+            "emporium: bell +5123ms cause=quiet_recorded brigade=1 director=dir \
+             event=QuiescenceSampled written"
+        );
+    }
+
+    #[test]
+    fn a_bell_that_could_not_be_written_is_logged_as_such_and_breaks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.path().join("bell.log"))
+            .unwrap();
+        ring_host_bell_to(
+            &mut BrokenSink,
+            &quiet_cause(),
+            Some(BellEntry {
+                file: &mut file,
+                since_start: Duration::ZERO,
+                event: "Tick",
+            }),
+        );
+        let lines = log_lines(&mut file);
+        assert!(
+            lines[0].ends_with("event=Tick failed=BrokenPipe"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_not_tidy_cannot_split_or_widen_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.path().join("bell.log"))
+            .unwrap();
+        let cause = banto_core::engine::BellCause::StagedPaneBell {
+            pane: SessionKey::from_id("a\nb\r\x1b[2Jc"),
+            others: 0,
+        };
+        ring_host_bell_to(
+            &mut Vec::new(),
+            &cause,
+            Some(BellEntry {
+                file: &mut file,
+                since_start: Duration::ZERO,
+                event: "Tick",
+            }),
+        );
+        let lines = log_lines(&mut file);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("pane=a_b__[2Jc"), "{lines:?}");
+        assert!(!lines[0].chars().any(char::is_control), "{lines:?}");
+    }
+
+    #[test]
+    fn with_no_log_the_bell_is_just_the_bell() {
+        let mut host = Vec::new();
+        ring_host_bell_to(&mut host, &quiet_cause(), None);
+        assert_eq!(host, b"\x07");
+        // And a host that fails is not an error anywhere.
+        ring_host_bell_to(&mut BrokenSink, &quiet_cause(), None);
+    }
 
     #[test]
     fn close_any_open_hyperlink_writes_the_bare_osc_8_close_and_flushes() {

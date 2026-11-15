@@ -113,7 +113,8 @@ fn press(state: &mut EmporiumState, app: &mut App, code: KeyCode, at: Instant) -
 }
 
 fn rang(cmds: &[Cmd]) -> bool {
-    cmds.iter().any(|cmd| matches!(cmd, Cmd::RingHostBell))
+    cmds.iter()
+        .any(|cmd| matches!(cmd, Cmd::RingHostBell { .. }))
 }
 
 fn key(id: &str) -> SessionKey {
@@ -121,11 +122,15 @@ fn key(id: &str) -> SessionKey {
 }
 
 /// A hosted pane of `brigade` under `token`, with a screen, whose process is
-/// taken to have run (and idled) before the test begins.
+/// taken to have run (and idled) before the test begins: started well before
+/// [`PROCESS_START_GRACE`] could matter, and already read idle.
 fn host(state: &mut EmporiumState, brigade: BrigadeId, token: &str, id: &str) -> SessionKey {
     let pane = host_fresh(state, brigade, token, id);
     let process = state.spawn_order[&pane];
     state.seen_idle.insert(process);
+    if let Some(long_ago) = t0().checked_sub(2 * PROCESS_START_GRACE) {
+        state.process_started.insert(pane.clone(), long_ago);
+    }
     pane
 }
 
@@ -458,6 +463,14 @@ fn the_brigade_rings_once_when_it_has_been_idle_for_the_settle() {
         idle_from + BRIGADE_QUIET_SETTLE,
     );
     assert!(rang(&cmds), "{cmds:?}");
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::QuietRecorded {
+            brigade: 1,
+            director: director.clone()
+        }],
+        "a brigade whose Director is not focused: a record"
+    );
     assert!(
         state.attention_panes().contains(&director),
         "the Director's tile carries the mark"
@@ -553,6 +566,7 @@ fn it_does_not_ring_again_until_someone_has_been_busy() {
     }
     // Spend the mark so the check below sees a new one.
     state.latched_attention_panes.clear();
+    state.attention.clear();
 
     // Someone works and the brigade goes quiet again: it rings again.
     let again = fired_at + 70 * SECOND;
@@ -772,9 +786,9 @@ fn two_brigades_settle_and_fire_independently() {
         idle_1 + BRIGADE_QUIET_SETTLE,
     );
     assert!(rang(&cmds), "brigade 1 is quiet: {cmds:?}");
-    assert!(state.latched_attention_panes.contains(&d1));
+    assert!(state.attention.contains_key(&1));
     assert!(
-        !state.latched_attention_panes.contains(&d2),
+        !state.attention.contains_key(&2),
         "brigade 2 is still working"
     );
 
@@ -786,14 +800,14 @@ fn two_brigades_settle_and_fire_independently() {
         &[(&d1, Idle), (&w1, Idle), (&d2, Idle), (&w2, Idle)],
         idle_2,
     );
-    assert!(!state.latched_attention_panes.contains(&d2));
+    assert!(!state.attention.contains_key(&2));
     sample(
         &mut state,
         &mut app,
         &[(&d1, Idle), (&w1, Idle), (&d2, Idle), (&w2, Idle)],
         idle_2 + BRIGADE_QUIET_SETTLE,
     );
-    assert!(state.latched_attention_panes.contains(&d2));
+    assert!(state.attention.contains_key(&2));
 }
 
 // --- an off-stage brigade, staged the way the product stages it ----------------------------------
@@ -818,9 +832,16 @@ enum OffStageSays {
     ClaudeWaiting,
     /// The target is Codex and reports `blocked`.
     CodexBlocked,
+    /// The target's session file says `waiting` because the operator has a
+    /// dialog open in it.
+    ClaudeDialog,
+    /// Brigade 1's Worker, which is on stage, starts waiting: it rings on its
+    /// own tile, before anything is off stage.
+    OnStageWait,
 }
 
 struct OffStage {
+    says: OffStageSays,
     state: EmporiumState,
     app: App,
     d2: SessionKey,
@@ -829,12 +850,24 @@ struct OffStage {
     at: Instant,
     /// Bells rung while the brigade was being set up off stage.
     rings_before: usize,
+    /// Why each of them rang.
+    causes_before: Vec<BellCause>,
 }
 
 fn rings(cmds: &[Cmd]) -> usize {
     cmds.iter()
-        .filter(|cmd| matches!(cmd, Cmd::RingHostBell))
+        .filter(|cmd| matches!(cmd, Cmd::RingHostBell { .. }))
         .count()
+}
+
+/// Why each bell in `cmds` was asked for, in order.
+fn bell_causes(cmds: &[Cmd]) -> Vec<BellCause> {
+    cmds.iter()
+        .filter_map(|cmd| match cmd {
+            Cmd::RingHostBell { cause } => Some(cause.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 impl OffStage {
@@ -842,11 +875,25 @@ impl OffStage {
     /// only its Director's row in the list (its Worker is hidden, as members are),
     /// and `says` about `target`: the Director when `on_director`, else the Worker.
     fn new(says: OffStageSays, on_director: bool) -> Self {
+        Self::new_with(says, on_director, false)
+    }
+
+    /// As [`Self::new`], with the operator `working` in brigade 1: the pane
+    /// focus on its Director's tile and banto's window focused.
+    fn new_with(says: OffStageSays, on_director: bool, working: bool) -> Self {
         use crate::model::Activity;
         let (mut state, mut app, d1, w1, at) = quiet_fixture();
+        if working {
+            state.focus = Focus::Pane;
+            state.window_focused = true;
+        }
         let d2 = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
         let w2 = host(&mut state, 2, "worker-1", "w2");
-        let target = if on_director { d2.clone() } else { w2.clone() };
+        let target = match says {
+            OffStageSays::OnStageWait => w1.clone(),
+            _ if on_director => d2.clone(),
+            _ => w2.clone(),
+        };
         let mut rows = vec![
             row_for("dir"),
             row_for("w1"),
@@ -857,6 +904,11 @@ impl OffStage {
             match says {
                 OffStageSays::CodexBlocked => row.agent = crate::model::AgentKind::Codex,
                 OffStageSays::ClaudeWaiting => row.activity = Activity::Waiting,
+                OffStageSays::ClaudeDialog => {
+                    row.activity = Activity::Waiting;
+                    row.dialog_open = true;
+                }
+                OffStageSays::OnStageWait => row.activity = Activity::Waiting,
                 OffStageSays::QuietFire | OffStageSays::Bell => {}
             }
         }
@@ -870,33 +922,45 @@ impl OffStage {
         app.set_viewport_height(20);
         let all_idle = [(&d1, Idle), (&w1, Idle), (&d2, Idle), (&w2, Idle)];
         let mut rings_before = 0;
+        let mut causes_before = Vec::new();
         match says {
             OffStageSays::QuietFire => {
                 let working = [(&d1, Idle), (&w1, Idle), (&d2, NotIdle), (&w2, Idle)];
-                rings_before += rings(&sample(&mut state, &mut app, &working, at));
+                let mut heard = sample(&mut state, &mut app, &working, at);
                 let idle_from = at + SECOND;
-                rings_before += rings(&sample(&mut state, &mut app, &all_idle, idle_from));
+                heard.extend(sample(&mut state, &mut app, &all_idle, idle_from));
                 let settled = idle_from + BRIGADE_QUIET_SETTLE;
-                rings_before += rings(&sample(&mut state, &mut app, &all_idle, settled));
+                heard.extend(sample(&mut state, &mut app, &all_idle, settled));
+                rings_before += rings(&heard);
+                causes_before.extend(bell_causes(&heard));
             }
             OffStageSays::Bell => {
-                rings_before += rings(&said(&mut state, &mut app, &target, b"\x07", at + SECOND));
+                let heard = said(&mut state, &mut app, &target, b"\x07", at + SECOND);
+                rings_before += rings(&heard);
+                causes_before.extend(bell_causes(&heard));
             }
-            OffStageSays::ClaudeWaiting => {
-                rings_before += rings(&sample(&mut state, &mut app, &all_idle, at + SECOND));
+            OffStageSays::ClaudeWaiting
+            | OffStageSays::ClaudeDialog
+            | OffStageSays::OnStageWait => {
+                let heard = sample(&mut state, &mut app, &all_idle, at + SECOND);
+                rings_before += rings(&heard);
+                causes_before.extend(bell_causes(&heard));
             }
             OffStageSays::CodexBlocked => {
-                rings_before += rings(&sample(&mut state, &mut app, &all_idle, at + SECOND));
-                rings_before += rings(&said(
+                let mut heard = sample(&mut state, &mut app, &all_idle, at + SECOND);
+                heard.extend(said(
                     &mut state,
                     &mut app,
                     &target,
                     REPORT_BLOCKED,
                     at + 2 * SECOND,
                 ));
+                rings_before += rings(&heard);
+                causes_before.extend(bell_causes(&heard));
             }
         }
         Self {
+            says,
             state,
             app,
             d2,
@@ -904,7 +968,51 @@ impl OffStage {
             target,
             at,
             rings_before,
+            causes_before,
         }
+    }
+
+    /// What the one bell rung while this was set up must say it was for.
+    fn expected_cause(&self) -> BellCause {
+        let on_director = self.target == self.d2;
+        match self.says {
+            OffStageSays::QuietFire => BellCause::QuietRecorded {
+                brigade: 2,
+                director: self.d2.clone(),
+            },
+            OffStageSays::Bell => BellCause::OffStageMemberBell {
+                member: self.target.clone(),
+                brigade: 2,
+                others: 0,
+            },
+            // A Director's own row is in the list, which is what rang.
+            OffStageSays::ClaudeWaiting | OffStageSays::CodexBlocked if on_director => {
+                BellCause::ListRowWaiting {
+                    session: self.target.clone(),
+                    others: 0,
+                }
+            }
+            OffStageSays::ClaudeWaiting | OffStageSays::CodexBlocked => {
+                BellCause::OffStageMemberWait {
+                    member: self.target.clone(),
+                    brigade: 2,
+                    others: 0,
+                }
+            }
+            OffStageSays::OnStageWait => BellCause::StagedPaneWait {
+                pane: self.target.clone(),
+                others: 0,
+            },
+            OffStageSays::ClaudeDialog => unreachable!("a dialog does not ring"),
+        }
+    }
+
+    fn assert_it_rang_once_for_its_cause(&self, what: &str) {
+        assert_eq!(
+            self.causes_before,
+            vec![self.expected_cause()],
+            "{what}: why it rang"
+        );
     }
 
     /// When the operator stages it: long after the setup, so the bell's cooldown
@@ -989,8 +1097,13 @@ impl OffStage {
         marks
     }
 
+    /// What is outstanding for the operator: the brigade's record for a quiet
+    /// fire, the target pane's latch for a BEL.
     fn latched(&self) -> bool {
-        self.state.latched_attention_panes.contains(&self.target)
+        match self.says {
+            OffStageSays::QuietFire => self.state.attention.contains_key(&2),
+            _ => self.state.latched_attention_panes.contains(&self.target),
+        }
     }
 
     /// An ordinary tick `secs` after staging.
@@ -1010,27 +1123,45 @@ impl OffStage {
     }
 }
 
-/// What staging an off-stage brigade does to a latch on its Director: with the
-/// window focused (F4 off or on) the Director's pane is the focused one, so the
-/// latch is cleared in the very update that stages the brigade — nothing is drawn
-/// in any frame and the bell never rings; with the window unfocused it is not
-/// effectively focused, so the mark is drawn and the bell rings once, and the
-/// mark goes silently when the window regains focus.
-fn assert_a_director_latch_is_lost_at_staging(says: OffStageSays) {
+/// What an off-stage brigade's attention on its Director does, and what staging
+/// does to it. Off stage it rings when it happens and marks the Director's row
+/// (the row is in the list whether or not the brigade is on stage), and counts.
+/// Staging it with the window focused reaches the Director's pane: the mark is
+/// over in the update that stages it, nothing is drawn on the tile and nothing
+/// rings again. Staging it with the window unfocused does not reach the pane, so
+/// the mark stays (now on the tile) and nothing rings again, and it goes quietly
+/// when the window regains focus. (This used to be a known defect: nothing
+/// reached the operator off stage, and staging cleared the latch unseen.)
+fn assert_an_off_stage_directors_attention_rings_at_once_and_ends_at_staging(says: OffStageSays) {
     for f4 in [false, true] {
         let mut off_stage = OffStage::new(says, true);
-        assert!(off_stage.latched(), "{says:?}: latched off stage");
+        assert!(off_stage.latched(), "{says:?}: outstanding off stage");
         assert!(off_stage.marks().is_empty(), "no tile is drawn for it");
         assert_eq!(
-            off_stage.rings_before, 0,
-            "no bell for a mark nobody can see"
+            off_stage.rings_before, 1,
+            "{says:?}: it rang when it happened"
+        );
+        off_stage.assert_it_rang_once_for_its_cause(&format!("{says:?}"));
+        assert!(
+            off_stage.app.is_waiting_id("dir2"),
+            "{says:?}: its row is marked"
+        );
+        assert_eq!(
+            off_stage.state.visible_waiting_count(),
+            1,
+            "{says:?}: counted"
         );
 
         let staged = off_stage.stage_by_enter(true, f4);
         off_stage.assert_focus_landed_on_the_director();
         assert!(off_stage.marks().is_empty(), "{says:?} f4 {f4}: no mark");
-        assert_eq!(rings(&staged), 0, "{says:?} f4 {f4}: no bell");
-        assert!(!off_stage.latched(), "{says:?} f4 {f4}: cleared by staging");
+        assert_eq!(rings(&staged), 0, "{says:?} f4 {f4}: no second bell");
+        assert!(!off_stage.latched(), "{says:?} f4 {f4}: ended by staging");
+        assert!(
+            !off_stage.app.is_waiting_id("dir2"),
+            "{says:?} f4 {f4}: row clear"
+        );
+        assert_eq!(off_stage.state.visible_waiting_count(), 0);
         for secs in [1, 30] {
             let cmds = off_stage.tick_after_staging(secs);
             assert!(off_stage.marks().is_empty());
@@ -1042,7 +1173,7 @@ fn assert_a_director_latch_is_lost_at_staging(says: OffStageSays) {
         let staged = off_stage.stage_by_enter(false, f4);
         off_stage.assert_focus_landed_on_the_director();
         assert_eq!(off_stage.marks(), ["dir2"], "{says:?} f4 {f4}, unfocused");
-        assert_eq!(rings(&staged), 1);
+        assert_eq!(rings(&staged), 0, "{says:?} f4 {f4}: it rang already");
         assert!(off_stage.latched());
         assert_eq!(rings(&off_stage.tick_after_staging(1)), 0, "once");
         let regained = off_stage.window_regains_focus(2);
@@ -1052,20 +1183,16 @@ fn assert_a_director_latch_is_lost_at_staging(says: OffStageSays) {
     }
 }
 
-// KNOWN DEFECT, pinned: an off-stage brigade's quiet fire does not reach the
-// operator. The fire latches the Director's mark, no tile is drawn for it off
-// stage, and staging the brigade clears the latch in the same update because
-// staging focuses the Director's pane (docs/REQUIREMENTS.md, "The quiet
-// brigade's bell"). This test says what the product does today, so that the
-// change which gives off-stage brigades a surface has a test to turn around.
 #[test]
-fn an_off_stage_brigades_quiet_fire_is_lost_when_it_is_staged_unless_the_window_is_unfocused() {
-    assert_a_director_latch_is_lost_at_staging(OffStageSays::QuietFire);
+fn an_off_stage_brigades_quiet_fire_rings_at_once_and_staging_ends_its_mark() {
+    assert_an_off_stage_directors_attention_rings_at_once_and_ends_at_staging(
+        OffStageSays::QuietFire,
+    );
 }
 
 #[test]
-fn a_bell_latch_on_an_off_stage_director_is_lost_at_staging_like_the_quiet_fire() {
-    assert_a_director_latch_is_lost_at_staging(OffStageSays::Bell);
+fn a_bell_latch_on_an_off_stage_director_rings_at_once_and_staging_ends_its_mark() {
+    assert_an_off_stage_directors_attention_rings_at_once_and_ends_at_staging(OffStageSays::Bell);
 }
 
 #[test]
@@ -1077,12 +1204,19 @@ fn a_bell_latch_on_an_off_stage_worker_shows_and_rings_once_at_staging_and_stays
             let mut off_stage = OffStage::new(OffStageSays::Bell, false);
             assert!(off_stage.latched());
             assert!(off_stage.marks().is_empty());
-            assert_eq!(off_stage.rings_before, 0);
+            // Off stage it has no tile, so the Director's row speaks for it: marked,
+            // counted, and rung for when the BEL came.
+            assert_eq!(off_stage.rings_before, 1);
+            off_stage.assert_it_rang_once_for_its_cause(&what);
+            assert!(off_stage.app.is_waiting_id("dir2"));
+            assert_eq!(off_stage.state.visible_waiting_count(), 1);
 
             let staged = off_stage.stage_by_enter(window_focused, f4);
             off_stage.assert_focus_landed_on_the_director();
             assert_eq!(off_stage.marks(), ["w2"], "{what}");
-            assert_eq!(rings(&staged), 1, "{what}");
+            // It rang at the BEL, through the Director's row; staging moves the
+            // mark onto the tile and does not ring for the same BEL again.
+            assert_eq!(rings(&staged), 0, "{what}");
             assert!(off_stage.latched(), "{what}");
             assert_eq!(rings(&off_stage.tick_after_staging(1)), 0, "{what}: once");
             assert_eq!(rings(&off_stage.tick_after_staging(30)), 0, "{what}: once");
@@ -1112,15 +1246,20 @@ fn an_off_stage_worker_that_is_waiting_or_blocked_shows_and_rings_once_at_stagin
                     off_stage.app.is_waiting_id("w2"),
                     "{what}: the row knows off stage"
                 );
-                // A hidden member is not in the list, and nothing draws it.
+                // A hidden member is not in the list, and nothing draws it: its
+                // Director's row speaks for it, marked, counted and rung for.
                 assert!(off_stage.marks().is_empty(), "{what}");
-                assert_eq!(off_stage.rings_before, 0, "{what}");
+                assert_eq!(off_stage.rings_before, 1, "{what}");
+                off_stage.assert_it_rang_once_for_its_cause(&what);
+                assert!(off_stage.app.is_waiting_id("dir2"), "{what}");
+                assert_eq!(off_stage.state.visible_waiting_count(), 1, "{what}");
 
                 let staged = off_stage.stage_by_enter(window_focused, f4);
                 off_stage.assert_focus_landed_on_the_director();
                 assert_eq!(off_stage.marks(), ["w2"], "{what}");
                 assert_eq!(off_stage.state.visible_waiting_count(), 1, "{what}");
-                assert_eq!(rings(&staged), 1, "{what}");
+                // Rang when it began, through the Director's row, not again here.
+                assert_eq!(rings(&staged), 0, "{what}");
                 assert_eq!(rings(&off_stage.tick_after_staging(1)), 0, "{what}: once");
                 assert_eq!(rings(&off_stage.tick_after_staging(30)), 0, "{what}: once");
             }
@@ -1139,6 +1278,7 @@ fn an_off_stage_director_that_is_waiting_or_blocked_rang_from_the_list_and_shows
                 // The Director's row is in the list, so the list rang when it
                 // turned up; nothing is drawn on stage for it yet.
                 assert_eq!(off_stage.rings_before, 1, "{what}");
+                off_stage.assert_it_rang_once_for_its_cause(&what);
                 assert!(off_stage.marks().is_empty(), "{what}");
 
                 let staged = off_stage.stage_by_enter(window_focused, f4);
@@ -1212,7 +1352,233 @@ fn a_brigade_whose_director_is_not_hosted_is_not_watched() {
         let cmds = sample(&mut state, &mut app, &[(&worker, Idle)], at + secs * SECOND);
         assert!(!rang(&cmds), "at +{secs}s: {cmds:?}");
     }
-    assert!(state.latched_attention_panes.is_empty());
+    assert!(state.latched_attention_panes.is_empty() && state.attention.is_empty());
+}
+
+// --- what a bell says it was for ----------------------------------------------------
+
+#[test]
+fn waits_that_begin_in_one_update_ring_once_naming_the_lowest_id_and_counting_the_rest() {
+    use crate::model::Activity;
+    // Off stage: two members of brigade 2 begin waiting in the same reload.
+    let (mut state, mut app, _d1, _w1, at) = quiet_fixture();
+    host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
+    host(&mut state, 2, "worker-1", "w3");
+    host(&mut state, 2, "worker-2", "w2");
+    let rows = |activity| {
+        let mut rows = vec![
+            row_for("dir"),
+            row_for("w1"),
+            row_for("dir2"),
+            row_for("w2"),
+            row_for("w3"),
+        ];
+        for row in rows.iter_mut().filter(|r| r.id == "w2" || r.id == "w3") {
+            row.activity = activity;
+        }
+        rows
+    };
+    app.replace_rows(rows(Activity::Alive));
+    app.set_hidden_member_ids(
+        ["dir", "w1", "w2", "w3"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    app.set_viewport_height(20);
+    tick(&mut state, &mut app, at + SECOND);
+    app.replace_rows(rows(Activity::Waiting));
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::OffStageMemberWait {
+            member: key("w2"),
+            brigade: 2,
+            others: 1
+        }],
+        "{cmds:?}"
+    );
+
+    // In the list: two rows nothing hosts begin waiting in the same reload.
+    let (mut state, mut app, _d1, _w1, at) = quiet_fixture();
+    app.replace_rows(vec![row_for("x2"), row_for("x1")]);
+    app.set_viewport_height(20);
+    tick(&mut state, &mut app, at + SECOND);
+    let mut waiting = vec![row_for("x2"), row_for("x1")];
+    for row in &mut waiting {
+        row.activity = Activity::Waiting;
+    }
+    app.replace_rows(waiting);
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::ListRowWaiting {
+            session: key("x1"),
+            others: 1
+        }],
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn a_new_plain_session_is_named_in_a_cause_without_its_working_directory() {
+    // The placeholder key of a session opened new carries its cwd; the log line
+    // keeps its kind and counter and nothing else of it.
+    let cwd = std::path::Path::new("/work/secret\nproject::7");
+    let pane = SessionKey::new_plain(cwd, 3);
+    assert_eq!(pane.log_id(), "new::3");
+
+    // Through real events: that session is on stage, the window is away, and the
+    // child rings BEL.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    state.screens.insert(pane.clone(), Screen::new(24, 80));
+    state.stage = Stage::Solo(pane.clone());
+    state.focus = Focus::Pane;
+    let at = t0();
+    send(
+        &mut state,
+        &mut app,
+        Event::WindowFocusChanged { focused: false },
+        at,
+    );
+    let cmds = said(&mut state, &mut app, &pane, b"\x07", at + SECOND);
+    let causes = bell_causes(&cmds);
+    assert_eq!(
+        causes,
+        vec![BellCause::StagedPaneBell {
+            pane: pane.clone(),
+            others: 0
+        }]
+    );
+    let text = causes[0].to_string();
+    assert_eq!(text, "staged_pane_bell pane=new::3 others=0");
+    assert!(!text.contains("secret") && !text.contains('/'), "{text}");
+
+    // The same for a wait.
+    let wait = BellCause::StagedPaneWait { pane, others: 0 };
+    assert_eq!(wait.to_string(), "staged_pane_wait pane=new::3 others=0");
+}
+
+#[test]
+fn nothing_a_key_can_contain_puts_a_line_break_or_a_control_character_in_a_cause() {
+    let hostile = [
+        "a\nb",
+        "a\r\nb",
+        "tab\there",
+        "nul\0here",
+        "esc\x1b[31mred",
+        "next\u{85}line",
+        "sep\u{2028}line",
+        "new::1\nnext",
+        "new-worker::1::wor\nker",
+        "new::/work/\n::x",
+    ];
+    for id in hostile {
+        let pane = SessionKey::from_id(id);
+        let causes = [
+            BellCause::QuietFocused {
+                brigade: 1,
+                director: pane.clone(),
+            },
+            BellCause::QuietRecorded {
+                brigade: 1,
+                director: pane.clone(),
+            },
+            BellCause::StagedPaneBell {
+                pane: pane.clone(),
+                others: 0,
+            },
+            BellCause::StagedPaneWait {
+                pane: pane.clone(),
+                others: 0,
+            },
+            BellCause::ListRowWaiting {
+                session: pane.clone(),
+                others: 0,
+            },
+            BellCause::OffStageMemberBell {
+                member: pane.clone(),
+                brigade: 1,
+                others: 0,
+            },
+            BellCause::OffStageMemberWait {
+                member: pane.clone(),
+                brigade: 1,
+                others: 0,
+            },
+        ];
+        for cause in causes {
+            let line = cause.to_string();
+            assert!(
+                !line
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() && c != ' '),
+                "{id:?} -> {line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{id:?}");
+        }
+    }
+    // A placeholder whose counter is not one is not trusted to be a counter.
+    let odd = SessionKey::new_plain(std::path::Path::new("/work/x"), 1);
+    assert_eq!(odd.log_id(), "new::1");
+    let mangled = SessionKey::from_id("new::/work/x::notanumber");
+    assert_eq!(mangled.log_id(), "new::?");
+    // And nothing makes a line longer than an id has any need of.
+    let long = SessionKey::from_id(&"x".repeat(500));
+    assert_eq!(long.log_id().len(), 80);
+}
+
+#[test]
+fn every_cause_reads_as_one_line_of_ids_and_counts() {
+    let dir = key("dir");
+    let lines: Vec<String> = [
+        BellCause::QuietFocused {
+            brigade: 4,
+            director: dir.clone(),
+        },
+        BellCause::QuietRecorded {
+            brigade: 4,
+            director: dir.clone(),
+        },
+        BellCause::StagedPaneBell {
+            pane: dir.clone(),
+            others: 2,
+        },
+        BellCause::StagedPaneWait {
+            pane: dir.clone(),
+            others: 0,
+        },
+        BellCause::ListRowWaiting {
+            session: dir.clone(),
+            others: 1,
+        },
+        BellCause::OffStageMemberBell {
+            member: dir.clone(),
+            brigade: 4,
+            others: 0,
+        },
+        BellCause::OffStageMemberWait {
+            member: dir.clone(),
+            brigade: 4,
+            others: 3,
+        },
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    assert_eq!(
+        lines,
+        [
+            "quiet_focused brigade=4 director=dir",
+            "quiet_recorded brigade=4 director=dir",
+            "staged_pane_bell pane=dir others=2",
+            "staged_pane_wait pane=dir others=0",
+            "list_row_waiting session=dir others=1",
+            "off_stage_member_bell member=dir brigade=4 others=0",
+            "off_stage_member_wait member=dir brigade=4 others=3",
+        ]
+    );
 }
 
 #[test]
@@ -1413,11 +1779,19 @@ fn with_the_switch_on_a_fire_with_the_director_focused_rings_and_leaves_no_mark(
         fire_at,
     );
     assert!(rang(&cmds), "{cmds:?}");
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::QuietFocused {
+            brigade: 1,
+            director: director.clone()
+        }],
+        "the switch is on and the Director is focused"
+    );
     assert!(
         state.attention_panes().is_empty(),
         "a focused pane carries no mark"
     );
-    assert!(state.latched_attention_panes.is_empty());
+    assert!(state.latched_attention_panes.is_empty() && state.attention.is_empty());
 }
 
 #[test]
@@ -1453,7 +1827,7 @@ fn with_the_director_not_focused_the_switch_changes_nothing() {
         );
         assert_eq!(
             cmds.iter()
-                .filter(|cmd| matches!(cmd, Cmd::RingHostBell))
+                .filter(|cmd| matches!(cmd, Cmd::RingHostBell { .. }))
                 .count(),
             1,
             "switch {on}: one bell: {cmds:?}"
@@ -1632,6 +2006,608 @@ fn a_paste_into_a_pane_counts_too() {
 }
 
 #[test]
+fn the_prefix_sent_through_literally_counts_too() {
+    // Prefix, then `b`: the prefix key itself goes to the child.
+    let (mut state, mut app, a, _b, at) = typing_fixture();
+    press_with(
+        &mut state,
+        &mut app,
+        KeyCode::Char('b'),
+        Modifiers::CONTROL,
+        at,
+    );
+    let cmds = press(&mut state, &mut app, KeyCode::Char('b'), at);
+    assert!(wrote_to(&cmds, &a), "{cmds:?}");
+    back_to_the_list(&mut state, &mut app, at);
+    press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+    );
+}
+
+// --- which of the pointer's traffic counts as input ------------------------------------
+
+fn mouse(
+    state: &mut EmporiumState,
+    app: &mut App,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+    at: Instant,
+) -> Vec<Cmd> {
+    send(
+        state,
+        app,
+        Event::Input(InputEvent::Mouse(MouseEvent { kind, column, row })),
+        at,
+    )
+}
+
+/// A cell in the middle of `pane`'s tile, clear of its title row and borders.
+fn inside(state: &EmporiumState, pane: &SessionKey) -> (u16, u16) {
+    let geometry = state.geometry(Rect::new(0, 0, state.size.0, state.size.1));
+    let (_, rect) = geometry
+        .tiles
+        .iter()
+        .find(|(key, _)| key == pane)
+        .expect("the pane has a tile");
+    (rect.x + rect.width / 2, rect.y + rect.height / 2)
+}
+
+/// A cell inside the list.
+fn in_the_list(state: &EmporiumState) -> (u16, u16) {
+    let sidebar = state
+        .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+        .areas
+        .sidebar;
+    (sidebar.x + 2, sidebar.y + 2)
+}
+
+/// What a child that asked for every mouse report ends up with.
+const MOUSE_REPORTING_ON: &[u8] = b"\x1b[?1003h\x1b[?1006h";
+
+fn wrote_to(cmds: &[Cmd], pane: &SessionKey) -> bool {
+    cmds.iter()
+        .any(|cmd| matches!(cmd, Cmd::WritePty { key, .. } if key == pane))
+}
+
+/// The pointer does `kind` over the focused pane, the operator clicks the list
+/// and presses Esc a second later: whether the pane's child was written to, and
+/// what the quit key then did.
+fn quit_after_pointer(kind: MouseEventKind) -> (bool, bool, Option<String>) {
+    let (mut state, mut app, a, _b, at) = typing_fixture();
+    state.size = (120, 40);
+    said(&mut state, &mut app, &a, MOUSE_REPORTING_ON, at);
+    assert!(
+        state.screens[&a].wants_sgr_mouse(),
+        "the child asked for reports"
+    );
+    let over = inside(&state, &a);
+    let forwarded = wrote_to(&mouse(&mut state, &mut app, kind, over, at), &a);
+    let list = in_the_list(&state);
+    mouse(
+        &mut state,
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        list,
+        at,
+    );
+    assert_eq!(state.focus, Focus::Sidebar);
+    press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+    (
+        forwarded,
+        app.should_quit(),
+        state.displayed_status().map(str::to_string),
+    )
+}
+
+#[test]
+fn no_pointer_traffic_asks_the_quit_question() {
+    // Reading a pane's scrollback, hovering, clicking it to focus it or finishing
+    // a gesture neither starts nor continues a turn: the operator who then leaves
+    // quits at once. Everything here but a bare move is still written to the child
+    // (a move has no SGR form here and never was).
+    for (kind, forwarded) in [
+        (MouseEventKind::Moved, false),
+        (MouseEventKind::Down(MouseButton::Left), true),
+        (MouseEventKind::Down(MouseButton::Middle), true),
+        (MouseEventKind::Down(MouseButton::Right), true),
+        (MouseEventKind::Drag(MouseButton::Left), true),
+        (MouseEventKind::Up(MouseButton::Left), true),
+        (MouseEventKind::ScrollUp, true),
+        (MouseEventKind::ScrollDown, true),
+    ] {
+        let (written, quit, status) = quit_after_pointer(kind);
+        assert_eq!(written, forwarded, "{kind:?}");
+        assert!(quit, "{kind:?}: asked {status:?}");
+    }
+}
+
+#[test]
+fn clicking_into_a_pane_and_back_to_the_list_then_leaving_quits_at_once() {
+    // The field sequence: the operator moves between the pane and the list by
+    // clicking, both ways, with nothing working anywhere.
+    let (mut state, mut app, a, _b, at) = quit_fixture();
+    state.stage = Stage::Solo(a.clone());
+    sample(&mut state, &mut app, &[(&a, Idle), (&_b, Idle)], at);
+    state.size = (120, 40);
+    said(&mut state, &mut app, &a, MOUSE_REPORTING_ON, at);
+    let over = inside(&state, &a);
+    let cmds = mouse(
+        &mut state,
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        over,
+        at,
+    );
+    assert!(wrote_to(&cmds, &a), "the click reached the child");
+    assert_eq!(state.focus, Focus::Pane, "the click focused the pane");
+    let list = in_the_list(&state);
+    mouse(
+        &mut state,
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        list,
+        at + SECOND / 2,
+    );
+    assert_eq!(state.focus, Focus::Sidebar);
+    press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+    assert!(app.should_quit(), "asked {:?}", state.displayed_status());
+}
+
+/// The Worker's pane focused for the operator, whose child asked for mouse
+/// reports, unread mail waiting for it and both members idle. The operator does
+/// `kind` over it, if anything; then the relay ticks once a second, and this
+/// gives the second after which it first writes a nudge into the Worker.
+fn first_nudge_after(kind: Option<MouseEventKind>) -> Option<u64> {
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    state.size = (120, 40);
+    stage(&mut state, 1, &director, &[&worker]);
+    if let Stage::Brigade { focused, .. } = &mut state.stage {
+        *focused = 1;
+    }
+    state.focus = Focus::Pane;
+    said(&mut state, &mut app, &worker, MOUSE_REPORTING_ON, at);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        at,
+    );
+    if let Some(kind) = kind {
+        let over = inside(&state, &worker);
+        assert!(wrote_to(
+            &mouse(&mut state, &mut app, kind, over, at),
+            &worker
+        ));
+    }
+    (0..=RELAY_INPUT_QUIET_PERIOD.as_secs() + 5).find(|secs| {
+        let cmds = send(
+            &mut state,
+            &mut app,
+            Event::Tick {
+                relay: vec![mail_for(1, "worker-1", &worker)],
+                brigades: Vec::new(),
+            },
+            at + Duration::from_secs(*secs),
+        );
+        typed_into(&cmds, &worker)
+    })
+}
+
+#[test]
+fn every_pointer_report_forwarded_to_a_pane_still_holds_the_relays_nudge() {
+    // The relay stays out of a pane the operator is doing something in, and
+    // reading a transcript with the wheel is doing something: a nudge typed into
+    // it would land in the middle. That is unlike the quit question, which asks
+    // about work given and does not count the wheel.
+    let free = first_nudge_after(None).expect("with no input the nudge goes out");
+    assert!(free < 5, "{free}");
+    for kind in [
+        MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollDown,
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Left),
+    ] {
+        let at = first_nudge_after(Some(kind)).expect("it goes out once the quiet period ends");
+        assert!(at >= RELAY_INPUT_QUIET_PERIOD.as_secs(), "{kind:?}: {at}");
+    }
+}
+
+#[test]
+fn the_relay_and_the_quit_question_read_two_different_records_of_pointer_traffic() {
+    let (mut state, mut app, a, _b, at) = typing_fixture();
+    state.size = (120, 40);
+    said(&mut state, &mut app, &a, MOUSE_REPORTING_ON, at);
+    let over = inside(&state, &a);
+    for kind in [
+        MouseEventKind::ScrollUp,
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+    ] {
+        mouse(&mut state, &mut app, kind, over, at);
+        assert!(state.last_forwarded_input.contains_key(&a), "{kind:?}");
+        assert!(!state.last_given_input.contains_key(&a), "{kind:?}");
+        state.last_forwarded_input.clear();
+    }
+    // A key is both.
+    press(&mut state, &mut app, KeyCode::Char('x'), at);
+    assert!(state.last_forwarded_input.contains_key(&a));
+    assert!(state.last_given_input.contains_key(&a));
+}
+
+/// Brigade 1 on stage with the operator inside the Director's pane and the bell
+/// switch on, both processes only just started (nothing is known about them),
+/// the Director's child asking for mouse reports. After `act` the Director
+/// reads busy for a second and then idle for as long as the settle: whether the
+/// quiet watch was armed by that, and the brigade rang.
+fn a_freshly_started_brigade_after(
+    act: impl FnOnce(&mut EmporiumState, &mut App, &SessionKey, Instant),
+) -> bool {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let director = host_fresh(&mut state, 1, DIRECTOR_TOKEN, "dir");
+    let worker = host_fresh(&mut state, 1, "worker-1", "w1");
+    stage(&mut state, 1, &director, &[&worker]);
+    state.focus = Focus::Pane;
+    state.size = (120, 40);
+    let at = t0();
+    tick(&mut state, &mut app, at);
+    toggle_bell(&mut state, &mut app, at);
+    assert!(state.bell_when_focused());
+    said(&mut state, &mut app, &director, MOUSE_REPORTING_ON, at);
+    act(&mut state, &mut app, &director, at + SECOND);
+    let idle_from = busy_then_idle(&mut state, &mut app, &[&director, &worker], at + 2 * SECOND);
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    rang(&cmds)
+}
+
+#[test]
+fn a_pane_the_operator_only_pointed_at_was_not_given_work_so_its_first_busy_reading_arms_nothing() {
+    // The field report: after a restart the operator staged the brigade, the bell
+    // rang once shortly after the resume, and nothing was being worked on. This
+    // pins one way a process could be taken for "given work" that it was not:
+    // pointer traffic over a freshly resumed pane. What a resumed pane reports at
+    // its start is not measured, so this says nothing about whether it was the
+    // cause there.
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollDown,
+    ] {
+        let rang = a_freshly_started_brigade_after(|state, app, director, at| {
+            let over = inside(state, director);
+            mouse(state, app, kind, over, at);
+        });
+        assert!(!rang, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_pane_that_was_typed_into_was_given_work_and_its_busy_reading_arms_the_watch() {
+    assert!(a_freshly_started_brigade_after(|state, app, _, at| {
+        press(state, app, KeyCode::Char('x'), at);
+    }));
+    assert!(a_freshly_started_brigade_after(|state, app, _, at| {
+        send(
+            state,
+            app,
+            Event::Input(InputEvent::Paste("hello".to_string())),
+            at,
+        );
+    }));
+}
+
+// --- a process's start-up is not work ------------------------------------------------
+
+const MS: Duration = Duration::from_millis(1);
+
+/// A brigade resumed by Enter on its Director's row, as in the operator's trial:
+/// the Director and two Claude Workers, and a Codex Worker whose pane reports its
+/// own state. Every pane spawned at `spawned`, the bell switch on, the operator
+/// inside the Director's pane.
+struct Resumed {
+    state: EmporiumState,
+    app: App,
+    director: SessionKey,
+    codex: SessionKey,
+    claude: Vec<SessionKey>,
+    start: Instant,
+    spawned: Instant,
+}
+
+impl Resumed {
+    fn new() -> Self {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(vec![
+            row_for("dir"),
+            codex_row("cx"),
+            row_for("c1"),
+            row_for("c2"),
+        ]);
+        app.set_hidden_member_ids(["cx", "c1", "c2"].into_iter().map(str::to_string).collect());
+        app.set_viewport_height(20);
+        let start = t0();
+        tick(&mut state, &mut app, start);
+        state.focus = Focus::Sidebar;
+        let asked = press(&mut state, &mut app, KeyCode::Enter, start);
+        assert!(
+            asked.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::Store(StoreIntent::ResolveMembership { session_id }) if session_id == "dir"
+            )),
+            "{asked:?}"
+        );
+        let roster = vec![
+            (
+                DIRECTOR_TOKEN.to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            (
+                "worker-1".to_string(),
+                BrigadeRole::Worker,
+                Some("cx".to_string()),
+            ),
+            (
+                "worker-2".to_string(),
+                BrigadeRole::Worker,
+                Some("c1".to_string()),
+            ),
+            (
+                "worker-3".to_string(),
+                BrigadeRole::Worker,
+                Some("c2".to_string()),
+            ),
+        ];
+        let mut cmds = send(
+            &mut state,
+            &mut app,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, DIRECTOR_TOKEN.to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+                layout: None,
+                names: Vec::new(),
+            },
+            start,
+        );
+        // The shell reports every spawn it was asked for, 741 ms in.
+        let spawned = start + 741 * MS;
+        let mut opened = 0;
+        while let Some(cmd) = cmds.pop() {
+            if let Cmd::OpenEmbedded { key, .. } = cmd {
+                opened += 1;
+                cmds.extend(send(&mut state, &mut app, Event::Spawned { key }, spawned));
+            }
+        }
+        assert_eq!(opened, 4, "the whole brigade was opened");
+        assert_eq!(state.focus, Focus::Pane);
+        toggle_bell(&mut state, &mut app, spawned);
+        assert!(state.bell_when_focused());
+        let director = key("dir");
+        let codex = key("cx");
+        said(&mut state, &mut app, &codex, b"", spawned);
+        Self {
+            state,
+            app,
+            director,
+            codex,
+            claude: vec![key("c1"), key("c2")],
+            start,
+            spawned,
+        }
+    }
+
+    /// One sample and relay tick at `ms` after the run started. `codex` and
+    /// `claude` are what the shell read for the Codex Worker and for the Claude
+    /// panes (the Director among them) at that moment.
+    fn sample_at(&mut self, ms: u64, codex: Quiescence, claude: Quiescence) -> Vec<Cmd> {
+        let mut readings = vec![(self.codex.clone(), codex), (self.director.clone(), claude)];
+        readings.extend(self.claude.iter().map(|pane| (pane.clone(), claude)));
+        let readings: Vec<(&SessionKey, Quiescence)> =
+            readings.iter().map(|(pane, q)| (pane, *q)).collect();
+        sample(
+            &mut self.state,
+            &mut self.app,
+            &readings,
+            self.start + Duration::from_millis(ms),
+        )
+    }
+
+    fn codex_reports(&mut self, ms: u64, report: &[u8]) {
+        said(
+            &mut self.state,
+            &mut self.app,
+            &self.codex,
+            report,
+            self.start + Duration::from_millis(ms),
+        );
+    }
+}
+
+#[test]
+fn a_codex_workers_start_up_report_of_working_does_not_arm_the_watch_and_nothing_rings() {
+    // The measured sequence (offsets from the run start; the spawns at 741 ms): the
+    // Codex pane reads idle on the shell's first sample, then reports `working`
+    // by itself while it starts, then `idle`; the Claude panes were never read
+    // idle before they settled. Nobody was given anything to do.
+    let mut run = Resumed::new();
+    let mut rang_at = None;
+    let mut note = |ms: u64, cmds: Vec<Cmd>| {
+        if rang(&cmds) && rang_at.is_none() {
+            rang_at = Some(ms);
+        }
+    };
+    note(900, run.sample_at(900, Unknown, Unknown));
+    note(1053, run.sample_at(1053, Idle, Unknown));
+    run.codex_reports(2000, REPORT_WORKING);
+    note(2061, run.sample_at(2061, Idle, Unknown));
+    run.codex_reports(2136, REPORT_IDLE);
+    note(3100, run.sample_at(3100, Idle, Unknown));
+    note(4141, run.sample_at(4141, Idle, Idle));
+    for ms in (5141..=15_141).step_by(1000) {
+        note(ms, run.sample_at(ms, Idle, Idle));
+    }
+    assert_eq!(rang_at, None, "a start-up is not work");
+}
+
+#[test]
+fn the_directors_own_start_up_is_covered_like_any_members() {
+    // Read idle at 1.5 s, busy at 3 s (a start-up that took its time), idle again:
+    // inside the grace, so nothing was begun and nothing rings.
+    let mut run = Resumed::new();
+    run.sample_at(1500, Idle, Idle);
+    run.sample_at(3000, Idle, NotIdle);
+    let mut rang_at = None;
+    for ms in (4000..=14_000).step_by(1000) {
+        if rang(&run.sample_at(ms, Idle, Idle)) && rang_at.is_none() {
+            rang_at = Some(ms);
+        }
+    }
+    assert_eq!(rang_at, None);
+}
+
+#[test]
+fn the_same_working_report_after_the_grace_arms_the_watch_and_the_brigade_rings() {
+    // Not a start-up any more: the process was read idle, then does something on
+    // its own at 11 s (more than the grace after it was spawned), and goes idle
+    // again. That is the watch's ordinary case.
+    let mut run = Resumed::new();
+    run.sample_at(1053, Idle, Unknown);
+    run.sample_at(4141, Idle, Idle);
+    assert!(PROCESS_START_GRACE < 11 * SECOND);
+    run.codex_reports(11_741, REPORT_WORKING);
+    run.sample_at(11_800, Idle, Idle);
+    run.codex_reports(14_000, REPORT_IDLE);
+    let mut rang_at = None;
+    for ms in (15_000..=25_000).step_by(1000) {
+        if rang(&run.sample_at(ms, Idle, Idle)) && rang_at.is_none() {
+            rang_at = Some(ms);
+        }
+    }
+    assert!(rang_at.is_some(), "the brigade went quiet after work");
+}
+
+#[test]
+fn work_that_is_still_going_when_the_grace_ends_arms_at_the_first_reading_past_it() {
+    let mut run = Resumed::new();
+    run.sample_at(1053, Idle, Unknown);
+    run.codex_reports(2000, REPORT_WORKING);
+    run.sample_at(2061, Idle, Unknown);
+    // Still working at the first sample past the grace.
+    let past = (PROCESS_START_GRACE.as_millis() as u64) + 741;
+    run.sample_at(past, Idle, Unknown);
+    run.codex_reports(past + 500, REPORT_IDLE);
+    let mut rang_at = None;
+    for ms in (past + 1000..=past + 12_000).step_by(1000) {
+        if rang(&run.sample_at(ms, Idle, Idle)) && rang_at.is_none() {
+            rang_at = Some(ms);
+        }
+    }
+    assert!(rang_at.is_some(), "self-started work past the grace arms");
+}
+
+#[test]
+fn what_the_operator_or_banto_gave_a_process_arms_the_watch_inside_the_grace() {
+    // A key typed into the Director's pane, then it reads busy: given work, at any
+    // age.
+    let mut run = Resumed::new();
+    press(
+        &mut run.state,
+        &mut run.app,
+        KeyCode::Char('x'),
+        run.spawned + 300 * MS,
+    );
+    run.sample_at(1500, Idle, NotIdle);
+    let mut rang_at = None;
+    for ms in (2500..=12_000).step_by(1000) {
+        if rang(&run.sample_at(ms, Idle, Idle)) && rang_at.is_none() {
+            rang_at = Some(ms);
+        }
+    }
+    assert!(rang_at.is_some(), "a key arms inside the grace");
+
+    // A nudge banto typed into a Worker, which then reads busy.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    state.process_started.insert(worker.clone(), at);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        at,
+    );
+    let tick_with_mail = |state: &mut EmporiumState, app: &mut App, when: Instant| {
+        send(
+            state,
+            app,
+            Event::Tick {
+                relay: vec![mail_for(1, "worker-1", &worker)],
+                brigades: Vec::new(),
+            },
+            when,
+        )
+    };
+    tick_with_mail(&mut state, &mut app, at + SECOND);
+    let cmds = tick_with_mail(&mut state, &mut app, at + 2 * SECOND);
+    assert!(typed_into(&cmds, &worker), "the nudge went out: {cmds:?}");
+    let busy = [(&director, Idle), (&worker, NotIdle)];
+    sample(&mut state, &mut app, &busy, at + 3 * SECOND);
+    let idle = [(&director, Idle), (&worker, Idle)];
+    let mut rang_at = None;
+    for secs in 4..=14 {
+        if rang(&sample(&mut state, &mut app, &idle, at + secs * SECOND)) && rang_at.is_none() {
+            rang_at = Some(secs);
+        }
+    }
+    assert!(rang_at.is_some(), "a nudge arms inside the grace");
+}
+
+#[test]
+fn a_relaunched_pane_gets_a_new_grace() {
+    let mut run = Resumed::new();
+    run.sample_at(1053, Idle, Idle);
+    // Long after, the Worker's process is replaced under the same key.
+    let relaunched = run.start + 40 * SECOND;
+    send(
+        &mut run.state,
+        &mut run.app,
+        Event::Spawned {
+            key: run.codex.clone(),
+        },
+        relaunched,
+    );
+    said(
+        &mut run.state,
+        &mut run.app,
+        &run.codex.clone(),
+        REPORT_IDLE,
+        relaunched + 100 * MS,
+    );
+    run.sample_at(40_500, Idle, Idle);
+    run.codex_reports(41_000, REPORT_WORKING);
+    run.sample_at(41_100, Idle, Idle);
+    run.codex_reports(41_500, REPORT_IDLE);
+    let mut rang_at = None;
+    for ms in (42_000..=52_000).step_by(1000) {
+        if rang(&run.sample_at(ms, Idle, Idle)) && rang_at.is_none() {
+            rang_at = Some(ms);
+        }
+    }
+    assert_eq!(rang_at, None, "its own start-up is not work either");
+}
+
+#[test]
 fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
     let (mut state, mut app, director, worker, at) = quiet_fixture();
     sample(
@@ -1718,17 +2694,27 @@ fn recent_input_changes_neither_the_brigade_bell_nor_what_the_samples_say() {
 
 #[test]
 fn a_panes_input_record_follows_its_key_and_goes_with_the_pane() {
+    // The operator's key, with nothing banto wrote: what the quit question reads
+    // for the operator's input must follow the rename on its own.
     let (mut state, mut app, a, _b, at) = typing_fixture();
     press(&mut state, &mut app, KeyCode::Char('x'), at);
-    state.last_prompted.insert(a.clone(), at);
     let renamed = key("a-after-discovery");
     state.rekey_pane_state(&a, &renamed);
     assert!(state.took_input_recently(&renamed, at));
     assert!(!state.took_input_recently(&a, at));
+    assert!(state.was_given_work(&renamed));
+    assert!(state.last_forwarded_input.contains_key(&renamed));
+    state.unstage(&renamed);
+    assert!(!state.last_forwarded_input.contains_key(&renamed));
+    assert!(!state.last_given_input.contains_key(&renamed));
 
+    // And banto's own write.
+    let (mut state, _app, a, _b, at) = typing_fixture();
+    state.last_prompted.insert(a.clone(), at);
+    state.rekey_pane_state(&a, &renamed);
+    assert!(state.took_input_recently(&renamed, at));
     state.unstage(&renamed);
     assert!(!state.last_prompted.contains_key(&renamed));
-    assert!(!state.last_forwarded_input.contains_key(&renamed));
 }
 
 // --- the quiet stretch belongs to the members that were watched ---------------------
@@ -2150,11 +3136,11 @@ fn a_nudge_in_one_brigade_does_not_restart_the_other() {
     let cmds = sample_with_relay(&mut state, &mut app, &all_idle, mail(), deadline);
     assert!(typed_into(&cmds, &d1));
     assert!(
-        state.latched_attention_panes.contains(&d2),
+        state.attention.contains_key(&2),
         "brigade 2 went quiet on time"
     );
     assert!(
-        !state.latched_attention_panes.contains(&d1),
+        !state.attention.contains_key(&1),
         "brigade 1 was just prompted"
     );
 }
@@ -2974,7 +3960,54 @@ fn a_pane_whose_key_changes_keeps_what_its_process_had_seen() {
         ],
         at + SECOND,
     );
-    // Discovery gives the same process its real id; its next work arms.
+    // Discovery gives the same process its real id; its next work, past the
+    // start-up grace, arms.
+    let renamed = key("ca-discovered");
+    state.rekey_pane_state(&claude_a, &renamed);
+    sample(
+        &mut state,
+        &mut app,
+        &[
+            (&director, Idle),
+            (&codex, Idle),
+            (&renamed, NotIdle),
+            (&claude_b, Idle),
+        ],
+        at + 12 * SECOND,
+    );
+    let all_idle = [
+        (&director, Idle),
+        (&codex, Idle),
+        (&renamed, Idle),
+        (&claude_b, Idle),
+    ];
+    let rang_at = tick_each_second_until(
+        &mut state,
+        &mut app,
+        &all_idle,
+        at + 13 * SECOND,
+        at + 40 * SECOND,
+    );
+    assert!(rang_at.is_some());
+}
+
+#[test]
+fn a_pane_whose_key_changes_keeps_the_start_up_grace_of_its_process() {
+    // The same rename inside the grace: the process was spawned a second ago, so
+    // its work reading is still its start-up, whatever its key is called now.
+    let (mut state, mut app, members, at) = opened_brigade();
+    let [director, codex, claude_a, claude_b] = members.clone();
+    sample(
+        &mut state,
+        &mut app,
+        &[
+            (&director, Idle),
+            (&codex, Idle),
+            (&claude_a, Idle),
+            (&claude_b, Idle),
+        ],
+        at + SECOND,
+    );
     let renamed = key("ca-discovered");
     state.rekey_pane_state(&claude_a, &renamed);
     sample(
@@ -2999,50 +4032,171 @@ fn a_pane_whose_key_changes_keeps_what_its_process_had_seen() {
         &mut app,
         &all_idle,
         at + 3 * SECOND,
-        at + 30 * SECOND,
+        at + 9 * SECOND,
     );
-    assert!(rang_at.is_some());
+    assert_eq!(rang_at, None);
+}
+
+/// The Resumed brigade with the operator inside Claude Worker `c1`'s pane, every
+/// process long past its start-up and read idle.
+fn resumed_with_the_operator_in_a_worker() -> Resumed {
+    let mut run = Resumed::new();
+    if let Stage::Brigade { panes, focused, .. } = &mut run.state.stage {
+        *focused = panes.iter().position(|pane| pane.as_str() == "c1").unwrap();
+    }
+    run.sample_at(15_000, Idle, Idle);
+    run
+}
+
+/// After a not-idle reading of `c1` one second after its relaunch, everyone idle:
+/// whether the brigade rang.
+fn rang_after_the_relaunched_worker_reads_busy(run: &mut Resumed, relaunched_ms: u64) -> bool {
+    let at = |ms: u64| run.start + Duration::from_millis(ms);
+    let c1 = key("c1");
+    let busy_at = at(relaunched_ms + 1000);
+    let readings = [
+        (&run.director, Idle),
+        (&run.codex, Idle),
+        (&c1, NotIdle),
+        (&run.claude[1], Idle),
+    ];
+    sample(&mut run.state, &mut run.app, &readings, busy_at);
+    let idle = [
+        (&run.director, Idle),
+        (&run.codex, Idle),
+        (&c1, Idle),
+        (&run.claude[1], Idle),
+    ];
+    (2..=9).any(|secs| {
+        rang(&sample(
+            &mut run.state,
+            &mut run.app,
+            &idle,
+            at(relaunched_ms + 1000 + secs * 1000),
+        ))
+    })
 }
 
 #[test]
-fn input_written_before_a_process_started_is_not_work_it_was_given() {
-    let (mut state, mut app, members, at) = opened_brigade();
-    let [director, codex, claude_a, claude_b] = members.clone();
-    // The operator typed into the Worker's previous process ...
-    state.last_forwarded_input.insert(claude_a.clone(), at);
-    // ... which was then replaced; the new process started a second later.
-    unhost(&mut state, &claude_a);
-    let claude_a = host_fresh(&mut state, 1, "worker-2", "ca");
-    state.process_started.insert(claude_a.clone(), at + SECOND);
-    for secs in 2..6 {
-        sample(
-            &mut state,
-            &mut app,
-            &[
-                (&director, Idle),
-                (&codex, Idle),
-                (&claude_a, NotIdle),
-                (&claude_b, Idle),
-            ],
-            at + secs * SECOND,
-        );
-    }
-    let all_idle = [
-        (&director, Idle),
-        (&codex, Idle),
-        (&claude_a, Idle),
-        (&claude_b, Idle),
-    ];
-    assert_eq!(
-        tick_each_second_until(
-            &mut state,
-            &mut app,
-            &all_idle,
-            at + 6 * SECOND,
-            at + 60 * SECOND
-        ),
-        None,
-        "the new process's start-up does not arm"
+fn input_given_to_a_process_that_was_replaced_is_not_work_given_to_the_new_one() {
+    // A key typed into the Worker's pane; the pane exits; the member is relaunched
+    // under the same key, later. Through real events, the state a real relaunch
+    // keeps. The new process reads busy inside its start-up: not armed.
+    let mut run = resumed_with_the_operator_in_a_worker();
+    let typed = run.start + 30 * SECOND;
+    press(&mut run.state, &mut run.app, KeyCode::Char('x'), typed);
+    assert!(run.state.last_given_input.contains_key(&key("c1")));
+    let relaunched = typed + 40 * SECOND;
+    let cmds = send(
+        &mut run.state,
+        &mut run.app,
+        Event::PtyExited {
+            key: key("c1"),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        relaunched,
+    );
+    assert!(
+        cmds.iter()
+            .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { key, .. } if key.as_str() == "c1")),
+        "relaunched: {cmds:?}"
+    );
+    send(
+        &mut run.state,
+        &mut run.app,
+        Event::Spawned { key: key("c1") },
+        relaunched,
+    );
+    assert!(!run.state.was_given_work(&key("c1")));
+    assert!(
+        !rang_after_the_relaunched_worker_reads_busy(&mut run, 70_000),
+        "the old process's key is not work given to the new one"
+    );
+}
+
+#[test]
+fn a_key_in_the_same_drain_as_the_relaunch_is_not_work_given_to_the_new_process() {
+    // One drain of the event loop stamps every event with the same instant, and
+    // the exit, a key typed into the dying pane and the `Spawned` that answers the
+    // relaunch can all be in it, in that order. The key was given to the process
+    // that was already gone.
+    let mut run = resumed_with_the_operator_in_a_worker();
+    let at = run.start + 30 * SECOND;
+    send(
+        &mut run.state,
+        &mut run.app,
+        Event::PtyExited {
+            key: key("c1"),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        at,
+    );
+    press(&mut run.state, &mut run.app, KeyCode::Char('x'), at);
+    send(
+        &mut run.state,
+        &mut run.app,
+        Event::Spawned { key: key("c1") },
+        at,
+    );
+    assert!(!run.state.was_given_work(&key("c1")));
+    // The relay's own record of the operator's input is as it was: a nudge is
+    // still held back for a pane the operator was just typing into.
+    assert!(run.state.last_forwarded_input.contains_key(&key("c1")));
+    assert!(
+        !rang_after_the_relaunched_worker_reads_busy(&mut run, 30_000),
+        "its start-up reading is not armed by a key meant for the old pane"
+    );
+}
+
+#[test]
+fn what_banto_wrote_to_the_old_process_in_the_same_drain_is_not_work_given_to_the_new_one() {
+    // The same for banto's own writes: a nudge typed at the old process, and its
+    // delayed Enter written by a tick at the instant of the exit and of the new
+    // process's `Spawned`, all in one drain.
+    let mut run = resumed_with_the_operator_in_a_worker();
+    let at = run.start + 30 * SECOND;
+    let c1 = key("c1");
+    let mail = |run: &mut Resumed, when: Instant| {
+        send(
+            &mut run.state,
+            &mut run.app,
+            Event::Tick {
+                relay: vec![mail_for(1, "worker-2", &key("c1"))],
+                brigades: Vec::new(),
+            },
+            when,
+        )
+    };
+    mail(&mut run, at - 3 * SECOND);
+    let nudged = mail(&mut run, at - 2 * SECOND);
+    assert!(
+        typed_into(&nudged, &c1),
+        "the nudge went to the old process"
+    );
+    // Its delayed submitting Enter goes out in the tick at the very instant the
+    // process is replaced.
+    let submitted = mail(&mut run, at);
+    assert!(typed_into(&submitted, &c1), "and so did its Enter");
+    assert!(run.state.last_prompted.contains_key(&c1));
+    send(
+        &mut run.state,
+        &mut run.app,
+        Event::PtyExited {
+            key: c1.clone(),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        at,
+    );
+    send(
+        &mut run.state,
+        &mut run.app,
+        Event::Spawned { key: c1.clone() },
+        at,
+    );
+    assert!(!run.state.was_given_work(&c1));
+    assert!(
+        !rang_after_the_relaunched_worker_reads_busy(&mut run, 30_000),
+        "its start-up reading is not armed by banto's nudge to the old process"
     );
 }
 
@@ -3246,9 +4400,9 @@ fn unread_mail_in_another_brigade_or_for_a_member_nobody_hosts_does_not_hold_thi
         Some(idle_from + BRIGADE_QUIET_SETTLE),
         "brigade 1 on time"
     );
-    assert!(state.latched_attention_panes.contains(&d1));
+    assert!(state.attention.contains_key(&1));
     assert!(
-        !state.latched_attention_panes.contains(&d2),
+        !state.attention.contains_key(&2),
         "brigade 2 still has mail to deliver"
     );
 }
@@ -3312,7 +4466,7 @@ fn a_former_director_left_open_on_its_own_does_not_ring_for_a_brigade_that_no_lo
         idle_from + 60 * SECOND,
     );
     assert_eq!(rang_at, None, "a brigade that is gone is not quiet");
-    assert!(state.latched_attention_panes.is_empty());
+    assert!(state.latched_attention_panes.is_empty() && state.attention.is_empty());
     assert!(state.brigade_quiet.is_empty(), "its watch went with it");
 }
 
@@ -4563,9 +5717,17 @@ fn a_blocked_codex_pane_is_marked_counted_and_rung_for_once_and_clears_with_the_
     assert_eq!(row_activity(&app, "cx"), crate::model::Activity::Waiting);
     assert_eq!(
         cmds.iter()
-            .filter(|c| matches!(c, Cmd::RingHostBell))
+            .filter(|c| matches!(c, Cmd::RingHostBell { .. }))
             .count(),
         1
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::StagedPaneWait {
+            pane: pane.clone(),
+            others: 0
+        }],
+        "a pane on its own tile that reports blocked"
     );
 
     // A level: it holds while the state does, through a reload of the list ...
@@ -4637,7 +5799,7 @@ fn a_bel_and_a_blocked_report_for_the_same_pane_ring_once() {
             let cmds = said(state, app, &pane, bytes, at + secs * SECOND);
             rings += cmds
                 .iter()
-                .filter(|c| matches!(c, Cmd::RingHostBell))
+                .filter(|c| matches!(c, Cmd::RingHostBell { .. }))
                 .count();
         };
         // Codex rings BEL for the same approval it reports; 10 s apart, beyond
@@ -5944,4 +7106,1006 @@ fn the_live_word_of_a_member_never_feeds_the_quit_question_or_the_watch() {
     let (state, app, worker, _) = rowless_claude_worker(live(Waiting, false));
     assert_eq!(state.quiescence_of(&app, &worker), Idle);
     assert_eq!(state.not_idle_count(&app, t0()), 0);
+}
+
+// --- S1: an off-stage brigade speaks through its Director's row --------------------------------
+
+#[test]
+fn an_off_stage_brigades_quiet_fire_rings_and_marks_its_directors_row_and_staging_clears_it_without_a_second_ring()
+ {
+    // Through the real staging path (`MembershipResolved`): two brigades hosted,
+    // the operator on brigade 1, brigade 2 goes quiet after work.
+    let off_stage = OffStage::new(OffStageSays::QuietFire, true);
+    assert_eq!(
+        off_stage.rings_before, 1,
+        "the fire rings while the brigade is off stage"
+    );
+    assert!(
+        off_stage.app.is_waiting_id("dir2"),
+        "its Director's row is marked"
+    );
+    assert!(off_stage.app.is_filtered_waiting_id("dir2"));
+    assert_eq!(off_stage.app.filtered_waiting_count(), 1);
+    assert_eq!(off_stage.state.visible_waiting_count(), 1, "`waiting 1`");
+
+    // Staging it reaches the Director's pane: the mark is over, and nothing
+    // rings again, with the window focused (F4 off or on).
+    for f4 in [false, true] {
+        let mut staged = OffStage::new(OffStageSays::QuietFire, true);
+        let cmds = staged.stage_by_enter(true, f4);
+        staged.assert_focus_landed_on_the_director();
+        assert_eq!(rings(&cmds), 0, "f4 {f4}: no second ring");
+        assert!(!staged.app.is_waiting_id("dir2"), "f4 {f4}: mark ended");
+        assert_eq!(staged.app.filtered_waiting_count(), 0);
+        assert_eq!(staged.state.visible_waiting_count(), 0);
+        for secs in [1, 30] {
+            assert_eq!(rings(&staged.tick_after_staging(secs)), 0, "+{secs}s");
+        }
+    }
+}
+
+#[test]
+fn a_fire_rings_while_the_operator_is_working_in_another_brigade() {
+    for says in [
+        OffStageSays::QuietFire,
+        OffStageSays::ClaudeWaiting,
+        OffStageSays::Bell,
+    ] {
+        let off_stage = OffStage::new_with(says, matches!(says, OffStageSays::QuietFire), true);
+        assert_eq!(effective_focused_pane(&off_stage.state), Some(key("dir")));
+        assert_eq!(off_stage.rings_before, 1, "{says:?}");
+        assert!(off_stage.app.is_waiting_id("dir2"), "{says:?}");
+        assert_eq!(off_stage.state.visible_waiting_count(), 1, "{says:?}");
+    }
+}
+
+#[test]
+fn an_off_stage_member_waiting_on_a_dialog_neither_marks_nor_rings() {
+    let off_stage = OffStage::new(OffStageSays::ClaudeDialog, false);
+    assert_eq!(off_stage.rings_before, 0);
+    assert!(!off_stage.app.is_waiting_id("dir2"));
+    assert_eq!(off_stage.state.visible_waiting_count(), 0);
+}
+
+#[test]
+fn a_staged_brigades_waiting_member_does_not_also_mark_its_directors_row() {
+    // Its tiles speak for it, and marking the row too would count one waiting
+    // Worker twice.
+    let (mut state, mut app, _director, _worker, at) = quiet_fixture();
+    let mut rows = vec![row_for("dir"), row_for("w1")];
+    rows[1].activity = crate::model::Activity::Waiting;
+    app.replace_rows(rows);
+    app.set_hidden_member_ids(["w1".to_string()].into_iter().collect());
+    app.set_viewport_height(20);
+    tick(&mut state, &mut app, at + SECOND);
+    assert!(
+        !app.is_waiting_id("dir"),
+        "the Director's row is not marked"
+    );
+    assert!(app.is_waiting_id("w1"));
+    assert_eq!(
+        state.visible_waiting_count(),
+        1,
+        "counted once, as its tile"
+    );
+}
+
+#[test]
+fn a_hidden_directors_row_does_not_silence_the_bell() {
+    // A search that hides the Director's row takes it out of the list's own
+    // Waiting sets; the ring is the mark's, not the list's.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![row_for("dir2"), row_for("w2")]);
+    app.set_hidden_member_ids(["w2".to_string()].into_iter().collect());
+    app.set_viewport_height(20);
+    app.enter_search();
+    for c in "zzzz".chars() {
+        app.push_char(c);
+    }
+    assert_eq!(app.filtered_len(), 0, "the row is filtered out");
+    let d2 = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
+    let w2 = host(&mut state, 2, "worker-1", "w2");
+    let at = t0();
+    let working = [(&d2, NotIdle), (&w2, Idle)];
+    let idle = [(&d2, Idle), (&w2, Idle)];
+    sample(&mut state, &mut app, &working, at);
+    sample(&mut state, &mut app, &idle, at + SECOND);
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &idle,
+        at + SECOND + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(rang(&cmds), "{cmds:?}");
+    assert!(app.has_brigade_mark("dir2"));
+}
+
+// --- the mark is display only ---------------------------------------------------------------
+
+/// Brigade 1 staged, the list focused, with rows for both members, and a quiet
+/// fire that has marked the Director's row (not yet looked at).
+fn marked_fixture() -> (EmporiumState, App, SessionKey, SessionKey, Instant) {
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![row_for("dir"), row_for("w1")]);
+    app.set_hidden_member_ids(["w1".to_string()].into_iter().collect());
+    app.set_viewport_height(20);
+    let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
+    let fired_at = idle_from + BRIGADE_QUIET_SETTLE;
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        fired_at,
+    );
+    assert!(rang(&cmds), "it fired");
+    assert!(app.has_brigade_mark("dir"), "and its row is marked");
+    (state, app, director, worker, fired_at)
+}
+
+#[test]
+fn a_marked_directors_row_does_not_make_its_brigade_not_idle_for_the_quit_question() {
+    for code in [KeyCode::Esc, KeyCode::Char('q')] {
+        let (mut state, mut app, director, _worker, fired_at) = marked_fixture();
+        assert_eq!(state.quiescence_of(&app, &director), Idle);
+        assert_eq!(state.not_idle_count(&app, fired_at + SECOND), 0);
+        press(&mut state, &mut app, code, fired_at + SECOND);
+        assert!(
+            app.should_quit(),
+            "{code:?}: one press quits an idle brigade whose row is marked"
+        );
+    }
+}
+
+#[test]
+fn a_marked_directors_row_neither_holds_nor_rearms_its_own_watch() {
+    let (mut state, mut app, director, worker, fired_at) = marked_fixture();
+    let all_idle = [(&director, Idle), (&worker, Idle)];
+    // Spent by the fire: a marked row does not re-arm it, however long it stays.
+    assert!(!state.brigade_quiet[&1].active);
+    for secs in 1..60 {
+        let cmds = sample(&mut state, &mut app, &all_idle, fired_at + secs * SECOND);
+        assert!(!rang(&cmds), "at +{secs}s: {cmds:?}");
+    }
+    assert!(!state.brigade_quiet[&1].active);
+    assert!(app.has_brigade_mark("dir"), "still not looked at");
+
+    // And it does not hold it: work, then quiet, fires as it would without a mark.
+    let again = fired_at + 70 * SECOND;
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, NotIdle)],
+        again,
+    );
+    assert!(state.brigade_quiet[&1].active, "armed by the work");
+    sample(&mut state, &mut app, &all_idle, again + SECOND);
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &all_idle,
+        again + SECOND + BRIGADE_QUIET_SETTLE,
+    );
+    assert!(
+        !state.brigade_quiet[&1].active,
+        "fired again, with the old mark standing"
+    );
+    assert!(
+        !rang(&cmds),
+        "a second fire under a standing mark is silent: {cmds:?}"
+    );
+}
+
+#[test]
+fn a_marked_directors_row_does_not_change_what_the_relay_decides() {
+    // The same brigade, once with a standing mark and once without, given the
+    // same unread mail: the same nudge goes out.
+    let nudges = |marked: bool| {
+        let (mut state, mut app, director, worker, at) = if marked {
+            marked_fixture()
+        } else {
+            let (state, app, director, worker, at) = quiet_fixture();
+            (state, app, director, worker, at + 40 * SECOND)
+        };
+        let observation = || RelayObservation {
+            live: None,
+            glance: None,
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+            agent: None,
+        };
+        let idle = [(&director, Idle), (&worker, Idle)];
+        let mut written = Vec::new();
+        for secs in 20..30 {
+            let cmds = sample_with_relay(
+                &mut state,
+                &mut app,
+                &idle,
+                vec![observation()],
+                at + secs * SECOND,
+            );
+            written.extend(
+                cmds.into_iter()
+                    .filter(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            );
+        }
+        written
+    };
+    let with_mark = nudges(true);
+    let without = nudges(false);
+    assert!(!with_mark.is_empty(), "a nudge went out");
+    assert_eq!(with_mark, without);
+}
+
+#[test]
+fn a_marked_directors_word_on_its_tile_stays_its_own_state() {
+    // The mark is colour and a dot, never the session's state: what the tile's
+    // title and the summary say is read from the row's own activity.
+    for says in [OffStageSays::QuietFire, OffStageSays::ClaudeWaiting] {
+        let off_stage = OffStage::new(says, matches!(says, OffStageSays::QuietFire));
+        assert!(off_stage.app.is_waiting_id("dir2"), "{says:?}: marked");
+        let row = off_stage.app.row_for_id("dir2").unwrap();
+        assert_eq!(
+            row.activity,
+            crate::model::Activity::Alive,
+            "{says:?}: the row's own state"
+        );
+        assert_eq!(
+            off_stage
+                .state
+                .displayed_activity(&off_stage.app, &off_stage.d2),
+            Some(crate::model::Activity::Alive),
+            "{says:?}: the word the tile shows"
+        );
+    }
+}
+
+// --- one event, one ring ------------------------------------------------------------------
+
+#[test]
+fn an_off_stage_members_wait_rings_once_across_the_event_and_staging_and_the_mark_moves_to_its_tile()
+ {
+    for says in [
+        OffStageSays::Bell,
+        OffStageSays::ClaudeWaiting,
+        OffStageSays::CodexBlocked,
+    ] {
+        for window_focused in [true, false] {
+            for f4 in [false, true] {
+                let what = format!("{says:?}, window focused {window_focused}, f4 {f4}");
+                let mut off_stage = OffStage::new(says, false);
+                let staged = off_stage.stage_by_enter(window_focused, f4);
+                off_stage.assert_focus_landed_on_the_director();
+                assert_eq!(
+                    off_stage.rings_before + rings(&staged),
+                    1,
+                    "{what}: one ring for the event, through the row, none at staging"
+                );
+                assert_eq!(off_stage.marks(), ["w2"], "{what}: the mark is on the tile");
+                // A BEL's mark is not a Waiting row, so it is not counted.
+                let counted = usize::from(!matches!(says, OffStageSays::Bell));
+                assert_eq!(off_stage.state.visible_waiting_count(), counted, "{what}");
+                for secs in [1, 30] {
+                    assert_eq!(rings(&off_stage.tick_after_staging(secs)), 0, "{what}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_new_wait_after_staging_rings_as_before() {
+    use crate::model::Activity;
+    // A BEL: seen (the focus goes to the Worker's tile, F3), then a second BEL
+    // is a new wait and rings.
+    let mut off_stage = OffStage::new(OffStageSays::Bell, false);
+    off_stage.stage_by_enter(true, false);
+    let at = off_stage.staged_at() + 40 * SECOND;
+    press(&mut off_stage.state, &mut off_stage.app, KeyCode::F(3), at);
+    assert!(off_stage.marks().is_empty(), "seen, so cleared");
+    // Back on the Director's tile, then the Worker's child rings again.
+    press(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        KeyCode::F(3),
+        at + SECOND,
+    );
+    let w2 = off_stage.w2.clone();
+    let cmds = said(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        &w2,
+        b"\x07",
+        at + 10 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 1, "a new wait rings: {cmds:?}");
+
+    // A waiting session: the wait ends, then another begins after staging.
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeWaiting, false);
+    off_stage.stage_by_enter(true, false);
+    let set_w2 = |off_stage: &mut OffStage, activity: Activity| {
+        let rows: Vec<_> = ["dir", "w1", "dir2", "w2"]
+            .iter()
+            .map(|id| {
+                let mut row = row_for(id);
+                if *id == "w2" {
+                    row.activity = activity;
+                }
+                row
+            })
+            .collect();
+        off_stage.app.replace_rows(rows);
+    };
+    set_w2(&mut off_stage, Activity::Alive);
+    tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        off_stage.at + 70 * SECOND,
+    );
+    set_w2(&mut off_stage, Activity::Waiting);
+    let cmds = tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        off_stage.at + 80 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 1, "the second wait is new: {cmds:?}");
+}
+
+#[test]
+fn a_member_never_announced_through_the_row_still_rings_when_its_wait_becomes_real_after_staging() {
+    use crate::model::Activity;
+    // Off stage it is waiting only on a dialog the operator opened: not marked,
+    // not rung for.
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeDialog, false);
+    assert_eq!(off_stage.rings_before, 0);
+    let staged = off_stage.stage_by_enter(true, false);
+    assert_eq!(
+        rings(&staged),
+        0,
+        "a dialog does not ring at staging either"
+    );
+    // The reason changes to a real wait: it rings now, as it always did.
+    let rows: Vec<_> = ["dir", "w1", "dir2", "w2"]
+        .iter()
+        .map(|id| {
+            let mut row = row_for(id);
+            if *id == "w2" {
+                row.activity = Activity::Waiting;
+            }
+            row
+        })
+        .collect();
+    off_stage.app.replace_rows(rows);
+    let cmds = tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        off_stage.at + 80 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 1, "{cmds:?}");
+}
+
+// --- a pane that is on stage speaks through its own tile --------------------------------------
+
+#[test]
+fn a_waiting_worker_whose_tile_is_soloed_is_counted_once_and_does_not_mark_its_directors_row() {
+    // The tile's solo button (prefix `z`) is a layout preference inside the staged
+    // brigade: every pane stays staged, so the rule that a pane on stage speaks
+    // through its own tile is what keeps this at one. (No real path puts a hidden
+    // Worker in `Stage::Solo`: that comes from opening a session on its own, which
+    // a brigade member's hidden row cannot be, and from a disband, which leaves
+    // the Director.)
+    let (mut state, mut app, _director, _worker, at) = quiet_fixture();
+    let mut rows = vec![row_for("dir"), row_for("w1")];
+    rows[1].activity = crate::model::Activity::Waiting;
+    app.replace_rows(rows);
+    app.set_hidden_member_ids(["w1".to_string()].into_iter().collect());
+    app.set_viewport_height(20);
+    state.focus = Focus::Pane;
+    press(&mut state, &mut app, KeyCode::F(3), at + SECOND);
+    state.prefix_armed = Some(at + 2 * SECOND);
+    press(&mut state, &mut app, KeyCode::Char('z'), at + 2 * SECOND);
+    assert_eq!(
+        state.brigade_layouts[&1].solo_member.as_deref(),
+        Some("worker-1"),
+        "the Worker's tile is soloed"
+    );
+    assert!(
+        matches!(&state.stage, Stage::Brigade { id: 1, .. }),
+        "still staged"
+    );
+    tick(&mut state, &mut app, at + 3 * SECOND);
+    assert!(app.is_waiting_id("w1"), "its own tile is marked");
+    assert!(
+        !app.is_waiting_id("dir"),
+        "not also through the Director's row"
+    );
+    assert_eq!(state.visible_waiting_count(), 1, "`waiting 1`, not 2");
+}
+
+#[test]
+fn taking_the_brigade_off_stage_again_marks_its_row_for_a_standing_wait_without_a_new_ring() {
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeWaiting, false);
+    off_stage.stage_by_enter(true, false);
+    assert!(
+        !off_stage.app.is_waiting_id("dir2"),
+        "on stage: the tile speaks"
+    );
+    // Off stage again — the operator opens a plain session on its own, as Enter on
+    // its row does — with the Worker still waiting: the row speaks again, quietly,
+    // because it is the same wait, already announced.
+    let mut rows = vec![
+        row_for("dir"),
+        row_for("w1"),
+        row_for("dir2"),
+        row_for("w2"),
+    ];
+    rows[3].activity = crate::model::Activity::Waiting;
+    off_stage.app.replace_rows(rows);
+    let later = off_stage.at + 90 * SECOND;
+    let cmds = open_a_plain_session_solo(&mut off_stage, later, "w2");
+    assert!(off_stage.app.is_waiting_id("dir2"));
+    assert_eq!(rings(&cmds), 0, "{cmds:?}");
+}
+
+// --- review fixes: one event, one ring, per event --------------------------------------------
+
+/// Leave brigade 1 (hosted, off stage from now on) by opening a plain session
+/// solo, the way Enter on its row does: the shell's `MembershipResolved` finds
+/// no brigade, `open_solo` asks for a spawn, the spawn lands.
+fn open_a_plain_session_solo(off_stage: &mut OffStage, at: Instant, waiting: &str) -> Vec<Cmd> {
+    let mut rows = vec![
+        row_for("dir"),
+        row_for("w1"),
+        row_for("dir2"),
+        row_for("w2"),
+    ];
+    // The Worker the test is about is still waiting.
+    for row in rows.iter_mut().filter(|row| row.id == waiting) {
+        row.activity = crate::model::Activity::Waiting;
+    }
+    rows.push(row_for("plain"));
+    off_stage.app.replace_rows(rows);
+    off_stage.state.pending_membership = Some(PendingMembership::Activate);
+    let mut cmds = send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::MembershipResolved {
+            session_id: "plain".to_string(),
+            membership: None,
+            members: None,
+            layout: None,
+            names: Vec::new(),
+        },
+        at,
+    );
+    let opened: Vec<SessionKey> = cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            Cmd::OpenEmbedded { key, .. } => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened, [key("plain")], "{cmds:?}");
+    cmds.extend(send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::Spawned { key: key("plain") },
+        at,
+    ));
+    assert!(matches!(&off_stage.state.stage, Stage::Solo(solo) if *solo == key("plain")));
+    cmds
+}
+
+#[test]
+fn a_wait_that_began_on_stage_does_not_ring_again_when_its_brigade_leaves_the_stage() {
+    // R1. Brigade 1 is on stage and its Worker starts waiting: it rings on its
+    // own tile. Then the operator stages brigade 2 (Enter on its Director's row),
+    // or opens a plain session solo: brigade 1 is off stage with the wait still
+    // standing, and its Director's row now speaks for it — without a second ring.
+    for f4 in [false, true] {
+        let mut off_stage = OffStage::new(OffStageSays::OnStageWait, false);
+        assert_eq!(off_stage.rings_before, 1, "it rang on its own tile");
+        off_stage.assert_it_rang_once_for_its_cause("on its own tile");
+        assert!(
+            !off_stage.app.is_waiting_id("dir"),
+            "on stage: the tile speaks"
+        );
+        let staged = off_stage.stage_by_enter(true, f4);
+        assert_eq!(rings(&staged), 0, "f4 {f4}: staging another brigade");
+        assert!(
+            off_stage.app.is_waiting_id("dir"),
+            "brigade 1 is off stage: its Director's row speaks"
+        );
+        for secs in [1, 30] {
+            assert_eq!(rings(&off_stage.tick_after_staging(secs)), 0, "+{secs}s");
+        }
+    }
+    let mut off_stage = OffStage::new(OffStageSays::OnStageWait, false);
+    let at = off_stage.staged_at();
+    let cmds = open_a_plain_session_solo(&mut off_stage, at, "w1");
+    assert_eq!(rings(&cmds), 0, "opening a session solo");
+    assert!(off_stage.app.is_waiting_id("dir"));
+    assert_eq!(rings(&off_stage.tick_after_staging(5)), 0);
+}
+
+#[test]
+fn a_director_pane_that_is_renamed_keeps_its_mark_without_ringing_again() {
+    // R2. An off-stage brigade fires and rings once. Its Director's session forks
+    // (compaction) or is discovered: its pane and its row change key, and the next
+    // tick must not take the mark for a new one.
+    let mut off_stage = OffStage::new(OffStageSays::QuietFire, true);
+    assert_eq!(off_stage.rings_before, 1);
+    let at = off_stage.at + 30 * SECOND;
+    let mut rung = 0;
+    rung += rings(&send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::MemberSessionForked {
+            brigade_id: 2,
+            token: DIRECTOR_TOKEN.to_string(),
+            old_id: "dir2".to_string(),
+            new_id: "dir2b".to_string(),
+        },
+        at,
+    ));
+    rung += rings(&send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::RowsLoaded {
+            rows: vec![
+                row_for("dir"),
+                row_for("w1"),
+                row_for("dir2b"),
+                row_for("w2"),
+            ],
+            hidden: ["dir", "w1", "w2"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            directors: ["dir", "dir2b"].into_iter().map(str::to_string).collect(),
+            superseded: Default::default(),
+        },
+        at,
+    ));
+    assert_eq!(rung, 0, "the rename is not a new event");
+    assert!(
+        off_stage.app.is_waiting_id("dir2b"),
+        "the mark followed the row"
+    );
+    for secs in [1, 2, 10] {
+        let cmds = tick(&mut off_stage.state, &mut off_stage.app, at + secs * SECOND);
+        assert_eq!(rings(&cmds), 0, "+{secs}s: {cmds:?}");
+    }
+    assert!(off_stage.app.is_waiting_id("dir2b"));
+}
+
+#[test]
+fn a_members_wait_rings_when_it_is_announced_even_while_the_row_is_already_marked() {
+    // R3. The brigade went quiet (row marked, rang). Later a Worker of it starts
+    // waiting: that is another event and rings, though the row was already marked.
+    let mut off_stage = OffStage::new(OffStageSays::QuietFire, true);
+    assert_eq!(off_stage.rings_before, 1);
+    let mut rows = vec![
+        row_for("dir"),
+        row_for("w1"),
+        row_for("dir2"),
+        row_for("w2"),
+    ];
+    rows[3].activity = crate::model::Activity::Waiting;
+    off_stage.app.replace_rows(rows);
+    let cmds = tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        off_stage.at + 60 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 1, "{cmds:?}");
+    // Still the one wait: no more rings while it stands.
+    let cmds = tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        off_stage.at + 70 * SECOND,
+    );
+    assert_eq!(rings(&cmds), 0, "{cmds:?}");
+    // A second quiet fire under a standing mark stays silent.
+    assert!(off_stage.app.is_waiting_id("dir2"));
+}
+
+#[test]
+fn a_hosted_member_that_is_not_on_the_stage_does_not_make_staging_ring_for_its_directors_mark() {
+    // A member that is hosted but not among the staged brigade's panes speaks
+    // through its Director's row; staging the brigade puts the Director's tile
+    // under the same mark, and that is not a new event.
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeDialog, false);
+    let w3 = host(&mut off_stage.state, 2, "worker-2", "w3");
+    assert_ne!(w3, off_stage.w2);
+    let mut rows = vec![
+        row_for("dir"),
+        row_for("w1"),
+        row_for("dir2"),
+        row_for("w2"),
+    ];
+    let mut third = row_for("w3");
+    third.activity = crate::model::Activity::Waiting;
+    rows.push(third);
+    off_stage.app.replace_rows(rows);
+    off_stage.app.set_hidden_member_ids(
+        ["dir", "w1", "w2", "w3"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    let announced = tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        off_stage.at + 10 * SECOND,
+    );
+    assert_eq!(
+        rings(&announced),
+        1,
+        "its wait is announced through the row"
+    );
+    // The roster the store lists has no w3, so it is not among the panes.
+    let staged = off_stage.stage_by_enter(true, false);
+    off_stage.assert_focus_landed_on_the_director();
+    assert!(
+        !matches!(&off_stage.state.stage, Stage::Brigade { panes, .. } if panes.contains(&w3)),
+        "w3 is hosted but not staged"
+    );
+    assert_eq!(
+        off_stage.marks(),
+        ["dir2"],
+        "the Director's tile carries the mark"
+    );
+    assert_eq!(rings(&staged), 0, "and that is not a second event");
+}
+
+// --- a Goinkyo that ends or is replaced leaves nothing of itself on the next one --------------
+
+fn glance_line(line: &str) -> crate::model::MessageGlance {
+    crate::model::MessageGlance {
+        created_at_ms: 1,
+        line: line.to_string(),
+        from_token: Some(GOINKYO_TOKEN.to_string()),
+    }
+}
+
+fn facts_of_goinkyo(state: &EmporiumState) -> Option<&MemberFacts> {
+    state.member_facts.get(&(1, GOINKYO_TOKEN.to_string()))
+}
+
+#[test]
+fn a_goinkyos_glance_lines_do_not_outlive_its_consultation() {
+    // Observed with lines while it lives.
+    let (mut state, mut app, ..) = quiet_fixture();
+    let g = host(&mut state, 1, GOINKYO_TOKEN, "g1");
+    let line = glance_line("a verdict");
+    let observation = RelayObservation {
+        live: None,
+        glance: Some(MemberGlance {
+            inbound: None,
+            sent: Some(line),
+        }),
+        brigade_id: 1,
+        token: GOINKYO_TOKEN.to_string(),
+        key: g.clone(),
+        has_unseen: false,
+        is_idle_this_tick: Some(true),
+        agent: None,
+    };
+    let at = t0();
+    let brigades = listed(&state);
+    send(
+        &mut state,
+        &mut app,
+        Event::Tick {
+            relay: vec![observation],
+            brigades,
+        },
+        at,
+    );
+    assert!(
+        facts_of_goinkyo(&state).is_some_and(|facts| facts.sent.is_some()),
+        "its sent line is shown while it lives"
+    );
+
+    // The consultation ends: the next gather finds no Goinkyo row.
+    send(
+        &mut state,
+        &mut app,
+        Event::GoinkyoAwaitingSpawn {
+            observation: GoinkyoObservation::NoGoinkyo { brigade_id: 1 },
+        },
+        at + SECOND,
+    );
+    assert!(
+        facts_of_goinkyo(&state).is_none(),
+        "its lines are gone with it: a new Goinkyo under the token starts empty"
+    );
+}
+
+#[test]
+fn a_new_goinkyo_hosted_before_it_has_a_session_starts_with_no_facts_even_if_the_end_was_never_seen()
+ {
+    // Dismiss and consult again inside one tick: the gather never sees a
+    // row-less moment, so no `NoGoinkyo`; the new consultation's spawn must clear
+    // what the old one left.
+    let (mut state, ..) = quiet_fixture();
+    state.member_facts.insert(
+        (1, GOINKYO_TOKEN.to_string()),
+        MemberFacts {
+            sent: Some(glance_line("old line")),
+            ..Default::default()
+        },
+    );
+    let cmds = update_goinkyo_awaiting_spawn(
+        &mut state,
+        &BrigadeConfig::default(),
+        GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+            brigade_id: 1,
+            cwd: std::path::PathBuf::from("/work"),
+            roster: Vec::new(),
+        }),
+        t0(),
+    );
+    assert!(
+        cmds.iter()
+            .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
+        "{cmds:?}"
+    );
+    assert!(facts_of_goinkyo(&state).is_none());
+}
+
+#[test]
+fn a_members_pane_that_is_renamed_keeps_its_announcement_and_does_not_ring_again() {
+    // The same one-event rule for a member: an off-stage Worker's wait rang
+    // through its Director's row; its session forks, its pane and row change key.
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeWaiting, false);
+    assert_eq!(off_stage.rings_before, 1);
+    let at = off_stage.at + 30 * SECOND;
+    let mut rung = rings(&send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::MemberSessionForked {
+            brigade_id: 2,
+            token: "worker-1".to_string(),
+            old_id: "w2".to_string(),
+            new_id: "w2b".to_string(),
+        },
+        at,
+    ));
+    let mut renamed = row_for("w2b");
+    renamed.activity = crate::model::Activity::Waiting;
+    rung += rings(&send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::RowsLoaded {
+            rows: vec![row_for("dir"), row_for("w1"), row_for("dir2"), renamed],
+            hidden: ["dir", "w1", "w2b"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            directors: ["dir", "dir2"].into_iter().map(str::to_string).collect(),
+            superseded: Default::default(),
+        },
+        at,
+    ));
+    rung += rings(&tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        at + 5 * SECOND,
+    ));
+    assert_eq!(rung, 0, "the same wait under a new key is not a new wait");
+    assert!(off_stage.app.is_waiting_id("dir2"));
+}
+
+#[test]
+fn a_wait_shown_on_its_tile_keeps_its_announcement_when_its_pane_is_renamed_on_stage() {
+    // Brigade 1's Worker waits on stage (rang on its own tile), its session forks
+    // and its pane and row change key, and then the brigade leaves the stage:
+    // still the one wait, still no second ring.
+    let mut off_stage = OffStage::new(OffStageSays::OnStageWait, false);
+    assert_eq!(off_stage.rings_before, 1);
+    let at = off_stage.at + 10 * SECOND;
+    let mut renamed = row_for("w1b");
+    renamed.activity = crate::model::Activity::Waiting;
+    // (While the row still carries the old id the staged pane's wait reads as
+    // gone and then back, so its own tile rings once more: that is the staged
+    // pane's edge as it always was, and not what this test is about.)
+    send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::MemberSessionForked {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            old_id: "w1".to_string(),
+            new_id: "w1b".to_string(),
+        },
+        at,
+    );
+    send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::RowsLoaded {
+            rows: vec![row_for("dir"), renamed, row_for("dir2"), row_for("w2")],
+            hidden: ["dir", "w1b", "w2"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            directors: ["dir", "dir2"].into_iter().map(str::to_string).collect(),
+            superseded: Default::default(),
+        },
+        at,
+    );
+    let mut rung = rings(&off_stage.stage_by_enter(true, false));
+    rung += rings(&off_stage.tick_after_staging(5));
+    assert_eq!(rung, 0, "no second ring after the rename and the move");
+    assert!(
+        off_stage.app.is_waiting_id("dir"),
+        "brigade 1's row speaks now"
+    );
+}
+
+// --- an announcement ends with its pane and with its latch --------------------------------------
+
+/// An off-stage brigade (2) with one more hosted member, `w3` (`worker-2`), that
+/// has no list row and no live information: nothing is known about it but what
+/// its child says.
+fn off_stage_with_an_unknown_member() -> (OffStage, SessionKey) {
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeDialog, false);
+    let w3 = host(&mut off_stage.state, 2, "worker-2", "w3");
+    (off_stage, w3)
+}
+
+fn pane_exits(off_stage: &mut OffStage, pane: &SessionKey, at: Instant) {
+    send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::PtyExited {
+            key: pane.clone(),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        at,
+    );
+}
+
+#[test]
+fn an_announcement_does_not_outlive_its_pane() {
+    // N1 a: a waiting member that was announced, whose pane then exits, leaves
+    // nothing behind in the sets for the rest of the run.
+    let mut off_stage = OffStage::new(OffStageSays::ClaudeWaiting, false);
+    let w2 = off_stage.w2.clone();
+    assert_eq!(off_stage.rings_before, 1);
+    assert!(off_stage.state.row_announced_waits.contains(&w2));
+    let later = off_stage.at + 20 * SECOND;
+    pane_exits(&mut off_stage, &w2, later);
+    assert!(
+        !off_stage.state.row_announced_waits.contains(&w2),
+        "{:?}",
+        off_stage.state.row_announced_waits
+    );
+    assert!(!off_stage.state.tile_announced_waits.contains(&w2));
+
+    // The same for a wait that stood on its own tile.
+    let mut off_stage = OffStage::new(OffStageSays::OnStageWait, false);
+    let w1 = key("w1");
+    assert!(off_stage.state.tile_announced_waits.contains(&w1));
+    let later = off_stage.at + 20 * SECOND;
+    pane_exits(&mut off_stage, &w1, later);
+    assert!(!off_stage.state.tile_announced_waits.contains(&w1));
+}
+
+#[test]
+fn a_new_pane_under_a_key_that_was_announced_rings_for_its_own_wait() {
+    // N1 b1: a hosted member nothing is known about rings a BEL (one ring); its
+    // pane dies and another is hosted under the same key, and its BEL is a new
+    // event.
+    let (mut off_stage, w3) = off_stage_with_an_unknown_member();
+    let at = off_stage.at + 10 * SECOND;
+    let first = said(&mut off_stage.state, &mut off_stage.app, &w3, b"\x07", at);
+    assert_eq!(rings(&first), 1, "{first:?}");
+    pane_exits(&mut off_stage, &w3, at + 5 * SECOND);
+    let again = host(&mut off_stage.state, 2, "worker-2", "w3");
+    assert_eq!(again, w3);
+    let second = said(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        &w3,
+        b"\x07",
+        at + 20 * SECOND,
+    );
+    assert_eq!(
+        rings(&second),
+        1,
+        "a new pane's BEL is a new event: {second:?}"
+    );
+}
+
+#[test]
+fn a_bell_rings_again_after_the_operator_has_looked_at_it_and_left() {
+    // N1 b2: BEL (one ring); the operator stages the brigade and focuses the
+    // member's tile, which clears the latch; he leaves for another session; a
+    // second BEL is a new event even though nothing is known about the member's
+    // activity.
+    let (mut off_stage, w3) = off_stage_with_an_unknown_member();
+    let at = off_stage.at + 10 * SECOND;
+    let first = said(&mut off_stage.state, &mut off_stage.app, &w3, b"\x07", at);
+    assert_eq!(rings(&first), 1, "{first:?}");
+
+    let roster = vec![
+        (
+            DIRECTOR_TOKEN.to_string(),
+            BrigadeRole::Director,
+            Some("dir2".to_string()),
+        ),
+        (
+            "worker-1".to_string(),
+            BrigadeRole::Worker,
+            Some("w2".to_string()),
+        ),
+        (
+            "worker-2".to_string(),
+            BrigadeRole::Worker,
+            Some("w3".to_string()),
+        ),
+    ];
+    off_stage.stage_with_roster(true, false, roster);
+    // Focus the member's tile (F3 steps through them).
+    let mut t = off_stage.staged_at();
+    for _ in 0..3 {
+        if effective_focused_pane(&off_stage.state).as_ref() == Some(&w3) {
+            break;
+        }
+        t += SECOND;
+        press(&mut off_stage.state, &mut off_stage.app, KeyCode::F(3), t);
+    }
+    assert_eq!(
+        effective_focused_pane(&off_stage.state),
+        Some(w3.clone()),
+        "its tile is focused, so its latch is cleared"
+    );
+    assert!(!off_stage.state.latched_attention_panes.contains(&w3));
+
+    // He leaves: a plain session takes the stage and brigade 2 is off stage.
+    open_a_plain_session_solo(&mut off_stage, t + 10 * SECOND, "none");
+    let second = said(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        &w3,
+        b"\x07",
+        t + 40 * SECOND,
+    );
+    assert_eq!(rings(&second), 1, "a second BEL is a new event: {second:?}");
+}
+
+#[test]
+fn a_bell_latched_member_renamed_keeps_its_latch_and_its_announcement() {
+    // The rename window: the pane is renamed before its row exists. A latch is
+    // carried by the rename, so the wait still stands, still announced, and the
+    // row catching up (there is no row to catch up here) changes nothing.
+    let (mut off_stage, w3) = off_stage_with_an_unknown_member();
+    let at = off_stage.at + 10 * SECOND;
+    let first = said(&mut off_stage.state, &mut off_stage.app, &w3, b"\x07", at);
+    assert_eq!(rings(&first), 1);
+    let mut rung = rings(&send(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        Event::MemberSessionForked {
+            brigade_id: 2,
+            token: "worker-2".to_string(),
+            old_id: "w3".to_string(),
+            new_id: "w3b".to_string(),
+        },
+        at + 5 * SECOND,
+    ));
+    rung += rings(&tick(
+        &mut off_stage.state,
+        &mut off_stage.app,
+        at + 10 * SECOND,
+    ));
+    assert_eq!(rung, 0, "the same BEL under a new key is not a new event");
+    let renamed = key("w3b");
+    assert!(off_stage.state.latched_attention_panes.contains(&renamed));
+    assert!(off_stage.state.row_announced_waits.contains(&renamed));
 }

@@ -868,6 +868,12 @@ impl Store {
     /// *the* newest unread one. Once everything is read this is the newest
     /// read one, which is what the collapsed tile shows.
     ///
+    /// Only messages past the member's own `joined_after_id` count: mail queued
+    /// before it joined is not mail it could ever receive (delivery starts at
+    /// the same point), and a Goinkyo's token is reused by the next consultation.
+    /// A token with no member row, or a row from before that column, has no
+    /// bound.
+    ///
     /// Read-only and never touches the read cursor: what the operator glances
     /// at on a collapsed tile must not count as the member having read it.
     pub fn latest_inbound_glance(
@@ -882,6 +888,8 @@ impl Store {
              FROM brigade_messages
              WHERE brigade_id = ?1 AND to_role = ?2
                AND (to_member IS NULL OR to_member = ?3)
+               AND id > COALESCE((SELECT joined_after_id FROM brigade_members
+                                  WHERE brigade_id = ?1 AND member_token = ?3), 0)
              ORDER BY id DESC LIMIT 1",
             params![
                 brigade_id,
@@ -893,7 +901,10 @@ impl Store {
     }
 
     /// The newest message `member_token` sent in `brigade_id`, reduced to a
-    /// one-line glance. Read-only.
+    /// one-line glance. Read-only. Bounded by the member's `joined_after_id`
+    /// like [`Self::latest_inbound_glance`]: a sender is identified only by its
+    /// token, and the Goinkyo's is reused, so what an earlier holder of the
+    /// token sent is not this member's.
     pub fn latest_sent_glance(
         &self,
         brigade_id: BrigadeId,
@@ -904,6 +915,8 @@ impl Store {
                     from_session
              FROM brigade_messages
              WHERE brigade_id = ?1 AND from_session = ?2
+               AND id > COALESCE((SELECT joined_after_id FROM brigade_members
+                                  WHERE brigade_id = ?1 AND member_token = ?2), 0)
              ORDER BY id DESC LIMIT 1",
             params![brigade_id, member_token, GLANCE_READ_CHARS],
         )
@@ -1036,8 +1049,11 @@ fn worker_number(token: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// The two inserts that make a member: its row and its read cursor, seeded to
-/// "now" so it sees only mail enqueued after it joined.
+/// The two inserts that make a member: its row and its read cursor, both seeded
+/// to "now" so it sees only mail enqueued after it joined. The row keeps that
+/// value (`joined_after_id`) because the cursor moves on as the member reads,
+/// while the glances need to know where its mail began; the two are written from
+/// the same expression, in one transaction, so they start equal.
 fn insert_member(
     tx: &rusqlite::Transaction,
     brigade_id: BrigadeId,
@@ -1047,8 +1063,8 @@ fn insert_member(
     agent: Option<AgentKind>,
 ) -> Result<(), StoreError> {
     tx.execute(
-        "INSERT INTO brigade_members (brigade_id, member_token, role, session_id, agent)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO brigade_members (brigade_id, member_token, role, session_id, agent, joined_after_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT MAX(id) FROM brigade_messages), 0))",
         params![
             brigade_id,
             token,
@@ -3135,6 +3151,124 @@ mod tests {
         assert_eq!(
             line_of(store.latest_sent_glance(a, "director").unwrap()),
             Some("to them".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_members_inbound_glance_skips_mail_queued_before_it_joined() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "before you")
+            .unwrap();
+
+        let token = store.add_worker(br, None).unwrap();
+
+        assert_eq!(
+            store
+                .latest_inbound_glance(br, &token, BrigadeRole::Worker)
+                .unwrap(),
+            None,
+            "a broadcast queued before the Worker existed is not mail it ever could receive"
+        );
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Worker, None, "for you")
+            .unwrap();
+        assert_eq!(
+            line_of(
+                store
+                    .latest_inbound_glance(br, &token, BrigadeRole::Worker)
+                    .unwrap()
+            ),
+            Some("for you".to_string())
+        );
+    }
+
+    #[test]
+    fn a_replaced_goinkyo_does_not_show_the_previous_ones_sent_line() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "goinkyo", BrigadeRole::Director, None, "my verdict")
+            .unwrap();
+        assert_eq!(
+            line_of(store.latest_sent_glance(br, "goinkyo").unwrap()),
+            Some("my verdict".to_string()),
+            "the first Goinkyo's own line shows for it"
+        );
+
+        assert!(store.dismiss_worker(br, "goinkyo").unwrap());
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+
+        assert_eq!(
+            store.latest_sent_glance(br, "goinkyo").unwrap(),
+            None,
+            "the token is reused, the member is not: it has sent nothing yet"
+        );
+        store
+            .enqueue_brigade_message(br, "goinkyo", BrigadeRole::Director, None, "second opinion")
+            .unwrap();
+        assert_eq!(
+            line_of(store.latest_sent_glance(br, "goinkyo").unwrap()),
+            Some("second opinion".to_string())
+        );
+    }
+
+    #[test]
+    fn a_replaced_goinkyos_inbound_glance_skips_mail_for_the_one_before_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+        store
+            .enqueue_brigade_message(br, "director", BrigadeRole::Goinkyo, None, "first question")
+            .unwrap();
+        assert_eq!(
+            line_of(
+                store
+                    .latest_inbound_glance(br, "goinkyo", BrigadeRole::Goinkyo)
+                    .unwrap()
+            ),
+            Some("first question".to_string())
+        );
+
+        store.dismiss_worker(br, "goinkyo").unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .latest_inbound_glance(br, "goinkyo", BrigadeRole::Goinkyo)
+                .unwrap(),
+            None,
+            "role-wide mail for the previous consultation is not this one's"
+        );
+        store
+            .enqueue_brigade_message(
+                br,
+                "director",
+                BrigadeRole::Goinkyo,
+                None,
+                "second question",
+            )
+            .unwrap();
+        assert_eq!(
+            line_of(
+                store
+                    .latest_inbound_glance(br, "goinkyo", BrigadeRole::Goinkyo)
+                    .unwrap()
+            ),
+            Some("second question".to_string())
         );
     }
 

@@ -205,7 +205,14 @@ fn row_line(
     now: SystemTime,
     show_pin_slot: bool,
 ) -> Line<'static> {
-    let dot = activity_dot(visible.row.activity);
+    // A brigade's mark outranks the session's own state on the dot: the dot is
+    // the one place a list row says "this wants you", and the row's own state
+    // (busy, alive, idle) is still the tile's word and the summary's.
+    let dot = activity_dot(if visible.brigade_mark {
+        Activity::Waiting
+    } else {
+        visible.row.activity
+    });
     // Archived outranks the rest: it is the only class here the operator put
     // on the row themselves, and the only one a key (`D`) acts on. Rows at
     // `Reveal::Archived` sit mixed in among ordinary ones, so without this
@@ -508,6 +515,42 @@ mod tests {
         SessionRow {
             agent: AgentKind::Codex,
             ..row(id, title, cwd, mtime)
+        }
+    }
+
+    #[test]
+    fn a_brigade_mark_turns_the_directors_dot_waiting_whatever_its_own_state() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let dot_colour = |marked: bool, activity: Activity| {
+            let mut director = row("dir", "lead", "/w", now);
+            director.activity = activity;
+            let mut app = App::new(vec![director]);
+            app.set_viewport_height(10);
+            if marked {
+                app.set_brigade_marks(["dir".to_string()].into_iter().collect());
+            }
+            let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+            terminal
+                .draw(|frame| render_list(frame, &app, frame.area(), now))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let cell = buffer.cell((0, 0)).unwrap();
+            (cell.symbol().to_string(), cell.fg)
+        };
+        for own in [
+            Activity::Busy,
+            Activity::Alive,
+            Activity::Idle(AgeBucket::Older),
+        ] {
+            let (symbol, colour) = dot_colour(true, own);
+            assert_eq!(
+                symbol, "\u{25cf}",
+                "{own:?}: a dot is drawn even for an idle row"
+            );
+            assert_eq!(colour, activity_color(Activity::Waiting), "{own:?}");
+            // Not marked: the row's own dot, unchanged.
+            let (_, own_colour) = dot_colour(false, own);
+            assert_ne!(own_colour, activity_color(Activity::Waiting), "{own:?}");
         }
     }
 

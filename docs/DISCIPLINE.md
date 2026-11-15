@@ -311,9 +311,9 @@ and the brigade bell (`Event::QuiescenceSampled`) now reads them for every other
 hosted Codex pane too — one sqlite lookup and one rollout tail per such pane per
 tick. A hosted Claude pane adds no read of its own: the live-file scan and the
 process snapshot are shared with the relay.
-File writes: banto's own sqlite DB, per-member `--mcp-config` files,
-diagnostic logs (`BANTO_INPUT_LOG`) — all under banto's
-own config/data dirs, never `~/.claude`.
+File writes: banto's own sqlite DB, per-member `--mcp-config` files, diagnostic logs
+(`BANTO_INPUT_LOG`, `BANTO_BELL_LOG`, one line per executed bell with its cause) —
+all under banto's own config/data dirs, never `~/.claude`.
 Clocks: `Instant::now()` (event loops, relay ticks, click timing, status
 expiry),
 `SystemTime::now()` (store timestamps, discovery `since` — both the
@@ -327,9 +327,10 @@ Watch: `notify` on `projects/` and `sessions/` (`LiveWatch`; its debounce
 is already a pure function of injected timestamps).
 Processes: PID liveness via sysinfo (`ProcessProbe`).
 MCP: stdio JSON-RPC in `_mcp` (per-connection).
-Terminal control: raw mode, alt screen, mouse capture, bracketed paste,
-terminal size, the host bell (`Cmd::RingHostBell`, a bare BEL — also what a
-brigade going quiet rings through).
+Terminal control: raw mode, alt screen, mouse capture, bracketed paste, terminal
+size, the host bell (`Cmd::RingHostBell { cause }`, a bare BEL — also what a brigade
+going quiet rings through; the cause only names the deciding site for
+`BANTO_BELL_LOG` and changes nothing written).
 Environment: the variables startup reads (`BANTO_CONFIG`, `XDG_CONFIG_HOME`,
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`), gathered into plain values before anything
 decides from them — with the relay decision functions, the house pattern to

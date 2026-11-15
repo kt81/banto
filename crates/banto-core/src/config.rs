@@ -365,10 +365,11 @@ when something is waiting), and send_to_peer is how you report back — \
 findings, results, questions. The Director cannot see your pane, so put \
 what matters in the message you send, not just in your own scrollback.
 
-Report what you checked and how you checked it. Ground a claim about \
-this repository on `git show HEAD:<path>`, never on the working tree — \
-a tree can be mid-write, and reading one has misled this brigade \
-before. Where you could not settle something, say it is unverified \
+Report what you checked and how you checked it. Say which source each \
+claim about this repository rests on: `git show HEAD:<path>` for what is \
+committed, and the working tree only for files the Director has asked \
+you to edit or review — a tree can be mid-write, and reading one as if \
+it were settled has misled this brigade before. Where you could not settle something, say it is unverified \
 rather than closing the gap with a guess. Reasons travel with \
 conclusions; the Director cannot see what you read. The work is yours \
 to do — do not hand off to sub-agents.";
@@ -1007,6 +1008,37 @@ worker_effort_codex = \"\"
         let worker = config.brigade.prompt_for(BrigadeRole::Worker).unwrap();
         assert!(worker.contains("{brigade}") && worker.contains("{token}"));
         assert!(worker.contains("send_to_peer") && worker.contains("check_messages"));
+    }
+
+    #[test]
+    fn the_default_worker_prompt_says_where_each_claim_rests_and_allows_the_tree_for_files_the_director_named()
+     {
+        // Pins the two things the sentence must keep saying. An absolute ban on
+        // the working tree made a Codex Worker refuse to review an uncommitted
+        // change a Director had pinned by hash: Codex receives the briefing as
+        // developer instructions, so even the operator's typed words could not
+        // lift it, and reviewing before committing is how a brigade works.
+        let config = Config::default();
+        let worker = config.brigade.prompt_for(BrigadeRole::Worker).unwrap();
+        let prompt = worker.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            prompt.contains("Say which source each claim about this repository rests on"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("`git show HEAD:<path>` for what is committed"),
+            "committed state is read from HEAD: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "the working tree only for files the Director has asked you to edit or review"
+            ),
+            "the tree is allowed for what the Director asked for: {prompt}"
+        );
+        assert!(
+            !prompt.contains("never on the working tree"),
+            "no absolute ban: {prompt}"
+        );
     }
 
     #[test]

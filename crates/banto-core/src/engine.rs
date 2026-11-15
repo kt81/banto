@@ -90,6 +90,38 @@ impl SessionKey {
         &self.0
     }
 
+    /// The key as a diagnostic log may carry it: an id or a counter, never a path
+    /// and never a character that could end or split a line. The placeholder of a
+    /// session opened new (`new::<cwd>::<n>`) keeps its kind and counter and loses
+    /// the working directory, which is the operator's; so that two placeholders
+    /// can still be told apart, and a member's placeholder
+    /// (`new-worker::<brigade>::<token>`), which carries no path, is kept as it is.
+    /// Every other key is an id, with any control character or whitespace replaced
+    /// by `_` and its length bounded, since nothing promises an id is tidy.
+    pub fn log_id(&self) -> String {
+        if let Some(rest) = self.0.strip_prefix("new::") {
+            let counter = rest
+                .rsplit_once("::")
+                .map(|(_, counter)| counter)
+                .filter(|counter| {
+                    !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit())
+                })
+                .unwrap_or("?");
+            return format!("new::{counter}");
+        }
+        self.0
+            .chars()
+            .take(80)
+            .map(|c| {
+                if c.is_control() || c.is_whitespace() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
     /// Whether this key is a placeholder awaiting id discovery, rather than
     /// a real session id.
     pub fn is_synthetic(&self) -> bool {
@@ -278,6 +310,19 @@ const ATTENTION_BELL_COOLDOWN: Duration = Duration::from_secs(3);
 /// few seconds lets the nudge turn the Director busy first. Sampling is about
 /// once a second, so the wait is met between this and one sample later.
 const BRIGADE_QUIET_SETTLE: Duration = Duration::from_secs(5);
+
+/// How long after a member's process started its own start-up can read as work to
+/// the brigade-quiet watch. Within it, a not-idle reading arms the watch only for
+/// a process that was given something to do ([`EmporiumState::was_given_work`]),
+/// not for one that has merely been read idle before: a Codex pane reads idle on
+/// the shell's first sample and then reports `working` by itself while it starts,
+/// and that armed the watch with nobody having asked for anything.
+///
+/// A margin, not a derived value. Measured in two recorded runs: the start-up
+/// `working` reports ended 1.4 and 2.0 seconds after the spawn, and the Claude
+/// panes settled to idle within about 3.5 seconds. Self-started work that is
+/// still going when it ends arms at the first reading past it.
+const PROCESS_START_GRACE: Duration = Duration::from_secs(10);
 
 /// How long after banto last wrote input into a pane the quit question counts
 /// that pane as not idle whatever its sample says. The sample is up to a tick
@@ -1066,15 +1111,22 @@ pub struct EmporiumState {
     /// When banto last wrote into each pane something that can start or
     /// continue a turn — a relay nudge and its submitting Enter, a Codex
     /// Worker's or a Goinkyo's kickoff and its retry — stamped at the moment of
-    /// the write. The quit question reads it beside [`Self::last_forwarded_input`]
-    /// (the operator's keys, mouse reports and pastes), and the brigade-quiet
+    /// the write. The quit question and the quiet watch's arming read it beside
+    /// [`Self::last_given_input`] (the operator's keys and pastes), and the
+    /// brigade-quiet
     /// stretch counts from it ([`update_brigade_quiet`]). Its own map rather than
-    /// another entry in that one: the relay reads that map to stay out of the
-    /// operator's way, and a nudge must not silence the next one. Focus reports
+    /// another entry in [`Self::last_forwarded_input`]: the relay reads that map
+    /// to stay out of the operator's way, and a nudge must not silence the next
+    /// one. Focus reports
     /// are written too but start nothing, and are not stamped.
     last_prompted: HashMap<SessionKey, Instant>,
-    /// When real operator input was last forwarded to each pane, keyed by
-    /// its own [`SessionKey`] — not a single run-wide instant. `should_nudge`
+    /// When operator input was last forwarded to each pane — every key, paste and
+    /// mouse report the child received, a wheel turn, a drag and a release
+    /// included — keyed by its own [`SessionKey`], not a single run-wide instant.
+    /// The relay's reader of "the operator is doing something in this pane":
+    /// `should_nudge`'s input quiet period and `unsent_verdict`'s echo settle.
+    /// What the quit question and the quiet watch read is the narrower
+    /// [`Self::last_given_input`]. `should_nudge`
     /// only ever suppresses a nudge for the pane the operator is actually
     /// typing into (`RELAY_INPUT_QUIET_PERIOD`'s whole point is protecting
     /// mid-composition text from a spliced-in nudge); a shared field here
@@ -1084,6 +1136,20 @@ pub struct EmporiumState {
     /// else's keystrokes. An entry is dropped when its pane unstages (see
     /// [`Self::unstage`]) so a closed pane's key never accumulates here.
     pub last_forwarded_input: HashMap<SessionKey, Instant>,
+    /// When the operator last gave each pane something that can start or continue
+    /// a turn: a key (one that encodes to no bytes included, and the prefix sent
+    /// through literally) or a paste. No mouse event is work given: a press, a
+    /// release, a drag and a wheel turn are forwarded to the child and are in
+    /// [`Self::last_forwarded_input`], but a click is how the operator moves
+    /// between the pane and the list and the rest is how a transcript is read,
+    /// so none is here. Read by
+    /// [`Self::took_input_recently`] (the quit question) and
+    /// [`Self::was_given_work`] (the quiet watch), never by the relay: the two
+    /// records answer different questions and must not be merged — scrolling a
+    /// pane must keep holding nudges back and must not make the quit question
+    /// ask or a fresh process count as given work. Rekeyed with its pane and
+    /// dropped when it unstages, like the record above.
+    last_given_input: HashMap<SessionKey, Instant>,
     /// Panes the operator has put text into that banto has not seen them
     /// send — see [`Self::has_unsent_operator_input`], the one way to read
     /// it. A pane enters when a forwarded key or paste may have added text
@@ -1320,11 +1386,41 @@ pub struct EmporiumState {
     /// while its border set can only contain panes.
     visible_waiting_count: usize,
     /// Panes whose child rang BEL while they were not effectively focused.
-    /// Folded into `attention_panes`, never drawn separately. A brigade that
-    /// has gone quiet latches its Director here too ([`update_brigade_quiet`]),
-    /// which is why that mark, its bell and its clearing on focus are the same
-    /// ones a BEL gets.
+    /// Folded into `attention_panes`, never drawn separately. A brigade that has
+    /// gone quiet does not latch here: it has a record of its own
+    /// ([`Self::attention`]), because a latch is drawn only for a pane that is
+    /// staged and the brigade may not be.
     latched_attention_panes: HashSet<SessionKey>,
+    /// Brigades that want the operator and have not been looked at. The mark and
+    /// the bell mean "not looked yet" and end when the operator reaches the
+    /// Director's pane ([`sync_brigade_marks`]). Memory only: nothing about it is
+    /// stored, so a restart starts with none. Display only — the quit question,
+    /// the quiet watch, the relay and the tiles' words never read it.
+    attention: HashMap<BrigadeId, AttentionCause>,
+    /// Members whose wait (a waiting session, a Codex pane reporting `blocked`, a
+    /// BEL) has rung through their Director's row while their brigade was not on
+    /// stage, and is still standing. Staging the brigade moves the mark onto the
+    /// member's tile but must not ring for the same wait a second time
+    /// ([`refresh_waiting_display`] counts these as already rung for). Ends with
+    /// the wait, so a new one rings. Keyed by pane, so [`EmporiumState::
+    /// rekey_pane_state`] carries it.
+    row_announced_waits: HashSet<SessionKey>,
+    /// Members whose wait has been shown on their own tile, because their pane was
+    /// on stage when it stood: it has had its ring, and a brigade that leaves the
+    /// stage with the wait still standing does not ring for it again through its
+    /// Director's row. Ends with the wait. Keyed by pane, like the set above.
+    tile_announced_waits: HashSet<SessionKey>,
+    /// The announced waits that stand only because the pane's child rang BEL
+    /// (its latch), so they end when the latch does: a BEL has no activity word
+    /// to say it is over, and what is known about such a member (nothing, often)
+    /// must not keep a second BEL from being a new event.
+    latch_announced_waits: HashSet<SessionKey>,
+    /// The Directors' panes whose rows carry a brigade mark now: a mark is rung
+    /// for when it is made, so putting the same mark on a tile by staging the
+    /// brigade is not an event ([`refresh_waiting_display`]). Recomputed by every
+    /// [`sync_brigade_marks`] from the current keys, so nothing here needs to
+    /// follow a rename.
+    marked_directors: HashSet<SessionKey>,
     /// The latest sample of whether each hosted pane is known to be idle, as
     /// the shell last reported it ([`Event::QuiescenceSampled`]). Read only
     /// for panes in [`Self::screens`]; a pane with no entry is
@@ -1423,6 +1519,7 @@ impl EmporiumState {
             persisted_last_worker_agent: None,
             last_prompted: HashMap::new(),
             last_forwarded_input: HashMap::new(),
+            last_given_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
             kickoff_trust_reminder: StatusReminder::default(),
@@ -1465,6 +1562,11 @@ impl EmporiumState {
             attention_panes: HashSet::new(),
             visible_waiting_count: 0,
             latched_attention_panes: HashSet::new(),
+            attention: HashMap::new(),
+            row_announced_waits: HashSet::new(),
+            tile_announced_waits: HashSet::new(),
+            latch_announced_waits: HashSet::new(),
+            marked_directors: HashSet::new(),
             quiescence: HashMap::new(),
             brigade_quiet: HashMap::new(),
             seen_idle: HashSet::new(),
@@ -1535,6 +1637,9 @@ impl EmporiumState {
         if let Some(value) = self.last_forwarded_input.remove(old_key) {
             self.last_forwarded_input.insert(new_key.clone(), value);
         }
+        if let Some(value) = self.last_given_input.remove(old_key) {
+            self.last_given_input.insert(new_key.clone(), value);
+        }
         if let Some(value) = self.last_prompted.remove(old_key) {
             self.last_prompted.insert(new_key.clone(), value);
         }
@@ -1555,6 +1660,15 @@ impl EmporiumState {
         }
         if self.latched_attention_panes.remove(old_key) {
             self.latched_attention_panes.insert(new_key.clone());
+        }
+        if self.row_announced_waits.remove(old_key) {
+            self.row_announced_waits.insert(new_key.clone());
+        }
+        if self.tile_announced_waits.remove(old_key) {
+            self.tile_announced_waits.insert(new_key.clone());
+        }
+        if self.latch_announced_waits.remove(old_key) {
+            self.latch_announced_waits.insert(new_key.clone());
         }
         if let Some(value) = self.quiescence.remove(old_key) {
             self.quiescence.insert(new_key.clone(), value);
@@ -1635,6 +1749,7 @@ impl EmporiumState {
             self.relay_states.remove(&(brigade_id, token));
         }
         self.last_forwarded_input.remove(key);
+        self.last_given_input.remove(key);
         self.last_prompted.remove(key);
         self.process_started.remove(key);
         self.unsent_operator_input.remove(key);
@@ -2275,13 +2390,16 @@ impl EmporiumState {
     }
 
     /// How many hosted panes (staged or not) are not known to be idle: running
-    /// something, waiting on the operator, unread, or given input by banto
-    /// within [`QUIT_RECENT_INPUT_WINDOW`] (a turn that input started may not
-    /// show in the sample yet). What a quit would end that is worth asking
-    /// about. Only the quit question reads the recent-input part: the relay
-    /// decides from the sample alone, and the brigade-quiet bell reads only
-    /// banto's own writes ([`EmporiumState::last_prompted`]), never the
-    /// operator's input.
+    /// something, waiting on the operator, unread, or given input (the operator's
+    /// keys and pastes, or banto's own writes) within
+    /// [`QUIT_RECENT_INPUT_WINDOW`] (a turn that input started may not show in
+    /// the sample yet). What a quit would end that is worth asking about. Only
+    /// the quit question reads this recent-input part. The relay decides from the
+    /// sample and its own hold on the operator's input
+    /// ([`EmporiumState::last_forwarded_input`]); the brigade-quiet watch counts
+    /// its quiet stretch from banto's own writes
+    /// ([`EmporiumState::last_prompted`]) and arms on the operator's input only
+    /// through [`EmporiumState::was_given_work`].
     fn not_idle_count(&self, app: &App, now: Instant) -> usize {
         self.screens
             .keys()
@@ -2343,18 +2461,26 @@ impl EmporiumState {
                 })
     }
 
+    /// Whether `key`'s process is past its start-up, the grace in which being read
+    /// idle before does not make a not-idle reading work ([`PROCESS_START_GRACE`]).
+    /// Counted from the instant the process started, so a relaunch under the same
+    /// key begins a new one. A pane with no recorded start has none to wait out.
+    fn past_start_up(&self, key: &SessionKey, now: Instant) -> bool {
+        self.process_started
+            .get(key)
+            .is_none_or(|started| now.saturating_duration_since(*started) >= PROCESS_START_GRACE)
+    }
+
     /// Whether anything was written into `key`'s pane to start or continue a
     /// turn since its process started: banto's own writes, or the operator's
-    /// input forwarded to it. Read only by the brigade-quiet arming decision.
+    /// keys and pastes ([`Self::last_given_input`]). Read only by the
+    /// brigade-quiet arming decision.
     fn was_given_work(&self, key: &SessionKey) -> bool {
         let started = self.process_started.get(key);
-        [
-            self.last_forwarded_input.get(key),
-            self.last_prompted.get(key),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|at| started.is_none_or(|started| at >= started))
+        [self.last_given_input.get(key), self.last_prompted.get(key)]
+            .into_iter()
+            .flatten()
+            .any(|at| started.is_none_or(|started| at >= started))
     }
 
     /// Whether `key`'s member has unread brigade mail that the relay is still
@@ -2380,19 +2506,16 @@ impl EmporiumState {
             })
     }
 
-    /// `last_forwarded_input` is stamped for every key forwarded from pane
-    /// focus, including one that encodes to no bytes and so reaches the child as
+    /// `last_given_input` is stamped for every key forwarded from pane focus,
+    /// including one that encodes to no bytes and so reaches the child as
     /// nothing; that stamp is also the relay's "the operator is typing" signal
     /// and keeps its timing, so such a key counts here too. It can only make the
-    /// quit prompt ask.
+    /// quit prompt ask. No mouse event is in it, a press included.
     fn took_input_recently(&self, key: &SessionKey, now: Instant) -> bool {
-        [
-            self.last_forwarded_input.get(key),
-            self.last_prompted.get(key),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
+        [self.last_given_input.get(key), self.last_prompted.get(key)]
+            .into_iter()
+            .flatten()
+            .any(|at| now.saturating_duration_since(*at) < QUIT_RECENT_INPUT_WINDOW)
     }
 
     /// Whether the brigade-quiet bell rings with the Director's pane focused
@@ -3051,10 +3174,114 @@ pub enum Cmd {
     },
     /// Ring the host terminal once for one or more newly visible attention
     /// marks. A bare BEL changes neither cells nor cursor, so the shell may
-    /// emit it before the next draw just like OSC 52 forwarding.
-    RingHostBell,
+    /// emit it before the next draw just like OSC 52 forwarding. `cause` is
+    /// what the core rang for, so a bell that was heard can be traced to the
+    /// decision that made it; the shell writes the same single BEL whatever it
+    /// says. A ring the cooldown swallowed is never a `Cmd`, so it is not here.
+    RingHostBell {
+        cause: BellCause,
+    },
     Store(StoreIntent),
     Reload,
+}
+
+/// Why the core asked for the host bell: the one site that decided it, and what
+/// it was about. Only ids, tokens and counts, never any text a session wrote, so
+/// the shell can log it as it stands: its text names a key through
+/// [`SessionKey::log_id`], which leaves out a working directory and any line break.
+///
+/// Where several waits gained a place in the same update, the cause names one of
+/// them (a Bell before a Wait, a tile before a list row, then the lowest id) and
+/// `others` counts the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BellCause {
+    /// A brigade went quiet while its Director's pane was the focused one and
+    /// the "bell always" switch is on: the only ring that leaves no mark.
+    QuietFocused {
+        brigade: BrigadeId,
+        director: SessionKey,
+    },
+    /// A brigade went quiet and the record of it was made (its Director's pane
+    /// is not the focused one, whether or not the brigade is on stage).
+    QuietRecorded {
+        brigade: BrigadeId,
+        director: SessionKey,
+    },
+    /// A pane on stage rang BEL while it was not the focused one (the tile's edge).
+    StagedPaneBell { pane: SessionKey, others: usize },
+    /// A pane on stage began waiting on the operator (the tile's edge).
+    StagedPaneWait { pane: SessionKey, others: usize },
+    /// A row in the session list began waiting and is on no tile (the list's
+    /// edge).
+    ListRowWaiting { session: SessionKey, others: usize },
+    /// A hosted member that is not on stage rang BEL, announced through its
+    /// Director's row.
+    OffStageMemberBell {
+        member: SessionKey,
+        brigade: BrigadeId,
+        others: usize,
+    },
+    /// A hosted member that is not on stage began waiting on the operator
+    /// (a waiting session, or a Codex pane reporting `blocked`), announced
+    /// through its Director's row.
+    OffStageMemberWait {
+        member: SessionKey,
+        brigade: BrigadeId,
+        others: usize,
+    },
+}
+
+impl std::fmt::Display for BellCause {
+    /// One line of `name key=value …`, for the shell's diagnostic log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QuietFocused { brigade, director } => {
+                write!(
+                    f,
+                    "quiet_focused brigade={brigade} director={}",
+                    director.log_id()
+                )
+            }
+            Self::QuietRecorded { brigade, director } => {
+                write!(
+                    f,
+                    "quiet_recorded brigade={brigade} director={}",
+                    director.log_id()
+                )
+            }
+            Self::StagedPaneBell { pane, others } => {
+                write!(f, "staged_pane_bell pane={} others={others}", pane.log_id())
+            }
+            Self::StagedPaneWait { pane, others } => {
+                write!(f, "staged_pane_wait pane={} others={others}", pane.log_id())
+            }
+            Self::ListRowWaiting { session, others } => {
+                write!(
+                    f,
+                    "list_row_waiting session={} others={others}",
+                    session.log_id()
+                )
+            }
+            Self::OffStageMemberBell {
+                member,
+                brigade,
+                others,
+            } => write!(
+                f,
+                "off_stage_member_bell member={} brigade={brigade} others={others}",
+                member.log_id()
+            ),
+            Self::OffStageMemberWait {
+                member,
+                brigade,
+                others,
+            } => write!(
+                f,
+                "off_stage_member_wait member={} brigade={brigade} others={others}",
+                member.log_id()
+            ),
+        }
+    }
 }
 
 /// A fact about the outside world, fed into [`update`]. Derives
@@ -3452,6 +3679,8 @@ pub fn update(
             }
             if rang && effective_focused_pane(state).as_ref() != Some(&key) {
                 state.latched_attention_panes.insert(key.clone());
+                // A latch on an off-stage member marks its Director's row.
+                overlay_may_have_changed = true;
             }
             cmds
         }
@@ -3730,6 +3959,7 @@ pub fn update(
     cmds.extend(persist_preferences(state));
     if overlay_may_have_changed {
         sync_reported_activity(state, app);
+        cmds.extend(sync_brigade_marks(state, app, now));
     }
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
@@ -3806,6 +4036,24 @@ impl TickObservations {
     }
 }
 
+/// Why a brigade wants the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionCause {
+    /// Every hosted member went idle after real work ([`update_brigade_quiet`]).
+    Quiet,
+}
+
+/// Forget what the relay read about a brigade's Goinkyo. Its token is reused by
+/// every consultation (a Worker's never is within its brigade, a Director's is
+/// one per brigade), so what is kept under it — the last lines it sent and was
+/// sent — would otherwise show on the next consultation's tile until that one is
+/// first observed, which waits for a session id it does not have yet.
+fn forget_goinkyo_facts(state: &mut EmporiumState, brigade_id: BrigadeId) {
+    state
+        .member_facts
+        .remove(&(brigade_id, GOINKYO_TOKEN.to_string()));
+}
+
 /// What [`update_brigade_quiet`] keeps about one brigade between samples.
 #[derive(Debug, Default)]
 struct QuietWatch {
@@ -3827,9 +4075,10 @@ struct QuietWatch {
 /// Tell the operator a brigade has gone quiet: every hosted member (Director,
 /// Workers, a Goinkyo) idle without a break for [`BRIGADE_QUIET_SETTLE`], after
 /// at least one of them was not idle since the last time this fired. Fires by
-/// latching the Director's attention mark, the one a BEL leaves, so the mark,
-/// the bell under its cooldown and the clearing on focus are exactly that
-/// mechanism's.
+/// recording the brigade ([`EmporiumState::attention`]) and ringing at once, under
+/// the usual cooldown, when the record is new; [`sync_brigade_marks`] turns the
+/// record into a mark on the Director's row and ends it when the operator reaches
+/// the Director's pane — the focus a BEL's latch is cleared by.
 ///
 /// The Director, because that is the pane the operator answers in; and not when
 /// the operator is already in it ([`effective_focused_pane`], the rule a BEL
@@ -3867,9 +4116,11 @@ struct QuietWatch {
 /// from being quiet and breaks the stretch like any other reading, but does not
 /// by itself make the brigade one that has done something. A not-idle reading
 /// arms it only from a process that has been read idle before
-/// ([`EmporiumState::seen_idle`]) or that was given work since it started
-/// ([`EmporiumState::was_given_work`]: banto's own writes, or operator input
-/// forwarded to it). Per process, so a relaunch starts over and a key change
+/// ([`EmporiumState::seen_idle`]) and is past its start-up
+/// ([`PROCESS_START_GRACE`]: a Codex pane's own `working` report while it starts
+/// is not work), or that was given work since it started, at any age
+/// ([`EmporiumState::was_given_work`]: banto's own writes, or the operator's
+/// keys and pastes). Per process, so a relaunch starts over and a key change
 /// does not.
 ///
 /// The bell decides only from what was observed in the tick: a brigade is
@@ -3895,10 +4146,11 @@ struct QuietWatch {
 /// waiting reads as not idle here (it has its own mark). A brigade whose
 /// Director is not hosted is not watched; there is no pane to mark.
 ///
-/// An off-stage brigade is watched and marked like any other, but only a staged
-/// pane draws an attention mark ([`refresh_waiting_display`] looks at the stage
-/// alone), so its Director's mark, and the bell with it, wait until the
-/// brigade is staged.
+/// An off-stage brigade is watched and marked like any other. Firing records the
+/// brigade ([`EmporiumState::attention`]), which rings at once, and
+/// [`sync_brigade_marks`] marks its Director's row — which exists whether or not
+/// the brigade is on stage; reaching the Director's pane (staging the brigade
+/// does) ends the mark.
 fn update_brigade_quiet(
     state: &mut EmporiumState,
     app: &App,
@@ -3941,8 +4193,13 @@ fn update_brigade_quiet(
         if sampled == Quiescence::Idle {
             idle_now.extend(process);
         }
+        // The grace is judged here and not on `seen_idle`, which stays a plain
+        // fact (this process was read idle): a process read idle at its first
+        // sample and not idle again after the grace is the ordinary case, and
+        // only the decision to call a reading work waits.
         if sampled == Quiescence::NotIdle
             && (process.is_some_and(|id| state.seen_idle.contains(&id))
+                && state.past_start_up(key, now)
                 || state.was_given_work(key))
         {
             brigade.real_work = true;
@@ -3961,7 +4218,7 @@ fn update_brigade_quiet(
     let running: HashSet<u64> = state.spawn_order.values().copied().collect();
     state.seen_idle.retain(|id| running.contains(id));
 
-    let mut fired = Vec::new();
+    let mut fired: Vec<(BrigadeId, SessionKey)> = Vec::new();
     state
         .brigade_quiet
         .retain(|id, _| hosted.get(id).is_some_and(|b| b.director.is_some()));
@@ -4008,29 +4265,49 @@ fn update_brigade_quiet(
                 .map_or(idle_since, |at| at.max(idle_since));
             if watch.active && now.saturating_duration_since(since) >= BRIGADE_QUIET_SETTLE {
                 watch.active = false;
-                fired.push(director);
+                fired.push((brigade_id, director));
             }
         }
     }
     let mut cmds = Vec::new();
-    for director in fired {
+    for (brigade_id, director) in fired {
         if effective_focused_pane(state).as_ref() != Some(&director) {
-            state.latched_attention_panes.insert(director);
+            // The brigade's record, not a latch on the pane: it marks the
+            // Director's row whether or not the brigade is on stage
+            // ([`sync_brigade_marks`]). The ring is made here, when the record
+            // is new: a second fire under a mark that is still standing is the
+            // same unlooked-at attention and does not ring again.
+            if state
+                .attention
+                .insert(brigade_id, AttentionCause::Quiet)
+                .is_none()
+            {
+                let cause = BellCause::QuietRecorded {
+                    brigade: brigade_id,
+                    director,
+                };
+                cmds.extend(ring_host_bell(state, now, cause));
+            }
         } else if state.bell_when_focused {
-            cmds.extend(ring_host_bell(state, now));
+            let cause = BellCause::QuietFocused {
+                brigade: brigade_id,
+                director,
+            };
+            cmds.extend(ring_host_bell(state, now, cause));
         }
     }
     cmds
 }
 
-/// The host bell, under the cooldown every attention bell shares.
-fn ring_host_bell(state: &mut EmporiumState, now: Instant) -> Option<Cmd> {
+/// The host bell, under the cooldown every attention bell shares. A ring the
+/// cooldown swallows is `None`, so it leaves no trace anywhere.
+fn ring_host_bell(state: &mut EmporiumState, now: Instant, cause: BellCause) -> Option<Cmd> {
     if state
         .last_attention_bell
         .is_none_or(|last| now.saturating_duration_since(last) >= ATTENTION_BELL_COOLDOWN)
     {
         state.last_attention_bell = Some(now);
-        Some(Cmd::RingHostBell)
+        Some(Cmd::RingHostBell { cause })
     } else {
         None
     }
@@ -4066,6 +4343,163 @@ fn sync_reported_activity(state: &EmporiumState, app: &mut App) {
     app.set_reported_activity(reported, dialogs);
 }
 
+/// Mark the Directors' rows of the brigades that want the operator, and ring for
+/// each member's wait the first time it is announced. A brigade wants him when it
+/// went quiet ([`EmporiumState::attention`]; [`update_brigade_quiet`] rings when
+/// it makes the record), or, for a member that is NOT on stage, when that member
+/// is waiting on him (its session file says `waiting`, or the Codex pane reports
+/// `blocked`, or its child rang BEL for him) — an off-stage member has no row of
+/// its own (members are hidden from the list), so the Director's row speaks for
+/// it. What is on stage speaks through its own tile and never also through its
+/// Director's row: a staged brigade's panes, and a pane on stage alone. Counting
+/// both would count one wait twice. A member that is waiting only on a dialog the
+/// operator opened neither marks nor rings, as everywhere. A Director's own
+/// waiting is its row's business.
+///
+/// The ring is per event, driven by the news and not by a comparison of which
+/// rows are marked: a wait rings once, when it is first announced — through the
+/// row ([`EmporiumState::row_announced_waits`]) or on its own tile
+/// ([`EmporiumState::tile_announced_waits`], where the staged-pane edge in
+/// [`refresh_waiting_display`] rings) — whether or not the row was already marked,
+/// and not again when its brigade moves on or off the stage or its pane is
+/// renamed. The shared cooldown still applies and may swallow it.
+///
+/// Reaching the Director's pane ends the record first ([`effective_focused_pane`],
+/// the focus a BEL latch is cleared by), so staging a brigade clears its mark in
+/// the update that stages it and nothing rings again. The mark is display only:
+/// it is laid over the list as a separate set ([`App::set_brigade_marks`]) and no
+/// decision (the quit question, the quiet watch, the relay) reads it. The bell is
+/// explicit and independent of what the list shows: a search that hides the
+/// Director's row does not silence it.
+fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
+    if let Some(key) = effective_focused_pane(state)
+        && state.member_tokens.get(&key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+        && let Some(brigade_id) = state.member_brigades.get(&key)
+    {
+        state.attention.remove(brigade_id);
+    }
+    let mut directors: HashMap<BrigadeId, &SessionKey> = HashMap::new();
+    for key in state.screens.keys() {
+        if state.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+            && let Some(&brigade_id) = state.member_brigades.get(key)
+        {
+            directors.insert(brigade_id, key);
+        }
+    }
+    // A record of a brigade whose Director is no longer hosted has nothing to
+    // mark and is forgotten.
+    state
+        .attention
+        .retain(|brigade_id, _| directors.contains_key(brigade_id));
+    let on_stage: HashSet<&SessionKey> = match &state.stage {
+        Stage::Empty => HashSet::new(),
+        Stage::Solo(key) => std::iter::once(key).collect(),
+        Stage::Brigade { panes, .. } => panes.iter().collect(),
+    };
+    let mut marked: HashSet<&SessionKey> = state
+        .attention
+        .keys()
+        .filter_map(|brigade_id| directors.get(brigade_id).copied())
+        .collect();
+    let mut announced_now: HashSet<SessionKey> = HashSet::new();
+    let mut on_tile_now: HashSet<SessionKey> = HashSet::new();
+    let mut by_latch_now: HashSet<SessionKey> = HashSet::new();
+    let mut ended: Vec<SessionKey> = Vec::new();
+    let mut news: Vec<(SessionKey, BrigadeId, bool)> = Vec::new();
+    for key in state.screens.keys() {
+        let is_director = state.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN);
+        let activity = state.displayed_activity(app, key);
+        let latched = state.latched_attention_panes.contains(key);
+        let waiting_now = (!is_director
+            && activity == Some(Activity::Waiting)
+            && !app.is_dialog_open_id(key.as_str()))
+            || latched;
+        if !waiting_now {
+            // A wait has ended when something is known that is not waiting, or
+            // when it stood only on a latch that is gone. A pane about which
+            // nothing is known — its row not yet under the new id after a
+            // rename — says nothing either way: what was announced stays
+            // announced, so the same wait does not ring again when its row
+            // catches up. (A latch is carried by the rename, so a latched pane
+            // never gets here during that window.)
+            if activity.is_some() || state.latch_announced_waits.contains(key) {
+                ended.push(key.clone());
+            }
+            continue;
+        }
+        if latched {
+            by_latch_now.insert(key.clone());
+        }
+        if on_stage.contains(key) {
+            on_tile_now.insert(key.clone());
+            continue;
+        }
+        let Some(&brigade_id) = state.member_brigades.get(key) else {
+            continue;
+        };
+        let Some(&director) = directors.get(&brigade_id) else {
+            continue;
+        };
+        if state.disbanding.contains(&brigade_id) {
+            continue;
+        }
+        marked.insert(director);
+        if !state.row_announced_waits.contains(key) && !state.tile_announced_waits.contains(key) {
+            news.push((key.clone(), brigade_id, latched));
+        }
+        announced_now.insert(key.clone());
+    }
+    let marked_directors: HashSet<SessionKey> = marked.iter().map(|key| (*key).clone()).collect();
+    let marks: HashSet<String> = marked_directors
+        .iter()
+        .map(|key| key.as_str().to_string())
+        .collect();
+    for key in ended {
+        state.row_announced_waits.remove(&key);
+        state.tile_announced_waits.remove(&key);
+        state.latch_announced_waits.remove(&key);
+    }
+    // A wait that now stands on more than a latch is no longer a latch's to end.
+    state.latch_announced_waits.retain(|key| {
+        by_latch_now.contains(key) || !(announced_now.contains(key) || on_tile_now.contains(key))
+    });
+    state.latch_announced_waits.extend(by_latch_now);
+    state.row_announced_waits.extend(announced_now);
+    state.tile_announced_waits.extend(on_tile_now);
+    // An announcement ends with its pane: a key that is gone has no wait, and a
+    // pane later hosted under it is a new one.
+    for set in [
+        &mut state.row_announced_waits,
+        &mut state.tile_announced_waits,
+        &mut state.latch_announced_waits,
+    ] {
+        set.retain(|key| state.screens.contains_key(key));
+    }
+    state.marked_directors = marked_directors;
+    app.set_brigade_marks(marks);
+    // Bells before waits, then the lowest id: the state's map order is not an
+    // order a log can be compared across runs by.
+    news.sort_by(|a, b| (!a.2, a.0.as_str()).cmp(&(!b.2, b.0.as_str())));
+    let Some((member, brigade, latched)) = news.first().cloned() else {
+        return Vec::new();
+    };
+    let others = news.len() - 1;
+    let cause = if latched {
+        BellCause::OffStageMemberBell {
+            member,
+            brigade,
+            others,
+        }
+    } else {
+        BellCause::OffStageMemberWait {
+            member,
+            brigade,
+            others,
+        }
+    };
+    ring_host_bell(state, now, cause).into_iter().collect()
+}
+
 /// Refresh the one fact behind both attention views: a mark is on screen when
 /// a Waiting row/tile (a Claude session whose live file says waiting, or a
 /// hosted Codex pane reporting blocked) is visible or a staged pane has latched
@@ -4097,6 +4531,15 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
             // the list's Waiting rows and count; it is left out of the set whose
             // growth rings the bell.
             .filter(|id| !app.is_dialog_open_id(id))
+            // A row that is Waiting only because its brigade is marked rings
+            // through the mark ([`sync_brigade_marks`]), once, and not again each
+            // time the mark moves between the row and the tile.
+            .filter(|id| {
+                !app.has_brigade_mark(id)
+                    || app
+                        .row_for_id(id)
+                        .is_some_and(|row| row.activity == Activity::Waiting)
+            })
             .map(|id| SessionKey::from_id(id))
             .collect();
         state.ring_list_generation = app.filtered_waiting_generation();
@@ -4123,20 +4566,35 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
     }
     let old_panes = std::mem::replace(&mut state.attention_panes, panes);
     state.visible_waiting_count = count;
+    // A wait that already rang through its Director's row while its brigade was
+    // off stage, and a mark that was rung for when it was made, are not announced
+    // again by putting them on a tile.
+    if let Some(previous) = &mut state.previous_ring_set {
+        previous.extend(
+            state
+                .attention_panes
+                .iter()
+                .filter(|key| {
+                    state.row_announced_waits.contains(*key)
+                        || state.marked_directors.contains(*key)
+                })
+                .cloned(),
+        );
+    }
 
     // What the bell rings for is the display set minus a Waiting pane that is
     // only a dialog the operator opened in it: such a pane is stopped for a
     // person, so its mark stays (it is the one thing on screen that explains a
     // brigade that does not move, and "dialog open" is a catch-all that a dialog
     // the product opens by itself reads as too), but it is the operator's own
-    // doing and they are looking at it. A pane that is latched (a BEL, a quiet
-    // brigade) rings whatever else it is. When the reason changes while the
+    // doing and they are looking at it. A pane that is latched (a BEL) rings
+    // whatever else it is. When the reason changes while the
     // session stays Waiting it enters this set, and rings, at that moment: a
     // reload that changes it bumps the list generation like any other.
     let rings = |key: &SessionKey| {
         state.latched_attention_panes.contains(key) || !app.is_dialog_open_id(key.as_str())
     };
-    let mut gained = false;
+    let mut gained: Vec<SessionKey> = Vec::new();
     match &mut state.previous_ring_set {
         None => {
             let mut seeded = state.ring_list_waiting.clone();
@@ -4158,7 +4616,12 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
                     .filter(|key| rings(key))
                     .cloned(),
             );
-            gained = current.iter().any(|key| !previous.contains(key));
+            gained.extend(
+                current
+                    .iter()
+                    .filter(|key| !previous.contains(*key))
+                    .cloned(),
+            );
             *previous = current;
         }
         Some(previous) => {
@@ -4171,7 +4634,9 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
                 let visible = state.ring_list_waiting.contains(&key)
                     || (state.attention_panes.contains(&key) && rings(&key));
                 if visible {
-                    gained |= previous.insert(key);
+                    if previous.insert(key.clone()) {
+                        gained.push(key);
+                    }
                 } else {
                     previous.remove(&key);
                 }
@@ -4179,11 +4644,37 @@ fn refresh_waiting_display(state: &mut EmporiumState, app: &App, now: Instant) -
         }
     }
 
-    if gained {
-        ring_host_bell(state, now).into_iter().collect()
+    // A pane on a tile before a row of the list, a BEL before a wait, then the
+    // lowest id.
+    let rank = |key: &SessionKey| {
+        let on_tile = state.attention_panes.contains(key);
+        let bell = on_tile && state.latched_attention_panes.contains(key);
+        (!bell, !on_tile, key.as_str().to_string())
+    };
+    gained.sort_by_key(rank);
+    let Some(first) = gained.first().cloned() else {
+        return Vec::new();
+    };
+    let others = gained.len() - 1;
+    let cause = if state.attention_panes.contains(&first) {
+        if state.latched_attention_panes.contains(&first) {
+            BellCause::StagedPaneBell {
+                pane: first,
+                others,
+            }
+        } else {
+            BellCause::StagedPaneWait {
+                pane: first,
+                others,
+            }
+        }
     } else {
-        Vec::new()
-    }
+        BellCause::ListRowWaiting {
+            session: first,
+            others,
+        }
+    };
+    ring_host_bell(state, now, cause).into_iter().collect()
 }
 
 /// Resize every currently-staged tile's `Screen` to match the current
@@ -4465,6 +4956,7 @@ fn update_key(
             if let Some(target) = state.stage.focused_key().cloned() {
                 let bytes = key_to_bytes(&key);
                 state.last_forwarded_input.insert(target.clone(), now);
+                state.last_given_input.insert(target.clone(), now);
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
@@ -4589,6 +5081,7 @@ fn resolve_armed_prefix(
             let literal = state.prefix.as_key_event();
             let bytes = key_to_bytes(&literal);
             state.last_forwarded_input.insert(target.clone(), now);
+            state.last_given_input.insert(target.clone(), now);
             if bytes.is_empty() {
                 Vec::new()
             } else {
@@ -6060,6 +6553,14 @@ fn update_mouse(
                 .is_some_and(crate::screen::Screen::wants_sgr_mouse)
             {
                 if let Some(bytes) = mouse_to_sgr(&mouse, pane_content(rect)) {
+                    // Everything forwarded is what the relay keeps out of the way
+                    // of, so every mouse report is stamped there; none is work
+                    // given to the child. A click is how the operator moves into
+                    // a pane and out again by pointing (it focuses the pane and
+                    // only then reaches it), and counting it made the quit
+                    // question ask for three seconds after each trip with
+                    // nothing working; a wheel turn or a drag is how a
+                    // transcript is read.
                     state.last_forwarded_input.insert(key.clone(), now);
                     return vec![Cmd::WritePty { key, bytes }];
                 }
@@ -6758,6 +7259,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
             normalized.into_bytes()
         };
         state.last_forwarded_input.insert(key.clone(), now);
+        state.last_given_input.insert(key.clone(), now);
         state.note_forwarded_input(&key, ForwardedInput::Paste(&text));
         cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
@@ -6778,6 +7280,18 @@ fn update_spawned(
     // A new process starts with nothing known about it, whatever the pane that
     // held this key before was last read as.
     state.quiescence.remove(&key);
+    // Work given to the process that held this key before is not work given to
+    // this one. `was_given_work` compares with `>=`, and one drain of the event
+    // loop stamps every event with the same instant: an exit, a key typed into the
+    // dying pane or a nudge written to it, and the `Spawned` that answers the
+    // relaunch can all share one, in that order. Forgotten here, at the start of
+    // the new process, so that only what is given after it counts. Nothing the
+    // relay decides from is touched (`last_forwarded_input`), and neither reader
+    // of these two can be hurt: the quit window reads a new process as unknown
+    // until it is sampled, and the quiet stretch counts from the later of the
+    // idle samples and the last write, and those samples come after this spawn.
+    state.last_given_input.remove(&key);
+    state.last_prompted.remove(&key);
     state.process_started.insert(key.clone(), now);
     state.screens.insert(
         key.clone(),
@@ -7958,6 +8472,7 @@ fn update_disbanded(
             // for this brigade goes here, with the brigade (nothing observes it
             // any more, so it would be inert anyway).
             state.brigade_quiet.remove(&brigade_id);
+            state.attention.remove(&brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
                 .into_iter()
@@ -8546,6 +9061,7 @@ fn update_goinkyo_awaiting_spawn(
             if let Some(joined) = state.member_order.get_mut(&brigade_id) {
                 joined.retain(|listed| listed != GOINKYO_TOKEN);
             }
+            forget_goinkyo_facts(state, brigade_id);
             let Some(key) = state.goinkyo_pane.remove(&brigade_id) else {
                 return Vec::new();
             };
@@ -8624,12 +9140,15 @@ fn update_goinkyo_awaiting_spawn(
         }
         return Vec::new();
     }
+    // A new consultation starts with nothing of the last one's: its end may not
+    // have been seen (dismissed and summoned again inside one tick).
+    forget_goinkyo_facts(state, candidate.brigade_id);
     let key = SessionKey::new_worker(candidate.brigade_id, GOINKYO_TOKEN);
     // Belt-and-suspenders alongside `goinkyo_pane` above: the guard is what
     // actually distinguishes "just failed" from "never tried" (see this
     // function's own doc), but a pane or an in-flight open already existing
-    // for this key — the same evidence `open_worker`'s reuse branch checks
-    // (line ~2674) — is a second, independent reason not to spawn again,
+    // for this key — the same evidence `open_worker` checks through
+    // `member_open_or_opening` — is a second, independent reason not to spawn again,
     // cheap to check now that this crate can build the key at all (the
     // shell-side gatherer cannot: `SessionKey::new_worker` is private to
     // this crate, which is exactly why this check lives here and not
@@ -24996,7 +25515,9 @@ mod tests {
             now,
         );
         assert!(
-            !seeded.iter().any(|cmd| matches!(cmd, Cmd::RingHostBell)),
+            !seeded
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RingHostBell { .. })),
             "startup seeds state but must not announce it: {seeded:?}"
         );
 
@@ -25010,7 +25531,15 @@ mod tests {
             },
             now + Duration::from_millis(1),
         );
-        assert_eq!(cmds, vec![Cmd::RingHostBell]);
+        assert_eq!(
+            cmds,
+            vec![Cmd::RingHostBell {
+                cause: BellCause::StagedPaneBell {
+                    pane: key.clone(),
+                    others: 0
+                }
+            }]
+        );
         assert!(state.attention_panes().contains(&key));
         assert_eq!(
             state.visible_waiting_count(),
@@ -25103,12 +25632,20 @@ mod tests {
             &mut app,
             &brigade,
             Event::PtyOutput {
-                key: a,
+                key: a.clone(),
                 chunk: b"\x07".to_vec(),
             },
             now + Duration::from_millis(1),
         );
-        assert_eq!(first, vec![Cmd::RingHostBell]);
+        assert_eq!(
+            first,
+            vec![Cmd::RingHostBell {
+                cause: BellCause::StagedPaneBell {
+                    pane: a.clone(),
+                    others: 0
+                }
+            }]
+        );
         let suppressed = update(
             &mut state,
             &mut app,
@@ -25125,12 +25662,20 @@ mod tests {
             &mut app,
             &brigade,
             Event::PtyOutput {
-                key: c,
+                key: c.clone(),
                 chunk: b"\x07".to_vec(),
             },
             now + ATTENTION_BELL_COOLDOWN + Duration::from_millis(1),
         );
-        assert_eq!(after_cooldown, vec![Cmd::RingHostBell]);
+        assert_eq!(
+            after_cooldown,
+            vec![Cmd::RingHostBell {
+                cause: BellCause::StagedPaneBell {
+                    pane: c.clone(),
+                    others: 0
+                }
+            }]
+        );
     }
 
     #[test]

@@ -201,17 +201,21 @@ entry records what was decided and why.
 3. **A brigade that has gone quiet marks its Director and rings.** When every live
    hosted member has been idle for 5 seconds after real work (a member still
    starting up does not count), and no member has unread mail the relay will still
-   deliver — counted
-   from the last member going idle or banto last prompting one — banto marks
-   the Director's pane and rings the host bell through the existing attention
-   mechanism, except while the Director's pane is effectively focused (it marks and
-   rings with banto's window unfocused). *Why:* a brigade going quiet is the moment
-   his input is wanted, and it is rare enough to deserve a sound. A runtime switch
-   (the function key `F4`, badge `BELL ALWAYS`, persisted as `bell_when_focused`, off by
-   default) makes the bell ring even with the Director's pane focused. *Why a
-   runtime switch and not a config key:* whether he wants the sound depends on what
-   he is doing, and he wants to change it while running. *Why F4 and not a
-   prefix chord:* he wants to flip it casually, in one keystroke, while working.
+   deliver — counted from the last member going idle or banto last prompting one —
+   banto marks the Director (its row in the list, and its tile when the brigade is
+   on stage) and rings the host bell, whether or not the brigade is on stage and
+   whatever the operator is doing elsewhere, except while the Director's pane is
+   effectively focused (it marks and rings with banto's window unfocused). *Why:* a
+   brigade going quiet is the moment his input is wanted, and it is rare enough to
+   deserve a sound. *Status (2026-11-14):* until then the fire latched the
+   Director's pane, which only a staged pane draws, so it reached him only for a
+   staged brigade; see "Decision (2026-11-14): an off-stage brigade speaks through
+   its Director's row". A runtime switch (the function key `F4`, badge `BELL
+   ALWAYS`, persisted as `bell_when_focused`, off by default) makes the bell ring
+   even with the Director's pane focused. *Why a runtime switch and not a config
+   key:* whether he wants the sound depends on what he is doing, and he wants to
+   change it while running. *Why F4 and not a prefix chord:* he wants to flip it
+   casually, in one keystroke, while working.
 
 Alongside, banto now asks Codex to BEL for `async-question` and `plan-mode-prompt`
 as well as `approval-requested` ("Attention"), so that a question the model asks
@@ -321,12 +325,10 @@ and the plan-implementation prompt ring too, not only an approval.
     tick that did not observe the member leaves it no word. The quit question, the
     brigade watch and the relay do not read it.
 
-*Not done:* a new member's "last message received" on its collapsed tile can show a
-broadcast that was sent before it joined (display only; the fix needs a stored join
-point, so it waits for the next schema change); answering the `?` query of the same
-protocol (which is what would make Claude Code report over it too — from the 2.1.323
-bundle, read and not run); keeping sub-records (reports naming an `id=` are parsed
-and dropped); and sub-agent activity is not tracked.
+*Not done:* answering the `?` query of the same protocol (which is what would make
+Claude Code report over it too — from the 2.1.323 bundle, read and not run); keeping
+sub-records (reports naming an `id=` are parsed and dropped); and sub-agent activity
+is not tracked.
 
 ## Decision (2026-11-14): a model and an effort are given only when a session is created
 
@@ -430,6 +432,147 @@ are the role's, are still passed on every launch, a resume included.
 *Not done:* banto keeps no record of what a member was created with, so there is
 nothing for a recreated Worker to be recreated from but the configuration; and the
 Director has no model or effort setting.
+
+## Decision (2026-11-14): an off-stage brigade speaks through its Director's row
+
+Decisions of the operator, 2026-11-14, about how a brigade that is not on stage
+reaches him. His own words were these: off-stage brigades should speak through the
+Director's row in the list; an off-stage quiet fire should ring even while he works
+in another brigade ("please ring it"); and he runs several brigades at once. The
+reasons below beyond that are the Director's and the implementers', not his. This is
+the first stage of a larger change to how brigades get his attention; only what is
+built is described. The behaviour is written out under "The emporium: hosted panes"
+("Attention", "The quiet brigade's bell"); this entry records what was decided and
+why.
+
+*What prompted it.* The quiet brigade's bell had a known defect (recorded in "The
+quiet brigade's bell" until now): for a brigade that was not on stage nothing
+reached him. Its fire latched a mark on the Director's pane, only a staged pane
+draws one, and staging the brigade put the focus on that Director's tile, which
+cleared the latch in the same update, so with banto's window focused there was no
+mark and no bell at all.
+
+1. **An off-stage brigade speaks through its Director's row.** The Director's row is
+   in the list whether or not the brigade is on stage; it gets the waiting-colour
+   dot and counts in `waiting N`. A hosted member whose pane is not on stage has no
+   row of its own (members are hidden from the list), so its Director's row speaks
+   for it: Claude `waiting`, Codex `blocked`, or a child BEL marks the row and rings
+   once; a dialog the operator opened (`dialog open`) does neither.
+2. **An off-stage quiet fire rings, even while he works in another brigade.** It is
+   suppressed only while he is effectively on that Director's pane. *Why (his):* he
+   runs several brigades at once and asked for it to ring. *(The implementers' added
+   reasoning: it is the reason of the 2026-11-13 decision, a brigade going quiet is
+   the moment his input is wanted, and a bell that waited for the brigade to be
+   staged never came.)*
+3. **One event, one ring.** The bell is rung when an event first happens (a wait
+   first announced, a quiet fire first recorded), not when a row mark appears.
+   Staging the brigade later does not ring again: the mark moves from the row to the
+   tile of the member that is still waiting (a quiet fire's mark ends, since staging
+   puts him on the Director's pane); nor does leaving a brigade for another with a
+   wait that began on stage still standing, which marks the row without a ring. A
+   second member's wait rings even while the Director's row is already marked; a
+   second quiet fire under a quiet mark that is still standing does not.
+4. **A pane on stage speaks only through its own tile.** A staged brigade's panes,
+   and a pane staged alone, never also mark their Director's row. *Why (the
+   implementers' reasoning, not his words):* counting both would count one waiting
+   member twice.
+5. **The join point of a member is a message id, not a time** (schema v18,
+   `brigade_members.joined_after_id`). *Why (the implementers' reasoning, not his
+   words):* clocks differ between processes and can step back; message ids are never
+   reused and are ordered across processes. It bounds the two message rows of a
+   collapsed tile, so a member no longer shows a broadcast sent before it joined and
+   a new Goinkyo no longer shows the previous one's lines, even before its first
+   observation (its token is reused by every consultation, so what was read about
+   the previous one is forgotten when a consultation ends and when the next is
+   summoned).
+
+*Consequences and limits.* The row's mark is display only: it is a set kept apart
+from the session's own activity, so the tile's word, the quit question, the quiet
+watch and the relay never read it. It is memory only, so a restart starts with none.
+A member that joined before v18 has no join point and shows what it showed before.
+Schema v18 also adds `brigades.request_text`, `request_seq` and `request_at_ms`,
+reserved for a later stage (a Director's unanswered decision request); nothing reads
+or writes them yet.
+
+## Decision (2026-11-14): the default Worker briefing says where each claim rests, not that the working tree is forbidden
+
+The operator approved a rewording of one sentence of the default Worker briefing
+(`DEFAULT_WORKER_PROMPT` in `crates/banto-core/src/config.rs`; `worker_prompt` in
+config.toml replaces the whole default, and a briefing the operator wrote is not
+touched).
+
+- *Before:* "Ground a claim about this repository on `git show HEAD:<path>`, never
+  on the working tree — a tree can be mid-write, and reading one has misled this
+  brigade before."
+- *Now:* "Say which source each claim about this repository rests on: `git show
+  HEAD:<path>` for what is committed, and the working tree only for files the
+  Director has asked you to edit or review — a tree can be mid-write, and reading
+  one as if it were settled has misled this brigade before."
+
+*Why.* The absolute "never" made a Codex Worker refuse to review an uncommitted
+change that the Director had pinned by sha256; reviewing before committing is how a
+brigade works. The reasoning about why the operator could not simply override it is
+the Director's diagnosis from the Worker's own quoted refusal, not the operator's
+words: Codex receives the briefing as developer instructions, so what he typed could
+not lift it. The wording was approved by the operator. A test pins what the sentence
+must keep saying (the "which source" opening, `git show HEAD:<path>` for what is
+committed, the working tree for files the Director asked for) and that "never on the
+working tree" is gone.
+
+## Decision (2026-11-14): work given to a session is a key or a paste, not every event forwarded to it
+
+Two records of operator input exist since 2026-11-14, because one notion was doing
+two jobs.
+
+- *Forwarded to the pane:* every key, paste and mouse report the child received, a
+  wheel turn, a drag, a press and a release included. Its reader is the relay, which
+  keeps out of the operator's way: every forwarded event, mouse included, still
+  holds a nudge (see "Auto-relay" and "Mail on the way") and feeds its judgement of
+  unsent input.
+- *Work given to the session:* a key forwarded to the pane (one that encodes to no
+  bytes included, and the prefix sent through literally) or a paste. No mouse event
+  is work given: a press, a release, a drag and a wheel turn are not in it (a bare
+  pointer move was never forwarded). Its readers are the quit question's
+  recent-input window and the quiet watch's "was given work".
+
+*The incidents, in order.* (a) The operator reads a pane's history with the mouse
+wheel. Having scrolled the Director's pane, he clicked the list and pressed Esc, and
+banto asked "1 session(s) not idle" for three seconds with nobody working. The same
+over-broad notion let a wheel notch over a freshly resumed pane count as work given,
+so that process's first not-idle reading armed the quiet watch: established by a
+test at the engine level. Whether that is what rang the bell he heard after a
+restart is not established: what a resumed pane reports at start is unmeasured. (b)
+The first fix kept a button press as work given, and he then got the same question
+every time he clicked into the Director's pane and back to the list: a click is how
+he moves into a pane and out of it, not an instruction to the agent. So no mouse
+event counts.
+
+## Decision (2026-11-14): start-up is not work
+
+For 10 s after a member's process started (`PROCESS_START_GRACE`), a not-idle
+reading does not arm the quiet watch through the "sampled idle before" rule. Being
+given work (the operator's key or paste, banto's own nudge or kickoff) arms at any
+age; work still going when the grace ends arms at the first reading past it; a
+relaunch under the same key gets a new grace, and on `Spawned` the stamps of work
+given to the previous process under that key (the operator's keys and pastes,
+banto's own nudges and kickoffs) are dropped, so work given to a process that was
+replaced never counts for the new one, including when both fall in the same
+event-loop drain (the relay's record of forwarded input is kept); a rename keeps the
+process's start; the Director is covered like any member; a pane with no recorded
+start has no grace to wait out.
+
+*What was measured.* On the operator's trial the bell rang 9.4 s after a restart
+with nothing asked of anyone (bell log: `quiet_focused`, a quiet fire with the
+Director's pane focused and the "bell always" switch on); a replay of the same run's
+recording reproduced it to the millisecond. The Codex Worker's pane read idle on the
+shell's first sample at 1.05 s, reported `working` by itself at 2.06 s and `idle` 75
+ms later, and that report was taken for work. In another recorded run the same
+report lasted 2.34-2.97 s and fell between samples, so nothing armed: the bell rang
+only when a sample landed inside the window. The start-up reports ended 1.4 and 2.0
+s after the spawn in those two runs and the Claude panes settled within about 3.5 s;
+10 s is a margin, not a derived value. *Unexplained:* one earlier ring at a resume.
+That run had no bell log, and a replay of its recording shows no ring near the
+resume.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -746,12 +889,18 @@ crates/
 ```
 
 **The store's schema** is versioned by `PRAGMA user_version`; `store/migrations.rs`
-holds one script per version (17 today) and every open applies what is pending,
-under the write lock. banto takes **no backup** before migrating, and an older
-build cannot open a database a newer one has migrated: it reports `unsupported
-database schema version <n>` rather than guess. v17 dropped `panes`, the map of
-a session to its external-terminal pane, which nothing records or reads once
-banto opens sessions only in its own panes; any rows went with it.
+holds one script per version (18 today) and every open applies what is pending,
+under the write lock. banto takes **no backup** before migrating, and an older build
+cannot open a database a newer one has migrated: it reports `unsupported database
+schema version <n>` rather than guess. v17 dropped `panes`, the map of a session to
+its external-terminal pane, which nothing records or reads once banto opens sessions
+only in its own panes; any rows went with it. v18 added
+`brigade_members.joined_after_id`, the highest message id that existed when the
+member joined (0 for a member that joined before v18, which means no bound; it lives
+on the member's own row, so a dismissed member's value goes with it, and a migration
+that rebuilds `brigade_members` must copy it), and, on `brigades`, `request_text`,
+`request_seq` and `request_at_ms`, reserved for a later stage (a Director's
+unanswered decision request): nothing reads or writes them yet.
 
 ## The emporium: hosted panes
 
@@ -798,6 +947,36 @@ of Enters. What a child prints and the brigade messages are never written. The p
 is no config key or flag. Nothing in banto reads the file back, and the pure
 core never sees it (`docs/DISCIPLINE.md` §6.2). **It holds the operator's real
 keystrokes: it must never be committed.**
+
+`BANTO_BELL_LOG=<file>` answers "why did it ring?". When the variable is set (to a
+path), the UI opens that file once at startup, created if missing, appended to,
+never truncated or rotated, and appends one line for each bell banto executes,
+`<unix ms> emporium: bell +<ms since the run started>ms cause=<cause> event=<event
+variant> <written|failed=<error kind>>`. An open that fails leaves the log off and a
+failed write is ignored, so a diagnostic never breaks the run; unset, no file is
+opened and no work is done. The `+ms` shares its zero with the offsets of
+`BANTO_RECORD_EVENTS`, so a line can be set beside a recording. `event` is the name
+of the `Event` variant whose update produced the ring and nothing else of it;
+`written` or `failed=<kind>` is the outcome of the write to the terminal. The cause
+names the decision that rang and what it was about, as ids and counts only, never
+session text, message text or screen content: `quiet_focused` (brigade, Director: a
+quiet fire with the Director's pane focused and the "bell always" switch on, the one
+ring that leaves no mark), `quiet_recorded` (brigade, Director), `staged_pane_bell`
+(pane, others: a staged pane's BEL), `staged_pane_wait` (pane, others),
+`list_row_waiting` (session, others: a list row that began Waiting and is on no
+tile), `off_stage_member_bell` and `off_stage_member_wait` (member, brigade,
+others); where several waits gained a place in the same update the cause names one
+and `others` counts the rest. A ring the cooldown swallowed is never a bell and is
+not logged. The cause changes no decision: it is carried on `Cmd::RingHostBell` for
+this log and the shell writes the same single BEL whatever it says. Ids in a cause
+are rendered for logging: a new plain session's placeholder key appears as
+`new::<n>` without its working directory, a member's placeholder
+(`new-worker::<brigade>::<token>`) as it is, and in any other key control characters
+and whitespace are replaced by `_` and the id is bounded in length (80 characters).
+The path is opened and written on the UI thread like the other diagnostic logs, so
+it should name a regular file: a FIFO with no reader would block the event loop. The
+path comes only from the variable. *Why it exists:* three days of answering "why did
+it ring?" by inference were settled by the first line it wrote.
 
 **Layout.** A solo session fills the whole pane. A staged brigade (see
 "Brigade" below) tiles Director left / Workers stacked down the right —
@@ -916,69 +1095,75 @@ signal, which is why it is shortened (`2m`) before it is dropped on a narrow til
 The two body rows read `← <age> <first line of the last message sent to this
 member>` and `→ <age> <first line of the last message this member sent>`, from
 banto's own brigade message store, read without touching any read cursor (a glance
-is not a delivery) and re-read only when a message has been appended; each is
-reduced at the store to its first non-empty line with control characters removed and
-cut to 200 characters, then clipped to the row by display width, and blank when
-there is none. A collapsed tile that is waiting for the operator still shows the
-waiting colour on its border. A tile's `[S]` button (or `z`) *solos* it, as on an
-audio mixer: every other stack tile is shown collapsed until the solo is turned off
-(the master tile has an `[S]` button too, and no collapse button: soloing it
-collapses the whole stack, which then narrows as described below). Turning the solo
-off brings back exactly what had been collapsed one by one (the solo is an overlay
-on those choices, never a rewrite; it is unrelated to the single-session "solo"
-stage). `M` clears both. Both buttons sit right-aligned in every stack tile's title
-row, only where the row has room for the label, a gap and both. When every stack
-tile is collapsed the stack stays the right-hand column but narrows to a width of
-its own (the "collapsed stack width", 36 columns until moved, per brigade; a width
-in columns, not a share, since a strip needs a fixed amount of room to be readable
-on any terminal) and the master takes the rest; the strips stack from the top in
-order and the space below them is left empty (at four rows each a 24-row terminal
-holds 5 collapsed Workers and a 40-row one 9, the stack being the terminal's rows
-less the status bar's one; one more and every strip gives a little rather than the
-last being dropped, down to the title row alone at one row; below one row a tile is
-not drawn at all: a tile with no rows or no columns, which a stack with more tiles
-than rows has, draws nothing and owns no button, label or drop slot
-(`layout::is_empty`), and keeps its place in the order and in the focus ring. *Why:*
-found in review: such a tile was placed on the next tile's top row and its buttons
-were still built, so a press on a visible tile's `[S]` or minimise button could
-resolve to the invisible one, and with the status on the title row it would also
-have painted over its neighbour. Known and not fixed: focus cycling (F3) can land on
-such an invisible tile). The master is never narrower there than in the ordinary
-split at the same width (the strips can be narrower than the ordinary stack, never
-wider), so whatever fit on it before — its title with its `[S]` button — still fits.
-Opening any tile returns to the ordinary master share. Dragging the master/stack
-edge sets whichever of the two preferences is in force (the collapsed width while
-every tile is collapsed, the master's share otherwise); the master's PTY is resized
-once on entering and once on leaving that state. A collapsed tile is not focusable
-(the focus ring, F3 and the arrows skip it; the pane number opens it first); its
-label still moves it. A collapsed tile's child is not resized, since a repaint into
-a grid of a row or two would wreck the screen the operator comes back to; it is
-sized when it opens. The row resize handle lies between expanded neighbours and
-rewrites only their weights. **Putting the sizes back** (prefix + `=`, from the
-sidebar or a pane, on a staged brigade). Forgets every row weight the layout holds
-for the brigade — staged members' and off-stage ones' alike, so a member reopened
-later brings no old height back — and returns the master share and the collapsed
-stack width to their defaults. It leaves the arrangement alone: stack order,
-collapsed flags, solo, display names and join order are not sizes, and the sidebar
-width is a window-level preference of a different layer, not part of any brigade.
-Like the other layout operations it ends a drag or move in progress; the panes are
-resized once, only where a tile's size really changes, and one layout save is
-written when something changed. A brigade already at its defaults changes and saves
-nothing and says so (`sizes already at their defaults`); with no brigade staged, or
-a single session, it is refused (`prefix: no brigade layout to reset`). The case
-that prompted it: a Worker added later takes the mean of the others' heights, so
-weights set when a brigade had two Workers leave one tile much smaller than the rest
-once it has four. **What is kept across a restart.** Everything arranged above, and
-the brigade bell's switch, is stored in banto's own sqlite store and comes back the
-next time banto runs: the sidebar width (table `ui_prefs`, key `sidebar_width`) and,
-in the same table, the brigade bell's switch (key `bell_when_focused`, `1` or `0`;
-any other stored value reads as no preference, which is off — see "The quiet
-brigade's bell") and the agent the Worker picker was last confirmed with (key
-`last_worker_agent`, `claude` or `codex`; any other stored value, a product a newer
-build wrote included, reads as none stored, and the picker then opens on the
-Director's own product; no schema change: it is one more row of `ui_prefs`); per brigade, the master share, the collapsed stack width and the
-soloed member (columns on `brigades`); per member, its place in the stack order, its
-row weight and its collapsed flag (columns on `brigade_members`). NULL means "no
+is not a delivery), counting only messages past the member's own join point
+(`brigade_members.joined_after_id`, schema v18: so a new member shows no broadcast
+sent before it joined, and a new Goinkyo shows none of the previous consultation's
+lines, even before its first observation, since what the relay read about the
+previous one is forgotten when a consultation ends and when the next is summoned; a
+member from before v18 has no bound) and re-read only when a message has been
+appended; each is reduced at the store to its first non-empty line with control
+characters removed and cut to 200 characters, then clipped to the row by display
+width, and blank when there is none. A collapsed tile that is waiting for the
+operator still shows the waiting colour on its border. A tile's `[S]` button (or
+`z`) *solos* it, as on an audio mixer: every other stack tile is shown collapsed
+until the solo is turned off (the master tile has an `[S]` button too, and no
+collapse button: soloing it collapses the whole stack, which then narrows as
+described below). Turning the solo off brings back exactly what had been collapsed
+one by one (the solo is an overlay on those choices, never a rewrite; it is
+unrelated to the single-session "solo" stage). `M` clears both. Both buttons sit
+right-aligned in every stack tile's title row, only where the row has room for the
+label, a gap and both. When every stack tile is collapsed the stack stays the
+right-hand column but narrows to a width of its own (the "collapsed stack width", 36
+columns until moved, per brigade; a width in columns, not a share, since a strip
+needs a fixed amount of room to be readable on any terminal) and the master takes
+the rest; the strips stack from the top in order and the space below them is left
+empty (at four rows each a 24-row terminal holds 5 collapsed Workers and a 40-row
+one 9, the stack being the terminal's rows less the status bar's one; one more and
+every strip gives a little rather than the last being dropped, down to the title row
+alone at one row; below one row a tile is not drawn at all: a tile with no rows or
+no columns, which a stack with more tiles than rows has, draws nothing and owns no
+button, label or drop slot (`layout::is_empty`), and keeps its place in the order
+and in the focus ring. *Why:* found in review: such a tile was placed on the next
+tile's top row and its buttons were still built, so a press on a visible tile's
+`[S]` or minimise button could resolve to the invisible one, and with the status on
+the title row it would also have painted over its neighbour. Known and not fixed:
+focus cycling (F3) can land on such an invisible tile). The master is never narrower
+there than in the ordinary split at the same width (the strips can be narrower than
+the ordinary stack, never wider), so whatever fit on it before — its title with its
+`[S]` button — still fits. Opening any tile returns to the ordinary master share.
+Dragging the master/stack edge sets whichever of the two preferences is in force
+(the collapsed width while every tile is collapsed, the master's share otherwise);
+the master's PTY is resized once on entering and once on leaving that state. A
+collapsed tile is not focusable (the focus ring, F3 and the arrows skip it; the pane
+number opens it first); its label still moves it. A collapsed tile's child is not
+resized, since a repaint into a grid of a row or two would wreck the screen the
+operator comes back to; it is sized when it opens. The row resize handle lies
+between expanded neighbours and rewrites only their weights. **Putting the sizes
+back** (prefix + `=`, from the sidebar or a pane, on a staged brigade). Forgets
+every row weight the layout holds for the brigade — staged members' and off-stage
+ones' alike, so a member reopened later brings no old height back — and returns the
+master share and the collapsed stack width to their defaults. It leaves the
+arrangement alone: stack order, collapsed flags, solo, display names and join order
+are not sizes, and the sidebar width is a window-level preference of a different
+layer, not part of any brigade. Like the other layout operations it ends a drag or
+move in progress; the panes are resized once, only where a tile's size really
+changes, and one layout save is written when something changed. A brigade already at
+its defaults changes and saves nothing and says so (`sizes already at their
+defaults`); with no brigade staged, or a single session, it is refused (`prefix: no
+brigade layout to reset`). The case that prompted it: a Worker added later takes the
+mean of the others' heights, so weights set when a brigade had two Workers leave one
+tile much smaller than the rest once it has four. **What is kept across a restart.**
+Everything arranged above, and the brigade bell's switch, is stored in banto's own
+sqlite store and comes back the next time banto runs: the sidebar width (table
+`ui_prefs`, key `sidebar_width`) and, in the same table, the brigade bell's switch
+(key `bell_when_focused`, `1` or `0`; any other stored value reads as no preference,
+which is off — see "The quiet brigade's bell") and the agent the Worker picker was
+last confirmed with (key `last_worker_agent`, `claude` or `codex`; any other stored
+value, a product a newer build wrote included, reads as none stored, and the picker
+then opens on the Director's own product; no schema change: it is one more row of
+`ui_prefs`); per brigade, the master share, the collapsed stack width and the soloed
+member (columns on `brigades`); per member, its place in the stack order, its row
+weight and its collapsed flag (columns on `brigade_members`). NULL means "no
 preference, use the default". The per-member values live on the member's own row on
 purpose: a dismissed member's row is deleted, so its arrangement goes with it, which
 bounds what is kept and keeps a later member under the same token (only the
@@ -1146,17 +1331,21 @@ brigade bell alike.
   member with no session id yet) → unknown, so a new pane asks rather than being
   taken for idle. A pane whose process ended is gone and counts for nothing.
 - *Recent input:* a pane also counts as not idle for 3 seconds
-  (`QUIT_RECENT_INPUT_WINDOW`) after anything was typed into it — the operator's
-  keys, a mouse report or a paste forwarded to it (a key from pane focus that
-  encodes to no bytes still counts), or something banto wrote itself to start or
-  continue a turn: the relay's nudge line and its delayed submitting Enter, a
-  Codex Worker's or a Goinkyo's kickoff line and its retries (an Enter-only retry
-  included) — whatever its sample says. The focus reports banto writes to a pane
-  start nothing and do not count. The sample is up to a tick plus the product's own report lag behind a turn
-  that input has only just started; without this, a prompt submitted a moment ago
-  still reads idle and one `q` quits on it. The quit question reads all of this; the
-  brigade bell reads only banto's own writes (never the operator's input, see
-  "The quiet brigade's bell"), and the relay decides from the sample alone.
+  (`QUIT_RECENT_INPUT_WINDOW`) after the operator gave it work — a key (the prefix
+  sent through literally included; a key from pane focus that encodes to no bytes
+  still counts) or a paste forwarded to it; no mouse event is work given (a press, a
+  release, a drag, a wheel turn: all are forwarded to the child as before, but
+  clicking into a pane or reading its history is not an instruction to the agent) —
+  or something banto wrote itself to start or continue a turn: the relay's nudge
+  line and its delayed submitting Enter, a Codex Worker's or a Goinkyo's kickoff
+  line and its retries (an Enter-only retry included) — whatever its sample says.
+  The focus reports banto writes to a pane start nothing and do not count. The
+  sample is up to a tick plus the product's own report lag behind a turn that input
+  has only just started; without this, a prompt submitted a moment ago still reads
+  idle and one `q` quits on it. The quit question reads all of this; the brigade
+  bell's quiet stretch reads only banto's own writes (its arming also reads the
+  operator's keys, pastes and button presses; see "The quiet brigade's bell"), and
+  the relay decides from the sample alone.
 
 One `q`/`Esc` quits when no hosted pane is counted; otherwise the first press arms
 the prompt `Esc again to quit — N session(s) not idle`, N the number counted, and
@@ -1211,21 +1400,48 @@ set minus a Claude session that is Waiting only because a dialog is open
 (`waitingFor` exactly `dialog open`). Such a session is shown, counted and marked
 like any Waiting one, but does not ring: it is the operator's own doing and he is
 looking at it. If its reason later becomes anything else while it is still waiting,
-it enters the ring set and rings once at that moment; a pane latched by a BEL or by
-a quiet brigade rings whatever else it is; and the reason changes the bell and
-nothing else on screen. The *host bell* (a BEL written to banto's own terminal)
-rings when the ring set (the visible Waiting rows and marked panes, less dialog-open
-ones) gains a member, at most once per 3 seconds (`ATTENTION_BELL_COOLDOWN`, shared
-by every cause below). Only a staged pane draws a mark, and staging a brigade puts
-the pane focus on its Director's tile. *What staging does to an off-stage pane's
-mark* (established by driving the real staging path in a test): a BEL latch on an
-off-stage Worker's pane shows and rings once at staging and stays until that pane is
-focused; an off-stage member in Claude `waiting` (or a Codex member reporting
-`blocked`) shows and rings once at staging, except the Director, whose list row is
-visible off-stage and so already rang, from the list, when it started waiting; but a
-BEL latch on an off-stage Director's pane, like a quiet brigade's fire ("The quiet
-brigade's bell", known defect), is cleared by the same staging, because the Director
-is then the effectively focused pane, and is normally never drawn and never rings.
+it enters the ring set and rings once at that moment; a pane latched by a BEL rings
+whatever else it is (a quiet brigade's fire has its own record and rings through
+it); and the reason changes the bell and nothing else on screen. The *host bell* (a
+BEL written to banto's own terminal) rings when the ring set (the visible Waiting
+rows and marked panes, less dialog-open ones) gains a member, at most once per 3
+seconds (`ATTENTION_BELL_COOLDOWN`, shared by every cause below). **On stage and
+off.** A pane on stage (a staged brigade's panes, or one pane staged alone) speaks
+only through its own tile. A hosted member whose pane is not on stage has no row of
+its own (members are hidden from the list), so its Director's row speaks for it:
+when the member is Claude `waiting`, a Codex pane reporting `blocked`, or its child
+rang BEL while the pane was not effectively focused, the Director's row gets the
+waiting-colour dot and counts in `waiting N`. A member that is waiting only on a
+dialog the operator opened neither marks nor rings, as everywhere. A quiet brigade's
+fire marks the row the same way whether or not the brigade is on stage (and the
+Director's tile, if it is, since the tile reads the same Waiting row). The row's
+mark is display only: a set kept apart from the session's own activity, so the
+tile's word, the quit question, the quiet watch and the relay never read it. It is
+memory only, so a restart starts with none, and it ends when the operator is
+effectively focused on that Director's pane, the focus a BEL latch is cleared by:
+staging the brigade puts him there, so staging clears a quiet fire's mark in the
+update that stages it.
+
+**One event, one ring.** The bell is rung for events, not for row marks, and does
+not depend on what the list shows (a search that hides the Director's row does not
+silence it). A member's wait rings once, when it is first announced: through its
+Director's row when its pane was off stage, or on its own tile when it was on stage.
+It does not ring again when its brigade moves on or off the stage with the wait
+still standing: staging moves the mark from the row to the member's tile with no
+second ring, and leaving a brigade for another with a wait that began on stage still
+standing marks the row without one. A second member's wait rings even while the
+Director's row is already marked; a second quiet fire under a quiet mark that is
+still standing does not, being the same unlooked-at attention (the quiet fire rings
+when its record is made). A wait ends when something is known about the pane that is
+not waiting; or, for one that stood only on a BEL latch, when the latch is cleared,
+whatever is known about its activity (a BEL has no activity word to say it is over);
+or when its pane is gone (a pane later hosted under the same key is a new one). A
+wait that begins again rings anew. A pane about which nothing is known for the
+moment (a compaction fork or discovery renamed it and its row is not yet under the
+new id) says nothing either way, so a rename is not an event and the same wait does
+not ring twice. Every ring is under the same 3-second cooldown as every attention
+bell, which may swallow it.
+
 Codex's session files carry no Waiting state, so beside the pane's own `blocked`
 banto launches it with `tui.notifications` set to `approval-requested`,
 `async-question` and `plan-mode-prompt` (with `bel` as the method and `always` as
@@ -1243,8 +1459,9 @@ added since were not part of that measurement, and Codex's own approval heuristi
 decide how often an approval is asked at all.
 
 **The quiet brigade's bell.** The operator's reason: a brigade going quiet is the
-moment his input is wanted, and it is rare enough to deserve a sound. It uses the
-mechanism above rather than a new one.
+moment his input is wanted, and it is rare enough to deserve a sound. It rings the
+same host bell under the same cooldown as the mechanism above, and marks through a
+record of its own (see *Effect* below) rather than through a pane's latch.
 
 - *Watched:* every brigade whose Director is hosted; its members are every hosted
   member (the Director, the Workers, a Goinkyo).
@@ -1272,17 +1489,25 @@ mechanism above rather than a new one.
 - *Armed by real work:* a member reading not idle while its process is still
   starting up delays the bell like any not-idle reading (it breaks the stretch) but
   does not arm it. A not-idle reading arms the brigade only from a process that has
-  been sampled idle before (from the next sample on), or that was given work at or
-  after its start — by the operator's input forwarded to it, or by banto's own nudge
-  or kickoff; input written under the same key before this process started does not
-  count. Per process, so a relaunch under the same key starts over and a key rename
-  keeps what the process had. *Why, measured:* in the operator's trial on 2026-11-13
-  (event recording), opening a brigade of resumed sessions rang the bell about 5
-  seconds later with no work done: resumed Claude sessions read not idle for one to
-  two seconds while starting (run A: all idle 6.1 s after a spawn at 2.1 s; run B:
-  all idle 3.2 s after a spawn at 0.9 s). *Known consequence:* a resumed member that
-  starts working on its own, never touched and never seen idle, does not arm the
-  bell that first time.
+  been sampled idle before (from the next sample on) and is past its start-up (the
+  first 10 s after the process started, `PROCESS_START_GRACE`: "Decision
+  (2026-11-14): start-up is not work"), or that was given work at or after its
+  start, at any age — by the operator's keys or a paste forwarded to it (no mouse
+  event), or by banto's own nudge or kickoff; input written under the same key
+  before this process started does not count. Work still going when the grace ends
+  arms at the first reading past it. Per process, so a relaunch under the same key
+  starts over, with a new grace and with the previous process's stamps of work given
+  dropped when the new one is spawned (the relay's record is kept), and a key rename
+  keeps what the process had, including its start; the Director is covered like any
+  member, and a pane with no recorded start has no grace to wait out. *Why,
+  measured:* in the operator's trial on 2026-11-13 (event recording), opening a
+  brigade of resumed sessions rang the bell about 5 seconds later with no work done:
+  resumed Claude sessions read not idle for one to two seconds while starting (run
+  A: all idle 6.1 s after a spawn at 2.1 s; run B: all idle 3.2 s after a spawn at
+  0.9 s). *Known consequence:* a resumed member that starts working on its own,
+  never touched and never seen idle, does not arm the bell that first time, and
+  self-started work that ends within the first 10 s of a process does not arm it
+  either.
 - A member whose state is *unknown* blocks it and breaks the idle stretch: silence
   is not claimed on missing information. A *waiting* member is not idle.
 - *A dialog the operator opened:* a Claude member that is `waiting` with
@@ -1339,46 +1564,44 @@ mechanism above rather than a new one.
   prompt); the operator has an unsent draft in that pane (the retry waits for them);
   the last allowed attempt (three) was typed and its 15-second acknowledgement
   window has run out.
-- *Effect:* it marks the Director's pane and, through the bell's edge, rings (under
-  the 3-second cooldown). Not while the Director's pane is effectively focused (the
-  selected pane and banto's window focused) — there every turn the Director ends
-  would otherwise ring; with the window in the background it marks and rings. A
-  fired brigade is spent either way: being in the Director's pane does not save the
-  ring for when the operator leaves it. **Known defect:** for an off-stage brigade
-  nothing reaches the operator in the normal case. Its fire latches the mark on the
-  Director's pane, but only a staged pane draws one, and staging the brigade (Enter
-  or double-click on the Director's row, which resolves its membership and stages
-  it) puts the pane focus on the Director's tile, so `refresh_waiting_display`
-  removes the effectively focused pane's latch at the start of that same update,
-  before it computes the mark set. With banto's window focused there is no mark in
-  any frame, no bell, and the latch is gone, with the F4 switch off or on. Only if
-  the window is unfocused at the moment of staging does the mark appear, with one
-  bell, and it goes without a sound when the window regains focus. (Established by
-  driving the real staging path in a test; the earlier committed test that claimed
-  the mark and the bell wait until staging staged the brigade in a way the product
-  cannot, and is being re-expressed. No fix is described here; none exists yet.) A
-  brigade whose Director is not hosted is not watched. A brigade is judged only in a
-  tick whose relay observations include its Director (the store was read this tick
-  and still has the brigade, and the Director is hosted with a session), and the
-  observation is about the pane banto itself holds for that member: the pane is
-  hosted and banto's own membership for it is the same brigade and the same member
-  token. Any other observation is ignored by the bell — for "Director observed" and
-  for "unread mail" alike — and so only delays it; the reason, found in review, is
-  that one taken at face value could mark a brigade as observed, or mail as unread,
-  through a pane that is not that member (a tick gathered just before a session-id
-  change the core has already applied). In a tick without that observation — a
-  roster that could not be read, or the brigade gone from the store by any path,
-  another banto on the same database included — nothing fires and the quiet stretch
-  starts over; the armed state is kept. A disband in flight does not fire and its
-  watch is kept as it was; a successful disband ends the watch (what was kept for it
-  is dropped with it); a failed one leaves it watched; and a former Director left
-  open on its own never rings for the brigade that is gone (its pane keeps the
-  membership maps it was staged with, which is why the test is observation, not
-  those maps). A brigade formed again around the same Director is a new brigade and
-  starts fresh. Consequences: during a roster outage of any length nothing rings,
-  and the count starts over when observations return; a Director hosted before its
-  session is discovered is not observed, so its brigade is not judged until
-  discovery completes.
+- *Effect:* it records the brigade as wanting the operator (memory only) and, from
+  that record, marks the Director's row in the list (the waiting-colour dot, counted
+  in `waiting N`; a staged Director's tile reads the same Waiting row) and rings the
+  host bell under the 3-second cooldown, whether or not the brigade is on stage and
+  whatever the operator is doing in another brigade; the ring is made when the
+  record is made, so a second fire under a mark still standing (not yet looked at)
+  records nothing new and is silent. Not while the Director's pane is effectively
+  focused (the selected pane and banto's window focused) — there every turn the
+  Director ends would otherwise ring; with the window in the background it marks and
+  rings, and with `F4` on the bell rings while he is in the pane. A fired brigade is
+  spent either way: being in the Director's pane does not save the ring for when the
+  operator leaves it. The mark ends when the operator reaches the Director's pane,
+  which staging the brigade does, without a second ring; the record of a brigade
+  whose Director is no longer hosted, or that is disbanded, is dropped. Until
+  2026-11-14 the fire latched the Director's pane instead, and so reached the
+  operator only for a staged brigade ("Decision (2026-11-14): an off-stage brigade
+  speaks through its Director's row"). A brigade whose Director is not hosted is not
+  watched. A brigade is judged only in a tick whose relay observations include its
+  Director (the store was read this tick and still has the brigade, and the Director
+  is hosted with a session), and the observation is about the pane banto itself
+  holds for that member: the pane is hosted and banto's own membership for it is the
+  same brigade and the same member token. Any other observation is ignored by the
+  bell — for "Director observed" and for "unread mail" alike — and so only delays
+  it; the reason, found in review, is that one taken at face value could mark a
+  brigade as observed, or mail as unread, through a pane that is not that member (a
+  tick gathered just before a session-id change the core has already applied). In a
+  tick without that observation — a roster that could not be read, or the brigade
+  gone from the store by any path, another banto on the same database included —
+  nothing fires and the quiet stretch starts over; the armed state is kept. A
+  disband in flight does not fire and its watch is kept as it was; a successful
+  disband ends the watch (what was kept for it is dropped with it); a failed one
+  leaves it watched; and a former Director left open on its own never rings for the
+  brigade that is gone (its pane keeps the membership maps it was staged with, which
+  is why the test is observation, not those maps). A brigade formed again around the
+  same Director is a new brigade and starts fresh. Consequences: during a roster
+  outage of any length nothing rings, and the count starts over when observations
+  return; a Director hosted before its session is discovered is not observed, so its
+  brigade is not judged until discovery completes.
 - *The principle:* the bell decides only from what the tick observed. Why: a
   remembered "unread" or "exists" could hold or ring forever once the thing it
   described could no longer be checked (found in review).
@@ -2296,6 +2519,12 @@ it still holds the nudge until the operator presses Enter in that pane (an
 Enter on the empty line is enough). So the requirement that a nudge wait only
 for a draft that is really there is **not met for Codex**.
 
+**Known limit (an observation of 2026-11-14, found by reading and by a test that
+tripped on it, not seen in the field):** a nudge's delayed submitting Enter that is
+still queued when its pane is relaunched is written to the new process, and counts
+as work given to it. It needs a nudge written less than 300 ms
+(`RELAY_SUBMIT_DELAY`) before the pane exits.
+
 `[brigade].relay` in config.toml (`RelayMode`, default `Auto`) toggles this
 off (`Manual`) for an operator who would rather prompt `check_messages`
 themselves.
@@ -2327,11 +2556,14 @@ operator restarted banto without knowing a command was still running in a pane t
 said "alive".) The relay, which asks whether a member can be nudged, still treats
 `shell` as idle enough: the turn has ended and the member can take a message; it
 never nudges a `waiting` session, `dialog open` included, since a nudge's Enter
-would choose something in the dialog. The same classification without its last step, the transcript's age
-(`live_activity`), is what the tile of a member with no list row shows: a Claude
-Worker that has not run a turn has a live file and no transcript, so its word comes
-from the file as the relay read it this tick, and goes with the tick that does not
-see it. The raw status stays visible in one place: the
+would choose something in the dialog. The same classification without its last step,
+the transcript's age (`live_activity`), is what the tile of a member with no list
+row shows: a Claude Worker that has not run a turn has a live file and no
+transcript, so its word comes from the file as the relay read it this tick, and goes
+with the tick that does not see it. A Director's row is the one place a brigade's
+attention shows in the list: its dot reads Waiting whatever its own state while its
+brigade is marked ("Attention"); the row's activity itself, which the tile's word
+and the decisions read, is untouched. The raw status stays visible in one place: the
 `brigade_status` MCP tool prints the live file's own word (`busy`, `waiting`,
 `idle`, `shell`) for a Claude peer.
 

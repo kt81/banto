@@ -310,6 +310,29 @@ const MIGRATIONS: &[&str] = &[
     // no banto starts or looks up any more. v1 above still creates `panes` — DO
     // NOT "clean up" v1, for the reason v11 gives.
     "DROP TABLE IF EXISTS panes;",
+    // v18: where a member's own mail begins, and a Director's unanswered request.
+    //
+    // `brigade_members.joined_after_id`: the highest message id that existed when
+    // the member joined (`insert_member` writes it in the same statement as the
+    // row, from the same value that seeds the read cursor). The two glances a
+    // collapsed tile shows only look at messages past it, so a new member does not
+    // show a broadcast queued before it existed, and a Goinkyo — whose token is
+    // reused by every consultation — does not show the previous one's lines. A message
+    // id, not a time: ids are never reused and are ordered across processes, a
+    // clock is neither. It is on the member's own row so that a dismissed member's
+    // value goes with it and the next member under the token starts fresh. 0, the
+    // default, means no bound, which is what every member that joined before this
+    // column existed gets: nothing recorded when they joined, and a guess would
+    // hide mail they did receive. A migration that rebuilds `brigade_members` must
+    // copy this column, or every member silently goes back to 0.
+    //
+    // `brigades.request_text`, `request_seq`, `request_at_ms`: a Director's
+    // unanswered decision request, one per brigade. They live on `brigades` so that
+    // disbanding the brigade deletes them with it. NULL / 0 / NULL is "no request".
+    "ALTER TABLE brigade_members ADD COLUMN joined_after_id INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE brigades ADD COLUMN request_text TEXT;
+    ALTER TABLE brigades ADD COLUMN request_seq INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE brigades ADD COLUMN request_at_ms INTEGER;",
 ];
 
 /// Applies all pending migrations. A `user_version` outside the known range
@@ -1591,6 +1614,131 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v17_to_v18_upgrade_adds_the_join_point_and_the_request_columns_and_keeps_what_was_there() {
+        use banto_core::model::BrigadeRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v17 code left it: a brigade with a Director and a Worker, and
+        // a broadcast that was queued while that Worker was already a member.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..17] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 3000)",
+                [],
+            )
+            .unwrap();
+            for (token, role) in [("director", "director"), ("worker-1", "worker")] {
+                conn.execute(
+                    "INSERT INTO brigade_members (brigade_id, member_token, role) VALUES (1, ?1, ?2)",
+                    rusqlite::params![token, role],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO brigade_messages (brigade_id, from_session, to_role, body, created_at_ms)
+                 VALUES (1, 'director', 'worker', 'old broadcast', 1000)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 17).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        // Members that joined before the column existed have no recorded join point, which
+        // reads as "no bound": their tiles show what they showed before.
+        let join_points: Vec<(String, i64)> = store
+            .conn
+            .prepare(
+                "SELECT member_token, joined_after_id FROM brigade_members ORDER BY member_token",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            join_points,
+            [("director".to_string(), 0), ("worker-1".to_string(), 0)]
+        );
+        assert_eq!(
+            store
+                .latest_inbound_glance(1, "worker-1", BrigadeRole::Worker)
+                .unwrap()
+                .map(|glance| glance.line),
+            Some("old broadcast".to_string())
+        );
+
+        // An existing brigade has no request recorded.
+        let request = |store: &Store| -> (Option<String>, i64, Option<i64>) {
+            store
+                .conn
+                .query_row(
+                    "SELECT request_text, request_seq, request_at_ms FROM brigades WHERE id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(request(&store), (None, 0, None));
+
+        // A member added afterwards is bound to the broadcast's id: it sees nothing older.
+        let token = store.add_worker(1, None).unwrap();
+        let joined_after: i64 = store
+            .conn
+            .query_row(
+                "SELECT joined_after_id FROM brigade_members WHERE member_token = ?1",
+                [&token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined_after, 1);
+        assert_eq!(
+            store
+                .latest_inbound_glance(1, &token, BrigadeRole::Worker)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fresh_database_has_the_join_point_and_the_request_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let brigade = store.create_brigade("cell").unwrap();
+        let (text, seq, at): (Option<String>, i64, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT request_text, request_seq, request_at_ms FROM brigades WHERE id = ?1",
+                [brigade],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((text, seq, at), (None, 0, None));
+        let columns: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('brigade_members')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "joined_after_id"),
+            "{columns:?}"
+        );
     }
 
     #[test]

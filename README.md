@@ -102,25 +102,26 @@ members with unread messages and wakes them by typing a short fixed nudge
 into their stdin — so a Director→Worker→Director round trip needs no human
 ferrying at all. This repository was largely built through that loop.
 
-When every live member of a brigade (the Director, the Workers, a Goinkyo) has
-been idle for 5 seconds after any of them did real work (starting up is not
-work) — counted from the
-last member going idle or banto last prompting one — the brigade has
-gone quiet — the moment your input is wanted. banto then marks the Director's
-pane (the magenta border a waiting session gets, though a focused pane keeps its
-focus colour) and rings the terminal bell.
-It stays silent while you are looking at the Director's pane (that pane
-selected and banto's window focused); with the window in the background it
-marks and rings. A member whose state banto cannot read keeps it quiet, as does a
-new Codex Worker or Goinkyo that banto has yet to start, as does a member with an
-unread report still on its way. A brigade that is not on screen does not notify you
-when it goes quiet; a member of it that is waiting on you is shown when you open it.
-A picker you open yourself in a Claude pane (a slash command such as `/model`) shows
-as waiting but does not ring, and keeps its brigade from counting as quiet while it
-is open.
-`F4` switches on "ring even while the Director's pane is focused" (the
-bell only, no mark); the status bar shows `BELL ALWAYS` left of the counts
-while it is on, and the setting is remembered across restarts.
+When every live member of a brigade (the Director, the Workers, a Goinkyo) has been
+idle for 5 seconds after any of them did real work (starting up is not work) —
+counted from the last member going idle or banto last prompting one — the brigade
+has gone quiet — the moment your input is wanted. banto then marks the Director (the
+waiting dot on its row in the list, counted in the sidebar's `waiting N`, and the
+magenta border a waiting session gets on its pane, though a focused pane keeps its
+focus colour) and rings the terminal bell. It stays silent while you are looking at
+the Director's pane (that pane selected and banto's window focused); with the window
+in the background it marks and rings. A member whose state banto cannot read keeps
+it quiet, as does a new Codex Worker or Goinkyo that banto has yet to start, as does
+a member with an unread report still on its way. A brigade that is not on screen
+reaches you too: its fire marks its Director's row and rings, even while you work in
+another brigade, and a member of it that is waiting on you (or whose child rang the
+bell) marks that row and rings once. The mark ends when you reach that Director's
+pane, and opening the brigade does not ring again. A picker you open yourself in a
+Claude pane (a slash command such as `/model`) shows as waiting but does not ring,
+and keeps its brigade from counting as quiet while it is open. `F4` switches on
+"ring even while the Director's pane is focused" (the bell only, no mark); the
+status bar shows `BELL ALWAYS` left of the counts while it is on, and the setting is
+remembered across restarts.
 
 Forming your first Codex brigade needs one thing from you: Codex reviews
 banto's own hook for trust at its own startup, once — not per launch — so
@@ -207,19 +208,20 @@ still accepted, do nothing, and will be removed.)
 
 One table. The first group is the list; the rest is what the panes add.
 
-`q`/`Esc` quits at once when every hosted session is known to be idle, or none
-is hosted. Otherwise it asks first: the status bar shows `Esc again to quit —
-N session(s) not idle`, and a second `q`/`Esc` within 3 seconds quits, since
-quitting ends every hosted process. N counts the sessions that are working,
-waiting on you, of unknown state, or that were typed into (by you, or by banto
-itself) within the last 3 seconds. A Claude Code session reports its own state,
-and so does a Codex one: banto reads the status report the Codex interface writes
-to its terminal (working, blocked on you, done or idle) and, until a session has
-made one, its last turn in the rollout. Codex records nothing about a command it
-left running in the background, so a Codex session that has not reported reads
-as idle. Once quitting is decided the status bar reads `Closing —
-ending N session(s)…` (`Closing…` with none) until banto exits: each session
-is closed in turn and given up to 5 seconds to finish.
+`q`/`Esc` quits at once when every hosted session is known to be idle, or none is
+hosted. Otherwise it asks first: the status bar shows `Esc again to quit — N
+session(s) not idle`, and a second `q`/`Esc` within 3 seconds quits, since quitting
+ends every hosted process. N counts the sessions that are working, waiting on you,
+of unknown state, or that were given work (a key or a paste by you, or something
+typed by banto itself) within the last 3 seconds; clicking or scrolling a pane does
+not count. A Claude Code session reports its own state, and so does a Codex one:
+banto reads the status report the Codex interface writes to its terminal (working,
+blocked on you, done or idle) and, until a session has made one, its last turn in
+the rollout. Codex records nothing about a command it left running in the
+background, so a Codex session that has not reported reads as idle. Once quitting is
+decided the status bar reads `Closing — ending N session(s)…` (`Closing…` with none)
+until banto exits: each session is closed in turn and given up to 5 seconds to
+finish.
 
 | Key | Action |
 |---|---|
@@ -326,8 +328,10 @@ message_log = false
 # Role briefings appended to each member's system prompt at launch.
 # {brigade} / {token} / {peers} are substituted; "" launches with no
 # briefing. The defaults tell a Director to delegate (and that it can name a
-# Worker with name_member) — that policy is yours to set, which is why it
-# is a setting.
+# Worker with name_member) and a Worker to say which source each claim about the
+# repository rests on (committed code from `git show HEAD:<path>`, the working
+# tree only for files the Director asked it to edit or review) — that policy is
+# yours to set, which is why it is a setting.
 director_prompt = "..."
 worker_prompt = "..."
 
@@ -360,7 +364,8 @@ prohibitions are maintained by review (see `docs/DISCIPLINE.md` §2 for the
 full breakdown, including a real breach that survived it). Event streams can
 be recorded (`BANTO_RECORD_EVENTS`) and replayed deterministically
 (`banto_core::replay`) — timeouts and debounces are tested by arithmetic,
-not by sleeping.
+not by sleeping. `BANTO_BELL_LOG=<file>` appends one line per bell banto rings, with
+the decision that rang it (ids and counts only, no session text).
 
 Further reading: [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) (design/
 requirements), [docs/notes/](docs/notes/) (on-device verification notes for
