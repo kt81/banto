@@ -150,6 +150,7 @@ def print_report(args, weights, since, until, sessions, live, dups, erows, srows
     P("USAGE REPORT (counts from local transcripts; no model was run)")
     P(tr.ASSUMPTION)
     P(weights.describe())
+    P(tr.unmatched_line(tr.unmatched_models(sessions, weights)))
     P(f"window: since {tr.iso(since) or '-'} until {tr.iso(until) or '-'}; project filter {args.project or '-'}")
     P(f"files {len(sessions)}; lines {sum(s.lines for s in sessions)}; parsed {sum(s.parsed for s in sessions)}; "
       f"ignored (other record types) {sum(s.ignored for s in sessions)}; SKIPPED (broken) {sum(s.skipped for s in sessions)}")

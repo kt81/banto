@@ -108,7 +108,7 @@ class AcMeasureHelperTests(unittest.TestCase):
         # 1000 tokens in, 350 characters out at 3.5 characters per token = 100 output tokens
         ot, a, b, c = ac_measure.summary_cost_estimate(1000, 350, tr.Weights())
         self.assertAlmostEqual(ot, 100)
-        self.assertAlmostEqual(a, 1000 * 0.1 + 100 * 5)     # input as cache read
+        self.assertAlmostEqual(a, 1000 * 0.025 + 100 * 5)   # input as cache read
         self.assertAlmostEqual(b, 1000 * 1.0 + 100 * 5)     # input uncached
         self.assertAlmostEqual(c, 1000 * 1.25 + 100 * 5)    # input as cache write
 
@@ -131,7 +131,8 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(len(list(csv.DictReader(fh))), 4)
         with open(os.path.join(self.out, "errands.csv"), encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))
-        self.assertEqual([(r["calls"], r["sends"], r["weighted"]) for r in rows], [("2", "1", "21370.0")])
+        self.assertEqual([(r["calls"], r["sends"], r["weighted"]) for r in rows], [("2", "1", "6370.0")])
+        self.assertEqual({r["weights_assumed"] for r in rows}, {tr.Weights().basis()})
 
     def test_window_filters_calls(self):
         rc, stdout, _ = run_main(usage_report, ["--root", self.root, "--out", self.out, "--since", ts(3)])
@@ -239,9 +240,16 @@ class QualityEndToEnd(unittest.TestCase):
         self.assertEqual([(e[0], e[1], e[2]) for e in ch["errands"]], [("worker-1", "implementation", "worker-name")])
         self.assertEqual([r["verdict"] for r in ch["reviews"]], [])      # an implementation errand is not a review
         self.assertEqual(ch["usage"]["worker-1"][0], 3)
-        self.assertAlmostEqual(ch["usage"]["worker-1"][1], 31370)
+        self.assertAlmostEqual(ch["usage"]["worker-1"][1], 8870)
         for name in ("report.txt", "candidates_a.txt", "candidates_b.txt", "errands_dump.txt"):
             self.assertTrue(os.path.exists(os.path.join(self.out, name)), name)
+
+    def test_a_bad_model_weight_is_refused_before_anything_is_written(self):
+        for value in ("fable", "fable=nan", "=2", "fable=1001"):
+            rc, _, err = self.run_quality("--model-weight", value)
+            self.assertEqual(rc, 2, value)
+            self.assertIn("--model-weight", err)
+        self.assertFalse(os.path.exists(self.out))
 
     def test_without_a_role_name_the_keyword_decides(self):
         rc, _, err = self.run_quality()
@@ -265,10 +273,18 @@ class QualityEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         with open(os.path.join(self.out, "changes.json"), encoding="utf-8") as fh:
             data = json.load(fh)
-        self.assertEqual(data["weights"], {"input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 5, "model_multipliers": {}})
+        self.assertEqual(data["weights"], {"input": 1, "cache_write": 1.25, "cache_read": 0.025, "output": 5,
+                                           "model_multipliers": {"fable": 4, "haiku": 0.68, "opus": 1, "sonnet": 0.68},
+                                           "other_models": 1})
+        # the synthetic model name matches no family: counted and named, not silently weighed at 1.0
+        self.assertEqual(list(data["unmatched_models"]), ["model-a"])
+        self.assertGreaterEqual(data["unmatched_models"]["model-a"]["calls"], 3)
         self.assertEqual(data["assumption"], tr.ASSUMPTION)
         with open(os.path.join(self.out, "report.txt"), encoding="utf-8") as fh:
-            self.assertIn(tr.ASSUMPTION, fh.read())
+            report = fh.read()
+        self.assertIn(tr.ASSUMPTION, report)
+        self.assertIn("fable 4", report)
+        self.assertIn("models matching no multiplier (weighed at 1.0): model-a (", report)
 
     def test_a_symlinked_output_file_is_never_written_through(self):
         os.makedirs(self.out)

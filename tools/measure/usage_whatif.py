@@ -230,6 +230,7 @@ def main(argv=None):
     P("WHAT-IF REPORT (counts from local transcripts; no model was run)")
     P(tr.ASSUMPTION)
     P(f"window since {tr.iso(since) or '-'} until {tr.iso(until) or '-'}; " + w.describe())
+    P(tr.unmatched_line(tr.unmatched_models(sessions, w)))
     P("")
 
     # ---- 1. baselines ----

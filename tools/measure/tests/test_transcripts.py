@@ -179,23 +179,24 @@ class DirectorTurnTests(Base):
 class WeightTests(unittest.TestCase):
     def test_default_weights(self):
         w = tr.Weights()
-        # input 1 + cache-write 1.25 + cache-read 0.1 + output 5
-        self.assertAlmostEqual(w.cost("m", 10, 100, 1000, 20), 10 + 125 + 100 + 100)
+        # input 1 + cache-write 1.25 + cache-read 0.025 + output 5; "m" matches no model family
+        self.assertAlmostEqual(w.cost("m", 10, 100, 1000, 20), 10 + 125 + 25 + 100)
 
-    def test_model_multiplier_exact_and_longest_prefix(self):
+    def test_model_multiplier_substring_and_longest_key(self):
         w = tr.Weights(model_mult={"fam": 2.0, "fam-big": 3.0, "exact-model": 0.5})
         self.assertEqual(w.mult("exact-model"), 0.5)
         self.assertEqual(w.mult("fam-big-1"), 3.0)
         self.assertEqual(w.mult("fam-small"), 2.0)
+        self.assertEqual(w.mult("a-fam-b"), 2.0)          # a substring anywhere, not a prefix
         self.assertEqual(w.mult("other"), 1.0)
-        self.assertAlmostEqual(w.cost("fam-small", 10, 100, 1000, 20), 335 * 2.0)
+        self.assertAlmostEqual(w.cost("fam-small", 10, 100, 1000, 20), 260 * 2.0)
 
     def test_weights_from_args(self):
         import argparse
         ap = argparse.ArgumentParser()
         tr.add_weight_args(ap)
         w = tr.weights_from_args(ap.parse_args(["--wcw", "2", "--model-weight", "a=4"]))
-        self.assertEqual((w.wcw, w.wcr, w.wout, w.mult("a-1")), (2.0, 0.1, 5.0, 4.0))
+        self.assertEqual((w.wcw, w.wcr, w.wout, w.mult("a-1")), (2.0, 0.025, 5.0, 4.0))
         with self.assertRaises(ValueError):
             tr.weights_from_args(ap.parse_args(["--model-weight", "nonsense"]))
 
@@ -207,7 +208,7 @@ class WeightTests(unittest.TestCase):
         sessions = tr.load_sessions(root)
         tr.prepare(sessions, tr.Weights(), since=tr.parse_ts(ts(10)))
         c1, c2 = sessions[0].calls["m1"], sessions[0].calls["m2"]
-        self.assertAlmostEqual(c1.weighted, 335)
+        self.assertAlmostEqual(c1.weighted, 260)
         self.assertEqual((c1.in_window, c2.in_window), (False, True))
         self.assertEqual(tr.live_calls(sessions[0]), [c2])
 

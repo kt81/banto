@@ -19,7 +19,8 @@ import transcripts as tr
 import usage_report
 import usage_whatif as wi
 
-DEFAULT_BASIS = "input=1 cache_write=1.25 cache_read=0.1 output=5 model_multipliers=none"
+DEFAULT_BASIS = ("input=1 cache_write=1.25 cache_read=0.025 output=5 "
+                 "model_multipliers=fable=4,haiku=0.68,opus=1,sonnet=0.68 other_models=1")
 
 
 class Base(unittest.TestCase):
@@ -465,14 +466,15 @@ class SelfDescribingOutputs(Base):
         argv = ["--root", self.root, "--out", out, "--wcr", "0.2", "--model-weight", "model-a=2"]
         self.assertEqual(run_main(usage_report, argv)[0], 0)
         basis = {r["weights_assumed"] for r in self.rows(os.path.join(out, "errands.csv"))}
-        self.assertEqual(basis, {"input=1 cache_write=1.25 cache_read=0.2 output=5 model_multipliers=model-a=2"})
+        self.assertEqual(basis, {"input=1 cache_write=1.25 cache_read=0.2 output=5 "
+                                 "model_multipliers=fable=4,haiku=0.68,model-a=2,opus=1,sonnet=0.68 other_models=1"})
 
 
 class WhatIfCarry(Base):
     def test_a_threshold_crossed_before_the_window_is_carried_into_it(self):
         write_jsonl(os.path.join(self.proj, "w.jsonl"), synth.worker_records())
         sessions = tr.load_sessions(self.root)
-        w = tr.Weights()
+        w = tr.Weights(wcr=0.1)          # the hand arithmetic below is at 0.1; the default is 0.025
         tr.prepare(sessions, w, since=tr.parse_ts(ts(1)))          # m0 (minute 0) is before the window
         s = sessions[0]
         wi.attach_order(s)

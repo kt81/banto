@@ -16,8 +16,10 @@ class WhatIfArithmetic(unittest.TestCase):
         m1       10      10            0      100000    100010
         m2       10      10         1000      100000    101010
 
-    Weights: input 1, cache-write 1.25, cache-read 0.1, output 5. All figures
-    below were worked out by hand.
+    Weights: input 1, cache-write 1.25, cache-read 0.1, output 5, every model 1.0
+    (model-a matches no family). The cache-read weight is set here because the hand
+    arithmetic below was done at 0.1; the default is 0.025. All figures below were
+    worked out by hand.
     """
 
     def setUp(self):
@@ -25,7 +27,7 @@ class WhatIfArithmetic(unittest.TestCase):
         self.addCleanup(synth.rmtree, root)
         write_jsonl(os.path.join(proj, "w.jsonl"), synth.worker_records())
         self.sessions = tr.load_sessions(root)
-        self.w = tr.Weights()
+        self.w = tr.Weights(wcr=0.1)
         tr.prepare(self.sessions, self.w)
         self.s = self.sessions[0]
         wi.attach_order(self.s)

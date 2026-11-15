@@ -339,9 +339,11 @@ class Analysis:
 
 
 def aggregate(changes, an, commits, sessions, label_of):
-    """Fill each change with errands, usage, reviews, rework, base-hash check and later fixes."""
+    """Fill each change with errands, usage, reviews, rework, base-hash check and later fixes.
+    Returns the calls whose cost went into some change's usage."""
     since = an.since
     usage = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))  # change id -> label -> [calls, weighted]
+    counted = []
     for s in sessions:
         lab = label_of.get(s.id, "unattributed")
         for c in s.calls.values():
@@ -353,6 +355,7 @@ def aggregate(changes, an, commits, sessions, label_of):
             a = usage[ch["id"]][lab]
             a[0] += 1
             a[1] += c.weighted
+            counted.append(c)
     for ch in changes:
         ch["errands"] = [e for e in an.errands if change_of(changes, since, e["start"]) is ch]
         ch["straddle_out"] = [e for e in ch["errands"] if e["end"] > ch["end"]]
@@ -386,6 +389,7 @@ def aggregate(changes, an, commits, sessions, label_of):
                 if ov:
                     later.append((c["hash"], c["subject"], len(ov), ov))
         ch["later_fixes"] = later
+    return counted
 
 
 def find_candidates(changes, since, director_events, release_triggers, horizon_h):
@@ -453,7 +457,7 @@ def write_errands_dump(out, errands, changes, since):
                      f"nrep={len(e['reports'])} tok={toks} | {excerpt(e['instr'], 90)} || {excerpt(rep, 110)}\n")
 
 
-def render_report(args, w, director_id, brigade, since, until, commits, changes, errands, label_of, missing, out_dir):
+def render_report(args, w, unmatched, director_id, brigade, since, until, commits, changes, errands, label_of, missing, out_dir):
     lines = []
     P = lines.append
     end = until or datetime.now(timezone.utc)
@@ -464,6 +468,7 @@ def render_report(args, w, director_id, brigade, since, until, commits, changes,
     no_usage = sorted({e["worker"] for e in errands} - set(label_of.values()))
     P(f"workers with errands but no transcript found (usage unmeasured): {', '.join(no_usage) or '-'}; transcript labels found: {', '.join(sorted(set(label_of.values())))}")
     P(w.describe() + ". Workers without a Claude transcript (for example Codex) have no usage here.")
+    P(tr.unmatched_line(unmatched))
     P(tr.ASSUMPTION)
     P("")
     P("PER-CHANGE TABLE")
@@ -500,7 +505,7 @@ def render_report(args, w, director_id, brigade, since, until, commits, changes,
     return lines
 
 
-def write_changes_json(out, changes, weights):
+def write_changes_json(out, changes, weights, unmatched):
     def plain(ch):
         d = {
             "id": ch["id"], "commits": [(c["hash"], c["subject"], c["ts"].isoformat()) for c in ch["commits"]],
@@ -510,7 +515,8 @@ def write_changes_json(out, changes, weights):
             "later_fixes": [(h, sj, n) for h, sj, n, _ in ch["later_fixes"]],
         }
         return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
-    doc = {"assumption": tr.ASSUMPTION, "weights": weights.as_dict(), "changes": [plain(ch) for ch in changes]}
+    doc = {"assumption": tr.ASSUMPTION, "weights": weights.as_dict(),
+           "unmatched_models": unmatched, "changes": [plain(ch) for ch in changes]}
     with tr.open_output(os.path.join(out, "changes.json")) as fh:
         json.dump(doc, fh, ensure_ascii=False, default=str, indent=1)
 
@@ -690,7 +696,7 @@ def main(argv=None):
     if until:
         commits = [c for c in commits if c["ts"] < until]
     changes = group_changes(commits, since, args.merge_gap_min)
-    aggregate(changes, an, commits, sessions, label_of)
+    unmatched = tr.unmatched_in(aggregate(changes, an, commits, sessions, label_of), w)
 
     releases = [(e[1], "release build (Director)") for e in director_events if e[0] == "release"]
     for s in sessions:
@@ -702,10 +708,10 @@ def main(argv=None):
     try:
         write_candidates(out, changes, cand_a, cand_b, args.horizon_h)
         write_errands_dump(out, an.errands, changes, since)
-        lines = render_report(args, w, director.id, brigade, since, until, commits, changes, an.errands, label_of, missing, out)
+        lines = render_report(args, w, unmatched, director.id, brigade, since, until, commits, changes, an.errands, label_of, missing, out)
         with tr.open_output(os.path.join(out, "report.txt")) as fh:
             fh.write("\n".join(lines))
-        write_changes_json(out, changes, w)
+        write_changes_json(out, changes, w, unmatched)
     except tr.OutDirError as err:
         print(err, file=sys.stderr)
         return 2

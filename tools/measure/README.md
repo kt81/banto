@@ -38,7 +38,10 @@ or by default every Worker session with a compaction at or after T), it adds the
 errands and the files re-read after a compaction. It also reports what started each
 compaction. It prints a report and writes no file. The summarising call that a
 compaction makes is not in any transcript, so its cost is estimated from stated
-assumptions, shown separately in its section 3.
+assumptions, shown separately in its section 3. That estimate is priced with the
+multiplier of an inferred model: the session's last call with tokens before the
+compaction, else its first such call after. Zero-token placeholder calls are skipped.
+Each row names the model with "(inferred)", or says "no model found (counts 1.0)".
 
 **`quality_report.py`: per change.** For one banto brigade it groups the git
 commits of a repository into changes (commits no more than `--merge-gap-min`
@@ -94,9 +97,10 @@ Each script is run as `python tools/measure/<script>.py`. Full flag lists are in
   or `cannot write <path>: <reason>` to stderr and exits 2, with no traceback; the file
   at that name is left as it was.
 - `--wcw`, `--wcr`, `--wout`: the weights of cache-creation, cache-read and output
-  tokens (defaults 1.25, 0.1 and 5; each 0 to 1000). See the next section.
-- `--model-weight MODEL=MULT`: a multiplier per model, 0 to 1000, by exact name or
-  longest prefix; 1.0 for every model by default. MODEL must be non-empty and the
+  tokens (defaults 1.25, 0.025 and 5; each 0 to 1000). See the next section.
+- `--model-weight KEY=MULT`: a multiplier, 0 to 1000, for every model whose name
+  contains KEY (case-insensitive; the longest matching key wins). Repeatable; it
+  replaces a default with the same KEY or adds a new one. KEY must be non-empty and
   `=` is required.
 
 Each script's own flags are in its `--help`. Two to know: `ac_measure` requires
@@ -114,18 +118,32 @@ a non-empty comma-separated list of whole numbers 1 to 1000000000.
 
 The weighted cost of a call is its input tokens, plus its cache-creation tokens
 times `--wcw`, plus its cache-read tokens times `--wcr`, plus its output tokens
-times `--wout`, times its model's multiplier. Those weights are an assumption about
-how a subscription counts usage, not a known fact: nothing here has been checked
-against any plan's real accounting. Set them to whatever you believe your plan
-charges for, and read every weighted figure as relative to the others, not as a
-usage number. Each script's `--help` and report say the same.
+times `--wout`, all times its model's multiplier. Those weights are an assumption
+about how a subscription counts usage, not a known fact: the only check against a
+plan's real accounting is the small fit described below. Set them to whatever you
+believe your plan charges for, and read every weighted figure as relative to the
+others, not as a usage number. Each script's `--help` and report say the same.
+
+The default multipliers, relative to Opus, are opus 1, sonnet 0.68, fable 4 and
+haiku 0.68. A key matches a model name when it occurs in the name, ignoring case; a
+model matching no key weighs 1.0. Such models are named in the report's "models
+matching no multiplier" line and in `unmatched_models` in `changes.json`. Calls with
+no tokens are not listed.
+
+Where the defaults come from: an unofficial outside report of measurements of
+subscription usage headers (posted on Reddit), not anything Anthropic publishes.
+That source is not verified. Fable's 4, relative to Sonnet's 0.68, was fitted to
+usage-screen readings: on one machine the defaults fitted five of six readings within
+the display's rounding (two screenshots of three bars, 2026-11-15 UTC). The Opus:Sonnet
+ratio (1 : 0.68) is the outside report's and is unchecked here. Haiku is unknown: its
+0.68 is a placeholder copied from Sonnet's, so that it is never silently 1.0.
 
 Every CSV that carries a weighted cost ends with a `weights_assumed` column naming
-the weights, so a file shared on its own still shows them. `usage_report` writes it
-in `calls.csv`, `errands.csv` and `sessions.csv`; `usage_whatif` in `whatif_A.csv`.
-`context_series.csv` has no weighted column. `quality_report`'s `changes.json` is an
-object with `assumption`, `weights` and `changes` keys, so the weights travel with
-the figures.
+the weights and multipliers, so a file shared on its own still shows them.
+`usage_report` writes it in `calls.csv`, `errands.csv` and `sessions.csv`;
+`usage_whatif` in `whatif_A.csv`. `context_series.csv` has no weighted column.
+`quality_report`'s `changes.json` is an object with `assumption`, `weights`,
+`unmatched_models` and `changes` keys.
 
 ## Privacy
 
@@ -147,7 +165,7 @@ Never commit these files.
 - **Codex sessions.** Their transcripts carry no per-call usage, so they are not
   counted.
 - **The summarising call of a compaction.** It is not in any transcript; `ac_measure`
-  estimates it and says so.
+  estimates it, with the model inferred as described above, and says so.
 - **Real billing or limits.** Nothing here reads a plan's usage, quota or invoice.
 - **Meaning.** Errand kinds, review verdicts, retractions and the two candidate
   lists are keyword heuristics tuned on one team's phrasing, under the named

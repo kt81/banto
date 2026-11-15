@@ -38,7 +38,11 @@ from datetime import datetime, timedelta, timezone
 
 ASSUMPTION = (
     "The weights below are an assumption about how the subscription counts "
-    "usage, not a known fact."
+    "usage, not a known fact. Of the default per-model multipliers, Fable's 4 "
+    "(relative to Sonnet's 0.68) was fitted to usage-screen readings; the "
+    "Opus:Sonnet ratio (1 : 0.68) is an unofficial outside report's and is "
+    "unchecked here; Haiku's is unknown and its 0.68 is a placeholder copied "
+    "from Sonnet so that it is never silently 1.0."
 )
 
 # ---------------------------------------------------------------------------
@@ -321,19 +325,51 @@ def open_output(path, newline=None):
 # weights
 # ---------------------------------------------------------------------------
 
+# How much one weighted token of each model family counts against the subscription, relative to
+# Opus. Not from anything Anthropic publishes. Fable's 4, relative to Sonnet's 0.68, was fitted to
+# the operator's usage-screen readings; the Opus:Sonnet ratio (1 : 0.68) is an unofficial outside
+# report's and was not checked here; Haiku's value is unknown and its 0.68 is a placeholder copied
+# from Sonnet so that it is never silently 1.0. ASSUMPTION says the same wherever the multipliers
+# are printed. Override any of them with --model-weight.
+DEFAULT_MODEL_MULT = {"opus": 1.0, "sonnet": 0.68, "fable": 4.0, "haiku": 0.68}
+
+
+def num(x):
+    """A weight as the shortest text that reads back as the same float ("4", "0.68"), so a printed
+    weight is the one the cost used: :g would round 0.123456789 to six digits and a shared output
+    would then name a number the report did not compute with."""
+    text = repr(float(x))
+    return text[:-2] if text.endswith(".0") else text
+
+
 class Weights:
     """Weighted cost of a call = (input + cc*wcw + cr*wcr + out*wout) * model multiplier.
-    The defaults are an assumption (see ASSUMPTION), not a measured price."""
+    The defaults are an assumption (see ASSUMPTION), not a measured price.
 
-    def __init__(self, wcw=1.25, wcr=0.1, wout=5.0, model_mult=None):
+    A model's multiplier is that of the longest key (case-insensitive) that occurs anywhere in
+    its name; a model that contains none weighs 1.0 and is counted by unmatched_models rather
+    than passed over."""
+
+    def __init__(self, wcw=1.25, wcr=0.025, wout=5.0, model_mult=None):
         self.wcw, self.wcr, self.wout = wcw, wcr, wout
-        self.model_mult = dict(model_mult or {})
+        # Keys are folded to lower case so an override replaces a default instead of sitting
+        # beside it, and so the matching below needs no second fold.
+        self.model_mult = dict(DEFAULT_MODEL_MULT)
+        self.model_mult.update({k.lower(): v for k, v in (model_mult or {}).items()})
+        self._keys = {}
+
+    def key_for(self, model):
+        """The multiplier key `model` matches, or None. Longest key wins; among keys of equal
+        length the alphabetically first, so the answer does not depend on flag order."""
+        name = (model or "").lower()
+        if name not in self._keys:
+            hits = [k for k in self.model_mult if k in name]
+            self._keys[name] = min(hits, key=lambda k: (-len(k), k)) if hits else None
+        return self._keys[name]
 
     def mult(self, model):
-        if model in self.model_mult:
-            return self.model_mult[model]
-        best = max((k for k in self.model_mult if model.startswith(k)), key=len, default=None)
-        return self.model_mult[best] if best else 1.0
+        key = self.key_for(model)
+        return self.model_mult[key] if key is not None else 1.0
 
     def cost(self, model, inp, cc, cr, out):
         return (inp * 1.0 + cc * self.wcw + cr * self.wcr + out * self.wout) * self.mult(model)
@@ -341,28 +377,35 @@ class Weights:
     def of(self, call):
         return self.cost(call.model, call.inp, call.cc, call.cr, call.out)
 
+    def _multipliers(self):
+        return ", ".join(f"{k} {num(v)}" for k, v in sorted(self.model_mult.items()))
+
     def describe(self):
-        return (f"weights: input 1, cache-creation {self.wcw}, cache-read {self.wcr}, output {self.wout}; "
-                f"model multipliers {self.model_mult or '1.0 for every model'}")
+        return (f"weights: input 1, cache-creation {num(self.wcw)}, cache-read {num(self.wcr)}, output {num(self.wout)}; "
+                f"model multipliers: {self._multipliers()} (a key matches as a case-insensitive substring of the "
+                f"model name, longest key first; a model matching none counts 1.0)")
 
     def basis(self):
         """One short line naming the weights, for a column in a file that may be
         shared without the report that came with it."""
-        mult = ",".join(f"{k}={v:g}" for k, v in sorted(self.model_mult.items())) or "none"
-        return (f"input=1 cache_write={self.wcw:g} cache_read={self.wcr:g} output={self.wout:g} "
-                f"model_multipliers={mult}")
+        mult = ",".join(f"{k}={num(v)}" for k, v in sorted(self.model_mult.items()))
+        return (f"input=1 cache_write={num(self.wcw)} cache_read={num(self.wcr)} output={num(self.wout)} "
+                f"model_multipliers={mult} other_models=1")
 
     def as_dict(self):
         return {"input": 1, "cache_write": self.wcw, "cache_read": self.wcr, "output": self.wout,
-                "model_multipliers": dict(self.model_mult)}
+                "model_multipliers": dict(sorted(self.model_mult.items())), "other_models": 1.0}
 
 
 def add_weight_args(ap):
     ap.add_argument("--wcw", type=float, default=1.25, help="weight of cache-creation tokens (0 to 1000; default 1.25; an assumption)")
-    ap.add_argument("--wcr", type=float, default=0.1, help="weight of cache-read tokens (0 to 1000; default 0.1; an assumption)")
+    ap.add_argument("--wcr", type=float, default=0.025, help="weight of cache-read tokens (0 to 1000; default 0.025; an assumption)")
     ap.add_argument("--wout", type=float, default=5.0, help="weight of output tokens (0 to 1000; default 5; an assumption)")
-    ap.add_argument("--model-weight", action="append", default=[], metavar="MODEL=MULT",
-                    help="per-model multiplier, 0 to 1000 (exact model name, else longest prefix); default 1.0 for every model")
+    ap.add_argument("--model-weight", action="append", default=[], metavar="KEY=MULT",
+                    help="per-model multiplier, 0 to 1000, for every model whose name contains KEY (case-insensitive, "
+                         "longest key wins); repeatable; replaces or adds to the defaults "
+                         + ", ".join(f"{k}={num(v)}" for k, v in DEFAULT_MODEL_MULT.items())
+                         + "; a model matching no key counts 1.0 and is listed in the report")
 
 
 # A weight or multiplier is a small price ratio; the ceiling is far above any plausible
@@ -397,7 +440,7 @@ def weights_from_args(args):
     for item in args.model_weight:
         name, sep, val = item.partition("=")
         if not sep or not name.strip():
-            raise ValueError(f"--model-weight wants MODEL=MULT, got {item!r}")
+            raise ValueError(f"--model-weight wants KEY=MULT, got {item!r}")
         mult[name.strip()] = check_number(val, f"--model-weight {name.strip()}", 0.0, WEIGHT_MAX)
     return Weights(args.wcw, args.wcr, args.wout, mult)
 
@@ -747,6 +790,35 @@ def prepare(sessions, weights, since=None, until=None):
 def live_calls(s):
     """The session's calls that count: not a cross-file duplicate, inside the window."""
     return [c for c in s.calls.values() if not c.dropped and c.in_window]
+
+
+def unmatched_in(calls, weights):
+    """{model: {"calls": n, "tokens": n}} for those of `calls` whose model matches no multiplier
+    key and so weighs 1.0. A call with no tokens is left out: it weighs nothing at any multiplier,
+    and Claude Code's own placeholder model name would otherwise head every list."""
+    found = {}
+    for c in calls:
+        tokens = c.inp + c.out + c.cc + c.cr
+        if tokens and weights.key_for(c.model) is None:
+            d = found.setdefault(c.model, {"calls": 0, "tokens": 0})
+            d["calls"] += 1
+            d["tokens"] += tokens
+    return found
+
+
+def unmatched_models(sessions, weights):
+    """unmatched_in over the sessions' counted calls (see live_calls)."""
+    return unmatched_in((c for s in sessions for c in live_calls(s)), weights)
+
+
+def unmatched_line(found):
+    """The one report line for unmatched_models: always printed, so its absence never has to be read."""
+    head = "models matching no multiplier (weighed at 1.0): "
+    if not found:
+        return head + "none"
+    return head + ", ".join(f"{m} ({d['calls']:,} call{'' if d['calls'] == 1 else 's'}, "
+                            f"{d['tokens']:,} tokens)"
+                            for m, d in sorted(found.items(), key=lambda kv: (-kv[1]["tokens"], kv[0])))
 
 
 # ---------------------------------------------------------------------------

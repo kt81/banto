@@ -95,14 +95,29 @@ def bash_read_paths(cmd, cwd=""):
     return out
 
 
-def summary_cost_estimate(pre_tokens, summary_chars, w):
+def summarising_model(s, ts):
+    """The model that most likely ran a compaction's summarising call: the session's last call
+    before it, else its first call after. The call is not in the transcript, so this is a guess
+    that a mid-session model switch can falsify. Calls with no tokens are skipped: Claude Code
+    writes placeholder assistant records (model "<synthetic>") between real calls, and one of
+    them would name a model that ran nothing and price the summary at the unmatched 1.0.
+    "" when the session has no call with tokens."""
+    cs = [c for c in live_sorted(s) if c.inp + c.out + c.cc + c.cr]
+    before = [c for c in cs if c.ts <= ts]
+    pick = before[-1] if before else (cs[0] if cs else None)
+    return pick.model if pick else ""
+
+
+def summary_cost_estimate(pre_tokens, summary_chars, w, model=""):
     """The summarising call of a compaction is not in the transcript. Assumes its
     input is preTokens once, its output is summary chars / CHARS_PER_TOKEN (the
     hidden analysis block is not counted, so this is a floor), and prices the input
-    three ways: A as cache read, B as uncached input, C as cache write.
+    three ways: A as cache read, B as uncached input, C as cache write, times the
+    multiplier of `model` (1.0 for none).
     Returns (output tokens, A, B, C)."""
     ot = summary_chars / CHARS_PER_TOKEN
-    return (ot, pre_tokens * w.wcr + ot * w.wout, pre_tokens * 1.0 + ot * w.wout, pre_tokens * w.wcw + ot * w.wout)
+    m = w.mult(model)
+    return (ot, (pre_tokens * w.wcr + ot * w.wout) * m, (pre_tokens * 1.0 + ot * w.wout) * m, (pre_tokens * w.wcw + ot * w.wout) * m)
 
 
 def label(value):
@@ -179,6 +194,7 @@ def section_identity(P, active, sessions, T0):
 def section_since_vs_before(P, active, T0, w, hours):
     P(f"\n=== 1. per session: since {tr.iso(T0)} vs before ===")
     P(w.describe())
+    P(tr.unmatched_line(tr.unmatched_models(active, w)))
     hdr = "  {:9} {:>5} {:>9} {:>9} {:>14} {:>11} | {:>6} {:>9} {:>11}  models(since) / models(before)"
     P(hdr.format("session", "calls", "meanCtx", "maxCtx", "weighted", "w/call", "calls", "meanCtx", "w/call"))
 
@@ -316,7 +332,7 @@ def section_summary_visibility(P, active, T0, w, selected):
                     kd += "(" + str(d.get("querySource")) + ")"
                 kinds[kd] += 1
             P(f"  {s.id[:8]} {hm(ts)}Z window [-{dur / 1000 + 5:.0f}s, +0.5s]: {dict(kinds)}  summary text chars {sumlen:,}")
-            vis[s.id].append((ts, trig, pre or 0, post, dur, sumlen))
+            vis[s.id].append((ts, trig, pre or 0, post, dur, sumlen, summarising_model(s, ts)))
     qs = Counter()
     for s in active:
         for d in tr.iter_records(s.path, API_REQUEST_RX):
@@ -324,14 +340,15 @@ def section_summary_visibility(P, active, T0, w, selected):
             if t and t >= T0:
                 qs[label(d.get("querySource"))] += 1
     P(f"  api-request querySource values since T, all selected sessions: {dict(qs)}")
-    P("\n  estimate of the summarising call (NOT in the transcript); weights as above")
+    P("\n  estimate of the summarising call (NOT in the transcript); weights as above, times the multiplier of the inferred model (the session's last call with tokens before the compaction, else its first after; named per row)")
     P(f"  assumptions: input = preTokens once; output = summary chars / {CHARS_PER_TOKEN:g} (hidden analysis block not counted, so a floor); price class per run noted")
     P("  session   time   preTokens  outTok(est)   A: pre as cache-read   B: pre uncached input   C: pre as cache-write")
     tot = defaultdict(lambda: [0.0, 0.0, 0.0])
     for sid, lst in vis.items():
-        for (ts, trig, pre, post, dur, sl) in lst:
-            ot, a, b, c = summary_cost_estimate(pre, sl, w)
-            P(f"  {sid[:8]:9} {hm(ts)} {pre:>9,} {ot:>10,.0f} {a:>20,.0f} {b:>22,.0f} {c:>22,.0f}")
+        for (ts, trig, pre, post, dur, sl, model) in lst:
+            ot, a, b, c = summary_cost_estimate(pre, sl, w, model)
+            P(f"  {sid[:8]:9} {hm(ts)} {pre:>9,} {ot:>10,.0f} {a:>20,.0f} {b:>22,.0f} {c:>22,.0f}  "
+              + (f"{model} (inferred)" if model else "no model found (counts 1.0)"))
             for x, v in enumerate((a, b, c)):
                 tot[sid][x] += v
     for s in selected:
@@ -350,14 +367,14 @@ def section_visible_cost(P, s, T0, w):
             dropped_acc += (comps[ci][2] or 0) - (comps[ci][3] or 0)
             firsts.append(c)
             ci += 1
-        saved += dropped_acc * w.wcr
+        saved += dropped_acc * w.wcr * w.mult(c.model)
     P(f"  calls {len(cs)}; sum weighted {k(sum(c.weighted for c in cs))}")
     P(f"  tokens dropped per compaction (pre-post): {[k((x[2] or 0) - (x[3] or 0)) for x in comps]}")
-    P(f"  cache-read cost avoided over later calls, if the dropped tokens had stayed (and been read each call at {w.wcr:g}): {k(saved)}")
+    P(f"  cache-read cost avoided over later calls, if the dropped tokens had stayed (and been read each call at {tr.num(w.wcr)} times that call's model multiplier): {k(saved)}")
     P("  (it ignores: cache-write cost of the tokens the dropped context would never have re-written, the extra tool calls that exist only to recover lost context, and that the pre-compaction history would have kept growing)")
     for c in firsts:
-        P(f"  first call after a compaction at {hm(c.ts)}: cc {c.cc:,} cr {c.cr:,} out {c.out:,}  weighted {k(c.weighted)}  of which cache-write {k(c.cc * w.wcw)}")
-    P(f"  summed visible first-call cache-write cost: {k(sum(c.cc * w.wcw for c in firsts))}")
+        P(f"  first call after a compaction at {hm(c.ts)}: cc {c.cc:,} cr {c.cr:,} out {c.out:,}  weighted {k(c.weighted)}  of which cache-write {k(c.cc * w.wcw * w.mult(c.model))}")
+    P(f"  summed visible first-call cache-write cost: {k(sum(c.cc * w.wcw * w.mult(c.model) for c in firsts))}")
 
 
 def section_costliest(P, s, T0, w):
@@ -400,8 +417,8 @@ def section_costliest(P, s, T0, w):
     P(f"\n=== 4b. session {s.id[:8]}: weighted cost per call by token kind (share) ===")
 
     def decomp(cs):
-        r = sum(c.cr * w.wcr for c in cs); wr = sum(c.cc * w.wcw for c in cs)
-        o = sum(c.out * w.wout for c in cs); i = sum(c.inp for c in cs)
+        r = sum(c.cr * w.wcr * w.mult(c.model) for c in cs); wr = sum(c.cc * w.wcw * w.mult(c.model) for c in cs)
+        o = sum(c.out * w.wout * w.mult(c.model) for c in cs); i = sum(c.inp * w.mult(c.model) for c in cs)
         t = (r + wr + o + i) or 1.0
         return (f"calls {len(cs):>4} w/call {k(t / max(1, len(cs))):>8}  cache-read {100 * r / t:4.1f}%  "
                 f"cache-write {100 * wr / t:4.1f}%  output {100 * o / t:4.1f}%  input {100 * i / t:4.2f}%")
