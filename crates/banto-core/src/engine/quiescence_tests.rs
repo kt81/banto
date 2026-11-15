@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::app::App;
 use crate::config::BrigadeConfig;
 use crate::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
-use crate::model::Quiescence::{Idle, NotIdle, Unknown};
+use crate::model::Quiescence::{Background, Idle, NotIdle, Unknown};
 use crate::screen::Screen;
 
 use super::*;
@@ -439,9 +439,220 @@ fn a_pane_whose_key_changes_keeps_its_sample() {
     let (mut state, mut app, a, b, at) = quit_fixture();
     sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
     state.rekey_pane_state(&a, &key("a-after-discovery"));
-    assert_eq!(state.not_idle_count(&app, at), 0);
+    assert_eq!(state.quit_counts(&app, at).not_idle, 0);
     press(&mut state, &mut app, KeyCode::Esc, at);
     assert!(app.should_quit());
+}
+
+// --- a background command in the quit question --------------------------------
+
+/// The text the first quit key arms with, given what each of `a` and `b` was read as.
+fn prompt_for(a_is: Quiescence, b_is: Quiescence) -> Option<String> {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(&mut state, &mut app, &[(&a, a_is), (&b, b_is)], at);
+    press(&mut state, &mut app, KeyCode::Esc, at);
+    if app.should_quit() {
+        return None;
+    }
+    state.displayed_status().map(str::to_string)
+}
+
+#[test]
+fn the_quit_prompt_says_a_background_command_apart_from_work_that_is_not_idle() {
+    let dash = "\u{2014}";
+    for (a, b, expected) in [
+        // Only what it always was: the same words.
+        (
+            NotIdle,
+            Idle,
+            format!("Esc again to quit {dash} 1 session(s) not idle"),
+        ),
+        (
+            Unknown,
+            NotIdle,
+            format!("Esc again to quit {dash} 2 session(s) not idle"),
+        ),
+        // Only background commands: said as that.
+        (
+            Background,
+            Idle,
+            format!("Esc again to quit {dash} 1 session(s) running a background command"),
+        ),
+        (
+            Background,
+            Background,
+            format!("Esc again to quit {dash} 2 session(s) running a background command"),
+        ),
+        // Both, and either order of the panes says the same.
+        (
+            NotIdle,
+            Background,
+            format!(
+                "Esc again to quit {dash} 1 session(s) not idle, 1 running a background command"
+            ),
+        ),
+        (
+            Background,
+            NotIdle,
+            format!(
+                "Esc again to quit {dash} 1 session(s) not idle, 1 running a background command"
+            ),
+        ),
+        // A pane nothing is known about is not idle, as it always was.
+        (
+            Unknown,
+            Background,
+            format!(
+                "Esc again to quit {dash} 1 session(s) not idle, 1 running a background command"
+            ),
+        ),
+    ] {
+        assert_eq!(
+            prompt_for(a, b).as_deref(),
+            Some(expected.as_str()),
+            "{a:?} {b:?}"
+        );
+    }
+    // And a second key confirms it as it confirms the others.
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(&mut state, &mut app, &[(&a, Background), (&b, Idle)], at);
+    press(&mut state, &mut app, KeyCode::Esc, at);
+    assert!(!app.should_quit());
+    press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+    assert!(app.should_quit());
+}
+
+#[test]
+fn a_background_command_still_makes_the_quit_ask_and_idle_alone_does_not() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
+    press(&mut state, &mut app, KeyCode::Esc, at);
+    assert!(app.should_quit(), "nothing running: one key");
+    assert!(prompt_for(Idle, Background).is_some(), "it asks");
+}
+
+#[test]
+fn the_prompt_follows_a_background_command_through_to_its_end() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Background), (&b, Background)],
+        at,
+    );
+    press(&mut state, &mut app, KeyCode::Esc, at);
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 2 session(s) running a background command")
+    );
+    // One of them ends its command, the other starts a turn: rebuilt each time.
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Idle), (&b, NotIdle)],
+        at + SECOND,
+    );
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+    );
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Background), (&b, NotIdle)],
+        at + 2 * SECOND,
+    );
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 1 session(s) not idle, 1 running a background command")
+    );
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Idle), (&b, Idle)],
+        at + 3 * SECOND,
+    );
+    assert_eq!(state.displayed_status(), None, "nothing left to ask about");
+    press(&mut state, &mut app, KeyCode::Esc, at + 3 * SECOND);
+    assert!(app.should_quit());
+}
+
+#[test]
+fn a_background_pane_that_was_just_typed_into_counts_as_not_idle_for_the_window() {
+    // A turn that input started may not show in the sample yet, and its being
+    // in the background says nothing about that: the pane is one that took
+    // input, so it is counted with the work, and goes back to the background
+    // count once the window is over.
+    for (after, expected) in [
+        (
+            QUIT_RECENT_INPUT_WINDOW - Duration::from_millis(1),
+            "Esc again to quit \u{2014} 1 session(s) not idle",
+        ),
+        (
+            QUIT_RECENT_INPUT_WINDOW,
+            "Esc again to quit \u{2014} 1 session(s) running a background command",
+        ),
+    ] {
+        let (mut state, mut app, a, b, at) = quit_fixture();
+        state.stage = Stage::Solo(a.clone());
+        state.focus = Focus::Pane;
+        sample(&mut state, &mut app, &[(&a, Background), (&b, Idle)], at);
+        press(&mut state, &mut app, KeyCode::Char('x'), at);
+        back_to_the_list(&mut state, &mut app, at);
+        press(&mut state, &mut app, KeyCode::Esc, at + after);
+        assert!(!app.should_quit());
+        assert_eq!(state.displayed_status(), Some(expected), "{after:?}");
+    }
+}
+
+#[test]
+fn a_pane_is_counted_once_whatever_it_is_read_as() {
+    // Not idle and in the background are two answers about one pane, never both:
+    // a background pane that took input is the not-idle one only.
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    state.stage = Stage::Solo(a.clone());
+    state.focus = Focus::Pane;
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Background), (&b, Background)],
+        at,
+    );
+    press(&mut state, &mut app, KeyCode::Char('x'), at);
+    back_to_the_list(&mut state, &mut app, at);
+    press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 1 session(s) not idle, 1 running a background command")
+    );
+}
+
+#[test]
+fn the_prompt_window_and_its_drop_rules_are_the_same_for_a_background_command() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(&mut state, &mut app, &[(&a, Background), (&b, Idle)], at);
+    press(&mut state, &mut app, KeyCode::Esc, at);
+    assert!(state.displayed_status().is_some());
+    // The window runs out: the prompt goes and the next key is a first press.
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Background), (&b, Idle)],
+        at + QUIT_CONFIRM_WINDOW,
+    );
+    assert_eq!(state.displayed_status(), None);
+    press(&mut state, &mut app, KeyCode::Esc, at + QUIT_CONFIRM_WINDOW);
+    assert!(!app.should_quit());
+    assert!(state.displayed_status().is_some(), "armed again");
+    // Leaving the list drops it too.
+    state.focus = Focus::Pane;
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Background), (&b, Idle)],
+        at + QUIT_CONFIRM_WINDOW + SECOND,
+    );
+    assert_eq!(state.displayed_status(), None);
 }
 
 // --- the closing line -------------------------------------------------------
@@ -802,6 +1013,237 @@ fn a_waiting_member_counts_as_busy_so_the_brigade_rings_when_it_is_answered_and_
         idle_from + BRIGADE_QUIET_SETTLE,
     );
     assert!(rang(&cmds), "{cmds:?}");
+}
+
+// --- a background command is not idle for the watch, the marks or the relay ---
+
+#[test]
+fn a_background_command_holds_the_quiet_stretch_and_arms_the_ring_as_work_does() {
+    for read_as in [NotIdle, Background] {
+        let (mut state, mut app, director, worker, at) = quiet_fixture();
+        // The only thing the brigade ever did, held for much longer than the
+        // settle: nothing rings while it lasts.
+        let mut heard = Vec::new();
+        for second in 0..SETTLED {
+            heard.extend(sample(
+                &mut state,
+                &mut app,
+                &[(&director, Idle), (&worker, read_as)],
+                at + second * SECOND,
+            ));
+        }
+        assert!(!rang(&heard), "{read_as:?}: {heard:?}");
+        // It ends: the settle is counted from there, and the brigade then rings
+        // once, for the stretch that background work armed.
+        let idle_from = at + SETTLED * SECOND;
+        let idle = [(&director, Idle), (&worker, Idle)];
+        let cmds = sample(&mut state, &mut app, &idle, idle_from);
+        assert!(!rang(&cmds), "{read_as:?}");
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &idle,
+            idle_from + BRIGADE_QUIET_SETTLE - SECOND,
+        );
+        assert!(!rang(&cmds), "{read_as:?}: not before the settle");
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &idle,
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert_eq!(
+            bell_causes(&cmds),
+            vec![BellCause::QuietRecorded {
+                brigade: 1,
+                director: director.clone()
+            }],
+            "{read_as:?}"
+        );
+    }
+}
+
+#[test]
+fn a_background_command_turning_up_in_a_settling_brigade_starts_the_settle_again() {
+    // The Worker's turn ends and the brigade begins to settle; then the Worker
+    // reads as having a background command: the stretch is broken as by work.
+    for read_as in [NotIdle, Background] {
+        let (mut state, mut app, director, worker, at) = quiet_fixture();
+        let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
+        let idle = [(&director, Idle), (&worker, Idle)];
+        sample(
+            &mut state,
+            &mut app,
+            &[(&director, Idle), (&worker, read_as)],
+            idle_from + BRIGADE_QUIET_SETTLE - SECOND,
+        );
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &idle,
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert!(!rang(&cmds), "{read_as:?}: counted from here");
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &idle,
+            idle_from + 2 * BRIGADE_QUIET_SETTLE,
+        );
+        assert!(rang(&cmds), "{read_as:?}");
+    }
+}
+
+#[test]
+fn a_request_spends_the_same_quiet_whether_the_stretch_was_work_or_a_background_command() {
+    for read_as in [NotIdle, Background] {
+        let (mut state, mut app, director, worker, at) = request_fixture();
+        focus_the_director(&mut state);
+        toggle_bell(&mut state, &mut app, at);
+        let works = |state: &mut EmporiumState, app: &mut App, from: Instant, secs: u32| {
+            let mut heard = Vec::new();
+            for second in 0..secs {
+                heard.extend(sample(
+                    state,
+                    app,
+                    &[(&director, read_as), (&worker, Idle)],
+                    from + second * SECOND,
+                ));
+            }
+            heard
+        };
+        let mut heard = works(&mut state, &mut app, at + SECOND, 2);
+        store_request(1);
+        heard.extend(works(&mut state, &mut app, at + 3 * SECOND, 4));
+        heard.extend(all_idle_for(
+            &mut state,
+            &mut app,
+            &director,
+            &worker,
+            at + 7 * SECOND,
+            SETTLED,
+        ));
+        assert_eq!(
+            bell_causes(&heard),
+            vec![the_request_ring(1, &director)],
+            "{read_as:?}: one ring, for the request: {heard:?}"
+        );
+        forget_stored_requests();
+    }
+}
+
+#[test]
+fn a_background_command_raises_no_mark_count_or_bell_that_work_does_not() {
+    let observed_with = |read_as| {
+        let (mut state, mut app, director, worker, at) = quiet_fixture();
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &[(&director, Idle), (&worker, read_as)],
+            at,
+        );
+        (
+            rang(&cmds),
+            state.attention_panes().is_empty(),
+            app.has_brigade_mark("dir"),
+            app.is_waiting_id("w1"),
+            state.displayed_activity(&app, &worker),
+        )
+    };
+    let nothing = (false, true, false, false, None);
+    assert_eq!(observed_with(NotIdle), nothing);
+    assert_eq!(observed_with(Background), nothing);
+}
+
+#[test]
+fn a_tile_word_is_idle_with_a_mark_only_for_a_background_command() {
+    use crate::model::Activity::{Alive, Busy};
+    for (read_as, word, background) in [
+        (Idle, Some(Alive), false),
+        (NotIdle, Some(Busy), false),
+        (Background, Some(Alive), true),
+        (Unknown, None, false),
+    ] {
+        let (mut state, mut app, director, worker, at) = quiet_fixture();
+        sample(
+            &mut state,
+            &mut app,
+            &[(&director, Idle), (&worker, read_as)],
+            at,
+        );
+        assert_eq!(state.pane_word(&app, &worker), word, "{read_as:?}");
+        assert_eq!(
+            state.pane_background(&app, &worker),
+            background,
+            "{read_as:?}"
+        );
+    }
+}
+
+#[test]
+fn a_member_that_is_waiting_is_waiting_and_never_in_the_background() {
+    // The live file says waiting this tick, and the sample (which cannot tell a
+    // wait from work) says there is more: the word is waiting, and no mark.
+    use crate::model::Activity::Waiting;
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    let waiting = RelayObservation {
+        live: Some(LiveStatus {
+            activity: Waiting,
+            dialog_open: false,
+        }),
+        has_unseen: false,
+        ..mail_for(1, "worker-1", &worker)
+    };
+    sample_with_relay(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Background)],
+        vec![waiting],
+        at,
+    );
+    assert_eq!(state.pane_word(&app, &worker), Some(Waiting));
+    assert!(!state.pane_background(&app, &worker));
+}
+
+/// The first second at which the relay types into the Worker's pane, with the
+/// Worker's sample read as `read_as`.
+fn first_nudge_when_read_as(read_as: Quiescence) -> Option<u64> {
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    state.size = (120, 40);
+    stage(&mut state, 1, &director, &[&worker]);
+    if let Stage::Brigade { focused, .. } = &mut state.stage {
+        *focused = 1;
+    }
+    state.focus = Focus::Pane;
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, read_as)],
+        at,
+    );
+    (0..=RELAY_INPUT_QUIET_PERIOD.as_secs() + 5).find(|secs| {
+        let cmds = send(
+            &mut state,
+            &mut app,
+            Event::Tick {
+                relay: vec![mail_for(1, "worker-1", &worker)],
+                brigades: Vec::new(),
+            },
+            at + Duration::from_secs(*secs),
+        );
+        typed_into(&cmds, &worker)
+    })
+}
+
+#[test]
+fn the_relay_nudges_a_member_whatever_the_sample_says_including_a_background_command() {
+    // What is idle enough to take a message is the live file's own word, decided
+    // by the shell and carried in the observation; the sample the quit question
+    // reads is not read for it.
+    for read_as in [Idle, NotIdle, Background] {
+        let at = first_nudge_when_read_as(read_as);
+        assert!(at.is_some_and(|secs| secs < 5), "{read_as:?}: {at:?}");
+    }
 }
 
 #[test]
@@ -5751,14 +6193,14 @@ fn nothing_the_brigade_kept_outlives_its_disband() {
     assert!(matches!(&state.stage, Stage::Solo(key) if key == &director));
     // The quit question is per screen and does not care about the brigade: the
     // former Director counts by its own sample.
-    assert_eq!(state.not_idle_count(&app, idle_from + 60 * SECOND), 0);
+    assert_eq!(state.quit_counts(&app, idle_from + 60 * SECOND).not_idle, 0);
     sample(
         &mut state,
         &mut app,
         &[(&director, NotIdle)],
         idle_from + 61 * SECOND,
     );
-    assert_eq!(state.not_idle_count(&app, idle_from + 61 * SECOND), 1);
+    assert_eq!(state.quit_counts(&app, idle_from + 61 * SECOND).not_idle, 1);
 }
 
 // --- the bell decides from what was observed in this tick ----------------------------------
@@ -8025,7 +8467,7 @@ fn the_brigade_watch_and_the_quit_question_follow_the_same_decision_when_a_confl
         conflict_at,
     );
     assert_eq!(state.quiescence_of(&app, &worker), Idle);
-    assert_eq!(state.not_idle_count(&app, conflict_at), 0);
+    assert_eq!(state.quit_counts(&app, conflict_at).not_idle, 0);
     let rang_at = tick_each_second_until(
         &mut state,
         &mut app,
@@ -8413,7 +8855,7 @@ fn a_key_typed_into_a_pane_does_not_make_its_word_busy_for_the_quit_windows_thre
     state.focus = Focus::Pane;
     press(&mut state, &mut app, KeyCode::Char('x'), at + SECOND);
     // The quit question asks (it counts a pane that just took input) ...
-    assert_eq!(state.not_idle_count(&app, at + SECOND), 1);
+    assert_eq!(state.quit_counts(&app, at + SECOND).not_idle, 1);
     // ... and the word does not follow it.
     assert_eq!(state.pane_word(&app, &pane), Some(Alive));
 }
@@ -8548,7 +8990,7 @@ fn the_live_word_of_a_member_never_feeds_the_quit_question_or_the_watch() {
     // file says waiting but whose sample says idle is idle for both.
     let (state, app, worker, _) = rowless_claude_worker(live(Waiting, false));
     assert_eq!(state.quiescence_of(&app, &worker), Idle);
-    assert_eq!(state.not_idle_count(&app, t0()), 0);
+    assert_eq!(state.quit_counts(&app, t0()).not_idle, 0);
 }
 
 // --- S1: an off-stage brigade speaks through its Director's row --------------------------------
@@ -8690,7 +9132,7 @@ fn a_marked_directors_row_does_not_make_its_brigade_not_idle_for_the_quit_questi
     for code in [KeyCode::Esc, KeyCode::Char('q')] {
         let (mut state, mut app, director, _worker, fired_at) = marked_fixture();
         assert_eq!(state.quiescence_of(&app, &director), Idle);
-        assert_eq!(state.not_idle_count(&app, fired_at + SECOND), 0);
+        assert_eq!(state.quit_counts(&app, fired_at + SECOND).not_idle, 0);
         press(&mut state, &mut app, code, fired_at + SECOND);
         assert!(
             app.should_quit(),

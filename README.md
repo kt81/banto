@@ -217,7 +217,12 @@ session(s) not idle`, and a second `q`/`Esc` within 3 seconds quits, since quitt
 ends every hosted process. N counts the sessions that are working, waiting on you,
 of unknown state, or that were given work (a key or a paste by you, or something
 typed by banto itself) within the last 3 seconds; clicking or scrolling a pane does
-not count. A Claude Code session reports its own state, and so does a Codex one:
+not count. A Claude Code session whose turn has ended but that left a command
+running in the background asks too, and the prompt says so: `Esc again to quit — M
+session(s) running a background command`, or `Esc again to quit — N session(s) not
+idle, M running a background command` when both are there. A session is counted
+once, as not idle when it was given work in the last 3 seconds. A Claude Code
+session reports its own state, and so does a Codex one:
 banto reads the status report the Codex interface writes to its terminal (working,
 blocked on you, done or idle) and, until a session has made one, its last turn in
 the rollout. Codex records nothing about a command it left running in the
@@ -236,7 +241,7 @@ finish.
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
 | `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
 | `D` | Restore (un-archive) the selected session, while archived ones are revealed |
-| `q` / `Esc` | Quit (a second press is needed while a session is not idle, see above) |
+| `q` / `Esc` | Quit (a second press is needed while a session is not idle or is running a background command, see above) |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
 | `F2` | Move focus between the list and the panes |
@@ -269,14 +274,17 @@ stack tile also has `[_]` to collapse it to a strip (`[+]` opens it again). Each
 arrangement, and the sidebar's width, is remembered across restarts.
 
 Every tile's title row says what its session is doing, minimised or not: **busy** (a
-turn or a background command is running), **waiting** (it needs you) or **idle**
-(running, nothing to do), then how long ago it last wrote; a session banto has read
+turn is running), **waiting** (it needs you) or **idle** (running, nothing to do),
+then how long ago it last wrote. A Claude Code session whose turn has ended but that
+has a command still running in the background reads `idle · bg`: the session list
+still draws it as busy, and quitting still asks about it. A session banto has read
 nothing of yet shows no word. It is the same for Claude and Codex: a session waiting
 at its prompt reads idle. A Codex session's word comes from the status report its
 interface writes to its terminal; a Claude Worker that has not run a turn yet shows
 its state from its live file. On a narrow tile the title gives way: the agent name
-goes first, then the age is shortened (`2m`) and finally dropped; the word stays,
-and the label never gives way, so at the default minimised width a long display name
+goes first, then the age is shortened (`2m`) and finally dropped; the word stays
+(with its `bg`, when it has one), and the label never gives way, so at the default
+minimised width a long display name
 leaves room for the word only. A minimised tile is four rows (its title row, the
 last message it was sent and the last it sent, and the bottom border), so five fit
 on a 24-row terminal. A tile too small for a screen shows the top-left corner of a

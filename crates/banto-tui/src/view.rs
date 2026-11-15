@@ -475,7 +475,9 @@ pub fn activity_color(activity: Activity) -> Color {
 /// session (`Idle(_)`, no live process, bucketed by age) would read "idle" too,
 /// but a tile is never given one: the word of a hosted pane comes from
 /// `EmporiumState::pane_word`, which yields only busy, waiting and `Alive`, and a
-/// pane nothing has been read of gets no word at all.
+/// pane nothing has been read of gets no word at all. A session with only a
+/// background command left running is `Alive` there too, so it reads "idle"; the
+/// tile's separate mark (`strip::BACKGROUND_MARK`) says the rest.
 pub fn activity_word(activity: Activity) -> &'static str {
     match activity {
         Activity::Busy => "busy",

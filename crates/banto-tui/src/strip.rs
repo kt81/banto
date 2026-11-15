@@ -42,6 +42,10 @@ pub struct StripData {
     /// the fixed tag ([`REQUEST_TAG`]) is drawn on the title row after the status
     /// ([`title_request_parts`]). Only a Director's tile has one.
     pub request: bool,
+    /// The activity is idle only for want of a turn: a background command of the
+    /// session is still running. Drawn as the mark [`BACKGROUND_MARK`] beside the
+    /// word, and only beside a word.
+    pub background: bool,
 }
 
 /// One message as a strip row shows it: when, and its first line (already
@@ -85,6 +89,10 @@ pub fn output_age_short(age: Duration) -> String {
 }
 
 const SEPARATOR: &str = " \u{b7} ";
+
+/// The mark a tile draws after `idle` while a background command of the session is
+/// still running.
+pub const BACKGROUND_MARK: &str = "bg";
 
 /// Draw the collapsed body's rows into `area` (the tile's content area: no
 /// border): the last message received on the first row, the last sent on the
@@ -154,12 +162,15 @@ enum AgeForm {
     Left,
 }
 
-/// What each step of the title status keeps — agent, activity word, age in
-/// which form — from the widest to the narrowest. The one place the shedding
-/// order and the long/short age choice are written: the agent goes first, then
-/// the age is shortened, then dropped; the word is never cut or shortened, and
-/// the label (not here) never sheds. A step that keeps nothing, or that a wider
-/// step already is (no age to shorten), is skipped.
+/// What each step of the title status keeps — agent, activity word (and the
+/// background mark that goes with it, when there is one), age in which form —
+/// from the widest to the narrowest. The one place the shedding order and the
+/// long/short age choice are written: the agent goes first, then the age is
+/// shortened, then dropped; the word is never cut or shortened, and the label
+/// (not here) never sheds. The mark is never a step of its own: it is kept
+/// exactly when the word is, so it is never drawn without the word and never
+/// lost before it. A step that keeps nothing, or that a wider step already is
+/// (no age to shorten), is skipped.
 ///
 /// Why the age is shortened before it is dropped: on a collapsed tile the pane
 /// cannot be seen, and for Codex the output age is the only liveness signal, so
@@ -174,7 +185,9 @@ const STATUS_STEPS: [(bool, AgeForm); 4] = [
 /// The status a tile's title row carries after its label, for every tile,
 /// collapsed or not: agent label, activity word, output age, in the list's own
 /// words and colours (busy, waiting, idle), from the same [`StripData`] — so one
-/// decision, drawn in one place, whatever the tile's state.
+/// decision, drawn in one place, whatever the tile's state. A session whose turn
+/// has ended with a background command still running reads `idle · bg`
+/// ([`BACKGROUND_MARK`]) where the word is.
 ///
 /// Shed in [`STATUS_STEPS`] order as `room` cells run out: the agent label, then
 /// the age's long form for its short one (`word · 2m`), then the age, and last
@@ -203,6 +216,10 @@ fn status_ladder(data: &StripData) -> Vec<Vec<(String, Color)>> {
             activity_color(activity),
         )
     });
+    // In the age's colour, not busy's or waiting's: the word says the turn has
+    // ended, and the mark says only that something is still running behind it.
+    let mark: Part =
+        (data.background && word.is_some()).then(|| (BACKGROUND_MARK.to_string(), Color::Gray));
     let mut ladder = Vec::new();
     for (with_agent, form) in STATUS_STEPS {
         let age: Part = match form {
@@ -224,11 +241,16 @@ fn status_ladder(data: &StripData) -> Vec<Vec<(String, Color)>> {
             }),
             AgeForm::Left => None,
         };
-        let kept: Vec<&(String, Color)> = [(with_agent, &agent), (true, &word), (true, &age)]
-            .into_iter()
-            .filter(|(keep, _)| *keep)
-            .filter_map(|(_, part)| part.as_ref())
-            .collect();
+        let kept: Vec<&(String, Color)> = [
+            (with_agent, &agent),
+            (true, &word),
+            (true, &mark),
+            (true, &age),
+        ]
+        .into_iter()
+        .filter(|(keep, _)| *keep)
+        .filter_map(|(_, part)| part.as_ref())
+        .collect();
         if kept.is_empty() {
             continue;
         }
@@ -539,6 +561,116 @@ mod tests {
                 texts(&title_status_parts(&data, room)),
                 expected,
                 "room {room}"
+            );
+        }
+    }
+
+    fn in_the_background(age: u64) -> StripData {
+        StripData {
+            background: true,
+            ..pane(AgentKind::ClaudeCode, Activity::Alive, age)
+        }
+    }
+
+    #[test]
+    fn a_background_mark_follows_the_word_and_sheds_only_with_it() {
+        assert_eq!(BACKGROUND_MARK, "bg");
+        let data = in_the_background(125);
+        let full = "Claude \u{b7} idle \u{b7} bg \u{b7} output 2m ago";
+        assert_eq!(full.width(), 34);
+        for (room, expected) in [
+            (200, full),
+            (34, full),
+            (33, "idle \u{b7} bg \u{b7} output 2m ago"),
+            (25, "idle \u{b7} bg \u{b7} output 2m ago"),
+            (24, "idle \u{b7} bg \u{b7} 2m"),
+            (14, "idle \u{b7} bg \u{b7} 2m"),
+            (13, "idle \u{b7} bg"),
+            (9, "idle \u{b7} bg"),
+            // Never the word without its mark, and never the mark alone.
+            (8, ""),
+            (0, ""),
+        ] {
+            assert_eq!(
+                texts(&title_status_parts(&data, room)),
+                expected,
+                "room {room}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_background_mark_is_in_the_age_text_colour_not_busy_or_waiting() {
+        let parts = title_status_parts(&in_the_background(125), 80);
+        let mark = parts.iter().find(|(text, _)| text == "bg").unwrap();
+        assert_eq!(mark.1, Color::Gray);
+        let word = parts.iter().find(|(text, _)| text == "idle").unwrap();
+        assert_eq!(word.1, activity_color(Activity::Alive));
+        assert_ne!(mark.1, activity_color(Activity::Busy));
+        assert_ne!(mark.1, activity_color(Activity::Waiting));
+    }
+
+    #[test]
+    fn a_mark_with_no_word_to_stand_beside_is_not_drawn() {
+        for data in [
+            StripData {
+                activity: None,
+                ..in_the_background(125)
+            },
+            StripData {
+                output_age: None,
+                activity: None,
+                ..in_the_background(125)
+            },
+        ] {
+            for room in [80, 30, 20, 12, 9, 4] {
+                let drawn = texts(&title_status_parts(&data, room));
+                assert!(!drawn.contains("bg"), "room {room}: {drawn:?}");
+            }
+        }
+        // And a pane that is not in the background never draws it.
+        let plain = pane(AgentKind::ClaudeCode, Activity::Alive, 125);
+        for room in [80, 30, 20, 12, 9, 4] {
+            let drawn = texts(&title_status_parts(&plain, room));
+            assert!(!drawn.contains("bg"), "room {room}: {drawn:?}");
+        }
+        assert_eq!(
+            texts(&title_status_parts(&plain, 80)),
+            "Claude \u{b7} idle \u{b7} output 2m ago"
+        );
+    }
+
+    #[test]
+    fn with_a_request_the_mark_stays_with_the_word_through_every_step() {
+        let data = StripData {
+            request: true,
+            ..in_the_background(125)
+        };
+        let at = |room| texts(&title_request_parts(&data, room));
+        let tag = "\u{25b8} decision";
+        assert_eq!(
+            at(80),
+            format!("Claude \u{b7} idle \u{b7} bg \u{b7} output 2m ago \u{b7} {tag}")
+        );
+        assert_eq!(
+            at(40),
+            format!("idle \u{b7} bg \u{b7} output 2m ago \u{b7} {tag}")
+        );
+        assert_eq!(at(30), format!("idle \u{b7} bg \u{b7} 2m \u{b7} {tag}"));
+        assert_eq!(at(25), format!("idle \u{b7} bg \u{b7} {tag}"));
+        // The word and its mark go together, the tag standing alone ...
+        assert_eq!(at(20), tag);
+        assert_eq!(at(10), tag);
+        // ... and a tag that does not fit leaves the status as if no request.
+        assert_eq!(at(9), "idle \u{b7} bg");
+        assert_eq!(at(8), "");
+        for room in 0..120 {
+            let drawn = at(room);
+            assert!(drawn.width() <= room, "room {room}: {drawn:?}");
+            assert_eq!(
+                drawn.contains("bg"),
+                drawn.contains("idle"),
+                "room {room}: the word and its mark go together: {drawn:?}"
             );
         }
     }

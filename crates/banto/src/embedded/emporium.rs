@@ -3179,8 +3179,10 @@ fn paint_tile_buttons(
 /// disagree. The activity is `EmporiumState::pane_word`: waiting when the pane
 /// waits on the operator (the decision the marks, the count and the bell read,
 /// and the member's live status of this tick), else busy or idle from what banto
-/// has read of it (the decision the quit question uses), else none; the product
-/// is the row's, else the one the relay resolved before there is a row. Computed
+/// has read of it (the decision the quit question uses), else none, with a mark
+/// beside an idle one whose turn has ended but whose background command still
+/// runs (`EmporiumState::pane_background`); the product is the row's, else the
+/// one the relay resolved before there is a row. Computed
 /// per staged tile on every frame, by a few map lookups.
 fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant) -> StripData {
     let row = app.row_for_id(key.as_str());
@@ -3198,6 +3200,7 @@ fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant
         // Only a Director's tile has one, and it stays while that pane is focused:
         // it is "not answered yet", not "not looked at yet".
         request: state.has_request(key),
+        background: state.pane_background(app, key),
     }
 }
 
@@ -4775,7 +4778,9 @@ mod tests {
             ("idle", Quiescence::Idle),
             ("busy", Quiescence::NotIdle),
             ("waiting", Quiescence::NotIdle),
-            ("shell", Quiescence::NotIdle),
+            // Not idle for want of a turn, but the turn has ended: the one
+            // status the quit question and the title tell from busy.
+            ("shell", Quiescence::Background),
             ("something-new", Quiescence::NotIdle),
         ] {
             let claude_home = tempfile::tempdir().unwrap();
@@ -4806,9 +4811,10 @@ mod tests {
     }
 
     #[test]
-    fn a_member_in_the_shell_state_is_still_nudgeable_and_yet_not_idle() {
+    fn a_member_in_the_shell_state_is_still_nudgeable_and_yet_in_the_background() {
         // The relay's own notion of idle enough to nudge is untouched: `shell`
-        // is neither busy nor waiting. The quiescence answer is a separate one.
+        // is neither busy nor waiting. The quiescence answer is a separate one,
+        // and says why it is not idle: a background command is running.
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         write_live_state_with_status(
@@ -4831,14 +4837,15 @@ mod tests {
         let worker = relay.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(true));
         let samples: HashMap<_, _> = gate.quiescence.into_iter().collect();
-        assert_eq!(samples[&SessionKey::from_id("w1")], Quiescence::NotIdle);
+        assert_eq!(samples[&SessionKey::from_id("w1")], Quiescence::Background);
     }
 
     #[test]
-    fn a_session_in_the_shell_state_is_shown_busy_while_the_relay_still_nudges_it() {
-        // One live file, two readers that must not be confused: what is shown
-        // follows the work (a background command is running), what the relay
-        // does follows the turn (it has ended, so the member can take a message).
+    fn a_session_in_the_shell_state_is_listed_busy_while_the_relay_still_nudges_it() {
+        // One live file, three readers that must not be confused: the list
+        // follows the work (a background command is running, so a green dot),
+        // the tile title says the turn has ended (`idle`, with a mark), and the
+        // relay follows the turn too (it can take a message).
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, mut app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         write_live_state_with_status(
@@ -4884,7 +4891,7 @@ mod tests {
         let worker = relay.iter().find(|o| o.token == "worker-1").unwrap();
         assert_eq!(worker.is_idle_this_tick, Some(true), "still nudgeable");
         let samples: HashMap<_, _> = gate.quiescence.into_iter().collect();
-        assert_eq!(samples[&SessionKey::from_id("w1")], Quiescence::NotIdle);
+        assert_eq!(samples[&SessionKey::from_id("w1")], Quiescence::Background);
     }
 
     #[test]
@@ -5396,6 +5403,64 @@ mod tests {
             ..test_row(W2, AgentKind::Codex)
         }]);
         assert!(!title_of(&state, &app, W2, now).contains("idle"));
+    }
+
+    #[test]
+    fn a_claude_pane_in_the_shell_state_says_idle_with_a_background_mark_on_its_title() {
+        // The turn has ended and a background command runs on: the title says
+        // idle and why that is not the whole story. Busy is still busy, and a
+        // row that says waiting outranks the sample, mark and all.
+        let (mut state, mut app, brigade, now) =
+            scene(160, [Activity::Alive, Activity::Alive, Activity::Alive]);
+        sampled(
+            &mut state,
+            &mut app,
+            &brigade,
+            &[(W1, Quiescence::Background), (DIR, Quiescence::NotIdle)],
+            now,
+        );
+        let title = title_of(&state, &app, W1, now);
+        assert!(
+            title.contains(" Claude \u{b7} idle \u{b7} bg \u{b7} output now "),
+            "{title:?}"
+        );
+        let director = title_of(&state, &app, DIR, now);
+        assert!(
+            director.contains(" Claude \u{b7} busy \u{b7} "),
+            "{director:?}"
+        );
+        assert!(!director.contains("bg"), "{director:?}");
+
+        sampled(
+            &mut state,
+            &mut app,
+            &brigade,
+            &[(W1, Quiescence::Idle)],
+            now,
+        );
+        let title = title_of(&state, &app, W1, now);
+        assert!(
+            title.contains(" Claude \u{b7} idle \u{b7} output now "),
+            "{title:?}"
+        );
+        assert!(!title.contains("bg"), "{title:?}");
+
+        // The same sample under a row that says waiting: waiting, no mark.
+        let (mut state, mut app, brigade, now) =
+            scene(160, [Activity::Alive, Activity::Waiting, Activity::Alive]);
+        sampled(
+            &mut state,
+            &mut app,
+            &brigade,
+            &[(W1, Quiescence::Background)],
+            now,
+        );
+        let title = title_of(&state, &app, W1, now);
+        assert!(
+            title.contains(" Claude \u{b7} waiting \u{b7} "),
+            "{title:?}"
+        );
+        assert!(!title.contains("bg"), "{title:?}");
     }
 
     #[test]

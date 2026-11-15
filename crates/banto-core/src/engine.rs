@@ -2442,7 +2442,10 @@ impl EmporiumState {
     /// and the bell keep reading `displayed_activity`, row first, as they always
     /// did. The live status is the latest tick's alone, replaced every tick and
     /// cleared by one that read nothing of the member, so it cannot outlive it.
-    /// Everything else the sample says. Not read: the list row's own activity, which is "no live
+    /// Everything else the sample says is `Alive`, drawn "idle", a background
+    /// command (the turn has ended, a command still runs) included: the title
+    /// marks that with `bg` beside the word (`pane_background`). Not read: the
+    /// list row's own activity, which is "no live
     /// process proven" for a pane of this banto's and changes only on a reload,
     /// and the quit question's three seconds after an input, which is a safety
     /// margin and would make the word flicker with every key.
@@ -2460,10 +2463,24 @@ impl EmporiumState {
             return Some(Activity::Waiting);
         }
         match self.quiescence_of(app, key) {
-            Quiescence::Idle => Some(Activity::Alive),
+            // A background command is the one not-idle reading a tile calls idle:
+            // the turn has ended. [`Self::pane_background`] is what keeps it from
+            // being the whole story.
+            Quiescence::Idle | Quiescence::Background => Some(Activity::Alive),
             Quiescence::NotIdle => Some(Activity::Busy),
             Quiescence::Unknown => None,
         }
+    }
+
+    /// Whether `key`'s tile says `idle` only because the turn has ended, a
+    /// background command of the session still running: the mark drawn beside the
+    /// word. Never beside `waiting`, which [`Self::pane_word`] puts first, and
+    /// never for a pane the sample does not read as such. The word is
+    /// [`Self::pane_word`]'s, and this is only what it leaves out, so the two
+    /// cannot disagree about which pane is in the background.
+    pub fn pane_background(&self, app: &App, key: &SessionKey) -> bool {
+        self.pane_word(app, key) == Some(Activity::Alive)
+            && self.quiescence_of(app, key) == Quiescence::Background
     }
 
     /// The member's live file as the latest tick read it.
@@ -2488,25 +2505,34 @@ impl EmporiumState {
         }
     }
 
-    /// How many hosted panes (staged or not) are not known to be idle: running
-    /// something, waiting on the operator, unread, or given input (the operator's
-    /// keys and pastes, or banto's own writes) within
-    /// [`QUIT_RECENT_INPUT_WINDOW`] (a turn that input started may not show in
-    /// the sample yet). What a quit would end that is worth asking about. Only
-    /// the quit question reads this recent-input part. The relay decides from the
-    /// sample and its own hold on the operator's input
+    /// What a quit would end that is worth asking about, over every hosted pane
+    /// (staged or not), each counted once: panes not known to be idle (running
+    /// something, waiting on the operator, unread, or given input — the
+    /// operator's keys and pastes, or banto's own writes — within
+    /// [`QUIT_RECENT_INPUT_WINDOW`], since a turn that input started may not show
+    /// in the sample yet), and, apart from them, panes whose one reason is a
+    /// background command ([`Quiescence::Background`]). A background pane that
+    /// took input is the first kind: the input may have started a turn, and its
+    /// being in the background says nothing about that. Only the quit question
+    /// reads this recent-input part. The relay decides from the sample and its
+    /// own hold on the operator's input
     /// ([`EmporiumState::last_forwarded_input`]); the brigade-quiet watch counts
     /// its quiet stretch from banto's own writes
     /// ([`EmporiumState::last_prompted`]) and arms on the operator's input only
     /// through [`EmporiumState::was_given_work`].
-    fn not_idle_count(&self, app: &App, now: Instant) -> usize {
-        self.screens
-            .keys()
-            .filter(|key| {
-                self.quiescence_of(app, key) != Quiescence::Idle
-                    || self.took_input_recently(key, now)
-            })
-            .count()
+    fn quit_counts(&self, app: &App, now: Instant) -> QuitCounts {
+        let mut counts = QuitCounts::default();
+        for key in self.screens.keys() {
+            let reading = self.quiescence_of(app, key);
+            if self.took_input_recently(key, now) {
+                counts.not_idle += 1;
+            } else if reading == Quiescence::Background {
+                counts.background += 1;
+            } else if reading != Quiescence::Idle {
+                counts.not_idle += 1;
+            }
+        }
+        counts
     }
 
     /// Whether banto still intends to type a kickoff into `key`'s pane: a Codex
@@ -2667,8 +2693,37 @@ struct PendingQuit {
     prompt: String,
 }
 
-fn quit_prompt(not_idle: usize) -> String {
-    format!("Esc again to quit \u{2014} {not_idle} session(s) not idle")
+/// How many hosted panes a quit would end that are worth asking about, told apart
+/// by why ([`EmporiumState::quit_counts`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QuitCounts {
+    /// Not known to be idle for any reason but the one below.
+    not_idle: usize,
+    /// Idle but for a background command that is still running.
+    background: usize,
+}
+
+impl QuitCounts {
+    fn is_empty(self) -> bool {
+        self.not_idle == 0 && self.background == 0
+    }
+}
+
+/// The question a first quit key asks. Only not-idle sessions: the words it has
+/// always had. A background command is named as that, so the operator can tell a
+/// turn in flight from a command left running, and both are said when both are
+/// there.
+fn quit_prompt(counts: QuitCounts) -> String {
+    let QuitCounts {
+        not_idle,
+        background,
+    } = counts;
+    let what = match (not_idle, background) {
+        (_, 0) => format!("{not_idle} session(s) not idle"),
+        (0, _) => format!("{background} session(s) running a background command"),
+        _ => format!("{not_idle} session(s) not idle, {background} running a background command"),
+    };
+    format!("Esc again to quit \u{2014} {what}")
 }
 
 /// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
@@ -4097,17 +4152,17 @@ fn settle_pending_quit(state: &mut EmporiumState, app: &App, now: Instant) {
     if state.pending_quit.is_none() {
         return;
     }
-    let not_idle = state.not_idle_count(app, now);
+    let counts = state.quit_counts(app, now);
     let Some(pending) = &mut state.pending_quit else {
         return;
     };
     if state.focus != Focus::Sidebar
-        || not_idle == 0
+        || counts.is_empty()
         || now.saturating_duration_since(pending.at) >= QUIT_CONFIRM_WINDOW
     {
         state.pending_quit = None;
     } else {
-        pending.prompt = quit_prompt(not_idle);
+        pending.prompt = quit_prompt(counts);
     }
 }
 
@@ -4445,7 +4500,7 @@ fn update_brigade_quiet(
         // fact (this process was read idle): a process read idle at its first
         // sample and not idle again after the grace is the ordinary case, and
         // only the decision to call a reading work waits.
-        if sampled == Quiescence::NotIdle
+        if sampled.is_working()
             && (process.is_some_and(|id| state.seen_idle.contains(&id))
                 && state.past_start_up(key, now)
                 || state.was_given_work(key))
@@ -4509,7 +4564,7 @@ fn update_brigade_quiet(
             watch.members = brigade.processes;
             watch.idle_since = None;
         }
-        if brigade.members.contains(&Quiescence::NotIdle) {
+        if brigade.members.iter().any(|member| member.is_working()) {
             watch.active |= brigade.real_work;
             watch.idle_since = None;
         } else if brigade.members.contains(&Quiescence::Unknown) {
@@ -5292,16 +5347,16 @@ fn update_key(
                     // window. The decision uses the last sample, so it can be
                     // about a tick (plus the product's own report lag) behind a
                     // turn that has only just begun.
-                    let not_idle = state.not_idle_count(app, now);
+                    let counts = state.quit_counts(app, now);
                     let confirmed = pending_quit.is_some_and(|pending| {
                         now.saturating_duration_since(pending.at) < QUIT_CONFIRM_WINDOW
                     });
-                    if not_idle == 0 || confirmed {
+                    if counts.is_empty() || confirmed {
                         app.request_quit();
                     } else {
                         state.pending_quit = Some(PendingQuit {
                             at: now,
-                            prompt: quit_prompt(not_idle),
+                            prompt: quit_prompt(counts),
                         });
                     }
                     Vec::new()
@@ -15274,6 +15329,41 @@ mod tests {
         draw_labelled_prompt(&mut state, &director, None);
         let sent = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
         assert_eq!(sent, nudge_then_enter_for(&director), "released");
+    }
+
+    #[test]
+    fn a_pane_with_a_background_command_that_stays_unreadable_is_reported_like_an_idle_one() {
+        // The input-line reader goes by the relay's own idle (the live file's
+        // turn has ended), not by the quit question's sample, which says
+        // `Background` for the same pane.
+        let (mut state, mut app, brigade, director, start) = reading_fixture();
+        state
+            .quiescence
+            .insert(director.clone(), Quiescence::Background);
+        let mut tick = |at: Duration| {
+            tick_obs(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Seen {
+                    agent: CLAUDE,
+                    idle: Some(true),
+                    has_unseen: false,
+                },
+                start + at,
+            );
+        };
+        tick(Duration::ZERO);
+        tick(INPUT_LINE_UNREADABLE_AFTER);
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("cannot read")),
+            "{:?}",
+            state.status
+        );
     }
 
     #[test]

@@ -15,7 +15,9 @@
 //!
 //! The same live file also answers a second, stricter question —
 //! [`claude_quiescence`], "is this session known to be doing nothing?" — where
-//! the degradation runs the other way: only the `idle` report is idle.
+//! the degradation runs the other way: only the `idle` report is idle. It tells
+//! `shell` apart from the rest (`Quiescence::Background`), because a tile and the
+//! quit question say more about a background command than about other work.
 //!
 //! PID liveness sits behind [`ProcessProbe`] so tests can mock it (no real
 //! processes in tests). Bucketing itself lives in `banto_core::status`, a
@@ -67,15 +69,20 @@ use banto_core::status::{AgeThresholds, age_bucket};
 /// member's measurement (not re-measured here): the turn has ended but a
 /// background shell command of the session, or of one of its sub-agents, is
 /// still running; when that work ends Claude is re-invoked (`"busy"`) and then
-/// goes `"idle"`. The list shows it as [`Activity::Busy`], which is what the quit
-/// question and the brigade watch already counted it as (not idle: a command is
-/// running that ending the session would lose), so what is drawn and what is
-/// decided say the same. The relay is the one reader that does NOT follow: it
-/// still counts `shell` as idle enough to nudge ([`claude_nudgeable`]), since the
-/// turn has ended and the member can take a message. The two readings are
-/// separate on purpose — display here in [`classify_from_alive_pids`], the relay
-/// in [`claude_nudgeable`] — so that changing a word on screen cannot change who
-/// gets nudged.
+/// goes `"idle"`. Four readers, each with its own answer on purpose, so that
+/// changing a word on screen cannot change who gets nudged or what a quit loses:
+///
+/// - The session list ([`classify_from_alive_pids`]) shows it as
+///   [`Activity::Busy`]: a command is running.
+/// - The quit question and the brigade watch ([`claude_quiescence`]) count it as
+///   not idle for the same reason, but as `Quiescence::Background`, the one
+///   reason a tile and the quit prompt name: the turn has ended and only a
+///   background command runs, so a tile says `idle` with a mark and the prompt
+///   says "running a background command". The watch holds its quiet stretch for
+///   it exactly as for work.
+/// - The relay ([`claude_nudgeable`]) counts it as idle enough to nudge, since
+///   the turn has ended and the member can take a message.
+/// - `brigade_status` prints the raw status, with `shell` spelled out.
 pub const LIVE_STATUS_BUSY: &str = "busy";
 pub const LIVE_STATUS_WAITING: &str = "waiting";
 pub const LIVE_STATUS_IDLE: &str = "idle";
@@ -164,11 +171,20 @@ pub fn claude_nudgeable(
 ///
 /// `Idle` only when a live entry for the session has a live PID and every such
 /// entry reports `"idle"` — the other values (`busy`, `waiting`, `shell`, an
-/// absent or unrecognised one) are all `NotIdle`, because each means something
+/// absent or unrecognised one) are all not idle, because each means something
 /// is running or waiting that ending the session would lose. No entry with a
 /// live PID is `Unknown`: the caller asks about a pane whose process is
 /// running, so an absent file is missing information, not idleness (a fresh
 /// session publishes its file only a moment after it starts).
+///
+/// `shell` is `Background`, a kind of not idle that says why: a turn that has
+/// ended with a background command still running. It is `Background` only when
+/// that is the whole reason, so any entry that is busy, waiting, in a status
+/// nothing here knows, or on a dialog beside it makes the answer `NotIdle`
+/// (the dialog case is `NotIdle` as it always was, though a dialog alone is
+/// `Unknown`): the extra word is for a session that is otherwise idle, and
+/// must never soften a reading that is something else. The answer does not
+/// depend on the order of the entries.
 ///
 /// One exception, `waiting` with exactly [`LIVE_WAITING_FOR_DIALOG_OPEN`]: that
 /// is `Unknown`, not `NotIdle` (unless another entry is busy or waiting for
@@ -187,6 +203,7 @@ pub fn claude_quiescence(
 ) -> Quiescence {
     let mut seen = false;
     let mut dialog = false;
+    let mut shell = false;
     for entry in live {
         if entry.session_id.as_deref() != Some(session_id) || !alive_pids.contains(&entry.pid) {
             continue;
@@ -195,12 +212,19 @@ pub fn claude_quiescence(
             dialog = true;
             continue;
         }
-        if entry.status.as_deref() != Some(LIVE_STATUS_IDLE) {
-            return Quiescence::NotIdle;
+        match entry.status.as_deref() {
+            Some(LIVE_STATUS_IDLE) => seen = true,
+            Some(LIVE_STATUS_SHELL) => shell = true,
+            _ => return Quiescence::NotIdle,
         }
-        seen = true;
     }
-    if dialog || !seen {
+    // A background command beside a dialog is not told apart: the dialog is
+    // what the session is stopped on, and the answer there was always `NotIdle`.
+    if shell && dialog {
+        Quiescence::NotIdle
+    } else if shell {
+        Quiescence::Background
+    } else if dialog || !seen {
         Quiescence::Unknown
     } else {
         Quiescence::Idle
@@ -561,7 +585,6 @@ mod tests {
         for status in [
             Some(LIVE_STATUS_BUSY),
             Some(LIVE_STATUS_WAITING),
-            Some(LIVE_STATUS_SHELL),
             Some("some-state-from-a-later-release"),
             Some(""),
             None,
@@ -600,14 +623,84 @@ mod tests {
     }
 
     #[test]
-    fn shell_is_busy_in_the_list_and_not_idle_for_quiescence() {
-        // The turn has ended but a background command is still running: what the
-        // list shows is what the quit question already counts, work in progress.
+    fn shell_is_busy_in_the_list_and_background_for_quiescence() {
+        // The turn has ended but a background command is still running: the list
+        // still shows work in progress, and the quit question and the quiet watch
+        // still count it ([`Quiescence::is_working`]) while being told why.
         let meta = meta_with_age(Duration::from_secs(60));
         let live = [live_entry(100, Some(SESSION_ID), Some(LIVE_STATUS_SHELL))];
         let probe = MockProbe::with_alive(&[100]);
         assert_eq!(classify_default(&meta, &live, &probe), Activity::Busy);
-        assert_eq!(quiescence_of(&live, &[100]), Quiescence::NotIdle);
+        assert_eq!(quiescence_of(&live, &[100]), Quiescence::Background);
+        assert!(Quiescence::Background.is_working());
+    }
+
+    #[test]
+    fn shell_is_background_only_when_it_is_the_whole_reason_the_session_is_not_idle() {
+        // Beside an idle entry it is the only reason; beside anything that is
+        // itself a reason to ask (busy, waiting for anything, a status nothing here
+        // knows, none) it is just not idle, and a dialog stays not idle with it
+        // exactly as before. A dead entry says nothing.
+        let entry = |pid, status: Option<&str>, waiting_for: Option<&str>| LiveSession {
+            waiting_for: waiting_for.map(str::to_string),
+            ..live_entry(pid, Some(SESSION_ID), status)
+        };
+        let shell = entry(100, Some(LIVE_STATUS_SHELL), None);
+        for (other, expected) in [
+            (
+                entry(200, Some(LIVE_STATUS_IDLE), None),
+                Quiescence::Background,
+            ),
+            (
+                entry(200, Some(LIVE_STATUS_SHELL), None),
+                Quiescence::Background,
+            ),
+            (
+                entry(200, Some(LIVE_STATUS_BUSY), None),
+                Quiescence::NotIdle,
+            ),
+            (
+                entry(200, Some(LIVE_STATUS_WAITING), None),
+                Quiescence::NotIdle,
+            ),
+            (
+                entry(200, Some(LIVE_STATUS_WAITING), Some("input needed")),
+                Quiescence::NotIdle,
+            ),
+            (
+                entry(
+                    200,
+                    Some(LIVE_STATUS_WAITING),
+                    Some(LIVE_WAITING_FOR_DIALOG_OPEN),
+                ),
+                Quiescence::NotIdle,
+            ),
+            (
+                entry(200, Some("a status nobody has seen"), None),
+                Quiescence::NotIdle,
+            ),
+            (entry(200, None, None), Quiescence::NotIdle),
+        ] {
+            let status = other.status.clone();
+            assert_eq!(
+                quiescence_of(&[shell.clone(), other.clone()], &[100, 200]),
+                expected,
+                "shell beside {status:?}"
+            );
+            assert_eq!(
+                quiescence_of(&[other, shell.clone()], &[100, 200]),
+                expected,
+                "{status:?} beside shell, the other way round"
+            );
+        }
+        let dead = entry(300, Some(LIVE_STATUS_SHELL), None);
+        assert_eq!(quiescence_of(&[dead], &[]), Quiescence::Unknown);
+        let idle = entry(200, Some(LIVE_STATUS_IDLE), None);
+        assert_eq!(
+            quiescence_of(&[shell, idle], &[200]),
+            Quiescence::Idle,
+            "a dead shell entry beside a live idle one is idle"
+        );
     }
 
     #[test]

@@ -184,14 +184,16 @@ quit question)", "The closing line", "Attention", "The quiet brigade's bell"); t
 entry records what was decided and why.
 
 1. **Quitting from the list asks only when a hosted session is not known to be
-   idle.** `q`/`Esc` quits on the first press when every hosted session is known
-   to be idle, or none is hosted; otherwise the prompt is `Esc again to quit — N
+   idle.** `q`/`Esc` quits on the first press when every hosted session is known to
+   be idle, or none is hosted; otherwise the prompt is `Esc again to quit — N
    session(s) not idle`, counting sessions that are working, waiting, of unknown
    state, or given input in the last 3 seconds. The window, the second key and the
-   ways the prompt is dropped are unchanged. This replaces the earlier rule (ask
-   whenever any session is hosted, `N session(s) running`). *Why:* he quits when
-   everything is idle and was made to press twice every time. Unknown asks rather
-   than quits, since the question fails safe.
+   ways the prompt is dropped are unchanged. (Since 2026-11-15 it also asks for a
+   session whose only reason is a background command, and says so: "Decision
+   (2026-11-15): a background command is named, not hidden".) This replaces the
+   earlier rule (ask whenever any session is hosted, `N session(s) running`). *Why:*
+   he quits when everything is idle and was made to press twice every time. Unknown
+   asks rather than quits, since the question fails safe.
 2. **Once quitting is decided, the status line says so.** `Closing — ending N
    session(s)…` (`Closing…` with none), with priority over everything else on the
    line, for every quit path, until the process exits. *Why:* the shutdown sweep
@@ -223,11 +225,13 @@ and the plan-implementation prompt ring too, not only an approval.
 
 *What "idle" means, per agent* (the facts behind decision 1 and 3):
 
-- **Claude Code:** the live file's `status` is `idle`. `busy`, `waiting`, `shell`
-  and anything else are not idle, except `waiting` with `waitingFor` exactly `dialog
-  open`, which is unknown (item 9); no usable live entry is unknown. `shell` was
-  measured on Claude Code 2.1.323 on 2026-11-13: the turn has ended but a background
-  shell command is still running (see "Data sources").
+- **Claude Code:** the live file's `status` is `idle`. `busy`, `waiting` and
+  anything else are not idle, and so is `shell`, which since 2026-11-15 is told
+  apart as *background*, not idle for one reason only ("Decision (2026-11-15): a
+  background command is named, not hidden"), except `waiting` with `waitingFor`
+  exactly `dialog open`, which is unknown (item 9); no usable live entry is unknown.
+  `shell` was measured on Claude Code 2.1.323 on 2026-11-13: the turn has ended but
+  a background shell command is still running (see "Data sources").
 - **Codex:** first, what the pane itself reports (item 4 above): idle, done and
   error → idle; working and blocked → not idle. With no report (or after its
   `clear`), the last turn marker in the rollout says the turn ended
@@ -281,12 +285,15 @@ and the plan-implementation prompt ring too, not only an approval.
    4 rows or stacking 6 Workers on a 24-row terminal. The published 0.16.13 no
    longer has that panic; the fork stays pinned in this change.
 8. **`shell` shows busy.** A live Claude session whose status is `shell` (the turn
-   ended, a background command is still running) is displayed as busy on every
-   surface, matching what the quit question and the watch already counted; the relay
-   still nudges it; `brigade_status` prints the raw word. *Why:* the operator
-   restarted banto without knowing a command was still running in a pane that said
-   "alive". (A tile now reads `shell` as busy through the sample, and says "idle"
-   where it said "alive": "Decision (2026-11-15)".)
+   ended, a background command is still running) is displayed as busy in the session
+   list and `banto list`, and through the list in the counts and marks, matching
+   what the quit question and the watch already counted; the relay still nudges it.
+   *Why:* the operator restarted banto without knowing a command was still running
+   in a pane that said "alive". (A tile read `shell` as busy through the sample from
+   2026-11-15, saying "idle" where it had said "alive"; later the same day a tile
+   says `idle · bg`, the quit prompt names the command and `brigade_status` says
+   what it is: "Decision (2026-11-15): a background command is named, not hidden".
+   The list is unchanged.)
 9. **A dialog the operator opens does not ring and does not arm.** A Claude session
    that is `waiting` with `waitingFor` exactly `dialog open` is shown and counted as
    Waiting everywhere but is left out of the ring set (it rings once if the reason
@@ -609,7 +616,8 @@ live process is shown as live (`App::set_hosted_ids`): a busy or waiting activit
 stands, ending the pane gives the row its own state back, a reload does not lose it,
 and the rows of sessions not hosted here are unchanged. `banto list` keeps "alive"
 for a live process, and `brigade_status` for a Codex peer is unchanged (a later
-step).
+step). A background command (`shell`) is a not-idle reading that this decision drew
+busy on a tile and the next entry draws idle with a mark.
 
 ## Decision (2026-11-15): a Director can tell the operator it is waiting, without stopping
 
@@ -732,6 +740,63 @@ quiet fire.
 *Known limit, not about requests.* Texts banto did not write that go through the
 column-shortening helper (brigade names, the first line of a message) can still
 carry an unbounded run of combining marks: a follow-up.
+
+## Decision (2026-11-15): a background command is named, not hidden
+
+Written from the code as it is in the working tree of 2026-11-15 (HEAD plus an
+uncommitted change, still under review). A Claude session whose live file says
+`shell` (the turn has ended, a background command of the session still runs; "Data
+sources") was drawn busy by every surface until this change. Two decisions met on
+it: item 8 of the first decision of 2026-11-13 made it show busy, so that a command
+left running is never overlooked, and the tile decision above says a tile answers
+whether the session is working or idle, where "the turn has ended" is idle. *His
+words, translated, where there are any:* on the mark, `bg` is fine, "I understand
+it"; on keeping the quiet watch as it is, "since the Director can now actively tell
+me it is waiting (`request_decision`), the times I want to sense that the brigade
+has gone quiet have become relatively fewer". *Not his words:* the choice of `idle`
+over `busy` for the tile's word is read off the two decisions above, and no reason
+of his for it is recorded here.
+
+1. **A tile says `idle · bg`.** The mark `bg` follows the word, in the age text's
+   colour, and sheds with it (`Claude · idle · bg · output 2m ago`, then without the
+   agent, then `idle · bg · 2m`, then `idle · bg`, then nothing); it never appears
+   or disappears without the word, and with a Director's decision tag the pairing
+   holds (`idle · bg · ▸ decision`).
+2. **The quit question still counts the pane, and says why.** Only not-idle
+   sessions: `Esc again to quit — N session(s) not idle`; only background commands:
+   `Esc again to quit — M session(s) running a background command`; both: `Esc again
+   to quit — N session(s) not idle, M running a background command`. A pane that
+   took input in the last 3 seconds is counted as not idle, and no pane is counted
+   twice.
+3. **`brigade_status` says what it is.** A shell peer prints as `idle (background
+   command running)`.
+4. **Unchanged.** The list row is still busy (the green dot) and so is `banto
+   list`'s tag; the marks, counts and bells; the quiet watch and a request's
+   spending of it, which treat `shell` as they treat busy; a shell member is still
+   nudgeable; the input-line notice; and Codex, which has no such value.
+
+*What the code does.* The quit question's fact gains a value,
+`Quiescence::Background`, beside idle, not idle and unknown; it is a kind of not
+idle, and every reader that asks whether ending the session loses something asks
+`Quiescence::is_working`, so the quit count and the brigade watch hold it exactly as
+they hold not idle. It is decided where the live file is read (`claude_quiescence`):
+`shell` is background only when it is the whole reason the session is not idle, so a
+`shell` entry beside a busy one, any waiting one (a dialog included) or an
+unrecognised status is not idle, beside a live idle entry it is background, and a
+dead entry says nothing, in whatever order the entries come. A Codex pane's own
+report and the rollout never produce it. The tile's word is still
+`EmporiumState::pane_word` (background reads idle, a waiting row or live file
+outranks it), and the mark is `EmporiumState::pane_background`, true only where
+`pane_word` says idle and the sample says background, so waiting never carries it.
+The quit count (`EmporiumState::quit_counts`) keeps two numbers from one pass over
+the hosted panes. A recording made before this change holds `shell` as not idle and
+replays as that, so it cannot show the mark or the new prompt; the new value is
+written into recordings made from here on.
+
+*Not measured.* All of it is read from the code and its tests; no observation of it
+on a running pane is recorded here (the status `shell` itself was measured on
+2026-11-13, "Data sources"). The widths at which the title row sheds are in the
+tests, not here.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -1238,10 +1303,14 @@ since reads busy to the sample until then, so for a short window the tile can sa
 live status does not outlive its tick, which replaces it every time); otherwise the
 one idle decision the quit question reads (`quiescence_of`: a Codex pane's own
 report, else the shell's sample of the live file or the rollout), where idle reads
-**idle**, not idle reads **busy** (a Claude live file saying `busy`, `shell` or a
-status banto does not know; a Codex pane reporting `working`), and unknown (nothing
+**idle**, not idle reads **busy** (a Claude live file saying `busy` or a status
+banto does not know; a Codex pane reporting `working`), a session whose only reason
+for not being idle is a background command (a Claude live file saying `shell`) reads
+**idle** with the mark `bg` after it, and unknown (nothing
 read yet: just spawned or respawned, or no usable source) shows no word. A Codex
-pane's own `idle`, `done` or `error` reads idle at once. It never says "alive": that
+pane's own `idle`, `done` or `error` reads idle at once. The mark is not a fourth
+word: `EmporiumState::pane_background` holds it only where `pane_word` says idle and
+the sample says background, so the two cannot disagree. It never says "alive": that
 is a word in contrast to "dead", and a tile answers whether the session is working
 or idle, so a hosted session waiting at its prompt reads "idle" whichever agent it
 is (the same word and colour as the list's live dot). Not read: the list row's own
@@ -1373,7 +1442,7 @@ A Worker added later gets the mean of the others' height.
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
 | `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
-| `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows `Esc again to quit — N session(s) not idle` and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
+| `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows `Esc again to quit — N session(s) not idle` (`M session(s) running a background command` for sessions whose only reason is such a command, both separated by a comma when both are there) and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
@@ -1421,7 +1490,12 @@ frame, so where they cross it they win; hit-testing is the same. When the room i
 short it gives way in this order, the same for both states: the agent label first
 (`word · output 2m ago`); then the age is shortened to a bare duration (`word · 2m`;
 "now", "20s", "3m", "2h", in the long form's steps); then the age goes (`word`); and
-when not even the word fits, the whole status. The word is never cut or shortened
+when not even the word fits, the whole status. A session whose turn has ended with a
+background command still running has the mark `bg` after the word (`Claude · idle ·
+bg · output 2m ago`), in the age text's colour, not busy's or waiting's. It sheds
+with the word and is never drawn alone: the word and its mark are kept or dropped
+together at every step, so `bg` never appears or disappears without the word, and a
+pane whose activity is not known draws none. The word is never cut or shortened
 and the label never sheds, so at the default collapsed width (36 columns) a plain
 label such as `worker-1` still leaves room for a short word and the short age, but a
 long display-named label leaves room for the word only. The widths at which the
@@ -1433,7 +1507,8 @@ short form. Only the label is reversed on a focused tile (a collapsed tile is ne
 focused); the status is not. A Director's open decision request puts the fixed tag
 `▸ decision`, in the waiting colour, after the status: `label · status · ▸ decision
 [buttons]`. The status sheds as before with the tag kept (the agent first, then the
-age's steps), then `word · ▸ decision`, then the tag alone; the tag is never cut and
+age's steps), then `word · ▸ decision` (`word · bg · ▸ decision` for a background
+pane), then the tag alone; the tag is never cut and
 has no ellipsis, and when it does not fit the status is drawn as if there were no
 request. Only a Director's tile ever shows it, and it stays while that pane is
 focused. There is no collapsed-body rule: a collapsed Director cannot exist today.
@@ -1472,10 +1547,15 @@ pinned.
 operator quits when everything is idle and, with the old rule (ask whenever anything
 is hosted), was made to press twice every time. So the question is not "is anything
 hosted" but "could ending a session lose work in flight", and it is asked of each
-hosted pane (staged or off-stage, collapsed or not) as a three-valued fact,
-`banto_core::model::Quiescence`: **idle**, **not idle**, **unknown**. Unknown is its
-own answer, never folded into idle: both readers of it fail safe on it (a quit asks;
-the brigade bell stays silent). The shell gathers it about once a second, just ahead
+hosted pane (staged or off-stage, collapsed or not) as a fact of three answers and
+one refinement, `banto_core::model::Quiescence`: **idle**, **not idle**,
+**unknown**, and **background**, a kind of not idle that says why (below). Unknown
+is its own answer, never folded into idle: both readers of it fail safe on it (a
+quit asks; the brigade bell stays silent). Background is not a fourth answer to the
+question "could ending a session lose work in flight": every reader that asks it
+takes background as not idle (`Quiescence::is_working`: the quit count and the
+brigade's quiet watch), and only the tile and the quit prompt tell it apart. The
+shell gathers it about once a second, just ahead
 of the tick, from reads the tick already makes, and hands it to the core as
 `Event::QuiescenceSampled`, which replaces the previous sample as a whole; the core
 decides, so a replay of the recorded stream gets the same answers. Every tick
@@ -1489,10 +1569,14 @@ this is the one place `quiescence_of` is decided, for the quit question and the
 brigade bell alike.
 
 - *Claude Code:* the session's live file (`sessions/<pid>.json`, PID alive) says
-  `status: idle` → idle. `busy`, `waiting`, `shell` (see "Data sources") and any
-  other or missing status → not idle, since each means something is running or
-  waiting that ending the session would lose; with several live entries for the
-  session any one that is not idle decides. One exception: `waiting` whose
+  `status: idle` → idle. `busy`, `waiting` and any other or missing status → not
+  idle, since each means something is running or waiting that ending the session
+  would lose; `shell` (see "Data sources": the turn has ended, a background command
+  still runs) → *background*, which is not idle for that one reason only, so a
+  `shell` entry beside a busy one, a waiting one (the dialog's included), or one in
+  a status nothing here knows makes the session not idle, and beside a live idle one
+  leaves it background, whatever the order of the entries; with several live entries
+  for the session any one that is not idle decides. One exception: `waiting` whose
   `waitingFor` is exactly `dialog open` (a picker the operator opened) is
   **unknown**, not not-idle, unless another entry is busy or waiting for something
   else, which wins: read as not idle, a dialog opened and closed again would count
@@ -1526,6 +1610,8 @@ brigade bell alike.
   or something banto wrote itself to start or continue a turn: the relay's nudge
   line and its delayed submitting Enter, a Codex Worker's or a Goinkyo's kickoff
   line and its retries (an Enter-only retry included) — whatever its sample says.
+  A pane in the background that took such input counts as not idle, not as
+  background, since the input may have started a turn, and no pane is counted twice.
   The focus reports banto writes to a pane start nothing and do not count. The
   sample is up to a tick plus the product's own report lag behind a turn that input
   has only just started; without this, a prompt submitted a moment ago still reads
@@ -1535,10 +1621,17 @@ brigade bell alike.
   the relay decides from the sample alone.
 
 One `q`/`Esc` quits when no hosted pane is counted; otherwise the first press arms
-the prompt `Esc again to quit — N session(s) not idle`, N the number counted, and
-the window, the second key and the ways it is dropped are as in the key table. The
-prompt is rebuilt from the current count at every update and goes when the count
-reaches zero. The decision uses the last sample, so it can be about a tick (plus
+the prompt, and the prompt says why it asks: with only panes not idle, `Esc again to
+quit — N session(s) not idle` (the words it has always had); with only panes whose
+reason is a background command, `Esc again to quit — M session(s) running a
+background command`; with both, `Esc again to quit — N session(s) not idle, M
+running a background command`. A pane is counted once: as not idle when it took
+input within the window or reads not idle or unknown, as background only when the
+background command is its whole reason. The window, the second key and the ways it
+is dropped are as in the key table. The prompt is rebuilt from the current counts at
+every update, so it follows a background command to its end (Claude is re-invoked
+when the command ends, "Data sources"), and goes when both counts reach zero. The
+decision uses the last sample, so it can be about a tick (plus
 the product's report lag) behind a turn that has only just begun. Cost: a Claude
 pane adds no read (the live-file scan and process snapshot are the relay's); a
 Codex brigade member adds none (the relay already tails its rollout every tick);
@@ -1703,6 +1796,13 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   brigade rang when it ended. The bell log said `quiet_recorded` and a replay
   reproduced it. Of the 40 not-idle episodes in that 63-minute run it was the only
   one not preceded by a write into the pane.
+- *A background command:* a Claude member whose live file says `shell` reads
+  background, and the watch takes it as it takes not idle
+  (`Quiescence::is_working`): it breaks the idle stretch and arms the brigade from a
+  process that qualifies, as work does, so a brigade with a command left running is
+  not quiet, and a request spends the same quiet either way. Only the tile and the
+  quit prompt tell it from work. By construction, pinned by engine tests; no
+  observation on a running brigade is recorded here.
 - A member whose state is *unknown* blocks it and breaks the idle stretch: silence
   is not claimed on missing information. A *waiting* member is not idle.
 - *A dialog the operator opened:* a Claude member that is `waiting` with
@@ -2595,7 +2695,9 @@ seven tools:
   addressable peers, each with what it's doing right now and whether it's
   holding unread mail from this member. Replaces an earlier bare ping-style
   health check, added once dogfooding showed a Director launched with only
-  the two message tools and no roster information mostly never used them.
+  the two message tools and no roster information mostly never used them. A Claude
+  peer's state is its live file's own word (`busy`, `waiting`, `idle`), except that
+  `shell` prints as `idle (background command running)`.
 - `consult_goinkyo(question, my_case, settled, unsettled, blind_spot[,
   their_case][, about])` — Director-only: files a written consultation
   request and creates the Goinkyo's member row (see "Brigade" above for what
@@ -2810,8 +2912,9 @@ themselves.
    is shown as waiting too, and one that reports `working` as busy — laid over the
    row for as long as the report holds ("Codex data sources")
 3. `sessions/<pid>.json` exists, PID alive, and `status=shell` (the turn ended with
-   a background command still running) → **busy**, on every surface; a waiting entry
-   outranks it, a person being needed
+   a background command still running) → **busy** in the list, `banto list`, and
+   through the list the counts and marks (a tile says `idle` with a mark: "The
+   emporium: hosted panes"); a waiting entry outranks it, a person being needed
 4. PID alive with any other status → **alive** (`idle` itself, and unknown upstream
    statuses, which deliberately degrade here): the list's word for a session whose
    process is up and doing nothing
@@ -2835,8 +2938,11 @@ superseded is listed, and not counted as hidden, for as long as its pane lasts, 
 is hidden again after. The stricter question "is this session known to be doing
 nothing?" — asked by the quit confirmation and the brigade bell (see "The emporium:
 hosted panes") — reads the same file the other way round: only `idle` is idle,
-`shell` is not, and an unrecognised status is not either, so what is drawn and what
-is decided say the same about `shell`. (Why `shell` shows busy: the operator
+`shell` is not (it is told apart as *background*, not idle for that one reason
+only), and an unrecognised status is not either, so the list's drawing and the
+decision still agree about `shell`; a tile says the same fact in more words (`idle`
+with the mark `bg`) and the quit prompt names the command ("Is it idle? (the quit
+question)"). (Why `shell` shows busy in the list: the operator
 restarted banto without knowing a command was still running in a pane that said
 "alive".) The relay, which asks whether a member can be nudged, still treats `shell`
 as idle enough: the turn has ended and the member can take a message; it never
@@ -2850,8 +2956,9 @@ not see it. A Director's row is the one place a brigade's attention shows in the
 list: its dot reads Waiting whatever its own state while its brigade is marked
 ("Attention"); the row's activity itself, which the tile's word and the decisions
 read, is untouched. The raw status stays visible in one place: the `brigade_status`
-MCP tool prints the live file's own word (`busy`, `waiting`, `idle`, `shell`) for a
-Claude peer.
+MCP tool prints the live file's own word (`busy`, `waiting`, `idle`) for a Claude
+peer, and for `shell` `idle (background command running)`, since the bare word told
+a Director nothing and `idle` alone would say nothing is running.
 
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
 when a Codex home resolves, its rollout tree (see "Codex data sources" above

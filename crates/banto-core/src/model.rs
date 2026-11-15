@@ -165,24 +165,42 @@ pub enum AgeBucket {
 /// "would ending this lose work in flight", asked by the quit confirmation and
 /// by the brigade's going-quiet bell.
 ///
-/// Three-valued on purpose: "no information" is its own answer, never folded
-/// into either of the others. Both questions this answers fail safe on it (a
-/// quit asks; a bell stays silent), so a reader that cannot tell must say so.
-/// Deliberately not [`Activity`]: that is what the session list draws and keeps
-/// `Alive` for every status it does not name; this one is decided from the
-/// product's own report and never guessed toward `Idle`.
+/// Three answers on purpose, and "no information" is one of them, never folded
+/// into the others. Both questions this answers fail safe on it (a quit asks; a
+/// bell stays silent), so a reader that cannot tell must say so. Deliberately
+/// not [`Activity`]: that is what the session list draws and keeps `Alive` for
+/// every status it does not name; this one is decided from the product's own
+/// report and never guessed toward `Idle`.
+///
+/// [`Self::Background`] is a refinement of "not idle", not a fourth answer to
+/// the question: ask [`Self::is_working`], not `== NotIdle`, wherever the
+/// question is whether ending the session loses something. It exists because a
+/// tile and the quit prompt say more about this one reason than about the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Quiescence {
     /// Reported idle: nothing running, nothing waiting on the operator.
     Idle,
-    /// Reported busy, waiting, running background work, or anything else that
-    /// is not the idle report.
+    /// Reported busy, waiting, or anything else that is not the idle report and
+    /// is not [`Self::Background`].
     NotIdle,
+    /// Not idle for one reason only: the turn has ended and a background command
+    /// of the session is still running (Claude's live status `shell`). Never
+    /// reported while the session is also busy, waiting on the operator or on a
+    /// dialog, or in a status nothing here knows.
+    Background,
     /// Nothing usable was read.
     Unknown,
 }
 
 impl Quiescence {
+    /// Whether ending the session would lose something in flight: not idle for
+    /// any reason, background work included. The question the quit count and the
+    /// brigade's quiet watch ask, so `Background` holds both exactly as `NotIdle`
+    /// does.
+    pub fn is_working(self) -> bool {
+        matches!(self, Self::NotIdle | Self::Background)
+    }
+
     /// From a probe that answers "idle?" with `None` for "could not tell" (the
     /// Codex rollout's last turn marker is the one such source).
     pub fn from_probe(idle: Option<bool>) -> Self {

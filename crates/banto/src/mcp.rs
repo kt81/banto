@@ -51,7 +51,9 @@ use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
-use banto_io::status::{LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions};
+use banto_io::status::{
+    LIVE_STATUS_SHELL, LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions,
+};
 use banto_io::store::{MemberNaming, Store, StoreError};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
@@ -616,6 +618,12 @@ fn peer_activity(
         .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()));
     match entry {
         Some(entry) if !SysinfoProbe.is_alive(entry.pid) => "not running".to_string(),
+        // The turn has ended and a background command runs on: the bare word
+        // told a Director nothing, and "idle" alone would say nothing is
+        // running. Every other status is the live file's own word.
+        Some(entry) if entry.status.as_deref() == Some(LIVE_STATUS_SHELL) => {
+            "idle (background command running)".to_string()
+        }
         Some(entry) => entry.status.clone().unwrap_or_else(|| "idle".to_string()),
         None if codex_home
             .is_some_and(|home| is_thread_alive(home, &session_id.0, &SysinfoStartTime)) =>
@@ -2387,11 +2395,18 @@ mod tests {
     }
 
     #[test]
-    fn brigade_status_prints_a_claude_peers_raw_status_including_shell() {
+    fn brigade_status_prints_a_claude_peers_raw_status_and_says_what_shell_means() {
         // What the tool prints for a live Claude peer is the live file's own word
-        // (`busy`, `waiting`, `idle`, and `shell` for a turn that has ended with a
-        // background command still running), not the list's display word.
-        for status in ["busy", "waiting", "idle", "shell"] {
+        // (`busy`, `waiting`, `idle`), not the list's display word. The one
+        // exception is `shell` (a turn that has ended with a background command
+        // still running): the bare word told a Director nothing, so it reads as
+        // what it is.
+        for (status, printed) in [
+            ("busy", "busy"),
+            ("waiting", "waiting"),
+            ("idle", "idle"),
+            ("shell", "idle (background command running)"),
+        ] {
             let home = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(home.path().join("sessions")).unwrap();
             let pid = std::process::id();
@@ -2418,7 +2433,7 @@ mod tests {
             let response = call(&mut ctx, &status_call());
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
             assert!(
-                text.contains(&format!("worker-1 \u{2014} {status}")),
+                text.contains(&format!("worker-1 \u{2014} {printed}")),
                 "{status}: {text:?}"
             );
         }
