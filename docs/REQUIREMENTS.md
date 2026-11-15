@@ -2732,23 +2732,30 @@ waiting. What is measured and what is not: one plain word of 7 cells, a blank on
 each side and the single trailing rule cell, at widths 81 and 84, is measured;
 blanks between words and wide characters are extension by construction (the one
 other session on the measuring machine with a label of this shape has a name with a
-space in it, and what writes the label is not known, so it may be free text in any
-script); the half-width floor is margin (the label sat in the last eighth, and half
-keeps a dialog title at the left or in the middle out). `HasText` holds the nudge
-even with no mark (recalled history is text no keystroke announced); `Empty` clears
-the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto last forwarded input to the
-pane, because a pane's screen lags its keys (36–108ms measured on 2026-11-10) and an
-`Empty` read inside that window is not yet true; `Unrecognized` — and every Codex
-pane, whose screen is not read — leaves the mark in charge. The delayed Enter never
-reads the screen: by then the line holds banto's own nudge sentence. A Claude pane
-that stays idle yet `Unrecognized` for `INPUT_LINE_UNREADABLE_AFTER` (60s) is
-reported once on the status line, since Claude's layout can change without notice
-and a reader that stopped recognising it would look like one that works; waiting (a
-permission dialog) is not counted. The same reading lets a retried Goinkyo kickoff
-press Enter alone when the line still holds exactly its sentence.
+space in it; the label is the session name given with `/rename`, free text in any
+script, and the second name the operator gave contains wide characters, so a
+wide-character label exists on a real pane: on 2026-11-15 the session renamed to
+that name showed the label, and its member then idled for two minutes without the
+"cannot read the input line" notice, which is due after 60 s
+(`INPUT_LINE_UNREADABLE_AFTER`) of an idle, unrecognised reading, so it is observed
+to be read; the screen itself was not replayed against the reader, so it is still
+not a cell-by-cell measurement); the half-width floor is margin (the label sat in
+the last eighth, and half keeps a dialog title at the left or in the middle out).
+`HasText` holds the nudge even with no mark (recalled history is text no keystroke
+announced); `Empty` clears the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto
+last forwarded input to the pane, because a pane's screen lags its keys (36–108ms
+measured on 2026-11-10) and an `Empty` read inside that window is not yet true;
+`Unrecognized` — and every Codex pane, whose screen is not read — leaves the mark in
+charge. The delayed Enter never reads the screen: by then the line holds banto's own
+nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
+`INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
+Claude's layout can change without notice and a reader that stopped recognising it
+would look like one that works; waiting (a permission dialog) is not counted. The
+same reading lets a retried Goinkyo kickoff press Enter alone when the line still
+holds exactly its sentence.
 
-*Incident (2026-11-15): a label in one session's input-box border.* The operator
-kept seeing `relay: cannot read the input line of director of "<brigade>" —
+*Incident (2026-11-15): a renamed session's label in its input-box border.* The
+operator kept seeing `relay: cannot read the input line of director of "<brigade>" —
 unsent-draft detection is back to keystroke tracking` for a brigade he had only
 opened. Measured by replaying a 100-minute recording against the reader: one
 Director's pane read `Unrecognized` on essentially every tick of its life, always
@@ -2759,12 +2766,21 @@ scrolling and size made no difference. That pane's top border was, at width 81, 
 session in the run whose transcript carries `agent-name` records (the link is by
 structure, character count and class, and by record types only; nobody read the
 label or the transcript's content). A session with only a `/rename` title
-(`custom-title` records) keeps the plain border: the other brigade's Director, also
-renamed with `/rename`, was always readable. Which user action writes `agent-name`
-is not known. The notice fires about 61 s after the member first idles, once per
-member, whatever the stage; it looked like an off-stage brigade's only because that
-is where he was not looking. The reader now accepts the labelled border (above), so
-such a member reads `Empty` or `HasText` and its draft protection works.
+(`custom-title` records) kept the plain border: the other brigade's Director, also
+renamed with `/rename`, was always readable. Observed on 2026-11-15, Claude Code
+2.1.325: the operator ran `/rename` on a long-lived session whose transcript until
+then held only `custom-title` records (it had been renamed under an earlier Claude
+Code); the transcript gained `agent-name` records and the label appeared at the top
+right of that session's input box at once, and he confirmed by eye that the
+originally measured pane has the label there. So the current `/rename` writes
+`agent-name` and draws the label, while an earlier version's `/rename` wrote only
+`custom-title` and drew none, which is why two Directors, both renamed, differed
+(his own explanation, offered before the check: the readable session was long-lived
+and had been renamed before Claude's behaviour changed). The notice fires about 61 s
+after the member first idles, once per member, whatever the stage; it looked like an
+off-stage brigade's only because that is where he was not looking. The reader now
+accepts the labelled border (above), so such a member reads `Empty` or `HasText` and
+its draft protection works.
 
 What this does not fix: a mark left standing over an empty line — after
 answering a permission dialog with `1`, after Ctrl+C clears the line, after

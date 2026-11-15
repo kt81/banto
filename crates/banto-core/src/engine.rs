@@ -14984,8 +14984,8 @@ mod tests {
     }
 
     /// [`draw_prompt`] for a pane whose input box carries a label inside its top
-    /// border, the shape `crate::input_line` documents (what writes such a label
-    /// is not known; only where it sits was measured).
+    /// border (what `/rename` draws in current Claude Code), the shape
+    /// `crate::input_line` documents.
     fn draw_labelled_prompt(state: &mut EmporiumState, key: &SessionKey, typed: Option<&str>) {
         draw_prompt_block(state.screens.get_mut(key).unwrap(), typed, Some("abcdefg"));
     }

@@ -29,15 +29,22 @@
 //! carried a short label inside its top rule. That pane belonged to the one
 //! session in the run whose transcript holds `agent-name` records; a session
 //! renamed only with `/rename` (`custom-title` records, no `agent-name`) had the
-//! plain border. Which user action writes `agent-name` is not known, so the label
-//! is described here by where it is and not by what causes it. The row above the prompt row was then a rule run from column 0, one blank, the
-//! label (one word of 7 plain cells in one colour), one blank and a single rule
-//! cell in the last column, at pane widths 81 and 84 alike (rule runs of 71 and
-//! 74 cells), so the label sits against the right edge whatever the width. Every
-//! other pane in the same recording had the plain full-width rule. Before the
-//! label was allowed for, that one pane read `Unrecognized` on essentially every
-//! tick of its life, whatever its stage, focus or size, for no other reason than
-//! this row. The label's own text was not looked at, and nothing here reads it.
+//! plain border. The cause was then observed (2026-11-15, Claude Code 2.1.325):
+//! `/rename` on a long-lived session whose transcript held only `custom-title`
+//! records, renamed under an earlier Claude Code, added `agent-name` records and
+//! drew the label in that session's input box at once. So the current `/rename`
+//! writes `agent-name` and draws the label, and an earlier version's wrote only
+//! `custom-title` and drew none, which is why two renamed Directors differed.
+//!
+//! On the recording, the row above the prompt row was a rule run from column 0,
+//! one blank, the label (one word of 7 plain cells in one colour), one blank and
+//! a single rule cell in the last column, at pane widths 81 and 84 alike (rule
+//! runs of 71 and 74 cells), so the label sits against the right edge whatever
+//! the width. Every other pane in the same recording had the plain full-width
+//! rule. Before the label was allowed for, that one pane read `Unrecognized` on
+//! essentially every tick of its life, whatever its stage, focus or size, for no
+//! other reason than this row. The label's own text was not looked at, and
+//! nothing here reads it.
 //! What was measured is only that one word; blanks between words and wide
 //! characters are allowed for by construction (see [`is_input_top_border`]).
 //! The consequence is accepted: the label's content is not examined, so any short
@@ -123,12 +130,17 @@ enum BorderCell {
 /// whose transcript also holds `agent-name` records had a label of 20 ASCII cells
 /// with a space in it, and the text is free in any script, so a reader that took
 /// only one plain word would give the next Director with such a label the same
-/// `Unrecognized`. The half-width floor is a margin
-/// too: what was seen put the label in the last eighth, and half keeps a title at
-/// the left or in the middle of a dialog border, a row of text between two rule
-/// cells and a mostly blank row out, since none of those is the input box. It
-/// caps the label at `width / 2 - 3` cells (wide characters count two); a longer
-/// label reads `Unrecognized`.
+/// `Unrecognized`. On 2026-11-15 a session renamed to a name with wide
+/// characters showed the label on a real pane, and its member then idled for two
+/// minutes without the relay's "cannot read the input line" notice, which is due
+/// after 60 s (`INPUT_LINE_UNREADABLE_AFTER`) of an idle, unrecognised reading.
+/// The screen itself was not replayed
+/// against this reader, so that shape is observed to be read, not measured cell
+/// by cell. The half-width floor is a margin too: what was seen put the label in
+/// the last eighth, and half keeps a title at the left or in the middle of a
+/// dialog border, a row of text between two rule cells and a mostly blank row
+/// out, since none of those is the input box. It caps the label at `width / 2 - 3`
+/// cells (wide characters count two); a longer label reads `Unrecognized`.
 fn is_input_top_border(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
     if is_full_width_rule(screen, row, cols) {
         return true;
