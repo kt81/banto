@@ -169,7 +169,7 @@ const STATUS_STEPS: [(bool, AgeForm); 4] = [
 
 /// The status a tile's title row carries after its label, for every tile,
 /// collapsed or not: agent label, activity word, output age, in the list's own
-/// words and colours, from the same [`StripData`] — so one decision, drawn in
+/// words and colours (busy, waiting, idle), from the same [`StripData`] — so one decision, drawn in
 /// one place, whatever the tile's state.
 ///
 /// Shed in [`STATUS_STEPS`] order as `room` cells run out: the agent label, then
@@ -510,16 +510,17 @@ mod tests {
             output_age: None,
             ..StripData::default()
         };
+        // `Alive` is drawn as "idle": see `activity_word`.
         assert_eq!(
             texts(&title_status_parts(&data, 80)),
-            "Claude \u{b7} alive \u{b7} no output yet"
+            "Claude \u{b7} idle \u{b7} no output yet"
         );
         assert_eq!(
-            texts(&title_status_parts(&data, 29)),
-            "alive \u{b7} no output yet"
+            texts(&title_status_parts(&data, 28)),
+            "idle \u{b7} no output yet"
         );
         // Nothing to shorten: it goes to the bare word.
-        assert_eq!(texts(&title_status_parts(&data, 20)), "alive");
+        assert_eq!(texts(&title_status_parts(&data, 19)), "idle");
     }
 
     #[test]

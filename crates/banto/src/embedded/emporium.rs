@@ -3160,12 +3160,12 @@ fn paint_tile_buttons(
 /// What a staged tile says about its pane's state, as its title row draws it
 /// (and a collapsed tile's body adds the messages): the one place the product,
 /// the activity and the output age are decided, so no two tiles or states can
-/// disagree. The activity is `EmporiumState::displayed_activity`, the decision
-/// the marks, the count and the bell read too: a hosted Codex pane's believed
-/// report, else the session list's row for the pane, else what the member's live
-/// file said this tick, else none; the product is the row's, else the one the
-/// relay resolved before there is a row. Computed per staged tile on every
-/// frame, by a few map lookups.
+/// disagree. The activity is `EmporiumState::pane_word`: waiting when the pane
+/// waits on the operator (the decision the marks, the count and the bell read,
+/// and the member's live status of this tick), else busy or idle from what banto
+/// has read of it (the decision the quit question uses), else none; the product
+/// is the row's, else the one the relay resolved before there is a row. Computed
+/// per staged tile on every frame, by a few map lookups.
 fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant) -> StripData {
     let row = app.row_for_id(key.as_str());
     let facts = state.member_facts(key);
@@ -3173,7 +3173,7 @@ fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant
         agent: row
             .map(|row| row.agent)
             .or_else(|| facts.and_then(|facts| facts.agent)),
-        activity: state.displayed_activity(app, key),
+        activity: state.pane_word(app, key),
         output_age: state
             .last_output_at(key)
             .map(|at| tick.saturating_duration_since(at)),
@@ -5186,7 +5186,57 @@ mod tests {
         for id in [DIR, W1, W2] {
             said(&mut state, &mut app, &brigade, id, b"x", now);
         }
+        // What the shell's tick would have read for each pane: a live file that
+        // says busy or waiting is not idle, and one that says idle is. (A status
+        // this build does not know is not idle either; the rows here do not
+        // carry one.) A row with no live process has nothing to read.
+        let samples = [DIR, W1, W2]
+            .into_iter()
+            .zip(activities)
+            .filter_map(|(id, activity)| {
+                let reading = match activity {
+                    Activity::Busy | Activity::Waiting => Quiescence::NotIdle,
+                    Activity::Alive => Quiescence::Idle,
+                    Activity::Idle(_) => return None,
+                };
+                Some((SessionKey::from_id(id), reading))
+            })
+            .collect();
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::QuiescenceSampled { samples },
+            now,
+        );
         (state, app, brigade, now)
+    }
+
+    /// The tick's samples for the panes named, replacing whatever was read before.
+    fn sampled(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        readings: &[(&str, Quiescence)],
+        now: Instant,
+    ) {
+        let samples = readings
+            .iter()
+            .map(|(id, reading)| (SessionKey::from_id(id), *reading))
+            .collect();
+        engine::update(
+            state,
+            app,
+            brigade,
+            Event::QuiescenceSampled { samples },
+            now,
+        );
+    }
+
+    /// The title row of pane `id` as drawn now.
+    fn title_of(state: &EmporiumState, app: &App, id: &str, now: Instant) -> String {
+        let buffer = render_at(state, app, 160, now);
+        title_row(state, &buffer, id, 160).0
     }
 
     fn said(
@@ -5229,15 +5279,10 @@ mod tests {
 
     #[test]
     fn a_directors_tile_title_keeps_its_own_state_word_while_its_row_carries_a_brigade_mark() {
-        use banto_core::model::AgeBucket::Today;
         // The mark is the row's dot and the tile's colour, never the session's
         // state: an idle Director marked for a quiet brigade still draws "idle",
         // and a busy one "busy", never "waiting".
-        for (activity, word) in [
-            (Activity::Idle(Today), "idle"),
-            (Activity::Busy, "busy"),
-            (Activity::Alive, "alive"),
-        ] {
+        for (activity, word) in [(Activity::Busy, "busy"), (Activity::Alive, "idle")] {
             let (state, mut app, _, now) = scene(160, [activity, Activity::Alive, Activity::Alive]);
             let unmarked = {
                 let buffer = render_at(&state, &app, 160, now);
@@ -5260,6 +5305,81 @@ mod tests {
     }
 
     #[test]
+    fn a_hosted_codex_pane_at_its_prompt_reads_idle_before_and_after_an_unrelated_reload() {
+        use banto_core::model::AgeBucket::Today;
+        // The incident: after a restart the open Codex Worker read "idle" (its row
+        // proving no live process) for a minute and then "alive" when an unrelated
+        // list reload found its pid. It is hosted, and says itself it is idle.
+        let (mut state, mut app, brigade, now) = scene(
+            160,
+            [Activity::Alive, Activity::Alive, Activity::Idle(Today)],
+        );
+        said(&mut state, &mut app, &brigade, W2, REPORT_IDLE, now);
+        assert!(title_of(&state, &app, W2, now).contains(" Codex \u{b7} idle \u{b7} "));
+        app.replace_rows(vec![
+            SessionRow {
+                activity: Activity::Alive,
+                ..test_row(DIR, AgentKind::ClaudeCode)
+            },
+            SessionRow {
+                activity: Activity::Alive,
+                ..test_row(W1, AgentKind::ClaudeCode)
+            },
+            SessionRow {
+                activity: Activity::Alive,
+                ..test_row(W2, AgentKind::Codex)
+            },
+        ]);
+        let title = title_of(&state, &app, W2, now);
+        assert!(title.contains(" Codex \u{b7} idle \u{b7} "), "{title:?}");
+        assert!(!title.contains("alive"), "{title:?}");
+    }
+
+    #[test]
+    fn a_hosted_panes_word_is_what_banto_has_read_of_it_and_nothing_before_that() {
+        use banto_core::model::AgeBucket::Today;
+        // A Codex pane that never reports: the sample decides. A Claude pane whose
+        // live file says something this build does not know reads as busy, as the
+        // quit question counts it. Nothing read yet: no word at all.
+        let (mut state, mut app, brigade, now) =
+            scene(160, [Activity::Alive, Activity::Alive, Activity::Alive]);
+        sampled(
+            &mut state,
+            &mut app,
+            &brigade,
+            &[
+                (W2, Quiescence::NotIdle),
+                (W1, Quiescence::NotIdle),
+                (DIR, Quiescence::Idle),
+            ],
+            now,
+        );
+        let codex = title_of(&state, &app, W2, now);
+        assert!(codex.contains(" Codex \u{b7} busy \u{b7} "), "{codex:?}");
+        let claude = title_of(&state, &app, W1, now);
+        assert!(claude.contains(" Claude \u{b7} busy \u{b7} "), "{claude:?}");
+        let director = title_of(&state, &app, DIR, now);
+        assert!(
+            director.contains(" Claude \u{b7} idle \u{b7} "),
+            "{director:?}"
+        );
+
+        sampled(&mut state, &mut app, &brigade, &[], now);
+        for id in [DIR, W1, W2] {
+            let title = title_of(&state, &app, id, now);
+            for word in ["idle", "busy", "alive", "waiting"] {
+                assert!(!title.contains(word), "{id}: nothing read yet: {title:?}");
+            }
+        }
+        // A row that says it has no live process changes nothing about that.
+        app.replace_rows(vec![SessionRow {
+            activity: Activity::Idle(Today),
+            ..test_row(W2, AgentKind::Codex)
+        }]);
+        assert!(!title_of(&state, &app, W2, now).contains("idle"));
+    }
+
+    #[test]
     fn a_collapsed_and_an_expanded_tile_render_the_same_title_row_for_every_state_and_product() {
         use banto_core::model::AgeBucket::Today;
         // What it is, the row's activity, what the Codex pane reported, and the
@@ -5271,7 +5391,7 @@ mod tests {
             Option<&'static [u8]>,
             &'static str,
         );
-        let cases: [Case; 11] = [
+        let cases: [Case; 12] = [
             (
                 "codex working",
                 AgentKind::Codex,
@@ -5291,21 +5411,28 @@ mod tests {
                 AgentKind::Codex,
                 Activity::Alive,
                 Some(REPORT_DONE),
-                "Codex \u{b7} alive \u{b7} output now",
+                "Codex \u{b7} idle \u{b7} output now",
             ),
             (
                 "codex idle",
                 AgentKind::Codex,
                 Activity::Alive,
                 Some(REPORT_IDLE),
-                "Codex \u{b7} alive \u{b7} output now",
+                "Codex \u{b7} idle \u{b7} output now",
             ),
             (
-                "codex no report",
+                "codex idle, its row proving no live process",
+                AgentKind::Codex,
+                Activity::Idle(Today),
+                Some(REPORT_IDLE),
+                "Codex \u{b7} idle \u{b7} output now",
+            ),
+            (
+                "codex no report, read idle",
                 AgentKind::Codex,
                 Activity::Alive,
                 None,
-                "Codex \u{b7} alive \u{b7} output now",
+                "Codex \u{b7} idle \u{b7} output now",
             ),
             (
                 "claude busy",
@@ -5322,18 +5449,18 @@ mod tests {
                 "Claude \u{b7} waiting \u{b7} output now",
             ),
             (
-                "claude idle or shell",
+                "claude at its prompt",
                 AgentKind::ClaudeCode,
                 Activity::Alive,
                 None,
-                "Claude \u{b7} alive \u{b7} output now",
+                "Claude \u{b7} idle \u{b7} output now",
             ),
             (
-                "claude, no live file",
+                "claude, no live file: nothing to say",
                 AgentKind::ClaudeCode,
                 Activity::Idle(Today),
                 None,
-                "Claude \u{b7} idle \u{b7} output now",
+                "Claude \u{b7} output now",
             ),
             (
                 "claude busy (a report is not read for it)",
@@ -5343,11 +5470,11 @@ mod tests {
                 "Claude \u{b7} busy \u{b7} output now",
             ),
             (
-                "codex row idle",
+                "codex, nothing known: nothing to say",
                 AgentKind::Codex,
                 Activity::Idle(Today),
                 None,
-                "Codex \u{b7} idle \u{b7} output now",
+                "Codex \u{b7} output now",
             ),
         ];
         for (what, agent, activity, report, expected) in cases {
@@ -5534,22 +5661,22 @@ mod tests {
     #[test]
     fn the_title_status_steps_happen_at_these_tile_widths_for_an_8_and_a_15_cell_label() {
         // The status needs the tile width minus the label's cells and 14 for the
-        // corners, the padding and the buttons: the word at label + 14 + 5 for
-        // "alive", the short age (`alive · 2m`, 10) at label + 24, the long age
-        // without the agent (21) at label + 35, the agent too (30) at label + 44.
+        // corners, the padding and the buttons: the word at label + 14 + 4 for
+        // "idle", the short age (`idle · 2m`, 9) at label + 23, the long age
+        // without the agent (20) at label + 34, the agent too (29) at label + 43.
         let steps = |label: u16| -> Vec<(u16, &'static str)> {
-            let full = "Claude \u{b7} alive \u{b7} output 2m ago";
-            let no_agent = "alive \u{b7} output 2m ago";
-            let short = "alive \u{b7} 2m";
+            let full = "Claude \u{b7} idle \u{b7} output 2m ago";
+            let no_agent = "idle \u{b7} output 2m ago";
+            let short = "idle \u{b7} 2m";
             vec![
-                (label + 44, full),
-                (label + 43, no_agent),
-                (label + 35, no_agent),
-                (label + 34, short),
-                (label + 24, short),
-                (label + 23, "alive"),
-                (label + 19, "alive"),
-                (label + 18, ""),
+                (label + 43, full),
+                (label + 42, no_agent),
+                (label + 34, no_agent),
+                (label + 33, short),
+                (label + 23, short),
+                (label + 22, "idle"),
+                (label + 18, "idle"),
+                (label + 17, ""),
             ]
         };
         for (named, label) in [(false, 8u16), (true, 15)] {
@@ -5574,7 +5701,7 @@ mod tests {
     #[test]
     fn at_the_default_collapsed_width_a_named_tile_keeps_the_word_and_a_plain_one_the_age() {
         // All collapsed, terminal 120: the stack column is 36 wide.
-        for (named, expected) in [(false, "alive \u{b7} 2m"), (true, "alive")] {
+        for (named, expected) in [(false, "idle \u{b7} 2m"), (true, "idle")] {
             let (mut state, mut app, brigade, tick) = aged_pair(120, named);
             for id in [W1, W2] {
                 toggle_minimize_for_test_at(
@@ -5851,11 +5978,7 @@ mod tests {
 
     #[test]
     fn an_idle_pane_with_an_age_shows_the_age_beside_its_word() {
-        use banto_core::model::AgeBucket::Today;
-        let (state, app, _, now) = scene(
-            160,
-            [Activity::Idle(Today), Activity::Alive, Activity::Alive],
-        );
+        let (state, app, _, now) = scene(160, [Activity::Alive, Activity::Alive, Activity::Alive]);
         let buffer = render_at(&state, &app, 160, now + Duration::from_secs(185));
         assert_eq!(
             status_segment(&state, &buffer, DIR, 160),
@@ -6128,18 +6251,25 @@ mod tests {
             (title, strip)
         };
         let waiting = "Codex \u{b7} waiting \u{b7} output now";
-        let claude_alive = "Claude \u{b7} alive \u{b7} output now";
+        let claude_idle = "Claude \u{b7} idle \u{b7} output now";
         assert_eq!(both(&state, &app).0, waiting);
         assert!(state.attention_panes().contains(&key));
         assert_eq!(state.visible_waiting_count(), 1);
 
-        // A row naming Claude arrives.
+        // A row naming Claude arrives, and the shell's sample of it reads idle.
+        update(
+            &mut state,
+            &mut app,
+            Event::QuiescenceSampled {
+                samples: vec![(key.clone(), Quiescence::Idle)],
+            },
+        );
         let claude = SessionRow {
             activity: Activity::Alive,
             ..test_row(W1, AgentKind::ClaudeCode)
         };
         let cmds = update(&mut state, &mut app, loaded(vec![claude.clone()]));
-        assert_eq!(both(&state, &app).0, claude_alive, "the title");
+        assert_eq!(both(&state, &app).0, claude_idle, "the title");
         assert!(!state.attention_panes().contains(&key), "no mark");
         assert_eq!(state.visible_waiting_count(), 0, "no count");
         assert!(
@@ -6149,7 +6279,7 @@ mod tests {
         );
         // The strip of the same pane says the same.
         toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
-        assert_eq!(both(&state, &app).1.as_deref(), Some(claude_alive));
+        assert_eq!(both(&state, &app).1.as_deref(), Some(claude_idle));
 
         // The row goes: the kept report counts again, on the strip too.
         update(&mut state, &mut app, loaded(Vec::new()));
@@ -6174,6 +6304,22 @@ mod tests {
         let key = SessionKey::from_id(W1);
         let now = Instant::now();
         let observe = |state: &mut EmporiumState, app: &mut App, live: Option<LiveStatus>| {
+            // The tick's sample of the same live file, as the shell reads it
+            // (nothing observed, nothing sampled).
+            let samples = live
+                .map(|live| match live.activity {
+                    Alive => Quiescence::Idle,
+                    _ => Quiescence::NotIdle,
+                })
+                .map(|reading| vec![(SessionKey::from_id(W1), reading)])
+                .unwrap_or_default();
+            engine::update(
+                state,
+                app,
+                &BrigadeConfig::default(),
+                Event::QuiescenceSampled { samples },
+                now,
+            );
             engine::update(
                 state,
                 app,
@@ -6223,7 +6369,7 @@ mod tests {
                     activity: Alive,
                     dialog_open: false,
                 },
-                "Claude \u{b7} alive \u{b7} output now",
+                "Claude \u{b7} idle \u{b7} output now",
             ),
             (
                 LiveStatus {
@@ -6404,9 +6550,23 @@ mod tests {
             b"\x1b]7501;state=clear\x1b\\",
             now,
         );
+        // Nothing reported any more, and nothing read: no word. The sample the
+        // shell takes next decides (the row's own "alive" never says it).
+        let buffer = render_at(&state, &app, 160, now);
         assert_eq!(
-            status_row(&state, &app, "alive").0,
-            "Codex \u{b7} alive \u{b7} output now"
+            status_segment(&state, &buffer, W2, 160),
+            "Codex \u{b7} output now"
+        );
+        sampled(
+            &mut state,
+            &mut app,
+            &brigade,
+            &[(W2, Quiescence::Idle)],
+            now,
+        );
+        assert_eq!(
+            status_row(&state, &app, "idle").0,
+            "Codex \u{b7} idle \u{b7} output now"
         );
     }
 

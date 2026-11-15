@@ -448,13 +448,21 @@ pub fn activity_color(activity: Activity) -> Color {
     }
 }
 
-/// An activity in one lowercase word: busy / waiting / alive / idle.
+/// An activity in one lowercase word: busy / waiting / idle.
+///
+/// There is no "alive" here, though [`Activity::Alive`] is what the list calls a
+/// session whose process is up and doing nothing. "Alive" is a word in contrast to
+/// "dead", and what a tile is asked is whether the session is working or idle, so
+/// a session waiting at its prompt reads "idle" whichever agent it is. A dormant
+/// session (`Idle(_)`, no live process, bucketed by age) would read "idle" too,
+/// but a tile is never given one: the word of a hosted pane comes from
+/// `EmporiumState::pane_word`, which yields only busy, waiting and `Alive`, and a
+/// pane nothing has been read of gets no word at all.
 pub fn activity_word(activity: Activity) -> &'static str {
     match activity {
         Activity::Busy => "busy",
         Activity::Waiting => "waiting",
-        Activity::Alive => "alive",
-        Activity::Idle(_) => "idle",
+        Activity::Alive | Activity::Idle(_) => "idle",
     }
 }
 

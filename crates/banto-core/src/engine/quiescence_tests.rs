@@ -7038,6 +7038,295 @@ fn a_row_arriving_later_for_a_waiting_row_less_member_changes_nothing_and_rings_
     assert_eq!(state.displayed_activity(&app, &worker), Some(Alive));
 }
 
+// --- the word a hosted pane's tile carries -----------------------------------------------
+//
+// What the operator wants from a tile is whether the session is working, waiting
+// on him or idle, the same way for either product. "Alive" is a word in contrast
+// to "dead", and a hosted pane is never that: so the word is `busy`, `waiting` or
+// `idle`, from what banto has read of the pane, and nothing before it has read
+// anything.
+
+fn row_that_says(row: SessionRow, activity: crate::model::Activity) -> SessionRow {
+    SessionRow { activity, ..row }
+}
+
+#[test]
+fn a_codex_pane_that_reports_idle_reads_idle_whatever_its_row_says() {
+    use crate::model::Activity::{Alive, Idle as Dormant};
+    use crate::model::AgeBucket::{Older, Today};
+    // The incident: a hosted Codex pane at its prompt read "idle" for a minute,
+    // meaning "no live process proven", and "alive" once a reload found its pid.
+    for report in [REPORT_IDLE, REPORT_DONE, REPORT_ERROR] {
+        for row in [Alive, Dormant(Today), Dormant(Older)] {
+            let (mut state, mut app, pane, at) = solo_fixture(row_that_says(codex_row("cx"), row));
+            said(&mut state, &mut app, &pane, report, at + SECOND);
+            assert_eq!(
+                state.pane_word(&app, &pane),
+                Some(Alive),
+                "{row:?}, report {report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_codex_pane_that_never_reports_reads_what_the_sample_says() {
+    use crate::model::Activity::{Alive, Busy};
+    for (reading, word) in [(Idle, Some(Alive)), (NotIdle, Some(Busy)), (Unknown, None)] {
+        let (mut state, mut app, pane, at) = solo_fixture(row_that_says(codex_row("cx"), Alive));
+        sample(&mut state, &mut app, &[(&pane, reading)], at + SECOND);
+        assert_eq!(state.pane_word(&app, &pane), word, "{reading:?}");
+    }
+}
+
+#[test]
+fn a_claude_pane_reads_what_its_live_file_was_sampled_as_not_what_its_row_was() {
+    use crate::model::Activity::{Alive, Busy};
+    // A live file that says idle, or anything this build does not know (the row
+    // says Alive for both), is sampled Idle or NotIdle, and so is the word.
+    for (reading, word) in [(Idle, Some(Alive)), (NotIdle, Some(Busy))] {
+        let (mut state, mut app, pane, at) = solo_fixture(row_that_says(row_for("cl"), Alive));
+        sample(&mut state, &mut app, &[(&pane, reading)], at + SECOND);
+        assert_eq!(state.pane_word(&app, &pane), word, "{reading:?}");
+    }
+    // `shell` and busy: the row says Busy, and the sample is not idle.
+    let (mut state, mut app, pane, at) = solo_fixture(row_that_says(row_for("cl"), Busy));
+    sample(&mut state, &mut app, &[(&pane, NotIdle)], at + SECOND);
+    assert_eq!(state.pane_word(&app, &pane), Some(Busy));
+}
+
+#[test]
+fn a_member_with_no_row_reads_the_sample_of_its_live_file() {
+    use crate::model::Activity::{Alive, Busy};
+    // No row yet (no transcript before the first turn): what the tick's sample
+    // made of the member's live file is the word.
+    let (mut state, mut app, worker, at) = rowless_claude_worker(live(Alive, false));
+    let director = key("dir");
+    assert_eq!(state.pane_word(&app, &worker), Some(Alive), "idle");
+    // The live file turns busy: the next tick samples it not idle.
+    let relay = vec![RelayObservation {
+        live: live(Busy, false),
+        ..observed_as(&state, &worker, Some(crate::model::AgentKind::ClaudeCode))
+    }];
+    sample_with_relay(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, NotIdle)],
+        relay,
+        at + SECOND,
+    );
+    assert_eq!(state.pane_word(&app, &worker), Some(Busy), "busy");
+    // A tick that read nothing of it leaves nothing to say.
+    sample(&mut state, &mut app, &[], at + 2 * SECOND);
+    assert_eq!(state.pane_word(&app, &worker), None, "nothing read");
+}
+
+#[test]
+fn a_member_whose_live_file_has_turned_waiting_reads_waiting_before_the_list_reloads() {
+    use crate::model::Activity::{Alive, Busy, Waiting};
+    // The row was last loaded as Alive and no reload has come since; the relay's
+    // tick has read the live file, which now waits. The word says so. The marks
+    // and the bell still read `displayed_activity`, row first, so for this short
+    // window the tile says `waiting` before the mark appears.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![row_for("dir"), row_for("w1")]);
+    app.set_viewport_height(20);
+    let tick = |state: &mut EmporiumState,
+                app: &mut App,
+                live: Option<crate::engine::LiveStatus>,
+                reading,
+                secs: u32| {
+        let relay = live
+            .map(|live| {
+                vec![RelayObservation {
+                    live: Some(live),
+                    ..observed_as(state, &worker, Some(crate::model::AgentKind::ClaudeCode))
+                }]
+            })
+            .unwrap_or_default();
+        sample_with_relay(
+            state,
+            app,
+            &[(&director, Idle), (&worker, reading)],
+            relay,
+            at + secs * SECOND,
+        )
+    };
+    let status = |activity, dialog_open| crate::engine::LiveStatus {
+        activity,
+        dialog_open,
+    };
+    tick(&mut state, &mut app, Some(status(Alive, false)), Idle, 1);
+    assert_eq!(state.pane_word(&app, &worker), Some(Alive));
+
+    tick(
+        &mut state,
+        &mut app,
+        Some(status(Waiting, false)),
+        NotIdle,
+        2,
+    );
+    assert_eq!(
+        state.pane_word(&app, &worker),
+        Some(Waiting),
+        "the live file waits"
+    );
+    assert_eq!(
+        state.displayed_activity(&app, &worker),
+        Some(Alive),
+        "the decision the marks read is the row's, as before"
+    );
+    assert!(!state.attention_panes().contains(&worker), "no mark yet");
+
+    // A dialog the operator opened is still waiting, as ruled.
+    tick(
+        &mut state,
+        &mut app,
+        Some(status(Waiting, true)),
+        NotIdle,
+        3,
+    );
+    assert_eq!(state.pane_word(&app, &worker), Some(Waiting), "a dialog");
+
+    // The live file stops waiting: the word follows the sample.
+    tick(&mut state, &mut app, Some(status(Busy, false)), NotIdle, 4);
+    assert_eq!(state.pane_word(&app, &worker), Some(Busy));
+    tick(&mut state, &mut app, Some(status(Alive, false)), Idle, 5);
+    assert_eq!(state.pane_word(&app, &worker), Some(Alive));
+
+    // And a status cannot outlive its tick: one that read nothing of the member
+    // takes `waiting` away, whatever was seen before.
+    tick(
+        &mut state,
+        &mut app,
+        Some(status(Waiting, false)),
+        NotIdle,
+        6,
+    );
+    assert_eq!(state.pane_word(&app, &worker), Some(Waiting));
+    tick(&mut state, &mut app, None, NotIdle, 7);
+    assert_eq!(
+        state.pane_word(&app, &worker),
+        Some(Busy),
+        "a stale wait is gone"
+    );
+}
+
+#[test]
+fn what_waits_on_the_operator_reads_waiting_whatever_the_sample_says() {
+    use crate::model::Activity::Waiting;
+    // A Claude row that says waiting (a permission prompt, or a dialog the
+    // operator opened), and a Codex pane that reports blocked.
+    for dialog in [false, true] {
+        let mut row = row_that_says(row_for("cl"), Waiting);
+        row.dialog_open = dialog;
+        let (mut state, mut app, pane, at) = solo_fixture(row);
+        sample(&mut state, &mut app, &[(&pane, NotIdle)], at + SECOND);
+        assert_eq!(
+            state.pane_word(&app, &pane),
+            Some(Waiting),
+            "dialog {dialog}"
+        );
+    }
+    let (mut state, mut app, pane, at) = solo_fixture(codex_row("cx"));
+    sample(&mut state, &mut app, &[(&pane, Idle)], at + SECOND);
+    said(&mut state, &mut app, &pane, REPORT_BLOCKED, at + 2 * SECOND);
+    assert_eq!(state.pane_word(&app, &pane), Some(Waiting));
+}
+
+#[test]
+fn nothing_is_said_of_a_pane_before_banto_has_read_it_and_again_after_a_respawn() {
+    use crate::model::Activity::Alive;
+    let (mut state, mut app, pane, at) = solo_fixture(row_that_says(row_for("cl"), Alive));
+    assert_eq!(state.pane_word(&app, &pane), Some(Alive), "read once");
+    // The process is replaced under the same key: nothing is known about the new
+    // one, and the row of the old one says nothing about it.
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned { key: pane.clone() },
+        at + SECOND,
+    );
+    assert_eq!(state.pane_word(&app, &pane), None, "just spawned");
+    sample(&mut state, &mut app, &[(&pane, Idle)], at + 2 * SECOND);
+    assert_eq!(state.pane_word(&app, &pane), Some(Alive));
+}
+
+#[test]
+fn a_key_typed_into_a_pane_does_not_make_its_word_busy_for_the_quit_windows_three_seconds() {
+    use crate::model::Activity::Alive;
+    let (mut state, mut app, pane, at) = solo_fixture(row_that_says(row_for("cl"), Alive));
+    state.focus = Focus::Pane;
+    press(&mut state, &mut app, KeyCode::Char('x'), at + SECOND);
+    // The quit question asks (it counts a pane that just took input) ...
+    assert_eq!(state.not_idle_count(&app, at + SECOND), 1);
+    // ... and the word does not follow it.
+    assert_eq!(state.pane_word(&app, &pane), Some(Alive));
+}
+
+#[test]
+fn the_word_is_not_what_the_marks_and_the_bell_read() {
+    // A pane whose row has not caught up (a rename window): the word reads the
+    // sample, but `displayed_activity` still says nothing is known, which is what
+    // keeps an announced wait from ringing a second time as the row arrives.
+    let (mut state, mut app, _director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![row_for("dir")]);
+    sample(&mut state, &mut app, &[(&worker, NotIdle)], at + SECOND);
+    assert!(app.row_for_id("w1").is_none());
+    assert_eq!(state.displayed_activity(&app, &worker), None);
+    assert_eq!(
+        state.pane_word(&app, &worker),
+        Some(crate::model::Activity::Busy)
+    );
+}
+
+#[test]
+fn a_hosted_rows_dot_says_live_and_goes_when_the_pane_does() {
+    use crate::model::Activity::Alive;
+    use crate::model::AgeBucket::Today;
+    // Laid over the list, as what a pane reports is: a pane banto hosts is not a
+    // row with no live process. A reload cannot lose it, and ending the pane
+    // gives the row back its own word.
+    let (mut state, mut app, pane, at) = solo_fixture(row_that_says(
+        codex_row("cx"),
+        crate::model::Activity::Idle(Today),
+    ));
+    send(
+        &mut state,
+        &mut app,
+        Event::Tick {
+            relay: Vec::new(),
+            brigades: Vec::new(),
+        },
+        at + SECOND,
+    );
+    assert_eq!(row_activity(&app, "cx"), Alive);
+    send(
+        &mut state,
+        &mut app,
+        rows_loaded(vec![row_that_says(
+            codex_row("cx"),
+            crate::model::Activity::Idle(Today),
+        )]),
+        at + 2 * SECOND,
+    );
+    assert_eq!(row_activity(&app, "cx"), Alive, "a reload keeps it");
+    send(
+        &mut state,
+        &mut app,
+        Event::PtyExited {
+            key: pane.clone(),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        at + 3 * SECOND,
+    );
+    assert_eq!(
+        row_activity(&app, "cx"),
+        crate::model::Activity::Idle(Today),
+        "the pane is gone"
+    );
+}
+
 #[test]
 fn the_word_comes_from_the_report_then_the_row_then_the_live_file() {
     use crate::model::Activity::{Alive, Busy, Waiting};

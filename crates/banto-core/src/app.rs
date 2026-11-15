@@ -888,6 +888,9 @@ pub struct App {
     /// [`Self::set_reported_activity`]). Laid over `base_rows`' own activity
     /// whenever `rows` is rebuilt, so a reload of the list cannot lose it.
     reported_activity: HashMap<String, Activity>,
+    /// The ids of the sessions this banto hosts a pane for ([`Self::set_hosted_ids`]):
+    /// a row among them that says it has no live process is shown as live.
+    hosted_ids: HashSet<String>,
     /// Directors whose brigade wants the operator ([`Self::set_brigade_marks`]):
     /// shown as Waiting on their rows and counted, nothing else.
     brigade_marks: HashSet<String>,
@@ -1046,6 +1049,7 @@ impl App {
             pinned: HashSet::new(),
             waiting_rows: HashSet::new(),
             reported_activity: HashMap::new(),
+            hosted_ids: HashSet::new(),
             brigade_marks: HashSet::new(),
             reported_dialogs: HashSet::new(),
             row_index: HashMap::new(),
@@ -1889,6 +1893,30 @@ impl App {
         self.refilter_keeping_selected(selected_id);
     }
 
+    /// Tell the list which sessions this banto hosts a pane for. A row of such a
+    /// session whose own activity says there is no live process (`Idle(_)`: the
+    /// Codex check of the logs database runs on a reload, which a pane at its
+    /// prompt never causes) is shown as live (`Alive`) while the pane lasts: the
+    /// process is the one banto started, whatever the files could prove. Anything
+    /// the row or a pane already says (busy, waiting) stands. Laid over `rows`
+    /// like [`Self::set_reported_activity`], so a reload cannot lose it and ending
+    /// the pane gives the row its own word back; and costs a comparison when
+    /// nothing changed.
+    ///
+    /// A side effect, intended: a live superseded row is never hidden
+    /// ([`Self::is_hidden_superseded`]), so a resumed ancestor whose pane this
+    /// banto hosts is listed, and not counted as hidden, for as long as the pane
+    /// lasts.
+    pub fn set_hosted_ids(&mut self, hosted: HashSet<String>) {
+        if self.hosted_ids == hosted {
+            return;
+        }
+        self.hosted_ids = hosted;
+        let selected_id = self.selected_row().map(|row| row.id.clone());
+        self.resort_rows();
+        self.refilter_keeping_selected(selected_id);
+    }
+
     /// The Directors whose brigade wants the operator — it went quiet, or one of
     /// its members off stage is waiting — laid over the list as a mark: the
     /// row's dot reads Waiting and the row is counted, which is all it does. It
@@ -1939,6 +1967,9 @@ impl App {
         for row in &mut self.rows {
             if let Some(&activity) = self.reported_activity.get(&row.id) {
                 row.activity = activity;
+            } else if matches!(row.activity, Activity::Idle(_)) && self.hosted_ids.contains(&row.id)
+            {
+                row.activity = Activity::Alive;
             }
         }
         self.rows.sort_by_key(|row| !self.pinned.contains(&row.id));
@@ -2615,6 +2646,87 @@ mod tests {
         assert!(got.contains(&"a".to_string()));
         assert!(got.contains(&"c".to_string()));
         assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn a_superseded_ancestor_is_listed_while_it_is_hosted_and_hidden_again_after() {
+        // Intended: a live superseded row is never hidden ("hiding a running
+        // session would lie"), and a hosted session is live whatever its files
+        // can prove, so while its pane lasts it is listed and not counted hidden.
+        let dormant = Activity::Idle(AgeBucket::Today);
+        let rows = vec![
+            SessionRow {
+                activity: dormant,
+                ..row("old", "old", "")
+            },
+            SessionRow {
+                activity: Activity::Alive,
+                ..row("new", "new", "")
+            },
+        ];
+        let mut app = App::new(rows).with_superseded(["old".to_string()].into_iter().collect());
+        app.set_viewport_height(10);
+        assert_eq!(ids(&app), vec!["new"]);
+        assert_eq!(app.hidden_count(), 1);
+
+        app.set_hosted_ids(["old".to_string()].into_iter().collect());
+        assert_eq!(ids(&app), vec!["old", "new"]);
+        assert_eq!(app.hidden_count(), 0);
+
+        app.set_hosted_ids(HashSet::new());
+        assert_eq!(ids(&app), vec!["new"]);
+        assert_eq!(app.hidden_count(), 1);
+    }
+
+    #[test]
+    fn a_hosted_row_with_no_live_process_shows_live_and_nothing_else_is_changed() {
+        let dormant = Activity::Idle(AgeBucket::Today);
+        let with = |id: &str, activity: Activity| SessionRow {
+            activity,
+            ..row(id, id, "")
+        };
+        let mut app = App::new(vec![
+            with("idle", dormant),
+            with("away", dormant),
+            with("busy", Activity::Busy),
+            with("waiting", Activity::Waiting),
+            with("live", Activity::Alive),
+        ]);
+        app.set_viewport_height(20);
+        let activity_of = |app: &App, id: &str| {
+            app.visible()
+                .into_iter()
+                .find_map(|line| match line {
+                    ListLine::Row(r) if r.row.id == id => Some(r.row.activity),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let hosted = ["idle", "busy", "waiting", "live"];
+        app.set_hosted_ids(hosted.iter().map(|id| id.to_string()).collect());
+        // A hosted session is not "no live process"; a session that is not hosted
+        // keeps what the files say, and what a row already says stands.
+        assert_eq!(activity_of(&app, "idle"), Activity::Alive);
+        assert_eq!(activity_of(&app, "away"), dormant);
+        assert_eq!(activity_of(&app, "busy"), Activity::Busy);
+        assert_eq!(activity_of(&app, "waiting"), Activity::Waiting);
+        assert_eq!(activity_of(&app, "live"), Activity::Alive);
+        // A reported activity beats it, and a reload cannot lose it.
+        app.set_reported_activity(
+            [("idle".to_string(), Activity::Busy)].into_iter().collect(),
+            HashSet::new(),
+        );
+        assert_eq!(activity_of(&app, "idle"), Activity::Busy);
+        app.set_reported_activity(HashMap::new(), HashSet::new());
+        app.replace_rows(vec![with("idle", dormant), with("away", dormant)]);
+        assert_eq!(
+            activity_of(&app, "idle"),
+            Activity::Alive,
+            "kept by a reload"
+        );
+        // The pane ends: the row has its own word back.
+        app.set_hosted_ids(HashSet::new());
+        assert_eq!(activity_of(&app, "idle"), dormant);
     }
 
     #[test]

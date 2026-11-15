@@ -2345,8 +2345,9 @@ impl EmporiumState {
     /// known to be Codex) is `None` and leaves the row's activity, if any, to
     /// say. The one decision behind every surface that shows a pane's activity:
     /// the list rows and the mark set get it laid over as an overlay
-    /// ([`sync_reported_activity`]), and a tile's strip and title take it
-    /// directly, so a pane without a row shows the same.
+    /// ([`sync_reported_activity`]), and a tile's word takes its waiting from it
+    /// ([`Self::pane_word`]) and its busy and idle from the same report through
+    /// [`Self::quiescence_of`], so a pane without a row shows the same.
     pub fn reported_activity(&self, app: &App, key: &SessionKey) -> Option<Activity> {
         match self.codex_report(app, key)? {
             report if report.is_blocked() => Some(Activity::Waiting),
@@ -2359,12 +2360,61 @@ impl EmporiumState {
     /// known: a hosted Codex pane's believed report, else the session list's row,
     /// else what the member's live file said this tick (a Claude Worker that has
     /// not run a turn has a live file and no row). The one decision behind the
-    /// strip, the title, the marks, the count and the bell edge, so they cannot
-    /// disagree.
+    /// marks, the count and the bell edge, and the first of the two a tile's
+    /// waiting is taken from, so the tile and the marks agree about a wait with
+    /// one exception: [`Self::pane_word`] also takes the member's live status of
+    /// this tick, which a row-first order does not see until the list reloads, so
+    /// the tile can say `waiting` shortly before the mark appears. A tile's whole
+    /// word is [`Self::pane_word`]: this row-first order says "alive" and "no
+    /// live process" of a pane whatever the pane is, which a tile must not.
     pub fn displayed_activity(&self, app: &App, key: &SessionKey) -> Option<Activity> {
         self.reported_activity(app, key)
             .or_else(|| app.row_for_id(key.as_str()).map(|row| row.activity))
             .or_else(|| self.member_live(key).map(|live| live.activity))
+    }
+
+    /// The word a hosted pane's tile carries, as an [`Activity`] the strip draws:
+    /// `Waiting`, `Busy`, `Alive` (drawn "idle", see `banto_tui::view::
+    /// activity_word`), or `None` when banto has read nothing of the pane yet.
+    ///
+    /// What the operator wants from a tile is whether the session is working,
+    /// waiting on him or idle, the same way for either product. A pane banto
+    /// hosts is never "no live process" and "alive" is a word in contrast to
+    /// "dead", so neither is said of it: the word is decided from what banto has
+    /// read of the pane, by the same decision the quit question uses
+    /// ([`Self::quiescence_of`]: a Codex pane's own report, else the shell's
+    /// sample of the live file or the rollout), plus what waits on the operator.
+    /// Waiting is [`Self::displayed_activity`]'s, the decision the marks read, and
+    /// also what the member's live file said in this very tick: a row is only as
+    /// new as the last list reload, and a session that has turned `waiting` since
+    /// reads `busy` (the sample cannot tell the two apart) until the next one. So
+    /// the word and the marks agree about a wait except for that one window, in
+    /// which the tile says `waiting` before the mark appears, because the marks
+    /// and the bell keep reading `displayed_activity`, row first, as they always
+    /// did. The live status is the latest tick's alone, replaced every tick and
+    /// cleared by one that read nothing of the member, so it cannot outlive it.
+    /// Everything else the sample says. Not read: the list row's own activity, which is "no live
+    /// process proven" for a pane of this banto's and changes only on a reload,
+    /// and the quit question's three seconds after an input, which is a safety
+    /// margin and would make the word flicker with every key.
+    ///
+    /// Deliberately not [`Self::displayed_activity`] itself: the marks and the bell
+    /// read whether a pane is known to be waiting, and its being unknown in a
+    /// window (a renamed pane whose row has not arrived) is what keeps a wait that
+    /// was announced from ringing again when the row does.
+    pub fn pane_word(&self, app: &App, key: &SessionKey) -> Option<Activity> {
+        if self.displayed_activity(app, key) == Some(Activity::Waiting)
+            || self
+                .member_live(key)
+                .is_some_and(|live| live.activity == Activity::Waiting)
+        {
+            return Some(Activity::Waiting);
+        }
+        match self.quiescence_of(app, key) {
+            Quiescence::Idle => Some(Activity::Alive),
+            Quiescence::NotIdle => Some(Activity::Busy),
+            Quiescence::Unknown => None,
+        }
     }
 
     /// The member's live file as the latest tick read it.
@@ -4320,6 +4370,10 @@ fn ring_host_bell(state: &mut EmporiumState, now: Instant, cause: BellCause) -> 
 /// for as long as the report does and is gone when the report, the pane or its
 /// being known to be Codex is. Nothing is laid over a pane that has reported
 /// nothing.
+///
+/// And the panes this banto hosts are told to the list: a row that says "no live
+/// process" about a session in one of them is wrong, and shows live instead
+/// ([`App::set_hosted_ids`]).
 fn sync_reported_activity(state: &EmporiumState, app: &mut App) {
     let mut reported: HashMap<String, Activity> = HashMap::new();
     let mut dialogs: HashSet<String> = HashSet::new();
@@ -4341,6 +4395,13 @@ fn sync_reported_activity(state: &EmporiumState, app: &mut App) {
         }
     }
     app.set_reported_activity(reported, dialogs);
+    app.set_hosted_ids(
+        state
+            .screens
+            .keys()
+            .map(|key| key.as_str().to_string())
+            .collect(),
+    );
 }
 
 /// Mark the Directors' rows of the brigades that want the operator, and ring for

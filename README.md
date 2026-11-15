@@ -265,17 +265,18 @@ tile by its title to move it; `[S]` in any tile's title row solos it, and a
 stack tile also has `[_]` to collapse it to a strip (`[+]` opens it again). Each brigade's
 arrangement, and the sidebar's width, is remembered across restarts.
 
-Every tile's title row says what its session is doing, minimised or not:
-**busy** (a turn or a background command is running), **waiting** (it needs you),
-**alive** (running, nothing to do) or **idle** (not running), then how long ago it
-last wrote. A Codex session's word comes from the status report its interface writes
-to its terminal; a Claude Worker that has not run a turn yet shows its state from
-its live file. On a narrow tile the title gives way: the agent name goes first, then
-the age is shortened (`2m`) and finally dropped; the word stays, and the label
-never gives way, so at the default minimised width a long display name leaves room
-for the word only. A minimised tile is four rows (its title row, the last message
-it was sent and the last it sent, and the bottom border), so five fit on a 24-row
-terminal. A tile too small for a screen shows the top-left corner of a
+Every tile's title row says what its session is doing, minimised or not: **busy** (a
+turn or a background command is running), **waiting** (it needs you) or **idle**
+(running, nothing to do), then how long ago it last wrote; a session banto has read
+nothing of yet shows no word. It is the same for Claude and Codex: a session waiting
+at its prompt reads idle. A Codex session's word comes from the status report its
+interface writes to its terminal; a Claude Worker that has not run a turn yet shows
+its state from its live file. On a narrow tile the title gives way: the agent name
+goes first, then the age is shortened (`2m`) and finally dropped; the word stays,
+and the label never gives way, so at the default minimised width a long display name
+leaves room for the word only. A minimised tile is four rows (its title row, the
+last message it was sent and the last it sent, and the bottom border), so five fit
+on a 24-row terminal. A tile too small for a screen shows the top-left corner of a
 2-row-by-2-column one: panes are never made smaller than that.
 
 ## Configuration

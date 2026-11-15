@@ -266,13 +266,14 @@ and the plan-implementation prompt ring too, not only an approval.
    the pane's list row, else what the member's live file said this tick (item 12),
    else none (`EmporiumState::displayed_activity`). The list rows, the counts and
    the marks get the report laid over the rows; the strip and the title row read it
-   directly. So a hosted pane with no row in the list yet still shows what it
-   reported, and a `blocked` one is marked, counted once and rung for once like a
-   pane with a row. *Why:* the collapsed strip first read the raw rows and showed
-   "alive" for a Codex pane reporting `working` (found in the operator's trial);
-   then the strip and the title took the activity only from the row, so a row-less
-   Codex pane showed no word while the quit question already treated it as not idle
-   (found in review).
+   directly (until 2026-11-15, when the word became `pane_word`, which takes its
+   waiting from it and from the latest tick's live file: "Decision (2026-11-15)").
+   So a hosted pane with no row in the list yet still shows what it reported, and a
+   `blocked` one is marked, counted once and rung for once like a pane with a row.
+   *Why:* the collapsed strip first read the raw rows and showed "alive" for a Codex
+   pane reporting `working` (found in the operator's trial); then the strip and the
+   title took the activity only from the row, so a row-less Codex pane showed no
+   word while the quit question already treated it as not idle (found in review).
 7. **A pane's screen and PTY are never smaller than 2 rows × 2 columns.** A smaller
    tile keeps a floor-sized screen and child and is drawn clipped ("Size floor").
    *Why, measured:* the pinned vt100 panics on wrapped text in a one-row screen, in
@@ -284,7 +285,8 @@ and the plan-implementation prompt ring too, not only an approval.
    surface, matching what the quit question and the watch already counted; the relay
    still nudges it; `brigade_status` prints the raw word. *Why:* the operator
    restarted banto without knowing a command was still running in a pane that said
-   "alive".
+   "alive". (A tile now reads `shell` as busy through the sample, and says "idle"
+   where it said "alive": "Decision (2026-11-15)".)
 9. **A dialog the operator opens does not ring and does not arm.** A Claude session
    that is `waiting` with `waitingFor` exactly `dialog open` is shown and counted as
    Waiting everywhere but is left out of the ring set (it rings once if the reason
@@ -573,6 +575,40 @@ s after the spawn in those two runs and the Claude panes settled within about 3.
 10 s is a margin, not a derived value. *Unexplained:* one earlier ring at a resume.
 That run had no bell log, and a replay of its recording shows no ring near the
 resume.
+
+## Decision (2026-11-15): a tile's word is busy, waiting or idle, never alive
+
+The operator's decision, 2026-11-15, in his words: "alive" is a word in contrast to
+"dead"; what he wants from a tile is whether the session is working or idle, so the
+words converge on "idle" — a hosted session waiting at its prompt reads "idle"
+whichever agent it is.
+
+*The incident.* After a restart the four Claude Workers' tiles read "alive" and the
+Codex Worker's tile, open and waiting at its prompt with its own report saying idle,
+read "idle" (there meaning "no live process proven") for about a minute and then
+"alive" when an unrelated list reload happened. Measured from a recording: the title
+flipped 59.9 s after the spawn, at the first reload after the operator's Enter in
+another pane. The Codex liveness check (of its logs database) runs only on a list
+reload, and an idle Codex pane causes none.
+
+*What the code does.* The word of a hosted pane's title row is `waiting`, `busy`,
+`idle` or nothing, from a word-only decision (`EmporiumState::pane_word`): waiting
+from the existing waiting sources or from the member's live file having said
+`waiting` in the latest relay tick (found in review: a hosted Claude Worker whose
+row was last loaded as live read busy until the next reload; for that short window
+the tile can say waiting before the mark appears), else the single idle decision the
+quit question reads, with nothing read yet showing no word and the quit question's
+3-second recent-input window not moving it ("The emporium: hosted panes", the strip
+and title paragraph). The marks, the count, the bell and the relay still read the
+older decision (`displayed_activity`) and are unchanged; the code comment on
+`pane_word` gives the reason they are kept apart (a renamed pane whose row has not
+arrived is unknown to them, which keeps an announced wait from ringing twice). In
+the session list, a row whose session is hosted here but whose own files prove no
+live process is shown as live (`App::set_hosted_ids`): a busy or waiting activity
+stands, ending the pane gives the row its own state back, a reload does not lose it,
+and the rows of sessions not hosted here are unchanged. `banto list` keeps "alive"
+for a live process, and `brigade_status` for a Codex peer is unchanged (a later
+step).
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -1061,39 +1097,52 @@ running untouched: the `[_]` button in its title row (or `m`), `[+]` to open it
 again. The strip's title row is the one every tile has ("The title row of a tile",
 below): the label, then agent · activity · output age, then the buttons, from one
 function (`tile_status`) and one painter (`paint_tile_title`); the strip itself is
-only the two message rows under it. The activity word is one of four, in the sidebar
-dot's colours: **busy** (a turn or a command is running: a Claude session whose live
-file says `busy` or `shell`, or a Codex pane that reports `working`), **waiting** (a
-person is needed: Claude `waiting`, whatever it waits for, or a Codex pane that
-reports `blocked`), **alive** (a live process with nothing running: Claude `idle` or
-a status banto does not know, a Codex session that has not reported busy or
-waiting), **idle** (no live process; the dot's brightness says how long ago). Every
-surface that shows a pane's activity — the list row and its dot, the Waiting count,
-the attention marks, the title row of every tile — reads the same value, and a
-hosted pane has one source for it: what the pane reported, when it is a Codex pane
-and the report is believed (`working` is busy, `blocked` is waiting); else its list
-row's activity; else, for a Claude member with no row yet, what its live file said
-this tick as the relay observed it; else none (`EmporiumState::displayed_activity`,
-which starts from `reported_activity`; the quit question and the bell are decided
-from the same Codex report, and none of them read the live word). The list rows, the
-counts and the marks get the report laid over the rows (`App::row_for_id` returns
-the displayed row, not the raw one); the title row asks `displayed_activity`
-directly, so a hosted pane with no row in the list yet still shows what it reported
-or its live file's word, and a `blocked` or `waiting` one is marked, counted once
-and rung for once like one with a row (a dialog is shown and counted, not rung). The
-strip once read the raw rows and showed "alive" for a Codex pane that was reporting
-`working`, found in the operator's trial; later it and the title took the activity
-only from the row, so a row-less Codex pane showed no word while the quit question
-already treated it as not idle, found in review; a Claude Worker that had not run a
-turn showed none either, until its live file became the third source. The product
-shown is the row's, else the one the relay resolved for the member. Output age is
-"output now", then in ten-second steps to a minute, then minutes, then hours; for
-Codex, whose session files record neither busy nor waiting, the activity word comes
-from the pane's own report once it has made one (`blocked` reads waiting, `working`
-busy; "Codex data sources"), and until then the output age is the only liveness
-signal, which is why it is shortened (`2m`) before it is dropped on a narrow tile.
-The two body rows read `← <age> <first line of the last message sent to this
-member>` and `→ <age> <first line of the last message this member sent>`, from
+only the two message rows under it. The word is one of three, in the sidebar dot's
+colours, or none: **busy**, **waiting**, **idle**. For a pane banto hosts it is
+decided by `EmporiumState::pane_word`: **waiting** when the pane waits on the
+operator by the decision the marks, the count and the bell read (a Codex pane's own
+`blocked` report, a Claude row or live file that waits, a dialog the operator opened
+included), or when the member's live file said `waiting` in the latest relay tick (a
+row is only as new as the last list reload, and a session that has turned `waiting`
+since reads busy to the sample until then, so for a short window the tile can say
+`waiting` before the mark appears; the marks, count and bell are unchanged, and a
+live status does not outlive its tick, which replaces it every time); otherwise the
+one idle decision the quit question reads (`quiescence_of`: a Codex pane's own
+report, else the shell's sample of the live file or the rollout), where idle reads
+**idle**, not idle reads **busy** (a Claude live file saying `busy`, `shell` or a
+status banto does not know; a Codex pane reporting `working`), and unknown (nothing
+read yet: just spawned or respawned, or no usable source) shows no word. A Codex
+pane's own `idle`, `done` or `error` reads idle at once. It never says "alive": that
+is a word in contrast to "dead", and a tile answers whether the session is working
+or idle, so a hosted session waiting at its prompt reads "idle" whichever agent it
+is (the same word and colour as the list's live dot). Not read: the list row's own
+activity, which for a pane of this banto's means "no live process proven" and
+changes only on a reload, and the quit question's 3-second recent-input window, a
+safety margin that would make the word flicker with every key. The marks, the
+Waiting count, the bell and the relay still read the older decision,
+`EmporiumState::displayed_activity` (a believed Codex report, else the session
+list's row for the pane, else what a Claude member's live file said this tick as the
+relay observed it, else none; "Decision (2026-11-14): a tile's word…" in the entry
+below), and are kept apart from the word on purpose: they ask whether a pane is
+*known* to be waiting, and its being unknown for a moment (a renamed pane whose row
+has not arrived) is what keeps an announced wait from ringing again when the row
+does, while a word has to answer for every pane. Apart from that one window, the
+word and those decisions agree about a wait because both take it from
+`displayed_activity`. History: the strip once read the raw rows and showed "alive"
+for a Codex pane that was reporting `working`, found in the operator's trial; later
+the strip and the title took the activity only from the row, so a row-less Codex
+pane showed no word while the quit question already treated it as not idle, found in
+review; a Claude Worker that had not run a turn showed none either, until its live
+file became the third source of `displayed_activity`; and until 2026-11-15 the title
+read `displayed_activity` itself. The product shown is the row's, else the one the
+relay resolved for the member. Output age is "output now", then in ten-second steps
+to a minute, then minutes, then hours; for Codex, whose session files record neither
+busy nor waiting, the word comes from the pane's own report once it has made one
+(`blocked` reads waiting, `working` busy, `idle`, `done` and `error` idle; "Codex
+data sources") and until then from the shell's sample, and the output age stays the
+other liveness signal, which is why it is shortened (`2m`) before it is dropped on a
+narrow tile. The two body rows read `← <age> <first line of the last message sent to
+this member>` and `→ <age> <first line of the last message this member sent>`, from
 banto's own brigade message store, read without touching any read cursor (a glance
 is not a delivery), counting only messages past the member's own join point
 (`brigade_members.joined_after_id`, schema v18: so a new member shows no broadcast
@@ -1508,6 +1557,12 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   never touched and never seen idle, does not arm the bell that first time, and
   self-started work that ends within the first 10 s of a process does not arm it
   either.
+- *Observed 2026-11-15 (a field observation, not a decision; nothing was changed for
+  it):* a Claude session's context auto-compaction (28.6 s, unprompted, 54 minutes
+  after its last turn) read as busy, armed the watch as self-started work, and the
+  brigade rang when it ended. The bell log said `quiet_recorded` and a replay
+  reproduced it. Of the 40 not-idle episodes in that 63-minute run it was the only
+  one not preceded by a write into the pane.
 - A member whose state is *unknown* blocks it and breaks the idle stretch: silence
   is not claimed on missing information. A *waiting* member is not idle.
 - *A dialog the operator opened:* a Claude member that is `waiting` with
@@ -2542,30 +2597,45 @@ themselves.
    a background command still running) → **busy**, on every surface; a waiting entry
    outranks it, a person being needed
 4. PID alive with any other status → **alive** (`idle` itself, and unknown upstream
-   statuses, which deliberately degrade here)
+   statuses, which deliberately degrade here): the list's word for a session whose
+   process is up and doing nothing
 5. Otherwise bucket by jsonl mtime: today / this week / older
    (thresholds and colors configurable)
 
-This is the display (the list row, the title row of every tile, the counts and marks
-all read it; `banto_core::model::Activity`). The stricter question "is this session
-known to be doing nothing?" — asked by the quit confirmation and the brigade bell
-(see "The emporium: hosted panes") — reads the same file the other way round: only
-`idle` is idle, `shell` is not, and an unrecognised status is not either, so what is
-drawn and what is decided say the same about `shell`. (Why `shell` shows busy: the
-operator restarted banto without knowing a command was still running in a pane that
-said "alive".) The relay, which asks whether a member can be nudged, still treats
-`shell` as idle enough: the turn has ended and the member can take a message; it
-never nudges a `waiting` session, `dialog open` included, since a nudge's Enter
-would choose something in the dialog. The same classification without its last step,
-the transcript's age (`live_activity`), is what the tile of a member with no list
-row shows: a Claude Worker that has not run a turn has a live file and no
-transcript, so its word comes from the file as the relay read it this tick, and goes
-with the tick that does not see it. A Director's row is the one place a brigade's
-attention shows in the list: its dot reads Waiting whatever its own state while its
-brigade is marked ("Attention"); the row's activity itself, which the tile's word
-and the decisions read, is untouched. The raw status stays visible in one place: the
-`brigade_status` MCP tool prints the live file's own word (`busy`, `waiting`,
-`idle`, `shell`) for a Claude peer.
+This is the display of the session list (the list row and its dot, `banto list`'s
+tags, and through the display decision `displayed_activity` the counts and marks;
+`banto_core::model::Activity`). A tile's word is a separate decision, `pane_word`,
+which says busy, waiting or idle and never "alive" ("The emporium: hosted panes",
+the strip and title paragraph). One more step applies to the list for the sessions
+banto itself hosts: a row of such a session whose own activity says there is no live
+process (step 5, dormant) is shown as live (`Alive`) while the pane lasts
+(`App::set_hosted_ids`), since the process is the one banto started; the Codex check
+of the logs database runs only on a list reload, which a pane at its prompt never
+causes. A busy or waiting activity stands, a reload does not lose it, and ending the
+pane gives the row its own word back; the rows of sessions not hosted here, and
+`banto list`, are unchanged. A side effect, intended and pinned by a test: a live
+superseded row is never hidden, so a resumed ancestor that the list hid as
+superseded is listed, and not counted as hidden, for as long as its pane lasts, and
+is hidden again after. The stricter question "is this session known to be doing
+nothing?" — asked by the quit confirmation and the brigade bell (see "The emporium:
+hosted panes") — reads the same file the other way round: only `idle` is idle,
+`shell` is not, and an unrecognised status is not either, so what is drawn and what
+is decided say the same about `shell`. (Why `shell` shows busy: the operator
+restarted banto without knowing a command was still running in a pane that said
+"alive".) The relay, which asks whether a member can be nudged, still treats `shell`
+as idle enough: the turn has ended and the member can take a message; it never
+nudges a `waiting` session, `dialog open` included, since a nudge's Enter would
+choose something in the dialog. The same classification without its last step, the
+transcript's age (`live_activity`), is what the marks, the count and the bell read
+for a member with no list row, and what its tile reads through the shell's sample: a
+Claude Worker that has not run a turn has a live file and no transcript, so it is
+read from the file as the relay read it this tick, and goes with the tick that does
+not see it. A Director's row is the one place a brigade's attention shows in the
+list: its dot reads Waiting whatever its own state while its brigade is marked
+("Attention"); the row's activity itself, which the tile's word and the decisions
+read, is untouched. The raw status stays visible in one place: the `brigade_status`
+MCP tool prints the live file's own word (`busy`, `waiting`, `idle`, `shell`) for a
+Claude peer.
 
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
 when a Codex home resolves, its rollout tree (see "Codex data sources" above
