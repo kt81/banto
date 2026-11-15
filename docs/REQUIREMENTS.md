@@ -2705,24 +2705,66 @@ the short form, never an arrow with nothing after it. Only the nudge notice
 carries this; how often and how long a status shows is unchanged.
 
 The mark is blunt on purpose — it does not model which keys an agent binds to
-clearing its line — so for a Claude pane it is backed by reading the input
-line off the pane's own screen (`banto_core::input_line`), at the moment relay
-decides and never otherwise, under the fence in `docs/DISCIPLINE.md` §3. The
-reader recognises Claude's framed input block (a full-width rule above and
-below, `❯` and a no-break space on the first row) and answers `Empty`,
-`HasText` or `Unrecognized`. `HasText` holds the nudge even with no mark
-(recalled history is text no keystroke announced); `Empty` clears the mark,
-but only `INPUT_ECHO_SETTLE` (3s) after banto last forwarded input to the
-pane, because a pane's screen lags its keys (36–108ms measured on 2026-11-10)
-and an `Empty` read inside that window is not yet true; `Unrecognized` — and
-every Codex pane, whose screen is not read — leaves the mark in charge. The
-delayed Enter never reads the screen: by then the line holds banto's own
-nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
-`INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
-Claude's layout can change without notice and a reader that stopped
-recognising it would look like one that works; waiting (a permission dialog)
-is not counted. The same reading lets a retried Goinkyo kickoff press Enter
-alone when the line still holds exactly its sentence.
+clearing its line — so for a Claude pane it is backed by reading the input line off
+the pane's own screen (`banto_core::input_line`), at the moment relay decides and
+never otherwise, under the fence in `docs/DISCIPLINE.md` §3. The reader recognises
+Claude's framed input block (a top border and a full-width rule below, `❯` and a
+no-break space on the first row) and answers `Empty`, `HasText` or `Unrecognized`.
+The top border, the row above the prompt row, is either the plain full-width rule or
+the rule with a label in it: a leading run of rule cells of at least half the pane's
+width, one blank, a label region, one blank, and exactly one rule cell in the last
+column. The label region starts and ends with a non-blank cell, holds no rule cell,
+and may hold single blanks between words and wide characters (their second cells
+identified from the terminal model, not inferred from an empty cell), but not two
+blanks in a row; a label longer than half the width minus three cells (wide
+characters count two), or a label the terminal model lays out wider than the
+application reserved (a joined emoji sequence: it fails closed and brings back the
+old notice, no worse), reads `Unrecognized`, as does a row of text, a blank or
+mostly blank row, a dialog border with its title at the left or in the middle, two
+label segments, and anything else. The bottom rule must still be full width (a
+labelled bottom row is not an input box), and the label is never part of the text
+the reader returns. Its content is not examined, so any short text in that position
+reads the same as a name (a hint, a count, a mode name); this is an accepted
+consequence, named by both reviewers, and the nudge is protected by the rest of the
+reader's conditions (the prompt glyph in column 0 of the cursor row, the full-width
+rule below, the cursor inside the block) and by the member being idle and not
+waiting. What is measured and what is not: one plain word of 7 cells, a blank on
+each side and the single trailing rule cell, at widths 81 and 84, is measured;
+blanks between words and wide characters are extension by construction (the one
+other session on the measuring machine with a label of this shape has a name with a
+space in it, and what writes the label is not known, so it may be free text in any
+script); the half-width floor is margin (the label sat in the last eighth, and half
+keeps a dialog title at the left or in the middle out). `HasText` holds the nudge
+even with no mark (recalled history is text no keystroke announced); `Empty` clears
+the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto last forwarded input to the
+pane, because a pane's screen lags its keys (36–108ms measured on 2026-11-10) and an
+`Empty` read inside that window is not yet true; `Unrecognized` — and every Codex
+pane, whose screen is not read — leaves the mark in charge. The delayed Enter never
+reads the screen: by then the line holds banto's own nudge sentence. A Claude pane
+that stays idle yet `Unrecognized` for `INPUT_LINE_UNREADABLE_AFTER` (60s) is
+reported once on the status line, since Claude's layout can change without notice
+and a reader that stopped recognising it would look like one that works; waiting (a
+permission dialog) is not counted. The same reading lets a retried Goinkyo kickoff
+press Enter alone when the line still holds exactly its sentence.
+
+*Incident (2026-11-15): a label in one session's input-box border.* The operator
+kept seeing `relay: cannot read the input line of director of "<brigade>" —
+unsent-draft detection is back to keystroke tracking` for a brigade he had only
+opened. Measured by replaying a 100-minute recording against the reader: one
+Director's pane read `Unrecognized` on essentially every tick of its life, always
+for "no full-width rule above the prompt row" and nothing else; stage, focus,
+scrolling and size made no difference. That pane's top border was, at width 81, rule
+× 71, blank, 7 non-rule non-blank cells, blank, rule × 1 (at width 84: rule × 74,
+…): a label right-aligned inside the box's top border. The pane belonged to the only
+session in the run whose transcript carries `agent-name` records (the link is by
+structure, character count and class, and by record types only; nobody read the
+label or the transcript's content). A session with only a `/rename` title
+(`custom-title` records) keeps the plain border: the other brigade's Director, also
+renamed with `/rename`, was always readable. Which user action writes `agent-name`
+is not known. The notice fires about 61 s after the member first idles, once per
+member, whatever the stage; it looked like an off-stage brigade's only because that
+is where he was not looking. The reader now accepts the labelled border (above), so
+such a member reads `Empty` or `HasText` and its draft protection works.
 
 What this does not fix: a mark left standing over an empty line — after
 answering a permission dialog with `1`, after Ctrl+C clears the line, after

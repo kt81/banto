@@ -14948,8 +14948,22 @@ mod tests {
     /// after what is on the prompt row. The shape `crate::input_line` reads;
     /// hand-made, nothing recorded.
     pub(super) fn draw_prompt_on(screen: &mut Screen, typed: Option<&str>) {
+        draw_prompt_block(screen, typed, None);
+    }
+
+    /// [`draw_prompt_on`] with, when `label` is given, a name label in the top
+    /// border: the rule, a blank, the label in an RGB colour, a blank and one
+    /// rule cell, the shape `crate::input_line` documents.
+    fn draw_prompt_block(screen: &mut Screen, typed: Option<&str>, label: Option<&str>) {
         let (rows, cols) = screen.screen().size();
         let rule = "\u{2500}".repeat(cols as usize);
+        let top = match label {
+            Some(label) => format!(
+                "{} \x1b[38;2;200;120;40m{label}\x1b[0m \u{2500}",
+                "\u{2500}".repeat(cols as usize - label.chars().count() - 3)
+            ),
+            None => rule.clone(),
+        };
         let p = rows - 3; // 1-based prompt row; the footer is the last row but one
         let body = match typed {
             Some(text) => text.to_string(),
@@ -14957,7 +14971,7 @@ mod tests {
         };
         let cursor_col = 3 + typed.map_or(0, |text| text.chars().count());
         let bytes = format!(
-            "\x1b[2J\x1b[{};1H{rule}\x1b[{p};1H\u{276f}\u{a0}{body}\x1b[{};1H{rule}\x1b[{};1H  footer\x1b[{p};{cursor_col}H",
+            "\x1b[2J\x1b[{};1H{top}\x1b[{p};1H\u{276f}\u{a0}{body}\x1b[{};1H{rule}\x1b[{};1H  footer\x1b[{p};{cursor_col}H",
             p - 1,
             p + 1,
             p + 2,
@@ -14967,6 +14981,13 @@ mod tests {
 
     fn draw_prompt(state: &mut EmporiumState, key: &SessionKey, typed: Option<&str>) {
         draw_prompt_on(state.screens.get_mut(key).unwrap(), typed);
+    }
+
+    /// [`draw_prompt`] for a pane whose input box carries a label inside its top
+    /// border, the shape `crate::input_line` documents (what writes such a label
+    /// is not known; only where it sits was measured).
+    fn draw_labelled_prompt(state: &mut EmporiumState, key: &SessionKey, typed: Option<&str>) {
+        draw_prompt_block(state.screens.get_mut(key).unwrap(), typed, Some("abcdefg"));
     }
 
     /// The Director pane's screen is laid out for real (a 160x50 terminal)
@@ -15197,6 +15218,62 @@ mod tests {
         );
 
         assert_eq!(writes_of(&cmds), vec![(director.clone(), b"\r".to_vec())]);
+    }
+
+    #[test]
+    fn an_idle_member_whose_input_box_border_carries_a_label_is_never_reported_unreadable() {
+        let (mut state, mut app, brigade, director, start) = reading_fixture();
+        draw_labelled_prompt(&mut state, &director, None);
+        for secs in [0, 30, 60, 61, 120, 600] {
+            tick_obs(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Seen {
+                    agent: CLAUDE,
+                    idle: Some(true),
+                    has_unseen: false,
+                },
+                start + Duration::from_secs(secs),
+            );
+            assert!(
+                !state
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("cannot read")),
+                "+{secs}s: {:?}",
+                state.status
+            );
+        }
+        assert!(
+            state.unreadable_since.is_empty(),
+            "the unreadable clock never started: {:?}",
+            state.unreadable_since
+        );
+    }
+
+    #[test]
+    fn text_in_a_labelled_input_box_holds_the_nudge_and_an_emptied_line_releases_it() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        draw_labelled_prompt(&mut state, &director, Some("recalled"));
+        assert!(!state.has_unsent_operator_input(&director), "no keystroke");
+
+        let held = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert!(held.is_empty(), "{held:?}");
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("holding the nudge")),
+            "the hold is announced: {:?}",
+            state.status
+        );
+
+        // The operator clears the line by a route banto does not model.
+        draw_labelled_prompt(&mut state, &director, None);
+        let sent = two_ticks_as(&mut state, &mut app, &brigade, &director, CLAUDE, &mut now);
+        assert_eq!(sent, nudge_then_enter_for(&director), "released");
     }
 
     #[test]
