@@ -85,7 +85,10 @@ channel between them over MCP: it wires every member back to `banto _mcp` on
 its own launch — Claude Code via `--mcp-config`, Codex via `-c
 mcp_servers.banto.*` overrides — so members get `send_to_peer` /
 `check_messages` / `brigade_status` tools backed by banto's own sqlite
-queue (plus Director-only `consult_goinkyo` / `dismiss_goinkyo`, and
+queue (plus Director-only `consult_goinkyo` / `dismiss_goinkyo`,
+`request_decision` (the Director is waiting on a decision only you can make: it
+writes the question in its own pane and banto shows a `▸ decision` tag against it,
+without stopping it, until you press Enter in its pane), and
 `name_member`, which gives a Worker a display name for the standing role the
 Director has given it — shown beside its token in the tile title, in
 `brigade_status` and in message headers; the token stays the address). Each member is also handed a role briefing naming its brigade, its
@@ -332,9 +335,13 @@ message_log = false
 # Worker with name_member) and a Worker to say which source each claim about the
 # repository rests on (committed code from `git show HEAD:<path>`, the working
 # tree only for files the Director asked it to edit or review) — that policy is
-# yours to set, which is why it is a setting.
+# yours to set, which is why it is a setting. The default Director briefing also
+# says when to call request_decision; your own director_prompt is never touched.
 director_prompt = "..."
 worker_prompt = "..."
+# A Director's request_decision also marks its row and rings, like a brigade going
+# quiet (read at start). false: the tag only.
+request_attention = true
 
 [keys]
 prefix = "C-b"      # pane prefix chord

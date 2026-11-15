@@ -1782,6 +1782,13 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let _ = store.borrow().set_bell_when_focused(on);
             Vec::new()
         }
+        // Conditional on the sequence, so an answer to an older request never
+        // wipes a newer one; a failed write is silent, and the core has already
+        // forgotten the request and will not take it back.
+        StoreIntent::ClearRequest { brigade_id, seq } => {
+            let _ = store.borrow_mut().clear_request(brigade_id, seq);
+            Vec::new()
+        }
         // A failed write loses a preference, not the brigade.
         StoreIntent::SaveLastWorkerAgent { agent } => {
             let _ = store.borrow().set_last_worker_agent(agent);
@@ -2341,6 +2348,14 @@ fn gather_relay_observations(
         // whole roster's — a Worker with no session id yet has no observation
         // below, but its tile is on screen and its Director may already have
         // named it.
+        // The Director's open request, one row read. A brigade whose request cannot
+        // be read is left out of this tick's facts like one whose roster cannot,
+        // and the core keeps what it had: an unreadable store must neither blank
+        // a request the operator has not answered nor invent one.
+        let request = match store.borrow().brigade_request(brigade.id) {
+            Ok(request) => request.map(|seq| banto_core::engine::RequestFact { seq }),
+            Err(_) => continue,
+        };
         glance_gate.brigades.push(BrigadeNameFacts {
             brigade_id: brigade.id,
             name: brigade.name.clone(),
@@ -2353,6 +2368,7 @@ fn gather_relay_observations(
                 .iter()
                 .filter_map(|member| Some((member.token.clone(), member.display_name.clone()?)))
                 .collect(),
+            request,
         });
         for member in &members {
             let Some(session_id) = member.session_id.as_ref() else {
@@ -3179,6 +3195,9 @@ fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant
             .map(|at| tick.saturating_duration_since(at)),
         inbound: None,
         sent: None,
+        // Only a Director's tile has one, and it stays while that pane is focused:
+        // it is "not answered yet", not "not looked at yet".
+        request: state.has_request(key),
     }
 }
 
@@ -5650,6 +5669,7 @@ mod tests {
                             "worker-1".to_string(),
                             "\u{5b9f}\u{88c5}".to_string(),
                         )],
+                        request: None,
                     }],
                 },
                 now,
@@ -6912,6 +6932,7 @@ mod tests {
                 name: "cell".to_string(),
                 director_session: Some("dir".to_string()),
                 member_names: Vec::new(),
+                request: None,
             })
         );
         assert_eq!(
@@ -6921,10 +6942,170 @@ mod tests {
                 name: "Second task".to_string(),
                 director_session: None,
                 member_names: Vec::new(),
+                request: None,
             })
         );
         assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
         assert_eq!(facts.len(), 3, "every visited brigade, once");
+    }
+
+    #[test]
+    fn a_tick_carries_each_brigades_open_request_from_the_store_and_nothing_a_director_wrote() {
+        let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        let other = store.borrow_mut().create_brigade("other").unwrap();
+        store.borrow_mut().set_request(1, "director").unwrap();
+        store.borrow_mut().set_request(1, "director").unwrap();
+        let claude_home = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut gathered = GlanceGate::default();
+        gather_relay_observations(&state, &store, &home, None, &app, None, &mut gathered);
+        let request_of = |id| {
+            gathered
+                .brigades
+                .iter()
+                .find(|facts| facts.brigade_id == id)
+                .map(|facts| facts.request.clone())
+        };
+        assert_eq!(
+            request_of(1),
+            Some(Some(banto_core::engine::RequestFact { seq: 2 }))
+        );
+        assert_eq!(request_of(other), Some(None), "a brigade with none says so");
+        // The fact is a sequence and nothing else: a recording of the tick holds no
+        // word of a Director's through this path.
+        let json = serde_json::to_string(&gathered.brigades).unwrap();
+        assert!(json.contains("\"request\":{\"seq\":2}"), "{json}");
+    }
+
+    #[test]
+    fn answering_clears_the_store_only_while_it_is_still_that_request() {
+        let (store, _, _) = staged_worker("w1", Some(AgentKind::ClaudeCode));
+        store.borrow_mut().set_request(1, "director").unwrap();
+        store.borrow_mut().set_request(1, "director").unwrap();
+        let clear =
+            |seq| execute_store_intent(StoreIntent::ClearRequest { brigade_id: 1, seq }, &store);
+        assert!(clear(1).is_empty(), "no event comes back");
+        assert_eq!(
+            store.borrow().brigade_request(1).unwrap(),
+            Some(2),
+            "the older answer wiped nothing"
+        );
+        clear(2);
+        assert_eq!(store.borrow().brigade_request(1).unwrap(), None);
+    }
+
+    /// The brigade's tick reads an open request, as the store would hand it over:
+    /// through a real tick.
+    fn give_request(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        open: bool,
+        now: Instant,
+    ) {
+        engine::update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: vec![BrigadeNameFacts {
+                    brigade_id: 1,
+                    name: "cell".to_string(),
+                    director_session: Some(DIR.to_string()),
+                    member_names: Vec::new(),
+                    request: open.then_some(banto_core::engine::RequestFact { seq: 1 }),
+                }],
+            },
+            now,
+        );
+    }
+
+    /// The title row of the Director's tile, drawn `width` columns wide, with an
+    /// open request or none.
+    fn director_request_title(width: u16, open: bool) -> String {
+        let (mut state, mut app, brigade, now) =
+            scene(width, [Activity::Busy, Activity::Alive, Activity::Alive]);
+        give_request(&mut state, &mut app, &brigade, open, now);
+        let buffer = render_at(&state, &app, width, now);
+        title_row(&state, &buffer, DIR, width).0
+    }
+
+    #[test]
+    fn a_staged_directors_title_row_carries_the_tag_beside_the_state_word() {
+        use banto_tui::strip::REQUEST_TAG;
+        for width in [160u16, 120] {
+            let title = director_request_title(width, true);
+            assert!(
+                title.contains(REQUEST_TAG),
+                "{width}: the tag is whole: {title:?}"
+            );
+            assert!(title.contains("busy"), "{width}: the word stays: {title:?}");
+            assert!(title.contains("director"), "{width}: the label: {title:?}");
+            assert!(title.contains("[S]"), "{width}: the buttons: {title:?}");
+        }
+        // At 100 columns the Director's tile gives its title row about 14 cells, and
+        // `busy · ▸ decision` needs 17: the tag stands alone, whole, with the label
+        // and the buttons in place.
+        let title = director_request_title(100, true);
+        assert!(title.contains(REQUEST_TAG), "{title:?}");
+        assert!(!title.contains("busy"), "{title:?}");
+        assert!(
+            title.contains("director") && title.contains("[S]"),
+            "{title:?}"
+        );
+        // Without a request the title row is what it was.
+        let plain = director_request_title(160, false);
+        assert!(!plain.contains('\u{25b8}'), "{plain:?}");
+    }
+
+    #[test]
+    fn the_directors_tile_shows_the_tag_while_its_pane_is_focused_and_a_workers_never_does() {
+        use banto_tui::strip::REQUEST_TAG;
+        let (mut state, mut app, brigade, now) =
+            scene(160, [Activity::Alive, Activity::Alive, Activity::Alive]);
+        give_request(&mut state, &mut app, &brigade, true, now);
+        assert_eq!(state.focus, Focus::Pane, "the Director's pane is focused");
+        let buffer = render_at(&state, &app, 160, now);
+        assert!(title_row(&state, &buffer, DIR, 160).0.contains(REQUEST_TAG));
+        for worker in [W1, W2] {
+            assert!(
+                !title_row(&state, &buffer, worker, 160)
+                    .0
+                    .contains('\u{25b8}'),
+                "{worker}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bell_for_a_request_is_logged_with_its_brigade_and_director() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.path().join("bell.log"))
+            .unwrap();
+        let cause = banto_core::engine::BellCause::Request {
+            brigade: 3,
+            director: SessionKey::from_id("dir"),
+        };
+        ring_host_bell_to(
+            &mut Vec::new(),
+            &cause,
+            Some(BellEntry {
+                file: &mut file,
+                since_start: Duration::from_millis(900),
+                event: "Tick",
+            }),
+        );
+        let lines = log_lines(&mut file);
+        assert!(
+            lines[0]
+                .ends_with("bell +900ms cause=request brigade=3 director=dir event=Tick written"),
+            "{lines:?}"
+        );
     }
 
     #[test]

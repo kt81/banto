@@ -66,6 +66,7 @@ use unicode_width::UnicodeWidthStr;
 use banto_core::app::{App, ListLine, VisibleRow};
 use banto_core::model::{self, Activity, AgeBucket, AgentKind, SessionRow};
 
+use crate::strip::REQUEST_TAG;
 use crate::text::{truncate_to_width, truncate_to_width_leading};
 
 const PIN_EMOJI: &str = "\u{1F4CC}"; // 📌
@@ -150,7 +151,7 @@ fn list_item(
         ListLine::Header { name, count } => header_line(&name, count),
         ListLine::Row(visible) => {
             let top = row_line(&visible, area_width, now, show_pin_slot);
-            let bottom = cwd_agent_line(visible.row, area_width, show_pin_slot);
+            let bottom = cwd_agent_line(visible.row, visible.request, area_width, show_pin_slot);
             ListItem::new(vec![top, bottom])
         }
     }
@@ -305,7 +306,12 @@ pub fn agent_label_color(agent: AgentKind) -> Color {
 /// gap guarantee is the first thing dropped (matching [`row_line`]'s own
 /// "drop the gap, not the content" order); the label itself is truncated,
 /// never panicking, only once even that alone doesn't fit.
-fn cwd_agent_line(row: &SessionRow, area_width: u16, show_pin_slot: bool) -> Line<'static> {
+fn cwd_agent_line(
+    row: &SessionRow,
+    request: bool,
+    area_width: u16,
+    show_pin_slot: bool,
+) -> Line<'static> {
     let indent = fixed_prefix_width(show_pin_slot);
     let content_width = (area_width as usize).saturating_sub(indent);
     let indent_span = Span::raw(" ".repeat(indent));
@@ -313,6 +319,18 @@ fn cwd_agent_line(row: &SessionRow, area_width: u16, show_pin_slot: bool) -> Lin
     let label = agent_label(row);
     let label_width = label.width();
     let label_style = Style::default().fg(agent_label_color(row.agent));
+    // A Director's open request takes the cwd's place: the fixed tag in the waiting
+    // colour, never cut. When it does not fit beside the agent label and its
+    // two-cell gap the row is drawn as if there were no request.
+    if request && REQUEST_TAG.width() + MIN_GAP_BEFORE_AGE + label_width <= content_width {
+        let gap = content_width.saturating_sub(REQUEST_TAG.width() + label_width);
+        return Line::from(vec![
+            indent_span,
+            Span::styled(REQUEST_TAG, Style::default().fg(WAITING_ACTIVITY_COLOR)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(label, label_style),
+        ]);
+    }
     let cwd_full = row.cwd_display();
 
     let max_cwd = content_width.saturating_sub(MIN_GAP_BEFORE_AGE + label_width);
@@ -524,6 +542,90 @@ mod tests {
             agent: AgentKind::Codex,
             ..row(id, title, cwd, mtime)
         }
+    }
+
+    fn director_with_request() -> App {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut app = App::new(vec![row("dir", "lead", "/work/project", now)]);
+        app.set_viewport_height(10);
+        app.set_request_rows(["dir".to_string()].into_iter().collect());
+        app
+    }
+
+    /// The second line of the only row, as drawn `width` columns wide.
+    fn line_two(app: &App, width: u16) -> String {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let text = draw_list(app, width, 6, now);
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines.iter().position(|l| l.contains("lead")).unwrap();
+        lines[at + 1].trim_end().to_string()
+    }
+
+    #[test]
+    fn a_directors_request_shows_the_fixed_tag_on_line_two_in_place_of_the_cwd() {
+        let app = director_with_request();
+        for width in [60u16, 40, 34] {
+            let line = line_two(&app, width);
+            assert!(line.contains(REQUEST_TAG), "{width}: {line:?}");
+            assert!(
+                !line.contains("project"),
+                "{width}: the cwd gives way: {line:?}"
+            );
+            assert!(line.ends_with("[Claude]"), "{width}: {line:?}");
+            let before_label = line.trim_end_matches("[Claude]");
+            assert!(before_label.ends_with("  "), "{width}: a gap: {line:?}");
+            assert!(!line.contains('\u{2026}'), "{width}: never cut: {line:?}");
+        }
+    }
+
+    #[test]
+    fn when_the_tag_does_not_fit_beside_the_label_the_line_is_drawn_as_if_there_were_no_request() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let with = director_with_request();
+        let mut without = App::new(vec![row("dir", "lead", "/work/project", now)]);
+        without.set_viewport_height(10);
+        // The indent is 8, so the tag (10), the label (8) and the two-cell gap need
+        // 28 columns of row; narrower than that they do not fit.
+        for width in [27u16, 24, 20, 18] {
+            let drawn = line_two(&with, width);
+            assert!(!drawn.contains('\u{25b8}'), "{width}: {drawn:?}");
+            assert_eq!(drawn, line_two(&without, width), "{width}");
+        }
+        assert!(line_two(&with, 28).contains(REQUEST_TAG));
+    }
+
+    #[test]
+    fn the_tag_is_in_the_waiting_colour_and_a_row_without_a_request_is_unchanged() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let app = director_with_request();
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area(), now))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = buffer_text(&buffer);
+        let lines: Vec<&str> = text.lines().collect();
+        let y = lines.iter().position(|l| l.contains("decision")).unwrap() as u16;
+        let x = lines[usize::from(y)]
+            .chars()
+            .position(|c| c == '\u{25b8}')
+            .unwrap() as u16;
+        assert_eq!(
+            buffer.cell((x, y)).unwrap().fg,
+            activity_color(Activity::Waiting)
+        );
+        assert_eq!(
+            buffer.cell((x + 3, y)).unwrap().fg,
+            activity_color(Activity::Waiting)
+        );
+        // Without a request, line two is the cwd and the label, as always.
+        let mut plain = App::new(vec![row("dir", "lead", "/work/project", now)]);
+        plain.set_viewport_height(10);
+        let line = line_two(&plain, 40);
+        assert!(
+            line.contains("project") && !line.contains('\u{25b8}'),
+            "{line:?}"
+        );
     }
 
     #[test]

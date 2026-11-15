@@ -20,7 +20,11 @@
 //! - `brigade_status()` reports who is in the brigade and what each is doing;
 //! - `consult_goinkyo(..)` / `dismiss_goinkyo()` (Director only) summon and end
 //!   the Goinkyo;
-//! - `name_member(member, name)` (Director only) labels a Worker.
+//! - `name_member(member, name)` (Director only) labels a Worker;
+//! - `request_decision()` (Director only) records that the brigade is waiting on
+//!   the operator's decision, shown as a short fixed tag until they answer in the
+//!   Director's pane. It takes no text: the question is in the Director's own
+//!   output. It never blocks.
 //!
 //! Delivery is a *pull*, never a stdin injection: even though the embedded banto
 //! is the sole writer to a child's stdin, injecting a peer's message there would
@@ -355,6 +359,22 @@ fn tools_list_result() -> Value {
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
             {
+                "name": "request_decision",
+                "description": "Director only. Tell banto that you are waiting on a \
+                                decision only the operator can make, and that work stops \
+                                until it is made. banto shows the operator THAT you are \
+                                waiting, not the question: write the question in your own \
+                                pane first, then call this. It takes no arguments and does \
+                                not block you: carry on with whatever can proceed. The tag \
+                                stays until the operator answers in your pane. Use it only \
+                                when the decision is the operator's alone AND work stops on \
+                                it; not for status, for questions you or a Worker can \
+                                settle, or for finished work (banto itself tells the \
+                                operator when the whole brigade has gone quiet). A second \
+                                call while one is open counts as a new request.",
+                "inputSchema": { "type": "object", "properties": {} },
+            },
+            {
                 "name": "name_member",
                 "description": "Director only. Give a Worker a display name, or change or clear \
                                 it, whenever you like. Worth doing when you give a Worker a \
@@ -399,6 +419,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "consult_goinkyo" => tool_consult_goinkyo(ctx, msg),
         "dismiss_goinkyo" => tool_dismiss_goinkyo(ctx),
         "name_member" => tool_name_member(ctx, msg),
+        "request_decision" => tool_request_decision(ctx),
         other => tool_error(&format!("unknown tool: {other}")),
     }
 }
@@ -1431,6 +1452,39 @@ fn tool_name_member(ctx: &mut ServerContext, msg: &Value) -> Value {
     }
 }
 
+/// `request_decision`: record that this Director is waiting on the operator's
+/// decision. It takes no text, and none is read: whatever a caller sends (an agent
+/// briefed by an older prompt may still send `text`) is ignored, so no agent-written
+/// word is stored, carried or drawn; the question is in the Director's own pane.
+/// Director only, by the store's live membership like `name_member`; a caller that
+/// is in no brigade (or whose brigade is gone) gets the usual refusal. The answer
+/// says only that the request is recorded: whether anything rings is the operator's
+/// setting, read by banto's own process, and must not be promised from here.
+fn tool_request_decision(ctx: &mut ServerContext) -> Value {
+    let (brigade, token, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Director {
+        return tool_error("request_decision may only be called by a Director.");
+    }
+    // The write checks again, in its own transaction, that this member is still the
+    // brigade's Director: a membership that changed since the check above (the
+    // brigade disbanded, the member removed) is the usual refusal, not a write.
+    match ctx.store.set_request(brigade, &token) {
+        Ok(Some(_)) => tool_text(
+            "Recorded. banto now shows the operator that you are waiting for a decision, \
+             not the question: write the question in your pane. You are not blocked: carry \
+             on with whatever can proceed."
+                .to_string(),
+            false,
+        ),
+        Ok(None) => not_in_brigade(),
+        Err(err) => tool_error(&format!("failed to record the request: {err}")),
+    }
+}
+
 fn tool_text(text: String, is_error: bool) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
 }
@@ -1692,6 +1746,166 @@ mod tests {
             },
             ..director
         }
+    }
+
+    // --- request_decision ------------------------------------------------------
+
+    /// A Director with Workers and a Goinkyo, and the brigade row they belong to,
+    /// which the request is written on.
+    fn request_ctx() -> ServerContext {
+        let ctx = named_ctx();
+        assert_eq!(ctx.store.create_brigade("cell").unwrap(), 1);
+        ctx
+    }
+
+    fn request_call() -> String {
+        json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": { "name": "request_decision", "arguments": {} }
+        })
+        .to_string()
+    }
+
+    /// The same call from an agent briefed by an older prompt, which still sends the
+    /// text the tool used to take.
+    fn request_call_with_text(text: &Value) -> String {
+        json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": { "name": "request_decision", "arguments": { "text": text } }
+        })
+        .to_string()
+    }
+
+    fn stored_request(ctx: &ServerContext) -> Option<i64> {
+        ctx.store.brigade_request(1).unwrap()
+    }
+
+    #[test]
+    fn the_tool_is_advertised_without_parameters_and_no_tool_is_named_for_asking() {
+        let mut ctx = ctx("s", None, None, None);
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        );
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"request_decision"));
+        // "Ask" is the word for a picker that stops the asker; this one does not.
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.to_lowercase().contains("ask")),
+            "{names:?}"
+        );
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "request_decision")
+            .unwrap();
+        // No parameters, nothing required, and nothing that forbids an extra one.
+        let schema = &tool["inputSchema"];
+        assert!(
+            schema["properties"]
+                .as_object()
+                .is_some_and(|p| p.is_empty()),
+            "{schema}"
+        );
+        assert!(schema.get("required").is_none(), "{schema}");
+        assert!(schema.get("additionalProperties").is_none(), "{schema}");
+        // It says plainly what is shown: that the Director waits, not the question.
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("THAT you are"), "{description}");
+        assert!(description.contains("not the question"), "{description}");
+        assert!(description.contains("write the question in your own pane first"));
+        // What lasts is the tag, until the answer; the mark, which ends sooner, is
+        // not promised to the Director.
+        assert!(
+            description.contains("The tag stays until the operator answers in your pane"),
+            "{description}"
+        );
+        assert!(
+            !description.to_lowercase().contains("mark"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn a_director_records_that_it_is_waiting_and_is_told_only_that_it_is_recorded() {
+        let mut ctx = request_ctx();
+        let response = call(&mut ctx, &request_call());
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(stored_request(&ctx), Some(1));
+        // True with the operator's setting on or off, so it says nothing about a
+        // bell or about anyone having been told, and it says what is shown.
+        let text = result_text(&response).to_lowercase();
+        assert!(text.contains("recorded"), "{text:?}");
+        assert!(text.contains("not the question"), "{text:?}");
+        for word in ["bell", "notif", "alert", "ring", "sent"] {
+            assert!(!text.contains(word), "{word}: {text:?}");
+        }
+        // A second call is a new request: the sequence says so.
+        call(&mut ctx, &request_call());
+        assert_eq!(stored_request(&ctx), Some(2));
+    }
+
+    #[test]
+    fn a_stray_text_argument_is_ignored_and_nothing_of_it_is_stored() {
+        // An agent briefed by an older prompt still sends a sentence, or anything.
+        for text in [
+            json!("Which API shape do we want?"),
+            json!(""),
+            json!(3),
+            json!({"nested": "\u{1b}[31mred"}),
+            Value::Null,
+        ] {
+            let mut ctx = request_ctx();
+            let response = call(&mut ctx, &request_call_with_text(&text));
+            assert!(!is_error(&response), "{text}: {}", result_text(&response));
+            assert_eq!(stored_request(&ctx), Some(1), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_worker_and_a_goinkyo_cannot_request_a_decision() {
+        let director = request_ctx();
+        let mut worker = worker_ctx_of(director, "worker-1");
+        let response = call(&mut worker, &request_call());
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("only be called by a Director"));
+        assert_eq!(stored_request(&worker), None);
+        let mut goinkyo = ServerContext {
+            identity: Identity {
+                session: Some("goinkyo-session".to_string()),
+                brigade: Some(1),
+                member: Some("goinkyo".to_string()),
+                role: Some(BrigadeRole::Goinkyo),
+            },
+            ..worker
+        };
+        let response = call(&mut goinkyo, &request_call());
+        assert!(is_error(&response));
+        assert_eq!(stored_request(&goinkyo), None);
+    }
+
+    #[test]
+    fn a_caller_outside_any_brigade_gets_the_usual_refusal() {
+        let mut ctx = ctx("spike-session", None, None, None);
+        let response = call(&mut ctx, &request_call());
+        let text = result_text(&response);
+        assert!(text.contains("not"), "{text:?}");
+        // The same words as `brigade_status` gives.
+        assert_eq!(text, result_text(&call(&mut ctx, &status_call())));
+    }
+
+    #[test]
+    fn a_disbanded_directors_request_is_the_usual_refusal_and_stores_nothing() {
+        let mut ctx = request_ctx();
+        ctx.store.delete_brigade(1).unwrap();
+        let response = call(&mut ctx, &request_call());
+        assert!(result_text(&response).contains("not"));
+        assert_eq!(stored_request(&ctx), None);
     }
 
     #[test]

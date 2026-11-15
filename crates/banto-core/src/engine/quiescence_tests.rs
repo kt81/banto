@@ -34,8 +34,53 @@ fn listed(state: &EmporiumState) -> Vec<BrigadeNameFacts> {
             name: "cell".to_string(),
             director_session: None,
             member_names: Vec::new(),
+            request: stored_request(brigade_id),
         })
         .collect()
+}
+
+thread_local! {
+    /// What the store holds as each brigade's open request, as the shell would
+    /// read it into every tick: its sequence. Per test thread.
+    static STORED_REQUESTS: std::cell::RefCell<HashMap<BrigadeId, i64>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn stored_request(brigade_id: BrigadeId) -> Option<RequestFact> {
+    STORED_REQUESTS.with(|stored| {
+        stored
+            .borrow()
+            .get(&brigade_id)
+            .map(|seq| RequestFact { seq: *seq })
+    })
+}
+
+/// A Director's `request_decision`: the store holds a request under a new number.
+fn store_request(brigade_id: BrigadeId) -> i64 {
+    STORED_REQUESTS.with(|stored| {
+        let mut stored = stored.borrow_mut();
+        let seq = stored.get(&brigade_id).copied().unwrap_or(0) + 1;
+        stored.insert(brigade_id, seq);
+        seq
+    })
+}
+
+/// What the shell does with the `Cmd`s that reach the store: a conditional clear.
+fn run_store(cmds: &[Cmd]) {
+    for cmd in cmds {
+        if let Cmd::Store(StoreIntent::ClearRequest { brigade_id, seq }) = cmd {
+            STORED_REQUESTS.with(|stored| {
+                let mut stored = stored.borrow_mut();
+                if stored.get(brigade_id).is_some_and(|held| held == seq) {
+                    stored.remove(brigade_id);
+                }
+            });
+        }
+    }
+}
+
+fn forget_stored_requests() {
+    STORED_REQUESTS.with(|stored| stored.borrow_mut().clear());
 }
 
 /// What the relay observes in a tick when the roster reads fine: every hosted
@@ -1353,6 +1398,1115 @@ fn a_brigade_whose_director_is_not_hosted_is_not_watched() {
         assert!(!rang(&cmds), "at +{secs}s: {cmds:?}");
     }
     assert!(state.latched_attention_panes.is_empty() && state.attention.is_empty());
+}
+
+// --- a Director's request for a decision --------------------------------------------
+
+/// A staged brigade 1 (the operator in the list) after the first tick that visits
+/// it, with nothing stored: the state a running banto is in when a Director calls
+/// `request_decision`.
+fn request_fixture() -> (EmporiumState, App, SessionKey, SessionKey, Instant) {
+    forget_stored_requests();
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    app.replace_rows(vec![row_for("dir"), row_for("w1")]);
+    app.set_viewport_height(20);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        at,
+    );
+    (state, app, director, worker, at)
+}
+
+/// The operator is inside the Director's pane and banto's window is focused.
+fn focus_the_director(state: &mut EmporiumState) {
+    state.focus = Focus::Pane;
+    state.window_focused = true;
+    if let Stage::Brigade { focused, .. } = &mut state.stage {
+        *focused = 0;
+    }
+}
+
+fn request_off() -> BrigadeConfig {
+    BrigadeConfig {
+        request_attention: false,
+        ..BrigadeConfig::default()
+    }
+}
+
+fn tick_under(
+    state: &mut EmporiumState,
+    app: &mut App,
+    config: &BrigadeConfig,
+    at: Instant,
+) -> Vec<Cmd> {
+    let brigades = listed(state);
+    let relay = observed(state, Vec::new());
+    update(state, app, config, Event::Tick { relay, brigades }, at)
+}
+
+fn the_request_ring(brigade: BrigadeId, director: &SessionKey) -> BellCause {
+    BellCause::Request {
+        brigade,
+        director: director.clone(),
+    }
+}
+
+#[test]
+fn the_first_sight_of_a_stored_request_draws_it_and_rings_and_marks_nothing() {
+    // Restart: the request was stored by the last run, and the first tick that
+    // visits the brigade is the one that reads it. Nothing happened just now.
+    forget_stored_requests();
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let director = host(&mut state, 1, DIRECTOR_TOKEN, "dir");
+    let worker = host(&mut state, 1, "worker-1", "w1");
+    stage(&mut state, 1, &director, &[&worker]);
+    state.focus = Focus::Sidebar;
+    app.replace_rows(vec![row_for("dir"), row_for("w1")]);
+    app.set_viewport_height(20);
+    let at = t0();
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(state.has_request(&director));
+    assert!(state.attention_panes().is_empty(), "no mark");
+    assert!(!app.has_brigade_mark("dir"));
+    assert_eq!(state.visible_waiting_count(), 0);
+    // And it is not a new request on the next tick either.
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(state.attention_panes().is_empty());
+}
+
+#[test]
+fn a_brigade_first_seen_with_no_request_does_not_make_a_later_one_a_first_sight() {
+    let (mut state, mut app, director, _worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert_eq!(bell_causes(&cmds), vec![the_request_ring(1, &director)]);
+}
+
+#[test]
+fn a_new_request_marks_a_staged_directors_tile_rings_and_shows_the_tag() {
+    let (mut state, mut app, director, _worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![the_request_ring(1, &director)],
+        "{cmds:?}"
+    );
+    assert!(
+        state.attention_panes().contains(&director),
+        "the tile's mark"
+    );
+    assert!(app.has_brigade_mark("dir"), "and the row's");
+    assert_eq!(state.visible_waiting_count(), 1);
+    assert!(state.has_request(&director));
+}
+
+/// Brigade 1 on stage with the list focused, brigade 2 hosted off stage with only
+/// its Director's row visible, both first seen with no request.
+fn off_stage_request_fixture() -> (EmporiumState, App, SessionKey, Instant) {
+    forget_stored_requests();
+    let (mut state, mut app, d1, w1, at) = quiet_fixture();
+    let d2 = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
+    let w2 = host(&mut state, 2, "worker-1", "w2");
+    app.replace_rows(vec![
+        row_for("dir"),
+        row_for("w1"),
+        row_for("dir2"),
+        row_for("w2"),
+    ]);
+    app.set_hidden_member_ids(
+        ["dir", "w1", "w2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    app.set_viewport_height(20);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&d1, Idle), (&w1, Idle), (&d2, Idle), (&w2, Idle)],
+        at,
+    );
+    tick(&mut state, &mut app, at + SECOND);
+    (state, app, d2, at + SECOND)
+}
+
+#[test]
+fn a_request_from_a_brigade_off_stage_marks_its_row_and_rings_wherever_the_operator_is() {
+    let (mut state, mut app, d2, at) = off_stage_request_fixture();
+    store_request(2);
+    let cmds = tick(&mut state, &mut app, at + SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![the_request_ring(2, &d2)],
+        "{cmds:?}"
+    );
+    assert!(app.has_brigade_mark("dir2"), "the Director's row is marked");
+    assert_eq!(state.visible_waiting_count(), 1);
+    assert!(state.has_request(&d2));
+}
+
+#[test]
+fn a_request_while_the_operator_is_in_that_directors_pane_makes_no_mark_and_rings_only_with_f4() {
+    for f4 in [false, true] {
+        let (mut state, mut app, director, _worker, at) = request_fixture();
+        focus_the_director(&mut state);
+        if f4 {
+            toggle_bell(&mut state, &mut app, at);
+        }
+        tick(&mut state, &mut app, at + SECOND);
+        store_request(1);
+        let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+        assert!(state.attention_panes().is_empty(), "f4 {f4}: no mark");
+        assert!(!app.has_brigade_mark("dir"), "f4 {f4}");
+        assert_eq!(state.visible_waiting_count(), 0, "f4 {f4}");
+        assert_eq!(
+            bell_causes(&cmds),
+            if f4 {
+                vec![the_request_ring(1, &director)]
+            } else {
+                Vec::new()
+            },
+            "f4 {f4}"
+        );
+        // The tag is shown all the same.
+        assert!(state.has_request(&director), "f4 {f4}");
+    }
+}
+
+#[test]
+fn the_mark_ends_at_the_directors_pane_and_the_tag_stays_until_the_answer() {
+    let (mut state, mut app, director, _worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(app.has_brigade_mark("dir"));
+    // The operator reaches the Director's pane: seen.
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 3 * SECOND);
+    assert!(!app.has_brigade_mark("dir"), "looked at");
+    assert!(state.attention_panes().is_empty());
+    assert_eq!(
+        state.visible_waiting_count(),
+        0,
+        "the tag alone is not counted"
+    );
+    assert!(state.has_request(&director), "not answered");
+}
+
+/// The samples of a stretch of work in progress: the Director not idle, the Worker
+/// idle (a Director calls `request_decision` in the middle of a turn), one a second
+/// from `from` for `secs` seconds. Returns every ring heard.
+fn director_works(
+    state: &mut EmporiumState,
+    app: &mut App,
+    director: &SessionKey,
+    worker: &SessionKey,
+    from: Instant,
+    secs: u32,
+) -> Vec<Cmd> {
+    let mut heard = Vec::new();
+    for second in 0..secs {
+        heard.extend(sample(
+            state,
+            app,
+            &[(director, NotIdle), (worker, Idle)],
+            from + second * SECOND,
+        ));
+    }
+    heard
+}
+
+/// Everything idle, one sample a second from `from` for `secs` seconds. Returns
+/// every ring heard.
+fn all_idle_for(
+    state: &mut EmporiumState,
+    app: &mut App,
+    director: &SessionKey,
+    worker: &SessionKey,
+    from: Instant,
+    secs: u32,
+) -> Vec<Cmd> {
+    let mut heard = Vec::new();
+    for second in 0..secs {
+        heard.extend(sample(
+            state,
+            app,
+            &[(director, Idle), (worker, Idle)],
+            from + second * SECOND,
+        ));
+    }
+    heard
+}
+
+/// The brigade's settle, with margin.
+const SETTLED: u32 = BRIGADE_QUIET_SETTLE.as_secs() as u32 + 4;
+
+#[test]
+fn a_request_made_in_the_middle_of_a_turn_swallows_the_quiet_that_ends_that_stretch() {
+    // The operator is in the Director's pane with the bell switch on, so the
+    // request rings (no mark). The Director then stays busy for several ticks, and
+    // when everything is idle that is the quiet the request was about: not a
+    // second ring.
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    focus_the_director(&mut state);
+    toggle_bell(&mut state, &mut app, at);
+    let mut heard = director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    heard.extend(director_works(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 3 * SECOND,
+        4,
+    ));
+    heard.extend(all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 7 * SECOND,
+        SETTLED,
+    ));
+    assert_eq!(
+        bell_causes(&heard),
+        vec![the_request_ring(1, &director)],
+        "one ring, for the request: {heard:?}"
+    );
+}
+
+#[test]
+fn a_request_whose_mark_was_looked_at_before_the_quiet_still_swallows_it() {
+    // Off stage or not on it, the operator saw the mark and left: the quiet that
+    // follows is the same stretch of work and is not announced again.
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    let cmds = director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    assert_eq!(bell_causes(&cmds), vec![the_request_ring(1, &director)]);
+    assert!(app.has_brigade_mark("dir"));
+    // The operator reaches the Director's pane (the mark ends) and leaves again.
+    focus_the_director(&mut state);
+    director_works(&mut state, &mut app, &director, &worker, at + 5 * SECOND, 2);
+    state.focus = Focus::Sidebar;
+    assert!(!app.has_brigade_mark("dir"));
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 7 * SECOND,
+        SETTLED,
+    );
+    assert!(!rang(&heard), "swallowed: {heard:?}");
+    assert!(!app.has_brigade_mark("dir"), "and no record");
+    assert!(state.attention_panes().is_empty());
+}
+
+#[test]
+fn once_the_operator_answers_the_next_stretch_is_his_and_its_end_rings() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    // He answers: an Enter into the Director's pane, then back to the list.
+    focus_the_director(&mut state);
+    let cmds = press(&mut state, &mut app, KeyCode::Enter, at + 5 * SECOND);
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::Store(StoreIntent::ClearRequest { .. })))
+    );
+    state.focus = Focus::Sidebar;
+    // The Director works on what he said and stops: that quiet rings.
+    director_works(&mut state, &mut app, &director, &worker, at + 6 * SECOND, 3);
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 9 * SECOND,
+        SETTLED,
+    );
+    assert_eq!(
+        bell_causes(&heard),
+        vec![BellCause::QuietRecorded {
+            brigade: 1,
+            director: director.clone()
+        }],
+        "{heard:?}"
+    );
+}
+
+#[test]
+fn a_key_the_operator_types_into_a_worker_ends_the_spending_too() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 5 * SECOND);
+    // He tells a Worker something: from here the stretch is his.
+    if let Stage::Brigade { focused, .. } = &mut state.stage {
+        *focused = 1;
+    }
+    press(&mut state, &mut app, KeyCode::Char('x'), at + 6 * SECOND);
+    state.focus = Focus::Sidebar;
+    director_works(&mut state, &mut app, &director, &worker, at + 7 * SECOND, 2);
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 9 * SECOND,
+        SETTLED,
+    );
+    assert!(rang(&heard), "{heard:?}");
+}
+
+#[test]
+fn what_banto_itself_types_into_a_worker_does_not_end_the_spending() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 5 * SECOND);
+    state.focus = Focus::Sidebar;
+    // The relay nudges the idle Worker (mail for it), and it works and stops.
+    let mail = |state: &mut EmporiumState, app: &mut App, when: Instant| {
+        send(
+            state,
+            app,
+            Event::Tick {
+                relay: vec![mail_for(1, "worker-1", &key("w1"))],
+                brigades: listed(state),
+            },
+            when,
+        )
+    };
+    mail(&mut state, &mut app, at + 6 * SECOND);
+    let nudged = mail(&mut state, &mut app, at + 7 * SECOND);
+    assert!(typed_into(&nudged, &worker), "{nudged:?}");
+    let mut heard = Vec::new();
+    for second in 0..3 {
+        heard.extend(sample(
+            &mut state,
+            &mut app,
+            &[(&director, Idle), (&worker, NotIdle)],
+            at + (8 + second) * SECOND,
+        ));
+    }
+    heard.extend(all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 11 * SECOND,
+        SETTLED,
+    ));
+    assert!(!rang(&heard), "still swallowed: {heard:?}");
+}
+
+#[test]
+fn a_request_made_when_everything_is_already_idle_spends_only_the_next_quiet_point() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    // Long idle, nothing in progress.
+    let heard = all_idle_for(&mut state, &mut app, &director, &worker, at + SECOND, 30);
+    assert!(!rang(&heard));
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + 31 * SECOND);
+    assert_eq!(bell_causes(&cmds), vec![the_request_ring(1, &director)]);
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 32 * SECOND);
+    state.focus = Focus::Sidebar;
+    // The next quiet point passes in silence ...
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 33 * SECOND,
+        SETTLED,
+    );
+    assert!(!rang(&heard), "{heard:?}");
+    // ... and an unrelated stretch of work later rings as usual: nothing lingers.
+    director_works(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 60 * SECOND,
+        3,
+    );
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 63 * SECOND,
+        SETTLED,
+    );
+    assert_eq!(
+        bell_causes(&heard),
+        vec![BellCause::QuietRecorded {
+            brigade: 1,
+            director: director.clone()
+        }],
+        "{heard:?}"
+    );
+}
+
+#[test]
+fn a_second_request_spends_again() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    // The first quiet point is swallowed ...
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 5 * SECOND,
+        SETTLED,
+    );
+    assert!(!rang(&heard), "{heard:?}");
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 20 * SECOND);
+    state.focus = Focus::Sidebar;
+    // ... and a request made in the next stretch swallows that one too.
+    director_works(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 21 * SECOND,
+        2,
+    );
+    store_request(1);
+    director_works(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 23 * SECOND,
+        2,
+    );
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 25 * SECOND,
+        SETTLED,
+    );
+    assert!(!rang(&heard), "{heard:?}");
+}
+
+#[test]
+fn with_the_setting_off_the_tag_is_shown_and_the_quiet_rings_as_it_always_did() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    let config = request_off();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    let cmds = tick_under(&mut state, &mut app, &config, at + 3 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(!app.has_brigade_mark("dir"));
+    assert!(state.attention_panes().is_empty());
+    assert_eq!(state.visible_waiting_count(), 0);
+    assert!(state.has_request(&director));
+    director_works(&mut state, &mut app, &director, &worker, at + 4 * SECOND, 2);
+    let mut rang_quiet = false;
+    for second in 0..SETTLED {
+        let at_secs = at + (6 + second) * SECOND;
+        update(
+            &mut state,
+            &mut app,
+            &config,
+            Event::QuiescenceSampled {
+                samples: vec![(director.clone(), Idle), (worker.clone(), Idle)],
+            },
+            at_secs,
+        );
+        rang_quiet |= rang(&tick_under(&mut state, &mut app, &config, at_secs));
+    }
+    assert!(rang_quiet, "nothing was spent");
+}
+
+#[test]
+fn a_request_from_a_brigade_whose_director_is_not_hosted_spends_nothing_that_could_linger() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    unhost(&mut state, &director);
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(state.request_spent.is_empty());
+    // The Director is hosted again and a stretch of work goes quiet: it rings.
+    let director = host(&mut state, 1, DIRECTOR_TOKEN, "dir");
+    director_works(&mut state, &mut app, &director, &worker, at + 5 * SECOND, 3);
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 8 * SECOND,
+        SETTLED,
+    );
+    assert!(rang(&heard), "{heard:?}");
+}
+
+#[test]
+fn a_directors_pane_ending_takes_the_spending_with_it_and_the_next_stretch_rings() {
+    // Not a disband: the Director's process exits (a Director is never relaunched
+    // by banto), and the operator reopens it from the list some time later.
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    assert!(state.request_spent.contains(&1), "spent");
+    send(
+        &mut state,
+        &mut app,
+        Event::PtyExited {
+            key: director.clone(),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        at + 5 * SECOND,
+    );
+    assert!(!state.screens.contains_key(&director), "its pane is gone");
+    sample(&mut state, &mut app, &[(&worker, Idle)], at + 6 * SECOND);
+    assert!(
+        state.request_spent.is_empty(),
+        "no Director hosted, nothing is spent"
+    );
+    // Reopened later, it works and stops: that quiet is the operator's to hear.
+    let director = host(&mut state, 1, DIRECTOR_TOKEN, "dir");
+    director_works(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 60 * SECOND,
+        3,
+    );
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 63 * SECOND,
+        SETTLED,
+    );
+    assert_eq!(
+        bell_causes(&heard),
+        vec![BellCause::QuietRecorded {
+            brigade: 1,
+            director: director.clone()
+        }],
+        "{heard:?}"
+    );
+}
+
+#[test]
+fn a_workers_pane_being_relaunched_keeps_the_spending_while_the_director_stays_hosted() {
+    // The paths that drop a pane's screen: a process that ends (a Worker is then
+    // relaunched under its key, a Director is not), a kill, a dismissal. A Worker
+    // relaunch leaves the Director's pane hosted throughout, so the spending stays.
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    let cmds = send(
+        &mut state,
+        &mut app,
+        Event::PtyExited {
+            key: worker.clone(),
+            reason: Some(PtyExitReason::Code(0)),
+        },
+        at + 5 * SECOND,
+    );
+    assert!(
+        cmds.iter()
+            .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { key, .. } if key == &worker)),
+        "relaunched: {cmds:?}"
+    );
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned {
+            key: worker.clone(),
+        },
+        at + 5 * SECOND,
+    );
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, NotIdle), (&worker, Idle)],
+        at + 6 * SECOND,
+    );
+    assert!(state.request_spent.contains(&1), "still spent");
+}
+
+#[test]
+fn disbanding_drops_what_a_request_spent() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    director_works(&mut state, &mut app, &director, &worker, at + SECOND, 2);
+    store_request(1);
+    director_works(&mut state, &mut app, &director, &worker, at + 3 * SECOND, 2);
+    send(
+        &mut state,
+        &mut app,
+        Event::Disbanded {
+            brigade_id: 1,
+            result: Ok((Default::default(), Default::default())),
+        },
+        at + 5 * SECOND,
+    );
+    assert!(state.request_spent.is_empty());
+}
+
+#[test]
+fn a_request_made_before_the_first_tick_of_a_brigade_formed_in_this_run_is_a_new_one() {
+    // The brigade is formed through the real path; its Director calls the tool
+    // before the first gathering tick visits it. Only a request that already stood
+    // when this run first saw the brigade is silent, and a brigade formed now had
+    // none.
+    forget_stored_requests();
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![row_for("dir")]);
+    let config = BrigadeConfig::default();
+    let at = t0();
+    let mut cmds = update(
+        &mut state,
+        &mut app,
+        &config,
+        Event::BrigadeFormed {
+            director_row_id: "dir".to_string(),
+            name: "cell".to_string(),
+            cwd: std::path::PathBuf::from("/work"),
+            worker_agent: crate::model::AgentKind::ClaudeCode,
+            worker_model: "sonnet".to_string(),
+            worker_effort: "high".to_string(),
+            result: Ok((1, vec!["worker-1".to_string()])),
+        },
+        at,
+    );
+    while let Some(cmd) = cmds.pop() {
+        if let Cmd::OpenEmbedded { key, .. } = cmd {
+            cmds.extend(update(
+                &mut state,
+                &mut app,
+                &config,
+                Event::Spawned { key },
+                at,
+            ));
+        }
+    }
+    assert!(state.member_brigades.values().any(|id| *id == 1), "formed");
+    state.focus = Focus::Sidebar;
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + SECOND);
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![the_request_ring(1, &key("dir"))],
+        "{cmds:?}"
+    );
+    assert!(app.has_brigade_mark("dir"), "marked");
+}
+
+#[test]
+fn a_second_request_rings_again_and_a_repeat_of_the_same_does_not() {
+    let (mut state, mut app, director, _worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert_eq!(bell_causes(&cmds), vec![the_request_ring(1, &director)]);
+    // The same stored request seen again is not a new one.
+    let cmds = tick(&mut state, &mut app, at + 3 * SECOND);
+    assert!(!rang(&cmds));
+    // A second call, with the mark still standing, is a new request and rings
+    // again once the shared cooldown has passed.
+    store_request(1);
+    let cmds = tick(
+        &mut state,
+        &mut app,
+        at + 2 * SECOND + ATTENTION_BELL_COOLDOWN,
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![the_request_ring(1, &director)],
+        "{cmds:?}"
+    );
+    assert!(state.has_request(&director));
+    assert!(app.has_brigade_mark("dir"));
+}
+
+#[test]
+fn a_quiet_fire_while_a_request_is_unanswered_but_looked_at_rings_as_usual() {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    tick(&mut state, &mut app, at + 2 * SECOND);
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 3 * SECOND);
+    assert!(!app.has_brigade_mark("dir"));
+    // The operator goes back to the list. The brigade was idle when the request was
+    // made, so the quiet point that comes first is the one the request spent.
+    state.focus = Focus::Sidebar;
+    let heard = all_idle_for(
+        &mut state,
+        &mut app,
+        &director,
+        &worker,
+        at + 4 * SECOND,
+        SETTLED,
+    );
+    assert!(!rang(&heard), "{heard:?}");
+    // Then the brigade works and goes quiet: that rings as usual.
+    let idle_from = busy_then_idle(
+        &mut state,
+        &mut app,
+        &[&worker, &director],
+        at + 20 * SECOND,
+    );
+    let cmds = sample(
+        &mut state,
+        &mut app,
+        &[(&director, Idle), (&worker, Idle)],
+        idle_from + BRIGADE_QUIET_SETTLE,
+    );
+    assert_eq!(
+        bell_causes(&cmds),
+        vec![BellCause::QuietRecorded {
+            brigade: 1,
+            director: director.clone()
+        }]
+    );
+    assert!(state.has_request(&director), "still unanswered");
+}
+
+/// A request the operator has looked at: the tag stands, the mark is gone.
+fn a_request_that_stands_unanswered() -> (EmporiumState, App, SessionKey, SessionKey, Instant) {
+    let (mut state, mut app, director, worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    tick(&mut state, &mut app, at + 2 * SECOND);
+    focus_the_director(&mut state);
+    tick(&mut state, &mut app, at + 3 * SECOND);
+    (state, app, director, worker, at + 3 * SECOND)
+}
+
+#[test]
+fn only_an_enter_into_the_directors_pane_answers_it_and_clears_the_store() {
+    let (mut state, mut app, director, _worker, at) = a_request_that_stands_unanswered();
+    let cmds = press(&mut state, &mut app, KeyCode::Enter, at + SECOND);
+    assert!(wrote_to(&cmds, &director), "the Enter went to the pane");
+    assert!(!state.has_request(&director), "answered");
+    assert!(
+        cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::Store(StoreIntent::ClearRequest {
+                brigade_id: 1,
+                seq: 1
+            })
+        )),
+        "{cmds:?}"
+    );
+    run_store(&cmds);
+    // The store was cleared, and the next tick has nothing to bring back.
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(!rang(&cmds));
+    assert!(!state.has_request(&director));
+}
+
+#[test]
+fn nothing_but_an_enter_answers_it() {
+    // A letter, a paste, Shift+Enter (the child receives a line feed, not a send),
+    // the wheel, a click, a focus change, and banto's own nudge with its Enter.
+    // What the operator (or banto) does in the Director's pane.
+    type Act = fn(&mut EmporiumState, &mut App, &SessionKey, Instant);
+    let cases: [(&str, Act); 6] = [
+        ("a key", |state, app, _, at| {
+            press(state, app, KeyCode::Char('x'), at);
+        }),
+        ("a paste", |state, app, _, at| {
+            send(
+                state,
+                app,
+                Event::Input(InputEvent::Paste("one\ntwo\r\n".to_string())),
+                at,
+            );
+        }),
+        ("shift+enter", |state, app, _, at| {
+            press_with(state, app, KeyCode::Enter, Modifiers::SHIFT, at);
+        }),
+        ("the pointer", |state, app, director, at| {
+            state.size = (120, 40);
+            said(state, app, director, MOUSE_REPORTING_ON, at);
+            let over = inside(state, director);
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+            ] {
+                mouse(state, app, kind, over, at);
+            }
+        }),
+        ("a focus change", |state, app, _, at| {
+            state.focus = Focus::Sidebar;
+            tick(state, app, at);
+            focus_the_director(state);
+            send(state, app, Event::WindowFocusChanged { focused: false }, at);
+            send(state, app, Event::WindowFocusChanged { focused: true }, at);
+        }),
+        ("banto's nudge", |state, app, director, at| {
+            // Mail waits for the Director; two idle ticks nudge it, and the Enter
+            // that submits the nudge follows a moment later.
+            let mail = |state: &mut EmporiumState, app: &mut App, when: Instant| {
+                send(
+                    state,
+                    app,
+                    Event::Tick {
+                        relay: vec![mail_for(1, DIRECTOR_TOKEN, director)],
+                        brigades: listed(state),
+                    },
+                    when,
+                )
+            };
+            // The operator is not typing into it: the nudge is free to go out.
+            state.focus = Focus::Sidebar;
+            mail(state, app, at);
+            let nudged = mail(state, app, at + SECOND);
+            assert!(typed_into(&nudged, director), "{nudged:?}");
+            let submitted = mail(state, app, at + 2 * SECOND);
+            assert!(typed_into(&submitted, director), "its Enter: {submitted:?}");
+        }),
+    ];
+    for (what, act) in cases {
+        let (mut state, mut app, director, _worker, at) = a_request_that_stands_unanswered();
+        act(&mut state, &mut app, &director, at + SECOND);
+        assert!(state.has_request(&director), "{what} does not answer it");
+        assert_eq!(
+            stored_request(1).map(|fact| fact.seq),
+            Some(1),
+            "{what}: the store was not cleared"
+        );
+    }
+}
+
+#[test]
+fn an_enter_into_another_pane_does_not_answer_the_directors_request() {
+    let (mut state, mut app, director, worker, at) = a_request_that_stands_unanswered();
+    if let Stage::Brigade { focused, .. } = &mut state.stage {
+        *focused = 1;
+    }
+    let cmds = press(&mut state, &mut app, KeyCode::Enter, at + SECOND);
+    assert!(wrote_to(&cmds, &worker));
+    assert!(state.has_request(&director));
+}
+
+#[test]
+fn a_late_or_failed_clear_cannot_bring_an_answered_request_back_and_a_newer_one_still_counts() {
+    let (mut state, mut app, director, _worker, at) = a_request_that_stands_unanswered();
+    let cmds = press(&mut state, &mut app, KeyCode::Enter, at + SECOND);
+    // The clear never reached the store (not run): the next tick still carries
+    // the request it had, the one that was answered.
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::Store(StoreIntent::ClearRequest { .. })))
+    );
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(!rang(&cmds));
+    assert!(!state.has_request(&director), "not resurrected");
+    assert!(!app.has_brigade_mark("dir"));
+    // A request made after it is a new one, whatever happened to the clear.
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + 3 * SECOND);
+    assert!(state.has_request(&director));
+    // The window is focused on the Director, so no mark; and with F4 off no bell.
+    assert!(!rang(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn disbanding_the_brigade_drops_its_request_and_everything_kept_for_it() {
+    let (mut state, mut app, director, _worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    store_request(1);
+    tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(app.has_brigade_mark("dir"));
+    send(
+        &mut state,
+        &mut app,
+        Event::Disbanded {
+            brigade_id: 1,
+            result: Ok((Default::default(), Default::default())),
+        },
+        at + 3 * SECOND,
+    );
+    assert!(!state.has_request(&director));
+    assert!(!app.has_brigade_mark("dir"));
+    assert!(state.attention.is_empty());
+    assert!(state.requests.is_empty() && state.request_seen.is_empty());
+}
+
+#[test]
+fn a_request_from_a_brigade_whose_director_is_not_hosted_is_the_tag_alone() {
+    let (mut state, mut app, director, _worker, at) = request_fixture();
+    tick(&mut state, &mut app, at + SECOND);
+    unhost(&mut state, &director);
+    store_request(1);
+    let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(state.attention.is_empty());
+}
+
+fn request_on_row(app: &App, id: &str) -> bool {
+    app.visible().into_iter().any(|line| match line {
+        crate::app::ListLine::Row(row) => row.row.id == id && row.request,
+        _ => false,
+    })
+}
+
+/// Stage brigade 2 from the list, the way the operator does: Enter on the
+/// Director's row, then the membership the engine resolves for it.
+fn stage_brigade_two(state: &mut EmporiumState, app: &mut App, at: Instant) {
+    let roster = vec![
+        (
+            DIRECTOR_TOKEN.to_string(),
+            BrigadeRole::Director,
+            Some("dir2".to_string()),
+        ),
+        (
+            "worker-1".to_string(),
+            BrigadeRole::Worker,
+            Some("w2".to_string()),
+        ),
+    ];
+    state.focus = Focus::Sidebar;
+    press(state, app, KeyCode::Enter, at);
+    send(
+        state,
+        app,
+        Event::MembershipResolved {
+            session_id: "dir2".to_string(),
+            membership: Some((2, DIRECTOR_TOKEN.to_string(), BrigadeRole::Director)),
+            members: Some(roster),
+            layout: None,
+            names: Vec::new(),
+        },
+        at,
+    );
+}
+
+#[test]
+fn a_directors_row_carries_the_tag_whether_its_brigade_is_on_stage_or_not() {
+    let (mut state, mut app, d2, at) = off_stage_request_fixture();
+    store_request(2);
+    tick(&mut state, &mut app, at + SECOND);
+    assert!(request_on_row(&app, "dir2"), "off stage: on its row");
+    assert!(app.has_brigade_mark("dir2"), "off stage: marked");
+    assert_eq!(state.visible_waiting_count(), 1, "off stage: counted");
+    // Brigade 1 is on stage and has no request; staging brigade 2 puts the tag on
+    // its tile and the row keeps it: the list is the overview of every brigade, so
+    // what a row says does not depend on which one is on stage.
+    stage_brigade_two(&mut state, &mut app, at + 2 * SECOND);
+    assert!(state.has_request(&d2), "still unanswered");
+    assert!(request_on_row(&app, "dir2"), "staged: still on its row");
+    // The tag is not a mark and is not counted: the staged pane speaks through its
+    // own tile, so the row's mark and the `waiting N` count are gone as they were.
+    assert!(!app.has_brigade_mark("dir2"), "staged: no mark");
+    assert_eq!(state.visible_waiting_count(), 0, "staged: not counted");
+    assert_eq!(app.filtered_waiting_count(), 0);
+}
+
+#[test]
+fn a_solo_staged_pane_of_a_requesting_brigade_leaves_the_row_as_it_was() {
+    let (mut state, mut app, d2, at) = off_stage_request_fixture();
+    store_request(2);
+    tick(&mut state, &mut app, at + SECOND);
+    assert!(request_on_row(&app, "dir2"));
+    // The Director's session opened on its own, with no brigade on stage.
+    state.stage = Stage::Solo(d2.clone());
+    tick(&mut state, &mut app, at + 2 * SECOND);
+    assert!(request_on_row(&app, "dir2"), "solo: still on its row");
+    assert!(state.has_request(&d2));
+}
+
+#[test]
+fn a_row_hidden_by_a_search_has_no_tag_to_draw_and_gets_it_back_when_the_search_ends() {
+    let (mut state, mut app, _d2, at) = off_stage_request_fixture();
+    store_request(2);
+    tick(&mut state, &mut app, at + SECOND);
+    assert!(request_on_row(&app, "dir2"));
+    state.focus = Focus::Sidebar;
+    press(&mut state, &mut app, KeyCode::Char('/'), at + 2 * SECOND);
+    for c in "zzz".chars() {
+        press(&mut state, &mut app, KeyCode::Char(c), at + 2 * SECOND);
+    }
+    assert_eq!(app.filtered_len(), 0, "the search hides every row");
+    assert!(
+        !request_on_row(&app, "dir2"),
+        "hidden: nothing to draw it on"
+    );
+    press(&mut state, &mut app, KeyCode::Esc, at + 3 * SECOND);
+    assert!(request_on_row(&app, "dir2"), "search over: back on its row");
+}
+
+#[test]
+fn a_brigade_nothing_hosts_yet_shows_its_stored_request_on_its_directors_row_with_no_effect() {
+    // Restart: the brigade is in the store and nothing is hosted. The roster names
+    // the Director's session, which is the row.
+    forget_stored_requests();
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(vec![row_for("dir9")]);
+    app.set_viewport_height(20);
+    store_request(9);
+    let facts = BrigadeNameFacts {
+        brigade_id: 9,
+        name: "cell".to_string(),
+        director_session: Some("dir9".to_string()),
+        member_names: Vec::new(),
+        request: stored_request(9),
+    };
+    let cmds = send(
+        &mut state,
+        &mut app,
+        Event::Tick {
+            relay: Vec::new(),
+            brigades: vec![facts],
+        },
+        t0(),
+    );
+    assert!(!rang(&cmds), "{cmds:?}");
+    assert!(request_on_row(&app, "dir9"));
+    assert!(!app.has_brigade_mark("dir9"));
+    assert_eq!(app.filtered_waiting_count(), 0);
+}
+
+#[test]
+fn the_request_ring_reads_as_one_line_for_the_bell_log() {
+    assert_eq!(
+        the_request_ring(7, &key("dir")).to_string(),
+        "request brigade=7 director=dir"
+    );
+    let hostile = BellCause::Request {
+        brigade: 7,
+        director: SessionKey::from_id("a\nb"),
+    }
+    .to_string();
+    assert_eq!(hostile.lines().count(), 1, "{hostile:?}");
 }
 
 // --- what a bell says it was for ----------------------------------------------------

@@ -891,6 +891,9 @@ pub struct App {
     /// The ids of the sessions this banto hosts a pane for ([`Self::set_hosted_ids`]):
     /// a row among them that says it has no live process is shown as live.
     hosted_ids: HashSet<String>,
+    /// The Director rows whose brigade has an open request
+    /// ([`Self::set_request_rows`]), by id.
+    request_rows: HashSet<String>,
     /// Directors whose brigade wants the operator ([`Self::set_brigade_marks`]):
     /// shown as Waiting on their rows and counted, nothing else.
     brigade_marks: HashSet<String>,
@@ -998,6 +1001,10 @@ pub struct VisibleRow<'a> {
     /// The row's brigade wants the operator ([`App::set_brigade_marks`]): the dot
     /// reads Waiting whatever the session's own state is.
     pub brigade_mark: bool,
+    /// The Director's brigade has an open request
+    /// ([`App::set_request_rows`]): the fixed tag is drawn on line two in place of
+    /// the cwd.
+    pub request: bool,
     /// True when this session has a known auto-compaction continuation —
     /// shown regardless of *why* the row is visible (still live, or the
     /// `a` cycle has revealed what banto hid).
@@ -1050,6 +1057,7 @@ impl App {
             waiting_rows: HashSet::new(),
             reported_activity: HashMap::new(),
             hosted_ids: HashSet::new(),
+            request_rows: HashSet::new(),
             brigade_marks: HashSet::new(),
             reported_dialogs: HashSet::new(),
             row_index: HashMap::new(),
@@ -1893,6 +1901,14 @@ impl App {
         self.refilter_keeping_selected(selected_id);
     }
 
+    /// The Directors, by id, whose brigade has an open request, on stage or not:
+    /// the row's second line carries the fixed tag in place of the cwd. Display
+    /// only, like [`Self::set_brigade_marks`]: no row's activity, order, filter or
+    /// count reads it.
+    pub fn set_request_rows(&mut self, rows: HashSet<String>) {
+        self.request_rows = rows;
+    }
+
     /// Tell the list which sessions this banto hosts a pane for. A row of such a
     /// session whose own activity says there is no live process (`Idle(_)`: the
     /// Codex check of the logs database runs on a reload, which a pane at its
@@ -2517,6 +2533,7 @@ impl App {
                         pinned: self.pinned.contains(&row.id),
                         director: self.directors.contains(&row.id),
                         brigade_mark: self.brigade_marks.contains(&row.id),
+                        request: self.request_rows.contains(&row.id),
                         superseded: self.superseded.contains(&row.id),
                     })
                 }
@@ -2676,6 +2693,29 @@ mod tests {
         app.set_hosted_ids(HashSet::new());
         assert_eq!(ids(&app), vec!["new"]);
         assert_eq!(app.hidden_count(), 1);
+    }
+
+    #[test]
+    fn an_open_request_is_carried_by_the_directors_row_and_changes_nothing_else() {
+        let mut app = App::new(vec![row("dir", "lead", ""), row("other", "other", "")]);
+        app.set_viewport_height(20);
+        let request_of = |app: &App, id: &str| {
+            app.visible().into_iter().find_map(|line| match line {
+                ListLine::Row(r) if r.row.id == id => Some(r.request),
+                _ => None,
+            })
+        };
+        assert_eq!(request_of(&app, "dir"), Some(false));
+        app.set_request_rows(["dir".to_string()].into_iter().collect());
+        assert_eq!(request_of(&app, "dir"), Some(true));
+        assert_eq!(request_of(&app, "other"), Some(false));
+        // A reload cannot lose it; the waiting sets are not touched by it.
+        app.replace_rows(vec![row("dir", "lead", ""), row("other", "other", "")]);
+        assert_eq!(request_of(&app, "dir"), Some(true));
+        assert_eq!(app.filtered_waiting_count(), 0);
+        assert!(!app.is_waiting_id("dir"));
+        app.set_request_rows(HashSet::new());
+        assert_eq!(request_of(&app, "dir"), Some(false));
     }
 
     #[test]

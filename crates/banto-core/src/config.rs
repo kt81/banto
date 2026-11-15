@@ -281,6 +281,14 @@ pub struct BrigadeConfig {
     /// deletes it. The location is not configurable, so that it can never leave
     /// banto's own directory.
     pub message_log: bool,
+    /// Whether a Director's `request_decision` is an attention event: on a new
+    /// request the Director's list row is marked and the terminal bell rings,
+    /// staged or not and wherever the operator is, and the brigade's quiet watch
+    /// is spent (the quiet after the same stretch of work does not ring a second
+    /// time). The tag that says the Director is waiting is drawn either way and
+    /// stays until the operator answers in its pane. Default `true`; `false` keeps
+    /// the tag and nothing else. Read once at start.
+    pub request_attention: bool,
 }
 
 /// See [`BrigadeConfig::director_prompt`]. Written to delegate by default:
@@ -354,7 +362,18 @@ the request that started it. A consultation does not end by itself — \
 you end it, with dismiss_goinkyo: an arbitration you already have your answer to is \
 finished, and one left open is a session still running with nothing \
 left to do. A design consultation lasting until the design is settled \
-is the ordinary case, not that.";
+is the ordinary case, not that.
+
+banto itself tells the operator when the whole brigade has gone quiet, so \
+do not announce that you are done. When the operator alone can decide \
+something AND work stops until they do, write the question in your own \
+output and then call request_decision: it shows the operator that you are \
+waiting, not the question, and it does not block you, so carry on with \
+whatever can proceed. banto keeps showing it until the operator answers in \
+your pane. Do not use it for status, for a question you or a Worker can \
+settle, or for finished work. Use your own question picker only when no \
+Worker is running: it stops you, and with Workers running request_decision \
+is how the operator learns where you are stuck without stopping them.";
 
 /// See [`BrigadeConfig::worker_prompt`].
 const DEFAULT_WORKER_PROMPT: &str = "\
@@ -427,6 +446,7 @@ impl Default for BrigadeConfig {
             goinkyo_permission_mode: "auto".to_string(),
             goinkyo_disallowed_tools: "Edit,Write,NotebookEdit".to_string(),
             message_log: false,
+            request_attention: true,
         }
     }
 }
@@ -1049,6 +1069,60 @@ worker_effort_codex = \"\"
             Some("lead {peers}")
         );
         assert_eq!(config.brigade.prompt_for(BrigadeRole::Worker), None);
+    }
+
+    #[test]
+    fn the_default_director_briefing_names_request_decision_and_says_when_to_use_it() {
+        let prompt = &Config::default().brigade.director_prompt;
+        // The tool by name, and what it is for: the operator alone can decide it
+        // AND work stops until they do, with the question written in its own pane.
+        assert!(prompt.contains("request_decision"), "{prompt}");
+        assert!(
+            prompt.contains("write the question in your own output and then call request_decision"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("shows the operator that you are waiting, not the question"));
+        assert!(prompt.contains("the operator alone can decide"), "{prompt}");
+        assert!(prompt.contains("work stops"), "{prompt}");
+        // banto itself says when the brigade has gone quiet: no announcing.
+        assert!(
+            prompt.contains("banto itself tells the operator"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("gone quiet"), "{prompt}");
+        assert!(prompt.contains("do not announce"), "{prompt}");
+        // The Director's own question picker is for when no Worker is running.
+        assert!(
+            prompt.contains("only when no Worker is running"),
+            "{prompt}"
+        );
+        // It does not block, and it is not for status or what can be settled.
+        assert!(prompt.contains("does not block you"), "{prompt}");
+        assert!(prompt.contains("status"), "{prompt}");
+        // And it still renders: nothing in it is a placeholder.
+        assert!(
+            !prompt
+                .replace("{brigade}", "")
+                .replace("{peers}", "")
+                .contains('{')
+        );
+    }
+
+    #[test]
+    fn a_requested_decision_is_an_attention_event_unless_the_config_turns_it_off() {
+        assert!(Config::default().brigade.request_attention);
+        assert!(parse("").brigade.request_attention);
+        assert!(parse("[brigade]\nworkers = 2\n").brigade.request_attention);
+        assert!(
+            !parse("[brigade]\nrequest_attention = false\n")
+                .brigade
+                .request_attention
+        );
+        assert!(
+            parse("[brigade]\nrequest_attention = true\n")
+                .brigade
+                .request_attention
+        );
     }
 
     #[test]

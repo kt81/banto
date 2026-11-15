@@ -525,6 +525,22 @@ pub struct BrigadeNameFacts {
     /// existed, which reads as "nobody is named".
     #[serde(default)]
     pub member_names: Vec<(MemberToken, String)>,
+    /// Whether the brigade's Director has an open request for the operator's
+    /// decision, as the store held it when the tick read it (a listed brigade with
+    /// `None` has none). `#[serde(default)]`, so a stream recorded before requests
+    /// existed reads as "none".
+    #[serde(default)]
+    pub request: Option<RequestFact>,
+}
+
+/// A Director's open request for a decision as the store holds it: the sequence
+/// number its `set_request` gave it. Nothing a Director wrote travels here (the
+/// request is the fact that the brigade waits on the operator, and the question is
+/// in the Director's own pane), so a recording of a tick holds nothing a Director
+/// wrote through this path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestFact {
+    pub seq: i64,
 }
 
 /// One relay-eligible live member's freshly-gathered observations for this
@@ -1397,6 +1413,22 @@ pub struct EmporiumState {
     /// stored, so a restart starts with none. Display only — the quit question,
     /// the quiet watch, the relay and the tiles' words never read it.
     attention: HashMap<BrigadeId, AttentionCause>,
+    /// Each brigade's open request, by its sequence number, "not answered yet": it
+    /// mirrors the store and lives until the operator sends an Enter into the
+    /// Director's pane, whatever became of the mark ([`Self::attention`], "not
+    /// looked at yet"). Shown as the fixed tag on the Director's list row, and on
+    /// its tile while its brigade is staged.
+    requests: HashMap<BrigadeId, i64>,
+    /// The highest request sequence number acted on per brigade. The first tick
+    /// that visits a brigade seeds it from the store without effect, so a stored
+    /// request rings nothing and marks nothing at start-up.
+    request_seen: HashMap<BrigadeId, i64>,
+    /// The highest sequence number the operator answered per brigade: a tick whose
+    /// facts were read before the store's clear landed, or after one that failed,
+    /// carries the request again, and it is not brought back.
+    request_answered: HashMap<BrigadeId, i64>,
+    /// Brigades whose next quiet point a request has spent ([`apply_request_fact`]).
+    request_spent: HashSet<BrigadeId>,
     /// Members whose wait (a waiting session, a Codex pane reporting `blocked`, a
     /// BEL) has rung through their Director's row while their brigade was not on
     /// stage, and is still standing. Staging the brigade moves the mark onto the
@@ -1563,6 +1595,10 @@ impl EmporiumState {
             visible_waiting_count: 0,
             latched_attention_panes: HashSet::new(),
             attention: HashMap::new(),
+            requests: HashMap::new(),
+            request_seen: HashMap::new(),
+            request_answered: HashMap::new(),
+            request_spent: HashSet::new(),
             row_announced_waits: HashSet::new(),
             tile_announced_waits: HashSet::new(),
             latch_announced_waits: HashSet::new(),
@@ -2004,6 +2040,19 @@ impl EmporiumState {
     /// own one-shot-guard bookkeeping ever writes to it.
     pub fn goinkyo_pane_for(&self, brigade_id: BrigadeId) -> Option<&SessionKey> {
         self.goinkyo_pane.get(&brigade_id)
+    }
+
+    /// Whether the pane `director` is a Director's and its brigade has an open
+    /// request: the tag drawn on its tile (and on its list row, staged or not).
+    /// Stays until the operator sends an Enter into the pane, whether
+    /// or not they have looked at it.
+    pub fn has_request(&self, director: &SessionKey) -> bool {
+        if self.member_tokens.get(director).map(String::as_str) != Some(DIRECTOR_TOKEN) {
+            return false;
+        }
+        self.member_brigades
+            .get(director)
+            .is_some_and(|brigade_id| self.requests.contains_key(brigade_id))
     }
 
     /// The durable brigade token associated with a currently staged pane.
@@ -2959,6 +3008,14 @@ pub enum StoreIntent {
     SaveBellWhenFocused {
         on: bool,
     },
+    /// The operator answered the Director's request numbered `seq`: clear it in
+    /// the store if, and only if, it is still that one (a newer request is never
+    /// wiped). Fire-and-forget like the preferences: a failed or late clear never
+    /// brings the request back, the core remembers what was answered.
+    ClearRequest {
+        brigade_id: BrigadeId,
+        seq: i64,
+    },
     /// Persist the agent the Worker picker was last confirmed with
     /// (`Store::set_last_worker_agent`).
     SaveLastWorkerAgent {
@@ -3279,6 +3336,12 @@ pub enum BellCause {
         brigade: BrigadeId,
         others: usize,
     },
+    /// A Director asked for a decision (`request_decision`) and the operator was
+    /// not already in its pane, or was and the "bell always" switch is on.
+    Request {
+        brigade: BrigadeId,
+        director: SessionKey,
+    },
 }
 
 impl std::fmt::Display for BellCause {
@@ -3296,6 +3359,13 @@ impl std::fmt::Display for BellCause {
                 write!(
                     f,
                     "quiet_recorded brigade={brigade} director={}",
+                    director.log_id()
+                )
+            }
+            Self::Request { brigade, director } => {
+                write!(
+                    f,
+                    "request brigade={brigade} director={}",
                     director.log_id()
                 )
             }
@@ -4010,6 +4080,7 @@ pub fn update(
     if overlay_may_have_changed {
         sync_reported_activity(state, app);
         cmds.extend(sync_brigade_marks(state, app, now));
+        sync_request_rows(state, app);
     }
     cmds.extend(refresh_waiting_display(state, app, now));
     cmds.extend(emit_focus_transitions(state));
@@ -4091,6 +4162,133 @@ impl TickObservations {
 enum AttentionCause {
     /// Every hosted member went idle after real work ([`update_brigade_quiet`]).
     Quiet,
+    /// The Director asked for a decision ([`apply_request_fact`]).
+    Request,
+}
+
+/// The hosted pane of `brigade_id`'s Director, if there is one.
+fn director_pane_of(state: &EmporiumState, brigade_id: BrigadeId) -> Option<SessionKey> {
+    state
+        .screens
+        .keys()
+        .find(|key| {
+            state.member_brigades.get(*key) == Some(&brigade_id)
+                && state.member_tokens.get(*key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+        })
+        .cloned()
+}
+
+/// What this tick's read of the store says about `brigade_id`'s Director's
+/// request ([`BrigadeNameFacts::request`]).
+///
+/// The request is adopted whatever else holds and stays until the operator
+/// answers. A request is NEW only
+/// when its sequence number is above the highest acted on, and the first sight of
+/// a brigade seeds that number without effect, so what a previous run stored rings
+/// nothing and marks nothing. A sequence at or below the one the operator
+/// answered is that request read again before its clear landed, or after one
+/// that failed: not brought back.
+///
+/// A new request, with [`BrigadeConfig::request_attention`] on, spends the
+/// brigade's next quiet point ([`EmporiumState::request_spent`]): the next moment
+/// every hosted member has been idle for [`BRIGADE_QUIET_SETTLE`] passes in
+/// silence (no ring, no record, no mark), whether or not a fire was due, and after
+/// it the watch works as before. It is the quiet point, not the watch's armed flag,
+/// that is spent: a Director calls the tool in the middle of a turn, so the watch
+/// is re-armed by its own not-idle readings for as long as the stretch lasts and
+/// clearing the flag here would be undone by the next sample. The spending ends
+/// early when the operator gives work to a member of the brigade
+/// ([`operator_gave_work`]: from then on the stretch is his), and a second request
+/// spends again. Then it does what a quiet fire does, with its own cause: with the
+/// operator effectively in that Director's pane there is no mark and a bell only
+/// if the "bell always" switch is on; anywhere else the brigade is recorded (the
+/// Director's row is marked, [`sync_brigade_marks`]) and the bell rings, whether
+/// the brigade is staged or not. With the setting off the tag is all there is,
+/// and nothing is spent. Nothing is spent for a brigade whose Director is not
+/// hosted: there is no quiet to swallow, and a spending left standing would eat a
+/// later, unrelated one.
+fn apply_request_fact(
+    state: &mut EmporiumState,
+    config: &BrigadeConfig,
+    brigade_id: BrigadeId,
+    fact: Option<RequestFact>,
+    now: Instant,
+) -> Vec<Cmd> {
+    let first_sight = !state.request_seen.contains_key(&brigade_id);
+    let answered = state.request_answered.get(&brigade_id).copied();
+    let open = fact.filter(|fact| answered.is_none_or(|answered| fact.seq > answered));
+    let Some(RequestFact { seq }) = open else {
+        state.requests.remove(&brigade_id);
+        if first_sight {
+            state.request_seen.insert(brigade_id, 0);
+        }
+        return Vec::new();
+    };
+    let seen = state.request_seen.get(&brigade_id).copied();
+    let is_new = seen.is_some_and(|seen| seq > seen);
+    if seen.is_none_or(|seen| seq >= seen) {
+        state.request_seen.insert(brigade_id, seq);
+        state.requests.insert(brigade_id, seq);
+    }
+    if !is_new || !config.request_attention {
+        return Vec::new();
+    }
+    let Some(director) = director_pane_of(state, brigade_id) else {
+        return Vec::new();
+    };
+    state.request_spent.insert(brigade_id);
+    let cause = BellCause::Request {
+        brigade: brigade_id,
+        director: director.clone(),
+    };
+    if effective_focused_pane(state).as_ref() == Some(&director) {
+        if state.bell_when_focused {
+            return ring_host_bell(state, now, cause).into_iter().collect();
+        }
+        return Vec::new();
+    }
+    state.attention.insert(brigade_id, AttentionCause::Request);
+    ring_host_bell(state, now, cause).into_iter().collect()
+}
+
+/// The operator gave `pane` something to do (a key or a paste forwarded to it, the
+/// Enter that answers a request included): the quiet point a request spent for
+/// its brigade is spent no longer, since from here the stretch of work is his and
+/// its end rings as usual. banto's own nudges and kickoffs do not come through
+/// here.
+fn operator_gave_work(state: &mut EmporiumState, pane: &SessionKey) {
+    if let Some(brigade_id) = state.member_brigades.get(pane) {
+        state.request_spent.remove(brigade_id);
+    }
+}
+
+/// An operator's key forwarded into `director`'s pane answers its brigade's
+/// request when it is the key that sends what was typed (a plain Enter, which
+/// reaches the child as a carriage return; Shift+Enter reaches it as a line feed
+/// and is not one): the request goes from the core, and the store is told to clear
+/// it if it is still that request. Nothing else answers: not another key, a
+/// paste, the pointer, a focus change, and not banto's own nudge, which is
+/// written by the relay and never comes through here.
+fn answer_request_on_enter(
+    state: &mut EmporiumState,
+    director: &SessionKey,
+    key: &KeyEvent,
+) -> Vec<Cmd> {
+    if input_effect(ForwardedInput::Key(key)) != InputEffect::Submits {
+        return Vec::new();
+    }
+    if state.member_tokens.get(director).map(String::as_str) != Some(DIRECTOR_TOKEN) {
+        return Vec::new();
+    }
+    let Some(&brigade_id) = state.member_brigades.get(director) else {
+        return Vec::new();
+    };
+    let Some(seq) = state.requests.remove(&brigade_id) else {
+        return Vec::new();
+    };
+    let answered = state.request_answered.entry(brigade_id).or_insert(seq);
+    *answered = (*answered).max(seq);
+    vec![Cmd::Store(StoreIntent::ClearRequest { brigade_id, seq })]
 }
 
 /// Forget what the relay read about a brigade's Goinkyo. Its token is reused by
@@ -4269,9 +4467,19 @@ fn update_brigade_quiet(
     state.seen_idle.retain(|id| running.contains(id));
 
     let mut fired: Vec<(BrigadeId, SessionKey)> = Vec::new();
+    let mut swallowed: Vec<BrigadeId> = Vec::new();
     state
         .brigade_quiet
         .retain(|id, _| hosted.get(id).is_some_and(|b| b.director.is_some()));
+    // What a request spent goes with the watch: with no Director pane hosted there
+    // is no quiet to swallow, and a spending left standing would eat the first quiet
+    // after a reopened Director's real work. A Director's process that ends is never
+    // relaunched (`relaunch_member`), so it is a reopen from the list that brings a
+    // new pane; a Worker's relaunch leaves the Director's pane hosted throughout
+    // and keeps the spending.
+    state
+        .request_spent
+        .retain(|id| hosted.get(id).is_some_and(|b| b.director.is_some()));
     for (brigade_id, brigade) in hosted {
         let Some(director) = brigade.director else {
             continue;
@@ -4293,6 +4501,7 @@ fn update_brigade_quiet(
             }
             continue;
         }
+        let spent = state.request_spent.contains(&brigade_id);
         let watch = state.brigade_quiet.entry(brigade_id).or_default();
         if watch.members != brigade.processes {
             // Not `active`: whether anyone was busy since the last ring says
@@ -4313,11 +4522,21 @@ fn update_brigade_quiet(
             let since = brigade
                 .last_prompted
                 .map_or(idle_since, |at| at.max(idle_since));
-            if watch.active && now.saturating_duration_since(since) >= BRIGADE_QUIET_SETTLE {
-                watch.active = false;
-                fired.push((brigade_id, director));
+            if now.saturating_duration_since(since) >= BRIGADE_QUIET_SETTLE {
+                if spent {
+                    // The quiet point a request spent: it passes in silence,
+                    // whether or not a fire was due, and is not spent again.
+                    watch.active = false;
+                    swallowed.push(brigade_id);
+                } else if watch.active {
+                    watch.active = false;
+                    fired.push((brigade_id, director));
+                }
             }
         }
+    }
+    for brigade_id in swallowed {
+        state.request_spent.remove(&brigade_id);
     }
     let mut cmds = Vec::new();
     for (brigade_id, director) in fired {
@@ -4402,6 +4621,30 @@ fn sync_reported_activity(state: &EmporiumState, app: &mut App) {
             .map(|key| key.as_str().to_string())
             .collect(),
     );
+}
+
+/// Tell the list which Directors' rows carry the request tag: those of every
+/// brigade with an open request, on stage or not, by the Director's session id as
+/// the roster named it, so a brigade nothing hosts yet (a restart, before it is
+/// staged) shows its tag too. The list is the overview of every brigade, so what
+/// a row says does not depend on which one is staged; the tag is neither a mark
+/// nor counted, so unlike them it is not left to the staged pane's own tile.
+/// Display only.
+fn sync_request_rows(state: &EmporiumState, app: &mut App) {
+    let rows: HashSet<String> = state
+        .requests
+        .keys()
+        .filter_map(|brigade_id| {
+            state
+                .brigade_names
+                .get(brigade_id)
+                .and_then(|facts| facts.director_session.clone())
+                .or_else(|| {
+                    director_pane_of(state, *brigade_id).map(|key| key.as_str().to_string())
+                })
+        })
+        .collect();
+    app.set_request_rows(rows);
 }
 
 /// Mark the Directors' rows of the brigades that want the operator, and ring for
@@ -5018,12 +5261,15 @@ fn update_key(
                 let bytes = key_to_bytes(&key);
                 state.last_forwarded_input.insert(target.clone(), now);
                 state.last_given_input.insert(target.clone(), now);
+                operator_gave_work(state, &target);
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
                     state.note_forwarded_input(&target, ForwardedInput::Key(&key));
                     cancel_pending_submit_on_input(&mut state.pending_submits, &target);
-                    vec![Cmd::WritePty { key: target, bytes }]
+                    let mut cmds = answer_request_on_enter(state, &target, &key);
+                    cmds.insert(0, Cmd::WritePty { key: target, bytes });
+                    cmds
                 }
             } else {
                 Vec::new()
@@ -5143,6 +5389,7 @@ fn resolve_armed_prefix(
             let bytes = key_to_bytes(&literal);
             state.last_forwarded_input.insert(target.clone(), now);
             state.last_given_input.insert(target.clone(), now);
+            operator_gave_work(state, &target);
             if bytes.is_empty() {
                 Vec::new()
             } else {
@@ -7321,6 +7568,7 @@ fn update_paste(state: &mut EmporiumState, app: &mut App, text: String, now: Ins
         };
         state.last_forwarded_input.insert(key.clone(), now);
         state.last_given_input.insert(key.clone(), now);
+        operator_gave_work(state, &key);
         state.note_forwarded_input(&key, ForwardedInput::Paste(&text));
         cancel_pending_submit_on_input(&mut state.pending_submits, &key);
         return vec![Cmd::WritePty { key, bytes }];
@@ -8313,8 +8561,14 @@ fn update_brigade_formed(
             name: name.clone(),
             director_session: Some(director_row_id.clone()),
             member_names: Vec::new(),
+            request: None,
         },
     );
+    // A brigade formed in this run had no request when it was formed, so one that
+    // is stored before the first tick that visits it is a new request, not one a
+    // previous run left: only what already stood when this run first saw a brigade
+    // is silent ([`apply_request_fact`]).
+    state.request_seen.insert(brigade_id, 0);
     let wiring = PendingDirectorWiring {
         director_row_id,
         brigade_id,
@@ -8534,6 +8788,10 @@ fn update_disbanded(
             // any more, so it would be inert anyway).
             state.brigade_quiet.remove(&brigade_id);
             state.attention.remove(&brigade_id);
+            state.requests.remove(&brigade_id);
+            state.request_seen.remove(&brigade_id);
+            state.request_answered.remove(&brigade_id);
+            state.request_spent.remove(&brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
             other_keys
                 .into_iter()
@@ -8741,7 +8999,10 @@ fn update_tick(
         // (first joiner keeps a duplicated name). Nothing is written back.
         let names = std::mem::take(&mut facts.member_names);
         state.replace_member_names(facts.brigade_id, names);
-        state.brigade_names.insert(facts.brigade_id, facts);
+        let request = facts.request.take();
+        let brigade_id = facts.brigade_id;
+        state.brigade_names.insert(brigade_id, facts);
+        cmds.extend(apply_request_fact(state, brigade, brigade_id, request, now));
     }
 
     // What each observed member's collapsed tile shows. A member the shell did
@@ -18708,6 +18969,7 @@ mod tests {
             name: name.to_string(),
             director_session: director.map(str::to_string),
             member_names: Vec::new(),
+            request: None,
         }
     }
 

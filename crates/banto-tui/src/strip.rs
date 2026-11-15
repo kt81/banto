@@ -38,6 +38,10 @@ pub struct StripData {
     pub inbound: Option<StripMessage>,
     /// The newest message the member sent (second body row).
     pub sent: Option<StripMessage>,
+    /// The Director's brigade has an open request for the operator's decision:
+    /// the fixed tag ([`REQUEST_TAG`]) is drawn on the title row after the status
+    /// ([`title_request_parts`]). Only a Director's tile has one.
+    pub request: bool,
 }
 
 /// One message as a strip row shows it: when, and its first line (already
@@ -169,8 +173,8 @@ const STATUS_STEPS: [(bool, AgeForm); 4] = [
 
 /// The status a tile's title row carries after its label, for every tile,
 /// collapsed or not: agent label, activity word, output age, in the list's own
-/// words and colours (busy, waiting, idle), from the same [`StripData`] — so one decision, drawn in
-/// one place, whatever the tile's state.
+/// words and colours (busy, waiting, idle), from the same [`StripData`] — so one
+/// decision, drawn in one place, whatever the tile's state.
 ///
 /// Shed in [`STATUS_STEPS`] order as `room` cells run out: the agent label, then
 /// the age's long form for its short one (`word · 2m`), then the age, and last
@@ -178,6 +182,18 @@ const STATUS_STEPS: [(bool, AgeForm); 4] = [
 /// left the same way (`Agent · output 2m ago`, `output 2m ago`, `output 2m`),
 /// and nothing once not even that fits.
 pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)> {
+    status_ladder(data)
+        .into_iter()
+        .find(|parts| parts_width(parts) <= room)
+        .unwrap_or_default()
+}
+
+/// Every step of the title status, widest first, each as its coloured parts with
+/// the separators in place ([`STATUS_STEPS`] says what each keeps). A step that
+/// keeps nothing is not there. The one place the steps are built, so the status
+/// alone ([`title_status_parts`]) and the status beside a request
+/// ([`title_request_parts`]) shed the same way.
+fn status_ladder(data: &StripData) -> Vec<Vec<(String, Color)>> {
     let agent: Part = data
         .agent
         .map(|agent| (agent.label().to_string(), agent_label_color(agent)));
@@ -187,6 +203,7 @@ pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)>
             activity_color(activity),
         )
     });
+    let mut ladder = Vec::new();
     for (with_agent, form) in STATUS_STEPS {
         let age: Part = match form {
             AgeForm::Long => Some((
@@ -215,11 +232,6 @@ pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)>
         if kept.is_empty() {
             continue;
         }
-        let width: usize = kept.iter().map(|part| part.0.width()).sum::<usize>()
-            + SEPARATOR.width() * (kept.len() - 1);
-        if width > room {
-            continue;
-        }
         let mut parts = Vec::new();
         for (index, (text, color)) in kept.into_iter().enumerate() {
             if index > 0 {
@@ -227,9 +239,45 @@ pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)>
             }
             parts.push((text.clone(), *color));
         }
-        return parts;
+        ladder.push(parts);
     }
-    Vec::new()
+    ladder
+}
+
+fn parts_width(parts: &[(String, Color)]) -> usize {
+    parts.iter().map(|(text, _)| text.width()).sum()
+}
+
+/// The fixed tag a Director's tile and list row carry while its brigade waits on
+/// the operator's decision. A constant: no agent-written text reaches the screen
+/// (the question is in the Director's own pane), so it is the same on every row,
+/// is never cut and has no ellipsis.
+pub const REQUEST_TAG: &str = "\u{25b8} decision";
+
+/// The title row's status with the request tag after it: `Claude · busy · output
+/// 2m ago · ▸ decision`. The tag is whole or absent. As the room shrinks the status
+/// sheds as it always does (the agent, then the age's steps) with the tag kept,
+/// then the word with the tag (`busy · ▸ decision`), then the tag alone; and when
+/// the tag itself does not fit the status is drawn as if there were no request, so
+/// the word is not lost to a tag that cannot be drawn. The tag is in the waiting
+/// colour. With no request this is [`title_status_parts`].
+pub fn title_request_parts(data: &StripData, room: usize) -> Vec<(String, Color)> {
+    if !data.request {
+        return title_status_parts(data, room);
+    }
+    let tag = (REQUEST_TAG.to_string(), activity_color(Activity::Waiting));
+    let tag_width = REQUEST_TAG.width();
+    for mut status in status_ladder(data) {
+        if parts_width(&status) + SEPARATOR.width() + tag_width <= room {
+            status.push((SEPARATOR.to_string(), Color::DarkGray));
+            status.push(tag);
+            return status;
+        }
+    }
+    if tag_width <= room {
+        return vec![tag];
+    }
+    title_status_parts(data, room)
 }
 
 /// Draw [`title_status_parts`] on row `y` into the cells `from..to` (a free
@@ -244,7 +292,7 @@ pub fn render_title_status(
     data: &StripData,
 ) -> u16 {
     let room = usize::from(to.saturating_sub(from)).saturating_sub(2);
-    let parts = title_status_parts(data, room);
+    let parts = title_request_parts(data, room);
     if parts.is_empty() {
         return 0;
     }
@@ -500,6 +548,107 @@ mod tests {
         let data = pane(AgentKind::ClaudeCode, Activity::Busy, 3);
         assert_eq!(texts(&title_status_parts(&data, 10)), "busy \u{b7} now");
         assert_eq!(texts(&title_status_parts(&data, 7)), "busy");
+    }
+
+    // --- a Director's request tag on its title row -------------------------------
+
+    fn director(request: bool) -> StripData {
+        StripData {
+            agent: Some(AgentKind::ClaudeCode),
+            activity: Some(Activity::Busy),
+            output_age: Some(Duration::from_secs(125)),
+            request,
+            ..StripData::default()
+        }
+    }
+
+    #[test]
+    fn without_a_request_the_title_status_is_what_it_always_was() {
+        for room in [60, 30, 20, 9, 4, 3] {
+            assert_eq!(
+                title_status_parts(&director(false), room),
+                title_request_parts(&director(false), room),
+                "{room}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tag_is_a_fixed_word_and_the_status_sheds_around_it_in_the_order_it_always_did() {
+        assert_eq!(REQUEST_TAG, "\u{25b8} decision");
+        let data = director(true);
+        let at = |room| texts(&title_request_parts(&data, room));
+        // The whole status, then the tag.
+        assert_eq!(
+            at(80),
+            "Claude \u{b7} busy \u{b7} output 2m ago \u{b7} \u{25b8} decision"
+        );
+        // The agent goes, then the age shortens, then it goes, with the tag kept ...
+        assert_eq!(at(41), "busy \u{b7} output 2m ago \u{b7} \u{25b8} decision");
+        assert_eq!(at(32), "busy \u{b7} 2m \u{b7} \u{25b8} decision");
+        assert_eq!(at(21), "busy \u{b7} \u{25b8} decision");
+        // ... then the word goes and the tag stands alone ...
+        assert_eq!(at(16), "\u{25b8} decision");
+        assert_eq!(at(10), "\u{25b8} decision");
+        // ... and when the tag does not fit the status is drawn as if there were no
+        // request, so the word is not lost to a tag that cannot be drawn.
+        assert_eq!(at(9), texts(&title_status_parts(&data, 9)));
+        assert_eq!(at(9), "busy \u{b7} 2m");
+        assert_eq!(at(4), "busy");
+        assert_eq!(at(3), "");
+    }
+
+    #[test]
+    fn the_tag_is_never_cut_and_never_has_an_ellipsis_at_any_width() {
+        let data = director(true);
+        for room in 0..120 {
+            let drawn = texts(&title_request_parts(&data, room));
+            assert!(drawn.width() <= room, "room {room}: {drawn:?}");
+            assert!(!drawn.contains('\u{2026}'), "room {room}: {drawn:?}");
+            // Whole or absent: never a piece of it.
+            let marker = drawn.contains('\u{25b8}');
+            assert_eq!(
+                marker,
+                drawn.contains(REQUEST_TAG),
+                "room {room}: {drawn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tag_is_in_the_waiting_colour_and_a_pane_with_no_word_still_shows_it() {
+        let parts = title_request_parts(&director(true), 60);
+        let tag = parts.iter().find(|(text, _)| text == REQUEST_TAG).unwrap();
+        assert_eq!(tag.1, activity_color(Activity::Waiting));
+        let no_word = StripData {
+            activity: None,
+            ..director(true)
+        };
+        assert!(texts(&title_request_parts(&no_word, 60)).ends_with(REQUEST_TAG));
+    }
+
+    #[test]
+    fn a_collapsed_tile_body_never_carries_a_request_it_is_the_titles() {
+        // The tag is on the title row, which a collapsed tile draws the same way, so
+        // the body keeps its messages whatever the Director's brigade is waiting on.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let message = |text: &str| StripMessage {
+            at: now,
+            text: text.to_string(),
+        };
+        let mut data = director(true);
+        data.inbound = Some(message("run the tests"));
+        data.sent = Some(message("done, see the diff"));
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buffer = Buffer::empty(area);
+        render_strip(&mut buffer, area, &data, now);
+        let row = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(row(0).contains("run the tests"), "{:?}", row(0));
+        assert!(!row(0).contains('\u{25b8}') && !row(1).contains('\u{25b8}'));
     }
 
     #[test]

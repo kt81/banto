@@ -203,6 +203,7 @@ impl Scene {
             name: "cell".to_string(),
             director_session: Some("dir".to_string()),
             member_names: self.names_of(brigade_id),
+            request: None,
         };
         self.feed(Event::Tick {
             relay,

@@ -34,6 +34,12 @@ use banto_core::model::{
 
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 
+/// What `brigades.request_text` holds while a Director's request is open. A
+/// constant: the request is the fact that the brigade is waiting on the operator's
+/// decision, never anything an agent wrote (the question is in the Director's own
+/// pane).
+pub const REQUEST_OPEN: &str = "open";
+
 impl Store {
     pub fn create_brigade(&self, name: &str) -> Result<BrigadeId, StoreError> {
         self.conn.execute(
@@ -56,6 +62,88 @@ impl Store {
         tx.execute("DELETE FROM brigades WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Records that a Director is waiting on the operator's decision. Only that
+    /// fact is stored, never anything the Director wrote: `request_text` holds the
+    /// constant [`REQUEST_OPEN`] while a request is open and is NULL when none is,
+    /// `request_seq` counts requests (so a second call is a new request even though
+    /// nothing in the row differs) and `request_at_ms` stamps the time. One
+    /// `BEGIN IMMEDIATE` transaction, so two writers get two numbers. Returns the
+    /// new sequence, `None` when there is no such brigade or `director_token` is
+    /// not, in that same transaction, the brigade's Director: the caller checked
+    /// its role a moment before, and a membership that has changed since (the
+    /// brigade disbanded, the member removed) is not written as. Lives on the
+    /// brigade's own row, so disbanding takes it with it.
+    pub fn set_request(
+        &mut self,
+        brigade_id: BrigadeId,
+        director_token: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let is_director: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM brigade_members \
+             WHERE brigade_id = ?1 AND member_token = ?2 AND role = ?3)",
+            params![brigade_id, director_token, BrigadeRole::Director.as_token()],
+            |row| row.get(0),
+        )?;
+        if !is_director {
+            return Ok(None);
+        }
+        // CAST: whatever a hand-edited column holds reads as an integer.
+        let changed = tx.execute(
+            "UPDATE brigades SET request_text = ?2, \
+             request_seq = CAST(request_seq AS INTEGER) + 1, request_at_ms = ?3 \
+             WHERE id = ?1",
+            params![
+                brigade_id,
+                REQUEST_OPEN,
+                system_time_to_unix_ms(SystemTime::now())
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let seq: i64 = tx.query_row(
+            "SELECT CAST(request_seq AS INTEGER) FROM brigades WHERE id = ?1",
+            [brigade_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some(seq))
+    }
+
+    /// Clears the brigade's request when, and only when, it is still the one
+    /// numbered `seq`: an answer to an older request never wipes a newer one.
+    /// The sequence stays, so the next request is still a new number. `true`
+    /// when a request was cleared.
+    pub fn clear_request(&mut self, brigade_id: BrigadeId, seq: i64) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE brigades SET request_text = NULL \
+             WHERE id = ?1 AND CAST(request_seq AS INTEGER) = ?2 AND request_text IS NOT NULL",
+            params![brigade_id, seq],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// The sequence of the brigade's open request; `None` when there is none (or
+    /// no such brigade). Open means `request_text` is not NULL, whatever it holds:
+    /// the value is never read, so a hand edit (bytes that are not text, a number)
+    /// cannot fail the read, which would drop the whole brigade from the tick's
+    /// facts every tick.
+    pub fn brigade_request(&self, brigade_id: BrigadeId) -> Result<Option<i64>, StoreError> {
+        let row: Option<(bool, i64)> = self
+            .conn
+            .query_row(
+                "SELECT request_text IS NOT NULL, CAST(request_seq AS INTEGER) \
+                 FROM brigades WHERE id = ?1",
+                [brigade_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(open, seq)| open.then_some(seq)))
     }
 
     /// Returns all brigades, oldest first (creation order).
@@ -1191,6 +1279,149 @@ mod tests {
             Some(_) => store.name_member(br, token, name).unwrap(),
             None => MemberNaming::NoSuchMember,
         }
+    }
+
+    // --- a Director's open request -------------------------------------------
+
+    /// A brigade with its Director, the member a request is written as.
+    fn briefed(store: &mut Store) -> BrigadeId {
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+        br
+    }
+
+    fn held(store: &Store, br: BrigadeId) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT CAST(request_text AS TEXT) FROM brigades WHERE id = ?1",
+                [br],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_request_is_the_fact_that_the_director_waits_and_is_stored_as_a_constant() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        assert_eq!(store.brigade_request(br).unwrap(), None);
+        assert_eq!(held(&store, br), None);
+        assert_eq!(store.set_request(br, "director").unwrap(), Some(1));
+        assert_eq!(store.brigade_request(br).unwrap(), Some(1));
+        // Never anything a caller wrote: the one value there is.
+        assert_eq!(held(&store, br).as_deref(), Some(REQUEST_OPEN));
+        // A second call is a new request: the sequence is what says so.
+        assert_eq!(store.set_request(br, "director").unwrap(), Some(2));
+        assert_eq!(store.brigade_request(br).unwrap(), Some(2));
+        assert_eq!(held(&store, br).as_deref(), Some(REQUEST_OPEN));
+        let at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT request_at_ms FROM brigades WHERE id = ?1",
+                [br],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(at.is_some_and(|ms| ms > 0), "the time is recorded: {at:?}");
+        // No brigade, no request.
+        assert_eq!(store.set_request(br + 100, "director").unwrap(), None);
+    }
+
+    #[test]
+    fn a_request_is_written_only_by_the_brigades_current_director() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        let worker = store.add_worker(br, None).unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, None)
+            .unwrap();
+        // The tool checked the role a moment ago; the write checks it again, in its
+        // own transaction, so a membership that has changed since is not written as.
+        assert_eq!(store.set_request(br, &worker).unwrap(), None);
+        assert_eq!(store.set_request(br, "goinkyo").unwrap(), None);
+        assert_eq!(store.brigade_request(br).unwrap(), None);
+        assert_eq!(store.set_request(br, "director").unwrap(), Some(1));
+        // The Director leaves the brigade between the check and the write.
+        store
+            .conn
+            .execute(
+                "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = 'director'",
+                [br],
+            )
+            .unwrap();
+        assert_eq!(store.set_request(br, "director").unwrap(), None);
+        assert_eq!(
+            store.brigade_request(br).unwrap(),
+            Some(1),
+            "nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_request_is_cleared_only_by_the_sequence_that_was_answered() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        store.set_request(br, "director").unwrap();
+        store.set_request(br, "director").unwrap();
+        // The answer was to the first: a newer request is never wiped by it.
+        assert!(!store.clear_request(br, 1).unwrap());
+        assert_eq!(store.brigade_request(br).unwrap(), Some(2));
+        assert!(store.clear_request(br, 2).unwrap());
+        assert_eq!(store.brigade_request(br).unwrap(), None);
+        // Clearing twice is harmless, and the next request still has a new number.
+        assert!(!store.clear_request(br, 2).unwrap());
+        assert_eq!(store.set_request(br, "director").unwrap(), Some(3));
+    }
+
+    #[test]
+    fn a_disbanded_brigade_takes_its_request_with_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        store.set_request(br, "director").unwrap();
+        store.delete_brigade(br).unwrap();
+        assert_eq!(store.brigade_request(br).unwrap(), None);
+        // A new brigade has its own, from the start.
+        let other = briefed(&mut store);
+        assert_eq!(store.set_request(other, "director").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn a_hand_edited_request_still_reads_and_counts_on() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = briefed(&mut store);
+        // A sequence that is a real number: open, whatever the text holds.
+        store
+            .conn
+            .execute(
+                "UPDATE brigades SET request_text = 42, request_seq = 7.5 WHERE id = ?1",
+                [br],
+            )
+            .unwrap();
+        assert_eq!(store.brigade_request(br).unwrap(), Some(7));
+        assert_eq!(store.set_request(br, "director").unwrap(), Some(8));
+        // Bytes that are not valid text in the column: the value is never read, so
+        // it cannot fail the read (which would drop the brigade from every tick).
+        store
+            .conn
+            .execute(
+                "UPDATE brigades SET request_text = X'46FF4F4F', request_seq = 4 WHERE id = ?1",
+                [br],
+            )
+            .unwrap();
+        assert_eq!(store.brigade_request(br).unwrap(), Some(4));
+        assert!(store.brigade_members(br).is_ok());
+        // NULL is no request, whatever the sequence says.
+        store
+            .conn
+            .execute(
+                "UPDATE brigades SET request_text = NULL WHERE id = ?1",
+                [br],
+            )
+            .unwrap();
+        assert_eq!(store.brigade_request(br).unwrap(), None);
     }
 
     #[test]
