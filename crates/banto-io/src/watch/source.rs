@@ -1,7 +1,7 @@
 //! The real filesystem watcher, isolated behind [`ChangeSource`] so callers
 //! (and their tests) depend on the trait rather than on `notify` directly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
@@ -68,39 +68,29 @@ impl NotifyChangeSource {
         claude_home: &ClaudeHome,
         codex_home: Option<&CodexHome>,
     ) -> Result<Self, WatchError> {
-        let projects_dir = claude_home.projects_dir();
-        let sessions_dir = claude_home.sessions_dir();
-        let codex_sessions_dir = codex_home.map(CodexHome::rollout_dir);
+        let roots = WatchRoots::new(claude_home, codex_home);
         let (tx, rx) = mpsc::channel();
-
-        let watch_projects_dir = projects_dir.clone();
-        let watch_sessions_dir = sessions_dir.clone();
-        let watch_codex_sessions_dir = codex_sessions_dir.clone();
+        let watch_roots = roots.clone();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             let Ok(event) = res else { return };
             let now = SystemTime::now();
-            for root in classify(
-                &event,
-                &watch_projects_dir,
-                &watch_sessions_dir,
-                watch_codex_sessions_dir.as_deref(),
-            ) {
+            for root in classify_paths(&event.paths, &watch_roots) {
                 // A send error means the receiving end was dropped (the
                 // source is going away); nothing to do about it here.
                 let _ = tx.send(RawChange { root, at: now });
             }
         })?;
 
-        if projects_dir.is_dir() {
-            watcher.watch(&projects_dir, RecursiveMode::Recursive)?;
+        if roots.projects.given.is_dir() {
+            watcher.watch(&roots.projects.given, RecursiveMode::Recursive)?;
         }
-        if sessions_dir.is_dir() {
-            watcher.watch(&sessions_dir, RecursiveMode::NonRecursive)?;
+        if roots.sessions.given.is_dir() {
+            watcher.watch(&roots.sessions.given, RecursiveMode::NonRecursive)?;
         }
-        if let Some(dir) = &codex_sessions_dir
-            && dir.is_dir()
+        if let Some(root) = &roots.codex_sessions
+            && root.given.is_dir()
         {
-            watcher.watch(dir, RecursiveMode::Recursive)?;
+            watcher.watch(&root.given, RecursiveMode::Recursive)?;
         }
 
         Ok(Self {
@@ -116,21 +106,58 @@ impl ChangeSource for NotifyChangeSource {
     }
 }
 
-/// Which watched roots `event`'s paths fall under (usually zero or one, but
-/// an event can name multiple paths, e.g. a rename).
-fn classify(
-    event: &Event,
-    projects_dir: &Path,
-    sessions_dir: &Path,
-    codex_sessions_dir: Option<&Path>,
-) -> Vec<WatchRoot> {
+#[derive(Clone)]
+struct WatchedRoot {
+    given: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl WatchedRoot {
+    fn new(given: PathBuf) -> Self {
+        let canonical = given.canonicalize().ok();
+        Self { given, canonical }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.given)
+            || self
+                .canonical
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+    }
+}
+
+#[derive(Clone)]
+struct WatchRoots {
+    projects: WatchedRoot,
+    sessions: WatchedRoot,
+    codex_sessions: Option<WatchedRoot>,
+}
+
+impl WatchRoots {
+    fn new(claude_home: &ClaudeHome, codex_home: Option<&CodexHome>) -> Self {
+        Self {
+            projects: WatchedRoot::new(claude_home.projects_dir()),
+            sessions: WatchedRoot::new(claude_home.sessions_dir()),
+            codex_sessions: codex_home.map(|home| WatchedRoot::new(home.rollout_dir())),
+        }
+    }
+}
+
+// FSEvents reports canonical paths; Windows can report the original spelling
+// even though canonicalize adds a verbatim prefix there, so both must match.
+fn classify_paths(paths: &[PathBuf], watched: &WatchRoots) -> Vec<WatchRoot> {
     let mut roots = Vec::new();
-    for path in &event.paths {
-        let root = if path.starts_with(projects_dir) {
+    for path in paths {
+        let root = if watched.projects.contains(path) {
             WatchRoot::Projects
-        } else if path.starts_with(sessions_dir) {
+        } else if watched.sessions.contains(path) {
             WatchRoot::Sessions
-        } else if codex_sessions_dir.is_some_and(|dir| path.starts_with(dir)) {
+        } else if watched
+            .codex_sessions
+            .as_ref()
+            .is_some_and(|root| root.contains(path))
+        {
             WatchRoot::CodexSessions
         } else {
             continue;
@@ -147,6 +174,93 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{Duration, Instant};
+
+    fn synthetic_roots() -> WatchRoots {
+        WatchRoots {
+            projects: WatchedRoot {
+                given: "given/projects".into(),
+                canonical: Some("canonical/projects".into()),
+            },
+            sessions: WatchedRoot {
+                given: "given/sessions".into(),
+                canonical: Some("canonical/sessions".into()),
+            },
+            codex_sessions: Some(WatchedRoot {
+                given: "given/codex".into(),
+                canonical: Some("canonical/codex".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn classifies_given_and_canonical_root_spellings() {
+        let roots = synthetic_roots();
+        for (path, expected) in [
+            ("given/projects/a", WatchRoot::Projects),
+            ("canonical/projects/a", WatchRoot::Projects),
+            ("given/sessions/a", WatchRoot::Sessions),
+            ("canonical/sessions/a", WatchRoot::Sessions),
+            ("given/codex/a", WatchRoot::CodexSessions),
+            ("canonical/codex/a", WatchRoot::CodexSessions),
+        ] {
+            assert_eq!(classify_paths(&[path.into()], &roots), vec![expected]);
+        }
+        assert!(classify_paths(&["unrelated/a".into()], &roots).is_empty());
+        assert!(classify_paths(&["given/projects-other/a".into()], &roots).is_empty());
+    }
+
+    #[test]
+    fn missing_root_keeps_its_given_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let root = WatchedRoot::new(missing.clone());
+        assert!(root.canonical.is_none());
+        assert!(root.contains(&missing.join("file")));
+    }
+
+    #[test]
+    fn overlapping_roots_keep_existing_priority_and_deduplicate() {
+        let mut roots = synthetic_roots();
+        roots.sessions.given = "given/projects/nested".into();
+        roots.codex_sessions.as_mut().unwrap().canonical = Some("canonical/sessions/nested".into());
+        assert_eq!(
+            classify_paths(
+                &["given/projects/nested/a".into(), "given/projects/b".into()],
+                &roots
+            ),
+            vec![WatchRoot::Projects]
+        );
+        assert_eq!(
+            classify_paths(&["canonical/sessions/nested/a".into()], &roots),
+            vec![WatchRoot::Sessions]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_symlink_root_accepts_event_under_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir_all(target.join("projects")).unwrap();
+        let link = temp.path().join("link");
+        symlink(&target, &link).unwrap();
+        let home = ClaudeHome::new(link.clone());
+        let _source = NotifyChangeSource::new(&home, None).unwrap();
+        let roots = WatchRoots::new(&home, None);
+        let canonical_event = target
+            .join("projects/a")
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join("a");
+        assert_eq!(
+            classify_paths(&[canonical_event], &roots),
+            vec![WatchRoot::Projects]
+        );
+    }
 
     /// Poll `source` until it reports a change under `want`, or `timeout`
     /// elapses. Real filesystem watchers deliver events asynchronously, so
