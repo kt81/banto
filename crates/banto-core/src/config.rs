@@ -227,11 +227,12 @@ pub struct BrigadeConfig {
     /// See [`RelayMode`].
     pub relay: RelayMode,
     /// Role briefing appended to a Director's system prompt at launch
-    /// (`claude --append-system-prompt`).
+    /// (`claude --append-system-prompt`; a Codex Director gets it through the
+    /// `SessionStart` hook instead, `crates/banto/src/hook.rs`).
     ///
     /// Without one, a brigade exists only in banto's data model and UI: the
     /// operator sees a Director pane beside its Workers, while the Director
-    /// itself is handed three tool names and no notion that it leads a cell
+    /// itself is handed banto's tool names and no notion that it leads a cell
     /// — and, since the relay only wakes a member that *has* mail, a cell
     /// whose Director never sends the first message stays inert forever.
     /// This is the text that closes that gap, so it is deliberately a

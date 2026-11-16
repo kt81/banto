@@ -196,7 +196,7 @@ revisited — Codex brigades exist in production
 (`crates/banto/src/hook.rs`, `crates/banto-core/src/config.rs`'s
 `WorkerAgentSetting::Codex`). The first half of the predicted cost landed as
 guessed: the briefing does name banto's tools by hand
-(`crate::briefing::CODEX_ADDENDUM`). The second half didn't — no launch
+(`crate::briefing::codex_addendum`). The second half didn't — no launch
 carries an approval flag. `--dangerously-bypass-hook-trust` turned out to be
 scoped to hook trust alone but to apply to *every* hook in a launch's merged
 config, not just banto's, so passing it on every launch would silently trust

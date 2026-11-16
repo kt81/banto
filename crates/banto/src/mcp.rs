@@ -1509,8 +1509,9 @@ fn tool_request_decision(ctx: &mut ServerContext) -> Value {
     match ctx.store.set_request(brigade, &token) {
         Ok(Some(_)) => tool_text(
             "Recorded. banto now shows the operator that you are waiting for a decision, \
-             not the question: write the question in your pane. You are not blocked: carry \
-             on with whatever can proceed."
+             not the question: the question you wrote before this call is what they will \
+             read, so do not write it again. You are not blocked: carry on with whatever \
+             can proceed."
                 .to_string(),
             false,
         ),
@@ -1918,6 +1919,31 @@ mod tests {
     }
 
     #[test]
+    fn every_advertised_tool_is_named_in_the_codex_briefing_of_the_role_that_may_call_it() {
+        // Codex shows banto's tools only once called by name, so a tool missing from
+        // the briefing does not exist for a Codex member. The briefing's list was
+        // once written by hand and four Director tools added after it were never
+        // put in it.
+        let tools = tools_list_result();
+        for tool in tools["tools"].as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let director_only = tool["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Director only.");
+            let director = crate::briefing::with_codex_addendum("", BrigadeRole::Director);
+            let worker = crate::briefing::with_codex_addendum("", BrigadeRole::Worker);
+            let called = format!("`mcp__banto__{name}`");
+            assert!(director.contains(&called), "a Director must be told {name}");
+            assert_eq!(
+                worker.contains(&called),
+                !director_only,
+                "a Worker is told {name} exactly when it may call it"
+            );
+        }
+    }
+
+    #[test]
     fn send_to_peer_prices_the_wake_and_does_not_promise_it() {
         let mut ctx = ctx("s", None, None, None);
         let response = call(
@@ -1967,6 +1993,12 @@ mod tests {
         for word in ["bell", "notif", "alert", "ring", "sent"] {
             assert!(!text.contains(word), "{word}: {text:?}");
         }
+        // The answer arrives after the question was written, so it must not read as
+        // an instruction to write it: on 2026-11-16 one that said "write the
+        // question in your pane" had a Director restate its whole question after
+        // every call, and the operator noticed.
+        assert!(!text.contains("write the question"), "{text:?}");
+        assert!(text.contains("do not write it again"), "{text:?}");
         // A second call is a new request: the sequence says so.
         call(&mut ctx, &request_call());
         assert_eq!(stored_request(&ctx), Some(2));

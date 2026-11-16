@@ -12,40 +12,68 @@
 use banto_core::model::{BrigadeId, BrigadeRole};
 use banto_io::store::Store;
 
+/// banto's tools any member may call, by the names Codex dispatches them under.
+const CODEX_MEMBER_TOOLS: [&str; 3] = [
+    "mcp__banto__check_messages",
+    "mcp__banto__send_to_peer",
+    "mcp__banto__brigade_status",
+];
+
+/// The tools only a Director may call. A Worker is not told them: calling one
+/// would only get it a tool error. The list was once a fixed sentence naming the
+/// three above, and the four Director tools added after it never reached it, so a
+/// Codex Director had no name to call them by; a test in `crate::mcp` now checks
+/// every advertised tool against these two lists.
+const CODEX_DIRECTOR_TOOLS: [&str; 4] = [
+    "mcp__banto__request_decision",
+    "mcp__banto__name_member",
+    "mcp__banto__consult_goinkyo",
+    "mcp__banto__dismiss_goinkyo",
+];
+
 /// Facts a Codex member needs that a Claude one does not, appended to the
 /// operator's own template by [`with_codex_addendum`].
 ///
 /// Both are measured, not defensive (docs/notes/codex-briefing-spike.md).
-/// Codex defers MCP tools: banto's three are absent from the tool set the
-/// model is given, so a member that waits to be offered them waits forever —
-/// but a tool named outright is dispatched normally. And Codex's own
-/// developer prompt casts the model as the primary agent of *its* multi-agent
-/// feature, which a brigade briefing reads as license to spawn sub-agents for
-/// work the cell's own peers exist to do.
+/// Codex defers MCP tools: banto's are absent from the tool set the model is
+/// given, so a member that waits to be offered them waits forever — but a tool
+/// named outright is dispatched normally. And Codex's own developer prompt
+/// casts the model as the primary agent of *its* multi-agent feature, which a
+/// brigade briefing reads as license to spawn sub-agents for work the cell's
+/// own peers exist to do.
 ///
 /// Kept out of the operator's configurable template deliberately: the
 /// template is where they say what a role is *for*, and these are product
 /// facts they should not have to know or maintain.
-const CODEX_ADDENDUM: &str = "\
-banto's tools are not listed among your available tools — this product loads \
-MCP tools lazily. `mcp__banto__check_messages`, `mcp__banto__send_to_peer` \
-and `mcp__banto__brigade_status` work when called by those exact names, so \
-call them; do not conclude from their absence that you have no channel.
-
-The brigade is not this product's own multi-agent feature, and you are not \
-its primary agent. Do not spawn sub-agents for brigade work: work through \
-your brigade peers, via banto.";
+fn codex_addendum(role: BrigadeRole) -> String {
+    let mut tools = CODEX_MEMBER_TOOLS.to_vec();
+    if role == BrigadeRole::Director {
+        tools.extend(CODEX_DIRECTOR_TOOLS);
+    }
+    let named: Vec<String> = tools.iter().map(|tool| format!("`{tool}`")).collect();
+    let (last, rest) = named.split_last().expect("every role may call a tool");
+    format!(
+        "banto's tools are not listed among your available tools — this product loads \
+         MCP tools lazily. {} and {last} work when called by those exact names, so \
+         call them; do not conclude from their absence that you have no channel.\n\n\
+         The brigade is not this product's own multi-agent feature, and you are not \
+         its primary agent. Do not spawn sub-agents for brigade work: work through \
+         your brigade peers, via banto.",
+        rest.join(", ")
+    )
+}
 
 /// The member's briefing with the Codex-only facts appended.
 ///
 /// An empty template still yields the addendum: the operator clearing the
 /// template is them declining to give a *role*, not declining to tell the
 /// model how to reach its cell.
-pub(crate) fn with_codex_addendum(briefing: &str) -> String {
+pub(crate) fn with_codex_addendum(briefing: &str, role: BrigadeRole) -> String {
+    let addendum = codex_addendum(role);
     if briefing.is_empty() {
-        return CODEX_ADDENDUM.to_string();
+        return addendum;
     }
-    format!("{briefing}\n\n{CODEX_ADDENDUM}")
+    format!("{briefing}\n\n{addendum}")
 }
 
 /// The members this one can address, newest roster from the store — the
@@ -181,22 +209,52 @@ mod tests {
         );
     }
 
+    const MEMBER_TOOLS: [&str; 3] = [
+        "mcp__banto__check_messages",
+        "mcp__banto__send_to_peer",
+        "mcp__banto__brigade_status",
+    ];
+
+    const DIRECTOR_TOOLS: [&str; 4] = [
+        "mcp__banto__request_decision",
+        "mcp__banto__name_member",
+        "mcp__banto__consult_goinkyo",
+        "mcp__banto__dismiss_goinkyo",
+    ];
+
     #[test]
-    fn the_codex_addendum_names_every_tool_a_member_cannot_see() {
-        let out = with_codex_addendum("you are worker-1");
+    fn the_codex_addendum_names_every_tool_a_worker_cannot_see() {
+        let out = with_codex_addendum("you are worker-1", BrigadeRole::Worker);
         assert!(out.starts_with("you are worker-1\n\n"));
-        for tool in [
-            "mcp__banto__check_messages",
-            "mcp__banto__send_to_peer",
-            "mcp__banto__brigade_status",
-        ] {
+        for tool in MEMBER_TOOLS {
             assert!(out.contains(tool), "addendum must name {tool}");
         }
     }
 
     #[test]
+    fn a_codex_director_is_told_the_names_of_its_own_tools_too() {
+        let out = with_codex_addendum("you are the director", BrigadeRole::Director);
+        for tool in MEMBER_TOOLS.iter().chain(&DIRECTOR_TOOLS) {
+            assert!(out.contains(tool), "addendum must name {tool}");
+        }
+    }
+
+    #[test]
+    fn a_codex_worker_is_not_told_the_directors_tools() {
+        // A Worker that called one would only get a tool error.
+        let out = with_codex_addendum("you are worker-1", BrigadeRole::Worker);
+        for tool in DIRECTOR_TOOLS {
+            assert!(!out.contains(tool), "a Worker must not be offered {tool}");
+        }
+    }
+
+    #[test]
     fn clearing_the_template_still_leaves_the_member_a_channel() {
-        assert_eq!(with_codex_addendum(""), CODEX_ADDENDUM);
+        for role in [BrigadeRole::Director, BrigadeRole::Worker] {
+            let out = with_codex_addendum("", role);
+            assert!(out.starts_with("banto's tools"), "{out}");
+            assert!(out.contains("mcp__banto__send_to_peer"), "{out}");
+        }
     }
 
     #[test]

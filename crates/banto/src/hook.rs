@@ -100,7 +100,7 @@ fn build_briefing(
     // `None`: a Goinkyo is Claude-only, so this hook — Codex's own
     // SessionStart briefing path — never renders one.
     let rendered = crate::briefing::render(template, brigade_id, token, &peers, None);
-    Some(crate::briefing::with_codex_addendum(&rendered))
+    Some(crate::briefing::with_codex_addendum(&rendered, role))
 }
 
 /// Resolves banto's own config and database, always leniently — see the module
@@ -265,9 +265,10 @@ mod tests {
         let briefing = build_briefing(&identity, &config, Some(&store));
         assert_eq!(
             briefing,
-            Some(crate::briefing::with_codex_addendum(&format!(
-                "I am worker-1 in {brigade_id}, peers: director"
-            )))
+            Some(crate::briefing::with_codex_addendum(
+                &format!("I am worker-1 in {brigade_id}, peers: director"),
+                BrigadeRole::Worker,
+            ))
         );
     }
 
@@ -290,7 +291,10 @@ mod tests {
 
         assert_eq!(
             build_briefing(&identity, &config, Some(&store)),
-            Some(crate::briefing::with_codex_addendum(""))
+            Some(crate::briefing::with_codex_addendum(
+                "",
+                BrigadeRole::Worker
+            ))
         );
     }
 

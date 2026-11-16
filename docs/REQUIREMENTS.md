@@ -2527,11 +2527,16 @@ how the rendered text reaches the member differs by product:
   `BANTO_ROLE` in the environment, which the hook process inherits.
   `banto _hook` (`crates/banto/src/hook.rs`) renders the same template
   (`crates/banto/src/briefing.rs`) and returns it as the turn's
-  `additionalContext`, appending a fixed Codex-only addendum: banto's own
+  `additionalContext`, appending a Codex-only addendum: banto's own
   MCP tools are deferred from Codex's own tool list until called by name,
   and Codex's own developer prompt otherwise casts the model as the primary
   agent of a different, unrelated multi-agent feature — measured end to end
-  in `docs/notes/codex-briefing-spike.md`.
+  in `docs/notes/codex-briefing-spike.md`. So the addendum names every tool
+  the member's role may call: the three any member has, and to a Director
+  only, its own four (`request_decision`, `name_member`, `consult_goinkyo`,
+  `dismiss_goinkyo`). Until 2026-11-16 it named only the three, so a Codex
+  Director was never told the four; a test checks every advertised tool
+  against the two lists.
 
 The shipped defaults tell a Director to delegate independent, parallelizable work to
 its Workers via `send_to_peer` and keep genuinely sequential work itself, that it
