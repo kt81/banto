@@ -10,9 +10,12 @@ last commit, this change's last commit]; the first change starts at --since.
 Writes in --out (default: a new directory under the system temp directory;
 refused inside a git working tree unless --force-out): report.txt (tables and
 definitions), candidates_a.txt (operator problem reports after a review PASS or a
-release build), candidates_b.txt (Director retractions), errands_dump.txt and
-changes.json. The candidate and dump files hold excerpts of real conversation:
-keep --out out of any repository.
+release build), candidates_b.txt (Director retractions; each candidate in both files
+has a stable id), errands_dump.txt and changes.json. report.txt also carries the effect
+metrics per change and a WINDOW SUMMARY at its end (caught by review, escaped review,
+Director reversals by trigger, lead time, parallelism, operator effort; see README.md);
+--judgments FILE turns candidate counts into judged counts. The candidate and dump files
+hold excerpts of real conversation: keep --out out of any repository.
 
 It reads banto brigade traffic (Director/Worker transcripts, relay headers); a
 transcript set without it yields no changes with errands. Classification of
@@ -24,9 +27,11 @@ Needs Python 3.9+, standard library only. Needs `git` on PATH for the commit log
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -86,21 +91,31 @@ BASE_HASH_RX = re.compile(r"HEAD (?:is |at |now |was )?(?:now )?([0-9a-f]{7})\b"
 # words (broken, behaves oddly, bug, not fixed, not working, does not appear,
 # vanished, wrong, glitch, error, failure, defect, problem, flicker, slow, heavy,
 # freeze, crash, ...) and English ones; NEG_RX removes "no problem"-style phrases first.
-PROB_RX = re.compile("|".join([
-    "おかしい", "変だ", "変に", "バグ", "直って", "直らな", "動かな", "動いて", "出ない", "出る", "出て", "消え", "落ち", "違う", "違って", "ずれ", "崩れ", "まだ", "ダメ", "だめ", "エラー", "失敗",
-    "壊れ", "不具合", "問題", "されない", "見えない", "ちらつ", "遅い", "重い", "固ま", "フリーズ", "クラッシュ", "鳴ら", "鳴って", "鳴る",
+# Two words were dropped after a person judged a first run's candidates: "vanished" (消え) and
+# "sound plays" (鳴ら) each matched several candidates judged not a problem and none judged real
+# or unsure. The other words stay: each of them matched a real or unsure candidate, matched at
+# most one 'not', or matched nothing in that run. One window and one judge: it is a first pass.
+PROB_WORDS = [
+    "おかしい", "変だ", "変に", "バグ", "直って", "直らな", "動かな", "動いて", "出ない", "出る", "出て", "落ち", "違う", "違って", "ずれ", "崩れ", "まだ", "ダメ", "だめ", "エラー", "失敗",
+    "壊れ", "不具合", "問題", "されない", "見えない", "ちらつ", "遅い", "重い", "固ま", "フリーズ", "クラッシュ", "鳴って", "鳴る",
     r"\bbug\b", r"\bbroken\b", r"\bwrong\b", r"\bstill\b", r"doesn'?t", r"does not", r"didn'?t", r"not working", r"\berror\b", r"\bfail", r"\bcrash", r"\bpanic",
-]), re.I)
+]
+PROB_RX = re.compile("|".join(PROB_WORDS), re.I)
 NEG_RX = re.compile(r"問題(?:は)?(?:ない|なし|ありません|なさそう)|no problem|not a problem|直って(?:いる|います|た)|動いて(?:いる|います)", re.I)
 # Candidate (b): a Director's retraction or correction phrase (English and Japanese:
 # correction, retraction, cancel, mistake, error, misunderstanding, earlier statement, sorry, excuse me).
-RETRACT_RX = re.compile("|".join([
+# Two phrases were dropped after a person judged a first run's candidates: "cancel" (取り消) and
+# "ignore my/the previous|earlier|last|broadcast" each were the only match of several candidates
+# (eleven and six) and every one was judged not a reversal. 誤り ("error") matched mostly 'not' but
+# also eight real ones, so it stays; phrases with one or two matches either way are left alone.
+RETRACT_PHRASES = [
     r"\bI was wrong\b", r"\bmy (?:mistake|slip|error|bad)\b", r"\bI (?:mis-?read|mis-?stated|misspoke|got (?:that|it|this) wrong)\b", r"\bretract", r"\bcorrection\b", r"\bscratch that\b",
-    r"\bdisregard\b", r"\bignore (?:my|the) (?:previous|earlier|last|broadcast)", r"\bthat (?:was|is) wrong\b", r"\bI (?:had|have) it backwards\b", r"\bI reverse", r"\breversing\b",
+    r"\bdisregard\b", r"\bthat (?:was|is) wrong\b", r"\bI (?:had|have) it backwards\b", r"\bI reverse", r"\breversing\b",
     r"\bwithdraw", r"\bnever ?mind\b", r"\bon second thought\b", r"\bapolog", r"\bmy earlier\b.{0,60}\b(?:wrong|false|incorrect)", r"\bI (?:said|told|wrote)\b.{0,80}\b(?:wrong|false|incorrect|not true)\b",
     r"\bit was false\b", r"\bnot true\b",
-    "訂正", "撤回", "取り消", "間違", "誤り", "勘違い", "前言", "申し訳", "失礼",
-]), re.I)
+    "訂正", "撤回", "間違", "誤り", "勘違い", "前言", "申し訳", "失礼",
+]
+RETRACT_RX = re.compile("|".join(RETRACT_PHRASES), re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -167,28 +182,47 @@ def change_of(changes, since, ts):
 
 def window_events(s, lo, hi):
     """Ordered events of one detailed session within [lo, hi): sends, deliveries,
-    operator messages, assistant text, release builds. Shapes:
+    operator messages, assistant text, release builds, and the inputs that are not
+    the operator's. Shapes:
     ('atext', ts, text) ('send', ts, to, text) ('release', ts, cmd)
-    ('deliver', ts, parts) ('operator', ts, text)."""
+    ('deliver', ts, parts) ('operator', ts, text) ('nudge', ts) ('system', ts)
+    ('result', ts) ('decision', ts). An atext, send or operator event carries one more element,
+    the name of its transcript record (see event_key), when the record had a uuid.
+
+    An operator message is a user record the operator typed: not a tool result, not
+    a relay nudge (those carry origin "human" too, so the prefix is what tells them
+    apart), not a record the harness or banto inserted (a `<tag>` wrapper, a
+    `[banto ...]` line typed into a pane, a task notification or channel message).
+    Meta, compaction-summary and transcript-only records never reach here: the reader drops them.
+    'system' is every other user record, 'result' a tool result that carried no
+    delivery, 'decision' a request_decision call."""
     out = []
-    for ev in s.events:
+    keys = getattr(s, "keys", {})
+    for index, ev in enumerate(s.events):
         kind = ev[0]
         ts = ev[1] if len(ev) > 1 else None
         if kind == "call" or kind == "compact" or ts is None or ts < lo or (hi is not None and ts >= hi):
             continue
+        key = (keys[index],) if index in keys else ()
         if kind == "atext":
-            out.append(("atext", ts, ev[2]))
+            out.append(("atext", ts, ev[2]) + key)
         elif kind == "send":
-            out.append(("send", ts, ev[2], ev[3]))
+            out.append(("send", ts, ev[2], ev[3]) + key)
         elif kind == "release":
             out.append(("release", ts, ev[2]))
         elif kind == "deliver":
             if ev[3] is not None:
                 out.append(("deliver", ts, ev[3]))
+        elif kind in ("result", "decision"):
+            out.append((kind, ts))
         elif kind == "user":
-            _, _, text, _is_nudge, is_human, _is_tag, origin = ev
-            if is_human and origin in (None, "human"):
-                out.append(("operator", ts, text))
+            _, _, text, is_nudge, is_human, _is_tag, origin = ev
+            if is_nudge:
+                out.append(("nudge", ts))
+            elif is_human and origin in (None, "human") and not text.lstrip().startswith("[banto"):
+                out.append(("operator", ts, text) + key)
+            else:
+                out.append(("system", ts))
     out.sort(key=lambda e: e[1])
     return out
 
@@ -392,9 +426,37 @@ def aggregate(changes, an, commits, sessions, label_of):
     return counted
 
 
-def find_candidates(changes, since, director_events, release_triggers, horizon_h):
+def candidate_id(session_id, ts, kind, n=0, key=None):
+    """A stable name for one candidate: the same inputs name it the same on every run, so a hand
+    judgment written against one run still applies to the next. `kind` is "a", "b-text" or "b-send".
+    With `key`, the name of the transcript record the candidate came from (its uuid, plus the
+    block index or the tool_use id inside the record), the id depends on nothing else: not the
+    timestamp, not any other record. That is stable because Claude Code appends transcript records
+    and never rewrites them; a rewritten record could move an id keyed by block index. Without a
+    key, `n` is the position among the same-kind records sharing the timestamp, counted over every
+    such record whether or not a word list matched it; that id moves when a record is added or
+    removed at that timestamp, so it is the fallback for a record that had no uuid, not a stable
+    name. The id keeps 32 bits of the hash, so two candidates can collide by chance: see id_collisions."""
+    if key is not None:
+        raw = f"{session_id}\x00{kind}\x00key\x00{key}"
+    else:
+        raw = f"{session_id}\x00{ts.isoformat()}\x00{kind}\x00{n}"
+    return f"{kind[0].upper()}-{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
+
+
+def event_key(ev):
+    """The transcript-record name window_events attached to an operator, atext or send event, or
+    None when its record had no uuid (or the event was built without one)."""
+    width = {"operator": 4, "atext": 4, "send": 5}.get(ev[0])
+    return ev[width - 1] if width and len(ev) == width else None
+
+
+def find_candidates(changes, since, director_events, release_triggers, horizon_h, session_id="?"):
     """(a) operator problem words within horizon_h after a review PASS or a release
-    build; (b) Director retraction phrases. Both are candidates only."""
+    build; (b) Director retraction phrases. Both are candidates only. Each carries its
+    stable id; a (b) candidate also carries what started its turn and what immediately preceded
+    it (see turn_trigger, predecessor_trigger).
+    cand_a rows: (ts, kind, t0, excerpt, id); cand_b rows: (ts, to, excerpt, id, trigger, predecessor)."""
     trig = list(release_triggers)
     for ch in changes:
         for r in ch["reviews"]:
@@ -403,7 +465,15 @@ def find_candidates(changes, since, director_events, release_triggers, horizon_h
     trig.sort()
     horizon = timedelta(hours=horizon_h)
     cand_a, cand_b = defaultdict(list), defaultdict(list)
-    for ev in director_events:
+    seen = Counter()
+    id_kind = {"operator": "a", "atext": "b-text", "send": "b-send"}
+
+    for i, ev in enumerate(director_events):
+        kind_id = id_kind.get(ev[0])
+        cid = None
+        if kind_id:
+            cid = candidate_id(session_id, ev[1], kind_id, seen[(ev[1], kind_id)], key=event_key(ev))
+            seen[(ev[1], kind_id)] += 1
         ch = change_of(changes, since, ev[1])
         if ch is None:
             continue
@@ -411,12 +481,14 @@ def find_candidates(changes, since, director_events, release_triggers, horizon_h
             before = [x for x in trig if x[0] < ev[1] and ev[1] - x[0] <= horizon]
             if before:
                 t0, kind = before[-1]
-                cand_a[ch["id"]].append((ev[1], kind, t0, excerpt(ev[2])))
+                cand_a[ch["id"]].append((ev[1], kind, t0, excerpt(ev[2]), cid))
         if ev[0] == "atext" and RETRACT_RX.search(ev[2]):
-            cand_b[ch["id"]].append((ev[1], "to operator", excerpt(ev[2], 320)))
+            cand_b[ch["id"]].append((ev[1], "to operator", excerpt(ev[2], 320), cid,
+                                     turn_trigger(director_events, i), predecessor_trigger(director_events, i)))
         if ev[0] == "send" and RETRACT_RX.search(ev[3]):
             m = RETRACT_RX.search(ev[3])
-            cand_b[ch["id"]].append((ev[1], f"to {ev[2] or 'all'}", excerpt(ev[3][max(0, m.start() - 120):], 320)))
+            cand_b[ch["id"]].append((ev[1], f"to {ev[2] or 'all'}", excerpt(ev[3][max(0, m.start() - 120):], 320), cid,
+                                     turn_trigger(director_events, i), predecessor_trigger(director_events, i)))
     for ch in changes:
         ch["cand_a"] = len(cand_a[ch["id"]])
         ch["cand_b_op"] = sum(1 for x in cand_b[ch["id"]] if x[1] == "to operator")
@@ -425,22 +497,243 @@ def find_candidates(changes, since, director_events, release_triggers, horizon_h
 
 
 # ---------------------------------------------------------------------------
+# effect metrics: what working as a brigade bought the operator
+# ---------------------------------------------------------------------------
+
+TRIGGERS = ("operator", "worker", "self")
+JUDGMENT_VERDICTS = ("real", "not", "unsure")
+JUDGMENT_ID_RX = re.compile(r"^[AB]-[0-9a-f]{8}$", re.I)
+WORKER_SENDERS = ("worker-", "goinkyo")
+
+
+def parse_judgments(text):
+    """The hand judgments of candidates: one `<id> <real|not|unsure> [free note]` per line; blank
+    and `#` lines are ignored. Returns ({id: (verdict, note)}, warnings). A malformed line is a
+    warning, never an error; a repeated id keeps its last line."""
+    out, warnings = {}, []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not JUDGMENT_ID_RX.match(parts[0]) or parts[1].lower() not in JUDGMENT_VERDICTS:
+            warnings.append(f"judgments line {n}: not '<id> <real|not|unsure> [note]', ignored")
+            continue
+        cid = parts[0][0].upper() + parts[0][1:].lower()
+        if cid in out:
+            warnings.append(f"judgments line {n}: {cid} was already judged, the later line wins")
+        out[cid] = (parts[1].lower(), parts[2].strip() if len(parts) > 2 else "")
+    return out, warnings
+
+
+def id_collisions(cand_a, cand_b):
+    """The ids that name more than one candidate in this run, sorted. The id is 32 bits of a hash, so
+    a chance collision is possible and nothing else would show it: a judgment for such an id would
+    silently land on both candidates."""
+    n = Counter(x[4] for rows in cand_a.values() for x in rows)
+    n.update(x[3] for rows in cand_b.values() for x in rows)
+    return sorted(i for i, c in n.items() if c > 1)
+
+
+def refuse_ambiguous(judgments, collisions):
+    """(the judgments minus those for a colliding id, a warning for each one dropped). The caller's
+    dict is left as it was."""
+    usable = {i: j for i, j in judgments.items() if i not in collisions}
+    warnings = [f"judgments: {i} names more than one candidate of this run (an id collision), so it is ambiguous and applied to neither"
+                for i in sorted(judgments) if i in collisions]
+    return usable, warnings
+
+
+def judged_counts(ids, judgments):
+    """How many of `ids` were judged real / not / unsure, and how many were not judged."""
+    c = {"real": 0, "not": 0, "unsure": 0, "unjudged": 0}
+    for i in ids:
+        j = judgments.get(i)
+        c[j[0] if j else "unjudged"] += 1
+    return c
+
+
+def worker_message(ev):
+    """True when a delivery event carries a message from a Worker or from Goinkyo."""
+    return any(p[0].startswith(WORKER_SENDERS) for p in ev[2])
+
+
+def turn_trigger(events, i):
+    """What started the Director's turn in which events[i] was written: 'operator' if the last thing
+    to start a turn was a message the operator typed, 'worker' if it was a relay nudge or a
+    check_messages answer carrying a Worker's or Goinkyo's message, else 'self'. Tool results,
+    system text and answers with no Worker in them do not start a turn, and the Director's own text,
+    sends and calls are never inputs. A delivery carrying a message from the operator counts as the
+    operator's. It cannot see self-correction: a turn an operator message or a Worker report started
+    counts as that trigger even when the Director found the error itself."""
+    for ev in reversed(events[:i]):
+        kind = ev[0]
+        if kind == "operator":
+            return "operator"
+        if kind == "nudge":
+            return "worker"
+        if kind == "deliver":
+            if any(p[0] == "operator" for p in ev[2]):
+                return "operator"
+            if worker_message(ev):
+                return "worker"
+    return "self"
+
+
+def predecessor_trigger(events, i):
+    """The same three names for the most recent input of ANY kind before events[i]: a tool result,
+    system text or an answer with no Worker message is 'self'. Mostly 'self', since a Director
+    writes most of its text right after a tool call; kept as the secondary column."""
+    for ev in reversed(events[:i]):
+        kind = ev[0]
+        if kind == "operator":
+            return "operator"
+        if kind == "nudge":
+            return "worker"
+        if kind == "deliver":
+            if any(p[0] == "operator" for p in ev[2]):
+                return "operator"
+            return "worker" if worker_message(ev) else "self"
+        if kind in ("result", "system"):
+            return "self"
+    return "self"
+
+
+def open_time(errands, lo, hi):
+    """(seconds with at least one errand open, seconds with two or more open at once), clipped to
+    [lo, hi]. Errands that only touch end to start are not parallel."""
+    points = []
+    for e in errands:
+        a, b = max(e["start"], lo), min(e["end"], hi)
+        if b > a:
+            points += [(a, 1), (b, -1)]
+    points.sort(key=lambda p: (p[0], p[1]))   # at one instant the closes come first
+    open_s = multi_s = 0.0
+    depth, last = 0, None
+    for t, d in points:
+        if last is not None and depth >= 1:
+            open_s += (t - last).total_seconds()
+            if depth >= 2:
+                multi_s += (t - last).total_seconds()
+        depth += d
+        last = t
+    return open_s, multi_s
+
+
+def never_reported(ch):
+    """Errands that started in the change and got no report back. Their end is only the Worker's
+    last record, not a finish, so lead time and parallelism leave them out."""
+    return sum(1 for e in ch["errands"] if not e["reports"])
+
+
+def lead_time(ch):
+    """(from the first errand that reported to the change's last commit, None) or (None, why it is
+    empty). Errands that never reported are left out, see never_reported."""
+    if not ch["errands"]:
+        return None, "no errand opened in this change's window"
+    starts = [e["start"] for e in ch["errands"] if e["reports"]]
+    if not starts:
+        return None, f"never reported: all {len(ch['errands'])} errand(s) of this change got no report, so none is counted"
+    return ch["end"] - min(starts), None
+
+
+def review_catch(reviews):
+    """What the review rounds of one change reported. A FAIL is counted, not judged: that it was
+    right is a hand question. BLK* is a derived mark (no explicit verdict) and is kept apart."""
+    fails = [r for r in reviews if r["verdict"] == "FAIL"]
+    return {"rounds": len(reviews), "fail_rounds": len(fails), "fail_findings": sum(r["findings"] for r in fails),
+            "fail_blockers": sum(r["blockers"] for r in fails),
+            "derived_blk_rounds": sum(1 for r in reviews if r["verdict"] == "BLK*")}
+
+
+def compute_effects(changes, errands, director_events, since, cand_a, cand_b, judgments):
+    """Fill ch["effect"] for every change and return the window summary (both plain data).
+    `judgments` is None when no --judgments file was given."""
+    reported = [e for e in errands if e["reports"]]
+    owned = {id(e) for ch in changes for e in ch["errands"]}
+    left_out = [e for e in errands if not e["reports"]
+                and (id(e) in owned or any(min(e["end"], ch["end"]) > max(e["start"], ch["start"]) for ch in changes))]
+    ops, decisions = defaultdict(int), defaultdict(int)
+    for ev in director_events:
+        if ev[0] in ("operator", "decision"):
+            ch = change_of(changes, since, ev[1])
+            if ch is not None:
+                (ops if ev[0] == "operator" else decisions)[ch["id"]] += 1
+    for ch in changes:
+        a_ids = [x[4] for x in cand_a[ch["id"]]]
+        b = cand_b[ch["id"]]
+        by = {t: sum(1 for x in b if x[4] == t) for t in TRIGGERS}
+        by_pred = {t: sum(1 for x in b if x[5] == t) for t in TRIGGERS}
+        lt, lt_note = lead_time(ch)
+        open_s, multi_s = open_time(reported, ch["start"], ch["end"])
+        ch["effect"] = {
+            "review": review_catch(ch["reviews"]),
+            "escapes": {"candidates_a": len(a_ids), "ids_a": a_ids, "fix_commits": len(ch["later_fixes"]),
+                        "judged_a": judged_counts(a_ids, judgments) if judgments is not None else None},
+            "reversals": {"by_trigger": by, "by_predecessor": by_pred,
+                          "candidates": [{"id": x[3], "to": x[1], "trigger": x[4], "predecessor": x[5]} for x in b],
+                          "judged": ({t: judged_counts([x[3] for x in b if x[4] == t], judgments) for t in TRIGGERS}
+                                     if judgments is not None else None)},
+            "lead_time_s": lt.total_seconds() if lt is not None else None,
+            "lead_time_note": lt_note, "left_out_errands": never_reported(ch),
+            "parallel": {"open_s": open_s, "multi_s": multi_s, "share": multi_s / open_s if open_s else None},
+            "operator_messages": ops[ch["id"]], "decisions": decisions[ch["id"]],
+            "cost": sum(a[1] for a in ch["usage"].values()),
+        }
+    es = [ch["effect"] for ch in changes]
+    n = len(changes)
+    leads = [e["lead_time_s"] for e in es if e["lead_time_s"] is not None]
+    open_s, multi_s = sum(e["parallel"]["open_s"] for e in es), sum(e["parallel"]["multi_s"] for e in es)
+    all_a = [i for e in es for i in e["escapes"]["ids_a"]]
+    all_b = [c for e in es for c in e["reversals"]["candidates"]]
+    return {
+        "changes": n,
+        "review": {"changes_with_review": sum(1 for e in es if e["review"]["rounds"]),
+                   "changes_with_fail": sum(1 for e in es if e["review"]["fail_rounds"]),
+                   "fail_rounds": sum(e["review"]["fail_rounds"] for e in es),
+                   "fail_findings": sum(e["review"]["fail_findings"] for e in es),
+                   "derived_blk_rounds": sum(e["review"]["derived_blk_rounds"] for e in es)},
+        "escapes": {"candidates_a": len(all_a), "changes_with_candidate_a": sum(1 for e in es if e["escapes"]["candidates_a"]),
+                    "fix_commits": sum(e["escapes"]["fix_commits"] for e in es),
+                    "changes_with_fix_commits": sum(1 for e in es if e["escapes"]["fix_commits"]),
+                    "judged_a": judged_counts(all_a, judgments) if judgments is not None else None},
+        "reversals": {"candidates_b": len(all_b),
+                      "by_trigger": {t: sum(1 for c in all_b if c["trigger"] == t) for t in TRIGGERS},
+                      "by_predecessor": {t: sum(1 for c in all_b if c["predecessor"] == t) for t in TRIGGERS},
+                      "judged": ({t: judged_counts([c["id"] for c in all_b if c["trigger"] == t], judgments) for t in TRIGGERS}
+                                 if judgments is not None else None)},
+        "lead_time": {"median_s": statistics.median(leads) if leads else None, "max_s": max(leads) if leads else None,
+                      "changes_with_lead_time": len(leads), "changes_without_lead_time": n - len(leads)},
+        "left_out_errands": {"errands": len(left_out), "changes": sum(1 for e in es if e["left_out_errands"]),
+                             "unowned": sum(1 for e in left_out if id(e) not in owned)},
+        "parallelism": {"open_s": open_s, "multi_s": multi_s, "share": multi_s / open_s if open_s else None},
+        "operator": {"messages": sum(e["operator_messages"] for e in es), "decisions": sum(e["decisions"] for e in es),
+                     "messages_per_change": sum(e["operator_messages"] for e in es) / n if n else None,
+                     "decisions_per_change": sum(e["decisions"] for e in es) / n if n else None},
+        "cost": {"weighted": sum(e["cost"] for e in es), "per_change": sum(e["cost"] for e in es) / n if n else None},
+        "judgments": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # output
 # ---------------------------------------------------------------------------
 
 def write_candidates(out, changes, cand_a, cand_b, horizon_h):
     with tr.open_output(os.path.join(out, "candidates_a.txt")) as fh:
-        fh.write(f"(a) operator message with a problem word, within {horizon_h:g} h after a review PASS or a release build. Candidates only.\n\n")
+        fh.write(f"(a) operator message with a problem word, within {horizon_h:g} h after a review PASS or a release build. Candidates only.\n"
+                 "Each line starts with the candidate's id; judge it in a --judgments file as '<id> real|not|unsure [note]'.\n\n")
         for ch in changes:
             fh.write(f"## change {ch['id']} {ch['commits'][-1]['hash']} ({len(cand_a[ch['id']])})\n")
-            for t, kind, t0, ex in cand_a[ch["id"]]:
-                fh.write(f"  {t:%m-%d %H:%M:%SZ}  after {kind} at {t0:%H:%M:%SZ}: {ex}\n")
+            for t, kind, t0, ex, cid in cand_a[ch["id"]]:
+                fh.write(f"  {cid}  {t:%m-%d %H:%M:%SZ}  after {kind} at {t0:%H:%M:%SZ}: {ex}\n")
     with tr.open_output(os.path.join(out, "candidates_b.txt")) as fh:
-        fh.write("(b) Director text containing a retraction/correction phrase. Candidates only (high false-positive rate).\n\n")
+        fh.write("(b) Director text containing a retraction/correction phrase. Candidates only (high false-positive rate).\n"
+                 "Each line starts with the candidate's id and, in brackets, what started the Director's turn (operator / worker / self).\n\n")
         for ch in changes:
             fh.write(f"## change {ch['id']} {ch['commits'][-1]['hash']} ({len(cand_b[ch['id']])})\n")
-            for t, to, ex in cand_b[ch["id"]]:
-                fh.write(f"  {t:%m-%d %H:%M:%SZ}  {to}: {ex}\n")
+            for t, to, ex, cid, trig, _pred in cand_b[ch["id"]]:
+                fh.write(f"  {cid}  {t:%m-%d %H:%M:%SZ}  [{trig}]  {to}: {ex}\n")
 
 
 def write_errands_dump(out, errands, changes, since):
@@ -457,7 +750,53 @@ def write_errands_dump(out, errands, changes, since):
                      f"nrep={len(e['reports'])} tok={toks} | {excerpt(e['instr'], 90)} || {excerpt(rep, 110)}\n")
 
 
-def render_report(args, w, unmatched, director_id, brigade, since, until, commits, changes, errands, label_of, missing, out_dir):
+def fmt_secs(x):
+    return "-" if x is None else fmt_dur(timedelta(seconds=x))
+
+
+def fmt_share(x):
+    return "-" if x is None else f"{x:.0%}"
+
+
+def fmt_judged(c):
+    return f"{c['real']} real / {c['not']} not / {c['unsure']} unsure / {c['unjudged']} unjudged"
+
+
+def fmt_triggers(by):
+    return " ".join(f"{t} {by[t]}" for t in TRIGGERS)
+
+
+DEFINITIONS = [
+    "DEFINITIONS (effect metrics; every count is a count of what a heuristic matched, not a judged fact)",
+    "  caught by review: review rounds whose report says FAIL, and the findings (BLOCKER-1, H2, F3 ... labels) listed in those rounds. A FAIL is counted, not judged real.",
+    "    BLK* rounds (no explicit verdict, the opening names a blocker) are counted apart and are not FAIL.",
+    "  escaped review: (a) candidates are operator messages with a problem word within --horizon-h after a review PASS or a release build; the second signal is later 'fix' commits",
+    "    touching the change's files within --fix-days. Without a --judgments file both are candidate counts. With one, a candidate is real / not / unsure / unjudged by the line written for its id.",
+    "    A candidate's id comes from the transcript record it was found in: that record's uuid, plus the text block index or the send_to_peer tool_use id inside it, so no other record, matching or not,",
+    "    can rename it. This relies on Claude Code appending transcript records and never rewriting them, so a record's uuid, its block order and its tool_use ids do not change between runs;",
+    "    were a record ever rewritten, an id keyed by block index could move. Two fallbacks are not stable: a record without a uuid is keyed by its position among same-kind records at its timestamp",
+    "    (it moves when a record at that timestamp is added or removed), and a send_to_peer block without a tool_use id by the position of the block in its record.",
+    "    The id keeps 32 bits of a hash, so two candidates can share one by chance: a run counts such collisions in the summary and warns on stderr, and a judgment naming a colliding id is ambiguous and applied to neither candidate.",
+    "    The problem-word and retraction-phrase lists were tuned once, on one window, against the first-pass judgments of one judge, with no holdout: a first pass, not a validation.",
+    "  Director reversal: a (b) candidate, a Director message (text to the operator, or a send_to_peer) containing a retraction phrase. Trigger = what started the Director's turn in which it was written:",
+    "    operator = the last thing to start a turn was a message the operator typed; worker = it was a relay nudge, or a check_messages answer with at least one worker-N or goinkyo message in it;",
+    "    self = neither (tool results, system text, an answer with no Worker message and the Director's own text never start a turn). 'by turn' CANNOT SEE self-correction: a turn an operator message",
+    "    or a Worker report started counts as that trigger even when the Director found the error itself; a human records self in the judgments note. The secondary column 'by predecessor' names the",
+    "    most recent input of any kind before the message (a tool result or system text is self); it is mostly self, since a Director writes most of its text right after a tool call.",
+    "  operator-typed message: a user record in the Director's transcript that is not a tool result, not meta/compaction-summary/transcript-only, has origin human or none, and whose text does not",
+    "    start with '[banto' (a relay nudge or a line banto typed into a pane) or '<' (a tag the harness wrote). An operator message that itself starts with '<' is missed.",
+    "  lead time: from the first errand that reported (not the first errand), opened in the change's window, to the change's last commit; empty when the change had no errand, or none that reported.",
+    "  parallelism: among the time at least one errand was open inside the change's window (a Worker's delivery opens one, its first send_to_peer closes it), the share with two or more open at once.",
+    "  left out: an errand that never reported back has no real end (it stays open to the Worker's last record), so lead time and parallelism leave it out. Every other use of errands (kinds, reviews, cost, rework) still includes them.",
+    "    The per-change count assigns an errand by the change it started in, once; an errand that starts at or before --since is owned by no change, so no per-change count has it.",
+    "    The summary counts every left-out errand whose time was excluded from parallelism or that a change owns, owned by a change or not; 'unowned' says how many of them no change owns.",
+    "  operator effort: operator-typed messages to the Director, and request_decision calls the Director made, with a timestamp inside the change's window.",
+    "  cost: the weighted cost of the change as above, the same number, no new cost logic. Effort and cost are not added into a score.",
+    "  A change owns (previous change's last commit, its own last commit]. Time or messages after the last commit belong to no change.",
+]
+
+
+def render_report(args, w, unmatched, director_id, brigade, since, until, commits, changes, errands, label_of, missing, out_dir, summary=None):
     lines = []
     P = lines.append
     end = until or datetime.now(timezone.utc)
@@ -497,15 +836,70 @@ def render_report(args, w, unmatched, director_id, brigade, since, until, commit
         P(f"  candidates: (a) operator problem after PASS/release {ch['cand_a']}; (b) Director retraction phrases {ch['cand_b_op']} to operator + {ch['cand_b_wk']} to Workers")
         P(f"  attribution: errands straddling the commit {len(ch['straddle_out'])}; errands in flight at window start {len(ch['carried_in'])}; "
           f"errands naming a HEAD hash equal to the previous change's last commit {ch['base_check'][0]}/{ch['base_check'][1]}")
+        ef = ch.get("effect")
+        if ef:
+            rv, es, rt = ef["review"], ef["escapes"], ef["reversals"]
+            P(f"  effect: caught by review: {rv['fail_rounds']} FAIL round(s) of {rv['rounds']}, {rv['fail_findings']} finding(s) in them")
+            P(f"          escaped (candidates): (a) {es['candidates_a']}"
+              + (f" [{fmt_judged(es['judged_a'])}]" if es["judged_a"] else "") + f"; later fix commits {es['fix_commits']}")
+            P(f"          Director reversals by trigger (turn): {fmt_triggers(rt['by_trigger'])}; by predecessor: {fmt_triggers(rt['by_predecessor'])}"
+              + ("".join(f"; {t}: {fmt_judged(c)}" for t, c in rt["judged"].items()) if rt["judged"] else ""))
+            lt = f"lead time {fmt_secs(ef['lead_time_s'])}" if ef["lead_time_s"] is not None else f"lead time - ({ef['lead_time_note']})"
+            pl = ef["parallel"]
+            P(f"          {lt}; parallelism {fmt_share(pl['share'])} of {fmt_secs(pl['open_s'])} with an errand open"
+              f"; errands left out (never reported) {ef['left_out_errands']}"
+              f"; operator messages {ef['operator_messages']}, request_decision {ef['decisions']}; weighted cost {kfmt(ef['cost'])}")
     P("")
     P(f"classification source over all errands: {dict(Counter(e['how'] for e in errands))}; kinds: {dict(Counter(e['kind'] for e in errands))}")
     vs = Counter(r["verdict"] or "none" for ch in changes for r in ch["reviews"])
     P(f"review reports over all changes: {dict(vs)}")
     P(f"candidates files: {os.path.join(out_dir, 'candidates_a.txt')} ; {os.path.join(out_dir, 'candidates_b.txt')}")
+    if summary is not None:
+        P("")
+        lines.extend(DEFINITIONS)
+        P("")
+        lines.extend(window_summary_lines(summary))
     return lines
 
 
-def write_changes_json(out, changes, weights, unmatched):
+def window_summary_lines(sm):
+    lines = []
+    P = lines.append
+    rv, es, rs, lt, pl, op, jd = sm["review"], sm["escapes"], sm["reversals"], sm["lead_time"], sm["parallelism"], sm["operator"], sm["judgments"]
+    P(f"WINDOW SUMMARY over {sm['changes']} change(s)")
+    P(f"  1 caught by review: {rv['changes_with_fail']} of {rv['changes_with_review']} change(s) with a review had at least one FAIL round; "
+      f"{rv['fail_rounds']} FAIL round(s), {rv['fail_findings']} finding(s) in them; {rv['derived_blk_rounds']} derived BLK* round(s) not counted as FAIL")
+    if es["judged_a"] is not None:
+        P(f"  2 escaped review: (a) candidates {es['candidates_a']} in {es['changes_with_candidate_a']} change(s), judged: {fmt_judged(es['judged_a'])}")
+    else:
+        P(f"  2 escaped review: (a) CANDIDATES {es['candidates_a']} in {es['changes_with_candidate_a']} change(s), none judged (no --judgments file)")
+    P(f"    second signal, later fix commits: {es['fix_commits']} in {es['changes_with_fix_commits']} change(s) (shown beside the candidates; they are not the same events)")
+    P(f"  3 Director reversals (candidates) {rs['candidates_b']}: by trigger (what started the turn; cannot see self-correction) {fmt_triggers(rs['by_trigger'])}; by predecessor {fmt_triggers(rs['by_predecessor'])}")
+    if rs["judged"]:
+        for t in TRIGGERS:
+            P(f"    {t}: {fmt_judged(rs['judged'][t])}")
+    else:
+        P("    none judged (no --judgments file)")
+    P(f"  4 lead time: median {fmt_secs(lt['median_s'])}, max {fmt_secs(lt['max_s'])} over {lt['changes_with_lead_time']} change(s); "
+      f"{lt['changes_without_lead_time']} change(s) have none (no errand, or none that reported)")
+    P(f"  5 parallelism: {fmt_share(pl['share'])} of the {fmt_secs(pl['open_s'])} with an errand open had two or more open at once ({fmt_secs(pl['multi_s'])})")
+    lo = sm["left_out_errands"]
+    P(f"    left out of 4 and 5 because they never reported: {lo['errands']} errand(s), {lo['errands'] - lo['unowned']} in {lo['changes']} change(s) by start and {lo['unowned']} owned by no change")
+    P(f"  6 operator effort: {op['messages']} operator-typed message(s) ({op['messages_per_change'] if op['messages_per_change'] is None else round(op['messages_per_change'], 2)} per change), "
+      f"{op['decisions']} request_decision call(s) ({op['decisions_per_change'] if op['decisions_per_change'] is None else round(op['decisions_per_change'], 2)} per change)")
+    P(f"  7 cost: weighted {kfmt(sm['cost']['weighted'])} in total, {kfmt(sm['cost']['per_change'] or 0)} per change")
+    if sm.get("id_collisions") is not None:
+        P(f"  candidate ids: {sm['id_collisions']} id collision(s) (two distinct candidates with one id; a judgment for such an id is refused as ambiguous)")
+    if jd:
+        P(f"  judgments: {jd['entries']} judged id(s) read from the --judgments file; {len(jd['warnings'])} warning(s)")
+        for wmsg in jd["warnings"]:
+            P(f"    warning: {wmsg}")
+    else:
+        P("  judgments: no --judgments file given, so every escape and reversal figure above is a candidate count")
+    return lines
+
+
+def write_changes_json(out, changes, weights, unmatched, summary=None):
     def plain(ch):
         d = {
             "id": ch["id"], "commits": [(c["hash"], c["subject"], c["ts"].isoformat()) for c in ch["commits"]],
@@ -514,9 +908,13 @@ def write_changes_json(out, changes, weights, unmatched):
             "reviews": ch["reviews"], "rework": ch["rework"], "usage": dict(ch["usage"]),
             "later_fixes": [(h, sj, n) for h, sj, n, _ in ch["later_fixes"]],
         }
+        if "effect" in ch:
+            d["effect"] = ch["effect"]
         return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
     doc = {"assumption": tr.ASSUMPTION, "weights": weights.as_dict(),
            "unmatched_models": unmatched, "changes": [plain(ch) for ch in changes]}
+    if summary is not None:
+        doc["summary"] = summary
     with tr.open_output(os.path.join(out, "changes.json")) as fh:
         json.dump(doc, fh, ensure_ascii=False, default=str, indent=1)
 
@@ -608,6 +1006,11 @@ def build_parser():
     ap.add_argument("--role-name", action="append", default=[], metavar="NAME=KIND",
                     help="a Worker display name and the errand kind it implies (implementation, review, docs, "
                          "measurement/investigation, other); repeatable; adds to the built-in names")
+    ap.add_argument("--judgments", default=None, metavar="FILE",
+                    help="hand judgments of candidates: a text file with one '<id> <real|not|unsure> [note]' per line "
+                         "(ids are the ones printed in candidates_a.txt and candidates_b.txt; blank lines and lines "
+                         "starting with # are ignored; an unknown id or a malformed line is a warning). With it the "
+                         "escape and reversal counts are also given as judged counts")
     tr.add_weight_args(ap)
     return ap
 
@@ -629,6 +1032,13 @@ def main(argv=None):
             if not sep or kind not in KINDS:
                 raise ValueError(f"--role-name wants NAME=KIND with KIND one of {', '.join(KINDS)}; got {item!r}")
             role_by_name[name] = kind
+        judgments, judgment_warnings = None, []
+        if args.judgments:
+            try:
+                with open(args.judgments, encoding="utf-8", errors="replace") as fh:
+                    judgments, judgment_warnings = parse_judgments(fh.read())
+            except OSError as err:
+                raise ValueError(f"--judgments {args.judgments}: {err}")
         out = tr.prepare_out_dir(args.out, "quality_report", args.force_out, names=OUT_NAMES)
     except (ValueError, tr.OutDirError) as err:
         print(err, file=sys.stderr)
@@ -703,15 +1113,30 @@ def main(argv=None):
         lab = label_of.get(s.id)
         if lab and lab != "director" and not lab.startswith("sub:"):
             releases += [(e[1], f"release build ({lab})") for e in window_events(s, lo_ev, hi_ev) if e[0] == "release"]
-    cand_a, cand_b = find_candidates(changes, since, director_events, releases, args.horizon_h)
+    cand_a, cand_b = find_candidates(changes, since, director_events, releases, args.horizon_h, director.id)
+    collisions = id_collisions(cand_a, cand_b)
+    for i in collisions:
+        print(f"warning: candidate id {i} names more than one candidate (an id collision); a judgment for it would be ambiguous", file=sys.stderr)
+    usable = judgments
+    if judgments is not None:
+        usable, ambiguous = refuse_ambiguous(judgments, collisions)
+        judgment_warnings += ambiguous
+    summary = compute_effects(changes, an.errands, director_events, since, cand_a, cand_b, usable)
+    summary["id_collisions"] = len(collisions)
+    if judgments is not None:
+        known = {x[4] for rows in cand_a.values() for x in rows} | {x[3] for rows in cand_b.values() for x in rows}
+        judgment_warnings += [f"judgments: {i} matches no candidate of this run, ignored" for i in sorted(set(judgments) - known)]
+        summary["judgments"] = {"entries": len(judgments), "warnings": judgment_warnings}
+        for msg in judgment_warnings:
+            print(f"warning: {msg}", file=sys.stderr)
 
     try:
         write_candidates(out, changes, cand_a, cand_b, args.horizon_h)
         write_errands_dump(out, an.errands, changes, since)
-        lines = render_report(args, w, unmatched, director.id, brigade, since, until, commits, changes, an.errands, label_of, missing, out)
+        lines = render_report(args, w, unmatched, director.id, brigade, since, until, commits, changes, an.errands, label_of, missing, out, summary)
         with tr.open_output(os.path.join(out, "report.txt")) as fh:
             fh.write("\n".join(lines))
-        write_changes_json(out, changes, w, unmatched)
+        write_changes_json(out, changes, w, unmatched, summary)
     except tr.OutDirError as err:
         print(err, file=sys.stderr)
         return 2

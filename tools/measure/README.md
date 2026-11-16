@@ -56,6 +56,98 @@ the review missed; **(b)** `candidates_b.txt`: Director messages, to the operato
 to a Worker, containing a retraction or correction phrase, not limited by
 `--horizon-h`. Both lists are candidates, not findings.
 
+### Effect metrics: what working as a brigade bought the operator
+
+`quality_report.py` also puts seven effect figures beside each change in
+`report.txt` and `changes.json` (under `effect`), a `DEFINITIONS` section and,
+last in `report.txt`, a `WINDOW SUMMARY` (also `summary` in `changes.json`). They
+are for comparing the same brigade across two windows (run the script twice with
+different `--since`/`--until`) and for asking what a role contributes. They are
+not a score and nothing adds them together. The ranking they serve is quality,
+then speed, then operator effort, then cost.
+
+1. **Caught by review.** Review rounds whose report says FAIL, and the findings
+   listed in them. Summary: changes with at least one FAIL out of the changes that
+   had any review, and the total FAIL rounds. It counts FAILs; it does not say any
+   was right. Rounds with only a derived mark (`BLK*`) are counted apart.
+2. **Escaped review.** Two signals side by side: the operator-problem
+   candidates (`candidates_a.txt`) and the later `fix` commits touching the
+   change's files within `--fix-days` (they are different events and are not
+   merged). Every candidate has an id (`A-` and
+   `B-` plus eight hex digits) derived from the session id, the kind and the
+   transcript record it was found in: that record's `uuid`, plus the text block index
+   or the `send_to_peer` tool_use id inside it. Nothing else enters the id, so no
+   other record at the same timestamp, matching or not, can rename it, and it is
+   the same on every run over the same transcripts. **That relies on Claude Code
+   appending transcript records and never rewriting them,** so a record's uuid,
+   its block order and its tool_use ids do not change between runs; were a record
+   ever rewritten, an id keyed by block index could move. Two fallbacks are **not
+   stable**: a record with no `uuid` is keyed by its position among same-kind
+   records at its timestamp (it moves when a record at that timestamp is added or
+   removed), and a `send_to_peer` block with no tool_use id by the position of the
+   block in its record. The id keeps 32 bits of a hash, so two candidates can share
+   one by chance: a run counts such collisions in the summary (`id_collisions`,
+   normally 0) and warns on stderr, and a judgment naming a colliding id is
+   reported as ambiguous and applied to neither candidate. The id is printed on its
+   line in both candidate files. **Candidate counts and judged counts are
+   different things:** without `--judgments` every number is how many lines a
+   keyword matched; with it, each candidate is also counted real, not, unsure or
+   unjudged by the line a person wrote for it.
+3. **Director reversals by trigger.** Each (b) candidate is classified by what
+   started the Director's turn in which it was written: `operator` (the last thing
+   to start a turn was a message the operator typed), `worker` (a relay nudge, or a
+   `check_messages` answer carrying a Worker's or Goinkyo's message), `self`
+   (neither). Tool results, system text and the Director's own text do not start a
+   turn. **By turn cannot see self-correction:** a turn that an operator message or a
+   Worker report started counts as that trigger even when the Director found the
+   error itself, so `self` is nearly empty by construction. A human who reads the
+   candidate records self in the judgments note. A secondary column, `by
+   predecessor`, names the most recent input of any kind before the message (a tool
+   result or system text counts as `self`); it is mostly `self`, because a Director
+   writes most of its text right after a tool call, and it is kept only to show
+   that. Counts per trigger, and judged counts per trigger when `--judgments`
+   covers them. It says what the Director answered, not why it was wrong.
+4. **Lead time.** The first errand that reported, opened in the change's window,
+   to the change's last commit; empty (and said so) when the change had no errand or
+   none that reported. Summary: median and maximum. Waiting for the operator is
+   inside it.
+5. **Parallelism.** Of the time at least one errand was open in the change's window,
+   the share with two or more open at once. Errands that only touch are not
+   parallel. Empty when no errand was open. **Errands that never reported are left
+   out of 4 and 5:** an errand whose Worker never sent a report has no real end (it
+   stays open to that Worker's last record, which once made three such errands
+   dominate a whole window's share). Each is counted once, in the change it started
+   in, per change and in the summary (`left out`). Every other use of errands (kinds,
+   reviews, rework, cost) still includes them. The per-change count assigns an
+   errand by the change it started in, once; an errand that starts at or before
+   `--since` is owned by no change, so no per-change count has it. The summary
+   counts every left-out errand whose time was excluded from parallelism or that a
+   change owns, and says how many of them no change owns (`unowned`).
+6. **Operator effort.** Operator-typed messages to the Director in the window, and
+   `request_decision` calls the Director made. An operator-typed message is a user
+   record in the Director's transcript that is not a tool result, not meta, not a
+   compaction summary, has origin human or none, and does not start with `[banto`
+   (a relay nudge or a line banto typed into a pane) or `<` (a tag the harness
+   wrote); an operator message that itself begins with `<` is missed.
+7. **Cost.** The existing weighted cost of the change, shown beside the rest.
+
+The problem-word list (`PROB_WORDS`, candidates (a)) and the retraction-phrase list
+(`RETRACT_PHRASES`, candidates (b)) were tuned once against a person's first-pass
+judgments of one window's candidates: a word or phrase that matched no real or
+unsure candidate and several judged-not ones was dropped, and every real or unsure
+candidate is still matched. That is one window and one judge, a first pass rather
+than a validation; the comments above the lists in `quality_report.py` say which
+entries went and why. Ids do not depend on which word matched, so a judgments file
+written against the uuid-based ids still applies after such a change (an id whose
+candidate no longer matches is reported as a warning).
+
+`--judgments FILE` is plain text, one line per candidate:
+`<id> <real|not|unsure> [free note]`. Blank lines and lines starting with `#` are
+ignored; an id no candidate of the run has, a malformed line, or a repeated id is a
+warning (on stderr and in the summary), never an error. Judging is a manual step:
+read the candidate on its line, decide, write the line. The judgments file holds no
+conversation text unless you write some in a note, so keep notes free of it.
+
 ## How to run
 
 Each script is run as `python tools/measure/<script>.py`. Full flag lists are in
@@ -143,7 +235,7 @@ the weights and multipliers, so a file shared on its own still shows them.
 `usage_report` writes it in `calls.csv`, `errands.csv` and `sessions.csv`;
 `usage_whatif` in `whatif_A.csv`. `context_series.csv` has no weighted column.
 `quality_report`'s `changes.json` is an object with `assumption`, `weights`,
-`unmatched_models` and `changes` keys.
+`unmatched_models`, `changes` (each with an `effect` object) and `summary` keys.
 
 ## Privacy
 

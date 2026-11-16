@@ -56,6 +56,10 @@ BANTO_TOOL_PREFIX = "mcp__banto__"
 DIRECTOR_ONLY_TOOLS = {"consult_goinkyo", "dismiss_goinkyo", "name_member", "request_decision"}
 # Text banto types into an agent's pane to make it call check_messages.
 NUDGE_PREFIX = "[banto relay]"
+# Events kept only in detail mode for quality_report: a request_decision call and a tool result that
+# carried no delivery. They mark when something happened, not what an errand or a turn is, so the
+# errand builder skips them and its boundaries stay what they were before they existed.
+MARK_EVENTS = ("decision", "result")
 # The first line of a check_messages answer that delivered mail.
 DELIVERED_RE = re.compile(r"^\s*\d+ message\(s\) relayed by banto")
 # The header banto puts above each delivered message: [from worker-2 "name" — to you]
@@ -486,6 +490,13 @@ class Session:
         #   ('compact', ts, trigger, pre, post, duration_ms)
         #   detail only: ('atext', ts, text)  ('release', ts, command)
         self.events = []
+        # event index -> the record-level name of that event ("<record uuid>" for a user text,
+        # "<record uuid>#t<block>" for an assistant text block, "<record uuid>#u<tool_use id>" for a
+        # send_to_peer, "<record uuid>#b<block>" for one without a tool_use id). Only text, send and
+        # user events get one, and only when the record has a string uuid. A side table, not a tuple
+        # field, so every consumer of the event shapes is untouched. The block-index forms are
+        # positional inside the record: stable only because the transcript is append-only.
+        self.keys = {}
         self.tools = Counter()
         self.compactions = []
         self.first_ts = None
@@ -563,6 +574,8 @@ def read_session(path, root, detail=False):
             except (TypeError, ValueError, AttributeError, OverflowError):
                 # a record is taken whole or not at all
                 del s.events[n_events:]
+                for stale in [k for k in s.keys if k >= n_events]:
+                    del s.keys[stale]
                 del s.compactions[n_comp:]
                 s.skipped += 1
                 continue
@@ -613,6 +626,15 @@ def _read_record(s, d, ts, check_ids, detail):
         s.events.append(("compact",) + comp)
 
 
+def _key(s, d, index, sub):
+    """Name the event about to be stored at `index` after its transcript record: the record's own
+    uuid, which no other record's presence, absence or text can change. A record without a string
+    uuid gets no name and its events fall back to positional naming downstream."""
+    uid = d.get("uuid")
+    if isinstance(uid, str) and uid:
+        s.keys[index] = uid + sub
+
+
 def _read_assistant(s, d, ts, check_ids, detail):
     """Everything is validated before anything is stored, so a bad record leaves
     no half-read state behind."""
@@ -642,15 +664,16 @@ def _read_assistant(s, d, ts, check_ids, detail):
         c.in_window = True
         new_call = c
 
-    events, tools, checks = [], [], []
+    events, subkeys, tools, checks = [], [], [], []
     content = msg.get("content")
-    for b in content if isinstance(content, list) else []:
+    for block_no, b in enumerate(content if isinstance(content, list) else []):
         if not isinstance(b, dict):
             continue
         btype = b.get("type")
         if btype == "text":
             if detail and b.get("text"):
                 events.append(("atext", ts, _optional_str(b["text"])))
+                subkeys.append(f"#t{block_no}")
         elif btype == "tool_use":
             name = _optional_str(b.get("name")) or ""
             tool_id = _optional_str(b.get("id"))
@@ -661,15 +684,20 @@ def _read_assistant(s, d, ts, check_ids, detail):
                 if short == "check_messages":
                     if tool_id:
                         checks.append(tool_id)
+                elif short == "request_decision" and detail:
+                    events.append(("decision", ts))
+                    subkeys.append(None)
                 elif short == "send_to_peer":
                     to = inp.get("to")
                     text = inp.get("text", "")
                     events.append(("send", ts, to if isinstance(to, str) else None,
                                    text if detail and isinstance(text, str) else ""))
+                    subkeys.append(f"#u{tool_id}" if tool_id else f"#b{block_no}")
             elif detail and name in ("Bash", "PowerShell"):
                 cmd = inp.get("command", "")
                 if isinstance(cmd, str) and RELEASE_BUILD_RX.search(cmd):
                     events.append(("release", ts, cmd[:120]))
+                    subkeys.append(None)
 
     # Commit. The call goes first: a record that carries a send_to_peer is often
     # the whole of a short errand's only call, and a send before its call would
@@ -685,6 +713,9 @@ def _read_assistant(s, d, ts, check_ids, detail):
             # the FIRST copy's timestamp
             new_call.ts = old.ts
             s.calls[mid] = new_call
+    for offset, sub in enumerate(subkeys):
+        if sub is not None:
+            _key(s, d, len(s.events) + offset, sub)
     s.events.extend(events)
     s.tools.update(tools)
     check_ids.update(checks)
@@ -702,6 +733,9 @@ def _read_user(s, d, ts, check_ids, detail):
                     text = block_text(b.get("content"))
                     if DELIVERED_RE.match(text):
                         events.append(("deliver", ts, instruction_label(text), split_delivery(text) if detail else None))
+                        continue
+                if detail:
+                    events.append(("result", ts))
         s.events.extend(events)
         return
     if d.get("isMeta") or d.get("isCompactSummary") or d.get("isVisibleInTranscriptOnly"):
@@ -713,6 +747,7 @@ def _read_user(s, d, ts, check_ids, detail):
     stripped = text.lstrip()
     is_nudge = stripped.startswith(NUDGE_PREFIX)
     is_tag = stripped.startswith("<") and not is_nudge  # task-notification, command wrappers, bash tags
+    _key(s, d, len(s.events), "")
     s.events.append(("user", ts, text, is_nudge, not is_nudge and not is_tag, is_tag, origin))
 
 
@@ -856,6 +891,8 @@ def build_errands(s):
     if s.role == "worker":
         for ev in s.events:
             kind = ev[0]
+            if kind in MARK_EVENTS:
+                continue
             ts = ev[1] if kind != "call" else None
             if ts:
                 last_ts = ts
@@ -872,6 +909,8 @@ def build_errands(s):
     else:
         for ev in s.events:
             kind = ev[0]
+            if kind in MARK_EVENTS:
+                continue
             if kind != "call" and len(ev) > 1 and ev[1]:
                 last_ts = ev[1]
             if kind == "user":
