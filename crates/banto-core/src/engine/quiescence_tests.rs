@@ -424,7 +424,10 @@ fn a_pane_opened_after_the_last_sample_asks_until_the_next_one() {
     send(
         &mut state,
         &mut app,
-        Event::Spawned { key: fresh.clone() },
+        Event::Spawned {
+            key: fresh.clone(),
+            agent: None,
+        },
         at,
     );
     press(&mut state, &mut app, KeyCode::Esc, at);
@@ -2945,6 +2948,7 @@ fn a_workers_pane_being_relaunched_keeps_the_spending_while_the_director_stays_h
         &mut app,
         Event::Spawned {
             key: worker.clone(),
+            agent: None,
         },
         at + 5 * SECOND,
     );
@@ -3007,7 +3011,7 @@ fn a_request_made_before_the_first_tick_of_a_brigade_formed_in_this_run_is_a_new
                 &mut state,
                 &mut app,
                 &config,
-                Event::Spawned { key },
+                Event::Spawned { key, agent: None },
                 at,
             ));
         }
@@ -4442,7 +4446,12 @@ impl Resumed {
         while let Some(cmd) = cmds.pop() {
             if let Cmd::OpenEmbedded { key, .. } = cmd {
                 opened += 1;
-                cmds.extend(send(&mut state, &mut app, Event::Spawned { key }, spawned));
+                cmds.extend(send(
+                    &mut state,
+                    &mut app,
+                    Event::Spawned { key, agent: None },
+                    spawned,
+                ));
             }
         }
         assert_eq!(opened, 4, "the whole brigade was opened");
@@ -4638,6 +4647,7 @@ fn a_relaunched_pane_gets_a_new_grace() {
         &mut run.app,
         Event::Spawned {
             key: run.codex.clone(),
+            agent: None,
         },
         relaunched,
     );
@@ -6158,7 +6168,10 @@ fn input_given_to_a_process_that_was_replaced_is_not_work_given_to_the_new_one()
     send(
         &mut run.state,
         &mut run.app,
-        Event::Spawned { key: key("c1") },
+        Event::Spawned {
+            key: key("c1"),
+            agent: None,
+        },
         relaunched,
     );
     assert!(!run.state.was_given_work(&key("c1")));
@@ -6189,7 +6202,10 @@ fn a_key_in_the_same_drain_as_the_relaunch_is_not_work_given_to_the_new_process(
     send(
         &mut run.state,
         &mut run.app,
-        Event::Spawned { key: key("c1") },
+        Event::Spawned {
+            key: key("c1"),
+            agent: None,
+        },
         at,
     );
     assert!(!run.state.was_given_work(&key("c1")));
@@ -6244,7 +6260,10 @@ fn what_banto_wrote_to_the_old_process_in_the_same_drain_is_not_work_given_to_th
     send(
         &mut run.state,
         &mut run.app,
-        Event::Spawned { key: c1.clone() },
+        Event::Spawned {
+            key: c1.clone(),
+            agent: None,
+        },
         at,
     );
     assert!(!run.state.was_given_work(&c1));
@@ -7223,7 +7242,10 @@ fn a_member_added_to_an_armed_brigade_only_delays_the_ring_and_its_own_rules_app
     send(
         &mut state,
         &mut app,
-        Event::Spawned { key: added.clone() },
+        Event::Spawned {
+            key: added.clone(),
+            agent: None,
+        },
         idle_from + 3 * SECOND,
     );
     let with_added =
@@ -7617,6 +7639,7 @@ fn a_reports_life_follows_its_process_and_its_pane() {
         &mut app,
         Event::Spawned {
             key: renamed.clone(),
+            agent: None,
         },
         at + 3 * SECOND,
     );
@@ -9304,7 +9327,10 @@ fn nothing_is_said_of_a_pane_before_banto_has_read_it_and_again_after_a_respawn(
     send(
         &mut state,
         &mut app,
-        Event::Spawned { key: pane.clone() },
+        Event::Spawned {
+            key: pane.clone(),
+            agent: None,
+        },
         at + SECOND,
     );
     assert_eq!(state.pane_word(&app, &pane), None, "just spawned");
@@ -9940,7 +9966,10 @@ fn open_a_plain_session_solo(off_stage: &mut OffStage, at: Instant, waiting: &st
     cmds.extend(send(
         &mut off_stage.state,
         &mut off_stage.app,
-        Event::Spawned { key: key("plain") },
+        Event::Spawned {
+            key: key("plain"),
+            agent: None,
+        },
         at,
     ));
     assert!(matches!(&off_stage.state.stage, Stage::Solo(solo) if *solo == key("plain")));

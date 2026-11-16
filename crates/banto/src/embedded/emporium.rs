@@ -1387,7 +1387,10 @@ fn execute_open_codex_trust_pane(
     ) {
         Ok(handle) => {
             handles.insert(key.clone(), handle);
-            vec![Event::Spawned { key }]
+            vec![Event::Spawned {
+                key,
+                agent: Some(AgentKind::Codex),
+            }]
         }
         Err(err) => vec![Event::SpawnFailed {
             key,
@@ -1662,7 +1665,10 @@ fn execute_open_embedded(
                     notified_untrusted: false,
                 });
             }
-            vec![Event::Spawned { key }]
+            vec![Event::Spawned {
+                key,
+                agent: Some(target.agent),
+            }]
         }
         Err(err) => vec![Event::SpawnFailed {
             key,
@@ -4325,7 +4331,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Spawned { key: director },
+            Event::Spawned {
+                key: director,
+                agent: None,
+            },
             now,
         );
         opened.extend(cmds.iter().filter_map(|cmd| match cmd {
@@ -4333,7 +4342,13 @@ mod tests {
             _ => None,
         }));
         for key in opened.into_iter().skip(1) {
-            engine::update(&mut state, &mut app, &brigade, Event::Spawned { key }, now);
+            engine::update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Spawned { key, agent: None },
+                now,
+            );
         }
         engine::update(
             &mut state,
@@ -8077,9 +8092,10 @@ mod tests {
             for cmd in engine::update(state, app, brigade, event, Instant::now()) {
                 match &cmd {
                     Cmd::Store(intent) => queue.extend(execute_store_intent(intent.clone(), store)),
-                    Cmd::OpenEmbedded { key, .. } => {
-                        queue.push_back(Event::Spawned { key: key.clone() })
-                    }
+                    Cmd::OpenEmbedded { key, .. } => queue.push_back(Event::Spawned {
+                        key: key.clone(),
+                        agent: None,
+                    }),
                     _ => {}
                 }
                 seen.push(cmd);
@@ -12113,6 +12129,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: director.clone(),
+                agent: None,
             },
             now,
         );
@@ -12130,6 +12147,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: worker.clone(),
+                agent: None,
             },
             now,
         );
@@ -12184,6 +12202,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: goinkyo_key.clone(),
+                agent: None,
             },
             now,
         );
@@ -12911,7 +12930,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Spawned { key: key.clone() },
+            Event::Spawned {
+                key: key.clone(),
+                agent: None,
+            },
             Instant::now(),
         );
         let mut events = VecDeque::new();
@@ -13008,7 +13030,8 @@ mod tests {
         assert_eq!(
             events,
             vec![Event::Spawned {
-                key: SessionKey::from_id("pane")
+                key: SessionKey::from_id("pane"),
+                agent: Some(AgentKind::ClaudeCode),
             }]
         );
         assert_eq!(
@@ -13282,7 +13305,10 @@ mod tests {
                 &mut HashMap::new(),
                 &mut Vec::new(),
             );
-            assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+            assert!(
+                matches!(&events[..], [Event::Spawned { agent: Some(actual), .. }] if *actual == agent),
+                "{events:?}"
+            );
             let argv = fixture.launches()[0].argv.clone();
             let has = |needle: &str| argv.iter().any(|arg| arg.contains(needle));
             let created = id.is_empty();

@@ -309,7 +309,14 @@ fn a_freshly_spawned_pane_starts_above_the_floor_with_the_size_its_pty_is_opened
     let mut state = EmporiumState::new(PrefixKey::default());
     let mut app = App::new(Vec::new());
     let pane = key("fresh");
-    send(&mut state, &mut app, Event::Spawned { key: pane.clone() });
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned {
+            key: pane.clone(),
+            agent: None,
+        },
+    );
     assert_eq!(state.screens[&pane].size(), (SPAWN_ROWS, SPAWN_COLS));
 }
 
@@ -396,7 +403,14 @@ fn a_held_move_ends_when_pane_arrivals_leave_the_dragged_tile_with_no_rows() {
             },
         );
         state.screens.insert(arriving.clone(), Screen::new(24, 80));
-        send(&mut state, &mut app, Event::Spawned { key: arriving });
+        send(
+            &mut state,
+            &mut app,
+            Event::Spawned {
+                key: arriving,
+                agent: None,
+            },
+        );
         let tile = state
             .geometry(area)
             .tiles
@@ -479,7 +493,14 @@ fn a_held_resize_ends_when_pane_arrivals_leave_a_neighbour_with_no_rows() {
             },
         );
         state.screens.insert(arriving.clone(), Screen::new(24, 80));
-        send(&mut state, &mut app, Event::Spawned { key: arriving });
+        send(
+            &mut state,
+            &mut app,
+            Event::Spawned {
+                key: arriving,
+                agent: None,
+            },
+        );
     }
     let w13 = state
         .geometry(area)

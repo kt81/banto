@@ -70,6 +70,7 @@ pub struct Screen {
 pub struct PaneModes {
     synchronized_update: bool,
     wants_focus_events: bool,
+    win32_input_enabled: bool,
     /// What the program last reported about its own state (OSC 7501, see
     /// [`crate::program_state`]); `None` before any report and after `clear`.
     reported: Option<ReportedState>,
@@ -122,6 +123,7 @@ impl vt100::Callbacks for PaneModes {
             match mode {
                 2026 => self.synchronized_update = enabled,
                 1004 => self.wants_focus_events = enabled,
+                9001 => self.win32_input_enabled = enabled,
                 _ => {}
             }
         }
@@ -161,6 +163,11 @@ impl Screen {
     /// (DECSET 1004), which it answers with `CSI I` / `CSI O`.
     pub fn wants_focus_events(&self) -> bool {
         self.parser.callbacks().wants_focus_events
+    }
+
+    /// Whether the pane has enabled the Win32 input protocol (DECSET 9001).
+    pub fn win32_input_enabled(&self) -> bool {
+        self.parser.callbacks().win32_input_enabled
     }
 
     /// Take any clipboard payload the child staged with OSC 52, as
@@ -268,6 +275,34 @@ impl Screen {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn win32_input_negotiation_is_per_screen_and_streaming() {
+        let mut a = super::Screen::new(24, 80);
+        let mut b = super::Screen::new(24, 80);
+        assert!(!a.win32_input_enabled());
+        let sequence = b"\x1b[?1004;9001h";
+        for &byte in &sequence[..sequence.len() - 1] {
+            a.process(&[byte]);
+            assert!(!a.win32_input_enabled());
+        }
+        a.process(&sequence[sequence.len() - 1..]);
+        assert!(a.win32_input_enabled());
+        assert!(a.wants_focus_events());
+        assert!(!b.win32_input_enabled());
+        a.resize(30, 90);
+        assert!(a.win32_input_enabled());
+        b.process(b"\x1b[?9001h");
+        b.process(b"\x1bc");
+        assert!(b.win32_input_enabled());
+        b.process(b"\x1b[?9001h");
+        assert!(b.win32_input_enabled());
+        a.process(b"\x1b[?9001l");
+        assert!(!a.win32_input_enabled());
+        assert!(b.win32_input_enabled());
+        b.process(b"\x1b[?9001l");
+        assert!(!b.win32_input_enabled());
+        assert!(!super::Screen::new(24, 80).win32_input_enabled());
+    }
     use super::*;
 
     #[test]

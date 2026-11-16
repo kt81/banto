@@ -147,7 +147,7 @@ impl Scene {
             keys.reverse();
         }
         for key in keys {
-            let more = self.feed(Event::Spawned { key });
+            let more = self.feed(Event::Spawned { key, agent: None });
             self.settle(more, arrival);
         }
     }

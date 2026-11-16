@@ -452,7 +452,10 @@ fn a_worker_that_dies_again_inside_the_cooldown_leaves_the_brigade() {
     send(
         &mut state,
         &mut app,
-        Event::Spawned { key: key("w1") },
+        Event::Spawned {
+            key: key("w1"),
+            agent: None,
+        },
         start + Duration::from_secs(1),
     );
 
@@ -486,7 +489,10 @@ fn a_worker_that_dies_again_after_the_cooldown_is_relaunched_again() {
     send(
         &mut state,
         &mut app,
-        Event::Spawned { key: key("w1") },
+        Event::Spawned {
+            key: key("w1"),
+            agent: None,
+        },
         start + Duration::from_secs(1),
     );
     let cmds = without_resizes(exits(

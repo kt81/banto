@@ -110,6 +110,27 @@ pub fn input_effect(input: ForwardedInput<'_>) -> InputEffect {
     }
 }
 
+/// Encode a key and classify its effect together. `win32_codex` requires both
+/// the negotiated Win32 input mode and a known Codex pane.
+pub fn key_to_encoded_input(key: &KeyEvent, win32_codex: bool) -> (Vec<u8>, InputEffect) {
+    if win32_codex {
+        let mods = key.modifiers;
+        let bytes: Option<&[u8]> = match key.code {
+            KeyCode::Enter if mods.shift && !mods.ctrl && !mods.alt => {
+                Some(b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_")
+            }
+            KeyCode::Char('j' | 'J') if mods.ctrl && !mods.shift && !mods.alt => {
+                Some(b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_")
+            }
+            _ => None,
+        };
+        if let Some(bytes) = bytes {
+            return (bytes.to_vec(), InputEffect::AddsText);
+        }
+    }
+    (key_to_bytes(key), input_effect(ForwardedInput::Key(key)))
+}
+
 /// Normalize a pasted string's line endings for a PTY child: CRLF and a lone
 /// LF both become a bare CR, matching what a real terminal delivers for
 /// Enter (xterm-style paste normalization). Without this, a child that only
@@ -168,6 +189,67 @@ fn ctrl_byte(c: char) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn win32_codex_encoded_newlines_preserve_effect_and_other_keys() {
+        use super::{
+            ForwardedInput, InputEffect, input_effect, key_to_bytes, key_to_encoded_input,
+        };
+        use crate::input::{KeyCode, KeyEvent, Modifiers};
+        let shift_enter = KeyEvent::new(KeyCode::Enter, Modifiers::SHIFT);
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), Modifiers::CONTROL);
+        assert_eq!(
+            key_to_encoded_input(&shift_enter, true),
+            (
+                b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_".to_vec(),
+                InputEffect::AddsText
+            )
+        );
+        for c in ['j', 'J'] {
+            let key = KeyEvent::new(KeyCode::Char(c), Modifiers::CONTROL);
+            assert_eq!(
+                key_to_encoded_input(&key, true),
+                (
+                    b"\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_".to_vec(),
+                    InputEffect::AddsText
+                )
+            );
+        }
+        for key in [
+            shift_enter,
+            ctrl_j,
+            KeyEvent::new(KeyCode::Enter, Modifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), Modifiers::NONE),
+        ] {
+            assert_eq!(
+                key_to_encoded_input(&key, false),
+                (key_to_bytes(&key), input_effect(ForwardedInput::Key(&key)))
+            );
+        }
+        let plain_enter = KeyEvent::new(KeyCode::Enter, Modifiers::NONE);
+        assert_eq!(
+            key_to_encoded_input(&plain_enter, true),
+            (b"\r".to_vec(), InputEffect::Submits)
+        );
+        for ctrl in [false, true] {
+            for alt in [false, true] {
+                for shift in [false, true] {
+                    let mods = Modifiers { ctrl, alt, shift };
+                    for code in [KeyCode::Enter, KeyCode::Char('j'), KeyCode::Char('J')] {
+                        let key = KeyEvent::new(code, mods);
+                        let special = (code == KeyCode::Enter && shift && !ctrl && !alt)
+                            || (matches!(code, KeyCode::Char('j' | 'J')) && ctrl && !alt && !shift);
+                        if !special {
+                            assert_eq!(
+                                key_to_encoded_input(&key, true),
+                                (key_to_bytes(&key), input_effect(ForwardedInput::Key(&key))),
+                                "{key:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     use crate::input::{KeyCode, KeyEvent, Modifiers};
 
     use super::{

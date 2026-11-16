@@ -219,7 +219,7 @@ fn run(
                 };
                 let key = key.clone();
                 out.opens.push(open);
-                vec![Event::Spawned { key }]
+                vec![Event::Spawned { key, agent: None }]
             }
             _ => Vec::new(),
         };
@@ -1277,7 +1277,7 @@ fn formation_awaiting_catalog(workers: usize) -> (EmporiumState, App, BrigadeCon
                 worker_effort,
                 result: Ok((1, (1..=workers).map(|n| format!("worker-{n}")).collect())),
             }],
-            Cmd::OpenEmbedded { key, .. } => vec![Event::Spawned { key }],
+            Cmd::OpenEmbedded { key, .. } => vec![Event::Spawned { key, agent: None }],
             _ => Vec::new(),
         };
         for event in events {
@@ -1667,6 +1667,7 @@ fn workers_of_a_brigade_disbanded_before_its_director_spawned_are_not_opened() {
         &brigade,
         Event::Spawned {
             key: SessionKey::from_id("dir"),
+            agent: None,
         },
         now(),
     );
@@ -1844,7 +1845,13 @@ fn restage_with_worker_resumed(state: &mut EmporiumState, app: &mut App, brigade
     );
     for cmd in cmds {
         if let Cmd::OpenEmbedded { key, .. } = cmd {
-            update(state, app, brigade, Event::Spawned { key }, now());
+            update(
+                state,
+                app,
+                brigade,
+                Event::Spawned { key, agent: None },
+                now(),
+            );
         }
     }
 }
@@ -2201,6 +2208,7 @@ fn the_formations_workers_skip_a_member_that_already_has_a_pane_when_the_directo
         &brigade,
         Event::Spawned {
             key: SessionKey::from_id("dir"),
+            agent: None,
         },
         now(),
     );
@@ -2318,7 +2326,10 @@ fn a_held_creation_is_not_released_beside_a_resume_that_is_still_in_flight() {
         &mut state,
         &mut app,
         &brigade,
-        Event::Spawned { key: live.clone() },
+        Event::Spawned {
+            key: live.clone(),
+            agent: None,
+        },
         now(),
     );
     assert!(state.screens.contains_key(&live));
@@ -2371,6 +2382,7 @@ fn the_formations_workers_skip_a_member_whose_resume_is_in_flight_when_the_direc
         &brigade,
         Event::Spawned {
             key: SessionKey::from_id("dir"),
+            agent: None,
         },
         now(),
     );

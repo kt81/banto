@@ -37,7 +37,7 @@ use crate::input_line::{
     InputLine, read_codex_input_line, read_input_line, typed_text_without_whitespace,
 };
 use crate::key_encode::{
-    ForwardedInput, InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings,
+    ForwardedInput, InputEffect, input_effect, key_to_encoded_input, normalize_paste_line_endings,
     wrap_bracketed_paste,
 };
 use crate::member_name;
@@ -1081,6 +1081,8 @@ const MOVE_HINT: &str = "move: release to drop · Esc cancels";
 
 pub struct EmporiumState {
     pub screens: HashMap<SessionKey, crate::screen::Screen>,
+    /// The product actually launched, available before session discovery.
+    launch_agents: HashMap<SessionKey, AgentKind>,
     pub stage: Stage,
     pub focus: Focus,
     pub status: Option<String>,
@@ -1564,6 +1566,7 @@ impl EmporiumState {
     pub fn new(prefix: PrefixKey) -> Self {
         Self {
             screens: HashMap::new(),
+            launch_agents: HashMap::new(),
             stage: Stage::Empty,
             focus: Focus::Sidebar,
             status: None,
@@ -1688,6 +1691,9 @@ impl EmporiumState {
         } else {
             false
         };
+        if let Some(agent) = self.launch_agents.remove(old_key) {
+            self.launch_agents.insert(new_key.clone(), agent);
+        }
         match &mut self.stage {
             Stage::Solo(key) if key == old_key => *key = new_key.clone(),
             Stage::Brigade {
@@ -2057,7 +2063,11 @@ impl EmporiumState {
     /// from [`Self::unstage`] and the rekeys; the rule itself lives in
     /// [`input_effect`].
     fn note_forwarded_input(&mut self, key: &SessionKey, input: ForwardedInput<'_>) {
-        match input_effect(input) {
+        self.note_input_effect(key, input_effect(input));
+    }
+
+    fn note_input_effect(&mut self, key: &SessionKey, effect: InputEffect) {
+        match effect {
             InputEffect::AddsText => {
                 self.unsent_operator_input.insert(key.clone());
             }
@@ -2409,6 +2419,33 @@ impl EmporiumState {
             (Some(row), Some(member)) if row != member => None,
             (row, member) => row.or(member),
         }
+    }
+
+    /// Old replays omit the launch fact, so an unconflicted row or member is
+    /// still usable. A disagreement between any known facts disables the mode.
+    fn uses_codex_win32_input(&self, app: &App, key: &SessionKey) -> bool {
+        if !self
+            .screens
+            .get(key)
+            .is_some_and(|screen| screen.win32_input_enabled())
+        {
+            return false;
+        }
+        let row = app.row_for_id(key.as_str()).map(|row| row.agent);
+        let member = (|| {
+            let brigade_id = *self.member_brigades.get(key)?;
+            let token = self.member_tokens.get(key)?;
+            self.member_facts.get(&(brigade_id, token.clone()))?.agent
+        })();
+        let launch = self.launch_agents.get(key).copied();
+        let mut known = None;
+        for agent in [row, member, launch].into_iter().flatten() {
+            if known.is_some_and(|previous| previous != agent) {
+                return false;
+            }
+            known = Some(agent);
+        }
+        known == Some(AgentKind::Codex)
     }
 
     /// What a hosted Codex pane has told banto about its own state (OSC 7501,
@@ -3040,7 +3077,7 @@ impl PrefixKey {
 
     /// The prefix's own key event — what "send the prefix through literally"
     /// (prefix-prefix, or plain `b`) actually forwards, encoded the same way
-    /// any other keypress would be (see [`key_to_bytes`]).
+    /// any other keypress would be (see [`crate::key_encode::key_to_bytes`]).
     fn as_key_event(&self) -> KeyEvent {
         KeyEvent::new(self.code, self.mods)
     }
@@ -3776,6 +3813,8 @@ pub enum Event {
     },
     Spawned {
         key: SessionKey,
+        #[serde(default)]
+        agent: Option<AgentKind>,
     },
     SpawnFailed {
         key: SessionKey,
@@ -4134,7 +4173,7 @@ pub fn update(
         Event::NewSessionCwdChecked { cwd, is_dir } => {
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
-        Event::Spawned { key } => update_spawned(state, brigade, key, now),
+        Event::Spawned { key, agent } => update_spawned(state, brigade, key, agent, now),
         Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
             rows,
@@ -4624,9 +4663,9 @@ fn operator_gave_work(state: &mut EmporiumState, pane: &SessionKey) {
 fn answer_request_on_enter(
     state: &mut EmporiumState,
     director: &SessionKey,
-    key: &KeyEvent,
+    effect: InputEffect,
 ) -> Vec<Cmd> {
-    if input_effect(ForwardedInput::Key(key)) != InputEffect::Submits {
+    if effect != InputEffect::Submits {
         return Vec::new();
     }
     if state.member_tokens.get(director).map(String::as_str) != Some(DIRECTOR_TOKEN) {
@@ -5610,16 +5649,17 @@ fn update_key(
     match state.focus {
         Focus::Pane => {
             if let Some(target) = state.stage.focused_key().cloned() {
-                let bytes = key_to_bytes(&key);
+                let (bytes, effect) =
+                    key_to_encoded_input(&key, state.uses_codex_win32_input(app, &target));
                 state.last_forwarded_input.insert(target.clone(), now);
                 state.last_given_input.insert(target.clone(), now);
                 operator_gave_work(state, &target);
                 if bytes.is_empty() {
                     Vec::new()
                 } else {
-                    state.note_forwarded_input(&target, ForwardedInput::Key(&key));
+                    state.note_input_effect(&target, effect);
                     cancel_pending_submit_on_input(&mut state.pending_submits, &target);
-                    let mut cmds = answer_request_on_enter(state, &target, &key);
+                    let mut cmds = answer_request_on_enter(state, &target, effect);
                     cmds.insert(0, Cmd::WritePty { key: target, bytes });
                     cmds
                 }
@@ -5738,14 +5778,15 @@ fn resolve_armed_prefix(
                 return Vec::new();
             };
             let literal = state.prefix.as_key_event();
-            let bytes = key_to_bytes(&literal);
+            let (bytes, effect) =
+                key_to_encoded_input(&literal, state.uses_codex_win32_input(app, &target));
             state.last_forwarded_input.insert(target.clone(), now);
             state.last_given_input.insert(target.clone(), now);
             operator_gave_work(state, &target);
             if bytes.is_empty() {
                 Vec::new()
             } else {
-                state.note_forwarded_input(&target, ForwardedInput::Key(&literal));
+                state.note_input_effect(&target, effect);
                 cancel_pending_submit_on_input(&mut state.pending_submits, &target);
                 vec![Cmd::WritePty { key: target, bytes }]
             }
@@ -8038,8 +8079,13 @@ fn update_spawned(
     state: &mut EmporiumState,
     brigade: &BrigadeConfig,
     key: SessionKey,
+    agent: Option<AgentKind>,
     now: Instant,
 ) -> Vec<Cmd> {
+    state.launch_agents.remove(&key);
+    if let Some(agent) = agent {
+        state.launch_agents.insert(key.clone(), agent);
+    }
     // A kill that never produced an exit — the child was already gone — would
     // otherwise leave its record behind to suppress the first genuine crash
     // of whatever opens under this key next.
@@ -8544,6 +8590,7 @@ fn relaunch_member(
     }
     state.last_relaunch.insert(key.clone(), now);
     state.screens.remove(key);
+    state.launch_agents.remove(key);
     state.quiescence.remove(key);
     // The process that held any draft is gone; the restarted one starts with
     // an empty input line.
@@ -8621,6 +8668,7 @@ fn update_pty_exited(
         None => false,
     };
     state.screens.remove(&key);
+    state.launch_agents.remove(&key);
     state.quiescence.remove(&key);
     state.unstage(&key);
     // A Goinkyo pane can close this way without ever being dismissed (its
@@ -8730,6 +8778,7 @@ fn update_pty_output_lost(
     };
     state.lost_output_waiting_for_exit.insert(key.clone());
     state.screens.remove(&key);
+    state.launch_agents.remove(&key);
     state.quiescence.remove(&key);
     state.unstage(&key);
     state.goinkyo_pane.retain(|_, pane| *pane != key);
@@ -10175,6 +10224,8 @@ mod codex_identity_tests;
 #[cfg(test)]
 mod launch_choice_tests;
 #[cfg(test)]
+mod newline_integration_tests;
+#[cfg(test)]
 mod small_tile_tests;
 
 #[cfg(test)]
@@ -11136,7 +11187,13 @@ mod tests {
 
         // The shell reports success: stage becomes the solo pane, focus moves
         // to it.
-        update(&mut state, &mut app, &brigade, Event::Spawned { key }, now);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key, agent: None },
+            now,
+        );
         assert_eq!(
             state.stage.focused_key(),
             Some(&SessionKey::from_id("sess-1"))
@@ -11401,6 +11458,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: worker.clone(),
+                agent: None,
             },
             now,
         );
@@ -12120,6 +12178,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: SessionKey::from_id("dir"),
+                agent: None,
             },
             test_instant(),
         );
@@ -12223,6 +12282,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: SessionKey::from_id("dir"),
+                agent: None,
             },
             test_instant(),
         );
@@ -12419,6 +12479,7 @@ mod tests {
             brigade,
             Event::Spawned {
                 key: SessionKey::from_id("dir"),
+                agent: None,
             },
             test_instant(),
         );
@@ -14497,7 +14558,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Spawned { key: key.clone() },
+            Event::Spawned {
+                key: key.clone(),
+                agent: None,
+            },
             test_instant(),
         );
 
@@ -14525,7 +14589,7 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Spawned { key },
+            Event::Spawned { key, agent: None },
             test_instant(),
         );
 
@@ -18709,6 +18773,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: SessionKey::new_worker(1, "worker-3"),
+                agent: None,
             },
             now,
         );
@@ -19046,6 +19111,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: SessionKey::new_worker(1, "worker-3"),
+                agent: None,
             },
             now,
         );
@@ -20050,7 +20116,10 @@ mod tests {
                 state,
                 app,
                 brigade,
-                Event::Spawned { key: key_of(name) },
+                Event::Spawned {
+                    key: key_of(name),
+                    agent: None,
+                },
                 now,
             ));
         }
@@ -21855,7 +21924,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Spawned { key: dir },
+            Event::Spawned {
+                key: dir,
+                agent: None,
+            },
             now,
         );
         assert_eq!(order_of(&state), ["dir", "w1", "w2", "w3"]);
@@ -22224,6 +22296,7 @@ mod tests {
                 &brigade,
                 Event::Spawned {
                     key: SessionKey::new_worker(1, token),
+                    agent: None,
                 },
                 now,
             );
@@ -22270,7 +22343,10 @@ mod tests {
             &mut state,
             &mut app,
             &brigade,
-            Event::Spawned { key: dir },
+            Event::Spawned {
+                key: dir,
+                agent: None,
+            },
             now,
         );
 
@@ -24115,6 +24191,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: goinkyo_key.clone(),
+                agent: None,
             },
             test_instant(),
         );
@@ -24235,6 +24312,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: synthetic_key.clone(),
+                agent: None,
             },
             test_instant(),
         );
@@ -24632,6 +24710,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: syn_key.clone(),
+                agent: None,
             },
             t0,
         );
@@ -27723,6 +27802,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: worker.clone(),
+                agent: None,
             },
             start + Duration::from_secs(1),
         );
@@ -27767,6 +27847,7 @@ mod tests {
             &brigade,
             Event::Spawned {
                 key: worker.clone(),
+                agent: None,
             },
             start + Duration::from_secs(1),
         );
