@@ -4382,11 +4382,165 @@ mod tests {
         let (mut state, mut app, at) = quitting_fixture(2);
         let bar = press_esc(&mut state, &mut app, at);
         assert!(
-            bar.contains("Esc again to quit \u{2014} 2 session(s) not idle"),
+            bar.contains("Esc again to quit \u{2014} 2 not idle"),
             "{bar:?}"
         );
         assert!(!bar.contains("Closing"), "{bar:?}");
         assert!(!app.should_quit());
+    }
+
+    /// A list as long as a real one: the counts segment is `[999/9999]`, the widest
+    /// a status bar is likely to carry, and what the quit question gets is what
+    /// is left of the line. The three hosted sessions' rows come first and do not
+    /// match the query the list is left filtered by; 999 fillers do.
+    fn crowd_the_list(app: &mut App, titles: [&str; 3]) {
+        let row = |id: String, title: String| banto_core::model::SessionRow {
+            id,
+            agent: AgentKind::ClaudeCode,
+            title: Some(title),
+            cwd: None,
+            dialog_open: false,
+            activity: banto_core::model::Activity::Alive,
+            is_agent: false,
+            preview: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            source_archived: false,
+            archived: false,
+        };
+        let mut rows: Vec<_> = titles
+            .iter()
+            .enumerate()
+            .map(|(i, title)| row(format!("s{i}"), title.to_string()))
+            .collect();
+        rows.extend((0..999).map(|n| row(format!("m-{n}"), format!("match {n}"))));
+        rows.extend((0..8997).map(|n| row(format!("o-{n}"), format!("other {n}"))));
+        app.replace_rows(rows);
+        app.enter_search();
+        "match".chars().for_each(|c| app.push_char(c));
+        app.confirm_search();
+    }
+
+    /// The status row of the quit question armed over three hosted sessions read
+    /// as `reads`, titled `titles` in the list, drawn at `width` columns, with the
+    /// bell badge on or off.
+    fn quit_question_at(
+        width: u16,
+        bell: bool,
+        titles: [&str; 3],
+        reads: [Quiescence; 3],
+    ) -> String {
+        let (mut state, mut app, at) = quitting_fixture(3);
+        crowd_the_list(&mut app, titles);
+        if bell {
+            engine::update(
+                &mut state,
+                &mut app,
+                &BrigadeConfig::default(),
+                bell_switch(true),
+                at,
+            );
+        }
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::QuiescenceSampled {
+                samples: reads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, read)| (SessionKey::from_id(&format!("s{i}")), *read))
+                    .collect(),
+            },
+            at,
+        );
+        press_esc(&mut state, &mut app, at);
+        assert!(!app.should_quit());
+        let bar = status_row_at_width(&state, &app, width);
+        assert!(bar.contains("[999/9999]"), "{bar:?}");
+        assert_eq!(bar.contains(banto_tui::hints::BELL_BADGE), bell, "{bar:?}");
+        bar
+    }
+
+    const WIDE: &str = "a title that is much longer than the budget";
+
+    #[test]
+    fn at_80_columns_the_first_entry_of_each_quit_form_is_whole() {
+        // The status line does not wrap, so what does not fit is cut off its end
+        // and only the first entry is sure to be seen. Each form, drawn beside
+        // the counts a long list has, shows it with its reason and any suffix.
+        let [unknown, busy, background, idle] = [
+            Quiescence::Unknown,
+            Quiescence::NotIdle,
+            Quiescence::Background,
+            Quiescence::Idle,
+        ];
+        let cases = [
+            // Not idle alone.
+            (
+                [WIDE, "b", "c"],
+                [unknown, idle, idle],
+                "Esc again to quit \u{2014} 1 not idle: a title th\u{2026} (unknown)",
+            ),
+            // Background alone: no reason, no tag.
+            (
+                [WIDE, "b", "c"],
+                [background, idle, idle],
+                "Esc again to quit \u{2014} 1 in background: a title th\u{2026}",
+            ),
+            // Both, the longest head there is, with the widest first entry.
+            (
+                [WIDE, "b", "c"],
+                [unknown, busy, background],
+                "Esc again to quit \u{2014} 2 not idle, 1 in background: \
+                 a title th\u{2026} (unknown)",
+            ),
+            // Both again, the first entry told apart from the next by a suffix
+            // that is paid for out of its name.
+            (
+                [WIDE, WIDE, "c"],
+                [unknown, busy, background],
+                "Esc again to quit \u{2014} 2 not idle, 1 in background: \
+                 a titl\u{2026} #s0 (unknown)",
+            ),
+        ];
+        for (titles, reads, expected) in cases {
+            let bar = quit_question_at(80, false, titles, reads);
+            assert!(bar.contains(expected), "{expected:?} not whole in {bar:?}");
+        }
+    }
+
+    #[test]
+    fn at_80_columns_with_the_bell_badge_a_single_group_question_still_shows_its_first_entry() {
+        // The badge takes 12 columns from the question's side of the line. The
+        // mixed form's longest head and first entry no longer fit beside it, and
+        // nothing here promises they do.
+        let [unknown, idle, background] = [
+            Quiescence::Unknown,
+            Quiescence::Idle,
+            Quiescence::Background,
+        ];
+        let cases = [
+            (
+                [WIDE, "b", "c"],
+                [unknown, idle, idle],
+                "Esc again to quit \u{2014} 1 not idle: a title th\u{2026} (unknown)",
+            ),
+            (
+                [WIDE, WIDE, "c"],
+                [unknown, unknown, idle],
+                "Esc again to quit \u{2014} 2 not idle: a titl\u{2026} #s0 (unknown)",
+            ),
+            (
+                [WIDE, "b", "c"],
+                [background, idle, idle],
+                "Esc again to quit \u{2014} 1 in background: a title th\u{2026}",
+            ),
+        ];
+        for (titles, reads, expected) in cases {
+            let bar = quit_question_at(80, true, titles, reads);
+            assert!(bar.contains(expected), "{expected:?} not whole in {bar:?}");
+        }
     }
 
     #[test]
@@ -7357,7 +7511,7 @@ mod tests {
         // idle it was read as before.
         let (app, bar) = quit_key_after_a_failed_roster_read("busy");
         assert!(!app.should_quit(), "{bar:?}");
-        assert!(bar.contains("1 session(s) not idle"), "{bar:?}");
+        assert!(bar.contains("1 not idle"), "{bar:?}");
     }
 
     #[test]
@@ -7425,7 +7579,7 @@ mod tests {
         state.focus = Focus::Sidebar;
         let bar = press_esc(&mut state, &mut app, now + Duration::from_secs(5));
         assert!(!app.should_quit(), "{bar:?}");
-        assert!(bar.contains("1 session(s) not idle"), "{bar:?}");
+        assert!(bar.contains("1 not idle"), "{bar:?}");
 
         // The roster is back: the next tick reads it again, and one press
         // quits again.

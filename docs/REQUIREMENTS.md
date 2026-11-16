@@ -185,9 +185,10 @@ entry records what was decided and why.
 
 1. **Quitting from the list asks only when a hosted session is not known to be
    idle.** `q`/`Esc` quits on the first press when every hosted session is known to
-   be idle, or none is hosted; otherwise the prompt is `Esc again to quit — N
-   session(s) not idle`, counting sessions that are working, waiting, of unknown
-   state, or given input in the last 3 seconds. The window, the second key and the
+   be idle, or none is hosted; otherwise the prompt names each session it counts
+   and why (`Esc again to quit — 2 not idle: a (unknown), b (busy)`), counting
+   sessions that are working, waiting, of unknown state, or given input in the last
+   3 seconds. The window, the second key and the
    ways the prompt is dropped are unchanged. (Since 2026-11-15 it also asks for a
    session whose only reason is a background command, and says so: "Decision
    (2026-11-15): a background command is named, not hidden".) This replaces the
@@ -762,12 +763,12 @@ of his for it is recorded here.
    agent, then `idle · bg · 2m`, then `idle · bg`, then nothing); it never appears
    or disappears without the word, and with a Director's decision tag the pairing
    holds (`idle · bg · ▸ decision`).
-2. **The quit question still counts the pane, and says why.** Only not-idle
-   sessions: `Esc again to quit — N session(s) not idle`; only background commands:
-   `Esc again to quit — M session(s) running a background command`; both: `Esc again
-   to quit — N session(s) not idle, M running a background command`. A pane that
-   took input in the last 3 seconds is counted as not idle, and no pane is counted
-   twice.
+2. **The quit question still counts the pane, and says why.** Each counted pane is
+   named with its reason: `Esc again to quit — 2 not idle: a (unknown), b (busy)`;
+   only background commands: `Esc again to quit — 2 in background: x, y`; both:
+   `Esc again to quit — 2 not idle, 1 in background: a (unknown), b (busy), c (bg)`.
+   A pane that took input in the last 3 seconds is counted as not idle, and no pane
+   is counted twice.
 3. **`brigade_status` says what it is.** A shell peer prints as `idle (background
    command running)`.
 4. **Unchanged.** The list row is still busy (the green dot) and so is `banto
@@ -1442,7 +1443,7 @@ A Worker added later gets the mean of the others' height.
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
 | `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
-| `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows `Esc again to quit — N session(s) not idle` (`M session(s) running a background command` for sessions whose only reason is such a command, both separated by a comma when both are there) and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
+| `q`/`Esc` (list focused) | Quit — at once when every hosted session is known to be idle (or none is hosted); otherwise the first press only shows the sessions it counts, each with its reason, for example `Esc again to quit — 2 not idle: a (unknown), b (busy)`, background commands as `(bg)` or `2 in background: x, y` (the forms and the naming are in "Is it idle? (the quit question)") and a second `q`/`Esc` within 3 seconds quits, since quitting ends every hosted process. N counts hosted sessions (staged or off-stage, collapsed tiles included) that are not known idle; "Is it idle? (the quit question)" below says what that is. Any other key, a mouse press, the focus leaving the list, every session becoming known idle or the window running out drops the prompt silently. Esc stays one of the two keys because an IME swallows `q`. Once quitting is decided the status line reads `Closing — ending N session(s)…` until the process exits. |
 | prefix chord (`Ctrl+B` default, `[keys] prefix` in config.toml), from sidebar or pane, then: | |
 | … `o`/`Tab` | cycle focus through sidebar and panes |
 | … arrows | directional pane navigation |
@@ -1555,7 +1556,15 @@ quit asks; the brigade bell stays silent). Background is not a fourth answer to 
 question "could ending a session lose work in flight": every reader that asks it
 takes background as not idle (`Quiescence::is_working`: the quit count and the
 brigade's quiet watch), and only the tile and the quit prompt tell it apart. The
-shell gathers it about once a second, just ahead
+quit prompt names each counted pane with its reason: `unknown` (nothing could be
+read of it, or it is on a dialog), `input` (given work within the last 3 seconds),
+`busy` (read as working or waiting, or as a status banto does not recognise), or
+background. The order is unknown first, because no tile marks an unknown pane, then
+input, busy and background, each group by name. A Director is named by its list
+row's title, else its token; a Worker or Goinkyo by its display name, else its
+token; any other pane as the list shows it (a placeholder not yet resolved to a
+session reads `new session`). A name is cut to 11 columns, with a `#…` suffix when
+two would read the same. The shell gathers the answers about once a second, just ahead
 of the tick, from reads the tick already makes, and hands it to the core as
 `Event::QuiescenceSampled`, which replaces the previous sample as a whole; the core
 decides, so a replay of the recorded stream gets the same answers. Every tick
@@ -1621,11 +1630,10 @@ brigade bell alike.
   the relay decides from the sample alone.
 
 One `q`/`Esc` quits when no hosted pane is counted; otherwise the first press arms
-the prompt, and the prompt says why it asks: with only panes not idle, `Esc again to
-quit — N session(s) not idle` (the words it has always had); with only panes whose
-reason is a background command, `Esc again to quit — M session(s) running a
-background command`; with both, `Esc again to quit — N session(s) not idle, M
-running a background command`. A pane is counted once: as not idle when it took
+the prompt, which names each counted pane and why it counts: `Esc again to quit — 2
+not idle: a (unknown), b (busy)`, `Esc again to quit — 2 in background: x, y` with
+only background commands, and `(bg)` beside the not-idle panes when both are there.
+A pane is counted once: as not idle when it took
 input within the window or reads not idle or unknown, as background only when the
 background command is its whole reason. The window, the second key and the ways it
 is dropped are as in the key table. The prompt is rebuilt from the current counts at

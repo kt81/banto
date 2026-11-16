@@ -264,7 +264,7 @@ fn one_session_that_is_not_idle_among_idle_ones_arms_the_prompt_with_a_count_of_
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: b (busy)")
     );
     press(
         &mut state,
@@ -284,7 +284,7 @@ fn a_session_nothing_is_known_about_asks_like_one_that_is_busy() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 2 session(s) not idle")
+        Some("Esc again to quit \u{2014} 2 not idle: a (unknown), b (unknown)")
     );
 }
 
@@ -295,7 +295,7 @@ fn before_any_sample_every_hosted_session_asks() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 2 session(s) not idle")
+        Some("Esc again to quit \u{2014} 2 not idle: a (unknown), b (unknown)")
     );
 }
 
@@ -357,7 +357,7 @@ fn the_prompt_follows_the_samples_and_goes_when_the_count_reaches_zero() {
     press(&mut state, &mut app, KeyCode::Esc, at);
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 2 session(s) not idle")
+        Some("Esc again to quit \u{2014} 2 not idle: a (busy), b (busy)")
     );
 
     sample(
@@ -368,7 +368,7 @@ fn the_prompt_follows_the_samples_and_goes_when_the_count_reaches_zero() {
     );
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle"),
+        Some("Esc again to quit \u{2014} 1 not idle: b (busy)"),
         "rebuilt from the new sample, not stale"
     );
 
@@ -409,7 +409,7 @@ fn a_sample_replaces_the_last_one_as_a_whole() {
     );
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: b (unknown)")
     );
 }
 
@@ -430,7 +430,7 @@ fn a_pane_opened_after_the_last_sample_asks_until_the_next_one() {
     press(&mut state, &mut app, KeyCode::Esc, at);
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: fresh (unknown)")
     );
 }
 
@@ -439,7 +439,7 @@ fn a_pane_whose_key_changes_keeps_its_sample() {
     let (mut state, mut app, a, b, at) = quit_fixture();
     sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
     state.rekey_pane_state(&a, &key("a-after-discovery"));
-    assert_eq!(state.quit_counts(&app, at).not_idle, 0);
+    assert_eq!(state.quit_counts(&app, at).not_idle(), 0);
     press(&mut state, &mut app, KeyCode::Esc, at);
     assert!(app.should_quit());
 }
@@ -461,50 +461,44 @@ fn prompt_for(a_is: Quiescence, b_is: Quiescence) -> Option<String> {
 fn the_quit_prompt_says_a_background_command_apart_from_work_that_is_not_idle() {
     let dash = "\u{2014}";
     for (a, b, expected) in [
-        // Only what it always was: the same words.
+        // Only work that is not idle: the words it has always had, then who.
         (
             NotIdle,
             Idle,
-            format!("Esc again to quit {dash} 1 session(s) not idle"),
+            format!("Esc again to quit {dash} 1 not idle: a (busy)"),
         ),
         (
             Unknown,
             NotIdle,
-            format!("Esc again to quit {dash} 2 session(s) not idle"),
+            format!("Esc again to quit {dash} 2 not idle: a (unknown), b (busy)"),
         ),
         // Only background commands: said as that.
         (
             Background,
             Idle,
-            format!("Esc again to quit {dash} 1 session(s) running a background command"),
+            format!("Esc again to quit {dash} 1 in background: a"),
         ),
         (
             Background,
             Background,
-            format!("Esc again to quit {dash} 2 session(s) running a background command"),
+            format!("Esc again to quit {dash} 2 in background: a, b"),
         ),
         // Both, and either order of the panes says the same.
         (
             NotIdle,
             Background,
-            format!(
-                "Esc again to quit {dash} 1 session(s) not idle, 1 running a background command"
-            ),
+            format!("Esc again to quit {dash} 1 not idle, 1 in background: a (busy), b (bg)"),
         ),
         (
             Background,
             NotIdle,
-            format!(
-                "Esc again to quit {dash} 1 session(s) not idle, 1 running a background command"
-            ),
+            format!("Esc again to quit {dash} 1 not idle, 1 in background: b (busy), a (bg)"),
         ),
         // A pane nothing is known about is not idle, as it always was.
         (
             Unknown,
             Background,
-            format!(
-                "Esc again to quit {dash} 1 session(s) not idle, 1 running a background command"
-            ),
+            format!("Esc again to quit {dash} 1 not idle, 1 in background: a (unknown), b (bg)"),
         ),
     ] {
         assert_eq!(
@@ -543,7 +537,7 @@ fn the_prompt_follows_a_background_command_through_to_its_end() {
     press(&mut state, &mut app, KeyCode::Esc, at);
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 2 session(s) running a background command")
+        Some("Esc again to quit \u{2014} 2 in background: a, b")
     );
     // One of them ends its command, the other starts a turn: rebuilt each time.
     sample(
@@ -554,7 +548,7 @@ fn the_prompt_follows_a_background_command_through_to_its_end() {
     );
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: b (busy)")
     );
     sample(
         &mut state,
@@ -564,7 +558,7 @@ fn the_prompt_follows_a_background_command_through_to_its_end() {
     );
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle, 1 running a background command")
+        Some("Esc again to quit \u{2014} 1 not idle, 1 in background: b (busy), a (bg)")
     );
     sample(
         &mut state,
@@ -586,11 +580,11 @@ fn a_background_pane_that_was_just_typed_into_counts_as_not_idle_for_the_window(
     for (after, expected) in [
         (
             QUIT_RECENT_INPUT_WINDOW - Duration::from_millis(1),
-            "Esc again to quit \u{2014} 1 session(s) not idle",
+            "Esc again to quit \u{2014} 1 not idle: a (input)",
         ),
         (
             QUIT_RECENT_INPUT_WINDOW,
-            "Esc again to quit \u{2014} 1 session(s) running a background command",
+            "Esc again to quit \u{2014} 1 in background: a",
         ),
     ] {
         let (mut state, mut app, a, b, at) = quit_fixture();
@@ -623,7 +617,7 @@ fn a_pane_is_counted_once_whatever_it_is_read_as() {
     press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle, 1 running a background command")
+        Some("Esc again to quit \u{2014} 1 not idle, 1 in background: a (input), b (bg)")
     );
 }
 
@@ -653,6 +647,470 @@ fn the_prompt_window_and_its_drop_rules_are_the_same_for_a_background_command() 
         at + QUIT_CONFIRM_WINDOW + SECOND,
     );
     assert_eq!(state.displayed_status(), None);
+}
+
+// --- the quit question names what it counts ------------------------------------
+
+/// A session row whose list title is `title`.
+fn titled(id: &str, title: &str) -> SessionRow {
+    SessionRow {
+        title: Some(title.to_string()),
+        ..row_for(id)
+    }
+}
+
+/// The question the first quit key arms with, `None` when it quit at once.
+fn asked(state: &mut EmporiumState, app: &mut App, at: Instant) -> Option<String> {
+    press(state, app, KeyCode::Esc, at);
+    if app.should_quit() {
+        return None;
+    }
+    state.displayed_status().map(str::to_string)
+}
+
+#[test]
+fn the_quit_question_names_each_session_it_counts_and_the_reason() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    let c = host_solo(&mut state, "c");
+    app.replace_rows(vec![
+        titled("a", "review"),
+        titled("b", "build"),
+        titled("c", "docs"),
+    ]);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, Unknown), (&b, NotIdle), (&c, Idle)],
+        at,
+    );
+    // Idle `c` is not named: the question is about what a quit would end.
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some("Esc again to quit \u{2014} 2 not idle: review (unknown), build (busy)")
+    );
+}
+
+#[test]
+fn a_session_that_took_input_is_named_by_the_input_not_by_what_the_sample_read() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    app.replace_rows(vec![titled("a", "typed into"), titled("b", "working")]);
+    // Both are read as busy, but only `a` was typed into: quit_counts counts it
+    // by the input first, so the input is the reason it names.
+    sample(&mut state, &mut app, &[(&a, NotIdle), (&b, NotIdle)], at);
+    state.last_given_input.insert(a.clone(), at);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             typed into (input), working (busy)"
+        )
+    );
+}
+
+#[test]
+fn a_pane_banto_typed_into_is_named_by_the_input_even_when_idle() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    sample(&mut state, &mut app, &[(&a, Idle), (&b, Idle)], at);
+    state.last_prompted.insert(b.clone(), at);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some("Esc again to quit \u{2014} 1 not idle: b (input)")
+    );
+}
+
+#[test]
+fn a_background_session_is_named_in_its_own_group() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    let c = host_solo(&mut state, "c");
+    app.replace_rows(vec![titled("a", "impl"), titled("b", "docs")]);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, NotIdle), (&b, Background), (&c, Background)],
+        at,
+    );
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 1 not idle, 2 in background: impl (busy), c (bg), docs (bg)"
+        )
+    );
+    // Only background: the group stands alone.
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    app.replace_rows(vec![titled("a", "docs")]);
+    sample(&mut state, &mut app, &[(&a, Background), (&b, Idle)], at);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some("Esc again to quit \u{2014} 1 in background: docs")
+    );
+}
+
+#[test]
+fn a_brigade_member_is_named_by_its_display_name_else_its_token() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let named = host(&mut state, 1, "worker-1", "w1");
+    let bare = host(&mut state, 1, "worker-2", "w2");
+    let director = host(&mut state, 1, DIRECTOR_TOKEN, "dir");
+    // The list's own title for a Worker is not what a brigade calls it.
+    app.replace_rows(vec![titled("w1", "a long transcript title")]);
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&named, NotIdle), (&bare, Unknown), (&director, NotIdle)],
+        at,
+    );
+    // After the tick: it carries the store's roster, which replaces what was stated.
+    state.state_member_name(1, "worker-1", Some("impl"));
+    state.resolve_member_names(1);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 3 not idle: \
+             worker-2 (unknown), director (busy), impl (busy)"
+        )
+    );
+}
+
+#[test]
+fn a_pane_the_list_has_no_row_for_is_named_by_its_id_and_a_placeholder_as_a_new_session() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    let fresh = SessionKey::new_worker(1, "worker-3");
+    state.screens.insert(fresh.clone(), Screen::new(24, 80));
+    // Not the Worker's own name: the pane belongs to no brigade here.
+    assert!(fresh.is_synthetic());
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, NotIdle), (&b, Idle), (&fresh, Unknown)],
+        at,
+    );
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             new session (unknown), a (busy)"
+        )
+    );
+}
+
+#[test]
+fn a_long_or_wide_name_is_cut_to_a_budget_and_a_long_list_is_not_cut() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    let long = "x".repeat(80);
+    app.replace_rows(vec![titled("a", &long), titled("b", "\u{5b9f}\u{88c5}")]);
+    let mut samples = vec![(a.clone(), NotIdle), (b.clone(), NotIdle)];
+    for n in 0..4 {
+        let pane = host_solo(&mut state, &format!("more-{n}"));
+        samples.push((pane, NotIdle));
+    }
+    let borrowed: Vec<(&SessionKey, Quiescence)> = samples.iter().map(|(k, q)| (k, *q)).collect();
+    sample(&mut state, &mut app, &borrowed, at);
+    let text = asked(&mut state, &mut app, at).expect("asks");
+    // Sorted by name: the four `more-N` ids, the cut title, then the wide one.
+    // Every session is named: the status bar clips, the question does not.
+    assert_eq!(
+        text,
+        "Esc again to quit \u{2014} 6 not idle: more-0 (busy), more-1 (busy), \
+         more-2 (busy), more-3 (busy), xxxxxxxxxx\u{2026} (busy), \u{5b9f}\u{88c5} (busy)"
+    );
+    // The cut itself: one name alone shows the ellipsis within the budget.
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    app.replace_rows(vec![titled("a", &long)]);
+    sample(&mut state, &mut app, &[(&a, NotIdle), (&b, Idle)], at);
+    let text = asked(&mut state, &mut app, at).expect("asks");
+    let name = text
+        .strip_prefix("Esc again to quit \u{2014} 1 not idle: ")
+        .and_then(|rest| rest.strip_suffix(" (busy)"))
+        .expect("one named session");
+    assert!(name.ends_with('\u{2026}'), "{name:?}");
+    assert!(
+        unicode_width::UnicodeWidthStr::width(name) <= super::QUIT_NAME_COLUMNS,
+        "{name:?}"
+    );
+}
+
+#[test]
+fn the_names_are_in_name_order_whichever_order_the_panes_were_hosted() {
+    let mut texts = Vec::new();
+    for ids in [["a", "b", "c"], ["c", "b", "a"], ["b", "c", "a"]] {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(Vec::new());
+        let panes: Vec<SessionKey> = ids.iter().map(|id| host_solo(&mut state, id)).collect();
+        // Two panes with one title are told apart by their ids, whichever came first.
+        app.replace_rows(vec![
+            titled("a", "same"),
+            titled("b", "same"),
+            titled("c", "alpha"),
+        ]);
+        state.focus = Focus::Sidebar;
+        let at = t0();
+        tick(&mut state, &mut app, at);
+        let samples: Vec<(&SessionKey, Quiescence)> = panes.iter().map(|k| (k, NotIdle)).collect();
+        sample(&mut state, &mut app, &samples, at);
+        texts.push(asked(&mut state, &mut app, at).expect("asks"));
+    }
+    assert!(texts.windows(2).all(|pair| pair[0] == pair[1]), "{texts:?}");
+    assert_eq!(
+        texts[0],
+        "Esc again to quit \u{2014} 3 not idle: \
+         alpha (busy), same #a (busy), same #b (busy)"
+    );
+}
+
+#[test]
+fn the_names_are_in_order_of_diagnostic_value_unknown_then_input_then_busy_then_background() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    let c = host_solo(&mut state, "c");
+    let d = host_solo(&mut state, "d");
+    let e = host_solo(&mut state, "e");
+    let f = host_solo(&mut state, "f");
+    app.replace_rows(vec![
+        titled("a", "a-busy"),
+        titled("b", "b-unknown"),
+        titled("c", "c-bg"),
+        titled("d", "d-input"),
+        titled("e", "e-unknown"),
+        titled("f", "f-busy"),
+    ]);
+    sample(
+        &mut state,
+        &mut app,
+        &[
+            (&a, NotIdle),
+            (&b, Unknown),
+            (&c, Background),
+            (&d, Idle),
+            (&e, Unknown),
+            (&f, NotIdle),
+        ],
+        at,
+    );
+    state.last_given_input.insert(d.clone(), at);
+    // Both counts first, so a clipped line still says how much is at stake; then
+    // one list, the least explained first, by name inside a reason.
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 5 not idle, 1 in background: b-unknown (unknown), \
+             e-unknown (unknown), d-input (input), a-busy (busy), f-busy (busy), c-bg (bg)"
+        )
+    );
+}
+
+#[test]
+fn a_directors_row_title_names_it_and_a_director_without_a_row_is_named_by_its_token() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let titled_director = host(&mut state, 1, DIRECTOR_TOKEN, "dir1");
+    let bare_director = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
+    app.replace_rows(vec![titled("dir1", "fix relay")]);
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&titled_director, NotIdle), (&bare_director, NotIdle)],
+        at,
+    );
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             director (busy), fix relay (busy)"
+        )
+    );
+}
+
+#[test]
+fn two_brigades_whose_directors_both_count_never_read_the_same() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let first = host(&mut state, 1, DIRECTOR_TOKEN, "dir1");
+    let second = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
+    let at = t0();
+    state.focus = Focus::Sidebar;
+    // Both sessions carry one title, as two Directors started from one prompt do.
+    app.replace_rows(vec![titled("dir1", "same job"), titled("dir2", "same job")]);
+    sample(
+        &mut state,
+        &mut app,
+        &[(&first, NotIdle), (&second, Unknown)],
+        at,
+    );
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             same job #2 (unknown), same job #1 (busy)"
+        )
+    );
+
+    // No rows: both read `director`, and the brigade number tells them apart.
+    let mut app = App::new(Vec::new());
+    state.pending_quit = None;
+    sample(
+        &mut state,
+        &mut app,
+        &[(&first, NotIdle), (&second, NotIdle)],
+        at,
+    );
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             director #1 (busy), director #2 (busy)"
+        )
+    );
+}
+
+#[test]
+fn members_of_different_brigades_with_one_token_are_told_apart_by_the_brigade_number() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let one = host(&mut state, 1, "worker-1", "w1");
+    let two = host(&mut state, 2, "worker-1", "w2");
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&one, NotIdle), (&two, NotIdle)],
+        at,
+    );
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             worker-1 #1 (busy), worker-1 #2 (busy)"
+        )
+    );
+}
+
+#[test]
+fn where_the_brigade_number_would_not_tell_two_apart_the_session_id_does() {
+    // One brigade's Director, titled `x`, and its Worker, named `x`: the same
+    // name and the same brigade number.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let director = host(&mut state, 1, DIRECTOR_TOKEN, "director-session-1234");
+    let worker = host(&mut state, 1, "worker-1", "worker-session-5678");
+    app.replace_rows(vec![titled("director-session-1234", "x")]);
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&director, NotIdle), (&worker, NotIdle)],
+        at,
+    );
+    state.state_member_name(1, "worker-1", Some("x"));
+    state.resolve_member_names(1);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 2 not idle: \
+             x #1234 (busy), x #5678 (busy)"
+        )
+    );
+}
+
+#[test]
+fn a_suffix_fits_inside_the_name_budget_by_cutting_the_name_shorter() {
+    // Two titles as wide as a name may be, and two longer ones that read the same
+    // once cut: each pair collides, and the suffix is paid for out of the name.
+    for (first, second) in [
+        (
+            "n".repeat(super::QUIT_NAME_COLUMNS),
+            "n".repeat(super::QUIT_NAME_COLUMNS),
+        ),
+        ("n".repeat(30), "n".repeat(40)),
+    ] {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(Vec::new());
+        let a = host_solo(&mut state, "a");
+        let b = host_solo(&mut state, "b");
+        app.replace_rows(vec![titled("a", &first), titled("b", &second)]);
+        state.focus = Focus::Sidebar;
+        let at = t0();
+        sample(&mut state, &mut app, &[(&a, NotIdle), (&b, NotIdle)], at);
+        let text = asked(&mut state, &mut app, at).expect("asks");
+        let cut = "n".repeat(super::QUIT_NAME_COLUMNS - " #a".len() - 1);
+        assert_eq!(
+            text,
+            format!(
+                "Esc again to quit \u{2014} 2 not idle: \
+                 {cut}\u{2026} #a (busy), {cut}\u{2026} #b (busy)"
+            )
+        );
+        let list = text
+            .strip_prefix("Esc again to quit \u{2014} 2 not idle: ")
+            .unwrap();
+        for entry in list.split(", ") {
+            let name = entry.strip_suffix(" (busy)").expect("a reason");
+            assert!(
+                unicode_width::UnicodeWidthStr::width(name) <= super::QUIT_NAME_COLUMNS,
+                "{name:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_suffix_never_makes_a_name_read_like_another_sessions_untouched_name() {
+    // Two brigades' Directors are both titled `review`, and an unrelated session is
+    // already titled `review #1`: the brigade-number suffix would give the first
+    // Director that very name.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let first = host(&mut state, 1, DIRECTOR_TOKEN, "dir1");
+    let second = host(&mut state, 2, DIRECTOR_TOKEN, "dir2");
+    let plain = host_solo(&mut state, "plain");
+    app.replace_rows(vec![
+        titled("dir1", "review"),
+        titled("dir2", "review"),
+        titled("plain", "review #1"),
+    ]);
+    state.focus = Focus::Sidebar;
+    let at = t0();
+    sample(
+        &mut state,
+        &mut app,
+        &[(&first, NotIdle), (&second, NotIdle), (&plain, NotIdle)],
+        at,
+    );
+    // The session that was already called `review #1` keeps its name; the one
+    // that would have collided with it moves on to its id.
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some(
+            "Esc again to quit \u{2014} 3 not idle: \
+             review #1 (busy), review #2 (busy), revi… #dir1 (busy)"
+        )
+    );
+}
+
+#[test]
+fn the_armed_question_follows_what_the_next_sample_says_about_the_same_sessions() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    app.replace_rows(vec![titled("a", "review")]);
+    sample(&mut state, &mut app, &[(&a, Unknown), (&b, Idle)], at);
+    assert_eq!(
+        asked(&mut state, &mut app, at).as_deref(),
+        Some("Esc again to quit \u{2014} 1 not idle: review (unknown)")
+    );
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a, NotIdle), (&b, Idle)],
+        at + SECOND,
+    );
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 1 not idle: review (busy)")
+    );
 }
 
 // --- the closing line -------------------------------------------------------
@@ -3553,7 +4011,7 @@ fn a_key_just_forwarded_to_a_pane_counts_it_as_not_idle_whatever_its_sample_says
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: a (input)")
     );
 }
 
@@ -3597,7 +4055,7 @@ fn a_paste_into_a_pane_counts_too() {
     press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: a (input)")
     );
 }
 
@@ -3618,7 +4076,7 @@ fn the_prefix_sent_through_literally_counts_too() {
     press(&mut state, &mut app, KeyCode::Esc, at + SECOND);
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: a (input)")
     );
 }
 
@@ -4255,7 +4713,7 @@ fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: worker-1 (input)")
     );
 }
 
@@ -4528,7 +4986,7 @@ fn the_retry_enter_of_a_kickoff_counts_the_pane_for_the_quit_question() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: goinkyo-re… (input)")
     );
 
     // After the window the sample alone decides again.
@@ -6193,14 +6651,20 @@ fn nothing_the_brigade_kept_outlives_its_disband() {
     assert!(matches!(&state.stage, Stage::Solo(key) if key == &director));
     // The quit question is per screen and does not care about the brigade: the
     // former Director counts by its own sample.
-    assert_eq!(state.quit_counts(&app, idle_from + 60 * SECOND).not_idle, 0);
+    assert_eq!(
+        state.quit_counts(&app, idle_from + 60 * SECOND).not_idle(),
+        0
+    );
     sample(
         &mut state,
         &mut app,
         &[(&director, NotIdle)],
         idle_from + 61 * SECOND,
     );
-    assert_eq!(state.quit_counts(&app, idle_from + 61 * SECOND).not_idle, 1);
+    assert_eq!(
+        state.quit_counts(&app, idle_from + 61 * SECOND).not_idle(),
+        1
+    );
 }
 
 // --- the bell decides from what was observed in this tick ----------------------------------
@@ -7541,7 +8005,7 @@ fn the_row_coming_back_as_codex_makes_the_kept_report_count_again() {
     assert!(!quits_at_once(&mut state, &mut app, at + 3 * SECOND));
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: cx (busy)")
     );
 }
 
@@ -8015,7 +8479,7 @@ fn a_dialog_open_session_still_asks_at_quit_and_is_not_idle_for_the_relay() {
     assert!(!app.should_quit());
     assert_eq!(
         state.displayed_status(),
-        Some("Esc again to quit \u{2014} 1 session(s) not idle")
+        Some("Esc again to quit \u{2014} 1 not idle: worker-1 (unknown)")
     );
 }
 
@@ -8467,7 +8931,7 @@ fn the_brigade_watch_and_the_quit_question_follow_the_same_decision_when_a_confl
         conflict_at,
     );
     assert_eq!(state.quiescence_of(&app, &worker), Idle);
-    assert_eq!(state.quit_counts(&app, conflict_at).not_idle, 0);
+    assert_eq!(state.quit_counts(&app, conflict_at).not_idle(), 0);
     let rang_at = tick_each_second_until(
         &mut state,
         &mut app,
@@ -8855,7 +9319,7 @@ fn a_key_typed_into_a_pane_does_not_make_its_word_busy_for_the_quit_windows_thre
     state.focus = Focus::Pane;
     press(&mut state, &mut app, KeyCode::Char('x'), at + SECOND);
     // The quit question asks (it counts a pane that just took input) ...
-    assert_eq!(state.quit_counts(&app, at + SECOND).not_idle, 1);
+    assert_eq!(state.quit_counts(&app, at + SECOND).not_idle(), 1);
     // ... and the word does not follow it.
     assert_eq!(state.pane_word(&app, &pane), Some(Alive));
 }
@@ -8990,7 +9454,7 @@ fn the_live_word_of_a_member_never_feeds_the_quit_question_or_the_watch() {
     // file says waiting but whose sample says idle is idle for both.
     let (state, app, worker, _) = rowless_claude_worker(live(Waiting, false));
     assert_eq!(state.quiescence_of(&app, &worker), Idle);
-    assert_eq!(state.quit_counts(&app, t0()).not_idle, 0);
+    assert_eq!(state.quit_counts(&app, t0()).not_idle(), 0);
 }
 
 // --- S1: an off-stage brigade speaks through its Director's row --------------------------------
@@ -9132,7 +9596,7 @@ fn a_marked_directors_row_does_not_make_its_brigade_not_idle_for_the_quit_questi
     for code in [KeyCode::Esc, KeyCode::Char('q')] {
         let (mut state, mut app, director, _worker, fired_at) = marked_fixture();
         assert_eq!(state.quiescence_of(&app, &director), Idle);
-        assert_eq!(state.quit_counts(&app, fired_at + SECOND).not_idle, 0);
+        assert_eq!(state.quit_counts(&app, fired_at + SECOND).not_idle(), 0);
         press(&mut state, &mut app, code, fired_at + SECOND);
         assert!(
             app.should_quit(),

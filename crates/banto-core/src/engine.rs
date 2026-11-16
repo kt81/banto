@@ -331,6 +331,19 @@ const PROCESS_START_GRACE: Duration = Duration::from_secs(10);
 /// "idle" and one `q` quits on it.
 const QUIT_RECENT_INPUT_WINDOW: Duration = Duration::from_secs(3);
 
+/// The longest a session's name is in the quit question, suffix included, in
+/// display columns (but for [`tell_apart`]'s whole-id last resort, which exceeds
+/// it to stay unique). The question is one status line that does not wrap, and
+/// beside a counts segment as wide as `[999/9999]` an 80-column terminal leaves
+/// it 70. The mixed head with one-digit counts ("Esc again to quit — 2 not idle,
+/// 1 in background: ") takes 49 of them, and the first entry must still fit
+/// whole with the longest reason, ` (unknown)`: 49 + 11 + 10 = 70. Two-digit
+/// counts do not fit: "10 not idle, 1 in background" makes it 71, and the reason
+/// loses its end. Accepted: ten sessions not idle at quit is rare, and the count
+/// in front still says how many. A wider budget lets one long title push its own
+/// reason off the line.
+const QUIT_NAME_COLUMNS: usize = 11;
+
 /// How soon after the first tick the data directory is swept for the first time,
 /// and then how often. Purely periodic: the sweep only deletes files that have
 /// been idle for `banto_io::data_dir::GRACE` (half an hour), so nothing a
@@ -2520,19 +2533,80 @@ impl EmporiumState {
     /// its quiet stretch from banto's own writes
     /// ([`EmporiumState::last_prompted`]) and arms on the operator's input only
     /// through [`EmporiumState::was_given_work`].
+    ///
+    /// Each counted pane carries the name and reason the question prints
+    /// ([`QuitCounts`]), decided here with the count so the two cannot drift: the
+    /// first condition a pane meets is its reason.
     fn quit_counts(&self, app: &App, now: Instant) -> QuitCounts {
-        let mut counts = QuitCounts::default();
+        let mut counted: Vec<(&SessionKey, QuitKind)> = Vec::new();
         for key in self.screens.keys() {
             let reading = self.quiescence_of(app, key);
-            if self.took_input_recently(key, now) {
-                counts.not_idle += 1;
+            let kind = if self.took_input_recently(key, now) {
+                QuitKind::NotIdle(QuitReason::Input)
             } else if reading == Quiescence::Background {
-                counts.background += 1;
+                QuitKind::Background
+            } else if reading == Quiescence::Unknown {
+                QuitKind::NotIdle(QuitReason::Unknown)
             } else if reading != Quiescence::Idle {
-                counts.not_idle += 1;
-            }
+                QuitKind::NotIdle(QuitReason::Busy)
+            } else {
+                continue;
+            };
+            counted.push((key, kind));
         }
-        counts
+        let panes: Vec<QuitPane> = counted
+            .iter()
+            .map(|(key, _)| QuitPane {
+                name: self.quit_name(app, key),
+                brigade: self
+                    .member_tokens
+                    .contains_key(*key)
+                    .then(|| self.member_brigades.get(*key))
+                    .flatten()
+                    .map(ToString::to_string),
+                id: key.as_str(),
+            })
+            .collect();
+        let mut entries: Vec<QuitEntry> = counted
+            .iter()
+            .zip(tell_apart(&panes))
+            .map(|((_, kind), name)| QuitEntry { kind: *kind, name })
+            .collect();
+        // The panes come out of a hash map, so the order is made here ([`QuitKind`]
+        // says which). Two entries that share a kind and a name cannot exist, so
+        // nothing else needs to break a tie.
+        entries.sort();
+        QuitCounts { entries }
+    }
+
+    /// What the quit question calls a hosted pane, whole: [`tell_apart`] cuts it.
+    /// A Director is what the list shows for its row: the title, else its token
+    /// (the row's id would be a uuid). Any other member is what its brigade calls
+    /// it ([`Self::member_call`]'s rule without the quotes: its display name, else
+    /// its token), since that is what the Director says and a Worker has no row in
+    /// the list. A pane that is no member is what the list shows for it: its
+    /// title, else its id; a placeholder not yet resolved to a session has
+    /// neither, so it is a "new session". Sanitised like every other name that
+    /// reaches the bar.
+    fn quit_name(&self, app: &App, key: &SessionKey) -> String {
+        let row = || app.row_for_id(key.as_str());
+        let called = match self.member_tokens.get(key) {
+            Some(token) if token == DIRECTOR_TOKEN => row()
+                .and_then(|row| row.title.as_deref())
+                .and_then(display_name)
+                .unwrap_or_else(|| token.clone()),
+            Some(token) => self
+                .member_brigades
+                .get(key)
+                .and_then(|id| self.member_display_name(*id, token))
+                .unwrap_or(token)
+                .to_string(),
+            None if key.is_synthetic() => "new session".to_string(),
+            None => row()
+                .map_or(key.as_str(), |row| row.display_title())
+                .to_string(),
+        };
+        display_name(&called).unwrap_or_else(|| key.as_str().to_string())
     }
 
     /// Whether banto still intends to type a kickoff into `key`'s pane: a Codex
@@ -2693,37 +2767,200 @@ struct PendingQuit {
     prompt: String,
 }
 
-/// How many hosted panes a quit would end that are worth asking about, told apart
-/// by why ([`EmporiumState::quit_counts`]).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// The hosted panes a quit would end that are worth asking about, each by name
+/// and told apart by why ([`EmporiumState::quit_counts`]), in the order the
+/// question lists them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct QuitCounts {
-    /// Not known to be idle for any reason but the one below.
-    not_idle: usize,
-    /// Idle but for a background command that is still running.
-    background: usize,
+    entries: Vec<QuitEntry>,
 }
 
 impl QuitCounts {
-    fn is_empty(self) -> bool {
-        self.not_idle == 0 && self.background == 0
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Not known to be idle for any reason but a background command.
+    fn not_idle(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, QuitKind::NotIdle(_)))
+            .count()
+    }
+
+    /// Idle but for a background command that is still running.
+    fn background(&self) -> usize {
+        self.entries.len() - self.not_idle()
     }
 }
 
-/// The question a first quit key asks. Only not-idle sessions: the words it has
-/// always had. A background command is named as that, so the operator can tell a
-/// turn in flight from a command left running, and both are said when both are
-/// there.
-fn quit_prompt(counts: QuitCounts) -> String {
-    let QuitCounts {
-        not_idle,
-        background,
-    } = counts;
-    let what = match (not_idle, background) {
-        (_, 0) => format!("{not_idle} session(s) not idle"),
-        (0, _) => format!("{background} session(s) running a background command"),
-        _ => format!("{not_idle} session(s) not idle, {background} running a background command"),
+/// One counted pane. Ordered as the question lists them: by kind, then name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct QuitEntry {
+    kind: QuitKind,
+    name: String,
+}
+
+/// Why a hosted pane is in the quit question, and the order the question lists
+/// them in: `Unknown`, `Input`, `Busy`, then background commands, each by name.
+///
+/// The status line is one line and what does not fit goes off its end, so the
+/// first entry is the one most likely to be read whole ([`QUIT_NAME_COLUMNS`]
+/// says when it is), and the order puts the likeliest culprit there. That is
+/// `Unknown`: nothing was read of that pane, and no tile marks it
+/// the way a turn in flight or a background command is marked, so the operator
+/// has nothing else to go by. `Input` is next because the operator just typed to
+/// it and the sample has not caught up; a pane read as `Busy` is the one the
+/// tiles already show working, and a background command is known and has its own
+/// mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QuitKind {
+    NotIdle(QuitReason),
+    Background,
+}
+
+/// Why a pane counts as not idle for the quit question. The one the count went
+/// by: a pane that took input is `Input` whatever the sample says of it. The
+/// variants are in the order [`QuitKind`] lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QuitReason {
+    /// Nothing was read of it: no sample, no live file, no report.
+    Unknown,
+    /// It was given input within [`QUIT_RECENT_INPUT_WINDOW`], which the sample
+    /// may not show yet.
+    Input,
+    /// The sample reads it as working, waiting, or in a dialog it has no word for.
+    Busy,
+}
+
+impl QuitReason {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Input => "input",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+/// What [`tell_apart`] needs of a counted pane to name it.
+struct QuitPane<'a> {
+    /// What the pane is called, whole.
+    name: String,
+    /// Its brigade's number, when it is a brigade member.
+    brigade: Option<String>,
+    /// Its session id: what is never shared between two panes.
+    id: &'a str,
+}
+
+/// The last form of [`QuitPane::tag`]: the whole id.
+const QUIT_LAST_TAG: usize = 4;
+
+impl QuitPane<'_> {
+    /// What tells this pane from another of the same name, at `level` (the more
+    /// it takes to tell them apart, the further it goes): its brigade's number
+    /// (a pane that has none starts at the id's last four characters), those
+    /// again, the last eight, then the whole id. A uuid differs at its end, so a
+    /// short tail is almost always enough; the whole id is for when it is not, and
+    /// is the one form that cannot repeat.
+    fn tag(&self, level: usize) -> Option<String> {
+        let tail = |chars: usize| {
+            let skip = self.id.chars().count().saturating_sub(chars);
+            self.id.chars().skip(skip).collect::<String>()
+        };
+        match level {
+            0 => None,
+            1 => Some(self.brigade.clone().unwrap_or_else(|| tail(4))),
+            2 => Some(tail(4)),
+            3 => Some(tail(8)),
+            _ => Some(self.id.to_string()),
+        }
+    }
+
+    /// The name as the question prints it at `level`: cut so that name and
+    /// suffix together stay within [`QUIT_NAME_COLUMNS`] (the whole-id form is
+    /// the one thing allowed to exceed it, as it must stay unique).
+    fn shown(&self, level: usize) -> String {
+        match self.tag(level) {
+            None => shorten_to_columns(&self.name, QUIT_NAME_COLUMNS),
+            Some(tag) => {
+                let suffix = format!(" #{tag}");
+                let room = QUIT_NAME_COLUMNS
+                    .saturating_sub(unicode_width::UnicodeWidthStr::width(suffix.as_str()));
+                format!("{}{suffix}", shorten_to_columns(&self.name, room))
+            }
+        }
+    }
+}
+
+/// The names the question prints for `panes`, in their order, no two alike.
+///
+/// Two Directors started from one prompt, or a `worker-1` in each of two
+/// brigades, share a name; so do two long titles that read the same once cut. A
+/// pane whose cut name another's shares takes a suffix ([`QuitPane::tag`]), and
+/// the next form where that still collides. Uniqueness is of everything the
+/// question prints, so a suffix that makes a pane read like another's name is
+/// one more collision: the pane that has the suffix moves on, and the one that
+/// had that name already, and had nothing wrong with it, keeps it.
+fn tell_apart(panes: &[QuitPane]) -> Vec<String> {
+    let mut levels = vec![0; panes.len()];
+    loop {
+        let names: Vec<String> = panes
+            .iter()
+            .zip(&levels)
+            .map(|(pane, level)| pane.shown(*level))
+            .collect();
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (at, name) in names.iter().enumerate() {
+            groups.entry(name).or_default().push(at);
+        }
+        let mut moved = false;
+        for group in groups.values().filter(|group| group.len() > 1) {
+            let can_move = |at: &&usize| levels[**at] < QUIT_LAST_TAG;
+            let mut movers: Vec<usize> = group
+                .iter()
+                .filter(can_move)
+                .filter(|at| levels[**at] > 0)
+                .copied()
+                .collect();
+            if movers.is_empty() {
+                movers = group.iter().filter(can_move).copied().collect();
+            }
+            for at in movers {
+                levels[at] += 1;
+                moved = true;
+            }
+        }
+        if !moved {
+            return names;
+        }
+    }
+}
+
+/// The question a first quit key asks: how many sessions, then which and why.
+///
+/// Every count comes before any name, so a line that gets cut still says how
+/// much is at stake; then one list in [`QuitKind`]'s order. The heads are one
+/// family, short because the first entry has to fit after them. A background
+/// command is told from work that is not idle by the head when it is alone and
+/// by `(bg)` when it is in the one list with the others.
+fn quit_prompt(counts: &QuitCounts) -> String {
+    let (not_idle, background) = (counts.not_idle(), counts.background());
+    let head = match (not_idle, background) {
+        (_, 0) => format!("{not_idle} not idle"),
+        (0, _) => format!("{background} in background"),
+        _ => format!("{not_idle} not idle, {background} in background"),
     };
-    format!("Esc again to quit \u{2014} {what}")
+    let list: Vec<String> = counts
+        .entries
+        .iter()
+        .map(|entry| match entry.kind {
+            QuitKind::NotIdle(reason) => format!("{} ({})", entry.name, reason.word()),
+            QuitKind::Background if not_idle > 0 => format!("{} (bg)", entry.name),
+            QuitKind::Background => entry.name.clone(),
+        })
+        .collect();
+    format!("Esc again to quit \u{2014} {head}: {}", list.join(", "))
 }
 
 /// A configured tmux-style prefix chord (`[keys] prefix` in config.toml —
@@ -4162,7 +4399,7 @@ fn settle_pending_quit(state: &mut EmporiumState, app: &App, now: Instant) {
     {
         state.pending_quit = None;
     } else {
-        pending.prompt = quit_prompt(counts);
+        pending.prompt = quit_prompt(&counts);
     }
 }
 
@@ -5356,7 +5593,7 @@ fn update_key(
                     } else {
                         state.pending_quit = Some(PendingQuit {
                             at: now,
-                            prompt: quit_prompt(counts),
+                            prompt: quit_prompt(&counts),
                         });
                     }
                     Vec::new()
@@ -27166,7 +27403,10 @@ mod tests {
             assert!(!app.should_quit(), "{first:?}: not yet");
             assert_eq!(
                 prompt(&state).as_deref(),
-                Some("Esc again to quit \u{2014} 3 session(s) not idle"),
+                Some(
+                    "Esc again to quit \u{2014} 3 not idle: \
+                     director (unknown), worker-1 (unknown), worker-2 (unknown)"
+                ),
                 "{first:?}"
             );
 
@@ -27204,7 +27444,10 @@ mod tests {
         quit_key(&mut state, &mut app, &brigade, KeyCode::Esc, now);
         assert_eq!(
             prompt(&state).as_deref(),
-            Some("Esc again to quit \u{2014} 5 session(s) not idle")
+            Some(
+                "Esc again to quit \u{2014} 5 not idle: director (unknown), \
+                 off-stage (unknown), worker-1 (unknown), worker-2 (unknown), worker-3 (unknown)"
+            )
         );
 
         // One ends during the window: the prompt is rebuilt, not stale.
@@ -27220,7 +27463,10 @@ mod tests {
         );
         assert_eq!(
             prompt(&state).as_deref(),
-            Some("Esc again to quit \u{2014} 4 session(s) not idle")
+            Some(
+                "Esc again to quit \u{2014} 4 not idle: director (unknown), \
+                 worker-1 (unknown), worker-2 (unknown), worker-3 (unknown)"
+            )
         );
     }
 

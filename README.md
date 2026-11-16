@@ -214,17 +214,26 @@ still accepted, do nothing, and will be removed.)
 One table. The first group is the list; the rest is what the panes add.
 
 `q`/`Esc` quits at once when every hosted session is known to be idle, or none is
-hosted. Otherwise it asks first: the status bar shows `Esc again to quit — N
-session(s) not idle`, and a second `q`/`Esc` within 3 seconds quits, since quitting
-ends every hosted process. N counts the sessions that are working, waiting on you,
-of unknown state, or that were given work (a key or a paste by you, or something
-typed by banto itself) within the last 3 seconds; clicking or scrolling a pane does
-not count. A Claude Code session whose turn has ended but that left a command
-running in the background asks too, and the prompt says so: `Esc again to quit — M
-session(s) running a background command`, or `Esc again to quit — N session(s) not
-idle, M running a background command` when both are there. A session is counted
-once, as not idle when it was given work in the last 3 seconds. A Claude Code
-session reports its own state, and so does a Codex one:
+hosted. Otherwise it asks first, and a second `q`/`Esc` within 3 seconds quits,
+since quitting ends every hosted process. The status bar names each session it
+counts and why, for example `Esc again to quit — 2 not idle: レビュー (unknown), 実装
+(busy)`. The reasons: `unknown` (nothing could be read of the pane, or it is on a
+dialog), `input` (given a key or a paste by you, or something typed by banto, within
+the last 3 seconds; clicking or scrolling does not count), and `busy` (read as
+working or waiting, or as a status banto does not recognise). A Claude Code session
+whose turn has ended but that left a command running in the background is counted
+too: it is `(bg)` beside sessions that are not idle (`2 not idle, 1 in background:
+a (unknown), b (busy), c (bg)`), and `2 in background: x, y` when it is alone. The
+count comes first, then the names: unknown first, because no tile marks an unknown
+pane, then input, busy and background, each group by name. A Director is named by
+its list row's title, else its token; a Worker or Goinkyo by its display name, else
+its token; any other pane as the list shows it (a placeholder not yet resolved to a
+session reads `new session`). A name is cut to 11 columns and gets a `#…` suffix when
+two would read the same (the whole-id suffix, the last resort, may go past 11). The
+question is one status line, so names past the first may be cut off; the count in
+front is always the whole
+count. A session is counted once, as not idle when it was given work in the last 3
+seconds. A Claude Code session reports its own state, and so does a Codex one:
 banto reads the status report the Codex interface writes to its terminal (working,
 blocked on you, done or idle) and, until a session has made one, its last turn in
 the rollout. Codex records nothing about a command it left running in the
