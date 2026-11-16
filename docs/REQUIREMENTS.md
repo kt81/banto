@@ -243,7 +243,9 @@ and the plan-implementation prompt ring too, not only an approval.
   0.168.0`): Codex records nothing about a command it left running after the turn
   ended — the process was alive for 108 s after `task_complete`, with no rollout or
   sqlite change and no re-invocation of the model at its end — so a Codex session
-  with no report reads as idle, and a quit can end it without asking.
+  with no report reads as idle, and a quit can end it without asking. The
+  `brigade_status` words for a Codex peer read this same marker (see
+  `brigade_status()` in the tool list), so they share the limit.
 
 4. **Later the same day: a hosted Codex pane's own state report is read.** banto
    reads it out of the pane's output: OSC 7501, the published Program Status
@@ -616,9 +618,10 @@ the session list, a row whose session is hosted here but whose own files prove n
 live process is shown as live (`App::set_hosted_ids`): a busy or waiting activity
 stands, ending the pane gives the row its own state back, a reload does not lose it,
 and the rows of sessions not hosted here are unchanged. `banto list` keeps "alive"
-for a live process, and `brigade_status` for a Codex peer is unchanged (a later
-step). A background command (`shell`) is a not-idle reading that this decision drew
-busy on a tile and the next entry draws idle with a mark.
+for a live process, and `brigade_status` for a Codex peer now reads the rollout's
+last turn marker (its words are under `brigade_status()`). A background command
+(`shell`) is a not-idle reading that this decision drew busy on a tile and the next
+entry draws idle with a mark.
 
 ## Decision (2026-11-15): a Director can tell the operator it is waiting, without stopping
 
@@ -770,7 +773,9 @@ of his for it is recorded here.
    A pane that took input in the last 3 seconds is counted as not idle, and no pane
    is counted twice.
 3. **`brigade_status` says what it is.** A shell peer prints as `idle (background
-   command running)`.
+   command running)`; a Codex peer prints `busy (turn in progress)` or `idle (turn
+   ended; background work not visible)` from its rollout, or `running` or `not
+   running` (see `brigade_status()`).
 4. **Unchanged.** The list row is still busy (the green dot) and so is `banto
    list`'s tag; the marks, counts and bells; the quiet watch and a request's
    spending of it, which treat `shell` as they treat busy; a shell member is still
@@ -2725,7 +2730,16 @@ seven tools:
   health check, added once dogfooding showed a Director launched with only
   the two message tools and no roster information mostly never used them. A Claude
   peer's state is its live file's own word (`busy`, `waiting`, `idle`), except that
-  `shell` prints as `idle (background command running)`.
+  `shell` prints as `idle (background command running)`. A Codex peer's state is
+  read from its rollout's last turn marker: `busy (turn in progress)` when a turn has
+  begun and not ended, `idle (turn ended; background work not visible)` when the last
+  one ended, `running` when it is alive with no turn record to read, and `not running`
+  when it is gone. Its limits: a background command left after a turn is not visible,
+  so such a peer reads idle; a pending approval or question is not visible either, so
+  such a peer reads busy; Codex never reads `waiting`. The hosted tile can disagree,
+  because it reads the pane's own OSC 7501 report first, and that report lives in the
+  UI process, which this tool (answered by the separate `_mcp` process) cannot see.
+  The relay's nudge reads the same rollout marker, so the nudge and this tool agree.
 - `consult_goinkyo(question, my_case, settled, unsettled, blind_spot[,
   their_case][, about])` — Director-only: files a written consultation
   request and creates the Goinkyo's member row (see "Brigade" above for what

@@ -56,6 +56,7 @@ use banto_core::model::{
 };
 use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
+use banto_io::codex_activity::is_thread_idle;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
 use banto_io::status::{
@@ -85,7 +86,8 @@ pub struct Identity {
 
 /// Per-connection state: the caller's identity, the shared store, and
 /// `claude_home` and (when available) `codex_home` — [`tool_brigade_status`]
-/// checks each product's separate live-state source. `goinkyo_dir` is where
+/// checks each product's separate source: Claude's live-state files, and for
+/// Codex its process log and rollout. `goinkyo_dir` is where
 /// [`tool_consult_goinkyo`] writes a consultation request; `None` when the
 /// platform's data-local directory couldn't be determined (see
 /// `banto_io::data_dir::DataDir::default_root`, the same fallibility). `message_log` is
@@ -267,9 +269,10 @@ fn tools_list_result() -> Value {
             {
                 "name": "brigade_status",
                 "description": "Who you are in this brigade, who your peers are, and what each \
-                                of them is doing right now (idle, busy or waiting; just running, \
-                                for a peer banto can only see to be alive; not running; or \
-                                starting up) \
+                                of them is doing right now (idle, busy or waiting; not running; \
+                                or starting up; a Codex peer's idle/busy comes from its turn \
+                                record, so it cannot see background work or a pending approval, \
+                                and \"running\" means alive with no turn record to read) \
                                 — plus whether anyone is holding unread mail from you. \
                                 Answering at all also proves the banto channel is up. Call it \
                                 when you want to know whether there is anyone to delegate to.",
@@ -612,10 +615,18 @@ fn elapsed_label(ms: i64) -> String {
 }
 
 /// What a peer is doing, as far as banto can tell: Claude's live-state entry
-/// reports its status, while Codex's log can establish only liveness, so its
-/// fallback deliberately says `running` rather than claiming idle or busy.
-/// A member without a session id is still starting; otherwise no live source
-/// means not running.
+/// reports its status. A Codex peer has no such file, so a live one (its log
+/// names a running process) is read from its rollout's last turn marker
+/// ([`is_thread_idle`]) and the word says that is all it is: `busy` for a turn
+/// begun and not ended, `idle` for one that ended. Two readings the marker cannot
+/// give, both named in the words rather than left for a Director to guess: it
+/// cannot see background work left running after the turn (REQUIREMENTS.md,
+/// "Codex data sources"), and it cannot tell a turn stuck on an approval from one
+/// still generating. The hosted tile reads the pane's own OSC 7501 report first
+/// and can say `waiting` or `busy` where this says `idle`; that report exists only
+/// in the UI process, which this one has no way to ask. With no marker to read the
+/// answer stays `running`, never a guess. A member without a session id is still
+/// starting; otherwise no live source means not running.
 fn peer_activity(
     peer: &BrigadeMember,
     live: &[LiveSession],
@@ -636,12 +647,16 @@ fn peer_activity(
             "idle (background command running)".to_string()
         }
         Some(entry) => entry.status.clone().unwrap_or_else(|| "idle".to_string()),
-        None if codex_home
-            .is_some_and(|home| is_thread_alive(home, &session_id.0, &SysinfoStartTime)) =>
-        {
-            "running".to_string()
-        }
-        None => "not running".to_string(),
+        None => match codex_home {
+            Some(home) if is_thread_alive(home, &session_id.0, &SysinfoStartTime) => {
+                match is_thread_idle(home, &session_id.0, None) {
+                    Some(false) => "busy (turn in progress)".to_string(),
+                    Some(true) => "idle (turn ended; background work not visible)".to_string(),
+                    None => "running".to_string(),
+                }
+            }
+            _ => "not running".to_string(),
+        },
     }
 }
 
@@ -1560,6 +1575,58 @@ mod tests {
         )
         .unwrap();
         (dir, home)
+    }
+
+    /// Gives `thread_id` a `threads` row and a rollout whose lines are `records`
+    /// (each an `event_msg` payload type), beside the liveness log
+    /// [`codex_home_with_live_log`] made — the two files a Codex peer's turn
+    /// state is read from.
+    fn with_rollout(home: &CodexHome, thread_id: &str, records: &[&str]) {
+        let rollout = home.root().join(format!("{thread_id}.jsonl"));
+        let lines: String = records
+            .iter()
+            .map(|kind| format!("{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{kind}\"}}}}\n"))
+            .collect();
+        std::fs::write(&rollout, lines).unwrap();
+        let conn = rusqlite::Connection::open(home.threads_db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+            rusqlite::params![thread_id, rollout.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    }
+
+    /// What `brigade_status` prints for a lone Codex Worker whose process has
+    /// `pid` and whose rollout holds `records` (`None`: no `threads` row at all).
+    fn status_of_codex_worker(pid: u32, records: Option<&[&str]>) -> String {
+        let (_dir, codex_home) = codex_home_with_live_log("codex-worker", pid);
+        if let Some(records) = records {
+            with_rollout(&codex_home, "codex-worker", records);
+        }
+        let mut ctx = ctx(
+            "dir-session",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.codex_home = Some(codex_home);
+        ctx.store
+            .add_brigade_member(
+                1,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("codex-worker".into())),
+            )
+            .unwrap();
+        let response = call(&mut ctx, &status_call());
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Builds a `ServerContext` from `(session, brigade, member, role)`
@@ -2527,27 +2594,50 @@ mod tests {
     }
 
     #[test]
-    fn brigade_status_reports_a_live_codex_peer_as_running() {
-        let (_dir, codex_home) = codex_home_with_live_log("codex-worker", std::process::id());
-        let mut ctx = ctx(
-            "dir-session",
-            Some(1),
-            Some("director"),
-            Some(BrigadeRole::Director),
-        );
-        ctx.codex_home = Some(codex_home);
-        ctx.store
-            .add_brigade_member(
-                1,
-                "worker-1",
-                BrigadeRole::Worker,
-                Some(&SessionId("codex-worker".into())),
-            )
-            .unwrap();
-
-        let response = call(&mut ctx, &status_call());
-        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    fn brigade_status_reports_a_live_codex_peer_with_no_turn_record_as_running() {
+        // No `threads` row at all: liveness is all that can be said.
+        let text = status_of_codex_worker(std::process::id(), None);
         assert!(text.contains("worker-1 — running"), "got {text:?}");
+        // A rollout that holds no turn marker (a thread that has not had its
+        // first turn) is the same: nothing to read, so nothing claimed.
+        let text = status_of_codex_worker(std::process::id(), Some(&["user_message"]));
+        assert!(text.contains("worker-1 — running"), "got {text:?}");
+    }
+
+    #[test]
+    fn brigade_status_reports_a_codex_peer_mid_turn_as_busy() {
+        let text = status_of_codex_worker(std::process::id(), Some(&["task_started"]));
+        assert!(
+            text.contains("worker-1 — busy (turn in progress)"),
+            "got {text:?}"
+        );
+    }
+
+    #[test]
+    fn brigade_status_reports_a_codex_peer_whose_turn_ended_as_idle_and_says_what_it_cannot_see() {
+        let text =
+            status_of_codex_worker(std::process::id(), Some(&["task_started", "task_complete"]));
+        assert!(
+            text.contains("worker-1 — idle (turn ended; background work not visible)"),
+            "got {text:?}"
+        );
+        // An interrupted turn ended too.
+        let text =
+            status_of_codex_worker(std::process::id(), Some(&["task_started", "turn_aborted"]));
+        assert!(
+            text.contains("worker-1 — idle (turn ended; background work not visible)"),
+            "got {text:?}"
+        );
+    }
+
+    #[test]
+    fn brigade_status_never_reads_a_dead_codex_peers_rollout() {
+        // Whatever the rollout says, a process that is gone is not running: a
+        // turn that died with its process leaves a `task_started` behind.
+        let text = status_of_codex_worker(u32::MAX, Some(&["task_started"]));
+        assert!(text.contains("worker-1 — not running"), "got {text:?}");
+        let text = status_of_codex_worker(u32::MAX, Some(&["task_started", "task_complete"]));
+        assert!(text.contains("worker-1 — not running"), "got {text:?}");
     }
 
     #[test]

@@ -1435,8 +1435,8 @@ worker_effort_codex = \"\"
             prompt.contains("banto tells the operator when the brigade has gone quiet"),
             "{prompt}"
         );
-        // brigade_status says idle only for a Claude Worker, so the rule does not
-        // rest on it.
+        // brigade_status says idle for a Codex Worker too, but from its turn record
+        // alone (background work is invisible there), so the rule does not rest on it.
         assert!(
             !prompt.contains("shows in brigade_status"),
             "no claim about what brigade_status shows of a Worker: {prompt}"
