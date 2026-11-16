@@ -98,12 +98,14 @@ Code, delivered by banto's own `SessionStart` hook for Codex, which has no
 banto's data model and the operator's screen, and a Director handed three
 tool names and no context mostly never uses them; `brigade_status` answers
 the follow-up question (who is on my team, what are they doing, is anyone
-holding my mail). Delivery is pull-based with per-member cursors and firewall
+holding my mail). A message's text is pulled, with per-member cursors and firewall
 framing (a relayed message is labeled as coming from another AI, never
-mistaken for operator input), and banto's **auto-relay** watches for idle
-members with unread messages and wakes them by typing a short fixed nudge
-into their stdin — so a Director→Worker→Director round trip needs no human
-ferrying at all. This repository was largely built through that loop.
+mistaken for operator input). banto's **auto-relay** watches for idle members
+with unread messages and wakes them by typing a short fixed nudge into their
+stdin — so a Director→Worker→Director round trip needs no human ferrying at all.
+With the relay on (`relay = "auto"`), that wake starts a turn over the member's
+whole context, so a message can cost an idle member a turn even when it asks for
+nothing. This repository was largely built through that loop.
 
 When every live member of a brigade (the Director, the Workers, a Goinkyo) has been
 idle for 5 seconds after any of them did real work (starting up is not work) —

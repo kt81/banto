@@ -2735,10 +2735,12 @@ and the caller's own name to its `You are …` line; `check_messages` headers an
 `send_to_peer`'s `Delivered to …` add the name in quotes after the token
 (`[from worker-3 "impl" — to you]`).
 
-Delivery is a pull, never a stdin injection: even though the embedded banto is
-the sole writer to a child's stdin, injecting a peer's message there would
-forge operator input mid-turn; a tool result respects turn boundaries and
-carries the firewall framing for free (`crates/banto/src/mcp.rs` module doc).
+The text of a message is pulled, never stdin-injected: even though the embedded
+banto is the sole writer to a child's stdin, injecting a peer's message there would
+forge operator input mid-turn; a tool result respects turn boundaries and carries
+the firewall framing for free (`crates/banto/src/mcp.rs` module doc). What banto
+does type into an idle member's stdin is the fixed nudge line under "Auto-relay"
+below, and that starts a turn, so a message can cost its recipient a turn.
 
 **Verified end to end against real Claude Code** (`docs/notes/mcp-spike.md`,
 2026-07-23, follow-up 2026-07-25): `claude --strict-mcp-config --mcp-config
@@ -2754,9 +2756,13 @@ existed in its own context at all — an information gap, not a reliability one.
 
 ## Auto-relay
 
-A Director↔Worker exchange over the MCP tools above is pull-based by design
-(see above), which means a member sitting idle with unread mail will never
-notice unless something nudges it. The auto-relay closes that loop: it
+A Director↔Worker exchange over the MCP tools above pulls each message's text
+(see above), which means an idle member is not guaranteed to notice unread mail
+without a nudge. With the relay in `auto`, a message to an idle recipient
+can wake it for a turn over its whole context, even when the message asks for
+nothing. The relay holds the nudge back when the relay is `manual`, the pane has an
+unsent draft, the member has no hosted pane or an unknown idle state, or its
+attempts on the batch are used up. The auto-relay closes that loop: it
 observes every live brigade pane's idle/busy status, including panes behind
 the currently displayed brigade (the same
 `sessions/<pid>.json` live-state read the Activity indicator uses) and unseen

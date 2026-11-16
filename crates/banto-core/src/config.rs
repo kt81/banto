@@ -311,6 +311,13 @@ pub struct BrigadeConfig {
 /// priced: every paragraph below prices delegation, and nothing priced
 /// keeping work, which is the whole skew a freshly-cleared Director reads
 /// off this text and nothing else.
+///
+/// The sentence that prices a message exists because, at the close of one
+/// session (2026-11-16), a Director broadcast "stop all work" to Workers that
+/// had all reported. The relay types a nudge line into an idle member's pane,
+/// which starts a turn, so each idle Worker was woken over its whole context
+/// to read a message that asked for nothing. The worker briefing carries the
+/// matching rule for replies.
 const DEFAULT_DIRECTOR_PROMPT: &str = "\
 You are the Director of banto brigade {brigade}. Your Workers: {peers}. \
 They are live agent sessions in this same working directory, \
@@ -332,8 +339,15 @@ delegate.
 
 Workers cannot see this conversation. Every instruction must carry its own \
 context and say what you want back. Set `to` to address one Worker; omit it \
-to broadcast. Call check_messages when banto nudges you, and at natural \
-checkpoints while waiting on a Worker. The Workers named above were \
+to broadcast. With banto's relay on, which is the default, a message wakes \
+an idle recipient for a turn over its whole context, and a wake is not \
+guaranteed (the operator can turn the relay off, and a draft in a pane holds \
+it back), so a sent message is not a read one. Send a Worker only work, or a \
+correction to work in flight, and a stop whenever its work may still be \
+running. Thanks, a stand-down and a closing note go to no Worker whose errand \
+is finished and reported, not even when the operator ends the day. banto \
+tells the operator when the brigade has gone quiet. Call check_messages when banto nudges you, and \
+at natural checkpoints while waiting on a Worker. The Workers named above were \
 the roster when you started, and it does not change afterwards — one \
 added later will not appear in it. `brigade_status` has the live one. \
 When you give a Worker a standing role, name_member gives it a display \
@@ -382,7 +396,9 @@ Director in this same working directory. banto relays between you: the \
 Director's instructions arrive through check_messages (banto nudges you \
 when something is waiting), and send_to_peer is how you report back — \
 findings, results, questions. The Director cannot see your pane, so put \
-what matters in the message you send, not just in your own scrollback.
+what matters in the message you send, not just in your own scrollback. Do \
+not reply to a message that asks for nothing: a reply can wake the Director \
+for a turn over its whole context.
 
 Report what you checked and how you checked it. Say which source each \
 claim about this repository rests on: `git show HEAD:<path>` for what is \
@@ -1059,6 +1075,91 @@ worker_effort_codex = \"\"
             !prompt.contains("never on the working tree"),
             "no absolute ban: {prompt}"
         );
+    }
+
+    #[test]
+    fn the_default_director_briefing_prices_a_message_and_sends_a_worker_only_work() {
+        let prompt = Config::default()
+            .brigade
+            .director_prompt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The price is conditional on the relay, which is on unless configured off.
+        assert_eq!(Config::default().brigade.relay, RelayMode::Auto);
+        assert!(
+            prompt.contains("With banto's relay on, which is the default"),
+            "the relay condition is stated: {prompt}"
+        );
+        assert!(
+            prompt.contains("wakes an idle recipient for a turn over its whole context"),
+            "the price of a message is stated: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Every message wakes"),
+            "a wake is not unconditional: {prompt}"
+        );
+        // And it is not guaranteed, so a sent message is not a read one.
+        assert!(
+            prompt.contains("a wake is not guaranteed"),
+            "no promise of delivery: {prompt}"
+        );
+        assert!(
+            prompt.contains("only work, or a correction to work in flight"),
+            "{prompt}"
+        );
+        // A stop is allowed whenever work may still be running: a Worker can send
+        // an interim report or a question and keep going, so a report does not
+        // mean it is finished.
+        assert!(
+            prompt.contains("and a stop whenever its work may still be running"),
+            "{prompt}"
+        );
+        // The prohibition is for a Worker whose errand is finished and reported.
+        assert!(
+            prompt.contains(
+                "Thanks, a stand-down and a closing note go to no Worker whose errand \
+                 is finished and reported"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("not even when the operator ends the day"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("has already reported") && !prompt.contains("nothing in flight"),
+            "a report alone is not read as the end of the work: {prompt}"
+        );
+        assert!(
+            prompt.contains("banto tells the operator when the brigade has gone quiet"),
+            "{prompt}"
+        );
+        // brigade_status says idle only for a Claude Worker, so the rule does not
+        // rest on it.
+        assert!(
+            !prompt.contains("shows in brigade_status"),
+            "no claim about what brigade_status shows of a Worker: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_default_worker_briefing_says_not_to_reply_to_a_message_that_asks_for_nothing() {
+        let prompt = Config::default()
+            .brigade
+            .worker_prompt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            prompt.contains("Do not reply to a message that asks for nothing"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("a reply can wake the Director for a turn over its whole context"),
+            "the reason is the price, and it is conditional: {prompt}"
+        );
+        assert!(!prompt.contains("each reply wakes"), "{prompt}");
     }
 
     #[test]

@@ -26,10 +26,17 @@
 //!   Director's pane. It takes no text: the question is in the Director's own
 //!   output. It never blocks.
 //!
-//! Delivery is a *pull*, never a stdin injection: even though the embedded banto
-//! is the sole writer to a child's stdin, injecting a peer's message there would
-//! forge operator input mid-turn. A tool result respects turn boundaries and
-//! carries the firewall framing for free.
+//! The text of a message is a *pull*, never a stdin injection: even though the
+//! embedded banto is the sole writer to a child's stdin, injecting a peer's
+//! message there would forge operator input mid-turn. A tool result respects
+//! turn boundaries and carries the firewall framing for free.
+//!
+//! What banto does type into an idle member's pane is a fixed line that says to
+//! call `check_messages` (the relay in `banto_core::engine`), and that starts a
+//! turn. So a message is free to send and not free to receive: the tool
+//! description and the briefings say so, because "a pull" read as costing the
+//! idle recipient nothing, and a stand-down broadcast to Workers that had all
+//! reported woke each for nothing (2026-11-16).
 //!
 //! Transport detail: MCP stdio — newline-delimited JSON-RPC 2.0 on stdin/stdout
 //! (no Content-Length framing). Requests carry an `id` and get a response;
@@ -221,8 +228,12 @@ fn tools_list_result() -> Value {
                 "name": "send_to_peer",
                 "description": "Send a message to your brigade peer through banto: a Director \
                                 reaches every Worker by default, a Worker or a Goinkyo reaches \
-                                the Director. Delivery is a pull — the peer receives it when it \
-                                next calls check_messages. Optionally set `to` to address one \
+                                the Director. banto's relay, on by default, types a line into an \
+                                idle recipient's pane to wake it to read the message, which costs \
+                                it a turn over its whole context; it reads the text with \
+                                check_messages. A wake is not guaranteed (the relay can be off, or \
+                                held back by a draft in the pane), so do not take a send as a \
+                                read. Optionally set `to` to address one \
                                 specific member instead of broadcasting — the only way a \
                                 Director reaches a Goinkyo, since a broadcast never does.",
                 "inputSchema": {
@@ -1837,6 +1848,42 @@ mod tests {
             !description.to_lowercase().contains("mark"),
             "{description}"
         );
+    }
+
+    #[test]
+    fn send_to_peer_prices_the_wake_and_does_not_promise_it() {
+        let mut ctx = ctx("s", None, None, None);
+        let response = call(
+            &mut ctx,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        );
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "send_to_peer")
+            .unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert!(!description.contains("pull"), "{description}");
+        assert!(
+            description.contains("relay, on by default"),
+            "the wake is the relay's, and is conditional: {description}"
+        );
+        assert!(
+            description.contains("idle recipient's pane to wake it"),
+            "{description}"
+        );
+        assert!(
+            description.contains("a turn over its whole context"),
+            "{description}"
+        );
+        assert!(
+            description.contains("not guaranteed"),
+            "a send is not a read: {description}"
+        );
+        assert!(!description.contains("every message"), "{description}");
+        // What it still says about addressing is untouched.
+        assert!(description.contains("check_messages"), "{description}");
+        assert!(description.contains("`to`"), "{description}");
     }
 
     #[test]
