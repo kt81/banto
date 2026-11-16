@@ -33,7 +33,9 @@ use crate::display_text::{display_name, shorten_to_columns};
 use crate::input::{
     InputEvent, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crate::input_line::{InputLine, read_input_line, typed_text_without_whitespace};
+use crate::input_line::{
+    InputLine, read_codex_input_line, read_input_line, typed_text_without_whitespace,
+};
 use crate::key_encode::{
     ForwardedInput, InputEffect, input_effect, key_to_bytes, normalize_paste_line_endings,
     wrap_bracketed_paste,
@@ -514,6 +516,22 @@ pub fn tick_relay_decision(
         state.nudge.attempts += 1;
     }
     nudge
+}
+
+fn would_nudge_on_tick(
+    state: Option<&RelayState>,
+    now: Instant,
+    is_idle_this_tick: Option<bool>,
+    input: PaneInput,
+    has_unseen: bool,
+) -> bool {
+    let state = state.copied().unwrap_or_default();
+    let idle_streak = if is_idle_this_tick == Some(true) {
+        state.idle_streak + 1
+    } else {
+        0
+    };
+    should_nudge(now, idle_streak, input, has_unseen, &state.nudge)
 }
 
 /// What the relay gather read about one brigade, enough to name it to the
@@ -9574,9 +9592,8 @@ fn update_tick(
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
-            // Read at the moment of the decision and nowhere else: only a
-            // Claude pane has a line this build can read, and a pane with no
-            // screen yet reads as nothing.
+            // Claude's reader also detects text the operator recalled without
+            // forwarding keys; Codex is checked separately at the release gate.
             let reading = match (obs.agent, state.screens.get(&obs.key)) {
                 (Some(AgentKind::ClaudeCode), Some(pane)) => Some(read_input_line(pane)),
                 _ => None,
@@ -9603,11 +9620,32 @@ fn update_tick(
             } else {
                 state.unreadable_since.remove(&member);
             }
-            let input = PaneInput {
+            let mut input = PaneInput {
                 is_focused: state.focus == Focus::Pane && focused.as_ref() == Some(&obs.key),
                 last_forwarded,
                 has_unsent,
             };
+            let release_codex = obs.agent == Some(AgentKind::Codex)
+                && input.has_unsent
+                && would_nudge_on_tick(
+                    state.relay_states.get(&(obs.brigade_id, obs.token.clone())),
+                    now,
+                    obs.is_idle_this_tick,
+                    PaneInput {
+                        has_unsent: false,
+                        ..input
+                    },
+                    obs.has_unseen,
+                )
+                && last_forwarded
+                    .is_none_or(|at| now.saturating_duration_since(at) >= INPUT_ECHO_SETTLE)
+                && state
+                    .screens
+                    .get(&obs.key)
+                    .is_some_and(|screen| read_codex_input_line(screen) == InputLine::Empty);
+            if release_codex {
+                input.has_unsent = false;
+            }
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
                 obs.brigade_id,
@@ -9618,6 +9656,9 @@ fn update_tick(
                 obs.has_unseen,
             );
             if nudge {
+                if release_codex {
+                    state.unsent_operator_input.remove(&obs.key);
+                }
                 state.last_prompted.insert(obs.key.clone(), now);
                 cmds.push(Cmd::WritePty {
                     key: obs.key.clone(),
@@ -16058,6 +16099,191 @@ mod tests {
 
     const CLAUDE: Option<AgentKind> = Some(AgentKind::ClaudeCode);
 
+    fn draw_empty_codex_prompt(state: &mut EmporiumState, key: &SessionKey) {
+        let screen = state.screens.get_mut(key).unwrap();
+        let (rows, _) = screen.size();
+        screen.process(format!("\x1b[2J\x1b[{};1H\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\x1b[{};3H\x1b]7501;state=idle\x07", rows - 3, rows - 3).as_bytes());
+    }
+
+    #[test]
+    fn codex_empty_releases_mark_only_at_an_eligible_nudge() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.unsent_operator_input.insert(director.clone());
+        state.last_forwarded_input.insert(director.clone(), now);
+        draw_empty_codex_prompt(&mut state, &director);
+        let codex = Some(AgentKind::Codex);
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
+        assert!(writes.is_empty());
+        assert!(state.has_unsent_operator_input(&director));
+        now += INPUT_ECHO_SETTLE;
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
+        assert_eq!(writes, nudge_then_enter_for(&director));
+        assert!(!state.has_unsent_operator_input(&director));
+    }
+
+    #[test]
+    fn codex_empty_retains_mark_when_other_nudge_gates_block() {
+        for gate in [
+            "streak",
+            "focus",
+            "cooldown",
+            "no_mail",
+            "busy",
+            "attempt_cap",
+        ] {
+            let (mut state, mut app, brigade, director, now) = reading_fixture();
+            state.unsent_operator_input.insert(director.clone());
+            state
+                .last_forwarded_input
+                .insert(director.clone(), now - INPUT_ECHO_SETTLE);
+            draw_empty_codex_prompt(&mut state, &director);
+            if gate != "streak" {
+                state.relay_states.insert(
+                    (1, "director".into()),
+                    RelayState {
+                        idle_streak: 1,
+                        nudge: NudgeState::default(),
+                    },
+                );
+            }
+            if gate == "focus"
+                && let Stage::Brigade { focused, .. } = &mut state.stage
+            {
+                *focused = 0;
+            }
+            if gate == "cooldown" {
+                state
+                    .relay_states
+                    .get_mut(&(1, "director".into()))
+                    .unwrap()
+                    .nudge
+                    .last_nudge = Some(now);
+            }
+            if gate == "attempt_cap" {
+                state
+                    .relay_states
+                    .get_mut(&(1, "director".into()))
+                    .unwrap()
+                    .nudge
+                    .attempts = RELAY_MAX_ATTEMPTS;
+            }
+            let cmds = tick_obs(
+                &mut state,
+                &mut app,
+                &brigade,
+                &director,
+                Seen {
+                    agent: Some(AgentKind::Codex),
+                    idle: Some(gate != "busy"),
+                    has_unseen: gate != "no_mail",
+                },
+                now,
+            );
+            assert!(writes_of(&cmds).is_empty(), "{gate}");
+            assert!(state.has_unsent_operator_input(&director), "{gate}");
+        }
+    }
+
+    #[test]
+    fn unrecognized_codex_keeps_draft_and_uses_existing_reminder_only() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.unsent_operator_input.insert(director.clone());
+        let mut writes = two_ticks_as(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(AgentKind::Codex),
+            &mut now,
+        );
+        now += Duration::from_secs(70);
+        writes.extend(two_ticks_as(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(AgentKind::Codex),
+            &mut now,
+        ));
+        assert!(writes.is_empty());
+        assert!(state.has_unsent_operator_input(&director));
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.contains("holding the nudge"))
+        );
+        assert!(state.unreadable_since.is_empty());
+        assert!(state.unreadable_noticed.is_empty());
+    }
+
+    #[test]
+    fn unmarked_codex_keeps_existing_nudge_behavior() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        let screen = state.screens.get_mut(&director).unwrap();
+        screen.process(b"unrecognized typed content");
+        let writes = two_ticks_as(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Some(AgentKind::Codex),
+            &mut now,
+        );
+        assert_eq!(writes, nudge_for(&director));
+    }
+
+    #[test]
+    fn input_after_codex_release_cancels_delayed_submit() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        state.unsent_operator_input.insert(director.clone());
+        draw_empty_codex_prompt(&mut state, &director);
+        state.relay_states.insert(
+            (1, "director".into()),
+            RelayState {
+                idle_streak: 1,
+                nudge: NudgeState::default(),
+            },
+        );
+        let cmds = tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: Some(AgentKind::Codex),
+                idle: Some(true),
+                has_unseen: true,
+            },
+            now,
+        );
+        assert_eq!(writes_of(&cmds), nudge_for(&director));
+        if let Stage::Brigade { focused, .. } = &mut state.stage {
+            *focused = 0;
+        }
+        forward_key(
+            &mut state,
+            &mut app,
+            &brigade,
+            KeyCode::Char('x'),
+            Modifiers::NONE,
+            now,
+        );
+        now += RELAY_SUBMIT_DELAY;
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: vec![],
+                brigades: vec![],
+            },
+            now,
+        );
+        assert!(writes_of(&cmds).is_empty());
+        assert!(state.has_unsent_operator_input(&director));
+    }
+
     #[test]
     fn text_on_the_screen_holds_the_nudge_even_though_banto_saw_no_typing() {
         let (mut state, mut app, brigade, director, mut now) = reading_fixture();
@@ -16150,7 +16376,7 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_pane_is_always_judged_by_the_mark_alone() {
+    fn codex_does_not_use_the_claude_prompt_reader() {
         let codex = Some(AgentKind::Codex);
         // Text drawn like Claude's, no mark: the screen is not read, so the
         // nudge goes.

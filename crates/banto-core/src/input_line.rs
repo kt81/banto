@@ -55,6 +55,127 @@
 
 use crate::screen::Screen;
 
+#[cfg(test)]
+mod codex_tests {
+    use super::{InputLine, Screen, read_codex_input_line};
+
+    fn frame(rows: u16, cols: u16, row: u16, prompt: &str, placeholder: &str) -> Screen {
+        let mut screen = Screen::new(rows, cols);
+        screen.process(
+            format!(
+                "\x1b[{};1H{} {}\x1b[{};3H",
+                row + 1,
+                prompt,
+                placeholder,
+                row + 1
+            )
+            .as_bytes(),
+        );
+        screen
+    }
+
+    fn empty(rows: u16, cols: u16, row: u16) -> Screen {
+        frame(
+            rows,
+            cols,
+            row,
+            "\x1b[1m›\x1b[0m",
+            "\x1b[2mAsk Codex to do anything\x1b[0m",
+        )
+    }
+
+    fn mutate(screen: &mut Screen, bytes: &str) {
+        screen.process(bytes.as_bytes());
+    }
+
+    #[test]
+    fn codex_empty_badge_accepts_valid_shapes() {
+        for (rows, cols, row) in [(24, 80, 10), (3, 27, 1), (24, 80, 20)] {
+            assert_eq!(
+                read_codex_input_line(&empty(rows, cols, row)),
+                InputLine::Empty
+            );
+        }
+        let screen = frame(
+            24,
+            80,
+            10,
+            "\x1b[1m»\x1b[0m",
+            "\x1b[2mAsk Codex to do anything\x1b[0m",
+        );
+        assert_eq!(read_codex_input_line(&screen), InputLine::Empty);
+    }
+
+    #[test]
+    fn codex_empty_badge_rejects_each_broken_guard() {
+        let cases = [
+            ("sync update", "\x1b[?2026h"),
+            ("hidden cursor", "\x1b[?25l"),
+            ("cursor column", "\x1b[11;4H"),
+            ("cursor wrong row", "\x1b[12;3H"),
+            ("wrong glyph", "\x1b[11;1H\x1b[1mX\x1b[0m\x1b[11;3H"),
+            ("unbold glyph", "\x1b[11;1H›\x1b[11;3H"),
+            ("dim glyph", "\x1b[11;1H\x1b[1;2m›\x1b[0m\x1b[11;3H"),
+            ("indent", "\x1b[11;2HX\x1b[11;3H"),
+            (
+                "placeholder mismatch",
+                "\x1b[11;3H\x1b[2mX\x1b[0m\x1b[11;3H",
+            ),
+            (
+                "typed literal",
+                "\x1b[11;3HAsk Codex to do anything\x1b[11;3H",
+            ),
+            (
+                "wide placeholder cell",
+                "\x1b[11;3H\x1b[2m界\x1b[0m\x1b[11;3H",
+            ),
+            ("side content", "\x1b[11;27HX\x1b[11;3H"),
+            ("above", "\x1b[10;80HX\x1b[11;3H"),
+            ("below", "\x1b[12;80HX\x1b[11;3H"),
+            (
+                "disabled input",
+                "\x1b[11;1H\x1b[2KInput disabled\x1b[11;3H",
+            ),
+            ("input exclamation", "\x1b[11;1H\x1b[2KInput!\x1b[11;3H"),
+        ];
+        for (name, change) in cases {
+            let mut screen = empty(24, 80, 10);
+            mutate(&mut screen, change);
+            assert_eq!(
+                read_codex_input_line(&screen),
+                InputLine::Unrecognized,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            read_codex_input_line(&empty(24, 26, 10)),
+            InputLine::Unrecognized
+        );
+        assert_eq!(
+            read_codex_input_line(&empty(24, 80, 0)),
+            InputLine::Unrecognized
+        );
+        assert_eq!(
+            read_codex_input_line(&empty(24, 80, 23)),
+            InputLine::Unrecognized
+        );
+    }
+
+    #[test]
+    fn codex_empty_badge_rejects_scrollback() {
+        let mut screen = Screen::new(24, 80);
+        screen.process("history\r\n".repeat(40).as_bytes());
+        screen.process(
+            "\x1b[2J\x1b[11;1H\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\x1b[11;3H"
+                .as_bytes(),
+        );
+        assert_eq!(read_codex_input_line(&screen), InputLine::Empty);
+        screen.scroll(1);
+        assert_ne!(screen.scrollback(), 0);
+        assert_eq!(read_codex_input_line(&screen), InputLine::Unrecognized);
+    }
+}
+
 /// What the input line of a pane holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputLine {
@@ -87,6 +208,54 @@ struct Block {
 
 fn is_blank(contents: &str) -> bool {
     contents.chars().all(|c| c == ' ' || c == '\u{a0}')
+}
+
+/// Recognize the Codex empty-placeholder screen shape. This is a visual
+/// signature, not proof that the composer has no attachments or hidden state.
+/// It never reports `HasText`.
+pub fn read_codex_input_line(pane: &Screen) -> InputLine {
+    let screen = pane.screen();
+    let (rows, cols) = screen.size();
+    let (row, col) = screen.cursor_position();
+    if pane.in_synchronized_update()
+        || screen.scrollback() != 0
+        || screen.hide_cursor()
+        || cols < 27
+        || col != 2
+        || row == 0
+        || row >= rows.saturating_sub(1)
+    {
+        return InputLine::Unrecognized;
+    }
+    let blank = |r, c| {
+        screen.cell(r, c).is_some_and(|cell| {
+            !cell.is_wide() && !cell.is_wide_continuation() && is_blank(cell.contents())
+        })
+    };
+    let prompt = screen
+        .cell(row, 0)
+        .is_some_and(|cell| matches!(cell.contents(), "›" | "»") && cell.bold() && !cell.dim());
+    let placeholder = "Ask Codex to do anything"
+        .bytes()
+        .enumerate()
+        .all(|(i, ch)| {
+            screen.cell(row, i as u16 + 2).is_some_and(|cell| {
+                cell.contents().as_bytes() == [ch]
+                    && cell.dim()
+                    && !cell.is_wide()
+                    && !cell.is_wide_continuation()
+            })
+        });
+    if prompt
+        && blank(row, 1)
+        && placeholder
+        && (26..cols).all(|c| blank(row, c))
+        && (0..cols).all(|c| blank(row - 1, c) && blank(row + 1, c))
+    {
+        InputLine::Empty
+    } else {
+        InputLine::Unrecognized
+    }
 }
 
 fn is_full_width_rule(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
