@@ -109,9 +109,11 @@ pane's screen may be read for a fact the agent publishes nowhere else, only at
 the moment a decision needs it, and only so that it closes when unsure: a
 shape it does not recognise answers `Unrecognized`, and the caller does what
 it did before it could read. It is never used to estimate or keep track of
-state — that is the disguised input above in a new coat. The one instance so
-far is whether a Claude pane's input line holds text (`banto_core::
-input_line`), asked when relay decides to nudge. Reading sends nothing;
+state — that is the disguised input above in a new coat. The relay's input-line
+reader (`banto_core::input_line`) is one instance: it reads Claude's line for
+text and recognises one bounded empty-looking Codex prompt shape. Both are
+asked only when relay decides to nudge. A Codex match is not proof of semantic
+emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay". Reading sends nothing;
 the operator approved the principle on 2026-11-10. The next shortcut that
 wants the screen cites this paragraph's conditions, not the instance.
 
@@ -301,6 +303,16 @@ is cached. *Where:* on the event loop's thread, like a PTY spawn, so a hung bina
 stands the screen still for up to the timeout and no longer. It takes about 0.1 s
 and needs no network or auth; Codex itself creates and removes a temporary directory
 under its own home on every start, as it does for every launch banto makes.
+
+PTY exit waiting: `PortablePtyHost` waits on a dedicated thread. After a failed
+wait it tries to send a nonterminal `Unknown` notification and retries after
+250 ms, with at most one notification queued. After a subsequent wait error, a
+dropped receiver stops further retries. Only a returned code or signal becomes
+a live `PtyExited` event. After output loss the handle and
+resume guard remain until that confirmation, including through persistent wait
+errors. A historical recorded `PtyExited` event with `Unknown` still follows
+the existing exit fold on replay. This entry was added by reading the current
+code, not by repeating the inventory sweep.
 File reads: session jsonl (head + tail chunks), `sessions/<pid>.json`,
 `config.toml`, dependency-free re-reads on live reload. Codex's reads (its
 `threads` sqlite lookup, read-only, and a tail of the rollout `.jsonl` for the
@@ -311,6 +323,18 @@ and the brigade bell (`Event::QuiescenceSampled`) now reads them for every other
 hosted Codex pane too — one sqlite lookup and one rollout tail per such pane per
 tick. A hosted Claude pane adds no read of its own: the live-file scan and the
 process snapshot are shared with the relay.
+Codex discovery also reads the full `session_index.jsonl` name index on each
+reload; individual lines are bounded, but total scan time and retained names
+grow with the index ("Codex data sources" in `docs/REQUIREMENTS.md`).
+For a fresh solo Codex pane, discovery also snapshots the read-only log
+database's high-water mark before spawn and scans later rows once per tick,
+in batches of at most 2,048, while checking PID start time and candidate
+threads in the read-only threads database. It retains at most 1,024 associated
+thread ids; an ambiguous or unavailable source leaves identity unresolved. It
+refuses databases with a WAL but no shared-memory sidecar, and rejects a
+replaced log file, rather than creating sidecars or trusting a changed source.
+These bounds apply to log rows and retained associations, not necessarily the
+number or cost of candidate-session queries.
 File writes: banto's own sqlite DB, per-member `--mcp-config` files, diagnostic logs
 (`BANTO_INPUT_LOG`, `BANTO_BELL_LOG`, one line per executed bell with its cause) —
 all under banto's own config/data dirs, never `~/.claude`.
@@ -322,8 +346,11 @@ summary panel's relative-age display, whose read now sits at the draw-loop
 boundary and is injected into the view).
 Input: crossterm key/mouse/paste/resize events; the ConPTY input quirks
 (headless SGR mouse, `\r` for Enter, chunk-boundary paste semantics) live
-at this boundary.
-Watch: `notify` on `projects/` and `sessions/` (`LiveWatch`; its debounce
+at this boundary. A hosted screen tracks its own Win32 input mode from child
+output; the pure key encoder uses that state and the pane's agent identity for
+the narrowly scoped Codex newline keys described in `docs/REQUIREMENTS.md`.
+Watch: `notify` on Claude `projects/` and `sessions/`, the Codex rollout tree,
+and filtered name-index events in the Codex home (`LiveWatch`; its debounce
 is already a pure function of injected timestamps).
 Processes: PID liveness via sysinfo (`ProcessProbe`).
 MCP: stdio JSON-RPC in `_mcp` (per-connection).

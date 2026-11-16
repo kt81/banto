@@ -731,7 +731,7 @@ count, which the tag is not, so showing it on the row and on the tile double-cou
 nothing. It stays, even while the Director's pane is focused, until the operator
 sends Enter into that pane: the key that submits what was typed, which reaches the
 child as a carriage return. Another key, a paste, any mouse event, a focus change,
-Shift+Enter (forwarded as a line feed), an Enter into another pane, and banto's own
+Shift+Enter, Ctrl+J, an Enter into another pane, and banto's own
 nudge and its submitting Enter do not clear it. Clearing removes the tag from the
 core and issues the conditional store clear. Disbanding drops all of it with the
 brigade's row. There is no collapsed-body rule: a collapsed Director cannot exist
@@ -837,16 +837,18 @@ synthetic fixtures. **Never bring real session data into the repository.**
 ## Codex data sources (observed 2026-07-26, this machine's installed Codex CLI)
 
 Nothing like Claude Code's layout: no `projects/`, no per-session `.jsonl`
-directory tree banto walks itself. One sqlite database, one table.
+directory tree banto walks itself. Discovery reads a sqlite table and a name
+index; the behavior below is from banto's implementation unless marked observed.
 
 | Source | Content |
 |---|---|
-| `$CODEX_HOME` (else `~/.codex`)`/state_5.sqlite`, `threads` table | One row per session. Columns banto reads: `id`, `title`, `cwd`, `rollout_path`, `first_user_message`, `updated_at_ms`, `archived`, `source`. The filename (`state_5.sqlite`) is what this machine's installed version uses; a future Codex CLI could rename it |
+| `$CODEX_HOME` (else `~/.codex`)`/state_5.sqlite`, `threads` table | One row per session. Columns banto reads: `id`, `title`, `cwd`, `rollout_path`, `first_user_message`, `updated_at_ms`, `archived`, `source`, and, when present, `history_mode` and `name`. The filename (`state_5.sqlite`) is what this machine's installed version uses; a future Codex CLI could rename it |
+| `$CODEX_HOME/session_index.jsonl` | Legacy names used by discovery: for each id, the last valid physical record with a nonblank `thread_name`, trimmed; `updated_at` does not choose the winner. Malformed, invalid UTF-8 and over-1 MiB lines are skipped; a valid final line need not end in a newline. The limit includes the newline when present. Synthetic tests cover these choices; the ordering agrees with the batch reader in Codex source tag `rust-v0.169.0`, not an observation of the installed binary |
 | `threads.rollout_path` | The session transcript file itself, under a `sessions/` tree whose internal (date-partitioned) layout banto does not rely on — the path comes from the column directly, never from walking the tree |
 | `threads.cwd` | Carries a Windows extended-length path prefix (`\\?\`) that a rollout file's own recorded cwd does not — normalized once, in `provider::codex`, at the point this becomes `SessionMeta.cwd` |
 | `threads.updated_at_ms` | Milliseconds since the Unix epoch, application-reported by Codex — not a filesystem mtime the way Claude Code's is. `SessionMeta.mtime` says so |
 | `threads.source` | Who started the thread. Measured (Codex 0.147 and 0.166–0.167.1): an ordinary session is plain text — `cli`, or `exec` for `codex exec` — while Codex's own automatic-review sub-thread of a session (title `Guardian review`, model `codex-auto-review`, one appearing beside every launch or resume) is a JSON object in the same TEXT column, `{"subagent":{"other":"guardian"}}`. `provider::codex` **does not list** a row whose `source` parses as a JSON object with a `subagent` key — in both `discover` and `find_new_sessions`, so no list, no Worker discovery and no liveness decoration can take one for a session. Everything else stays listed: plain text of any value (including ones never seen), empty, an object without that key, unparsable text, a non-text value, text that is not valid UTF-8, and a schema with no `source` column at all — only a positively recognised sub-agent is hidden, since hiding a real session costs more than showing a stray thread. Decided by `source`, never by `threads.thread_source` (newer, nullable, its value for the same thread changed between those versions) and never by title. Anything banto keys by such a thread's id (pins, groups, archive marks) simply no longer matches a listed row |
-| `$CODEX_HOME/logs_2.sqlite`, `logs` table | Process liveness (not read by discovery — the Codex-side double-resume guard, `codex_liveness::is_thread_alive`). Real schema, read from a real, live `~/.codex/logs_2.sqlite` on this machine (2026-07-27): `id, ts, ts_nanos, level, target, thread_id, process_uuid, ...`, with `CREATE INDEX idx_logs_thread_id_ts ON logs(thread_id, ts DESC, ts_nanos DESC, id DESC)` — the newest row per `thread_id` is exactly what that index is for |
+| `$CODEX_HOME/logs_2.sqlite`, `logs` table | Process liveness (the Codex-side double-resume guard, `codex_liveness::is_thread_alive`) and fresh solo Codex attribution during discovery. Real schema, read from a real, live `~/.codex/logs_2.sqlite` on this machine (2026-07-27): `id, ts, ts_nanos, level, target, thread_id, process_uuid, ...`, with `CREATE INDEX idx_logs_thread_id_ts ON logs(thread_id, ts DESC, ts_nanos DESC, id DESC)` — the newest row per `thread_id` is exactly what that index is for |
 | `logs.process_uuid` | `pid:<PID>:<suffix>`. Confirmed against that same real database: the newest row's pid for the session actually running matched a real, live process (cross-checked via `Win32_Process`); three finished sessions' newest rows named three dead pids |
 | `logs.ts` | Unix **seconds** (confirmed by comparing a real row's value against the current clock — not milliseconds, unlike `threads.updated_at_ms`). Compared against `sysinfo::Process::start_time()` (also unix seconds, and available on every platform `sysinfo` supports — unlike Claude's Linux/WSL-only `/proc` ticks comparison) for the pid-recycling guard: a process that started strictly after this log row was written cannot be the one that wrote it |
 
@@ -886,16 +888,37 @@ Codex CLI versions. Same defense: **lenient parsing** (a malformed row is
 skipped, not fatal) plus synthetic-fixture tests. **Never bring a real
 `~/.codex` database into the repository.**
 
+Each discovery reads the whole name index and keeps the last usable name for
+each distinct id in memory. The per-line bound limits a single allocation,
+not total scan time or the number of names retained; both grow with the index.
+For a legacy row (including a missing or unrecognized `history_mode`), a
+nonblank `threads.title` distinct from the trimmed first user message wins;
+otherwise an indexed name wins, followed by the original database title. For
+`paginated`, banto uses the trimmed nonblank `threads.name`, then the trimmed
+nonblank first user message, then the session id if neither exists; it does not
+use an older title or index name. The first-message fallback is banto's display
+choice. An unreadable or absent index leaves the other fallbacks in use, and a
+read error partway through leaves the names already read in use. The mode-based
+name selection is guided by the list reader in Codex source tag `rust-v0.169.0`
+and exercised with synthetic databases; the full cause of any observed missing
+session remains unverified.
+
 **Live-reload watch:** `crate::watch` watches `CodexHome::rollout_dir`
 (`<codex_home>/sessions/`, recursively) so a new session's rollout file
-appearing triggers the same debounced reload a Claude Code change does. It
-does not watch any of Codex's sqlite files. Measured against a synthetic
+appearing triggers the same debounced reload a Claude Code change does. It also
+watches an existing Codex home non-recursively for create, modify and remove
+events naming exactly `session_index.jsonl`, including creation and replacement.
+Access events and unrelated paths, including sqlite and log files, do not trigger
+reloads through this home watch. A home missing at startup is not watched later;
+failure to register the optional home watch leaves the other watches running.
+Synthetic watcher tests cover index creation and replacement; they do not prove
+what events an installed Codex emits for a rename. Measured against a synthetic
 WAL-mode database shaped like `state_5.sqlite`: a write never touches the
 main file's own mtime (everything lands in its `-wal`/`-shm` sidecars), and a
 running session writes somewhere in `$CODEX_HOME` on every turn —
-`logs_2.sqlite` on every log line — so a directory watch there would fire far
-more often than the rollout tree's one event per turn, across databases
-discovery doesn't even read.
+`logs_2.sqlite` on every log line — so an unfiltered directory watch would
+fire far more often than the rollout tree's one event per turn, across
+database writes that do not require a session-list reload.
 
 **Busy/idle detection** (the relay engine's Codex-side signal —
 `crate::codex_activity`; Claude Code publishes its own `status: busy` in
@@ -2201,10 +2224,9 @@ them:
    "MCP mediation server" below) only ever travels through that launch's own
    argv, so a pane opened before formation can't carry it.
    `Modal::ConfirmDirectorReopen` — Enter kills that pane and re-issues
-   formation only once the pane is confirmed gone — `Event::PtyExited`, or
-   `Event::PtyOutputLost` for the pane it killed (any
-   sooner risks the double-resume guard seeing the not-yet-dead
-   session as still live and refusing the reopen); Esc cancels the whole
+   formation only once the process is confirmed gone by `Event::PtyExited`.
+   Lost output alone does not confirm that the process exited; banto waits
+   for the wait thread before reopening it. Esc cancels the whole
    attempt. Placed first, ahead of the other two, because it is both the
    most disruptive of the three (running work in that pane is lost) and the
    cheapest to abort (nothing has been picked or written yet) — asking the
@@ -2246,6 +2268,33 @@ reopens the Director's pane in the gap between gate 1 confirming and the
 store round trip actually forming the brigade — is handled without asking:
 `update_brigade_formed` kills and rewires that pane unconditionally rather
 than leaving a Director with no wiring at all.
+
+**Unidentified Codex panes.** A newly created Codex pane may have no session id
+until its first turn. While any such pane is unidentified, banto holds Codex
+resumes, and formation or staging that would resume a Codex member, until
+discovery or process exit resolves the uncertainty. If formation has already
+been saved when this uncertainty appears, the brigade stays saved and a status
+message asks the operator to identify the pane before staging it. This guard
+reduces the risk of an unknown pane and a resumed session sharing a history.
+
+For a solo Codex creation, discovery snapshots the Codex log database before
+spawn and associates later log rows with the spawned PID and its process start
+time; the unique associated thread must also be a new session in the pane's
+cwd. Already claimed identities are excluded. An unavailable, replaced, or
+ambiguous source leaves the pane unidentified rather than guessing, and solo
+discovery has no timeout. Brigade members use their hook-recorded identity.
+
+Solo attribution requires the PTY child PID to identify the Codex process; a
+wrapper or absent PID can leave the pane unresolved. Process start times have
+seconds resolution. Uniqueness covers associations through the caught-up log
+high-water mark at that poll, not associations that might appear later. File
+identity and a decreasing maximum log id detect some replacements or resets,
+but not an in-place rewrite and refill. These behaviors have synthetic test
+coverage; the original disappearance has not been reproduced in the field.
+On 2026-11-16, after restarting the prepared banto, the operator observed that
+brigade 23's title was correct and that the Director remained visible when they
+created a new brigade named Testing. This observation does not establish the
+cause of the earlier disappearance or reproduce its unspecified full sequence.
 
 **Member identity.** Each member gets a banto-owned `member_token`
 (`"director"`, `"worker-1"`, `"worker-2"`, ...) rather than being keyed by its
@@ -2324,8 +2373,19 @@ the member** — nothing is removed from the store and nothing is relaunched in
 place (a reader that fails at once would loop, and relaunching while the old
 process may still run would resume one session twice). The status says so
 (`lost the output of worker-5 — pane closed; it stays in the brigade`), and the
-next staging reopens the member, one pane. Nobody ever leaves a brigade on that
-evidence alone.
+process remains tracked until the wait thread reports `PtyExited`; staging a
+brigade containing that pane is held until then, so it cannot resume the same
+session while the old process may still be alive. A requested kill remains an
+expected exit and does not dismiss the member. Nobody ever leaves a brigade on
+output loss alone.
+
+A failed `child.wait()` does not establish that the process exited. The waiter
+tries to report `Unknown` as a nonterminal notification and retries after 250 ms;
+its one-slot queue bounds pending notifications. After a subsequent wait error,
+a dropped receiver stops further retries. Only a returned exit code or signal
+confirms a live exit. If wait keeps failing after output loss, the process and
+resume guard remain tracked until a later confirmed exit. A historical
+`PtyExited` event with `Unknown` still follows the existing exit fold on replay.
 
 **Config** (`crates/banto-core/src/config.rs`, `[brigade]` in config.toml):
 
@@ -2543,6 +2603,13 @@ how the rendered text reaches the member differs by product:
   `dismiss_goinkyo`). Until 2026-11-16 it named only the three, so a Codex
   Director was never told the four; a test checks every advertised tool
   against the two lists.
+
+  **Known limit:** in a synthetic Codex 0.169.0 session without compaction,
+  identical `SessionStart` additional context appeared once on `codex exec`
+  startup and accumulated in model requests across two `exec resume` runs. A
+  launch-time `developer_instructions` override did not refresh on resume in
+  that test. The current hook delivery is unchanged; the investigation is
+  recorded separately.
 
 The shipped defaults tell a Director to delegate independent, parallelizable work to
 its Workers via `send_to_peer` and keep genuinely sequential work itself, that it
@@ -2817,8 +2884,9 @@ A Director↔Worker exchange over the MCP tools above pulls each message's text
 (see above), which means an idle member is not guaranteed to notice unread mail
 without a nudge. With the relay in `auto`, a message to an idle recipient
 can wake it for a turn over its whole context, even when the message asks for
-nothing. The relay holds the nudge back when the relay is `manual`, the pane has an
-unsent draft, the member has no hosted pane or an unknown idle state, or its
+nothing. The relay holds the nudge back when the relay is `manual`, the pane is
+marked for possible unsent input or Claude's reader detects text, the member has no
+hosted pane or an unknown idle state, or its
 attempts on the batch are used up. The auto-relay closes that loop: it
 observes every live brigade pane's idle/busy status, including panes behind
 the currently displayed brigade (the same
@@ -2838,14 +2906,30 @@ capped number of attempts on one unseen batch
 A time window cannot protect a draft, so the operator's unsent text is
 tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
 pane is marked when banto forwards something that may add text to its input
-line — a printable key, a paste, Tab, Shift+Enter (sent as a line feed,
-Claude's newline) — and unmarked only when an Enter that reaches the child
-as a `\r` (plain, Alt, Ctrl) is forwarded, the pane goes away, or — for a
-Claude pane — its screen shows an empty input line (below). While a pane is
+line — a printable key, a paste, Tab, or Shift+Enter — and unmarked only when
+an Enter that reaches the child as a `\r` (plain, Alt, Ctrl) is forwarded, the
+pane goes away, or a settled
+screen reading recognises an empty Claude input line. The Codex
+reader additionally requires the relay to be eligible to nudge on that same
+tick before an empty reading clears the mark (below). While a pane is
 marked, a nudge to it is suppressed whatever the focus and however long ago
 the operator last typed, a nudge's own delayed Enter is dropped if the mark
 appeared before it was due, and the status line says the nudge is being held
 (re-shown every 30s, never over another message).
+
+When a known Codex pane has enabled Win32 input mode (`CSI ? 9001 h`), banto
+forwards exactly Shift+Enter and Ctrl+J as Win32 key
+press and release records. Both count as adding text, including for the draft
+mark and cancellation of a pending relay Enter. The pane's own mode is tracked
+until `CSI ? 9001 l`; this is not inferred from another pane. The spawn event
+records the launched agent even before a new session is indexed. Its agent field
+is optional for older replays; an unconflicted session row or member fact can
+also establish identity. Conflicting known identities disable this encoding.
+Without that
+mode, for non-Codex panes, and for other modifier
+combinations, the existing key encoding and input effects apply. In particular,
+the legacy Shift+Enter encoding is a line feed, and legacy Ctrl+J does not gain
+the special path's text-adding effect.
 
 Every status that names a brigade member — this one, the nudge notice, the
 unreadable-input notice and the kickoff notices — names the brigade the way the
@@ -2910,8 +2994,8 @@ the last eighth, and half keeps a dialog title at the left or in the middle out)
 announced); `Empty` clears the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto
 last forwarded input to the pane, because a pane's screen lags its keys (36–108ms
 measured on 2026-11-10) and an `Empty` read inside that window is not yet true;
-`Unrecognized` — and every Codex pane, whose screen is not read — leaves the mark in
-charge. The delayed Enter never reads the screen: by then the line holds banto's own
+`Unrecognized` leaves the mark in charge. The delayed Enter never reads the screen:
+by then the line holds banto's own
 nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
 `INPUT_LINE_UNREADABLE_AFTER` (60s) is reported once on the status line, since
 Claude's layout can change without notice and a reader that stopped recognising it
@@ -2947,13 +3031,33 @@ off-stage brigade's only because that is where he was not looking. The reader no
 accepts the labelled border (above), so such a member reads `Empty` or `HasText` and
 its draft protection works.
 
-What this does not fix: a mark left standing over an empty line — after
-answering a permission dialog with `1`, after Ctrl+C clears the line, after
-Shift+Tab switches mode — now resolves itself only where the line is read. On
-**Codex panes**, and on a Claude pane whose screen is not the recognised shape,
-it still holds the nudge until the operator presses Enter in that pane (an
-Enter on the empty line is enough). So the requirement that a nudge wait only
-for a draft that is really there is **not met for Codex**.
+**Codex's bounded empty reader.** At the same relay decision, the reader
+recognises one prompt shape. The visible
+cursor is in column 2 of row R, with no fixed offset from the bottom. Column 0
+of R holds a bold, non-dim `›` or `»`; column 1 is blank; columns 2 through 25
+hold exactly `Ask Codex to do anything`, each character dim and single-width;
+the rest of the row is blank. Rows R−1 and R+1 are entirely blank, both must
+exist, and the screen must be at least 27 columns wide, not in synchronized
+output, and at scrollback offset zero. No color or OSC status is required. A
+mismatch reads `Unrecognized`; blank cells contain only spaces or no-break
+spaces, or have no contents, and are neither wide nor wide continuations. The
+Codex reader never returns `HasText`. A
+recognised `Empty` clears a mark only on a tick otherwise eligible to nudge and
+at least 3 seconds after the last forwarded input. Until then the mark holds.
+This applies automatically, with no new setting or operator action. The dim
+attribute is required and was observed through ConPTY. The prompt glyph and
+placeholder are tied to Codex 0.169.0; a future change falls back to the
+existing mark rather than guessing.
+
+The reading is evidence of a painted shape, not a guarantee that Codex has no
+draft. Unmarked text recalled from history or restored can still receive a blind
+nudge when the shape is unrecognised, as before. An attachment-only composer can
+look empty to this reader, so a nudge can be sent with images attached. A draft
+held by Codex outside the composer is not observable here; whether a restored
+startup draft can coexist with this placeholder is unverified. A mark over an
+unrecognised shape still holds until a later recognised empty reading or an Enter
+reaches the pane. Claude's reader can additionally detect `HasText` without a
+mark; Codex's cannot.
 
 **Known limit (an observation of 2026-11-14, found by reading and by a test that
 tripped on it, not seen in the field):** a nudge's delayed submitting Enter that is
@@ -3024,8 +3128,8 @@ peer, and for `shell` `idle (background command running)`, since the bare word t
 a Director nothing and `idle` alone would say nothing is running.
 
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
-when a Codex home resolves, its rollout tree (see "Codex data sources" above
-for why not its sqlite files too).
+when a Codex home resolves, its rollout tree and filtered name-index events
+(see "Codex data sources" above).
 
 ## Stack
 
