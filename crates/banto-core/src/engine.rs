@@ -1226,6 +1226,8 @@ pub struct EmporiumState {
     pending_goinkyo_kickoffs: Vec<PendingGoinkyoKickoff>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
+    unresolved_codex: HashSet<SessionKey>,
+    lost_output_waiting_for_exit: HashSet<SessionKey>,
     pending_membership: Option<PendingMembership>,
     pending_brigade_formation: Option<PendingBrigadeFormation>,
     pending_worker_addition: Option<PendingWorkerAddition>,
@@ -1246,10 +1248,9 @@ pub struct EmporiumState {
     /// The session id of a Director-to-be whose already-open pane was just
     /// killed (`confirm_director_reopen_modal`), waiting for that pane to be gone
     /// before formation can continue — reopening any sooner would resume a
-    /// session `banto::launch::is_live` still sees as live and refuse. `update_pty_exited` takes it once the end of this exact key lands:
-    /// an `Event::PtyExited`, or an `Event::PtyOutputLost` (which
-    /// `update_pty_output_lost` hands to it, since the pane banto killed is gone
-    /// either way). Unlike `pending_brigade_formation`/
+    /// session `banto::launch::is_live` still sees as live and refuse.
+    /// `update_pty_exited` takes it when this exact child is known to have
+    /// exited; losing its output alone does not prove that. Unlike `pending_brigade_formation`/
     /// `pending_codex_trust_formation`, not cleared on every Esc: by the
     /// time this is set, `Modal::ConfirmDirectorReopen` is already closed
     /// (see that function), so no *other* modal's Esc should touch it.
@@ -1576,6 +1577,8 @@ impl EmporiumState {
             pending_goinkyo_kickoffs: Vec::new(),
             pending_submits: Vec::new(),
             pending_opens: HashMap::new(),
+            unresolved_codex: HashSet::new(),
+            lost_output_waiting_for_exit: HashSet::new(),
             pending_membership: None,
             pending_brigade_formation: None,
             pending_worker_addition: None,
@@ -3725,8 +3728,9 @@ pub enum Event {
         /// `None` therefore only appears in a stream recorded before this field
         /// existed (`#[serde(default)]`, same precedent as
         /// `RowsLoaded::superseded`), which still means an exit.
-        /// [`PtyExitReason::Unknown`] is different: the shell *did* observe the
-        /// exit, but `wait()` itself returned an error rather than a status.
+        /// A historical stream may contain [`PtyExitReason::Unknown`], which
+        /// replay continues to treat as an exit. A live wait error is retried
+        /// and does not become `PtyExited`.
         #[serde(default)]
         reason: Option<PtyExitReason>,
     },
@@ -4103,6 +4107,8 @@ pub fn update(
             cmds
         }
         Event::PtyExited { key, reason } => {
+            state.unresolved_codex.remove(&key);
+            state.lost_output_waiting_for_exit.remove(&key);
             update_pty_exited(state, app, brigade, key, reason, now)
         }
         Event::PtyOutputLost { key } => update_pty_output_lost(state, app, brigade, key, now),
@@ -4367,6 +4373,36 @@ pub fn update(
             Vec::new()
         }
     };
+    if !state.unresolved_codex.is_empty() || !state.lost_output_waiting_for_exit.is_empty() {
+        let mut blocked = Vec::new();
+        cmds.retain(|cmd| {
+            if let Cmd::OpenEmbedded { key, target, .. } = cmd
+                && !target.id.is_empty()
+                && ((target.agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
+                    || state.lost_output_waiting_for_exit.contains(key))
+            {
+                blocked.push(key.clone());
+                return false;
+            }
+            true
+        });
+        for key in blocked {
+            let error = if state.lost_output_waiting_for_exit.contains(&key) {
+                "waiting for the previous process to exit before resuming"
+            } else {
+                "waiting to identify a new Codex pane before resuming"
+            };
+            update_spawn_failed(state, key, error.to_string(), now);
+        }
+    }
+    for cmd in &cmds {
+        if let Cmd::OpenEmbedded { key, target, .. } = cmd
+            && target.agent == AgentKind::Codex
+            && target.id.is_empty()
+        {
+            state.unresolved_codex.insert(key.clone());
+        }
+    }
     // Before anything sizes a tile: whatever rebuilt `panes` this event is
     // put back in the operator's order first.
     state.apply_stack_order();
@@ -5988,6 +6024,15 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
     let Some(formation) = state.pending_brigade_formation.take() else {
         return Vec::new();
     };
+    if (formation.director_agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
+        || state
+            .lost_output_waiting_for_exit
+            .contains(&SessionKey::from_id(&formation.director_row_id))
+    {
+        state.status =
+            Some("waiting to identify a new Codex pane before forming a brigade".to_string());
+        return Vec::new();
+    }
     state.last_worker_agent = Some(worker_agent);
     if worker_agent == AgentKind::Codex {
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
@@ -6115,6 +6160,9 @@ fn update_new_session_cwd_checked(
     let agent = app.modal_new_session_agent();
     app.close_modal();
     let key = state.mint_plain_key(&cwd);
+    if agent == AgentKind::Codex {
+        state.unresolved_codex.insert(key.clone());
+    }
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
     vec![Cmd::OpenEmbedded {
         key,
@@ -6317,6 +6365,16 @@ fn update_membership_resolved(
             // pane is about to restart anyway would be the wrong order. See
             // `confirm_director_reopen_modal`/`update_pty_exited` for the
             // other half of this round trip.
+            None if (row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
+                || state
+                    .lost_output_waiting_for_exit
+                    .contains(&SessionKey::from_id(&row.id)) =>
+            {
+                state.status = Some(
+                    "waiting to identify a new Codex pane before forming a brigade".to_string(),
+                );
+                Vec::new()
+            }
             None if state.screens.contains_key(&SessionKey::from_id(&row.id)) => {
                 app.open_confirm_director_reopen_modal(
                     row.id.clone(),
@@ -6346,6 +6404,11 @@ fn begin_brigade_formation(
     brigade: &BrigadeConfig,
     row: &SessionRow,
 ) -> Vec<Cmd> {
+    if row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
+        state.status =
+            Some("waiting to identify a new Codex pane before forming a brigade".to_string());
+        return Vec::new();
+    }
     if brigade.worker_agent == WorkerAgentSetting::Select {
         state.pending_brigade_formation = Some(PendingBrigadeFormation {
             director_row_id: row.id.clone(),
@@ -6429,6 +6492,17 @@ fn update_codex_trust_checked(
     let Some(formation) = state.pending_codex_trust_formation.take() else {
         return Vec::new();
     };
+    if (formation.director_agent == AgentKind::Codex && !state.unresolved_codex.is_empty())
+        || state
+            .lost_output_waiting_for_exit
+            .contains(&SessionKey::from_id(&formation.director_row_id))
+    {
+        state.set_status(
+            "waiting to identify a new Codex pane before forming a brigade".to_string(),
+            now,
+        );
+        return Vec::new();
+    }
     if !hook_launchable {
         state.set_status(
             "codex: banto's own path contains a space, which Codex cannot launch a hook \
@@ -6494,6 +6568,19 @@ fn confirm_director_reopen_modal(state: &mut EmporiumState, app: &mut App) -> Ve
         return Vec::new();
     };
     let director_row_id = director_row_id.clone();
+    if state
+        .lost_output_waiting_for_exit
+        .contains(&SessionKey::from_id(&director_row_id))
+        || (!state.unresolved_codex.is_empty()
+            && app
+                .row_for_id(&director_row_id)
+                .is_none_or(|row| row.agent == AgentKind::Codex))
+    {
+        state.status =
+            Some("waiting to identify a new Codex pane before forming a brigade".to_string());
+        app.close_modal();
+        return Vec::new();
+    }
     app.close_modal();
     let director_key = SessionKey::from_id(&director_row_id);
     state.pending_director_reopen = Some(director_row_id);
@@ -6506,6 +6593,14 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
     if state.screens.contains_key(&key) {
         state.stage = Stage::Solo(key);
         state.focus = Focus::Pane;
+        return Vec::new();
+    }
+    if state.lost_output_waiting_for_exit.contains(&key) {
+        state.status = Some("waiting for the previous process to exit before resuming".to_string());
+        return Vec::new();
+    }
+    if row.agent == AgentKind::Codex && !state.unresolved_codex.is_empty() {
+        state.status = Some("waiting to identify a new Codex pane before resuming".to_string());
         return Vec::new();
     }
     state.pending_opens.insert(key.clone(), PendingOpen::Solo);
@@ -6698,6 +6793,33 @@ fn stage_brigade(
     members: &[(MemberToken, BrigadeRole, Option<String>)],
     brigade: &BrigadeConfig,
 ) -> Vec<Cmd> {
+    if members.iter().any(|(_, _, id)| {
+        id.as_deref().is_some_and(|id| {
+            state
+                .lost_output_waiting_for_exit
+                .contains(&SessionKey::from_id(id))
+        })
+    }) {
+        state.status =
+            Some("waiting for a previous process to exit before staging this brigade".to_string());
+        return Vec::new();
+    }
+    if !state.unresolved_codex.is_empty()
+        && members.iter().any(|(token, _, id)| {
+            live_panes_of(state, brigade_id, token).is_empty()
+                && id
+                    .as_deref()
+                    .and_then(|id| app.row_for_id(id))
+                    .is_some_and(|row| {
+                        row.agent == AgentKind::Codex
+                            && !state.screens.contains_key(&SessionKey::from_id(&row.id))
+                    })
+        })
+    {
+        state.status =
+            Some("waiting to identify a new Codex pane before staging this brigade".to_string());
+        return Vec::new();
+    }
     let director_session_id = members
         .iter()
         .find(|(_, role, _)| *role == BrigadeRole::Director)
@@ -6957,6 +7079,10 @@ fn stage_brigade(
             None => said,
         });
     }
+    // Known resumes precede fresh creations in one staging batch, so the
+    // shell's unresolved-creation guard sees only children that already
+    // existed when the batch was decided.
+    cmds.sort_by_key(|cmd| !matches!(cmd, Cmd::OpenEmbedded { target, .. } if target.agent == AgentKind::Codex && !target.id.is_empty()));
     cmds
 }
 
@@ -8190,6 +8316,7 @@ fn forget_unopened_worker(state: &mut EmporiumState, brigade_id: BrigadeId, toke
     if state.screens.contains_key(&key) {
         return;
     }
+    state.unresolved_codex.remove(&key);
     state.member_tokens.remove(&key);
     state.member_brigades.remove(&key);
     state.pending_opens.remove(&key);
@@ -8320,6 +8447,7 @@ fn update_spawn_failed(
     error: String,
     now: Instant,
 ) -> Vec<Cmd> {
+    state.unresolved_codex.remove(&key);
     state.pending_opens.remove(&key);
     state.set_status(format!("failed to open: {error}"), now);
     Vec::new()
@@ -8548,40 +8676,22 @@ fn update_pty_exited(
 /// says the member left, so **nothing is removed from the store** (the member,
 /// its cursor and its mail stay) and nothing is relaunched.
 ///
-/// The process is asked to end through the asked-for path ([`kill_pane`]), so it
-/// leaves no orphan and a later exit report is not mistaken for an unrequested
-/// one (the record is kept after the cleanup below consumes it: the shell drops
-/// the handle once the screen is gone, so none is expected, and a stale record
-/// is cleared by the next spawn of the key).
+/// The process is asked to end through the asked-for path ([`kill_pane`]);
+/// its handle remains until the waiter confirms that it exited.
 ///
 /// Not relaunched in place, on purpose: a reader that fails immediately would
 /// loop, restarting a process each time, and a relaunch while the old process
 /// might still be alive would resume one session twice (the double-resume the
-/// brigade guards against). The next staging reopens the member — the one-pane
-/// rule makes that a single reopen.
+/// brigade guards against). Once the process exit is confirmed, the next
+/// staging can reopen the member; the one-pane rule makes that a single reopen.
 ///
-/// If a Director reopen or wiring is waiting on this very pane to be gone, the
-/// pane is gone as far as it can tell: continue as for an exit.
 fn update_pty_output_lost(
     state: &mut EmporiumState,
     app: &mut App,
-    brigade: &BrigadeConfig,
+    _brigade: &BrigadeConfig,
     key: SessionKey,
     now: Instant,
 ) -> Vec<Cmd> {
-    let waited_on = state
-        .pending_director_reopen
-        .as_deref()
-        .is_some_and(|id| SessionKey::from_id(id) == key)
-        || state
-            .pending_director_wiring
-            .as_ref()
-            .is_some_and(|wiring| SessionKey::from_id(&wiring.director_row_id) == key);
-    if waited_on || state.expected_exits.contains(&key) {
-        // banto asked for this one (or is waiting for it): the lost output is
-        // just how the end of a pane it killed reached it.
-        return update_pty_exited(state, app, brigade, key, None, now);
-    }
     // Said as the operator knows it, before the cleanup drops the member's maps.
     let call = match (
         state.member_brigades.get(&key),
@@ -8594,11 +8704,20 @@ fn update_pty_output_lost(
             .unwrap_or_else(|| key.as_str().to_string()),
     };
     let is_member = state.member_tokens.contains_key(&key);
-    let cmds = vec![kill_pane(state, key.clone())];
-    // The ordinary cleanup of a pane that ended (screen, tile, ownership), as an
-    // asked-for exit: it neither relaunches nor removes the member.
-    update_pty_exited(state, app, brigade, key.clone(), None, now);
-    state.expected_exits.insert(key);
+    let was_expected = state.expected_exits.contains(&key);
+    let cmds = if was_expected {
+        Vec::new()
+    } else {
+        vec![kill_pane(state, key.clone())]
+    };
+    state.lost_output_waiting_for_exit.insert(key.clone());
+    state.screens.remove(&key);
+    state.quiescence.remove(&key);
+    state.unstage(&key);
+    state.goinkyo_pane.retain(|_, pane| *pane != key);
+    if was_expected {
+        return cmds;
+    }
     state.set_status(
         if is_member {
             format!("lost the output of {call} \u{2014} pane closed; it stays in the brigade")
@@ -8698,6 +8817,9 @@ fn update_discovery_result(
     member: Option<(BrigadeId, MemberToken)>,
     now: Instant,
 ) -> Vec<Cmd> {
+    if !state.screens.contains_key(&old_key) {
+        return Vec::new();
+    }
     let new_key = SessionKey::from_id(&session_id);
     if new_key == old_key {
         return Vec::new();
@@ -8735,6 +8857,7 @@ fn update_discovery_result(
         );
         return Vec::new();
     }
+    state.unresolved_codex.remove(&old_key);
     let mut cmds = Vec::new();
     if state.rekey_pane_state(&old_key, &new_key) {
         cmds.push(Cmd::RekeyPty {
@@ -8859,6 +8982,17 @@ fn update_brigade_formed(
             return Vec::new();
         }
     };
+    if !state.unresolved_codex.is_empty()
+        && app
+            .row_for_id(&director_row_id)
+            .is_none_or(|row| row.agent == AgentKind::Codex)
+    {
+        state.set_status(
+            "brigade saved; identify the new Codex pane before staging it".to_string(),
+            now,
+        );
+        return Vec::new();
+    }
     let director_key = SessionKey::from_id(&director_row_id);
     let worker_count = worker_tokens.len();
     // Joined in the order they were numbered, whichever pane spawns first.
@@ -9996,6 +10130,8 @@ mod one_pane_duplicates_tests;
 mod stack_order_tests;
 
 #[cfg(test)]
+mod codex_identity_tests;
+#[cfg(test)]
 mod launch_choice_tests;
 #[cfg(test)]
 mod small_tile_tests;
@@ -10035,6 +10171,221 @@ mod tests {
 
     fn app_with(rows: Vec<SessionRow>) -> App {
         App::new(rows)
+    }
+
+    #[test]
+    fn unresolved_codex_blocks_resume_and_formation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .unresolved_codex
+            .insert(SessionKey::new_worker(1, "pending"));
+        let mut target = row("actual");
+        target.agent = AgentKind::Codex;
+        let mut app = app_with(vec![target.clone()]);
+        assert!(open_solo(&mut state, &target).is_empty());
+        assert!(
+            begin_brigade_formation(&mut state, &mut app, &brigade_config(), &target).is_empty()
+        );
+    }
+
+    #[test]
+    fn unresolved_codex_stays_guarded_when_output_is_lost_and_releases_on_exit() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::new_worker(1, "solo");
+        state.unresolved_codex.insert(key.clone());
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutputLost { key: key.clone() },
+            test_instant(),
+        );
+        assert!(state.unresolved_codex.contains(&key));
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key, reason: None },
+            test_instant(),
+        );
+        assert!(state.unresolved_codex.is_empty());
+    }
+
+    #[test]
+    fn discovery_arriving_after_exit_does_not_record_a_member() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade_config(),
+            Event::DiscoveryResult {
+                key: SessionKey::new_worker(1, "worker-1"),
+                session_id: "late".into(),
+                member: Some((1, "worker-1".into())),
+            },
+            test_instant(),
+        );
+        assert!(!cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::RekeyPty { .. } | Cmd::Store(StoreIntent::SetMemberSession { .. })
+        )));
+    }
+
+    #[test]
+    fn director_output_loss_waits_for_actual_exit_before_formation() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("dir");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.pending_director_reopen = Some("dir".into());
+        state.expected_exits.insert(key.clone());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutputLost { key: key.clone() },
+            test_instant(),
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::FormBrigade { .. })))
+        );
+        assert!(state.pending_director_reopen.is_some());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key, reason: None },
+            test_instant(),
+        );
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::FormBrigade { .. })))
+        );
+    }
+
+    #[test]
+    fn lost_output_blocks_a_known_resume_until_confirmed_exit() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let key = SessionKey::from_id("known");
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let target = row("known");
+        let mut app = app_with(vec![target.clone()]);
+        let brigade = brigade_config();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyOutputLost { key: key.clone() },
+            test_instant(),
+        );
+        assert!(open_solo(&mut state, &target).is_empty());
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited { key, reason: None },
+            test_instant(),
+        );
+        assert!(matches!(
+            open_solo(&mut state, &target).as_slice(),
+            [Cmd::OpenEmbedded { .. }]
+        ));
+    }
+
+    #[test]
+    fn fresh_codex_discovery_then_brigade_reopens_the_same_session_once() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut director = row("dir");
+        director.agent = AgentKind::Codex;
+        let mut app = app_with(vec![director]);
+        let brigade = brigade_config();
+        let pending = SessionKey::new_worker(1, "solo");
+        let real = SessionKey::from_id("dir");
+        state.screens.insert(pending.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(pending.clone());
+        state.unresolved_codex.insert(pending.clone());
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: pending.clone(),
+                session_id: "dir".into(),
+                member: None,
+            },
+            test_instant(),
+        );
+        assert!(cmds.iter().any(
+            |cmd| matches!(cmd, Cmd::RekeyPty { from, to } if from == &pending && to == &real)
+        ));
+        assert!(matches!(&state.stage, Stage::Solo(key) if key == &real));
+        assert!(state.unresolved_codex.is_empty());
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".into(),
+                membership: None,
+                members: None,
+                layout: None,
+                names: Vec::new(),
+            },
+            test_instant(),
+        );
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::ConfirmDirectorReopen { .. })
+        ));
+        assert!(
+            matches!(confirm_director_reopen_modal(&mut state, &mut app).as_slice(), [Cmd::KillPty { key }] if key == &real)
+        );
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::PtyExited {
+                key: real.clone(),
+                reason: None,
+            },
+            test_instant(),
+        );
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::CheckCodexTrust)));
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::CodexTrustChecked {
+                primed: true,
+                hook_launchable: true,
+            },
+            test_instant(),
+        );
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::FormBrigade { director_row_id, .. }) if director_row_id == "dir")));
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".into(),
+                name: "dir".into(),
+                cwd: PathBuf::from("/work"),
+                worker_agent: AgentKind::Codex,
+                worker_model: String::new(),
+                worker_effort: String::new(),
+                result: Ok((1, Vec::new())),
+            },
+            test_instant(),
+        );
+        assert_eq!(cmds.iter().filter(|cmd| matches!(cmd, Cmd::OpenEmbedded { target, brigade: Some((_, _, BrigadeRole::Director)), .. } if target.id == "dir" && target.agent == AgentKind::Codex)).count(), 1);
     }
 
     fn brigade_config() -> BrigadeConfig {

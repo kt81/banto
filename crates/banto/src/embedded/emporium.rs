@@ -69,6 +69,7 @@ use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
 use banto_io::provider::SessionProvider;
 use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
+use banto_io::provider::codex::CodexProvider;
 use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
     LiveSession, SysinfoProbe, ancestry_reaches, claude_nudgeable, claude_quiescence,
@@ -485,6 +486,7 @@ struct DiscoveryTracker {
     /// match against `sessions/<pid>.json` that [`poll_discovery`] tries
     /// before falling back to scanning session files by cwd.
     pid: Option<u32>,
+    codex_log_scan: Option<banto_io::codex_liveness::CodexLogScan>,
     /// Which product this is — Claude's own two sources above don't apply
     /// to a Codex child at all (see [`poll_discovery`]'s doc for the
     /// store-based fallback this gates), and only a Codex tracker ever
@@ -652,31 +654,10 @@ fn event_loop(
 
         // Pump every registered handle (kept-alive sessions off-stage keep
         // advancing too, matching the pre-migration "pump every session").
-        // `PtyPoll::Disconnected` is only ever reached once a handle's every
-        // last chunk has been drained (see `PtyHandle::poll`'s doc), so a
-        // handle reports its end once, right here, then gets dropped below —
-        // as an exit or as lost output, whichever the evidence supports.
+        // Lost output is reported separately; the handle stays until the
+        // waiter reports that the child actually exited.
         let pty_pump_start = Instant::now();
-        for (key, handle) in &mut handles {
-            loop {
-                match handle.poll() {
-                    PtyPoll::Chunk(chunk) => events.push_back(Event::PtyOutput {
-                        key: key.clone(),
-                        chunk,
-                    }),
-                    PtyPoll::Empty => break,
-                    PtyPoll::Disconnected => {
-                        // Two facts, reported apart (`disconnect_event`): core
-                        // decides what each means.
-                        events.push_back(super::session::disconnect_event(
-                            key.clone(),
-                            handle.exit_reason(),
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
+        pump_pty_handles(&mut handles, &mut events);
         let pty_pump_dur = pty_pump_start.elapsed();
 
         // One real input event, waited for on the reader thread's channel
@@ -772,6 +753,16 @@ fn event_loop(
                 deps.store,
                 deps.claude_home,
             ));
+            if last_tick.is_none_or(|tick| now.duration_since(tick) >= TICK_INTERVAL)
+                && let Some(home) = deps.codex_home
+            {
+                events.extend(poll_solo_codex_discovery(
+                    &mut discovery,
+                    home,
+                    &claimed,
+                    &SysinfoStartTime,
+                ));
+            }
         }
         let discovery_dur = discovery_start.elapsed();
 
@@ -865,7 +856,7 @@ fn event_loop(
         let dispatch_dur = dispatch_start.elapsed();
 
         // A `PtyExited` or `PtyOutputLost` handler drops the session's `Screen`;
-        // the handle itself (now pointing at a dead reader thread) is reaped here.
+        // a lost-output handle stays until its child actually exits.
         // This is also why every core-side `screens` rekey must reach the
         // handle map (`Cmd::RekeyPty`): a handle left under a stale key
         // reads as "screen gone" and is reaped here, which on Unix closes
@@ -880,10 +871,8 @@ fn event_loop(
         // process sat at zero CPU, and no further input was ever read.
         // Whatever the exact contract turns out to be, a teardown that can
         // block must not run on the thread that serves the operator.
-        let reaped: Vec<PtyHandle> = handles
-            .extract_if(|key, _| !state.screens.contains_key(key))
-            .map(|(_, handle)| handle)
-            .collect();
+        let reaped = reap_pty_handles(&mut handles, &state);
+        discovery.retain(|tracker| state.screens.contains_key(&tracker.key));
         if !reaped.is_empty() {
             std::thread::spawn(move || drop(reaped));
         }
@@ -1542,6 +1531,17 @@ fn execute_open_embedded(
         disallowed_tools,
         autocompact,
     } = request;
+    if target.agent == AgentKind::Codex
+        && !target.id.is_empty()
+        && discovery
+            .iter()
+            .any(|tracker| tracker.agent == AgentKind::Codex)
+    {
+        return vec![Event::SpawnFailed {
+            key,
+            error: "waiting to identify a new Codex pane before resuming".to_string(),
+        }];
+    }
     let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
     // fresh (unresumed) spawn never does.
@@ -1618,6 +1618,13 @@ fn execute_open_embedded(
     }
     let argv = launch.argv(&launch::agent_binary(target.agent, deps.agent_binaries));
     let env = brigade_env(brigade.as_ref(), deps.child);
+    let discovery_since = SystemTime::now();
+    let mut codex_log_scan = (target.agent == AgentKind::Codex && target.id.is_empty())
+        .then(|| {
+            deps.codex_home
+                .and_then(banto_io::codex_liveness::CodexLogScan::open)
+        })
+        .flatten();
     // Size is corrected on this same tick's resize pass, once staged.
     match PtyHandle::open(
         deps.pty_host,
@@ -1630,6 +1637,9 @@ fn execute_open_embedded(
     ) {
         Ok(handle) => {
             let pid = handle.pid();
+            if let (Some(scan), Some(pid)) = (&mut codex_log_scan, pid) {
+                scan.bind_pid(pid, &SysinfoStartTime);
+            }
             if let Some((brigade_id, token, _)) = brigade.as_ref() {
                 // The pane and its member survive a missed ledger update; a
                 // later open retries it, and until then relay falls back to
@@ -1645,9 +1655,10 @@ fn execute_open_embedded(
                     key: key.clone(),
                     agent: target.agent,
                     cwd: target.cwd,
-                    since: SystemTime::now(),
+                    since: discovery_since,
                     member: brigade.map(|(brigade_id, token, _)| (brigade_id, token)),
                     pid,
+                    codex_log_scan,
                     notified_untrusted: false,
                 });
             }
@@ -2060,6 +2071,51 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
 /// keep waiting forever, unchanged from before this existed.
 const CODEX_WORKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
+fn poll_solo_codex_discovery(
+    trackers: &mut Vec<DiscoveryTracker>,
+    home: &CodexHome,
+    claimed: &HashSet<String>,
+    start_time: &dyn banto_io::codex_liveness::ProcessStartTime,
+) -> Vec<Event> {
+    if !banto_io::codex_liveness::attribution_db_readable(&home.threads_db_path()) {
+        return Vec::new();
+    }
+    let provider = CodexProvider::new(home.clone());
+    let mut used = claimed.clone();
+    let mut events = Vec::new();
+    trackers.retain_mut(|tracker| {
+        if tracker.agent != AgentKind::Codex || tracker.member.is_some() {
+            return true;
+        }
+        let Some(pid) = tracker.pid else { return true };
+        let Ok(since) = tracker.since.duration_since(SystemTime::UNIX_EPOCH) else {
+            return true;
+        };
+        let candidates = provider
+            .find_new_sessions(&tracker.cwd, tracker.since)
+            .into_iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>();
+        let Some(id) = tracker
+            .codex_log_scan
+            .as_mut()
+            .and_then(|scan| scan.poll(home, &candidates, pid, since.as_secs(), start_time))
+        else {
+            return true;
+        };
+        if !used.insert(id.clone()) {
+            return true;
+        }
+        events.push(Event::DiscoveryResult {
+            key: tracker.key.clone(),
+            session_id: id,
+            member: None,
+        });
+        false
+    });
+    events
+}
+
 /// This member's `briefed_session_id`, if the store has one — the id
 /// `banto _hook` recorded on stdin the last time it ran for this member
 /// (`BrigadeMember::briefed_session_id`'s own doc, in `banto-core`). The
@@ -2107,12 +2163,12 @@ fn codex_briefed_session_id(
 ///    tried only for a tracker whose `agent` is `AgentKind::Codex`: sources
 ///    1 and 2 don't apply to it at all — see that function's own doc.
 ///
-/// A Codex tracker still unresolved past [`CODEX_WORKER_DISCOVERY_TIMEOUT`]
+/// A Codex member tracker still unresolved past [`CODEX_WORKER_DISCOVERY_TIMEOUT`]
 /// gives up: removed the same as a resolved one, but reported as
 /// [`Event::CodexWorkerDiscoveryTimedOut`] instead of
 /// [`Event::DiscoveryResult`], so the operator sees why rather than the
-/// pane just silently never identifying itself. A Claude tracker never
-/// times out — unchanged from before this existed.
+/// pane just silently never identifying itself. Solo and Claude trackers do
+/// not time out.
 ///
 /// A Claude tracker still unresolved (regardless of how long) whose own cwd
 /// reads as definitively [`banto_io::directory_trust::DirectoryTrust::NotTrusted`]
@@ -2158,12 +2214,16 @@ fn poll_discovery(
     let mut timed_out: Vec<usize> = Vec::new();
     let mut newly_untrusted: Vec<usize> = Vec::new();
     for (i, tracker) in trackers.iter().enumerate() {
-        let by_pid = tracker
-            .pid
+        let by_pid = (tracker.agent == AgentKind::ClaudeCode)
+            .then_some(tracker.pid)
+            .flatten()
             .and_then(|pid| live_session_id(live, pid, &tracker.cwd));
         let id = by_pid
             .filter(|id| !claimed.contains(id) && !used_this_pass.contains(id))
             .or_else(|| {
+                if tracker.agent != AgentKind::ClaudeCode {
+                    return None;
+                }
                 provider
                     .find_new_sessions(&tracker.cwd, tracker.since)
                     .into_iter()
@@ -2183,6 +2243,7 @@ fn poll_discovery(
             used_this_pass.insert(id.clone());
             resolved.push((i, id));
         } else if tracker.agent == AgentKind::Codex
+            && tracker.member.is_some()
             && SystemTime::now()
                 .duration_since(tracker.since)
                 .is_ok_and(|elapsed| elapsed >= CODEX_WORKER_DISCOVERY_TIMEOUT)
@@ -4007,6 +4068,43 @@ fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
         crossterm::event::Event::FocusLost => Some(Event::WindowFocusChanged { focused: false }),
         _ => None,
     }
+}
+
+fn pump_pty_handles(handles: &mut HashMap<SessionKey, PtyHandle>, events: &mut VecDeque<Event>) {
+    for (key, handle) in handles {
+        loop {
+            match handle.poll() {
+                PtyPoll::Chunk(chunk) => events.push_back(Event::PtyOutput {
+                    key: key.clone(),
+                    chunk,
+                }),
+                PtyPoll::Empty => break,
+                PtyPoll::OutputLost => {
+                    events.push_back(Event::PtyOutputLost { key: key.clone() });
+                    break;
+                }
+                PtyPoll::Disconnected => {
+                    events.push_back(super::session::disconnect_event(
+                        key.clone(),
+                        handle.exit_reason(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn reap_pty_handles(
+    handles: &mut HashMap<SessionKey, PtyHandle>,
+    state: &EmporiumState,
+) -> Vec<PtyHandle> {
+    handles
+        .extract_if(|key, handle| {
+            !state.screens.contains_key(key) && !handle.awaiting_exit_after_output_loss()
+        })
+        .map(|(_, handle)| handle)
+        .collect()
 }
 
 /// Compact description of one raw crossterm event, logged before conversion.
@@ -9530,6 +9628,7 @@ mod tests {
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: Some(4242),
+            codex_log_scan: None,
             notified_untrusted: false,
         }];
         let store = RefCell::new(Store::open_in_memory().unwrap());
@@ -9578,6 +9677,7 @@ mod tests {
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: Some(4242),
+            codex_log_scan: None,
             notified_untrusted: false,
         }];
         let store = RefCell::new(Store::open_in_memory().unwrap());
@@ -9622,6 +9722,7 @@ mod tests {
             since,
             member: Some((1, token.to_string())),
             pid: None,
+            codex_log_scan: None,
             notified_untrusted: false,
         };
         let mut trackers = vec![tracker("worker-1"), tracker("worker-2")];
@@ -9683,8 +9784,133 @@ mod tests {
             since,
             member: Some((brigade_id, token.to_string())),
             pid: None,
+            codex_log_scan: None,
             notified_untrusted: false,
         }
+    }
+
+    #[test]
+    fn codex_discovery_does_not_claim_a_claude_session_in_the_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(dir.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(home.clone());
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let since = SystemTime::now() - Duration::from_secs(2);
+        write_session_at(dir.path(), "unrelated-claude", Path::new("/work/alpha"));
+        let mut trackers = vec![codex_tracker(1, "worker-1", since)];
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &[],
+                &store,
+                &home
+            )
+            .is_empty()
+        );
+        assert_eq!(trackers.len(), 1);
+    }
+
+    #[test]
+    fn solo_codex_discovery_keeps_waiting_after_worker_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(dir.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(home.clone());
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut tracker = codex_tracker(
+            1,
+            "solo",
+            SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1),
+        );
+        tracker.member = None;
+        let mut trackers = vec![tracker];
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &[],
+                &store,
+                &home
+            )
+            .is_empty()
+        );
+        assert_eq!(trackers.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_codex_tracker_blocks_resuming_a_known_codex_at_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = SpawnFixture::new(dir.path().to_path_buf());
+        let mut handles = HashMap::new();
+        let mut tracker = codex_tracker(1, "solo", SystemTime::now());
+        tracker.member = None;
+        let mut discovery = vec![tracker];
+        let events = execute_cmd(
+            open_embedded_cmd(AgentKind::Codex, "known", dir.path()),
+            &fixture.deps(),
+            &mut handles,
+            &mut discovery,
+        );
+        assert!(matches!(events.as_slice(), [Event::SpawnFailed { .. }]));
+        assert!(fixture.launches().is_empty());
+    }
+
+    #[test]
+    fn codex_discovery_does_not_use_a_claude_live_pid_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = ClaudeHome::new(dir.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(home.clone());
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let cwd = PathBuf::from("/work/alpha");
+        write_live_state(dir.path(), 4242, "unrelated-claude", &cwd);
+        let live = read_live_sessions(&home.sessions_dir());
+        let mut tracker = codex_tracker(1, "worker-1", SystemTime::now());
+        tracker.pid = Some(4242);
+        let mut trackers = vec![tracker];
+        assert!(
+            poll_discovery(
+                &mut trackers,
+                &provider,
+                &HashSet::new(),
+                &live,
+                &store,
+                &home
+            )
+            .is_empty()
+        );
+        assert_eq!(trackers.len(), 1);
+    }
+
+    #[test]
+    fn solo_codex_discovery_correlates_only_the_hosted_child() {
+        struct Starts;
+        impl banto_io::codex_liveness::ProcessStartTime for Starts {
+            fn start_time(&self, pid: u32) -> Option<u64> {
+                (pid == 100).then_some(900)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = CodexHome::new(dir.path().to_path_buf());
+        let conn = rusqlite::Connection::open(home.threads_db_path()).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT, cwd TEXT, updated_at_ms INTEGER, source TEXT); INSERT INTO threads VALUES ('own', '/work/alpha', 1000000, 'cli'), ('other', '/work/alpha', 1000000, 'cli');").unwrap();
+        let conn = rusqlite::Connection::open(home.logs_db_path()).unwrap();
+        conn.execute_batch("CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, ts_nanos INTEGER, thread_id TEXT, process_uuid TEXT);").unwrap();
+        let mut scan = banto_io::codex_liveness::CodexLogScan::open(&home).unwrap();
+        assert!(scan.bind_pid(100, &Starts));
+        conn.execute_batch("INSERT INTO logs VALUES (1, 1000, 0, 'own', 'pid:100:abc'), (2, 1000, 0, 'other', 'pid:101:def');").unwrap();
+        let mut tracker =
+            codex_tracker(1, "solo", SystemTime::UNIX_EPOCH + Duration::from_secs(900));
+        tracker.member = None;
+        tracker.pid = Some(100);
+        tracker.codex_log_scan = Some(scan);
+        let mut trackers = vec![tracker];
+        let events = poll_solo_codex_discovery(&mut trackers, &home, &HashSet::new(), &Starts);
+        assert!(
+            matches!(events.as_slice(), [Event::DiscoveryResult { session_id, member: None, .. }] if session_id == "own")
+        );
+        assert!(trackers.is_empty());
     }
 
     #[test]
@@ -9760,6 +9986,7 @@ mod tests {
             since: SystemTime::now(),
             member: Some((brigade_id, "worker-1".to_string())),
             pid: None,
+            codex_log_scan: None,
             notified_untrusted: false,
         }];
 
@@ -9822,6 +10049,7 @@ mod tests {
             since: long_ago,
             member: Some((1, "worker-1".to_string())),
             pid: None,
+            codex_log_scan: None,
             notified_untrusted: false,
         }];
 
@@ -9867,6 +10095,7 @@ mod tests {
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: None,
+            codex_log_scan: None,
             notified_untrusted: false,
         }];
 
@@ -9922,6 +10151,7 @@ mod tests {
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
             pid: None,
+            codex_log_scan: None,
             notified_untrusted: false,
         }];
 
@@ -12619,6 +12849,143 @@ mod tests {
             disallowed_tools: None,
             autocompact: None,
         }
+    }
+
+    #[test]
+    fn lost_output_retains_handle_until_waiter_confirms_exit() {
+        struct FailingKiller;
+        impl banto_io::pty::Killer for FailingKiller {
+            fn kill(&mut self) -> anyhow::Result<()> {
+                anyhow::bail!("synthetic kill failure")
+            }
+        }
+        struct FailingHost(MockPtyHost);
+        impl PtyHost for FailingHost {
+            fn open(
+                &self,
+                argv: &[String],
+                cwd: Option<&Path>,
+                env: &[(String, String)],
+                removed: &[&str],
+                rows: u16,
+                cols: u16,
+            ) -> anyhow::Result<banto_io::pty::PtyIo> {
+                let mut io = self.0.open(argv, cwd, env, removed, rows, cols)?;
+                io.killer = Box::new(FailingKiller);
+                Ok(io)
+            }
+        }
+
+        let host = FailingHost(MockPtyHost {
+            unix_style_exit: true,
+            ..Default::default()
+        });
+        let mut row = test_row("existing", AgentKind::Codex);
+        row.cwd = Some(PathBuf::from("/synthetic"));
+        let mut app = App::new(vec![row]);
+        app.open_new_session_modal();
+        app.modal_toggle_agent();
+        let cwd = app.modal_new_session_target().unwrap();
+        app.modal_begin_new_session_check();
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let brigade = BrigadeConfig::default();
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::NewSessionCwdChecked { cwd, is_dir: true },
+            Instant::now(),
+        );
+        let key = cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                Cmd::OpenEmbedded { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mut handle =
+            PtyHandle::open(&host, &["synthetic".into()], None, &[], &[], 24, 80).unwrap();
+        handle.skip_output_loss_grace();
+        let mut handles = HashMap::from([(key.clone(), handle)]);
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned { key: key.clone() },
+            Instant::now(),
+        );
+        let mut events = VecDeque::new();
+        pump_pty_handles(&mut handles, &mut events);
+        assert!(matches!(events.front(), Some(Event::PtyOutputLost { key: k }) if k == &key));
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            events.pop_front().unwrap(),
+            Instant::now(),
+        );
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::KillPty { key: k } if k == &key))
+        );
+        assert!(handles.get_mut(&key).unwrap().kill().is_err());
+        assert!(!state.screens.contains_key(&key));
+        assert!(reap_pty_handles(&mut handles, &state).is_empty());
+        let activate = |state: &mut EmporiumState, app: &mut App| {
+            let requested = engine::update(
+                state,
+                app,
+                &brigade,
+                key_event(
+                    banto_core::input::KeyCode::Enter,
+                    banto_core::input::Modifiers::NONE,
+                ),
+                Instant::now(),
+            );
+            assert!(
+                requested
+                    .iter()
+                    .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::ResolveMembership { .. })))
+            );
+            engine::update(
+                state,
+                app,
+                &brigade,
+                Event::MembershipResolved {
+                    session_id: "existing".into(),
+                    membership: None,
+                    members: None,
+                    layout: None,
+                    names: Vec::new(),
+                },
+                Instant::now(),
+            )
+        };
+        assert!(
+            !activate(&mut state, &mut app)
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. }))
+        );
+        pump_pty_handles(&mut handles, &mut events);
+        assert!(events.is_empty());
+        assert!(reap_pty_handles(&mut handles, &state).is_empty());
+        host.0.fire_exit();
+        pump_pty_handles(&mut handles, &mut events);
+        assert!(matches!(events.front(), Some(Event::PtyExited { key: k, .. }) if k == &key));
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            events.pop_front().unwrap(),
+            Instant::now(),
+        );
+        assert_eq!(reap_pty_handles(&mut handles, &state).len(), 1);
+        assert!(handles.is_empty());
+        assert!(
+            activate(&mut state, &mut app).iter().any(
+                |cmd| matches!(cmd, Cmd::OpenEmbedded { target, .. } if target.id == "existing")
+            )
+        );
     }
 
     #[test]

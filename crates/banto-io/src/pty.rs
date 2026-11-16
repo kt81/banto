@@ -35,11 +35,12 @@ pub struct PtyIo {
     /// shim spawned through a shell, say — in which case id discovery falls
     /// back to matching session files by cwd.
     pub pid: Option<u32>,
-    /// Fires exactly once, when the child has actually exited, carrying
+    /// Reports a confirmed child exit, carrying
     /// what `Child::wait()` reported (translated to banto-core's own plain
     /// [`PtyExitReason`] here, at the I/O boundary — see that type's own
     /// doc for why the richer `portable_pty::ExitStatus` never leaves this
-    /// crate). The only proof the process ended: `output` disconnecting is
+    /// crate). `Unknown` means wait failed and is not an exit. The only proof
+    /// the process ended is a code or signal: `output` disconnecting is
     /// not one, because the reader thread drops its sender on *any* read
     /// error, and on ConPTY a child's exit does **not** produce EOF on
     /// `output` at all (the pseudoconsole keeps the pipe open). See `PortablePtyHost::open`'s exit-waiter thread
@@ -221,13 +222,16 @@ impl PtyHost for PortablePtyHost {
         // ConPTY quirk: a child's exit does not produce EOF on the master
         // reader (see `PtyIo::exited`'s doc), so the read loop above would
         // block forever and never report it. This thread actively waits
-        // instead — `child.wait()` blocks until the process truly exits on
-        // every platform, so it also does what holding `child` here used to
-        // do (keep the handle alive for the pane's lifetime); the resizer
-        // holder below now keeps only the master.
-        let (exited_tx, exited_rx) = mpsc::channel::<PtyExitReason>();
+        // instead; keep the child until wait returns a status.
+        let (exited_tx, exited_rx) = mpsc::sync_channel::<PtyExitReason>(1);
         std::thread::spawn(move || {
-            let _ = exited_tx.send(pty_exit_reason(child.wait()));
+            wait_for_child(
+                &exited_tx,
+                || child.wait(),
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                },
+            );
         });
 
         Ok(PtyIo {
@@ -249,10 +253,7 @@ impl PtyHost for PortablePtyHost {
 /// doc describes. `portable_pty::ExitStatus` carries a `signal` only on
 /// Unix (`ExitStatus::from(std::process::ExitStatus)`, `pty.rs`'s upstream
 /// conversion); a status with none is reported by exit code alone,
-/// regardless of platform. `wait()` itself returning `Err` — observed on no
-/// real machine so far, but the trait allows it — is not treated as "still
-/// running": the exit-waiter thread only ever reaches this after `wait()`
-/// has returned at all, so the child is known gone, just not how.
+/// regardless of platform. A wait error is not proof of exit.
 fn pty_exit_reason(result: std::io::Result<portable_pty::ExitStatus>) -> PtyExitReason {
     match result {
         Ok(status) => match status.signal() {
@@ -263,11 +264,35 @@ fn pty_exit_reason(result: std::io::Result<portable_pty::ExitStatus>) -> PtyExit
     }
 }
 
+fn wait_for_child(
+    sender: &mpsc::SyncSender<PtyExitReason>,
+    mut wait: impl FnMut() -> std::io::Result<portable_pty::ExitStatus>,
+    mut pause: impl FnMut(),
+) {
+    loop {
+        match pty_exit_reason(wait()) {
+            PtyExitReason::Unknown => {
+                if matches!(
+                    sender.try_send(PtyExitReason::Unknown),
+                    Err(mpsc::TrySendError::Disconnected(_))
+                ) {
+                    return;
+                }
+                pause();
+            }
+            reason => {
+                let _ = sender.send(reason);
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod pty_exit_reason_tests {
     use portable_pty::ExitStatus;
 
-    use super::pty_exit_reason;
+    use super::{pty_exit_reason, wait_for_child};
     use banto_core::model::PtyExitReason;
 
     #[test]
@@ -295,11 +320,114 @@ mod pty_exit_reason_tests {
     }
 
     #[test]
-    fn a_wait_error_maps_to_unknown_not_treated_as_still_running() {
+    fn a_wait_error_maps_to_unknown() {
         assert_eq!(
             pty_exit_reason(Err(std::io::Error::other("wait() failed"))),
             PtyExitReason::Unknown
         );
+    }
+
+    #[test]
+    fn wait_error_retries_until_a_status_is_confirmed() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut attempts = 0;
+        wait_for_child(
+            &tx,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::other("synthetic"))
+                } else {
+                    Ok(ExitStatus::with_exit_code(7))
+                }
+            },
+            || assert_eq!(rx.try_recv().unwrap(), PtyExitReason::Unknown),
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(rx.try_recv().unwrap(), PtyExitReason::Code(7));
+    }
+
+    #[test]
+    fn persistent_wait_error_is_bounded_and_stops_when_receiver_drops() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut rx = Some(rx);
+        let mut pauses = 0;
+        wait_for_child(
+            &tx,
+            || Err(std::io::Error::other("synthetic")),
+            || {
+                pauses += 1;
+                if pauses == 3 {
+                    drop(rx.take());
+                }
+            },
+        );
+        assert_eq!(pauses, 3);
+    }
+
+    #[test]
+    fn queued_failure_precedes_a_later_confirmed_status() {
+        for status in [
+            ExitStatus::with_exit_code(7),
+            ExitStatus::with_signal("SIGTERM"),
+        ] {
+            let expected = pty_exit_reason(Ok(status.clone()));
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let mut first = true;
+                wait_for_child(
+                    &tx,
+                    || {
+                        if first {
+                            first = false;
+                            Err(std::io::Error::other("synthetic"))
+                        } else {
+                            ready_tx.send(()).unwrap();
+                            Ok(status.clone())
+                        }
+                    },
+                    || {},
+                );
+                done_tx.send(()).unwrap();
+            });
+            let timeout = std::time::Duration::from_secs(2);
+            ready_rx.recv_timeout(timeout).unwrap();
+            assert_eq!(rx.recv_timeout(timeout).unwrap(), PtyExitReason::Unknown);
+            assert_eq!(rx.recv_timeout(timeout).unwrap(), expected);
+            done_rx.recv_timeout(timeout).unwrap();
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_receiver_after_failure_allows_terminal_sender_to_finish() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut first = true;
+            wait_for_child(
+                &tx,
+                || {
+                    if first {
+                        first = false;
+                        Err(std::io::Error::other("synthetic"))
+                    } else {
+                        ready_tx.send(()).unwrap();
+                        Ok(ExitStatus::with_exit_code(0))
+                    }
+                },
+                || {},
+            );
+            done_tx.send(()).unwrap();
+        });
+        let timeout = std::time::Duration::from_secs(2);
+        ready_rx.recv_timeout(timeout).unwrap();
+        drop(rx);
+        done_rx.recv_timeout(timeout).unwrap();
+        thread.join().unwrap();
     }
 }
 
@@ -550,12 +678,6 @@ pub mod mock {
     /// Mirrors reality: killing a child makes it exit, so `kill` also fires
     /// the same `exited` signal a real `child.wait()` returning would —
     /// keeps `session.rs`'s `poll_reaches_disconnected_after_kill` honest.
-    /// The reason sent is `Unknown`: a real kill on Unix is a signal (which
-    /// platform-specific one depends on `Killer::kill`'s own implementation,
-    /// not modeled here), and on Windows a forced termination reports
-    /// through the same `ExitStatus` a graceful exit does — nothing this
-    /// mock can say with a straight face beyond "gone, not by its own
-    /// choosing."
     struct MockKiller(
         Arc<Mutex<u32>>,
         Arc<Mutex<Option<mpsc::Sender<PtyExitReason>>>>,
@@ -565,7 +687,7 @@ pub mod mock {
         fn kill(&mut self) -> Result<()> {
             *self.0.lock().unwrap() += 1;
             if let Some(tx) = self.1.lock().unwrap().take() {
-                let _ = tx.send(PtyExitReason::Unknown);
+                let _ = tx.send(PtyExitReason::Signal("mock kill".to_string()));
             }
             Ok(())
         }

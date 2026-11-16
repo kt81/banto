@@ -106,6 +106,141 @@ pub fn is_thread_alive(
     newest_thread_is_alive(&conn, thread_id, start_time)
 }
 
+/// An incremental, bounded scan of log rows written after a child was spawned.
+pub struct CodexLogScan {
+    file: same_file::Handle,
+    cursor: i64,
+    associations: BTreeSet<String>,
+    started: Option<u64>,
+    invalid: bool,
+}
+
+/// Decline SQLite crash residue that a read-only open could recreate a sidecar for.
+pub fn attribution_db_readable(path: &std::path::Path) -> bool {
+    let wal = crate::sqlite_ro::wal_sidecar_path(path);
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    !wal.exists() || std::path::Path::new(&shm).exists()
+}
+
+impl CodexLogScan {
+    /// Capture the log's current high-water mark before spawning the child.
+    pub fn open(home: &CodexHome) -> Option<Self> {
+        let path = home.logs_db_path();
+        if !attribution_db_readable(&path) {
+            return None;
+        }
+        let file = same_file::Handle::from_path(&path).ok()?;
+        let conn = open_read_only(&path).ok()?;
+        let cursor = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM logs", [], |row| {
+                row.get(0)
+            })
+            .ok()?;
+        if file != same_file::Handle::from_path(&path).ok()? {
+            return None;
+        }
+        Some(Self {
+            file,
+            cursor,
+            associations: BTreeSet::new(),
+            started: None,
+            invalid: false,
+        })
+    }
+
+    /// Bind the snapshot to the spawned process while its PID is still fresh.
+    pub fn bind_pid(&mut self, pid: u32, start_time: &dyn ProcessStartTime) -> bool {
+        self.started = start_time.start_time(pid);
+        self.started.is_some()
+    }
+
+    /// Return an identity only after all rows through this poll's high-water mark are read.
+    pub fn poll(
+        &mut self,
+        home: &CodexHome,
+        candidates: &[String],
+        pid: u32,
+        since: u64,
+        start_time: &dyn ProcessStartTime,
+    ) -> Option<String> {
+        const BATCH: i64 = 2048;
+        if self.invalid {
+            return None;
+        }
+        let started = self.started?;
+        if start_time.start_time(pid)? != started {
+            return None;
+        }
+        let path = home.logs_db_path();
+        if !attribution_db_readable(&path) || !attribution_db_readable(&home.threads_db_path()) {
+            return None;
+        }
+        if self.file != same_file::Handle::from_path(&path).ok()? {
+            self.invalid = true;
+            return None;
+        }
+        let conn = open_read_only(&path).ok()?;
+        conn.execute_batch("BEGIN").ok()?;
+        let high: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM logs", [], |row| {
+                row.get(0)
+            })
+            .ok()?;
+        if high < self.cursor {
+            self.invalid = true;
+            return None;
+        }
+        let mut stmt = conn.prepare("SELECT id, ts, thread_id, process_uuid FROM logs WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT ?3").ok()?;
+        let rows = stmt
+            .query_map(rusqlite::params![self.cursor, high, BATCH], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .ok()?;
+        for result in rows {
+            let (id, ts, thread, uuid) = result.ok()?;
+            self.cursor = id;
+            if ts >= 0
+                && ts as u64 >= since
+                && ts as u64 >= started
+                && uuid.as_deref().and_then(parse_pid) == Some(pid)
+                && let Some(thread) = thread
+            {
+                self.associations.insert(thread);
+                if self.associations.len() > 1024 {
+                    self.invalid = true;
+                    return None;
+                }
+            }
+        }
+        if self.file != same_file::Handle::from_path(&path).ok()? {
+            self.invalid = true;
+            return None;
+        }
+        if self.cursor < high {
+            return None;
+        }
+        let threads = open_read_only(&home.threads_db_path()).ok();
+        let mut eligible = self.associations.iter().filter(|id| {
+            !threads.as_ref().is_some_and(|conn| {
+                conn.query_row(
+                    "SELECT source FROM threads WHERE id = ?1",
+                    [id.as_str()],
+                    |row| Ok(crate::provider::codex::is_subagent_source(row.get_ref(0)?)),
+                )
+                .unwrap_or(false)
+            })
+        });
+        let id = eligible.next()?;
+        (eligible.next().is_none() && candidates.contains(id)).then(|| id.clone())
+    }
+}
+
 /// Every thread for which Codex's log database can currently prove a live
 /// process.  Opens the database once for a pull that needs to inspect many
 /// sessions, rather than repeating the connection setup per row.
@@ -305,6 +440,110 @@ mod tests {
         fn start_time(&self, pid: u32) -> Option<u64> {
             self.0.get(&pid).copied()
         }
+    }
+
+    #[test]
+    fn candidate_identity_requires_one_fresh_matching_live_pid() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        write_log_row(&home, 1_000, "own", Some("pid:100:abc"));
+        write_log_row(&home, 1_000, "other", Some("pid:101:abc"));
+        let ids = vec!["own".into(), "other".into()];
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        assert_eq!(
+            scan.poll(&home, &ids, 100, 950, &starts),
+            Some("own".into())
+        );
+        assert_eq!(
+            scan.poll(
+                &home,
+                &ids,
+                100,
+                950,
+                &MockStartTime(HashMap::from([(100, 1001)]))
+            ),
+            None
+        );
+        write_log_row(&home, 1_001, "other", Some("pid:100:def"));
+        assert_eq!(scan.poll(&home, &ids, 100, 950, &starts), None);
+    }
+
+    #[test]
+    fn identity_rejects_an_unindexed_second_thread_for_the_same_pid() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        write_log_row(&home, 1_000, "own", Some("pid:100:abc"));
+        write_log_row(&home, 1_000, "unindexed", Some("pid:100:abc"));
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        assert_eq!(scan.poll(&home, &["own".into()], 100, 950, &starts), None);
+    }
+
+    #[test]
+    fn recognized_subagent_does_not_make_the_root_ambiguous() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let db = Connection::open(home.threads_db_path()).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, source TEXT); INSERT INTO threads VALUES ('own', 'cli'), ('guardian', '{\"subagent\":{}}');").unwrap();
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        write_log_row(&home, 1_000, "own", Some("pid:100:abc"));
+        write_log_row(&home, 1_000, "guardian", Some("pid:100:abc"));
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        assert_eq!(
+            scan.poll(&home, &["own".into()], 100, 950, &starts),
+            Some("own".into())
+        );
+    }
+
+    #[test]
+    fn attribution_refuses_wal_without_shm() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let wal = crate::sqlite_ro::wal_sidecar_path(&home.logs_db_path());
+        std::fs::write(&wal, []).unwrap();
+        assert!(CodexLogScan::open(&home).is_none());
+        let mut shm = home.logs_db_path().into_os_string();
+        shm.push("-shm");
+        assert!(!std::path::Path::new(&shm).exists());
+    }
+
+    #[test]
+    fn identity_waits_for_all_bounded_batches_before_deciding() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        let conn = Connection::open(home.logs_db_path()).unwrap();
+        conn.execute_batch("BEGIN; INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) VALUES (1000, 0, 'INFO', 'test', 'own', 'pid:100:x'); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 2048) INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) SELECT 1000, 0, 'INFO', 'test', 'other', 'pid:101:x' FROM n; INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) VALUES (1000, 0, 'INFO', 'test', 'hidden', 'pid:100:x'); COMMIT;").unwrap();
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        assert_eq!(scan.poll(&home, &["own".into()], 100, 950, &starts), None);
+        assert_eq!(scan.poll(&home, &["own".into()], 100, 950, &starts), None);
+    }
+
+    #[test]
+    fn attribution_observes_a_writer_entering_wal_after_the_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 500, "old", Some("pid:100:old"));
+        let mut scan = CodexLogScan::open(&home).unwrap();
+        let starts = MockStartTime(HashMap::from([(100, 900)]));
+        assert!(scan.bind_pid(100, &starts));
+        let writer = Connection::open(home.logs_db_path()).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.execute("INSERT INTO logs (ts, ts_nanos, level, target, thread_id, process_uuid) VALUES (1000, 0, 'INFO', 'test', 'own', 'pid:100:x')", []).unwrap();
+        assert_eq!(
+            scan.poll(&home, &["own".into()], 100, 950, &starts),
+            Some("own".into())
+        );
     }
     #[test]
     fn parse_pid_extracts_the_middle_field() {

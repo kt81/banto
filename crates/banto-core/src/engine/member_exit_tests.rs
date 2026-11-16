@@ -896,9 +896,7 @@ fn a_confirmed_exit_still_removes_the_worker_lost_output_would_have_spared() {
 }
 
 #[test]
-fn lost_output_of_a_director_being_reopened_continues_the_reopen_and_cannot_hang_it() {
-    // The reopen waits for the pane to be gone; the pane it killed may reach
-    // banto as a lost stream instead of an exit report.
+fn lost_output_of_a_director_being_reopened_waits_for_confirmed_exit() {
     let mut state = EmporiumState::new(PrefixKey::default());
     state.screens.insert(key("dir"), Screen::new(24, 80));
     let mut app = App::new(vec![row("dir")]);
@@ -908,6 +906,9 @@ fn lost_output_of_a_director_being_reopened_continues_the_reopen_and_cannot_hang
 
     let cmds = output_lost(&mut state, &mut app, "dir", now());
     assert!(!state.screens.contains_key(&key("dir")));
+    assert!(state.pending_director_reopen.is_some());
+    assert!(cmds.is_empty());
+    let cmds = exits(&mut state, &mut app, "dir", now());
     assert!(state.pending_director_reopen.is_none());
     assert!(
         matches!(

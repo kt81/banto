@@ -20,11 +20,9 @@ pub(crate) enum PtyPoll {
     /// Nothing available right now: the child is running, or its end is still
     /// being confirmed (see [`PtyHandle::poll`]).
     Empty,
-    /// The output stream is gone, with every chunk it ever sent already
-    /// drained (this variant is only reached once no `Chunk` remains). That says
-    /// nothing yet about the process: it is `Event::PtyExited` only if the wait
-    /// thread reported an exit ([`PtyHandle::exit_reason`] is `Some`), and
-    /// `Event::PtyOutputLost` otherwise — see [`disconnect_event`].
+    /// Output ended without a confirmed child exit; emitted once.
+    OutputLost,
+    /// The waiter reported an exit and all available output was drained.
     Disconnected,
 }
 
@@ -34,11 +32,11 @@ pub(crate) enum PtyPoll {
 /// wait thread reported proves the process ended.
 pub(crate) fn disconnect_event(key: SessionKey, reason: Option<PtyExitReason>) -> Event {
     match reason {
-        Some(reason) => Event::PtyExited {
+        Some(reason @ (PtyExitReason::Code(_) | PtyExitReason::Signal(_))) => Event::PtyExited {
             key,
             reason: Some(reason),
         },
-        None => Event::PtyOutputLost { key },
+        None | Some(PtyExitReason::Unknown) => Event::PtyOutputLost { key },
     }
 }
 
@@ -47,15 +45,14 @@ pub(crate) fn disconnect_event(key: SessionKey, reason: Option<PtyExitReason>) -
 /// `engine::SessionKey` — never touched from `update`.
 pub(crate) struct PtyHandle {
     io: PtyIo,
-    /// Latches once `io.exited` has fired, carrying what it reported. A
-    /// `Receiver` only ever fires once, so every reader of it — `poll`,
-    /// `exit_reason`, `has_exited` — must remember the report here rather than
-    /// consume it for itself alone.
+    /// A confirmed exit is shared by `poll`, `exit_reason`, and `has_exited`
+    /// after any one of them consumes it. `Unknown` is not an exit.
     exit_reason: Option<PtyExitReason>,
     /// When `output` was first found disconnected without the child's exit
     /// having been reported (see [`Self::poll`]): the start of the bounded wait
     /// for the waiter's report.
     output_lost_since: Option<std::time::Instant>,
+    output_loss_reported: bool,
     /// How long that wait lasts. A field so a test need not sleep.
     output_lost_grace: std::time::Duration,
 }
@@ -81,6 +78,7 @@ impl PtyHandle {
             io: host.open(argv, cwd, env, env_remove, rows, cols)?,
             exit_reason: None,
             output_lost_since: None,
+            output_loss_reported: false,
             output_lost_grace: OUTPUT_LOST_GRACE,
         })
     }
@@ -100,17 +98,14 @@ impl PtyHandle {
     /// tail output is never dropped; (b) `output` disconnected: if the waiter has
     /// reported, `Disconnected` at once; if not, `Empty` for up to
     /// [`OUTPUT_LOST_GRACE`] — the Unix EOF routinely lands just before the
-    /// waiter's report — and then `Disconnected` with no reason; (c) `output`
+    /// waiter's report — and then `OutputLost` once; (c) `output`
     /// still open but the waiter has reported: the first such poll only latches
     /// the reason and answers `Empty`, a one-tick grace for the race where
     /// `wait()` returns while the reader still holds a chunk it has not forwarded
     /// (the ~50ms loop cadence makes one tick plenty), and the next poll is
     /// `Disconnected`.
     ///
-    /// So `Disconnected` is two facts, told apart by [`Self::exit_reason`]
-    /// afterwards: a reason means **the process exited**; none means **its output
-    /// was lost**, exit unconfirmed. The pump turns them into different events
-    /// ([`disconnect_event`]).
+    /// After `OutputLost`, polling continues until the waiter confirms exit.
     pub(crate) fn poll(&mut self) -> PtyPoll {
         match self.io.output.try_recv() {
             Ok(chunk) => return PtyPoll::Chunk(chunk),
@@ -118,19 +113,16 @@ impl PtyHandle {
                 // The stream ended. Whether the child did is the waiter's to say:
                 // ask it, and give it a bounded moment — without blocking the
                 // loop — before calling the output lost.
-                if self.exit_reason.is_none()
-                    && let Ok(reason) = self.io.exited.try_recv()
-                {
-                    self.exit_reason = Some(reason);
-                }
+                self.latch_exit();
                 if self.exit_reason.is_some() {
                     return PtyPoll::Disconnected;
                 }
                 let since = *self
                     .output_lost_since
                     .get_or_insert_with(std::time::Instant::now);
-                return if since.elapsed() >= self.output_lost_grace {
-                    PtyPoll::Disconnected
+                return if since.elapsed() >= self.output_lost_grace && !self.output_loss_reported {
+                    self.output_loss_reported = true;
+                    PtyPoll::OutputLost
                 } else {
                     PtyPoll::Empty
                 };
@@ -140,10 +132,17 @@ impl PtyHandle {
         if self.exit_reason.is_some() {
             return PtyPoll::Disconnected;
         }
-        if let Ok(reason) = self.io.exited.try_recv() {
-            self.exit_reason = Some(reason);
-        }
+        self.latch_exit();
         PtyPoll::Empty
+    }
+
+    pub(crate) fn awaiting_exit_after_output_loss(&self) -> bool {
+        self.output_loss_reported && self.exit_reason.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_output_loss_grace(&mut self) {
+        self.output_lost_grace = Duration::ZERO;
     }
 
     /// The child's OS pid, when the platform reports one — how a
@@ -160,12 +159,24 @@ impl PtyHandle {
     /// guessed into an exit. The `try_recv` here is a harmless no-op once a reason
     /// is latched.
     pub(crate) fn exit_reason(&mut self) -> Option<PtyExitReason> {
-        if self.exit_reason.is_none()
-            && let Ok(reason) = self.io.exited.try_recv()
-        {
-            self.exit_reason = Some(reason);
-        }
+        self.latch_exit();
         self.exit_reason.clone()
+    }
+
+    fn latch_exit(&mut self) {
+        if self.exit_reason.is_some() {
+            return;
+        }
+        for _ in 0..16 {
+            match self.io.exited.try_recv() {
+                Ok(PtyExitReason::Unknown) => continue,
+                Ok(reason) => {
+                    self.exit_reason = Some(reason);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     /// Forward raw bytes (mouse report, paste, relay nudge/submit) to the
@@ -222,11 +233,7 @@ impl PtyHandle {
     /// waiter has reported, and is never followed by another `poll()` on the same
     /// handle.
     pub(crate) fn has_exited(&mut self) -> bool {
-        if self.exit_reason.is_none()
-            && let Ok(reason) = self.io.exited.try_recv()
-        {
-            self.exit_reason = Some(reason);
-        }
+        self.latch_exit();
         self.exit_reason.is_some()
     }
 }
@@ -350,6 +357,42 @@ mod tests {
     }
 
     #[test]
+    fn output_loss_is_reported_once_then_waits_for_the_actual_exit() {
+        let host = reader_error_host();
+        let mut handle = open_handle(&host);
+        handle.output_lost_grace = std::time::Duration::ZERO;
+        assert!(matches!(handle.poll(), PtyPoll::OutputLost));
+        assert!(handle.awaiting_exit_after_output_loss());
+        assert!(handle.exit_reason().is_none());
+        assert!(matches!(handle.poll(), PtyPoll::Empty));
+        assert!(matches!(handle.poll(), PtyPoll::Empty));
+        host.fire_exit_with_reason(PtyExitReason::Code(7));
+        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+        assert_eq!(handle.exit_reason(), Some(PtyExitReason::Code(7)));
+        assert!(!handle.awaiting_exit_after_output_loss());
+    }
+
+    #[test]
+    fn failed_kill_after_output_loss_does_not_claim_an_exit() {
+        struct FailingKiller;
+        impl banto_io::pty::Killer for FailingKiller {
+            fn kill(&mut self) -> anyhow::Result<()> {
+                anyhow::bail!("synthetic kill failure")
+            }
+        }
+
+        let host = reader_error_host();
+        let mut handle = open_handle(&host);
+        handle.io.killer = Box::new(FailingKiller);
+        handle.output_lost_grace = std::time::Duration::ZERO;
+        assert!(matches!(handle.poll(), PtyPoll::OutputLost));
+        assert!(handle.kill().is_err());
+        assert!(matches!(handle.poll(), PtyPoll::Empty));
+        assert!(handle.awaiting_exit_after_output_loss());
+        assert_eq!(handle.exit_reason(), None);
+    }
+
+    #[test]
     fn a_reader_error_with_the_child_alive_is_output_lost_and_never_an_exit() {
         let host = reader_error_host();
         let mut handle = open_handle(&host);
@@ -359,7 +402,7 @@ mod tests {
         // The wait is over and no exit was reported: the output is lost — the
         // pane is gone, but there is NO exit reason, so the shell reports no exit.
         handle.output_lost_grace = std::time::Duration::ZERO;
-        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+        assert!(matches!(handle.poll(), PtyPoll::OutputLost));
         assert_eq!(handle.exit_reason(), None, "no report, so no exit");
     }
 
@@ -415,7 +458,6 @@ mod tests {
         for reason in [
             PtyExitReason::Code(0),
             PtyExitReason::Signal("SIGKILL".to_string()),
-            PtyExitReason::Unknown,
         ] {
             assert_eq!(
                 disconnect_event(SessionKey::from_id("k"), Some(reason.clone())),
@@ -425,6 +467,67 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn wait_failure_does_not_claim_exit_and_later_status_is_observed() {
+        for reason in [
+            PtyExitReason::Code(7),
+            PtyExitReason::Signal("SIGTERM".into()),
+        ] {
+            let host = MockPtyHost::default();
+            let mut handle = open_handle(&host);
+            host.exit_sender
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .send(PtyExitReason::Unknown)
+                .unwrap();
+            assert!(!handle.has_exited());
+            assert!(matches!(handle.poll(), PtyPoll::Empty));
+            assert!(matches!(
+                disconnect_event(SessionKey::from_id("k"), Some(PtyExitReason::Unknown)),
+                Event::PtyOutputLost { .. }
+            ));
+            host.fire_exit_with_reason(reason.clone());
+            assert_eq!(handle.exit_reason(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn wait_failure_after_output_loss_keeps_the_handle_until_confirmed_exit() {
+        let host = reader_error_host();
+        let mut handle = open_handle(&host);
+        handle.output_lost_grace = Duration::ZERO;
+        assert!(matches!(handle.poll(), PtyPoll::OutputLost));
+        host.exit_sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(PtyExitReason::Unknown)
+            .unwrap();
+        assert!(matches!(handle.poll(), PtyPoll::Empty));
+        assert!(handle.awaiting_exit_after_output_loss());
+        host.fire_exit_with_reason(PtyExitReason::Code(0));
+        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+        assert_eq!(handle.exit_reason(), Some(PtyExitReason::Code(0)));
+    }
+
+    #[test]
+    fn queued_wait_failure_does_not_hide_following_exit() {
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        host.exit_sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(PtyExitReason::Unknown)
+            .unwrap();
+        host.fire_exit_with_reason(PtyExitReason::Code(4));
+        assert_eq!(handle.exit_reason(), Some(PtyExitReason::Code(4)));
     }
 
     #[test]
@@ -444,7 +547,7 @@ mod tests {
         let host = reader_error_host();
         let mut handle = open_handle(&host);
         handle.output_lost_grace = std::time::Duration::ZERO;
-        assert!(matches!(handle.poll(), PtyPoll::Disconnected));
+        assert!(matches!(handle.poll(), PtyPoll::OutputLost));
         assert!(matches!(
             disconnect_event(SessionKey::from_id("k"), handle.exit_reason()),
             Event::PtyOutputLost { .. }

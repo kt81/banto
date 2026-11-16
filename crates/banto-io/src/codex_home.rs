@@ -56,11 +56,10 @@ impl CodexHome {
         self.0.join("state_5.sqlite")
     }
 
-    /// `<root>/logs_2.sqlite`: process liveness (`logs.process_uuid`,
-    /// `pid:<PID>:<suffix>`) — not read by discovery; here for the liveness
-    /// round that follows, which must independently re-verify its own
-    /// version of the sqlite-safety question rather than assuming
-    /// `threads_db_path`'s answer transfers to a different database file.
+    /// `<root>/logs_2.sqlite`: process liveness and fresh solo Codex
+    /// discovery attribution (`logs.process_uuid`, `pid:<PID>:<suffix>`).
+    /// SQLite safety must be checked independently for each database file;
+    /// the answer for `threads_db_path` does not transfer to this one.
     pub fn logs_db_path(&self) -> PathBuf {
         self.0.join("logs_2.sqlite")
     }
