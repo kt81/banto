@@ -24,7 +24,7 @@ unicode-width = "0.2.2"
 # Grapheme clusters, so a cut to width never separates a letter from its
 # combining mark or half a flag (`display_text::shorten_to_columns`). Pure.
 unicode-segmentation = "1.13.3"
-vt100 = { version = "0.16.9", package = "vt100-psmux" }
+vt100 = { version = "0.16.13", package = "vt100-psmux" }
 
 [dev-dependencies]
 toml = "0.9.8"

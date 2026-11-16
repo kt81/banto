@@ -664,17 +664,33 @@ mod tests {
     }
 
     #[test]
-    fn a_label_the_terminal_lays_out_wider_than_the_application_reserved_is_unrecognized() {
-        // The likeliest way a real label brings the old notice back. The
-        // application reserves the cells its own width rule gives the label and
-        // lays the row out to fit; the terminal model here counts a ZWJ sequence
-        // one character at a time (each emoji two cells, the joiner none), so it
-        // lays out more cells than were reserved, the row overflows, and the last
-        // cell is no longer the single rule cell. It reads Unrecognized: closed,
-        // as before the label was allowed for, and no worse.
+    fn a_zwj_label_sized_as_a_grapheme_aware_application_counts_it_is_read_as_empty() {
+        // The likeliest way a real label brought the old notice back, and no
+        // longer does. The application reserves the cells its own width rule
+        // gives a ZWJ sequence (here "ab " and one two-cell emoji) and lays the
+        // row out to fit. The earlier terminal model counted the sequence one
+        // character at a time (each emoji two cells, the joiner none), so it laid
+        // out more cells than were reserved, the row overflowed and read
+        // Unrecognized. `vt100-psmux` 0.16.13 counts the sequence as two cells,
+        // as the application does, so the row ends in its rule cell and reads
+        // Empty.
         let label = "ab \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
-        // As a grapheme-aware application counts it: "ab " and one two-cell emoji.
         let border = labelled_border_of(80, label, 3 + 2);
+        let screen = block_with_border(80, &border, None);
+        let last = screen.screen().cell(18, 79).map(|cell| cell.contents());
+        assert_eq!(last, Some(RULE_GLYPH), "the row ends in its rule cell");
+        assert_eq!(read_input_line(&screen), InputLine::Empty);
+    }
+
+    #[test]
+    fn a_label_the_terminal_lays_out_wider_than_the_application_reserved_is_unrecognized() {
+        // Whatever the cause, a label the model lays out in more cells than the
+        // application reserved overflows the row, so the last cell is no longer
+        // the single rule cell. It reads Unrecognized: closed, as before the
+        // label was allowed for, and no worse. The fixture under-reserves plain
+        // text on purpose, because no real label is known to disagree with the
+        // current model (the ZWJ sequence that did is the test above).
+        let border = labelled_border_of(80, "abcdefgh", 4);
         let screen = block_with_border(80, &border, None);
         // Fixture check: the model really did lay it out wider, so the border
         // row no longer ends in its rule cell.

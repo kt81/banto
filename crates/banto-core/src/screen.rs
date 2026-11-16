@@ -19,21 +19,29 @@ const SCROLLBACK_LEN: usize = 2000;
 
 /// The fewest rows a screen, and so its PTY, is ever given.
 ///
-/// The pinned vt100 (rev 3a8186e of the psmux fork) panics when text wraps on a
-/// one-row screen: `Grid::col_wrap` takes the rows it scrolled away from the row
-/// it left (`grid.rs:739`), and with one row that is 0 - 1. A release build
-/// wraps the subtraction instead and the `unwrap()` that follows panics
-/// (`grid.rs:745`), so it is no debug-only check. A screen with no rows panics
-/// at creation in a debug build. Found by a sweep of 27 classes of input (wrapping
-/// text, wide glyphs, scroll sequences, region and alternate-screen changes) over
-/// sizes 0 to 4 on each axis, fresh, shrunk from 24x80 and grown to it, in both
-/// profiles: nothing at two rows or more and two columns or more panicked.
-/// `a_screen_at_or_above_the_floor_never_panics_in_the_real_parser` re-runs it.
+/// The parser banto pinned from 2026-08-03 to 2026-11-16 (a fork of
+/// `vt100-psmux` 0.16.9) panicked when text wrapped on a one-row screen:
+/// `Grid::col_wrap` took the rows it scrolled away from the row it left, and
+/// with one row that was 0 - 1; a release build wrapped the subtraction and the
+/// `unwrap()` after it panicked, so it was no debug-only check. The published
+/// `vt100-psmux` 0.16.13 no longer does: a sweep of 27 classes of input
+/// (wrapping text, wide glyphs, scroll sequences, region and alternate-screen
+/// changes) over sizes 0 to 3 on each axis, fresh, shrunk from 24x80 and grown
+/// to it, found nothing panicking at one row or one column or more in either
+/// profile, and a screen with no rows or no columns still panicking (every
+/// input in a debug build; six scroll, insert, delete and erase inputs with no
+/// rows in a release build, none with no columns). So two is now banto's own
+/// floor rather than the parser's: dropping it to one would be safe for the
+/// parser, but it also changes the size every child is told and what a tile
+/// can shrink to, which nobody has measured.
+/// `what_panics_below_the_floor_is_recorded_so_a_parser_upgrade_is_noticed`
+/// pins the parser's side, and
+/// `a_screen_at_or_above_the_floor_never_panics_in_the_real_parser` re-runs
+/// the sweep at and above the floor.
 pub const MIN_ROWS: u16 = 2;
-/// The fewest columns, for the same reason. A one-column screen is safe in a
-/// release build, but a double-width glyph in it underflows `cols - width` in a
-/// debug build (`screen.rs:1162`), and a screen with no columns panics as soon
-/// as anything is printed; two columns hold a wide glyph.
+/// The fewest columns, for the same reason. Two columns hold a wide glyph; the
+/// parser itself no longer needs them (a double-width glyph in one column used to
+/// underflow `cols - width` in a debug build, and does not in 0.16.13).
 pub const MIN_COLS: u16 = 2;
 
 /// What a freshly spawned pane's screen and PTY start at, until the first layout
@@ -170,8 +178,8 @@ impl Screen {
         self.parser.screen_mut().take_clipboard()
     }
 
-    /// Take whether the child rang BEL since the previous call. The pinned
-    /// vt100 fork coalesces however many BEL bytes arrived into this one-shot
+    /// Take whether the child rang BEL since the previous call. `vt100-psmux`
+    /// coalesces however many BEL bytes arrived into this one-shot
     /// fact, which is exactly what the emporium needs for a pane latch.
     pub fn take_audible_bell(&mut self) -> bool {
         self.parser.screen_mut().take_audible_bell()
@@ -471,8 +479,7 @@ mod tests {
     //
     // Hand-made synthetic bytes only (repo invariant 2) — no captured session
     // data. Probes which `OSC 8` close spellings the pinned vt100-psmux
-    // (github.com/kt81/psmux, `banto/vt100-patches`,
-    // `perform.rs:244`'s `[b"8", id_params, uri_rest @ ..]` arm) actually
+    // (0.16.13, `perform.rs:304`'s `[b"8", id_params, uri_rest @ ..]` arm) actually
     // recognizes as "close the current hyperlink" — a form the pattern does
     // not match falls through to `unhandled_osc` and leaves `attrs.link`
     // (the running pen) non-zero, so every later-written cell keeps
@@ -481,16 +488,16 @@ mod tests {
     // form was sent.
     //
     // The "leaves the link stuck" tests below assert a KNOWN, CURRENTLY
-    // UNFIXED gap in the vendored parser — a bare `OSC 8 ST`/`OSC 8 BEL`
+    // UNFIXED gap in the parser — a bare `OSC 8 ST`/`OSC 8 BEL`
     // close (no semicolons) never reaches `set_hyperlink` at all. That is a
     // bug being documented, not a contract this crate is protecting: the
     // operator has deliberately chosen a different fix (a frame-boundary
     // OSC 8 close in `banto/src/embedded/emporium.rs`, addressing a
     // separate mechanism — the cell diff can transmit an open with its
     // paired close skipped) over patching this parser gap, so the parser
-    // gap itself is still open. If this ever gets fixed upstream in the
-    // fork, these two assertions should flip to `assert_eq!(.., 0)` along
-    // with it — do not "fix" the test to match the bug going forward.
+    // gap itself is still open. If this ever gets fixed upstream, these two
+    // assertions should flip to `assert_eq!(.., 0)` along with it — do not
+    // "fix" the test to match the bug going forward.
 
     fn hyperlink_id_at(screen: &Screen, col: u16) -> u32 {
         screen
@@ -575,7 +582,7 @@ mod tests {
     fn a_close_split_across_two_process_calls_at_an_awkward_byte_boundary_still_clears() {
         // The close's own bytes (`\x1b]8;;\x1b\\`) are split mid-sequence,
         // as an OS-buffered PTY read could split it. `vte`'s own state
-        // machine is what has to reassemble this, not banto or the fork —
+        // machine is what has to reassemble this, not banto or the parser —
         // this documents that the reassembly does happen, not that this
         // repo built it.
         let mut screen = Screen::new(1, 20);
@@ -1040,34 +1047,52 @@ mod floor_tests {
         }
     }
 
-    /// What breaks below the floor today, recorded so that a parser upgrade that
-    /// fixes any of it is noticed (and the floor then reconsidered), not
-    /// silently followed. Only what holds in both build profiles is asserted
-    /// unconditionally; the rest is a debug build's overflow checks.
+    /// What the parser does below the floor today, recorded so that an upgrade
+    /// that changes it is noticed (and the floor then reconsidered), not silently
+    /// followed. The floor is now banto's own choice and no longer the parser's
+    /// need: one row or one column is safe, and only a screen with no rows or no
+    /// columns still panics. Below one, each profile's own result is pinned
+    /// exactly, since they differ by the debug build's overflow checks; the
+    /// release half runs only under `cargo test --release`.
     #[test]
     fn what_panics_below_the_floor_is_recorded_so_a_parser_upgrade_is_noticed() {
-        // One row: text that wraps panics, in a release build too (the
-        // subtraction wraps and the `unwrap()` after it panics).
-        for cols in 1..=6 {
-            assert!(
-                panicking(1, cols).contains(&"wrap"),
-                "wrapping text on 1x{cols}"
-            );
+        // One row or one column, text that wraps included: no panic in either
+        // profile. This is where the parser used to panic (an overflow in
+        // `Grid::col_wrap` and the `unwrap()` after it), which is why the floor
+        // was set at two rows.
+        for rows in 1..=6 {
+            for cols in 1..=6 {
+                if rows == 1 || cols == 1 {
+                    assert_eq!(
+                        panicking(rows, cols),
+                        Vec::<&str>::new(),
+                        "{rows}x{cols} is below the floor and still safe"
+                    );
+                }
+            }
         }
         if cfg!(debug_assertions) {
-            // One column: a double-width glyph underflows `cols - width`.
-            for rows in MIN_ROWS..=6 {
-                let failed = panicking(rows, 1);
-                assert_eq!(
-                    failed,
-                    ["wide", "text then wide", "emoji"],
-                    "{rows}x1 in a debug build"
-                );
-            }
             // No rows, or no columns: panics, whatever is printed.
             for size in 0..=3 {
                 assert_eq!(panicking(0, size).len(), INPUTS.len(), "0x{size}");
                 assert_eq!(panicking(size, 0).len(), INPUTS.len(), "{size}x0");
+            }
+        } else {
+            // No rows: exactly scrolling and line editing panic. No columns with
+            // a row: nothing does.
+            let no_rows = [
+                "scroll down",
+                "insert lines",
+                "delete lines",
+                "reverse index",
+                "ich dch ech",
+                "erase",
+            ];
+            for size in 0..=3 {
+                assert_eq!(panicking(0, size), no_rows, "0x{size}");
+            }
+            for rows in 1..=3 {
+                assert_eq!(panicking(rows, 0), Vec::<&str>::new(), "{rows}x0");
             }
         }
     }

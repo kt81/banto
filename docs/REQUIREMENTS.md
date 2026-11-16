@@ -283,10 +283,12 @@ and the plan-implementation prompt ring too, not only an approval.
    word while the quit question already treated it as not idle (found in review).
 7. **A pane's screen and PTY are never smaller than 2 rows × 2 columns.** A smaller
    tile keeps a floor-sized screen and child and is drawn clipped ("Size floor").
-   *Why, measured:* the pinned vt100 panics on wrapped text in a one-row screen, in
-   release builds too, and a one-row tile is reachable by shrinking the terminal to
-   4 rows or stacking 6 Workers on a 24-row terminal. The published 0.16.13 no
-   longer has that panic; the fork stays pinned in this change.
+   *Why, measured:* the parser banto pinned from 2026-08-03 to 2026-11-16 (a fork of
+   `vt100-psmux` 0.16.9) panicked on wrapped text in a one-row screen, in release builds too, and a one-row
+   tile is reachable by shrinking the terminal to 4 rows or stacking 6 Workers on a
+   24-row terminal. The published `vt100-psmux` 0.16.13, which banto now uses, no
+   longer has that panic, so the floor is banto's own choice and no longer the
+   parser's need (below).
 8. **`shell` shows busy.** A live Claude session whose status is `shell` (the turn
    ended, a background command is still running) is displayed as busy in the session
    list and `banto list`, and through the list in the counts and marks, matching
@@ -1534,20 +1536,24 @@ drawn clipped: rows and columns beyond the tile are dropped, so its top-left sho
 The PTY is told the size the screen took, not the tile's; the one place either is
 resized is `resize_staged_tiles`, so the two cannot differ. A collapsed tile keeps
 the size it had and is floored when it opens again; an off-stage pane keeps the size
-it has. *Why, measured:* the pinned `vt100` panics on wrapped text in a one-row
-screen, in release builds too (an overflow in `Grid::col_wrap`, then `unwrap()`), a
-one-column screen underflows `cols - width` for a wide glyph in a debug build, and a
-screen with no rows or no columns panics outright; a sweep of 27 input classes over
-sizes 0 to 4 on each axis found nothing at two rows and two columns or more. A
-one-row tile is reachable by shrinking the terminal to 4 rows or by stacking 6
-Workers on a 24-row terminal. *Where the pin lives:* `vt100` is `vt100-psmux`,
-pinned in the root `Cargo.toml` (`[patch.crates-io]`) to one commit of `kt81/psmux`,
-branch `banto/vt100-patches`, rev `3a8186e` (the two fixes it carries are explained
-in the comment beside the pin). *A fact for the future, not a plan:* the published
-crate 0.16.13 (2026-10-13) no longer has this one-row panic (read in its source and
-run in a throwaway crate: no panic for one row or more and one column or more, debug
-and release; zero rows or zero columns still panic in a debug build); the fork stays
-pinned.
+it has. *Why, measured:* the parser banto pinned from 2026-08-03 to 2026-11-16, a
+fork of `vt100-psmux` 0.16.9, panicked on wrapped text in a one-row screen, in release builds too (an
+overflow in `Grid::col_wrap`, then `unwrap()`), a one-column screen underflowed
+`cols - width` for a wide glyph in a debug build, and a screen with no rows or no
+columns panicked outright. A one-row tile is reachable by shrinking the terminal to
+4 rows or by stacking 6 Workers on a 24-row terminal. *Where it stands:* `vt100` is
+the published `vt100-psmux` 0.16.13 (2026-10-13; the manifests require that
+version), and it has neither the one-row panic nor the one-column underflow: a
+sweep of 27 input classes over sizes 0 to 3 on each axis found no panic at one row
+or more and one column or more, in debug and release, while zero rows or zero
+columns still panic (every input in a debug build; six scroll, insert, delete and
+erase inputs with no rows in a release build). So two by two is now banto's choice
+rather than the parser's need. Lowering it to one by one would be safe for the
+parser but also changes the size every child is told and what a tile can shrink to,
+which has not been measured, so the floor stays. Two tests hold the parser's side:
+one re-runs the sweep at and above the floor, one records exactly what panics below
+it in each build profile so that an upgrade that changes it is noticed (the release
+half only under `cargo test --release`; CI runs the debug half).
 
 **Is it idle? (the quit question).** Quitting ends every hosted process, but the
 operator quits when everything is idle and, with the old rule (ask whenever anything
@@ -3024,8 +3030,9 @@ for why not its sqlite files too).
 ## Stack
 
 Rust workspace (edition 2024). ratatui + ratatui-core + crossterm / nucleo /
-rusqlite(bundled) / notify / vt100 (VT emulation for the emporium's embedded
-panes) / portable-pty (the embedded PTY host) / unicode-width / serde,
+rusqlite(bundled) / notify / vt100 (the published `vt100-psmux`: VT emulation
+for the emporium's embedded panes) / portable-pty (the embedded PTY host) /
+unicode-width / serde,
 serde_json, toml / clap / dirs / sysinfo (PID liveness) / thiserror, anyhow.
 Unix builds additionally depend on `libc`.
 

@@ -18,7 +18,7 @@ dirs = "6.0.0"
 ratatui = "0.30.2"
 serde_json = "1.0.150"
 unicode-width = "0.2.2"
-vt100 = { version = "0.16.9", package = "vt100-psmux" }
+vt100 = { version = "0.16.13", package = "vt100-psmux" }
 
 [dev-dependencies]
 rusqlite = { version = "0.40.1", features = ["bundled"] }
