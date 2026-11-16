@@ -1,7 +1,8 @@
 [package]
 name = "banto-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "banto's pure core: Event -> State + Cmd, no I/O (TEA / sans-IO)"
