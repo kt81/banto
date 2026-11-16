@@ -565,15 +565,102 @@ class IdCollisions(unittest.TestCase):
         self.assertEqual(sm["left_out_errands"], {"errands": 0, "changes": 0, "unowned": 0})
 
 
+class DecisionAvailability(unittest.TestCase):
+    def test_before_straddling_and_after_the_commit(self):
+        cutoff = qr.REQUEST_DECISION_AVAILABLE
+        starts = [cutoff - timedelta(hours=2), cutoff - timedelta(hours=1), cutoff]
+        ends = [cutoff - timedelta(hours=1), cutoff, cutoff + timedelta(hours=1)]
+        changes = [{"id": i + 1, "start": start, "end": end, "errands": [], "reviews": [],
+                    "later_fixes": [], "usage": {}} for i, (start, end) in enumerate(zip(starts, ends))]
+        events = [("decision", cutoff - timedelta(minutes=30)), ("decision", cutoff + timedelta(minutes=5))]
+        empty = defaultdict(list)
+        summary = qr.compute_effects(changes, [], events, starts[0], empty, empty, None)
+        self.assertEqual([ch["effect"]["decisions"] for ch in changes], [None, None, 1])
+        self.assertEqual(summary["operator"]["decisions"], 1)
+        self.assertEqual(summary["operator"]["decisions_eligible_changes"], 1)
+        self.assertEqual(summary["operator"]["decisions_per_change"], 1)
+
+
+class DirectorSideFollowups(unittest.TestCase):
+    def test_followups_belong_to_the_first_report_until_next_instruction(self):
+        an = qr.Analysis(when(9, 0), when(12, 0), 3, {})
+        events = [("send", when(10, 0), "worker-9", "review errand"),
+                  ("deliver", when(10, 1), [("worker-9", None, None, "FAIL\n1. High — a.rs:1")]),
+                  ("deliver", when(10, 2), [("worker-9", None, None, "H2: follow-up")]),
+                  ("send", when(10, 3), "worker-9", "review errand"),
+                  ("deliver", when(10, 4), [("worker-9", None, None, "PASS")])]
+        an.director_side_errands(events)
+        self.assertEqual(len(an.errands), 2)
+        self.assertEqual(an.errands[0]["end"], when(10, 1))
+        self.assertEqual(len(an.errands[0]["reports"]), 2)
+        self.assertEqual(qr.neutral_findings(an.errands[0]["reports"]), 2)
+        self.assertEqual(len(an.errands[1]["reports"]), 1)
+
+
+    def test_followup_explicit_verdict_stops_a_director_side_review(self):
+        since = when(9, 0)
+        an = qr.Analysis(since, when(12, 0), 3, {})
+        an.director_side_errands([
+            ("send", when(10, 0), "worker-9", "review errand"),
+            ("deliver", when(10, 1), [("worker-9", None, None, "Checking the change.")]),
+            ("deliver", when(10, 2), [("worker-9", None, None, "Verdict: FAIL\n1. High — synthetic.rs:12")]),
+        ])
+        commits = [{"hash": "abc1234", "ts": when(10, 30), "subject": "feat: x", "files": ["x"]}]
+        changes = qr.group_changes(commits, since, 15)
+        qr.aggregate(changes, an, commits, [], {})
+        review = changes[0]["reviews"][0]
+        self.assertEqual((review["t"], review["verdict"]), (when(10, 2), "FAIL"))
+        result = qr.review_catch([review])
+        self.assertEqual((result["stopped_rounds"], result["stopped_findings"]), (1, 1))
+
+    def test_explicit_verdict_takes_precedence_over_earlier_derived_mark(self):
+        reports = [(when(10, 1), "BLOCKER in this case"), (when(10, 2), "Verdict: PASS")]
+        self.assertEqual(qr.selected_review_report(reports)[2], "PASS")
+        self.assertEqual(qr.selected_review_report(reports[:1])[2], "BLK*")
+
+
+class NeutralFindingHeadings(unittest.TestCase):
+    def test_numbered_severity_not_numbered_checks(self):
+        text = "PASS checks:\n1. verified the output\n2. checked the boundary\nFAIL\n1. High — sample.rs:12\n2. Medium — sample.rs:20"
+        self.assertEqual(qr.neutral_findings([(None, text)]), 2)
+
+    def test_empty_severity_heading_is_not_a_finding(self):
+        self.assertEqual(qr.neutral_findings([(None, "BLOCKER: none.\nSHOULD-FIX: none found.")]), 0)
+
+    def test_bare_severity_and_numbered_severity_are_not_findings(self):
+        for text in ("HIGH", "HIGH:", "1. HIGH", "**HIGH**:"):
+            with self.subTest(text=text):
+                self.assertEqual(qr.neutral_findings([(None, text)]), 0)
+        for text in ("HIGH: no handling for missing input", "1. HIGH — missing input"):
+            with self.subTest(text=text):
+                self.assertEqual(qr.neutral_findings([(None, text)]), 1)
+
+    def test_negated_clear_words_remain_findings(self):
+        for text in ("H1: not fixed", "H1: failure was not resolved", "H1: never fixed"):
+            with self.subTest(text=text):
+                self.assertEqual(qr.neutral_findings([(None, text)]), 1)
+        for text in ("H1: fixed", "H1: failure was resolved", "H1: passed"):
+            with self.subTest(text=text):
+                self.assertEqual(qr.neutral_findings([(None, text)]), 0)
+
+    def test_unlisted_finding_sentence_with_location(self):
+        self.assertEqual(qr.neutral_findings([(None, "New finding, low — a.rs:12. Broken case.")]), 1)
+
+    def test_labels_clear_checks_and_followups(self):
+        reports = [(None, "BLOCKER 1 — a.rs:1\nH2: unhandled case\nH3: holds on test"),
+                   (None, "H2: still unhandled\nH4: another issue")]
+        self.assertEqual(qr.neutral_findings(reports), 3)
+
+
 class ReviewCatch(unittest.TestCase):
     def test_fail_rounds_findings_and_derived_marks(self):
-        reviews = [{"verdict": "FAIL", "findings": 3, "blockers": 1}, {"verdict": "PASS", "findings": 1, "blockers": 0},
-                   {"verdict": "FAIL", "findings": 2, "blockers": 2}, {"verdict": "BLK*", "findings": 4, "blockers": 1},
+        reviews = [{"verdict": "FAIL", "findings": 3, "neutral_findings": 2, "blockers": 1}, {"verdict": "PASS", "findings": 1, "blockers": 0},
+                   {"verdict": "FAIL", "findings": 2, "blockers": 2}, {"verdict": "BLK*", "findings": 4, "neutral_findings": 1, "blockers": 1},
                    {"verdict": None, "findings": 0, "blockers": 0}]
-        self.assertEqual(qr.review_catch(reviews), {"rounds": 5, "fail_rounds": 2, "fail_findings": 5, "fail_blockers": 3, "derived_blk_rounds": 1})
+        self.assertEqual(qr.review_catch(reviews), {"rounds": 5, "fail_rounds": 2, "fail_findings": 5, "fail_blockers": 3, "derived_blk_rounds": 1, "stopped_rounds": 3, "stopped_findings": 3})
 
     def test_no_review_is_all_zero(self):
-        self.assertEqual(qr.review_catch([]), {"rounds": 0, "fail_rounds": 0, "fail_findings": 0, "fail_blockers": 0, "derived_blk_rounds": 0})
+        self.assertEqual(qr.review_catch([]), {"rounds": 0, "fail_rounds": 0, "fail_findings": 0, "fail_blockers": 0, "derived_blk_rounds": 0, "stopped_rounds": 0, "stopped_findings": 0})
 
 
 GIT_DATES = ("2025-03-10T10:30:00+00:00", "2025-03-10T11:30:00+00:00")
@@ -684,7 +771,7 @@ class EffectEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         doc = self.load("o1")
         c1, c2 = (ch["effect"] for ch in doc["changes"])
-        self.assertEqual(c1["review"], {"rounds": 1, "fail_rounds": 1, "fail_findings": 2, "fail_blockers": 0, "derived_blk_rounds": 0})
+        self.assertEqual(c1["review"], {"rounds": 1, "fail_rounds": 1, "fail_findings": 2, "fail_blockers": 0, "derived_blk_rounds": 0, "stopped_rounds": 1, "stopped_findings": 2})
         self.assertEqual(c2["review"]["rounds"], 0)
         self.assertEqual((c1["escapes"]["candidates_a"], c2["escapes"]["candidates_a"]), (1, 1))
         self.assertEqual((c1["escapes"]["fix_commits"], c2["escapes"]["fix_commits"]), (1, 0))
@@ -702,10 +789,10 @@ class EffectEndToEnd(unittest.TestCase):
         self.assertEqual((c1["parallel"]["open_s"], c1["parallel"]["multi_s"]), (420, 60))   # 10:01..10:08 open, 10:02..10:03 two at once
         self.assertEqual((c2["parallel"]["open_s"], c2["parallel"]["share"]), (0, None))
         self.assertEqual((c1["operator_messages"], c2["operator_messages"]), (3, 1))         # nudges, tags, meta text excluded
-        self.assertEqual((c1["decisions"], c2["decisions"]), (1, 0))
+        self.assertEqual((c1["decisions"], c2["decisions"]), (None, None))
         self.assertGreater(c1["cost"], 0)
         s = doc["summary"]
-        self.assertEqual(s["review"], {"changes_with_review": 1, "changes_with_fail": 1, "fail_rounds": 1, "fail_findings": 2, "derived_blk_rounds": 0})
+        self.assertEqual(s["review"], {"changes_with_review": 1, "changes_with_fail": 1, "fail_rounds": 1, "fail_findings": 2, "derived_blk_rounds": 0, "changes_with_stopped": 1, "stopped_rounds": 1, "stopped_findings": 2})
         self.assertEqual(s["escapes"]["candidates_a"], 2)
         self.assertIsNone(s["escapes"]["judged_a"])
         self.assertEqual(s["escapes"]["changes_with_candidate_a"], 2)
@@ -716,7 +803,9 @@ class EffectEndToEnd(unittest.TestCase):
         self.assertEqual(s["lead_time"], {"median_s": 29 * 60, "max_s": 29 * 60, "changes_with_lead_time": 1, "changes_without_lead_time": 1})
         self.assertEqual(s["left_out_errands"], {"errands": 2, "changes": 2, "unowned": 0})
         self.assertEqual(s["parallelism"]["share"], 60 / 420)
-        self.assertEqual((s["operator"]["messages"], s["operator"]["decisions"]), (4, 1))
+        self.assertEqual((s["operator"]["messages"], s["operator"]["decisions"]), (4, None))
+        self.assertEqual(s["operator"]["decisions_eligible_changes"], 0)
+        self.assertIsNone(s["operator"]["decisions_per_change"])
         self.assertEqual(s["operator"]["messages_per_change"], 2)
         self.assertIsNone(s["judgments"])
         self.assertIn("WINDOW SUMMARY", stdout)

@@ -69,7 +69,23 @@ then speed, then operator effort, then cost.
 1. **Caught by review.** Review rounds whose report says FAIL, and the findings
    listed in them. Summary: changes with at least one FAIL out of the changes that
    had any review, and the total FAIL rounds. It counts FAILs; it does not say any
-   was right. Rounds with only a derived mark (`BLK*`) are counted apart.
+   was right. Rounds with only a derived mark (`BLK*`) are counted apart. The
+   adjacent stopped count includes both explicit FAIL and derived BLK* rounds.
+   Its separate finding heuristic counts severity headings with content,
+   F/N/H/W/B-number labels, and severity-qualified finding sentences containing
+   a file:line reference. Bare severity headings and headings whose entire detail
+   is `none`, `none found`, `0`, or `no` plus issue/problem/finding/blocker
+   (singular or plural) do not count. For labels, clear-check words such as
+   `fixed` or `resolved` suppress a count unless preceded within three words by
+   a recognized negation such as `not` or `never`. Explicit labels deduplicate
+   across messages; numbered severity headings are distinct per message.
+   Follow-up messages before the next instruction are included, with the first
+   report still ending the errand. The first explicit verdict across the messages
+   takes precedence over derived marks; otherwise the first derived mark is used.
+   These rules can miss unlabelled findings, count a labelled check as a finding,
+   miss negations outside the three-word window, or double-count restated
+   numbered findings. Reviewer neutrality has not been established. The previous
+   fields remain beside them for comparison.
 2. **Escaped review.** Two signals side by side: the operator-problem
    candidates (`candidates_a.txt`) and the later `fix` commits touching the
    change's files within `--fix-days` (they are different events and are not
@@ -124,7 +140,10 @@ then speed, then operator effort, then cost.
    counts every left-out errand whose time was excluded from parallelism or that a
    change owns, and says how many of them no change owns (`unowned`).
 6. **Operator effort.** Operator-typed messages to the Director in the window, and
-   `request_decision` calls the Director made. An operator-typed message is a user
+   `request_decision` calls the Director made. Commit `1b44854` introduced the
+   tool at 2026-11-15 10:43:38 UTC. Changes starting before that time, including
+   changes that straddle it, show N/A; the summary uses only changes starting at
+   or after that time for its decision count and per-change denominator. An operator-typed message is a user
    record in the Director's transcript that is not a tool result, not meta, not a
    compaction summary, has origin human or none, and does not start with `[banto`
    (a relay nudge or a line banto typed into a pane) or `<` (a tag the harness

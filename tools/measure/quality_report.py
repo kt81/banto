@@ -55,6 +55,8 @@ ROLE_BY_NAME = {
 }
 KINDS = ["implementation", "review", "docs", "measurement/investigation", "other"]
 OUT_NAMES = ["candidates_a.txt", "candidates_b.txt", "errands_dump.txt", "report.txt", "changes.json"]
+REQUEST_DECISION_AVAILABLE = datetime(2026, 11, 15, 10, 43, 38, tzinfo=timezone.utc)
+
 KIND_LETTER = {"implementation": "I", "review": "R", "docs": "D", "measurement/investigation": "M", "other": "O"}
 
 # Errand-instruction keywords, tried in this order on the first 400 characters
@@ -81,6 +83,14 @@ HOLDS_RX = re.compile(r"\bHOLDS\b")
 BLOCK_RX = re.compile(r"\b(BLOCKERS?|BLOCK|DOES NOT (?:FULLY )?HOLD|CANNOT TELL)\b")
 # Finding labels at the start of a line of a review report (BLOCKER-1, H2, F3, NIT ...).
 ITEM_RX = re.compile(r"(?m)^[\s>*\-•]*(?:\*\*|`)?(?:\d+[.)]\s*)?(?:\*\*|`)?((?:BLOCKER|HIGH|MED(?:IUM)?|LOW|NIT|MAJOR|MINOR|SHOULD-FIX)-?\d{0,2}|(?:F|N|W|H|B|P|T|S|R|NEW-?)\d{1,2}[′']*)(?=[\s:.)—\-*`]|$)")
+
+# Finding headings are narrower than ITEM_RX: ordinary numbered checklists are not findings.
+FINDING_SEVERITY_RX = re.compile(r"^\s*(?:[-*>#•]+\s*)?(?:\*\*|`)?(?:(\d+)[.)]\s*)?(?:\*\*|`)?(BLOCKER|HIGH|MED(?:IUM)?|LOW|NIT|MAJOR|MINOR|SHOULD-FIX)(?:[ -]?(\d+))?(?=[\s:.)—\-*`]|$)", re.I)
+FINDING_SENTENCE_RX = re.compile(r"^\s*(?:\w+\s+)?finding\s*,\s*(?:BLOCKER|HIGH|MED(?:IUM)?|LOW|NIT|MAJOR|MINOR)\b.*\b[\w.-]+\.[a-z0-9]+:\d+", re.I)
+FINDING_LABEL_RX = re.compile(r"^\s*(?:[-*>#•]+\s*)?(?:\*\*|`)?([FNHWB]\d{1,2}[′']*)(?=[\s:.)—\-*`]|$)")
+CLEAR_FINDING_RX = re.compile(r"\b(?:pass(?:es|ed)?|holds|no (?:issue|problem|finding|blocker)s?|confirmed clean|fixed|resolved)\b", re.I)
+NEGATED_CLEAR_RX = re.compile(r"\b(?:not|never|isn't|wasn't|weren't|hasn't|haven't|hadn't)\b(?:\W+\w+){0,3}\W*$", re.I)
+EMPTY_SEVERITY_RX = re.compile(r"(?:none(?:\s+found)?|no\s+(?:issues?|problems?|findings?|blockers?)|0)(?:[.!])?", re.I)
 
 # Conventional-commit "fix" subject: a later fix touching the same files counts against the change.
 FIX_SUBJECT_RX = re.compile(r"^fix(\(|:|!)")
@@ -274,6 +284,49 @@ def findings_of(text):
     return len(finding_tokens(text)), len(re.findall(r"\bblockers?\b", text, re.I))
 
 
+def selected_review_report(reports):
+    """Prefer the first explicit verdict across messages, then the first derived verdict."""
+    derived = None
+    for t, text in reports:
+        verdict = verdict_of(text) if text else None
+        if verdict in ("PASS", "FAIL"):
+            return t, text, verdict
+        if verdict and derived is None:
+            derived = (t, text, verdict)
+    return derived or (reports[0][0], reports[0][1], None)
+
+
+def has_clear_check(line):
+    return any(not NEGATED_CLEAR_RX.search(line[:match.start()]) for match in CLEAR_FINDING_RX.finditer(line))
+
+
+def neutral_findings(reports):
+    """Count severity headings and labelled findings; suppress labelled clear checks.
+
+    Numbered severity headings are distinct within a message, while explicit labels
+    are deduplicated across follow-up messages. This is still a heuristic.
+    """
+    found = set()
+    for message, (_ts, text) in enumerate(reports):
+        for line in text.splitlines():
+            severity = FINDING_SEVERITY_RX.match(line)
+            if severity:
+                detail = line[severity.end():].strip(" \t:—-.*`#")
+                if not detail or EMPTY_SEVERITY_RX.fullmatch(detail):
+                    continue
+                number, word, suffix = severity.groups()
+                key = ("number", message, number) if number else ("severity", word.upper(), suffix or "")
+                found.add(key)
+                continue
+            if FINDING_SENTENCE_RX.match(line):
+                found.add(("sentence", message, line))
+                continue
+            label = FINDING_LABEL_RX.match(line)
+            if label and not has_clear_check(line):
+                found.add(("label", label.group(1).upper()))
+    return len(found)
+
+
 def excerpt(t, n=260):
     return re.sub(r"\s+", " ", t).strip()[:n]
 
@@ -344,7 +397,7 @@ class Analysis:
     def director_side_errands(self, director_events):
         """Workers without a transcript (Codex has none in this format): the
         instruction is a Director send to that Worker (or a broadcast naming it),
-        the report is the next message from that Worker the Director received."""
+        the first received report ends the errand; further messages before the next instruction stay with it."""
         known = {e["worker"] for e in self.errands}
         senders = {sender for e in director_events if e[0] == "deliver" for sender, _, _, _ in e[2] if sender.startswith("worker-")}
         missing = sorted(senders - known)
@@ -352,19 +405,16 @@ class Analysis:
             pending = None
             for e in director_events:
                 if e[0] == "send" and (e[2] == w or (e[2] in (None, "") and re.search(rf"\b{w}\b", e[3]))):
-                    if pending is not None and not pending["reports"]:
-                        self.add_errand(w, pending["start"], e[1], pending["instr"], [], [], None, False, "director-side (no transcript)")
+                    if pending is not None:
+                        self.add_errand(w, pending["start"], pending["end"] or e[1], pending["instr"], pending["reports"], [], None, False, "director-side (no transcript)")
                     pending = {"start": e[1], "instr": e[3], "reports": [], "end": None}
                 elif e[0] == "deliver" and pending is not None:
                     for sender, _n, _sc, body in e[2]:
                         if sender == w:
                             pending["reports"].append((e[1], body))
                             pending["end"] = pending["end"] or e[1]
-                    if pending["reports"]:
-                        self.add_errand(w, pending["start"], pending["end"], pending["instr"], pending["reports"], [], None, False, "director-side (no transcript)")
-                        pending = None
             if pending is not None:
-                self.add_errand(w, pending["start"], self.until or pending["start"], pending["instr"], [], [], None, True, "director-side (no transcript)")
+                self.add_errand(w, pending["start"], pending["end"] or self.until or pending["start"], pending["instr"], pending["reports"], [], None, pending["end"] is None, "director-side (no transcript)")
         return missing
 
     def finish_errands(self):
@@ -402,13 +452,9 @@ def aggregate(changes, an, commits, sessions, label_of):
                 continue
             if not e["reports"]:
                 continue
-            for t, tx in e["reports"]:
-                v = verdict_of(tx) if tx else None
-                fi, bl = findings_of(tx) if tx else (0, 0)
-                if v is None and len(e["reports"]) > 1:
-                    continue
-                ch["reviews"].append({"reviewer": e["worker"], "t": t, "verdict": v, "findings": fi, "blockers": bl, "chars": len(tx)})
-                break
+            t, tx, v = selected_review_report(e["reports"])
+            fi, bl = findings_of(tx) if tx else (0, 0)
+            ch["reviews"].append({"reviewer": e["worker"], "t": t, "verdict": v, "findings": fi, "neutral_findings": neutral_findings(e["reports"]), "blockers": bl, "chars": len(tx)})
         ch["reviews"].sort(key=lambda r: r["t"] or ch["start"])
         impl = [e for e in ch["errands"] if e["kind"] == "implementation"]
         ch["rework"] = max(0, len(impl) - 1)
@@ -643,7 +689,9 @@ def review_catch(reviews):
     fails = [r for r in reviews if r["verdict"] == "FAIL"]
     return {"rounds": len(reviews), "fail_rounds": len(fails), "fail_findings": sum(r["findings"] for r in fails),
             "fail_blockers": sum(r["blockers"] for r in fails),
-            "derived_blk_rounds": sum(1 for r in reviews if r["verdict"] == "BLK*")}
+            "derived_blk_rounds": sum(1 for r in reviews if r["verdict"] == "BLK*"),
+            "stopped_rounds": sum(1 for r in reviews if r["verdict"] in ("FAIL", "BLK*")),
+            "stopped_findings": sum(r.get("neutral_findings", 0) for r in reviews if r["verdict"] in ("FAIL", "BLK*"))}
 
 
 def compute_effects(changes, errands, director_events, since, cand_a, cand_b, judgments):
@@ -677,7 +725,7 @@ def compute_effects(changes, errands, director_events, since, cand_a, cand_b, ju
             "lead_time_s": lt.total_seconds() if lt is not None else None,
             "lead_time_note": lt_note, "left_out_errands": never_reported(ch),
             "parallel": {"open_s": open_s, "multi_s": multi_s, "share": multi_s / open_s if open_s else None},
-            "operator_messages": ops[ch["id"]], "decisions": decisions[ch["id"]],
+            "operator_messages": ops[ch["id"]], "decisions": (decisions[ch["id"]] if ch["start"] >= REQUEST_DECISION_AVAILABLE else None),
             "cost": sum(a[1] for a in ch["usage"].values()),
         }
     es = [ch["effect"] for ch in changes]
@@ -690,6 +738,9 @@ def compute_effects(changes, errands, director_events, since, cand_a, cand_b, ju
         "changes": n,
         "review": {"changes_with_review": sum(1 for e in es if e["review"]["rounds"]),
                    "changes_with_fail": sum(1 for e in es if e["review"]["fail_rounds"]),
+                   "changes_with_stopped": sum(1 for e in es if e["review"]["stopped_rounds"]),
+                   "stopped_rounds": sum(e["review"]["stopped_rounds"] for e in es),
+                   "stopped_findings": sum(e["review"]["stopped_findings"] for e in es),
                    "fail_rounds": sum(e["review"]["fail_rounds"] for e in es),
                    "fail_findings": sum(e["review"]["fail_findings"] for e in es),
                    "derived_blk_rounds": sum(e["review"]["derived_blk_rounds"] for e in es)},
@@ -707,9 +758,10 @@ def compute_effects(changes, errands, director_events, since, cand_a, cand_b, ju
         "left_out_errands": {"errands": len(left_out), "changes": sum(1 for e in es if e["left_out_errands"]),
                              "unowned": sum(1 for e in left_out if id(e) not in owned)},
         "parallelism": {"open_s": open_s, "multi_s": multi_s, "share": multi_s / open_s if open_s else None},
-        "operator": {"messages": sum(e["operator_messages"] for e in es), "decisions": sum(e["decisions"] for e in es),
+        "operator": {"messages": sum(e["operator_messages"] for e in es), "decisions": (sum(e["decisions"] for e in es if e["decisions"] is not None) if any(e["decisions"] is not None for e in es) else None),
+                     "decisions_eligible_changes": sum(e["decisions"] is not None for e in es),
                      "messages_per_change": sum(e["operator_messages"] for e in es) / n if n else None,
-                     "decisions_per_change": sum(e["decisions"] for e in es) / n if n else None},
+                     "decisions_per_change": (sum(e["decisions"] for e in es if e["decisions"] is not None) / sum(e["decisions"] is not None for e in es) if any(e["decisions"] is not None for e in es) else None)},
         "cost": {"weighted": sum(e["cost"] for e in es), "per_change": sum(e["cost"] for e in es) / n if n else None},
         "judgments": None,
     }
@@ -768,7 +820,7 @@ def fmt_triggers(by):
 
 DEFINITIONS = [
     "DEFINITIONS (effect metrics; every count is a count of what a heuristic matched, not a judged fact)",
-    "  caught by review: review rounds whose report says FAIL, and the findings (BLOCKER-1, H2, F3 ... labels) listed in those rounds. A FAIL is counted, not judged real.",
+    "  caught by review: review rounds whose report says FAIL, and the findings (BLOCKER-1, H2, F3 ... labels) listed in those rounds. A FAIL is counted, not judged real. Stopped includes explicit FAIL and derived BLK*. Its finding count recognises severity headings with detail, F/N/H/W/B labels except labelled clear checks, and severity-qualified finding sentences with file:line; see README for negation and limits. Follow-ups before the next instruction count; explicit labels deduplicate, numbered headings are distinct per message. It can miss unlabelled or misread ambiguous findings.",
     "    BLK* rounds (no explicit verdict, the opening names a blocker) are counted apart and are not FAIL.",
     "  escaped review: (a) candidates are operator messages with a problem word within --horizon-h after a review PASS or a release build; the second signal is later 'fix' commits",
     "    touching the change's files within --fix-days. Without a --judgments file both are candidate counts. With one, a candidate is real / not / unsure / unjudged by the line written for its id.",
@@ -790,7 +842,7 @@ DEFINITIONS = [
     "  left out: an errand that never reported back has no real end (it stays open to the Worker's last record), so lead time and parallelism leave it out. Every other use of errands (kinds, reviews, cost, rework) still includes them.",
     "    The per-change count assigns an errand by the change it started in, once; an errand that starts at or before --since is owned by no change, so no per-change count has it.",
     "    The summary counts every left-out errand whose time was excluded from parallelism or that a change owns, owned by a change or not; 'unowned' says how many of them no change owns.",
-    "  operator effort: operator-typed messages to the Director, and request_decision calls the Director made, with a timestamp inside the change's window.",
+    "  operator effort: operator-typed messages to the Director, and request_decision calls. The tool arrived at commit 1b44854 (2026-11-15 10:43:38 UTC); changes starting before it, including straddlers, are N/A. The decision summary uses only fully eligible changes.",
     "  cost: the weighted cost of the change as above, the same number, no new cost logic. Effort and cost are not added into a score.",
     "  A change owns (previous change's last commit, its own last commit]. Time or messages after the last commit belong to no change.",
 ]
@@ -840,6 +892,7 @@ def render_report(args, w, unmatched, director_id, brigade, since, until, commit
         if ef:
             rv, es, rt = ef["review"], ef["escapes"], ef["reversals"]
             P(f"  effect: caught by review: {rv['fail_rounds']} FAIL round(s) of {rv['rounds']}, {rv['fail_findings']} finding(s) in them")
+            P(f"          stopped (FAIL or derived BLK*): {rv['stopped_rounds']} round(s), {rv['stopped_findings']} findings (heading heuristic)")
             P(f"          escaped (candidates): (a) {es['candidates_a']}"
               + (f" [{fmt_judged(es['judged_a'])}]" if es["judged_a"] else "") + f"; later fix commits {es['fix_commits']}")
             P(f"          Director reversals by trigger (turn): {fmt_triggers(rt['by_trigger'])}; by predecessor: {fmt_triggers(rt['by_predecessor'])}"
@@ -848,7 +901,7 @@ def render_report(args, w, unmatched, director_id, brigade, since, until, commit
             pl = ef["parallel"]
             P(f"          {lt}; parallelism {fmt_share(pl['share'])} of {fmt_secs(pl['open_s'])} with an errand open"
               f"; errands left out (never reported) {ef['left_out_errands']}"
-              f"; operator messages {ef['operator_messages']}, request_decision {ef['decisions']}; weighted cost {kfmt(ef['cost'])}")
+              f"; operator messages {ef['operator_messages']}, request_decision {ef['decisions'] if ef['decisions'] is not None else 'N/A'}; weighted cost {kfmt(ef['cost'])}")
     P("")
     P(f"classification source over all errands: {dict(Counter(e['how'] for e in errands))}; kinds: {dict(Counter(e['kind'] for e in errands))}")
     vs = Counter(r["verdict"] or "none" for ch in changes for r in ch["reviews"])
@@ -869,6 +922,7 @@ def window_summary_lines(sm):
     P(f"WINDOW SUMMARY over {sm['changes']} change(s)")
     P(f"  1 caught by review: {rv['changes_with_fail']} of {rv['changes_with_review']} change(s) with a review had at least one FAIL round; "
       f"{rv['fail_rounds']} FAIL round(s), {rv['fail_findings']} finding(s) in them; {rv['derived_blk_rounds']} derived BLK* round(s) not counted as FAIL")
+    P(f"    stopped (FAIL or derived BLK*): {rv['changes_with_stopped']} change(s), {rv['stopped_rounds']} round(s), {rv['stopped_findings']} findings (heading heuristic)")
     if es["judged_a"] is not None:
         P(f"  2 escaped review: (a) candidates {es['candidates_a']} in {es['changes_with_candidate_a']} change(s), judged: {fmt_judged(es['judged_a'])}")
     else:
@@ -886,7 +940,7 @@ def window_summary_lines(sm):
     lo = sm["left_out_errands"]
     P(f"    left out of 4 and 5 because they never reported: {lo['errands']} errand(s), {lo['errands'] - lo['unowned']} in {lo['changes']} change(s) by start and {lo['unowned']} owned by no change")
     P(f"  6 operator effort: {op['messages']} operator-typed message(s) ({op['messages_per_change'] if op['messages_per_change'] is None else round(op['messages_per_change'], 2)} per change), "
-      f"{op['decisions']} request_decision call(s) ({op['decisions_per_change'] if op['decisions_per_change'] is None else round(op['decisions_per_change'], 2)} per change)")
+      f"{op['decisions'] if op['decisions'] is not None else 'N/A'} request_decision call(s) ({round(op['decisions_per_change'], 2) if op['decisions_per_change'] is not None else 'N/A'} per eligible change, {op['decisions_eligible_changes']} eligible)")
     P(f"  7 cost: weighted {kfmt(sm['cost']['weighted'])} in total, {kfmt(sm['cost']['per_change'] or 0)} per change")
     if sm.get("id_collisions") is not None:
         P(f"  candidate ids: {sm['id_collisions']} id collision(s) (two distinct candidates with one id; a judgment for such an id is refused as ambiguous)")
