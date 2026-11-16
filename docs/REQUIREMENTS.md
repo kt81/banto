@@ -2383,14 +2383,18 @@ threshold, and clamps it to 90% of the model's window, so a larger value changes
 nothing (for example, the window is 500k for gpt-6.1-terra, whose default threshold
 is 450k, and 272k for the gpt-6 and gpt-5.6 families, whose default is 244.8k; these
 are examples, not a list banto keeps). These Codex facts come from reading codex-cli
-0.169.0's help and its upstream source, not from running it, and whether a resumed
-Codex thread honours the key at all is unverified. Accepted: `"auto"`, which gives
-Claude `--autocompact auto` and Codex nothing; an integer from 100000 to 1000000,
-which goes to both agents; or `""`, which passes nothing to either. Any other value,
-a TOML float included, passes nothing, and startup shows a one-line notice:
-`worker_autocompact: ignored "abc" (not auto or 100000-1000000)`, with the value
-escaped and cut to 24 characters. A Director and a Goinkyo never get it, whichever
-agent they run, so their compaction stays whatever that agent's own settings say.
+0.169.0's help and its upstream source, not from running it. One resumed Codex
+thread was watched, on 2026-11-16: a Worker resumed with 250000, whose previous turn
+had ended at 288k of a 475k window, compacted before the first model call of its
+next turn. The default threshold there is 450k by the source, and the same thread's
+earlier compaction had come at 448k; no run without the override was made to
+compare. Accepted: `"auto"`, which gives Claude `--autocompact auto` and Codex
+nothing; an integer from 100000 to 1000000, which goes to both agents; or `""`,
+which passes nothing to either. Any other value, a TOML float included, passes
+nothing, and startup shows a one-line notice: `worker_autocompact: ignored "abc"
+(not auto or 100000-1000000)`, with the value escaped and cut to 24 characters. A
+Director and a Goinkyo never get it, whichever agent they run, so their compaction
+stays whatever that agent's own settings say.
 
 **Model and effort: only when a session is created.** `worker_model`,
 `worker_effort`, `worker_model_codex`, `worker_effort_codex`, `goinkyo_model` and

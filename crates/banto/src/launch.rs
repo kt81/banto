@@ -156,9 +156,8 @@ pub(crate) enum AgentLaunch {
         /// on a resume as on a creation, unlike the effort override, because it
         /// names neither a model nor an effort, so it does not switch the
         /// thread's saved choices off. Cited from upstream `main` as read on
-        /// 2026-11-16, with codex-cli 0.169.0 installed; not run. The config
-        /// doc has the rest, including that a resumed thread honouring it is
-        /// unverified.
+        /// 2026-11-16, with codex-cli 0.169.0 installed. The config doc has the
+        /// rest, including the one resumed thread seen compacting under it.
         autocompact: Option<String>,
         /// `None` outside brigade context (an ordinary resume/new session);
         /// `Some` adds the `-c` overrides that make this launch a brigade

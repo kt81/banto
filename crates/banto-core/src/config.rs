@@ -173,15 +173,19 @@ pub struct BrigadeConfig {
     /// Goinkyo, or to a pane banto did not launch as a member: their
     /// compaction stays whatever the agent's own settings say.
     ///
-    /// What is known of Codex's side comes from upstream `main` as read on
-    /// 2026-11-16 and the installed codex-cli 0.169.0's help and strings; none
-    /// of it was run. Codex uses the key only to
-    /// lower its threshold: the key is clamped to 90% of the model's window
-    /// (500k for gpt-6.1-terra, 272k for the gpt-6 and gpt-5.6 families, so
-    /// 450k and 244.8k), and a value above the clamp changes nothing. A resumed
-    /// thread keeps its saved model and effort unless the overrides name one,
-    /// and this key names neither, so passing it on a resume is safe; whether
-    /// it takes effect on a resumed thread is unverified.
+    /// The clamp and the resume rule below come from upstream `main` as read on
+    /// 2026-11-16 and the installed codex-cli 0.169.0's help and strings, not
+    /// from running it. Codex uses the key only to lower its threshold: the key
+    /// is clamped to 90% of the model's window (500k for gpt-6.1-terra, 272k
+    /// for the gpt-6 and gpt-5.6 families, so 450k and 244.8k), and a value
+    /// above the clamp changes nothing. A resumed thread keeps its saved model
+    /// and effort unless the overrides name one, and this key names neither, so
+    /// passing it on a resume is safe. One resumed thread was watched, on
+    /// 2026-11-16: a Worker resumed with 250000, whose previous turn had ended
+    /// at 288k of a 475k window, compacted before the first model call of its
+    /// next turn. The default threshold there is 450k by the source, and the
+    /// same thread's earlier compaction had come at 448k; no run without the
+    /// override was made to compare.
     ///
     /// A value outside that set never stops a Worker launching: nothing is
     /// passed, and the startup status line says so
