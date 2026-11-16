@@ -15,8 +15,9 @@ jobs:
       matrix:
         # Windows-first (ConPTY is the primary target), but the codebase keeps
         # a cross-platform structure (repo invariant 5) — the ubuntu job is
-        # what enforces that invariant mechanically.
-        os: [windows-latest, ubuntu-latest]
+        # what enforces that invariant mechanically, and the macos job checks
+        # the other Unix target the cfg arms reach.
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +31,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # The measurement scripts are Python with the standard library only, so
-      # one platform is enough to catch a regression in them.
+      # The measurement scripts are Python with the standard library only,
+      # but their tests make symlinks, hard links and git repositories, which
+      # behave differently per file system, so both Unix hosts run them.
       - name: Measurement tools tests
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os != 'windows-latest'
         run: python3 -m unittest discover -s tools/measure/tests
