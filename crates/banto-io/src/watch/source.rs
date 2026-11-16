@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::SystemTime;
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{RawChange, WatchRoot};
 use crate::claude_home::ClaudeHome;
@@ -31,8 +31,8 @@ pub trait ChangeSource {
 
 /// Watches `<claude_home>/projects/` (recursively), `<claude_home>/sessions/`
 /// (flat), and — when a Codex home is given — `<codex_home>/sessions/`
-/// (recursively) with `notify`, tagging every observed change with the
-/// [`WatchRoot`] it falls under.
+/// (recursively) and its index in the home directory, tagging observed changes
+/// with the [`WatchRoot`] they fall under.
 pub struct NotifyChangeSource {
     // Kept alive for the lifetime of the source; dropping it stops watching.
     _watcher: RecommendedWatcher,
@@ -52,18 +52,9 @@ impl NotifyChangeSource {
     /// [`crate::status::read_live_sessions`] tolerate the same case. Roots
     /// created after this call is made are not picked up.
     ///
-    /// Deliberately never watches any of Codex's sqlite files
-    /// (`state_5.sqlite`, `logs_2.sqlite`, ...). Measured against a
-    /// synthetic WAL-mode database shaped like the real `state_5.sqlite`: a
-    /// write never touches the main file's own mtime (everything lands in
-    /// its `-wal`/`-shm` sidecars), and a running Codex session writes
-    /// somewhere in its home on every turn — `logs_2.sqlite` on every log
-    /// line — so a directory watch there would fire many times per turn
-    /// across databases banto doesn't even read, for no discovery benefit
-    /// (`session::discover_all` already re-reads `threads` in full on every
-    /// fired root, regardless of which one fired). The rollout tree alone
-    /// reproduces the fix — a new `rollout-*.jsonl` appearing — at the same
-    /// one-event-per-turn rate `projects/` already has for Claude.
+    /// The Codex home is watched non-recursively to catch index creation and
+    /// replacement. Only events naming `session_index.jsonl` trigger reloads;
+    /// SQLite and log activity is excluded.
     pub fn new(
         claude_home: &ClaudeHome,
         codex_home: Option<&CodexHome>,
@@ -74,30 +65,47 @@ impl NotifyChangeSource {
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             let Ok(event) = res else { return };
             let now = SystemTime::now();
-            for root in classify_paths(&event.paths, &watch_roots) {
+            let index_changed = matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            );
+            for root in classify_paths(&event.paths, &watch_roots, index_changed) {
                 // A send error means the receiving end was dropped (the
                 // source is going away); nothing to do about it here.
                 let _ = tx.send(RawChange { root, at: now });
             }
         })?;
 
-        if roots.projects.given.is_dir() {
-            watcher.watch(&roots.projects.given, RecursiveMode::Recursive)?;
-        }
-        if roots.sessions.given.is_dir() {
-            watcher.watch(&roots.sessions.given, RecursiveMode::NonRecursive)?;
-        }
-        if let Some(root) = &roots.codex_sessions
-            && root.given.is_dir()
-        {
-            watcher.watch(&root.given, RecursiveMode::Recursive)?;
-        }
+        register_roots(&roots, |path, mode| watcher.watch(path, mode))?;
 
         Ok(Self {
             _watcher: watcher,
             changes: rx,
         })
     }
+}
+
+fn register_roots(
+    roots: &WatchRoots,
+    mut watch: impl FnMut(&Path, RecursiveMode) -> notify::Result<()>,
+) -> notify::Result<()> {
+    if roots.projects.given.is_dir() {
+        watch(&roots.projects.given, RecursiveMode::Recursive)?;
+    }
+    if roots.sessions.given.is_dir() {
+        watch(&roots.sessions.given, RecursiveMode::NonRecursive)?;
+    }
+    if let Some(root) = &roots.codex_sessions
+        && root.given.is_dir()
+    {
+        watch(&root.given, RecursiveMode::Recursive)?;
+    }
+    if let Some(root) = &roots.codex_home
+        && root.given.is_dir()
+    {
+        let _ = watch(&root.given, RecursiveMode::NonRecursive);
+    }
+    Ok(())
 }
 
 impl ChangeSource for NotifyChangeSource {
@@ -132,6 +140,7 @@ struct WatchRoots {
     projects: WatchedRoot,
     sessions: WatchedRoot,
     codex_sessions: Option<WatchedRoot>,
+    codex_home: Option<WatchedRoot>,
 }
 
 impl WatchRoots {
@@ -140,13 +149,14 @@ impl WatchRoots {
             projects: WatchedRoot::new(claude_home.projects_dir()),
             sessions: WatchedRoot::new(claude_home.sessions_dir()),
             codex_sessions: codex_home.map(|home| WatchedRoot::new(home.rollout_dir())),
+            codex_home: codex_home.map(|home| WatchedRoot::new(home.root().to_path_buf())),
         }
     }
 }
 
 // FSEvents reports canonical paths; Windows can report the original spelling
 // even though canonicalize adds a verbatim prefix there, so both must match.
-fn classify_paths(paths: &[PathBuf], watched: &WatchRoots) -> Vec<WatchRoot> {
+fn classify_paths(paths: &[PathBuf], watched: &WatchRoots, index_changed: bool) -> Vec<WatchRoot> {
     let mut roots = Vec::new();
     for path in paths {
         let root = if watched.projects.contains(path) {
@@ -157,6 +167,14 @@ fn classify_paths(paths: &[PathBuf], watched: &WatchRoots) -> Vec<WatchRoot> {
             .codex_sessions
             .as_ref()
             .is_some_and(|root| root.contains(path))
+            || (index_changed
+                && watched.codex_home.as_ref().is_some_and(|root| {
+                    *path == root.given.join("session_index.jsonl")
+                        || root
+                            .canonical
+                            .as_ref()
+                            .is_some_and(|canonical| *path == canonical.join("session_index.jsonl"))
+                }))
         {
             WatchRoot::CodexSessions
         } else {
@@ -185,6 +203,7 @@ mod tests {
                 given: "given/sessions".into(),
                 canonical: Some("canonical/sessions".into()),
             },
+            codex_home: None,
             codex_sessions: Some(WatchedRoot {
                 given: "given/codex".into(),
                 canonical: Some("canonical/codex".into()),
@@ -203,10 +222,10 @@ mod tests {
             ("given/codex/a", WatchRoot::CodexSessions),
             ("canonical/codex/a", WatchRoot::CodexSessions),
         ] {
-            assert_eq!(classify_paths(&[path.into()], &roots), vec![expected]);
+            assert_eq!(classify_paths(&[path.into()], &roots, true), vec![expected]);
         }
-        assert!(classify_paths(&["unrelated/a".into()], &roots).is_empty());
-        assert!(classify_paths(&["given/projects-other/a".into()], &roots).is_empty());
+        assert!(classify_paths(&["unrelated/a".into()], &roots, true).is_empty());
+        assert!(classify_paths(&["given/projects-other/a".into()], &roots, true).is_empty());
     }
 
     #[test]
@@ -226,12 +245,13 @@ mod tests {
         assert_eq!(
             classify_paths(
                 &["given/projects/nested/a".into(), "given/projects/b".into()],
-                &roots
+                &roots,
+                true
             ),
             vec![WatchRoot::Projects]
         );
         assert_eq!(
-            classify_paths(&["canonical/sessions/nested/a".into()], &roots),
+            classify_paths(&["canonical/sessions/nested/a".into()], &roots, true),
             vec![WatchRoot::Sessions]
         );
     }
@@ -257,7 +277,7 @@ mod tests {
             .unwrap()
             .join("a");
         assert_eq!(
-            classify_paths(&[canonical_event], &roots),
+            classify_paths(&[canonical_event], &roots, true),
             vec![WatchRoot::Projects]
         );
     }
@@ -380,5 +400,92 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(50));
         assert!(source.drain().is_empty());
+    }
+    #[test]
+    fn detects_index_created_after_watcher_start_and_replaced() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        let source = NotifyChangeSource::new(
+            &ClaudeHome::new(claude.path().into()),
+            Some(&CodexHome::new(codex.path().into())),
+        )
+        .unwrap();
+        let index = codex.path().join("session_index.jsonl");
+        fs::write(&index, "{}\n").unwrap();
+        assert!(wait_for(
+            &source,
+            WatchRoot::CodexSessions,
+            Duration::from_secs(2)
+        ));
+        std::thread::sleep(Duration::from_millis(100));
+        source.drain();
+        let replacement = codex.path().join("replacement.tmp");
+        fs::write(&replacement, "{}\n").unwrap();
+        fs::remove_file(&index).unwrap();
+        assert!(wait_for(
+            &source,
+            WatchRoot::CodexSessions,
+            Duration::from_secs(2)
+        ));
+        std::thread::sleep(Duration::from_millis(100));
+        source.drain();
+        fs::rename(&replacement, &index).unwrap();
+        assert!(wait_for(
+            &source,
+            WatchRoot::CodexSessions,
+            Duration::from_secs(2)
+        ));
+    }
+    #[test]
+    fn index_filter_ignores_access_and_unrelated_files() {
+        let mut roots = synthetic_roots();
+        roots.codex_home = Some(WatchedRoot {
+            given: "given/home".into(),
+            canonical: Some("canonical/home".into()),
+        });
+        for p in [
+            "given/home/session_index.jsonl",
+            "canonical/home/session_index.jsonl",
+        ] {
+            assert_eq!(
+                classify_paths(&[p.into()], &roots, true),
+                vec![WatchRoot::CodexSessions]
+            );
+            assert!(classify_paths(&[p.into()], &roots, false).is_empty());
+        }
+        for p in [
+            "given/home/state_5.sqlite",
+            "given/home/logs_2.sqlite-wal",
+            "given/home/session_index.jsonl.tmp",
+            "given/home/sub/session_index.jsonl",
+        ] {
+            assert!(classify_paths(&[p.into()], &roots, true).is_empty());
+        }
+        roots.codex_home = None;
+        assert!(
+            classify_paths(&["given/home/session_index.jsonl".into()], &roots, true).is_empty()
+        );
+    }
+    #[test]
+    fn index_watch_failure_does_not_disable_existing_watches() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        fs::create_dir_all(claude.path().join("projects")).unwrap();
+        fs::create_dir_all(claude.path().join("sessions")).unwrap();
+        fs::create_dir_all(codex.path().join("sessions")).unwrap();
+        let roots = WatchRoots::new(
+            &ClaudeHome::new(claude.path().into()),
+            Some(&CodexHome::new(codex.path().into())),
+        );
+        let mut registered = Vec::new();
+        let result = register_roots(&roots, |path, _| {
+            if path == codex.path() {
+                return Err(notify::Error::generic("denied"));
+            }
+            registered.push(path.to_path_buf());
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(registered.len(), 3);
     }
 }

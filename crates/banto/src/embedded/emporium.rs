@@ -574,7 +574,11 @@ fn event_loop(
     let mut state = EmporiumState::new(PrefixKey::parse(&keys.prefix));
     let mut handles: HashMap<SessionKey, PtyHandle> = HashMap::new();
     let mut discovery: Vec<DiscoveryTracker> = Vec::new();
-    let mut watch = LiveWatch::new(deps.claude_home, deps.codex_home);
+    let mut watch = LiveWatch::new(
+        deps.claude_home,
+        deps.codex_home
+            .filter(|_| deps.enabled_agents.contains(&AgentKind::Codex)),
+    );
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
     let mut glance_gate = GlanceGate::default();

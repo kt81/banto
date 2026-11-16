@@ -12,7 +12,9 @@
 //! [`crate::sqlite_ro`] — see that module's doc for the stat-then-choose
 //! strategy and what it costs.
 
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,7 +61,7 @@ impl CodexProvider {
 /// into a `String` (or an owned `Value`, which converts text through UTF-8) fails
 /// on a TEXT cell holding invalid UTF-8, and a failed read drops the whole row
 /// before this could answer "not a sub-agent". Invalid bytes simply do not parse.
-fn is_subagent_source(source: ValueRef<'_>) -> bool {
+pub(crate) fn is_subagent_source(source: ValueRef<'_>) -> bool {
     let ValueRef::Text(bytes) = source else {
         return false;
     };
@@ -97,6 +99,79 @@ fn source_column(conn: &Connection) -> &'static str {
     if has_source { "source" } else { "NULL" }
 }
 
+fn optional_column(conn: &Connection, name: &'static str) -> &'static str {
+    if conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('threads') WHERE name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .is_ok()
+    {
+        name
+    } else {
+        "NULL"
+    }
+}
+
+fn session_names(home: &CodexHome) -> HashMap<String, String> {
+    let Ok(file) = fs::File::open(home.root().join("session_index.jsonl")) else {
+        return HashMap::new();
+    };
+    let mut names = HashMap::new();
+    let mut reader = BufReader::new(file);
+    const MAX_INDEX_LINE: usize = 1024 * 1024;
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let (consumed, complete) = {
+            let Ok(bytes) = reader.fill_buf() else { break };
+            if bytes.is_empty() {
+                if !line.is_empty() && !oversized {
+                    record_session_name(&line, &mut names);
+                }
+                break;
+            }
+            let end = bytes.iter().position(|&b| b == b'\n');
+            let consumed = end.map_or(bytes.len(), |i| i + 1);
+            if !oversized && line.len().saturating_add(consumed) <= MAX_INDEX_LINE {
+                line.extend_from_slice(&bytes[..consumed]);
+            } else {
+                oversized = true;
+            }
+            (consumed, end.is_some())
+        };
+        reader.consume(consumed);
+        if complete {
+            if !oversized {
+                record_session_name(&line, &mut names);
+            }
+            line.clear();
+            oversized = false;
+        }
+    }
+    names
+}
+
+fn record_session_name(line: &[u8], names: &mut HashMap<String, String>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return;
+    };
+    if let (Some(id), Some(name)) = (
+        value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()),
+        value
+            .get("thread_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        names.insert(id.to_string(), name.to_string());
+    }
+}
+
 impl SessionProvider for CodexProvider {
     fn name(&self) -> AgentKind {
         AgentKind::Codex
@@ -109,9 +184,9 @@ impl SessionProvider for CodexProvider {
         }
         let conn = open_read_only(&db_path)?;
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived, {} \
+            "SELECT id, title, cwd, rollout_path, first_user_message, updated_at_ms, archived, {}, {}, {} \
              FROM threads",
-            source_column(&conn)
+            source_column(&conn), optional_column(&conn, "history_mode"), optional_column(&conn, "name")
         ))?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -127,9 +202,12 @@ impl SessionProvider for CodexProvider {
                 // skipped below — hiding a session for a reason that has nothing
                 // to do with sub-agents.
                 is_subagent_source(row.get_ref(7)?),
+                lossy_text(row, 8)?,
+                lossy_text(row, 9)?,
             ))
         })?;
 
+        let names = session_names(&self.codex_home);
         let sessions = rows
             // A row whose column types don't match the query (corrupt or
             // unexpectedly-shaped) is skipped, not fatal to the whole scan.
@@ -144,6 +222,8 @@ impl SessionProvider for CodexProvider {
                     updated_at_ms,
                     archived,
                     is_subagent,
+                    history_mode,
+                    canonical_name,
                 )| {
                     if is_subagent {
                         return None;
@@ -154,8 +234,31 @@ impl SessionProvider for CodexProvider {
                     // `archived` unset (a row from before `codex archive`
                     // existed) reads as not archived, not "unknown" — the
                     // same "no signal means visible" default `is_agent` uses.
+                    let id = id?;
+                    let index_name = names.get(&id).cloned();
+                    let title = if history_mode.as_deref() == Some("paginated") {
+                        canonical_name
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                first_user_message
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string)
+                            })
+                    } else {
+                        let distinct_title = title
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .filter(|s| first_user_message.as_deref().map(str::trim) != Some(*s));
+                        distinct_title.map(str::to_string).or(index_name).or(title)
+                    };
                     Some(session_meta_from_row(
-                        id?,
+                        id,
                         title,
                         cwd,
                         rollout_path?,
@@ -813,5 +916,212 @@ mod tests {
         assert_eq!(sessions[0].title.as_deref(), Some("A\u{FFFD}"));
         assert_eq!(sessions[0].preview.as_deref(), Some("B\u{FFFD}"));
         assert!(sessions[0].cwd.is_some());
+    }
+    #[test]
+    fn session_index_rename_overrides_database_title_and_skips_bad_lines() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        write_thread(
+            &home,
+            ThreadRow {
+                title: Some("original"),
+                first_user_message: Some("original"),
+                ..ThreadRow::new("thread-1", &rollout)
+            },
+            true,
+        );
+        fs::write(
+            home.root().join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"thread-1\",\"thread_name\":\"first\"}\n",
+                "broken\n",
+                "{\"id\":\"thread-1\",\"thread_name\":\"latest\",\"extra\":1}\n",
+                "{\"id\":\"thread-1\",\"thread_name\":null}\n",
+                "{\"id\":\"other\",\"thread_name\":\"other\"}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn session_index_ignores_invalid_utf8_and_empty_names() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        write_thread(
+            &home,
+            ThreadRow {
+                title: Some("fallback"),
+                first_user_message: Some("fallback"),
+                ..ThreadRow::new("thread-1", &rollout)
+            },
+            true,
+        );
+        fs::write(
+            home.root().join("session_index.jsonl"),
+            b"\xff\n{\"id\":\"thread-1\",\"thread_name\":\"\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("fallback")
+        );
+        fs::write(
+            home.root().join("session_index.jsonl"),
+            b"\xff\n{\"id\":\"thread-1\",\"thread_name\":\"valid\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("valid")
+        );
+    }
+    #[test]
+    fn index_names_ignore_whitespace_and_trim_last_valid_record() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        write_thread(&home, ThreadRow::new("thread-1", &rollout), true);
+        fs::write(
+            home.root().join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"thread-1\",\"thread_name\":\"old\",\"updated_at\":\"2099\"}\n",
+                "{\"id\":\"thread-1\",\"thread_name\":\"  new  \",\"updated_at\":\"2000\"}\n",
+                "{\"id\":\"thread-1\",\"thread_name\":\"   \"}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn index_skips_oversized_line_and_accepts_final_unterminated_record() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        write_thread(
+            &home,
+            ThreadRow {
+                title: Some("fallback"),
+                first_user_message: Some("fallback"),
+                ..ThreadRow::new("thread-1", &rollout)
+            },
+            true,
+        );
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("fallback")
+        );
+        let mut bytes = b"{\"id\":\"thread-1\",\"thread_name\":\"".to_vec();
+        bytes.extend(vec![b'x'; 1024 * 1024 + 1]);
+        bytes.extend_from_slice(b"\"}\n");
+        fs::write(home.root().join("session_index.jsonl"), &bytes).unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("fallback")
+        );
+        bytes.extend_from_slice(b"{\"id\":\"thread-1\",\"thread_name\":\"valid\"}");
+        fs::write(home.root().join("session_index.jsonl"), bytes).unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("valid")
+        );
+    }
+    #[test]
+    fn title_resolution_respects_history_mode_and_legacy_distinct_title() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        write_thread(&home, ThreadRow::new("legacy-distinct", &rollout), true);
+        let conn = Connection::open(home.threads_db_path()).unwrap();
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN history_mode TEXT; ALTER TABLE threads ADD COLUMN name TEXT;").unwrap();
+        conn.execute("UPDATE threads SET title=' database title ', first_user_message='first', history_mode='legacy' WHERE id='legacy-distinct'", []).unwrap();
+        for (id, title, first, mode, name) in [
+            (
+                "legacy-generated",
+                " first ",
+                "first",
+                "legacy",
+                Some("ignored"),
+            ),
+            (
+                "paginated",
+                "derived",
+                "first",
+                "paginated",
+                Some(" canonical "),
+            ),
+            (
+                "paginated-empty",
+                "derived",
+                "first",
+                "paginated",
+                Some("  "),
+            ),
+            (
+                "paginated-no-preview",
+                "stale title",
+                "  ",
+                "paginated",
+                None,
+            ),
+        ] {
+            conn.execute("INSERT INTO threads (id, title, first_user_message, history_mode, name, rollout_path) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![id,title,first,mode,name,rollout.to_string_lossy()]).unwrap();
+        }
+        drop(conn);
+        fs::write(
+            home.root().join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"legacy-distinct\",\"thread_name\":\"indexed\"}\n",
+                "{\"id\":\"legacy-generated\",\"thread_name\":\"indexed\"}\n",
+                "{\"id\":\"paginated\",\"thread_name\":\"stale index\"}\n",
+                "{\"id\":\"paginated-empty\",\"thread_name\":\"stale index\"}\n",
+                "{\"id\":\"paginated-no-preview\",\"thread_name\":\"stale index\"}\n"
+            ),
+        )
+        .unwrap();
+        let rows: std::collections::HashMap<_, _> = provider(&dir)
+            .discover()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id.0, r.title))
+            .collect();
+        assert_eq!(rows["legacy-distinct"].as_deref(), Some("database title"));
+        assert_eq!(rows["legacy-generated"].as_deref(), Some("indexed"));
+        assert_eq!(rows["paginated"].as_deref(), Some("canonical"));
+        assert_eq!(rows["paginated-empty"].as_deref(), Some("first"));
+        assert_eq!(rows["paginated-no-preview"], None);
+    }
+    #[test]
+    fn legacy_schema_without_mode_or_name_prefers_distinct_sqlite_title() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        write_thread(
+            &home,
+            ThreadRow {
+                title: Some("  saved title  "),
+                first_user_message: Some("initial"),
+                ..ThreadRow::new("thread-1", &rollout)
+            },
+            true,
+        );
+        fs::write(
+            home.root().join("session_index.jsonl"),
+            "{\"id\":\"thread-1\",\"thread_name\":\"older\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            provider(&dir).discover().unwrap()[0].title.as_deref(),
+            Some("saved title")
+        );
     }
 }
