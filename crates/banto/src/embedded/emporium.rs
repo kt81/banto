@@ -441,13 +441,7 @@ pub fn run(
                 hook_launchable,
             )
         });
-    let startup_notices: Vec<String> = [
-        trust_notice,
-        session::agents_ignored_notice(settings.resolved_agents),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let startup_notices = session::startup_notices(trust_notice, settings.resolved_agents, brigade);
 
     let deps = Deps {
         claude_home,
@@ -1147,6 +1141,7 @@ fn execute_cmd(
             effort,
             permission_mode,
             disallowed_tools,
+            autocompact,
         } => execute_open_embedded(
             OpenEmbeddedRequest {
                 key,
@@ -1156,6 +1151,7 @@ fn execute_cmd(
                 effort,
                 permission_mode,
                 disallowed_tools,
+                autocompact,
             },
             deps,
             handles,
@@ -1416,8 +1412,8 @@ fn execute_open_codex_trust_pane(
 /// here whatever the caller passed (`launch::SessionStart`'s doc says why: the
 /// product restores what the session last used, and a flag would overwrite a
 /// choice the operator made inside it), so the rule holds even for a producer
-/// that forgets it. `permission_mode`, `disallowed_tools` and `briefing` are the
-/// role's, and ride on both.
+/// that forgets it. The [`RoleFlags`] and `briefing` are the role's, and ride on
+/// both.
 /// `target.agent` picks the variant; `briefing` only ever reaches the
 /// `Claude` one, because only Claude takes a briefing as launch argv; a
 /// Codex member gets the same text from the `banto _hook` process the
@@ -1439,8 +1435,7 @@ fn build_open_launch(
     target: &SessionToOpen,
     model: Option<&str>,
     effort: Option<&str>,
-    permission_mode: Option<&str>,
-    disallowed_tools: Option<&str>,
+    flags: RoleFlags<'_>,
     briefing: Option<&str>,
     ctx: &launch::OpenContext,
 ) -> Option<launch::AgentLaunch> {
@@ -1461,8 +1456,9 @@ fn build_open_launch(
     Some(match target.agent {
         AgentKind::ClaudeCode => launch::AgentLaunch::Claude {
             start,
-            permission_mode: permission_mode.map(str::to_string),
-            disallowed_tools: disallowed_tools.map(str::to_string),
+            permission_mode: flags.permission_mode.map(str::to_string),
+            disallowed_tools: flags.disallowed_tools.map(str::to_string),
+            autocompact: flags.autocompact.map(str::to_string),
             append_system_prompt: briefing.map(str::to_string),
             mcp_config: None,
         },
@@ -1475,12 +1471,28 @@ fn build_open_launch(
         // `permission_mode` and `disallowed_tools` are dropped:
         // `AgentLaunch::Codex` has no field for either (Claude-only flags),
         // and a Codex Worker does arrive with `permission_mode` set.
+        // `autocompact` is not: it arrives already in Codex's own terms (a
+        // token count, or `None` for `auto`).
         AgentKind::Codex => launch::AgentLaunch::Codex {
             start,
             cwd: target.cwd.clone(),
+            autocompact: flags.autocompact.map(str::to_string),
             brigade: None,
         },
     })
+}
+
+/// The flags a launch carries because of the role, not the session: the part of
+/// [`Cmd::OpenEmbedded`] that rides on a resume as it does on a creation. Claude
+/// takes all of them; a Codex launch takes only `autocompact`
+/// ([`launch::AgentLaunch::Codex`] has no field for the other two), so a Codex
+/// target drops those here whatever it is handed.
+/// Bundled so [`build_open_launch`] stays under clippy's `too_many_arguments`.
+#[derive(Default)]
+struct RoleFlags<'a> {
+    permission_mode: Option<&'a str>,
+    disallowed_tools: Option<&'a str>,
+    autocompact: Option<&'a str>,
 }
 
 /// The per-call parameters of [`Cmd::OpenEmbedded`], bundled so
@@ -1496,6 +1508,7 @@ struct OpenEmbeddedRequest {
     effort: Option<String>,
     permission_mode: Option<String>,
     disallowed_tools: Option<String>,
+    autocompact: Option<String>,
 }
 
 /// Spawn `target` under `key`, enforcing the no-double-resume guard
@@ -1523,6 +1536,7 @@ fn execute_open_embedded(
         effort,
         permission_mode,
         disallowed_tools,
+        autocompact,
     } = request;
     let claude_home = deps.claude_home;
     // Only read live sessions when a resume might actually need them — a
@@ -1545,8 +1559,11 @@ fn execute_open_embedded(
         &target,
         model.as_deref(),
         effort.as_deref(),
-        permission_mode.as_deref(),
-        disallowed_tools.as_deref(),
+        RoleFlags {
+            permission_mode: permission_mode.as_deref(),
+            disallowed_tools: disallowed_tools.as_deref(),
+            autocompact: autocompact.as_deref(),
+        },
         briefing.as_deref(),
         &open_ctx,
     ) else {
@@ -10837,8 +10854,7 @@ mod tests {
             &open_target("sess-1"),
             Some("opus"),
             Some("max"),
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10854,8 +10870,7 @@ mod tests {
             &codex_target,
             Some("gpt-6.1-terra"),
             Some("high"),
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10882,8 +10897,7 @@ mod tests {
             &target,
             Some("gpt-6.1-terra"),
             Some("high"),
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10903,8 +10917,7 @@ mod tests {
             &open_target(""),
             Some("fable"),
             Some("max"),
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10918,8 +10931,7 @@ mod tests {
             &open_target(""),
             Some("fable"),
             None,
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10939,8 +10951,10 @@ mod tests {
             &open_target(""),
             Some("fable"),
             Some("max"),
-            Some("auto"),
-            None,
+            RoleFlags {
+                permission_mode: Some("auto"),
+                ..RoleFlags::default()
+            },
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10963,8 +10977,7 @@ mod tests {
             &open_target(""),
             Some("fable"),
             Some("max"),
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -10985,8 +10998,11 @@ mod tests {
             &open_target(""),
             Some("fable"),
             Some("max"),
-            Some("auto"),
-            Some("Edit,Write,NotebookEdit"),
+            RoleFlags {
+                permission_mode: Some("auto"),
+                disallowed_tools: Some("Edit,Write,NotebookEdit"),
+                ..RoleFlags::default()
+            },
             None,
             &test_ctx(&probe, &[]),
         )
@@ -11011,8 +11027,10 @@ mod tests {
             &open_target(""),
             Some("fable"),
             Some("max"),
-            Some("auto"),
-            None,
+            RoleFlags {
+                permission_mode: Some("auto"),
+                ..RoleFlags::default()
+            },
             None,
             &test_ctx(&probe, &[]),
         )
@@ -11041,8 +11059,7 @@ mod tests {
             &open_target(""),
             Some("opus"),
             None,
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -11062,8 +11079,7 @@ mod tests {
             &open_target("sess-1"),
             None,
             None,
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -11095,8 +11111,7 @@ mod tests {
                 &open_target("sess-1"),
                 Some("opus"),
                 None,
-                None,
-                None,
+                RoleFlags::default(),
                 None,
                 &test_ctx(&probe, &live),
             )
@@ -11127,8 +11142,7 @@ mod tests {
                 &open_target("sess-1"),
                 None,
                 None,
-                None,
-                None,
+                RoleFlags::default(),
                 None,
                 &test_ctx(&probe, &live),
             )
@@ -11148,13 +11162,11 @@ mod tests {
             // A resume carries no model whatever the caller hands it — see
             // `build_open_launch`'s doc.
             Some("o3"),
-            // `effort` is dropped on a resume too, and `permission_mode`/
-            // `disallowed_tools` are Claude-only (`AgentLaunch::Claude`'s
-            // own doc); dropped here for the same reason the briefing below
-            // is.
+            // `effort` is dropped on a resume too, and the role flags are
+            // Claude-only (`AgentLaunch::Claude`'s own doc); dropped here for
+            // the same reason the briefing below is.
             None,
-            None,
-            None,
+            RoleFlags::default(),
             // The caller resolves a briefing for any brigade member
             // regardless of product (`member_briefing` takes only
             // `brigade_id`/`token`/`role`, never `agent` — see
@@ -11203,8 +11215,10 @@ mod tests {
             &target,
             Some("o3"),
             None,
-            Some("auto"),
-            None,
+            RoleFlags {
+                permission_mode: Some("auto"),
+                ..RoleFlags::default()
+            },
             None,
             &test_ctx(&probe, &[]),
         )
@@ -11229,8 +11243,7 @@ mod tests {
             &open_target(""),
             Some("opus"),
             None,
-            None,
-            None,
+            RoleFlags::default(),
             Some("you are the Director"),
             &test_ctx(&probe, &[]),
         )
@@ -11251,8 +11264,7 @@ mod tests {
             &open_target("sess-1"),
             Some("opus"),
             None,
-            None,
-            None,
+            RoleFlags::default(),
             Some("you are the Director"),
             &test_ctx(&probe, &[]),
         )
@@ -11279,8 +11291,7 @@ mod tests {
             &open_target("sess-1"),
             None,
             None,
-            None,
-            None,
+            RoleFlags::default(),
             None,
             &test_ctx(&probe, &[]),
         )
@@ -12602,6 +12613,7 @@ mod tests {
             effort: None,
             permission_mode: None,
             disallowed_tools: None,
+            autocompact: None,
         }
     }
 
@@ -12713,6 +12725,148 @@ mod tests {
         assert!(handles.is_empty());
     }
 
+    /// `open_embedded_cmd` carrying `autocompact`.
+    fn open_with_autocompact(
+        agent: AgentKind,
+        id: &str,
+        cwd: &Path,
+        autocompact: Option<&str>,
+    ) -> Cmd {
+        let Cmd::OpenEmbedded {
+            key,
+            target,
+            brigade,
+            model,
+            effort,
+            permission_mode,
+            disallowed_tools,
+            ..
+        } = open_embedded_cmd(agent, id, cwd)
+        else {
+            unreachable!()
+        };
+        Cmd::OpenEmbedded {
+            key,
+            target,
+            brigade,
+            model,
+            effort,
+            permission_mode,
+            disallowed_tools,
+            autocompact: autocompact.map(str::to_string),
+        }
+    }
+
+    /// The argv the one pane `cmd` started was launched with.
+    fn launched_argv(cmd: Cmd) -> Vec<String> {
+        let fixture = SpawnFixture::new(PathBuf::from("/nonexistent"));
+        let mut handles = HashMap::new();
+        let mut discovery = Vec::new();
+        execute_cmd(cmd, &fixture.deps(), &mut handles, &mut discovery);
+        let launches = fixture.launches();
+        assert_eq!(launches.len(), 1, "one pane, one child");
+        launches[0].argv.clone()
+    }
+
+    #[test]
+    fn a_claude_pane_is_launched_with_autocompact_whether_it_is_new_or_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["", "claude-session"] {
+            let argv = launched_argv(open_with_autocompact(
+                AgentKind::ClaudeCode,
+                id,
+                dir.path(),
+                Some("250000"),
+            ));
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--autocompact")
+                .unwrap_or_else(|| panic!("no --autocompact for id {id:?}: {argv:?}"));
+            assert_eq!(argv[at + 1], "250000", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_claude_pane_with_no_autocompact_is_launched_without_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["", "claude-session"] {
+            let argv = launched_argv(open_with_autocompact(
+                AgentKind::ClaudeCode,
+                id,
+                dir.path(),
+                None,
+            ));
+            assert!(!argv.iter().any(|arg| arg == "--autocompact"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_codex_pane_is_launched_with_its_token_limit_override_new_or_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["", "codex-session"] {
+            let argv = launched_argv(open_with_autocompact(
+                AgentKind::Codex,
+                id,
+                dir.path(),
+                Some("250000"),
+            ));
+            let at = argv
+                .iter()
+                .position(|arg| arg == "model_auto_compact_token_limit=250000")
+                .unwrap_or_else(|| panic!("no override for id {id:?}: {argv:?}"));
+            assert_eq!(argv[at - 1], "-c", "{argv:?}");
+            assert!(
+                !argv.iter().any(|arg| arg == "--autocompact"),
+                "Claude's flag is not Codex's: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_pane_with_no_autocompact_is_launched_without_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["", "codex-session"] {
+            let argv = launched_argv(open_with_autocompact(
+                AgentKind::Codex,
+                id,
+                dir.path(),
+                None,
+            ));
+            assert!(
+                !argv.iter().any(|arg| arg.contains("auto_compact")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_open_launch_gives_a_claude_target_its_autocompact_on_creation_and_on_resume() {
+        let probe = MockProbe {
+            alive: HashSet::new(),
+        };
+        for id in ["", "sess-1"] {
+            let launch = build_open_launch(
+                &open_target(id),
+                None,
+                None,
+                RoleFlags {
+                    autocompact: Some("auto"),
+                    ..RoleFlags::default()
+                },
+                None,
+                &test_ctx(&probe, &[]),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    &launch,
+                    launch::AgentLaunch::Claude { autocompact: Some(value), .. } if value == "auto"
+                ),
+                "{launch:?}"
+            );
+        }
+    }
+
     /// `cmd` with a model and an effort, for `agent`, resuming `id` (empty for a
     /// new session).
     fn open_with_model_and_effort(agent: AgentKind, id: &str, cwd: &Path) -> Cmd {
@@ -12722,6 +12876,7 @@ mod tests {
             brigade,
             permission_mode,
             disallowed_tools,
+            autocompact,
             ..
         } = open_embedded_cmd(agent, id, cwd)
         else {
@@ -12735,6 +12890,7 @@ mod tests {
             effort: Some("the-effort".to_string()),
             permission_mode,
             disallowed_tools,
+            autocompact,
         }
     }
 

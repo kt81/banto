@@ -80,6 +80,7 @@ mod tests {
                 effort: None,
             },
             cwd: PathBuf::from("/work/anywhere"),
+            autocompact: None,
             brigade: Some(CodexBrigade {
                 exe: exe.clone(),
                 brigade_id: 1,

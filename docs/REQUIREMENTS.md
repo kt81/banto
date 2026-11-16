@@ -2135,7 +2135,8 @@ brigade around an already-discovered Goinkyo (one that already has a
 session id, resolvable to a real row) already works**, for free, through
 the same resumed-member path a Director's or Worker's own closed pane
 reopens through (`stage_brigade`) — `--permission-mode` and
-`--disallowedTools` carry on a resume as on a fresh spawn, because they answer
+`--disallowedTools` carry on a resume as on a fresh spawn (a Worker's
+`--autocompact` does too, `worker_autocompact` above), because they answer
 "who's here to click 'allow'" and "what may this role attempt", not "what should
 this session think with"; `--model` and `--effort` do not (2026-11-14: a session
 keeps what it last used, so a Goinkyo reopened after a restart is on its own
@@ -2326,6 +2327,7 @@ pub struct BrigadeConfig {
     pub worker_effort_codex: String, // -c model_reasoning_effort for a NEW Codex Worker only; "" = no flag; default "high"
     pub worker_agent: WorkerAgentSetting, // Inherit (default) | Select | Claude | Codex — see below
     pub worker_permission_mode: String, // --permission-mode for an auto-spawned Worker; "" = no flag; default "auto"; Claude only
+    pub worker_autocompact: String, // a Worker's auto-compact window, every launch; "auto", 100000..=1000000 or ""; default 250000; Claude --autocompact, Codex -c model_auto_compact_token_limit
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub request_attention: bool,    // a Director's decision request also marks and rings, like a quiet fire; default true, read at start; false = the tag only
     pub director_prompt: String,    // role briefing template for the Director
@@ -2366,6 +2368,24 @@ downstream, in `build_open_launch`, the same place that already drops
 `disallowed_tools` for Codex. (A Codex Worker does get its effort, at creation, as
 `-c model_reasoning_effort`; that is not a `--permission-mode`-style role flag and
 is not computed there.)
+
+`worker_autocompact` is passed on every launch, a resume included, as
+`worker_permission_mode` is and unlike the model and effort below: it is a launch
+flag, and banto does not count on a resumed session remembering it. Default
+`250000`. Claude Workers get `--autocompact <value>`; Codex Workers get `-c
+model_auto_compact_token_limit=<n>`. Codex uses that key only to lower its
+threshold, and clamps it to 90% of the model's window, so a larger value changes
+nothing (for example, the window is 500k for gpt-6.1-terra, whose default threshold
+is 450k, and 272k for the gpt-6 and gpt-5.6 families, whose default is 244.8k; these
+are examples, not a list banto keeps). These Codex facts come from reading codex-cli
+0.169.0's help and its upstream source, not from running it, and whether a resumed
+Codex thread honours the key at all is unverified. Accepted: `"auto"`, which gives
+Claude `--autocompact auto` and Codex nothing; an integer from 100000 to 1000000,
+which goes to both agents; or `""`, which passes nothing to either. Any other value,
+a TOML float included, passes nothing, and startup shows a one-line notice:
+`worker_autocompact: ignored "abc" (not auto or 100000-1000000)`, with the value
+escaped and cut to 24 characters. A Director and a Goinkyo never get it, whichever
+agent they run, so their compaction stays whatever that agent's own settings say.
 
 **Model and effort: only when a session is created.** `worker_model`,
 `worker_effort`, `worker_model_codex`, `worker_effort_codex`, `goinkyo_model` and

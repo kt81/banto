@@ -3453,6 +3453,11 @@ pub enum Cmd {
     /// set for a Goinkyo, and a Worker's `permission_mode`, whether the launch
     /// is fresh or a resume, never for a Director, and ignored for Codex
     /// (Claude-only flags; `banto::launch::AgentLaunch::Codex` carries neither).
+    /// `autocompact` is a role's property too, but narrower: only a **Worker**
+    /// has one, on every launch, a resume included, and a Director, a Goinkyo
+    /// and a pane that is no member never do (`RoleLaunch`'s doc says why). It
+    /// is `--autocompact <value>` for Claude and `-c
+    /// model_auto_compact_token_limit=<n>` for Codex, which gets none for `auto`.
     /// The shell answers with `Event::Spawned`/`SpawnFailed`.
     OpenEmbedded {
         key: SessionKey,
@@ -3462,6 +3467,7 @@ pub enum Cmd {
         effort: Option<String>,
         permission_mode: Option<String>,
         disallowed_tools: Option<String>,
+        autocompact: Option<String>,
     },
     /// Kill the child at `key` — active termination (a confirmed prefix-`x`
     /// dismissal or kill, a disbanded brigade's Workers, a Goinkyo's end). The passive `Event::PtyExited` fold
@@ -6123,6 +6129,7 @@ fn update_new_session_cwd_checked(
         effort: None,
         permission_mode: None,
         disallowed_tools: None,
+        autocompact: None,
     }]
 }
 
@@ -6515,6 +6522,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         effort: None,
         permission_mode: None,
         disallowed_tools: None,
+        autocompact: None,
     }]
 }
 
@@ -6522,17 +6530,25 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
 /// everything about a member that banto's configuration decides for the role
 /// rather than for the session.
 ///
-/// Two things, both Claude-only flags: who may approve a tool call
-/// (`permission_mode`) and which tools exist to call (`disallowed_tools`). A
-/// Worker's own operator is no more watching every pane than the Goinkyo's, so
-/// a Worker gets the non-default `permission_mode` too. `disallowed_tools` stays
-/// Goinkyo-only: it answers "what may this role even attempt", which only needs
-/// guarding for a role meant to be called holding nothing of its own — a
-/// Worker's whole job is the editing that setting exists to deter (see
-/// `BrigadeConfig::goinkyo_disallowed_tools`'s own doc). Closing a
-/// consultation's pane mid-conversation and re-staging the brigade brings the
+/// Three things: who may approve a tool call (`permission_mode`) and which
+/// tools exist to call (`disallowed_tools`), both Claude-only flags, and the
+/// size of the window a session compacts at (`autocompact`), which both
+/// products take. A Worker's own operator is no more watching every pane than
+/// the Goinkyo's, so a Worker gets the non-default `permission_mode` too.
+/// `disallowed_tools` stays Goinkyo-only: it answers "what may this role even
+/// attempt", which only needs guarding for a role meant to be called holding
+/// nothing of its own — a Worker's whole job is the editing that setting exists
+/// to deter (see `BrigadeConfig::goinkyo_disallowed_tools`'s own doc). Closing
+/// a consultation's pane mid-conversation and re-staging the brigade brings the
 /// Goinkyo right back to an unattended prompt (or an editable working tree) if
 /// one comes up, same as a fresh spawn.
+///
+/// `autocompact` is a **Worker's** alone, whichever product it runs. The
+/// Director and the Goinkyo get nothing, whatever their product, and keep the
+/// agent's own compaction setting. Like the two above it rides on every
+/// launch: it is given as a launch flag, and banto does not count on a resumed
+/// session remembering it. What each product is given for it is
+/// `BrigadeConfig::worker_autocompact_for`'s to say.
 ///
 /// The model and the reasoning effort are *not* here. They are decided once,
 /// when a session is created, and never again: a resumed member passes neither
@@ -6547,17 +6563,22 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
 /// authority on what a member runs, and the operator's decision since is that
 /// the session is.
 ///
-/// The Director gets none of it: `BrigadeConfig` has no `director_*` setting at
-/// all — that session is the operator's own, launched (and re-launched)
-/// entirely outside banto's control.
+/// The Director gets none of it: `BrigadeConfig` has no Director counterpart of
+/// any of these three role flags, so each stays whatever the agent's own
+/// settings say for it.
+#[derive(Default)]
 struct RoleLaunch {
     permission_mode: Option<String>,
     disallowed_tools: Option<String>,
+    autocompact: Option<String>,
 }
 
 impl RoleLaunch {
-    fn of(role: BrigadeRole, brigade: &BrigadeConfig) -> Self {
+    fn of(role: BrigadeRole, agent: AgentKind, brigade: &BrigadeConfig) -> Self {
         Self {
+            autocompact: (role == BrigadeRole::Worker)
+                .then(|| brigade.worker_autocompact_for(agent))
+                .flatten(),
             permission_mode: match role {
                 BrigadeRole::Worker => brigade.worker_permission_mode(),
                 BrigadeRole::Goinkyo => brigade.goinkyo_permission_mode(),
@@ -6793,7 +6814,7 @@ fn stage_brigade(
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                     );
-                    let launch = RoleLaunch::of(*role, brigade);
+                    let launch = RoleLaunch::of(*role, row.agent, brigade);
                     cmds.push(Cmd::OpenEmbedded {
                         key,
                         target: SessionToOpen {
@@ -6809,6 +6830,7 @@ fn stage_brigade(
                         effort: None,
                         permission_mode: launch.permission_mode,
                         disallowed_tools: launch.disallowed_tools,
+                        autocompact: launch.autocompact,
                     });
                 }
             }
@@ -6844,7 +6866,7 @@ fn stage_brigade(
                             model: brigade.worker_model_for(fresh_worker_agent).unwrap_or(""),
                             effort: brigade.worker_effort_for(fresh_worker_agent).unwrap_or(""),
                         },
-                        brigade.worker_permission_mode(),
+                        RoleLaunch::of(BrigadeRole::Worker, fresh_worker_agent, brigade),
                     ));
                 }
             }
@@ -7947,7 +7969,7 @@ fn update_spawned(
                             model: &worker_model,
                             effort: &worker_effort,
                         },
-                        brigade.worker_permission_mode(),
+                        RoleLaunch::of(BrigadeRole::Worker, worker_agent, brigade),
                     )
                 })
                 .collect()
@@ -8049,7 +8071,7 @@ fn open_worker(
     token: &str,
     cwd: &std::path::Path,
     choice: WorkerChoice<'_>,
-    permission_mode: Option<&str>,
+    launch: RoleLaunch,
 ) -> Vec<Cmd> {
     let WorkerChoice {
         agent,
@@ -8095,8 +8117,9 @@ fn open_worker(
         brigade: Some((brigade_id, token.to_string(), BrigadeRole::Worker)),
         model: (!model.is_empty()).then(|| model.to_string()),
         effort: (!effort.is_empty()).then(|| effort.to_string()),
-        permission_mode: permission_mode.map(str::to_string),
-        disallowed_tools: None,
+        permission_mode: launch.permission_mode,
+        disallowed_tools: launch.disallowed_tools,
+        autocompact: launch.autocompact,
     };
     if agent == AgentKind::Codex && !model.is_empty() {
         // Joins the round already waiting, if there is one: its one read serves
@@ -8391,7 +8414,7 @@ fn relaunch_member(
             cwd: cwd.clone(),
         },
     );
-    let launch = RoleLaunch::of(BrigadeRole::Worker, brigade);
+    let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
     let call = state.member_call(Some(brigade_id), &token);
     state.set_status(format!("worker {call} exited — restarting"), now);
     Some(ExitHandling::Relaunch(Box::new(Cmd::OpenEmbedded {
@@ -8408,6 +8431,7 @@ fn relaunch_member(
         effort: None,
         permission_mode: launch.permission_mode,
         disallowed_tools: launch.disallowed_tools,
+        autocompact: launch.autocompact,
     })))
 }
 
@@ -8949,6 +8973,7 @@ fn open_director_with_wiring(
         effort: None,
         permission_mode: None,
         disallowed_tools: None,
+        autocompact: None,
     }]
 }
 
@@ -9007,7 +9032,7 @@ fn update_worker_added(
                     model: &worker_model,
                     effort: &worker_effort,
                 },
-                brigade.worker_permission_mode(),
+                RoleLaunch::of(BrigadeRole::Worker, worker_agent, brigade),
             )
         }
         Err(err) => {
@@ -9810,6 +9835,7 @@ fn update_goinkyo_awaiting_spawn(
         effort: brigade.goinkyo_effort().map(str::to_string),
         permission_mode: brigade.goinkyo_permission_mode().map(str::to_string),
         disallowed_tools: brigade.goinkyo_disallowed_tools().map(str::to_string),
+        autocompact: None,
     }]
 }
 
@@ -11211,8 +11237,49 @@ mod tests {
     fn staged_trio_launch_modes(
         brigade: &BrigadeConfig,
     ) -> Vec<(String, Option<String>, Option<String>)> {
+        staged_trio_cmds(brigade, AgentKind::ClaudeCode)
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::OpenEmbedded {
+                    target,
+                    permission_mode,
+                    disallowed_tools,
+                    ..
+                } => Some((
+                    target.id.clone(),
+                    permission_mode.clone(),
+                    disallowed_tools.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `Cmd`s staging the trio produces, with the Worker's row of
+    /// `worker_agent`'s product.
+    fn staged_trio_cmds(brigade: &BrigadeConfig, worker_agent: AgentKind) -> Vec<Cmd> {
+        staged_trio_cmds_of(brigade, AgentKind::ClaudeCode, worker_agent)
+    }
+
+    /// [`staged_trio_cmds`] with the Director's row of `director_agent`'s product
+    /// too.
+    fn staged_trio_cmds_of(
+        brigade: &BrigadeConfig,
+        director_agent: AgentKind,
+        worker_agent: AgentKind,
+    ) -> Vec<Cmd> {
         let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("dir"), row("w1"), row("g1")]);
+        let mut app = app_with(vec![
+            SessionRow {
+                agent: director_agent,
+                ..row("dir")
+            },
+            SessionRow {
+                agent: worker_agent,
+                ..row("w1")
+            },
+            row("g1"),
+        ]);
         let now = test_instant();
         state.pending_membership = Some(PendingMembership::Activate);
 
@@ -11233,7 +11300,7 @@ mod tests {
                 Some("g1".to_string()),
             ),
         ];
-        let cmds = update(
+        update(
             &mut state,
             &mut app,
             brigade,
@@ -11245,23 +11312,7 @@ mod tests {
                 names: Vec::new(),
             },
             now,
-        );
-
-        cmds.iter()
-            .filter_map(|cmd| match cmd {
-                Cmd::OpenEmbedded {
-                    target,
-                    permission_mode,
-                    disallowed_tools,
-                    ..
-                } => Some((
-                    target.id.clone(),
-                    permission_mode.clone(),
-                    disallowed_tools.clone(),
-                )),
-                _ => None,
-            })
-            .collect()
+        )
     }
 
     #[test]
@@ -11905,6 +11956,296 @@ mod tests {
             }
             other => panic!("expected exactly one OpenEmbedded: {other:?}"),
         }
+    }
+
+    // --- autocompact: a Claude Worker's, on every launch ------------------------
+
+    /// `(target id, autocompact)` for every open among `cmds`.
+    fn autocompacts(cmds: &[Cmd]) -> Vec<(String, Option<String>)> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                Cmd::OpenEmbedded {
+                    target,
+                    autocompact,
+                    ..
+                } => Some((target.id.clone(), autocompact.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `autocompact` of the one open among `cmds` for the target `id`.
+    fn autocompact_of_open(cmds: &[Cmd], id: &str) -> Option<String> {
+        let found: Vec<_> = autocompacts(cmds)
+            .into_iter()
+            .filter(|(target, _)| target == id)
+            .collect();
+        assert_eq!(found.len(), 1, "one open for {id:?} in {cmds:?}");
+        found.into_iter().next().unwrap().1
+    }
+
+    /// Form a brigade whose Workers are `worker_agent`, let its Director
+    /// spawn, and return the `Cmd`s for the Director (from forming) and for
+    /// the first Worker (from the spawn).
+    fn formed_brigade_opens(
+        brigade: &BrigadeConfig,
+        worker_agent: AgentKind,
+    ) -> (Vec<Cmd>, Vec<Cmd>) {
+        formed_brigade_opens_of(brigade, AgentKind::ClaudeCode, worker_agent)
+    }
+
+    /// [`formed_brigade_opens`] with the Director's row of `director_agent`'s
+    /// product.
+    fn formed_brigade_opens_of(
+        brigade: &BrigadeConfig,
+        director_agent: AgentKind,
+        worker_agent: AgentKind,
+    ) -> (Vec<Cmd>, Vec<Cmd>) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![SessionRow {
+            agent: director_agent,
+            ..row("dir")
+        }]);
+        let director_cmds = update(
+            &mut state,
+            &mut app,
+            brigade,
+            Event::BrigadeFormed {
+                director_row_id: "dir".to_string(),
+                name: "cell".to_string(),
+                cwd: PathBuf::from("/work"),
+                worker_agent,
+                worker_model: String::new(),
+                worker_effort: String::new(),
+                result: Ok((1, vec!["worker-1".to_string()])),
+            },
+            test_instant(),
+        );
+        let worker_cmds = update(
+            &mut state,
+            &mut app,
+            brigade,
+            Event::Spawned {
+                key: SessionKey::from_id("dir"),
+            },
+            test_instant(),
+        );
+        let worker_cmds = launch_choice_tests::answer_catalog(
+            &mut state,
+            &mut app,
+            brigade,
+            worker_cmds,
+            &launch_choice_tests::catalog(),
+        );
+        (director_cmds, worker_cmds)
+    }
+
+    #[test]
+    fn a_resumed_claude_worker_carries_the_autocompact_window_and_no_other_role_does() {
+        let cmds = staged_trio_cmds(&BrigadeConfig::default(), AgentKind::ClaudeCode);
+        assert_eq!(autocompacts(&cmds).len(), 3, "{cmds:?}");
+        assert_eq!(autocompact_of_open(&cmds, "w1").as_deref(), Some("250000"));
+        assert_eq!(
+            autocompact_of_open(&cmds, "dir"),
+            None,
+            "the Director resumed"
+        );
+        assert_eq!(
+            autocompact_of_open(&cmds, "g1"),
+            None,
+            "the Goinkyo resumed"
+        );
+    }
+
+    #[test]
+    fn a_resumed_codex_worker_carries_the_autocompact_window_as_a_token_count() {
+        let cmds = staged_trio_cmds(&BrigadeConfig::default(), AgentKind::Codex);
+        assert_eq!(autocompact_of_open(&cmds, "w1").as_deref(), Some("250000"));
+    }
+
+    #[test]
+    fn auto_is_claudes_word_and_a_codex_worker_gets_nothing_for_it() {
+        let brigade = BrigadeConfig {
+            worker_autocompact: "auto".to_string(),
+            ..BrigadeConfig::default()
+        };
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            let expected = (agent == AgentKind::ClaudeCode).then_some("auto");
+            let resumed = staged_trio_cmds(&brigade, agent);
+            assert_eq!(
+                autocompact_of_open(&resumed, "w1").as_deref(),
+                expected,
+                "resumed {agent:?}"
+            );
+            let (_, fresh) = formed_brigade_opens(&brigade, agent);
+            assert_eq!(
+                autocompact_of_open(&fresh, "").as_deref(),
+                expected,
+                "created {agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_director_never_carries_autocompact_whichever_product_it_is() {
+        for director in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            // Resumed (re-staging a brigade) and created (forming one).
+            let resumed =
+                staged_trio_cmds_of(&BrigadeConfig::default(), director, AgentKind::Codex);
+            assert_eq!(autocompact_of_open(&resumed, "dir"), None, "{director:?}");
+            let (formed, _) =
+                formed_brigade_opens_of(&BrigadeConfig::default(), director, AgentKind::Codex);
+            assert_eq!(autocompact_of_open(&formed, "dir"), None, "{director:?}");
+        }
+    }
+
+    #[test]
+    fn the_autocompact_window_is_what_the_config_says_and_only_when_valid() {
+        for (written, passed) in [
+            ("auto", Some("auto")),
+            ("300000", Some("300000")),
+            ("100000", Some("100000")),
+            ("1000000", Some("1000000")),
+            ("99999", None),
+            ("1000001", None),
+            ("abc", None),
+            ("-250000", None),
+            ("", None),
+        ] {
+            let brigade = BrigadeConfig {
+                worker_autocompact: written.to_string(),
+                ..BrigadeConfig::default()
+            };
+            let cmds = staged_trio_cmds(&brigade, AgentKind::ClaudeCode);
+            assert_eq!(
+                autocompact_of_open(&cmds, "w1").as_deref(),
+                passed,
+                "worker_autocompact = {written:?}"
+            );
+            assert_eq!(autocompact_of_open(&cmds, "dir"), None, "{written:?}");
+            assert_eq!(autocompact_of_open(&cmds, "g1"), None, "{written:?}");
+        }
+    }
+
+    #[test]
+    fn a_freshly_spawned_claude_worker_carries_the_autocompact_window_and_the_director_does_not() {
+        let (director, worker) =
+            formed_brigade_opens(&BrigadeConfig::default(), AgentKind::ClaudeCode);
+        assert_eq!(
+            autocompact_of_open(&director, "dir"),
+            None,
+            "the Director's own launch"
+        );
+        assert_eq!(
+            autocompact_of_open(&worker, "").as_deref(),
+            Some("250000"),
+            "the first Worker's own launch"
+        );
+    }
+
+    #[test]
+    fn a_freshly_spawned_codex_worker_carries_the_autocompact_window_as_a_token_count() {
+        let (_, worker) = formed_brigade_opens(&BrigadeConfig::default(), AgentKind::Codex);
+        assert_eq!(autocompact_of_open(&worker, "").as_deref(), Some("250000"));
+    }
+
+    #[test]
+    fn a_worker_added_later_carries_the_autocompact_window_of_either_product() {
+        for (agent, passed) in [
+            (AgentKind::ClaudeCode, Some("250000")),
+            (AgentKind::Codex, Some("250000")),
+        ] {
+            let mut state = EmporiumState::new(PrefixKey::default());
+            let mut app = app_with(vec![]);
+            let brigade = brigade_config();
+            let cmds = update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::WorkerAdded {
+                    brigade_id: 1,
+                    cwd: PathBuf::from("/work"),
+                    worker_agent: agent,
+                    worker_model: String::new(),
+                    worker_effort: String::new(),
+                    result: Ok("worker-2".to_string()),
+                },
+                test_instant(),
+            );
+            let cmds = launch_choice_tests::answer_catalog(
+                &mut state,
+                &mut app,
+                &brigade,
+                cmds,
+                &launch_choice_tests::catalog(),
+            );
+            assert_eq!(
+                autocompact_of_open(&cmds, "").as_deref(),
+                passed,
+                "{agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_with_no_session_yet_is_staged_with_the_autocompact_window() {
+        // `stage_brigade`'s id-less arm: a Worker whose process died before its
+        // session was ever discovered is created afresh.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        state.pending_membership = Some(PendingMembership::Activate);
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade_config(),
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(vec![
+                    (
+                        "director".to_string(),
+                        BrigadeRole::Director,
+                        Some("dir".to_string()),
+                    ),
+                    ("worker-1".to_string(), BrigadeRole::Worker, None),
+                ]),
+                layout: None,
+                names: Vec::new(),
+            },
+            test_instant(),
+        );
+        assert_eq!(autocompact_of_open(&cmds, "dir"), None);
+        assert_eq!(autocompact_of_open(&cmds, "").as_deref(), Some("250000"));
+    }
+
+    #[test]
+    fn a_restarted_worker_carries_the_autocompact_window_of_either_product() {
+        for (agent, passed) in [
+            (AgentKind::ClaudeCode, Some("250000")),
+            (AgentKind::Codex, Some("250000")),
+        ] {
+            let (mut state, _) = staged_brigade_with_worker();
+            let mut app = app_with(vec![row("dir"), SessionRow { agent, ..row("w1") }]);
+            let cmds = worker_exits(&mut state, &mut app, &brigade_config(), test_instant());
+            match &cmds[..] {
+                [Cmd::OpenEmbedded { autocompact, .. }] => {
+                    assert_eq!(autocompact.as_deref(), passed, "{agent:?}");
+                }
+                other => panic!("expected one OpenEmbedded, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_goinkyo_never_carries_an_autocompact_window() {
+        let cmds = update(
+            &mut EmporiumState::new(PrefixKey::default()),
+            &mut app_with(vec![]),
+            &BrigadeConfig::default(),
+            awaiting_spawn(7),
+            test_instant(),
+        );
+        assert_eq!(autocompacts(&cmds), vec![(String::new(), None)], "{cmds:?}");
     }
 
     // --- worker_agent = "select": the formation-time picker modal ----------
@@ -13708,7 +14049,7 @@ mod tests {
                 model: "",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
         let key = SessionKey::new_worker(1, "worker-1");
         assert!(matches!(
@@ -13733,7 +14074,7 @@ mod tests {
                 model: "",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
         let key = SessionKey::new_worker(1, "worker-1");
         assert!(matches!(
@@ -17783,7 +18124,7 @@ mod tests {
                 model: "",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
         update(
             &mut state,
@@ -18120,7 +18461,7 @@ mod tests {
                 model: "",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
         update(
             &mut state,
@@ -21296,7 +21637,7 @@ mod tests {
                     model: "",
                     effort: "",
                 },
-                None,
+                RoleLaunch::default(),
             );
         }
         for token in ["worker-1", "worker-2", "worker-3"] {
@@ -23500,7 +23841,7 @@ mod tests {
                 model: "",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
 
         assert!(state.pending_goinkyo_kickoffs.is_empty());
@@ -24628,6 +24969,7 @@ mod tests {
                     effort: None,
                     permission_mode: None,
                     disallowed_tools: None,
+                    autocompact: None,
                 },
             ] => {
                 assert!(key.is_synthetic());

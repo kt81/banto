@@ -131,6 +131,12 @@ pub(crate) enum AgentLaunch {
         /// alike — which tools exist to call is as much a role property as
         /// who approves them).
         disallowed_tools: Option<String>,
+        /// `--autocompact <value>` (`claude --help`: `auto`, or a window of
+        /// 100k–1M tokens) — `BrigadeConfig::worker_autocompact`, a Worker's
+        /// alone (Codex's counterpart is [`Self::Codex`]'s own field). Like
+        /// `permission_mode` it rides on a resume too: banto does not count on
+        /// a resumed session remembering a launch flag.
+        autocompact: Option<String>,
         append_system_prompt: Option<String>,
         mcp_config: Option<PathBuf>,
     },
@@ -144,6 +150,16 @@ pub(crate) enum AgentLaunch {
         /// `-c model_reasoning_effort="<level>"` — see [`SessionStart`].
         start: SessionStart,
         cwd: PathBuf,
+        /// `-c model_auto_compact_token_limit=<tokens>`, a Codex Worker's
+        /// share of `BrigadeConfig::worker_autocompact`: the token count only
+        /// ("auto" is Claude's word, and gives Codex no override at all). Rides
+        /// on a resume as on a creation, unlike the effort override, because it
+        /// names neither a model nor an effort, so it does not switch the
+        /// thread's saved choices off. Cited from upstream `main` as read on
+        /// 2026-11-16, with codex-cli 0.169.0 installed; not run. The config
+        /// doc has the rest, including that a resumed thread honouring it is
+        /// unverified.
+        autocompact: Option<String>,
         /// `None` outside brigade context (an ordinary resume/new session);
         /// `Some` adds the `-c` overrides that make this launch a brigade
         /// member — see [`CodexBrigade`].
@@ -452,11 +468,12 @@ impl AgentLaunch {
     /// agreed on before this type existed, `effort` slotted in right after
     /// `--model` since `claude --help` groups the two: `--resume`, or `--model`
     /// then `--effort`, then `--permission-mode`, `--disallowedTools`,
-    /// `--append-system-prompt`, `--mcp-config`. Codex's: the `resume <uuid>`
+    /// `--autocompact`, `--append-system-prompt`, `--mcp-config`. Codex's: the `resume <uuid>`
     /// subcommand (or nothing, for a fresh launch), then `-m`, then the
     /// notification `-c` overrides (always present — see
     /// [`NOTIFICATION_OVERRIDES`]), then `-c model_reasoning_effort` (a new
-    /// session with an effort), then brigade `-c` overrides (if any — see
+    /// session with an effort), then `-c model_auto_compact_token_limit` (a
+    /// Worker's, create or resume), then brigade `-c` overrides (if any — see
     /// [`CodexBrigade::overrides`]), then `-C <cwd>` last, always present.
     pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
         let mut argv = vec![binary.to_string()];
@@ -465,6 +482,7 @@ impl AgentLaunch {
                 start,
                 permission_mode,
                 disallowed_tools,
+                autocompact,
                 append_system_prompt,
                 mcp_config,
             } => {
@@ -492,6 +510,10 @@ impl AgentLaunch {
                     argv.push("--disallowedTools".to_string());
                     argv.push(tools.clone());
                 }
+                if let Some(window) = autocompact {
+                    argv.push("--autocompact".to_string());
+                    argv.push(window.clone());
+                }
                 if let Some(prompt) = append_system_prompt {
                     argv.push("--append-system-prompt".to_string());
                     argv.push(prompt.clone());
@@ -504,6 +526,7 @@ impl AgentLaunch {
             AgentLaunch::Codex {
                 start,
                 cwd,
+                autocompact,
                 brigade,
             } => {
                 let mut effort_override = None;
@@ -527,6 +550,12 @@ impl AgentLaunch {
                 if let Some(value) = effort_override {
                     argv.push("-c".to_string());
                     argv.push(value);
+                }
+                // Outside the `SessionStart` match on purpose: this one rides
+                // on a resume too (the field's doc says why that is safe).
+                if let Some(tokens) = autocompact {
+                    argv.push("-c".to_string());
+                    argv.push(format!("model_auto_compact_token_limit={tokens}"));
                 }
                 if let Some(brigade) = brigade {
                     for value in brigade.overrides() {
@@ -703,6 +732,7 @@ mod tests {
             },
             permission_mode: None,
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         }
@@ -725,6 +755,7 @@ mod tests {
             },
             permission_mode: None,
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-worker-1.json")),
         };
@@ -748,6 +779,7 @@ mod tests {
             },
             permission_mode: None,
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -763,6 +795,7 @@ mod tests {
             },
             permission_mode: None,
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -781,6 +814,7 @@ mod tests {
             },
             permission_mode: Some("auto".to_string()),
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -805,12 +839,75 @@ mod tests {
             },
             permission_mode: None,
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         };
         assert_eq!(
             no_permission_mode.argv("claude"),
             ["claude", "--model", "fable", "--effort", "max"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_autocompact_renders_after_the_role_flags_and_before_the_briefing() {
+        let launch = AgentLaunch::Claude {
+            start: SessionStart::Resume("sess-1".to_string()),
+            permission_mode: Some("auto".to_string()),
+            disallowed_tools: Some("Edit".to_string()),
+            autocompact: Some("250000".to_string()),
+            append_system_prompt: Some("you are a Worker".to_string()),
+            mcp_config: Some(PathBuf::from("/tmp/mcp.json")),
+        };
+        assert_eq!(
+            launch.argv("claude"),
+            [
+                "claude",
+                "--resume",
+                "sess-1",
+                "--permission-mode",
+                "auto",
+                "--disallowedTools",
+                "Edit",
+                "--autocompact",
+                "250000",
+                "--append-system-prompt",
+                "you are a Worker",
+                "--mcp-config",
+                "/tmp/mcp.json",
+            ]
+            .map(str::to_string)
+        );
+        let create = AgentLaunch::Claude {
+            start: SessionStart::Create {
+                model: Some("sonnet".to_string()),
+                effort: None,
+            },
+            permission_mode: None,
+            disallowed_tools: None,
+            autocompact: Some("auto".to_string()),
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            create.argv("claude"),
+            ["claude", "--model", "sonnet", "--autocompact", "auto"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn agent_launch_autocompact_is_absent_when_none() {
+        let launch = AgentLaunch::Claude {
+            start: SessionStart::Resume("sess-1".to_string()),
+            permission_mode: None,
+            disallowed_tools: None,
+            autocompact: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            launch.argv("claude"),
+            ["claude", "--resume", "sess-1"].map(str::to_string)
         );
     }
 
@@ -823,6 +920,7 @@ mod tests {
             },
             permission_mode: Some("auto".to_string()),
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -849,6 +947,7 @@ mod tests {
             },
             permission_mode: Some("auto".to_string()),
             disallowed_tools: None,
+            autocompact: None,
             append_system_prompt: None,
             mcp_config: None,
         };
@@ -872,6 +971,7 @@ mod tests {
             start,
             permission_mode: Some("auto".to_string()),
             disallowed_tools: Some("Edit,Write,NotebookEdit".to_string()),
+            autocompact: None,
             append_system_prompt: Some("you are the Director".to_string()),
             mcp_config: Some(PathBuf::from("C:/data/banto/mcp/1-director.json")),
         }
@@ -931,6 +1031,84 @@ mod tests {
     }
 
     #[test]
+    fn agent_launch_codex_autocompact_is_a_bare_integer_override_for_a_create_and_a_resume() {
+        for start in [
+            SessionStart::Create {
+                model: Some("gpt-6.1-terra".to_string()),
+                effort: Some("high".to_string()),
+            },
+            SessionStart::Resume("codex-uuid-1".to_string()),
+        ] {
+            let resumed = matches!(start, SessionStart::Resume(_));
+            let argv = AgentLaunch::Codex {
+                start,
+                cwd: PathBuf::from("/work/alpha"),
+                autocompact: Some("250000".to_string()),
+                brigade: None,
+            }
+            .argv("codex");
+            let at = argv
+                .iter()
+                .position(|arg| arg == "model_auto_compact_token_limit=250000")
+                .unwrap_or_else(|| panic!("no override (resume: {resumed}): {argv:?}"));
+            assert_eq!(argv[at - 1], "-c", "{argv:?}");
+            // With the overrides that apply to both, and ahead of `-C`, which
+            // stays last.
+            assert_eq!(&argv[argv.len() - 2..], ["-C", "/work/alpha"], "{argv:?}");
+            assert_eq!(argv.len() - at, 3, "{argv:?}");
+            if !resumed {
+                let effort = argv
+                    .iter()
+                    .position(|arg| arg.starts_with("model_reasoning_effort="))
+                    .expect("a creation keeps its effort override");
+                assert!(effort < at, "{argv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn agent_launch_codex_autocompact_sits_before_the_brigade_overrides() {
+        let launch = AgentLaunch::Codex {
+            start: SessionStart::Resume("codex-uuid-1".to_string()),
+            cwd: PathBuf::from("/work/alpha"),
+            autocompact: Some("250000".to_string()),
+            brigade: Some(CodexBrigade {
+                exe: PathBuf::from("/opt/banto"),
+                brigade_id: 1,
+                token: "worker-1".to_string(),
+                role: BrigadeRole::Worker,
+                session: Some("codex-uuid-1".to_string()),
+                child_args: Vec::new(),
+            }),
+        };
+        let argv = launch.argv("codex");
+        let limit = argv
+            .iter()
+            .position(|arg| arg == "model_auto_compact_token_limit=250000")
+            .unwrap();
+        let first_brigade_override = argv
+            .iter()
+            .position(|arg| arg.starts_with("mcp_servers."))
+            .expect("a brigade launch carries its MCP override");
+        assert!(limit < first_brigade_override, "{argv:?}");
+    }
+
+    #[test]
+    fn agent_launch_codex_without_autocompact_has_no_such_override() {
+        let argv = AgentLaunch::Codex {
+            start: SessionStart::Resume("codex-uuid-1".to_string()),
+            cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
+            brigade: None,
+        }
+        .argv("codex");
+        assert!(
+            !argv.iter().any(|arg| arg.contains("auto_compact")),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
     fn agent_launch_codex_fresh_launch_carries_the_notification_overrides_plus_cwd() {
         let launch = AgentLaunch::Codex {
             start: SessionStart::Create {
@@ -938,6 +1116,7 @@ mod tests {
                 effort: None,
             },
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: None,
         };
         assert_eq!(
@@ -962,6 +1141,7 @@ mod tests {
         let launch = AgentLaunch::Codex {
             start: SessionStart::Resume("codex-uuid-1".to_string()),
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: None,
         };
         let argv = launch.argv("codex");
@@ -1000,6 +1180,7 @@ mod tests {
                 effort: Some("high".to_string()),
             },
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: None,
         };
         assert_eq!(
@@ -1032,6 +1213,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
             },
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: Some(CodexBrigade {
                 exe: PathBuf::from("/opt/banto/banto"),
                 brigade_id: 1,
@@ -1063,6 +1245,7 @@ mod tests {
                 effort: effort.map(str::to_string),
             },
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: None,
         };
         let quoted = launch(Some("hi\"gh")).argv("codex");
@@ -1084,6 +1267,7 @@ mod tests {
                 effort: None,
             },
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: Some(CodexBrigade {
                 exe: PathBuf::from("/opt/banto/banto"),
                 brigade_id: 1,
@@ -1127,6 +1311,7 @@ mod tests {
         let launch = AgentLaunch::Codex {
             start: SessionStart::Resume("codex-uuid-1".to_string()),
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: None,
         };
         let argv = launch.argv("codex");
@@ -1285,6 +1470,7 @@ mod tests {
         let launch = AgentLaunch::Codex {
             start: SessionStart::Resume("codex-uuid-1".to_string()),
             cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
             brigade: None,
         };
         let argv = launch.argv(&agent_binary(AgentKind::Codex, &binaries));

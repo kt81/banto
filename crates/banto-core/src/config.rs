@@ -160,6 +160,36 @@ pub struct BrigadeConfig {
     /// then comes from the operator's own Claude settings, which Claude saves
     /// per model (read in its docs, not measured by running it).
     pub worker_effort: String,
+    /// The window a Worker compacts at: `auto`, or a size in tokens from
+    /// 100000 to 1000000. Built-in `250000`; an empty string passes nothing.
+    /// Written as a TOML integer (`250000`) or as a string (`"auto"`,
+    /// `"250000"`). A Claude Worker gets it as `--autocompact <value>`; a Codex
+    /// Worker gets a token count as `-c model_auto_compact_token_limit=<n>` and
+    /// nothing for `auto` ([`Self::worker_autocompact_for`]).
+    ///
+    /// Unlike the model and the effort, passed on *every* launch of a Worker, a
+    /// resume included: it is given as a launch flag, and banto does not count
+    /// on a resumed session remembering it. Never passed to a Director or a
+    /// Goinkyo, or to a pane banto did not launch as a member: their
+    /// compaction stays whatever the agent's own settings say.
+    ///
+    /// What is known of Codex's side comes from upstream `main` as read on
+    /// 2026-11-16 and the installed codex-cli 0.169.0's help and strings; none
+    /// of it was run. Codex uses the key only to
+    /// lower its threshold: the key is clamped to 90% of the model's window
+    /// (500k for gpt-6.1-terra, 272k for the gpt-6 and gpt-5.6 families, so
+    /// 450k and 244.8k), and a value above the clamp changes nothing. A resumed
+    /// thread keeps its saved model and effort unless the overrides name one,
+    /// and this key names neither, so passing it on a resume is safe; whether
+    /// it takes effect on a resumed thread is unverified.
+    ///
+    /// A value outside that set never stops a Worker launching: nothing is
+    /// passed, and the startup status line says so
+    /// ([`Self::worker_autocompact_ignored`]). Kept as the text the operator
+    /// wrote, as every other setting here is; [`Self::worker_autocompact`] is
+    /// the one reader.
+    #[serde(deserialize_with = "autocompact_as_written")]
+    pub worker_autocompact: String,
     /// The model a Codex Worker launches with when its session is first
     /// created — the Codex sibling of [`Self::worker_model`], same
     /// empty-string escape hatch, independent default (the products share no
@@ -449,6 +479,7 @@ impl Default for BrigadeConfig {
             workers: 1,
             worker_model: "sonnet".to_string(),
             worker_effort: "high".to_string(),
+            worker_autocompact: "250000".to_string(),
             worker_model_codex: "terra".to_string(),
             worker_effort_codex: "high".to_string(),
             worker_agent: WorkerAgentSetting::default(),
@@ -476,6 +507,99 @@ impl Default for BrigadeConfig {
 pub fn flag_value(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// `[brigade] worker_autocompact` as the operator wrote it, whatever its TOML
+/// type: an integer becomes its digits, a string stays as it is, and anything
+/// else (a boolean, any float, a list, a table) becomes a word for what it was,
+/// which no reader accepts. A field that failed to deserialize would fail the
+/// whole document, and with it every other setting in `config.toml`; this
+/// field's own rule is "a bad value passes nothing", so it never gets to.
+fn autocompact_as_written<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct AsWritten;
+
+    impl<'de> Visitor<'de> for AsWritten {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or a string")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<String, E> {
+            Ok(value.to_string())
+        }
+
+        // Whatever its value: `250000.0` and `1e6` hold an integer, but only a
+        // TOML integer or a string is a token count, and `to_string` on the
+        // float would have turned them into digits.
+        fn visit_f64<E>(self, _value: f64) -> Result<String, E> {
+            Ok("a float".to_string())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<String, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok("a list".to_string())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<String, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok("a table".to_string())
+        }
+    }
+
+    deserializer.deserialize_any(AsWritten)
+}
+
+/// The window sizes `--autocompact` takes, in tokens, as the CLI's own help
+/// states them (`auto, or 100k–1M tokens`).
+const AUTOCOMPACT_TOKENS: std::ops::RangeInclusive<u64> = 100_000..=1_000_000;
+
+enum AutocompactReading {
+    /// What goes after `--autocompact`.
+    Pass(String),
+    /// Nothing written: the operator asked for no flag.
+    Empty,
+    /// Written, but not a value the flag takes.
+    Invalid,
+}
+
+/// The one rule for `worker_autocompact`. Plain ASCII digits only, so a sign, a
+/// unit (`250k`), a separator or an exponent is invalid rather than guessed at;
+/// the number is passed back as canonical decimal text, so leading zeros never
+/// reach the CLI.
+fn autocompact_reading(raw: &str) -> AutocompactReading {
+    let Some(text) = flag_value(raw) else {
+        return AutocompactReading::Empty;
+    };
+    if text.eq_ignore_ascii_case("auto") {
+        return AutocompactReading::Pass("auto".to_string());
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return AutocompactReading::Invalid;
+    }
+    match text.parse::<u64>() {
+        Ok(tokens) if AUTOCOMPACT_TOKENS.contains(&tokens) => {
+            AutocompactReading::Pass(tokens.to_string())
+        }
+        _ => AutocompactReading::Invalid,
+    }
 }
 
 impl BrigadeConfig {
@@ -516,6 +640,40 @@ impl BrigadeConfig {
             AgentKind::Codex => &self.worker_effort_codex,
         };
         flag_value(raw)
+    }
+
+    /// The value a Claude Worker's `--autocompact` gets: `auto`, or the
+    /// token count as plain digits. `None` passes no flag, whether the setting
+    /// is empty or invalid ([`Self::worker_autocompact_ignored`] tells the two
+    /// apart). Read on every launch of a Claude Worker, a resume included
+    /// ([`Self::worker_autocompact`]'s field doc says why).
+    pub fn worker_autocompact(&self) -> Option<String> {
+        match autocompact_reading(&self.worker_autocompact) {
+            AutocompactReading::Pass(value) => Some(value),
+            AutocompactReading::Empty | AutocompactReading::Invalid => None,
+        }
+    }
+
+    /// What a Worker of `agent` is launched with for this setting. Claude
+    /// takes [`Self::worker_autocompact`] as it stands. Codex takes the token
+    /// count only: `auto` is Claude's word, and Codex has no equivalent, so it
+    /// gets no override at all (its own default threshold stays).
+    pub fn worker_autocompact_for(&self, agent: AgentKind) -> Option<String> {
+        let value = self.worker_autocompact()?;
+        match agent {
+            AgentKind::ClaudeCode => Some(value),
+            AgentKind::Codex => (value != "auto").then_some(value),
+        }
+    }
+
+    /// The setting as written when it is neither empty nor a value
+    /// [`Self::worker_autocompact`] can pass, so the startup status line can
+    /// say a Worker is launching without it.
+    pub fn worker_autocompact_ignored(&self) -> Option<&str> {
+        match autocompact_reading(&self.worker_autocompact) {
+            AutocompactReading::Invalid => Some(self.worker_autocompact.trim()),
+            AutocompactReading::Pass(_) | AutocompactReading::Empty => None,
+        }
     }
 
     /// [`Self::worker_permission_mode`], or `None` for the empty-string
@@ -711,6 +869,148 @@ mod tests {
     /// job to test end to end, over a real temp file).
     fn parse(text: &str) -> Config {
         toml::from_str(text).unwrap()
+    }
+
+    /// `[brigade] worker_autocompact = <toml>` parsed, and what a Claude Worker
+    /// would be handed for it.
+    fn autocompact_of(toml_value: &str) -> (Option<String>, Option<String>) {
+        let config = parse(&format!("[brigade]\nworker_autocompact = {toml_value}\n"));
+        (
+            config.brigade.worker_autocompact(),
+            config
+                .brigade
+                .worker_autocompact_ignored()
+                .map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn worker_autocompact_for_a_codex_worker_is_the_token_count_and_never_auto() {
+        for (written, claude, codex) in [
+            ("250000", Some("250000"), Some("250000")),
+            ("\"300000\"", Some("300000"), Some("300000")),
+            ("100000", Some("100000"), Some("100000")),
+            ("1000000", Some("1000000"), Some("1000000")),
+            ("\"auto\"", Some("auto"), None),
+            ("\"AUTO\"", Some("auto"), None),
+            ("99999", None, None),
+            ("1000001", None, None),
+            ("\"abc\"", None, None),
+            ("\"\"", None, None),
+        ] {
+            let config = parse(&format!("[brigade]\nworker_autocompact = {written}\n"));
+            assert_eq!(
+                config
+                    .brigade
+                    .worker_autocompact_for(AgentKind::ClaudeCode)
+                    .as_deref(),
+                claude,
+                "Claude, {written}"
+            );
+            assert_eq!(
+                config
+                    .brigade
+                    .worker_autocompact_for(AgentKind::Codex)
+                    .as_deref(),
+                codex,
+                "Codex, {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_autocompact_defaults_to_the_operators_window() {
+        let brigade = Config::default().brigade;
+        assert_eq!(brigade.worker_autocompact().as_deref(), Some("250000"));
+        assert_eq!(brigade.worker_autocompact_ignored(), None);
+        // A file that never mentions the key gets the same.
+        let config = parse("[brigade]\nworkers = 2\n");
+        assert_eq!(
+            config.brigade.worker_autocompact().as_deref(),
+            Some("250000")
+        );
+    }
+
+    #[test]
+    fn worker_autocompact_takes_an_integer_or_a_string_and_passes_digits_or_auto() {
+        for (written, passed) in [
+            ("250000", "250000"),
+            ("\"250000\"", "250000"),
+            ("\"auto\"", "auto"),
+            ("\"AUTO\"", "auto"),
+            ("\" auto \"", "auto"),
+            ("\" 300000 \"", "300000"),
+            ("100000", "100000"),
+            ("1000000", "1000000"),
+            ("\"100000\"", "100000"),
+            ("\"1000000\"", "1000000"),
+            // Digits are read as a number, so leading zeros do not reach the CLI.
+            ("\"0300000\"", "300000"),
+        ] {
+            assert_eq!(
+                autocompact_of(written),
+                (Some(passed.to_string()), None),
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_autocompact_outside_the_window_passes_nothing_and_is_reported() {
+        for written in [
+            "99999",
+            "1000001",
+            "0",
+            "-250000",
+            "\"99999\"",
+            "\"1000001\"",
+            "\"abc\"",
+            "\"-250000\"",
+            "\"250k\"",
+            "\"2.5e5\"",
+            "\"+250000\"",
+            "\"250 000\"",
+            "\"99999999999999999999999\"",
+            "true",
+            "2.5",
+            // A float is never a token count, even one that holds an integer
+            // value: only a TOML integer or a string is accepted.
+            "250000.0",
+            "1e6",
+            "1_000e3",
+            "300000.0",
+            "inf",
+            "nan",
+            "[250000]",
+            "{ tokens = 250000 }",
+        ] {
+            let (passed, ignored) = autocompact_of(written);
+            assert_eq!(passed, None, "{written}");
+            assert!(ignored.is_some(), "{written} must be reported");
+        }
+    }
+
+    #[test]
+    fn worker_autocompact_reports_the_value_as_the_operator_wrote_it() {
+        assert_eq!(autocompact_of("\"abc\"").1.as_deref(), Some("abc"));
+        assert_eq!(autocompact_of("99999").1.as_deref(), Some("99999"));
+        assert_eq!(autocompact_of("\" abc \"").1.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn worker_autocompact_empty_passes_nothing_and_is_not_an_error() {
+        for written in ["\"\"", "\"   \""] {
+            assert_eq!(autocompact_of(written), (None, None), "{written}");
+        }
+    }
+
+    #[test]
+    fn a_wrongly_typed_worker_autocompact_does_not_cost_the_rest_of_the_file() {
+        let config =
+            parse("[brigade]\nworkers = 3\nworker_autocompact = true\nworker_model = \"opus\"\n");
+        assert_eq!(config.brigade.workers, 3);
+        assert_eq!(config.brigade.worker_model, "opus");
+        assert_eq!(config.brigade.worker_autocompact(), None);
     }
 
     #[test]

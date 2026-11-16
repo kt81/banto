@@ -343,6 +343,13 @@ worker_model = "sonnet"          # Claude: --model
 worker_effort = "high"           # Claude: --effort (low | medium | high | xhigh | max)
 worker_model_codex = "terra"     # Codex: a slug, or a family word resolved to its newest slug
 worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
+# A Worker's auto-compact window, passed on EVERY launch, a resume included (unlike
+# the model and effort above): it is a launch flag, and banto does not count on a
+# resumed session remembering it. "auto", an integer 100000..=1000000, or "" (no
+# flag). Directors and Goinkyo never get it.
+# Claude: --autocompact; Codex: -c model_auto_compact_token_limit (a token count
+# only; "auto" gives Codex nothing).
+worker_autocompact = 250000
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
 # For banto developers: append every brigade message, in full, to
 # <data dir>/banto/logs/brigade-<id>.log. Off by default. The file holds real

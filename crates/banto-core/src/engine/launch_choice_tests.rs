@@ -1119,7 +1119,7 @@ fn two_workers_with_different_words_are_each_resolved_and_both_said() {
                 model: word,
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
         asks += cmds
             .iter()
@@ -1164,7 +1164,7 @@ fn two_workers_with_different_words_are_each_resolved_and_both_said() {
             model: "terra",
             effort: "",
         },
-        None,
+        RoleLaunch::default(),
     );
     assert!(
         cmds.iter()
@@ -1502,7 +1502,7 @@ fn disbanding_one_brigade_leaves_another_brigades_held_creations_to_be_released(
                 model: "terra",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
     }
     assert_eq!(state.codex_opens_awaiting_catalog.len(), 2);
@@ -1542,12 +1542,26 @@ fn a_second_read_is_asked_for_when_the_first_brigades_creations_were_dropped_and
     state.member_order.insert(1, vec!["worker-1".to_string()]);
     state.member_order.insert(2, vec!["worker-1".to_string()]);
     let dir = std::path::Path::new("/w");
-    let first = open_worker(&mut state, 1, "worker-1", dir, choice(), None);
+    let first = open_worker(
+        &mut state,
+        1,
+        "worker-1",
+        dir,
+        choice(),
+        RoleLaunch::default(),
+    );
     assert_eq!(first, vec![Cmd::ReadCodexCatalog { round: 1 }]);
     update(&mut state, &mut app, &brigade, disbanded(1), now());
     // Brigade 1's answer is still on its way, and brigade 2 now finds nothing
     // held: it asks again rather than wait on a read that may be for nobody.
-    let second = open_worker(&mut state, 2, "worker-1", dir, choice(), None);
+    let second = open_worker(
+        &mut state,
+        2,
+        "worker-1",
+        dir,
+        choice(),
+        RoleLaunch::default(),
+    );
     assert_eq!(second, vec![Cmd::ReadCodexCatalog { round: 2 }]);
 
     let answer = |round| Event::CodexCatalogRead {
@@ -1896,7 +1910,7 @@ fn no_creation_is_held_or_requested_for_a_member_that_already_has_a_pane_under_a
                 model: "terra",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         );
         assert!(cmds.is_empty(), "{agent:?}: {cmds:?}");
     }
@@ -1923,7 +1937,7 @@ fn a_member_whose_creation_is_already_held_or_in_flight_is_not_created_again() {
                 model: "terra",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         )
     };
     // Held for the catalog: a second request for the same member adds nothing,
@@ -1959,7 +1973,7 @@ fn creations_requested_while_a_round_is_waiting_join_it_and_share_its_one_read()
                 model: "terra",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         ));
     }
     assert_eq!(reads, vec![Cmd::ReadCodexCatalog { round: 1 }]);
@@ -1987,7 +2001,7 @@ fn hold_one(state: &mut EmporiumState, brigade_id: BrigadeId) -> u64 {
             model: "terra",
             effort: "",
         },
-        None,
+        RoleLaunch::default(),
     );
     let [Cmd::ReadCodexCatalog { round }] = cmds[..] else {
         panic!("expected one read: {cmds:?}");
@@ -2425,7 +2439,7 @@ fn a_resume_that_fails_leaves_nothing_that_blocks_the_member_afterwards() {
             model: "opus",
             effort: "",
         },
-        None,
+        RoleLaunch::default(),
     );
     assert_eq!(opens_for(&created, "worker-1"), 1, "{created:?}");
 }
@@ -2524,7 +2538,7 @@ fn the_round_counter_wraps_past_the_end_without_landing_on_no_round() {
                 model: "terra",
                 effort: "",
             },
-            None,
+            RoleLaunch::default(),
         )
     };
     assert_eq!(
