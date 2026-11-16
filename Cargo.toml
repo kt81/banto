@@ -34,10 +34,18 @@ crossterm = { git = "https://github.com/kt81/crossterm", branch = "banto/0.29-em
 # (measured 2026-08-03 on Claude Code's status line: a ten-cell bar drawn as
 # eleven). Upstream doy/vt100-rust has been unmaintained since 2025-07 and
 # the fix has sat in its PR #32 since 2026-05. The pinned commit also fixes
-# an orphaned-wide-cell panic in Row::erase/resize; this fork exists
-# solely for those two. crates.io's newest publish, 0.16.9 (2026-07-20),
-# predates both, and the pinned commit never bumps its own version past
-# 0.16.9 — dropping this patch swaps in an unfixed build under the same
-# version number, silently. Fold back only once a published source
-# actually contains both fixes.
+# an orphaned-wide-cell panic in Row::erase/resize. The published
+# vt100-psmux carries both since 0.16.10, but moving to 0.16.13 was tried
+# and backed out on 2026-11-16. It counts thumbs-up with a skin tone
+# (U+1F44D U+1F3FD) and the flag U+1F1EF U+1F1F5 as one two-cell cluster
+# each. A pane's PTY stream captured on Windows that day moved the cursor
+# past each as if it took four cells, assuming the label after it was
+# meant to stay aligned, and the thumbs-up row was drawn with the spaces
+# after its emoji gone. This fork counts the thumbs-up as four cells and
+# the flag as two. Which layer, the agent or ConPTY, chose those moves is
+# not established. Fold back only once the published widths agree with
+# what panes send here. The pinned commit never bumps its own version past
+# 0.16.9, and the manifests require ^0.16.9, so dropping this patch alone
+# lets cargo resolve any published 0.16.x from 0.16.9 up, the unfixed
+# 0.16.9 among them, with nothing in the version number to tell them apart.
 vt100-psmux = { git = "https://github.com/kt81/psmux", branch = "banto/vt100-patches" }

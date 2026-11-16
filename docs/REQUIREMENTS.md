@@ -286,7 +286,8 @@ and the plan-implementation prompt ring too, not only an approval.
    *Why, measured:* the pinned vt100 panics on wrapped text in a one-row screen, in
    release builds too, and a one-row tile is reachable by shrinking the terminal to
    4 rows or stacking 6 Workers on a 24-row terminal. The published 0.16.13 no
-   longer has that panic; the fork stays pinned in this change.
+   longer has that panic, but moving to it was backed out for its emoji widths
+   ("Size floor"), so the fork stays pinned.
 8. **`shell` shows busy.** A live Claude session whose status is `shell` (the turn
    ended, a background command is still running) is displayed as busy in the session
    list and `banto list`, and through the list in the counts and marks, matching
@@ -1543,11 +1544,16 @@ one-row tile is reachable by shrinking the terminal to 4 rows or by stacking 6
 Workers on a 24-row terminal. *Where the pin lives:* `vt100` is `vt100-psmux`,
 pinned in the root `Cargo.toml` (`[patch.crates-io]`) to one commit of `kt81/psmux`,
 branch `banto/vt100-patches`, rev `3a8186e` (the two fixes it carries are explained
-in the comment beside the pin). *A fact for the future, not a plan:* the published
-crate 0.16.13 (2026-10-13) no longer has this one-row panic (read in its source and
-run in a throwaway crate: no panic for one row or more and one column or more, debug
-and release; zero rows or zero columns still panic in a debug build); the fork stays
-pinned.
+in the comment beside the pin). *A fact for the future:* the published crate 0.16.13
+(2026-10-13) no longer has this one-row panic (read in its source and run in a
+throwaway crate: no panic for one row or more and one column or more, debug and
+release; zero rows or zero columns still panic in a debug build). Moving to it was
+tried on 2026-11-16 and backed out: it counts one skin-toned emoji and one flag that
+were tested as a two-cell cluster each, while a pane's PTY stream captured on
+Windows that day moved the cursor past each as if it took four cells (assuming the
+label after it was meant to stay aligned), and the skin-toned row was drawn with the
+spaces after its emoji gone (the comment beside the pin has the code points and the
+rest). The fork stays pinned.
 
 **Is it idle? (the quit question).** Quitting ends every hosted process, but the
 operator quits when everything is idle and, with the old rule (ask whenever anything
