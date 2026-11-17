@@ -59,6 +59,7 @@ use banto_core::model::{
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::screen::{SPAWN_COLS, SPAWN_ROWS, Screen};
 use banto_core::status::AgeThresholds;
+use banto_io::claude_briefing::{self, BriefingPattern};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_activity;
 use banto_io::codex_catalog::{CodexCatalogSource, CodexCli};
@@ -1420,9 +1421,11 @@ fn execute_open_codex_trust_pane(
 ///
 /// `briefing` is the member's already-rendered role briefing
 /// (`--append-system-prompt`, see [`crate::briefing::render`]) — rendered by
-/// the caller because it needs a store read for the roster, verified against
-/// `claude` 2.1.219 to apply to a `--resume` exactly as it does to a fresh
-/// launch, which is what makes it reach a resumed Director at all.
+/// the caller because it needs a store read for the roster. Passing it does not
+/// by itself put it in front of a resumed session's model: Claude reuses the
+/// system prompt it recorded on the conversation's first request, so on a resume
+/// the caller adds `--system-prompt-snapshot off` when the recorded copy is not
+/// this text ([`resume_needs_snapshot_off`]).
 ///
 /// Pulled out of [`execute_open_embedded`] so this decision logic is
 /// unit-testable without spawning a real PTY; the returned launch's
@@ -1621,7 +1624,12 @@ fn execute_open_embedded(
             }];
         }
     }
-    let argv = launch.argv(&launch::agent_binary(target.agent, deps.agent_binaries));
+    let snapshot_off =
+        resume_needs_snapshot_off(deps, &target, brigade.as_ref(), briefing.as_deref());
+    let argv = launch.argv_with_snapshot_off(
+        &launch::agent_binary(target.agent, deps.agent_binaries),
+        snapshot_off,
+    );
     let env = brigade_env(brigade.as_ref(), deps.child);
     let discovery_since = SystemTime::now();
     let mut codex_log_scan = (target.agent == AgentKind::Codex && target.id.is_empty())
@@ -2826,9 +2834,7 @@ fn member_briefing(
     role: BrigadeRole,
 ) -> Option<String> {
     let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
-    let request = (role == BrigadeRole::Goinkyo)
-        .then(|| data_dir_of(deps).and_then(|dir| goinkyo_request_path(&dir, brigade_id)))
-        .flatten();
+    let request = briefing_request(deps, brigade_id, role);
     // Always the Claude form: a Codex member discards this string
     // (`build_open_launch`) and gets its briefing from the hook.
     crate::briefing::compose(
@@ -2839,6 +2845,65 @@ fn member_briefing(
         token,
         &peers,
         request.as_deref(),
+    )
+}
+
+/// What [`member_briefing`] would be compared against: the same briefing with
+/// `{peers}` left a hole. Everything but the roster comes from the same inputs
+/// as [`member_briefing`] — the one [`briefing_request`] and the same
+/// `crate::briefing::compose` underneath — so the two cannot drift apart.
+fn member_briefing_pattern(
+    deps: &Deps,
+    brigade_id: BrigadeId,
+    token: &str,
+    role: BrigadeRole,
+) -> Option<BriefingPattern> {
+    let request = briefing_request(deps, brigade_id, role);
+    crate::briefing::compose_pattern(deps.brigade, role, brigade_id, token, request.as_deref())
+}
+
+/// The consultation request path a Goinkyo's briefing names as `{request}`;
+/// `None` for the other roles, whose templates have none.
+fn briefing_request(deps: &Deps, brigade_id: BrigadeId, role: BrigadeRole) -> Option<String> {
+    (role == BrigadeRole::Goinkyo)
+        .then(|| data_dir_of(deps).and_then(|dir| goinkyo_request_path(&dir, brigade_id)))
+        .flatten()
+}
+
+/// Whether a launch needs `--system-prompt-snapshot off` to get its briefing to
+/// the model. Claude records the system prompt on a conversation's first request
+/// and reuses it on every request after, `--resume` included, so a resumed
+/// member's `--append-system-prompt` text is ignored unless the recorded copy
+/// already is that text — or the conversation has been compacted since, which
+/// makes the next default launch record afresh (`banto_io::claude_briefing` has
+/// the rule and the measurements). A creation records whatever it is given, so it
+/// never needs the flag; neither does a launch with no briefing, or Codex, whose
+/// briefing does not travel this way.
+///
+/// The transcript read lives here, at the edge, and is read-only. Every
+/// transcript that holds the session id is read, and one that cannot be found or
+/// read asks for the flag: not knowing is never taken for "nothing to deliver",
+/// and which copy Claude resumes from is unmeasured, so one needing the flag is
+/// enough.
+fn resume_needs_snapshot_off(
+    deps: &Deps,
+    target: &SessionToOpen,
+    brigade: Option<&(BrigadeId, MemberToken, BrigadeRole)>,
+    briefing: Option<&str>,
+) -> bool {
+    if target.agent != AgentKind::ClaudeCode || target.id.is_empty() || briefing.is_none() {
+        return false;
+    }
+    let Some((brigade_id, token, role)) = brigade else {
+        return false;
+    };
+    let Some(pattern) = member_briefing_pattern(deps, *brigade_id, token, *role) else {
+        return true;
+    };
+    claude_briefing::resume_needs_snapshot_off(
+        &deps.claude_home.projects_dir(),
+        &target.id,
+        &pattern,
     )
 }
 
@@ -13502,6 +13567,372 @@ mod tests {
                     assert_eq!(has("resume"), !created, "{agent:?} {id:?}: {argv:?}");
                 }
             }
+        }
+    }
+
+    // --- a resumed member's briefing against what Claude recorded ----------
+    //
+    // Claude reuses the system prompt it recorded on a conversation's first
+    // request, so a resumed member is passed `--system-prompt-snapshot off`
+    // exactly when its transcript does not already hold the briefing (the rule
+    // and its grounds: `banto_io::claude_briefing`). Everything here is
+    // synthetic: transcripts are made by hand in a temporary Claude home.
+
+    const SNAPSHOT_OFF: [&str; 2] = ["--system-prompt-snapshot", "off"];
+
+    /// A brigade in a store, a Claude home and a data directory that are all
+    /// temporary, so a launch writes nothing outside them.
+    struct BriefingRig {
+        fixture: SpawnFixture,
+        _claude_home: tempfile::TempDir,
+        data_dir: tempfile::TempDir,
+        brigade_id: BrigadeId,
+    }
+
+    impl BriefingRig {
+        fn new() -> Self {
+            let claude_home = tempfile::tempdir().unwrap();
+            let fixture = SpawnFixture::new(claude_home.path().to_path_buf());
+            let brigade_id = {
+                let mut store = fixture.store.borrow_mut();
+                let id = store.create_brigade("cell").unwrap();
+                for (token, role) in [
+                    ("director", BrigadeRole::Director),
+                    ("worker-1", BrigadeRole::Worker),
+                    ("goinkyo", BrigadeRole::Goinkyo),
+                ] {
+                    store.add_brigade_member(id, token, role, None).unwrap();
+                }
+                id
+            };
+            Self {
+                fixture,
+                _claude_home: claude_home,
+                data_dir: tempfile::tempdir().unwrap(),
+                brigade_id,
+            }
+        }
+
+        fn resolved(&self) -> crate::startup::Resolved {
+            crate::startup::Resolved {
+                config_file: crate::startup::ConfigFile::None,
+                db_path: None,
+                claude_home: None,
+                codex_home: None,
+                data_dir: Some(self.data_dir.path().to_path_buf()),
+            }
+        }
+
+        /// Records `lines` as session `id`'s transcript.
+        fn transcript(&self, id: &str, lines: &[String]) {
+            self.transcript_in("-work-alpha", id, lines);
+        }
+
+        /// The same, in the project folder `project`.
+        fn transcript_in(&self, project: &str, id: &str, lines: &[String]) {
+            let dir = self.fixture.claude_home.projects_dir().join(project);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut text = lines.join("\n");
+            text.push('\n');
+            std::fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+        }
+
+        /// The briefing the member would be launched with, now.
+        fn briefing(&self, token: &str, role: BrigadeRole) -> String {
+            let resolved = self.resolved();
+            let deps = Deps {
+                child: Some(&resolved),
+                ..self.fixture.deps()
+            };
+            member_briefing(&deps, self.brigade_id, token, role).unwrap()
+        }
+
+        /// The argv of the one pane opening `id` (empty: a creation) as
+        /// `token` launched with.
+        fn launch(
+            &self,
+            agent: AgentKind,
+            id: &str,
+            token: &str,
+            role: BrigadeRole,
+        ) -> Vec<String> {
+            let resolved = self.resolved();
+            let deps = Deps {
+                child: Some(&resolved),
+                ..self.fixture.deps()
+            };
+            let Cmd::OpenEmbedded {
+                key,
+                target,
+                model,
+                effort,
+                permission_mode,
+                disallowed_tools,
+                autocompact,
+                ..
+            } = open_embedded_cmd(agent, id, self.data_dir.path())
+            else {
+                unreachable!()
+            };
+            let events = execute_cmd(
+                Cmd::OpenEmbedded {
+                    key,
+                    target,
+                    brigade: Some((self.brigade_id, token.to_string(), role)),
+                    model,
+                    effort,
+                    permission_mode,
+                    disallowed_tools,
+                    autocompact,
+                },
+                &deps,
+                &mut HashMap::new(),
+                &mut Vec::new(),
+            );
+            assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+            self.fixture.launches().last().unwrap().argv.clone()
+        }
+    }
+
+    fn snapshot_line(last_section: &str) -> String {
+        serde_json::json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "prompt_snapshot",
+                "systemPrompt": ["Claude's own section.", last_section],
+            }
+        })
+        .to_string()
+    }
+
+    fn boundary_line() -> String {
+        serde_json::json!({"type": "system", "subtype": "compact_boundary"}).to_string()
+    }
+
+    fn has_snapshot_off(argv: &[String]) -> bool {
+        argv.windows(2).any(|pair| pair == SNAPSHOT_OFF)
+    }
+
+    const MEMBERS: [(&str, BrigadeRole); 3] = [
+        ("director", BrigadeRole::Director),
+        ("worker-1", BrigadeRole::Worker),
+        ("goinkyo", BrigadeRole::Goinkyo),
+    ];
+
+    #[test]
+    fn a_resumed_member_whose_transcript_holds_its_briefing_gets_no_flag() {
+        for (token, role) in MEMBERS {
+            let rig = BriefingRig::new();
+            let briefing = rig.briefing(token, role);
+            rig.transcript("sess-1", &[snapshot_line(&briefing)]);
+            let argv = rig.launch(AgentKind::ClaudeCode, "sess-1", token, role);
+            assert!(!has_snapshot_off(&argv), "{token}: {argv:?}");
+            // The text is still passed: the flag is about the recorded copy.
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "--append-system-prompt" && pair[1] == briefing),
+                "{token}: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_roster_that_changed_since_the_recording_is_not_a_different_briefing() {
+        let rig = BriefingRig::new();
+        let recorded = crate::briefing::compose(
+            &rig.fixture.brigade,
+            AgentKind::ClaudeCode,
+            BrigadeRole::Director,
+            rig.brigade_id,
+            "director",
+            &[
+                "worker-1".to_string(),
+                "worker-7".to_string(),
+                "worker-9".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_ne!(recorded, rig.briefing("director", BrigadeRole::Director));
+        rig.transcript("sess-1", &[snapshot_line(&recorded)]);
+        let argv = rig.launch(
+            AgentKind::ClaudeCode,
+            "sess-1",
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(!has_snapshot_off(&argv), "{argv:?}");
+    }
+
+    #[test]
+    fn a_resumed_member_whose_recorded_briefing_differs_is_launched_with_the_flag() {
+        for (token, role) in MEMBERS {
+            let rig = BriefingRig::new();
+            rig.transcript("sess-1", &[snapshot_line("an older briefing")]);
+            let argv = rig.launch(AgentKind::ClaudeCode, "sess-1", token, role);
+            let at = argv
+                .iter()
+                .position(|arg| arg == "--system-prompt-snapshot")
+                .unwrap_or_else(|| panic!("{token}: {argv:?}"));
+            assert_eq!(argv[at + 1], "off", "{token}");
+            // Right after the briefing it is about, before the brigade channel.
+            assert_eq!(argv[at - 2], "--append-system-prompt", "{token}: {argv:?}");
+            assert_eq!(argv[at + 2], "--mcp-config", "{token}: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_resumed_member_with_no_readable_record_is_launched_with_the_flag() {
+        // No transcript at all, one with no snapshot, and one that is not JSON.
+        let rig = BriefingRig::new();
+        let argv = rig.launch(
+            AgentKind::ClaudeCode,
+            "absent",
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(has_snapshot_off(&argv), "{argv:?}");
+        for (id, lines) in [
+            (
+                "no-snapshot",
+                vec![serde_json::json!({"type": "user"}).to_string()],
+            ),
+            ("garbled", vec!["this is not json".to_string()]),
+        ] {
+            rig.transcript(id, &lines);
+            let argv = rig.launch(AgentKind::ClaudeCode, id, "director", BrigadeRole::Director);
+            assert!(has_snapshot_off(&argv), "{id}: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_compaction_newer_than_the_recording_needs_no_flag() {
+        let rig = BriefingRig::new();
+        rig.transcript(
+            "sess-1",
+            &[snapshot_line("an older briefing"), boundary_line()],
+        );
+        let argv = rig.launch(
+            AgentKind::ClaudeCode,
+            "sess-1",
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(!has_snapshot_off(&argv), "{argv:?}");
+        // A recording made after the compaction is compared again.
+        rig.transcript(
+            "sess-2",
+            &[
+                boundary_line(),
+                snapshot_line("recorded after the compaction"),
+            ],
+        );
+        let argv = rig.launch(
+            AgentKind::ClaudeCode,
+            "sess-2",
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(has_snapshot_off(&argv), "{argv:?}");
+    }
+
+    #[test]
+    fn a_session_held_by_two_projects_gets_the_flag_if_either_copy_needs_it() {
+        // Which copy Claude resumes from is unmeasured, so neither is trusted:
+        // a newest-wins reading would skip the flag in the first case below.
+        for (older, newer) in [
+            ("an older briefing", "matching"),
+            ("matching", "an older briefing"),
+        ] {
+            let rig = BriefingRig::new();
+            let briefing = rig.briefing("director", BrigadeRole::Director);
+            let pick = |which: &str| {
+                if which == "matching" {
+                    briefing.clone()
+                } else {
+                    which.to_string()
+                }
+            };
+            rig.transcript_in("-work-alpha", "sess-1", &[snapshot_line(&pick(older))]);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            rig.transcript_in("-work-beta", "sess-1", &[snapshot_line(&pick(newer))]);
+            let argv = rig.launch(
+                AgentKind::ClaudeCode,
+                "sess-1",
+                "director",
+                BrigadeRole::Director,
+            );
+            assert!(
+                has_snapshot_off(&argv),
+                "{older:?} then {newer:?}: {argv:?}"
+            );
+        }
+        // Both copies holding the briefing is the one case that needs nothing.
+        let rig = BriefingRig::new();
+        let briefing = rig.briefing("director", BrigadeRole::Director);
+        rig.transcript_in("-work-alpha", "sess-1", &[snapshot_line(&briefing)]);
+        rig.transcript_in("-work-beta", "sess-1", &[snapshot_line(&briefing)]);
+        let argv = rig.launch(
+            AgentKind::ClaudeCode,
+            "sess-1",
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(!has_snapshot_off(&argv), "{argv:?}");
+    }
+
+    #[test]
+    fn a_creation_is_never_launched_with_the_flag() {
+        for (token, role) in MEMBERS {
+            let rig = BriefingRig::new();
+            let argv = rig.launch(AgentKind::ClaudeCode, "", token, role);
+            assert!(!has_snapshot_off(&argv), "{token}: {argv:?}");
+            assert!(
+                argv.contains(&"--append-system-prompt".to_string()),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_with_no_briefing_is_never_launched_with_the_flag() {
+        let mut rig = BriefingRig::new();
+        rig.fixture.brigade.director_prompt = String::new();
+        rig.fixture.brigade.goinkyo_consult = String::new();
+        let argv = rig.launch(
+            AgentKind::ClaudeCode,
+            "absent",
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(
+            !argv.contains(&"--append-system-prompt".to_string()),
+            "{argv:?}"
+        );
+        assert!(!has_snapshot_off(&argv), "{argv:?}");
+    }
+
+    #[test]
+    fn a_resumed_session_outside_a_brigade_is_never_launched_with_the_flag() {
+        let rig = BriefingRig::new();
+        let argv = launched_argv(open_embedded_cmd(
+            AgentKind::ClaudeCode,
+            "sess-1",
+            rig.data_dir.path(),
+        ));
+        assert!(!has_snapshot_off(&argv), "{argv:?}");
+    }
+
+    #[test]
+    fn a_codex_member_is_not_given_the_flag_whatever_its_transcript_says() {
+        for id in ["", "codex-session"] {
+            let rig = BriefingRig::new();
+            rig.transcript("codex-session", &[snapshot_line("an older briefing")]);
+            let argv = rig.launch(AgentKind::Codex, id, "director", BrigadeRole::Director);
+            assert!(
+                !argv.iter().any(|arg| arg.contains("snapshot")),
+                "{id:?}: {argv:?}"
+            );
         }
     }
 

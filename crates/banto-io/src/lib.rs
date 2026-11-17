@@ -27,6 +27,7 @@
 
 pub mod agent_versions;
 pub mod brigade_log;
+pub mod claude_briefing;
 pub mod claude_home;
 pub mod codex_activity;
 pub mod codex_briefing;

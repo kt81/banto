@@ -93,10 +93,12 @@ without stopping it, until you press Enter in its pane), and
 Director has given it — shown beside its token in the tile title, in
 `brigade_status` and in message headers; the token stays the address). Each member is also handed a role briefing naming its brigade, its
 token, and its peers — appended to the system prompt on launch for Claude
-Code, delivered by banto's own `SessionStart` hook for Codex, which has no
-`--append-system-prompt` of its own — without one a cell exists only in
-banto's data model and the operator's screen, and a Director handed three
-tool names and no context mostly never uses them; `brigade_status` answers
+Code (on a resume, with `--system-prompt-snapshot off` when the session's own
+record of its system prompt would otherwise be reused; that flag needs Claude
+Code 2.1.267 or later), delivered by banto's own `SessionStart` hook for Codex,
+which has no `--append-system-prompt` of its own — without one a cell exists
+only in banto's data model and the operator's screen, and a Director handed
+three tool names and no context mostly never uses them; `brigade_status` answers
 the follow-up question (who is on my team, what are they doing, is anyone
 holding my mail). A message's text is pulled, with per-member cursors and firewall
 framing (a relayed message is labeled as coming from another AI, never

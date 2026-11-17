@@ -11,6 +11,7 @@
 
 use banto_core::config::{BrigadeConfig, GoinkyoConsult};
 use banto_core::model::{AgentKind, BrigadeId, BrigadeRole};
+use banto_io::claude_briefing::{BriefingPattern, PEERS_HOLE};
 use banto_io::codex_briefing::BRIEFING_LAST_SENTENCE;
 use banto_io::store::Store;
 
@@ -254,6 +255,33 @@ pub(crate) fn compose(
     }
 }
 
+/// [`compose`] for a Claude member, as a pattern to compare a recorded briefing
+/// against: the same text, with `{peers}` left a hole instead of filled from a
+/// roster (`banto_io::claude_briefing`). Rendering through [`compose`] with a
+/// marker in place of the roster keeps this the one place the template, the
+/// consultation paragraph and the empty-template rule are applied.
+///
+/// `None` exactly when [`compose`] gives no briefing, so the two cannot
+/// disagree about whether there is one to compare.
+pub(crate) fn compose_pattern(
+    brigade: &BrigadeConfig,
+    role: BrigadeRole,
+    brigade_id: BrigadeId,
+    token: &str,
+    request: Option<&str>,
+) -> Option<BriefingPattern> {
+    compose(
+        brigade,
+        AgentKind::ClaudeCode,
+        role,
+        brigade_id,
+        token,
+        &[PEERS_HOLE.to_string()],
+        request,
+    )
+    .map(|marked| BriefingPattern::from_marked(&marked, peers_ends))
+}
+
 /// The members this one can address, newest roster from the store — the
 /// same [`BrigadeRole::can_reach`] rule [`crate::mcp::validate_target`]
 /// gates actual delivery with and `tool_brigade_status` groups its roster
@@ -274,6 +302,67 @@ pub(crate) fn peers_of(store: &Store, brigade_id: BrigadeId, role: BrigadeRole) 
         .filter(|member| role.can_reach(member.role))
         .map(|member| member.token)
         .collect()
+}
+
+/// What `{peers}` renders to when the member has no addressable peer yet.
+const NO_PEERS: &str = "none yet";
+
+/// What `{peers}` puts between two tokens.
+const PEERS_SEPARATOR: &str = ", ";
+
+/// The longest a `{peers}` text is looked at: a hundred Workers is about a
+/// kilobyte, so beyond this no real roster lives. A longer one reads as a
+/// changed briefing, which costs one redundant flag; what the cap buys is that
+/// matching a recorded copy never reads more than this per hole, whatever the
+/// transcript holds.
+const MAX_PEERS_LEN: usize = 4096;
+
+/// Whether `byte` may be in a member token: the characters banto's own tokens
+/// are made of (`director`, `goinkyo`, `worker-<n>`).
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+/// The byte length of every prefix of `text` that [`render`] can put where
+/// `{peers}` stands, ascending: "none yet", or one or more member tokens joined
+/// by [`PEERS_SEPARATOR`], a token being one or more of `[A-Za-z0-9_-]`. Looks
+/// no further than [`MAX_PEERS_LEN`], and in one pass.
+///
+/// It sits beside [`render`] because a recorded briefing's `{peers}` is compared
+/// against it ([`compose_pattern`]): a looser rule would let that comparison step
+/// over text the operator later deleted from the template (`worker-1.Never-merge`
+/// would pass for a roster), a tighter one would call a changed roster a changed
+/// briefing.
+pub(crate) fn peers_ends(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let limit = bytes.len().min(MAX_PEERS_LEN);
+    let mut ends = Vec::new();
+    let mut pos = 0;
+    loop {
+        let token_start = pos;
+        while pos < limit && is_token_byte(bytes[pos]) {
+            pos += 1;
+            // Every prefix that ends inside a token is a roster of its own.
+            ends.push(pos);
+        }
+        if pos == token_start || !text[pos..].starts_with(PEERS_SEPARATOR) {
+            break;
+        }
+        pos += PEERS_SEPARATOR.len();
+    }
+    // "none yet" begins with the token "none", so its end is past every end the
+    // tokens found: pushing it last keeps the list ascending.
+    if text.starts_with(NO_PEERS) {
+        ends.push(NO_PEERS.len());
+    }
+    ends
+}
+
+/// Whether the whole of `text` is something [`render`] can put where `{peers}`
+/// stands: [`peers_ends`] reaches its end.
+#[cfg(test)]
+pub(crate) fn is_peers_text(text: &str) -> bool {
+    peers_ends(text).last() == Some(&text.len())
 }
 
 /// Substitute `{brigade}` / `{token}` / `{peers}` — and, when `request` is
@@ -300,9 +389,9 @@ pub(crate) fn render(
     request: Option<&str>,
 ) -> String {
     let peers = if peers.is_empty() {
-        "none yet".to_string()
+        NO_PEERS.to_string()
     } else {
-        peers.join(", ")
+        peers.join(PEERS_SEPARATOR)
     };
     let rendered = template
         .replace("{brigade}", &brigade_id.to_string())
@@ -638,6 +727,253 @@ mod tests {
                 consult_paragraph(GoinkyoConsult::Design)
             )
         );
+    }
+
+    #[test]
+    fn the_pattern_matches_the_briefing_for_any_roster_and_nothing_that_differs_elsewhere() {
+        let config = config_with(
+            "You lead {brigade} as {token}: {peers}. Be brief.",
+            "design",
+        );
+        let pattern = compose_pattern(&config, BrigadeRole::Director, 7, "director", None).unwrap();
+        for peers in [
+            vec![],
+            vec!["worker-1".to_string()],
+            vec![
+                "worker-1".to_string(),
+                "worker-2".to_string(),
+                "goinkyo".to_string(),
+            ],
+        ] {
+            let real = compose(
+                &config,
+                AgentKind::ClaudeCode,
+                BrigadeRole::Director,
+                7,
+                "director",
+                &peers,
+                None,
+            )
+            .unwrap();
+            assert!(pattern.matches(&real), "{real}");
+        }
+        // The hole is only where `{peers}` is: another brigade, another token or
+        // another template is a different briefing.
+        let other_brigade = compose_director_for(&config, 8, "director");
+        assert!(!pattern.matches(&other_brigade));
+        let other_token = compose_director_for(&config, 7, "worker-1");
+        assert!(!pattern.matches(&other_token));
+        let changed = config_with(
+            "You lead {brigade} as {token}: {peers}. Be thorough.",
+            "design",
+        );
+        assert!(!pattern.matches(&compose_director_for(&changed, 7, "director")));
+        let other_level = config_with(
+            "You lead {brigade} as {token}: {peers}. Be brief.",
+            "decisions",
+        );
+        assert!(!pattern.matches(&compose_director_for(&other_level, 7, "director")));
+    }
+
+    #[test]
+    fn matching_a_recorded_briefing_stays_fast_whatever_the_transcript_holds() {
+        use banto_io::claude_briefing::PEERS_HOLE;
+        let token_run = "a".repeat(1 << 20);
+        let started = std::time::Instant::now();
+        // A template ending in the roster, against a megabyte with no end to it.
+        let tail = BriefingPattern::from_marked(&format!("Workers: {PEERS_HOLE}"), peers_ends);
+        assert!(!tail.matches(&format!("Workers: {token_run}")));
+        assert!(!tail.matches(&format!("Workers: {token_run}!")));
+        // Holes in a row, each able to end at every character of the run.
+        let rows = BriefingPattern::from_marked(&PEERS_HOLE.repeat(5), peers_ends);
+        assert!(!rows.matches(&format!("{token_run}!")));
+        assert!(!rows.matches(&token_run));
+        let rows = BriefingPattern::from_marked(&format!("{}!", PEERS_HOLE.repeat(5)), peers_ends);
+        assert!(!rows.matches(&format!("{}?", &token_run[..MAX_PEERS_LEN * 3])));
+        // A roster of any real size is still found among all that.
+        let roster = (1..=100)
+            .map(|n| format!("worker-{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(roster.len() < MAX_PEERS_LEN);
+        let ok = BriefingPattern::from_marked(&format!("A {PEERS_HOLE}. B"), peers_ends);
+        assert!(ok.matches(&format!("A {roster}. B")));
+        // A generous wall-clock bound: the work done was cubic or worse before.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn what_render_puts_where_peers_stands_is_always_a_peers_text() {
+        let tokens = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        for peers in [
+            tokens(&[]),
+            tokens(&["director"]),
+            tokens(&["worker-1", "worker-2", "goinkyo"]),
+            tokens(&["worker-10", "worker-2"]),
+        ] {
+            let rendered = render("{peers}", 1, "x", &peers, None);
+            assert!(is_peers_text(&rendered), "{rendered:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_roster_is_a_peers_text() {
+        for yes in [
+            "none yet",
+            "worker-1",
+            "worker-1, worker-2",
+            "Worker_3, a-b",
+        ] {
+            assert!(is_peers_text(yes), "{yes:?}");
+        }
+        for no in [
+            "",
+            "none yet.",
+            "worker-1 worker-2",
+            "a.b, c",
+            "[worker-1]",
+            "worker-1.",
+            "worker-1.Never-merge-without-asking",
+            "worker-1,worker-2",
+            "worker-1, ",
+            ", worker-1",
+            "worker-1,  worker-2",
+            "worker-1\nworker-2",
+            "worker-1. Never merge without asking me",
+            "worker-1, worker-2.\n\nThey are live agent sessions.",
+        ] {
+            assert!(!is_peers_text(no), "{no:?}");
+        }
+    }
+
+    /// The shipped Director template and consultation paragraph, with the
+    /// sentence after `{peers}` as the operator may have edited it.
+    fn shipped_director_pattern_and_briefing(recorded_extra: &str) -> (BriefingPattern, String) {
+        let config = BrigadeConfig::default();
+        let pattern = compose_pattern(&config, BrigadeRole::Director, 7, "director", None).unwrap();
+        let template = config.director_prompt.clone();
+        let (before, after) = template.split_once("{peers}").unwrap();
+        // What was recorded: the same template with a sentence of its own right
+        // after the roster, and a roster that is not today's.
+        let recorded_template = format!("{before}{{peers}}{recorded_extra}{after}");
+        let recorded = compose(
+            &BrigadeConfig {
+                director_prompt: recorded_template,
+                ..config
+            },
+            AgentKind::ClaudeCode,
+            BrigadeRole::Director,
+            7,
+            "director",
+            &["worker-1".to_string(), "worker-3".to_string()],
+            None,
+        )
+        .unwrap();
+        (pattern, recorded)
+    }
+
+    fn transcript_with_snapshot(dir: &std::path::Path, last_section: &str) -> std::path::PathBuf {
+        let line = serde_json::json!({
+            "type": "attachment",
+            "attachment": {"type": "prompt_snapshot", "systemPrompt": ["x", last_section]},
+        });
+        let path = dir.join("sess.jsonl");
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_shipped_director_briefing_recorded_for_another_roster_is_not_a_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pattern, recorded) = shipped_director_pattern_and_briefing("");
+        assert!(recorded.ends_with(consult_paragraph(GoinkyoConsult::Design)));
+        let path = transcript_with_snapshot(dir.path(), &recorded);
+        assert_eq!(
+            banto_io::claude_briefing::decide(Some(&path), &pattern),
+            banto_io::claude_briefing::Outcome::Matches
+        );
+    }
+
+    #[test]
+    fn a_sentence_the_operator_deleted_after_the_roster_is_a_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pattern, recorded) =
+            shipped_director_pattern_and_briefing(". Never merge without asking me");
+        assert!(recorded.contains("Never merge without asking me"));
+        let path = transcript_with_snapshot(dir.path(), &recorded);
+        assert_eq!(
+            banto_io::claude_briefing::decide(Some(&path), &pattern),
+            banto_io::claude_briefing::Outcome::Differs
+        );
+    }
+
+    #[test]
+    fn a_sentence_the_operator_added_after_the_roster_is_a_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrigadeConfig::default();
+        let (_, recorded) = shipped_director_pattern_and_briefing("");
+        config.director_prompt = config
+            .director_prompt
+            .replace("{peers}.", "{peers}. Never merge without asking me.");
+        let pattern = compose_pattern(&config, BrigadeRole::Director, 7, "director", None).unwrap();
+        let path = transcript_with_snapshot(dir.path(), &recorded);
+        assert_eq!(
+            banto_io::claude_briefing::decide(Some(&path), &pattern),
+            banto_io::claude_briefing::Outcome::Differs
+        );
+    }
+
+    fn compose_director_for(config: &BrigadeConfig, brigade: BrigadeId, token: &str) -> String {
+        compose(
+            config,
+            AgentKind::ClaudeCode,
+            BrigadeRole::Director,
+            brigade,
+            token,
+            &["worker-1".to_string()],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_template_without_peers_gives_an_exact_pattern_and_the_request_is_substituted() {
+        let config = BrigadeConfig {
+            goinkyo_prompt: "Consultation at {request} in {brigade}.".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let pattern = compose_pattern(
+            &config,
+            BrigadeRole::Goinkyo,
+            7,
+            "goinkyo",
+            Some("/tmp/7.txt"),
+        )
+        .unwrap();
+        assert!(pattern.matches("Consultation at /tmp/7.txt in 7."));
+        assert!(!pattern.matches("Consultation at /tmp/8.txt in 7."));
+    }
+
+    #[test]
+    fn the_pattern_exists_exactly_when_a_briefing_does() {
+        let empty = config_with("", "decisions");
+        assert!(compose_pattern(&empty, BrigadeRole::Director, 7, "director", None).is_none());
+        let config = BrigadeConfig::default();
+        for role in [
+            BrigadeRole::Director,
+            BrigadeRole::Worker,
+            BrigadeRole::Goinkyo,
+        ] {
+            assert_eq!(
+                compose_pattern(&config, role, 7, "x", None).is_some(),
+                compose(&config, AgentKind::ClaudeCode, role, 7, "x", &[], None).is_some(),
+                "{role:?}"
+            );
+        }
     }
 
     #[test]

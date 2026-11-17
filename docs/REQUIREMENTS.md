@@ -2598,7 +2598,88 @@ alone in the other two roles' templates the same way any unrecognized
 data model and the operator's own screen, and a Director handed three MCP
 tool names with no notion that it leads a cell mostly never uses them. Only
 how the rendered text reaches the member differs by product:
-- **Claude**: on the launch argv, `--append-system-prompt <rendered>`.
+- **Claude**: on the launch argv, `--append-system-prompt <rendered>` — and, on a
+  resume, `--system-prompt-snapshot off` when the session's own transcript says
+  the text would otherwise never be read.
+
+  **A resumed Claude member does not read the argv text on its own.** Claude Code
+  began recording the system prompt in 2.1.265, and `--system-prompt-snapshot`
+  exists from 2.1.267 (both from the changelog; the behaviour below was measured
+  on 2.1.326, print mode, synthetic sessions). banto therefore needs a Claude
+  Code of at least 2.1.267 for a resumed member: an older one would be expected
+  to reject the unknown flag and fail the launch loudly, which has **not been
+  verified** against an old binary. Claude records the system prompt on a
+  conversation's first request, as an `attachment` record whose
+  `attachment.type` is `prompt_snapshot` and whose `attachment.systemPrompt` is a
+  list of text sections, banto's appended briefing being the last one and
+  byte-equal to the argv text. Every later request reuses that recorded prompt,
+  `--resume` included, and **a resumed launch's own `--append-system-prompt` text
+  is ignored** — so a session that already had a turn before it was appointed
+  Director never got its briefing, and a changed template never reached a
+  resumed member. `--system-prompt-snapshot off` makes Claude render the prompt
+  on every request instead: the new text then reaches the model, and the cache
+  stays stable for as long as the text does not change. It does not re-record,
+  though, so the transcript keeps the old copy. After a compaction (a `system`
+  record with `subtype` `compact_boundary`) the next launch *without* the flag
+  records its own text afresh. Snapshots are written when a conversation is
+  created (before and after its first request) and on the first request after a
+  compaction; resumed turns wrote none. (An earlier version of this section, and
+  of the code, relied on a check against 2.1.219 that the text applies to a
+  `--resume` as to a fresh launch; for these sessions it does not.)
+
+  banto's rule, applied at each launch of a Claude brigade member (Director,
+  Worker, Goinkyo) that is passed a briefing
+  (`crates/banto-io/src/claude_briefing.rs`, called where
+  `crates/banto/src/embedded/emporium.rs` builds the launch):
+  - A creation never gets the flag: it records what it is given.
+  - A resume reads the session's own transcript, read-only
+    (`<claude home>/projects/<project>/<session id>.jsonl`; banto never writes
+    under the agent's home), from its end, in a bounded window (1 MiB, growing to
+    32 MiB; bytes after the last newline are ignored), and walks complete lines
+    backwards to the *first* of two records. Records of a subagent
+    (`isSidechain: true`) and of any other type are walked past. Four real
+    interactive transcripts (up to 127 MB) had the newest such record never more
+    than about 12 MB from the end; a session with none within the bound gets
+    the flag, which is redundant at worst. Every project folder holding the
+    session id is read, since which copy Claude resumes from is unmeasured, and
+    one that needs the flag is enough; no transcript at all needs it too.
+    - A `prompt_snapshot`: its last section against the briefing about to be
+      passed. Equal: launch as before. Different: add `--system-prompt-snapshot
+      off`. `{peers}` is a hole in that comparison that matches only what a
+      roster can render to — "none yet", or member tokens joined by `, `, a token
+      being one or more of `[A-Za-z0-9_-]`, the characters banto's own tokens
+      (`director`, `goinkyo`, `worker-<n>`) are made of — and the text around it
+      must match exactly. A changed roster alone must not cost the flag; but a
+      hole that took any text would also step over a sentence the operator has
+      since deleted from the template right after `{peers}`, leaving the member
+      on the rule it was meant to lose. The grammar lives beside `render` in
+      `crates/banto/src/briefing.rs`. A hole is looked at for at most 4096 bytes
+      and a comparison gives up after a fixed number of steps, so that a
+      transcript built to be slow to match cannot hold a launch; both read as "a
+      different briefing", which costs a redundant flag.
+    - A compact boundary (`type` `system` and `subtype` `compact_boundary`, both
+      exact): launch as before; the next default launch records its own text.
+    - Anything else gets the flag: the bound reached, a missing or unreadable
+      file, a line that does not parse, a snapshot of a shape this reader does
+      not know, or the start of the file with neither record. **Not finding a
+      snapshot is never read as "there is nothing to disagree with"**; only a
+      boundary newer than any snapshot proves that. An upstream rename of either
+      record therefore costs a redundant flag, never a member silently left on a
+      stale briefing.
+  - A launch with no briefing (an empty template), a session outside a brigade,
+    and Codex are not touched.
+
+  Because `off` never re-records, a member stays on `off` until its first
+  relaunch after its next compaction: each launch in between reads the same
+  transcript, so the answer changes only when the launch text does (a template
+  edited back to the recorded text needs the flag no longer). Two levers follow
+  for the operator:
+  compacting a session just before appointing it Director avoids the flag
+  entirely (the Director's first launch then records the briefing itself), and
+  `/compact` inside a member ends its `off` period. And a cost: while a member is
+  on `off`, a launch text that differs from the previous launch's (a roster change
+  at relaunch, an edited template) changes the rendered system prompt, which
+  rewrites the cached context once; launches with unchanged text do not.
 - **Codex has no equivalent flag.** Its briefing instead rides banto's own
   `SessionStart` hook: every Codex member's launch adds a `-c
   hooks.SessionStart=[...]` override naming `<banto executable> _hook` as

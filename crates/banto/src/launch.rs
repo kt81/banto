@@ -462,19 +462,38 @@ const NOTIFICATION_OVERRIDES: [&str; 3] = [
 ];
 
 impl AgentLaunch {
+    /// [`Self::argv_with_snapshot_off`] with the flag left off, the common case
+    /// in the tests. A real launch always has a say in
+    /// `--system-prompt-snapshot`, so it never goes through here.
+    #[cfg(test)]
+    pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
+        self.argv_with_snapshot_off(binary, false)
+    }
+
     /// Render as `binary`'s own argv (see [`agent_binary`] for resolving
     /// it). Claude's fixed order is the one every existing call site already
     /// agreed on before this type existed, `effort` slotted in right after
     /// `--model` since `claude --help` groups the two: `--resume`, or `--model`
     /// then `--effort`, then `--permission-mode`, `--disallowedTools`,
-    /// `--autocompact`, `--append-system-prompt`, `--mcp-config`. Codex's: the `resume <uuid>`
+    /// `--autocompact`, `--append-system-prompt` (then `--system-prompt-snapshot
+    /// off`, when asked for), `--mcp-config`. Codex's: the `resume <uuid>`
     /// subcommand (or nothing, for a fresh launch), then `-m`, then the
     /// notification `-c` overrides (always present — see
     /// [`NOTIFICATION_OVERRIDES`]), then `-c model_reasoning_effort` (a new
     /// session with an effort), then `-c model_auto_compact_token_limit` (a
     /// Worker's, create or resume), then brigade `-c` overrides (if any — see
     /// [`CodexBrigade::overrides`]), then `-C <cwd>` last, always present.
-    pub(crate) fn argv(&self, binary: &str) -> Vec<String> {
+    ///
+    /// With `snapshot_off` set and a Claude launch carrying a briefing, also
+    /// `--system-prompt-snapshot off`: Claude then renders the system prompt
+    /// on every request instead of reusing the one it recorded, which is how a
+    /// resumed member's `--append-system-prompt` text reaches the model
+    /// (`banto_io::claude_briefing` decides when that is needed). The flag only
+    /// means something beside a briefing, so it follows one; Codex has no such
+    /// flag and ignores the argument. A method rather than a field of
+    /// [`Self::Claude`] so the choice can be made after the launch is built, from
+    /// a transcript read the builder has no business doing.
+    pub(crate) fn argv_with_snapshot_off(&self, binary: &str, snapshot_off: bool) -> Vec<String> {
         let mut argv = vec![binary.to_string()];
         match self {
             AgentLaunch::Claude {
@@ -516,6 +535,10 @@ impl AgentLaunch {
                 if let Some(prompt) = append_system_prompt {
                     argv.push("--append-system-prompt".to_string());
                     argv.push(prompt.clone());
+                    if snapshot_off {
+                        argv.push("--system-prompt-snapshot".to_string());
+                        argv.push("off".to_string());
+                    }
                 }
                 if let Some(path) = mcp_config {
                     argv.push("--mcp-config".to_string());
@@ -1027,6 +1050,79 @@ mod tests {
             .map(str::to_string)
         );
         assert!(!argv.iter().any(|arg| arg == "--model" || arg == "--effort"));
+    }
+
+    #[test]
+    fn the_snapshot_off_flag_follows_the_briefing_and_precedes_the_brigade_channel() {
+        let launch = every_claude_flag(SessionStart::Resume("sess-1".to_string()));
+        assert_eq!(
+            launch.argv_with_snapshot_off("claude", true),
+            [
+                "claude",
+                "--resume",
+                "sess-1",
+                "--permission-mode",
+                "auto",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit",
+                "--append-system-prompt",
+                "you are the Director",
+                "--system-prompt-snapshot",
+                "off",
+                "--mcp-config",
+                "C:/data/banto/mcp/1-director.json",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn without_the_snapshot_off_request_the_argv_is_what_it_always_was() {
+        for start in [
+            SessionStart::Resume("sess-1".to_string()),
+            SessionStart::Create {
+                model: Some("opus".to_string()),
+                effort: Some("high".to_string()),
+            },
+        ] {
+            let launch = every_claude_flag(start);
+            assert_eq!(
+                launch.argv_with_snapshot_off("claude", false),
+                launch.argv("claude")
+            );
+            assert!(
+                !launch
+                    .argv("claude")
+                    .iter()
+                    .any(|arg| arg.contains("snapshot"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_snapshot_off_flag_is_only_ever_beside_a_briefing_and_only_on_claude() {
+        let no_briefing = AgentLaunch::Claude {
+            start: SessionStart::Resume("sess-1".to_string()),
+            permission_mode: None,
+            disallowed_tools: None,
+            autocompact: None,
+            append_system_prompt: None,
+            mcp_config: None,
+        };
+        assert_eq!(
+            no_briefing.argv_with_snapshot_off("claude", true),
+            ["claude", "--resume", "sess-1"].map(str::to_string)
+        );
+        let codex = AgentLaunch::Codex {
+            start: SessionStart::Resume("codex-uuid-1".to_string()),
+            cwd: PathBuf::from("/work/alpha"),
+            autocompact: None,
+            brigade: None,
+        };
+        assert_eq!(
+            codex.argv_with_snapshot_off("codex", true),
+            codex.argv("codex")
+        );
     }
 
     #[test]
