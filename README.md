@@ -362,9 +362,21 @@ message_log = false
 # repository rests on (committed code from `git show HEAD:<path>`, the working
 # tree only for files the Director asked it to edit or review) — that policy is
 # yours to set, which is why it is a setting. The default Director briefing also
-# says when to call request_decision; your own director_prompt is never touched.
+# says when to call request_decision; your own director_prompt does not get that.
 director_prompt = "..."
 worker_prompt = "..."
+# How readily a Director consults the Goinkyo on its own initiative, appended after
+# director_prompt (yours included): "off" (only when you ask) | "disputes" (a
+# disagreement it cannot settle) | "design" (also before a lasting change is shaped) |
+# "decisions" (also whenever it chooses between courses). At every level it also
+# consults when you ask. banto enforces none of them: each is an instruction in the
+# Director's briefing, off included, and consult_goinkyo works the same at every
+# level. "" appends nothing; with an empty director_prompt the setting does nothing.
+# banto reads this once at start, and a Claude Director gets it in its launch
+# arguments, so restart banto after editing. A Codex Director's hook re-reads the
+# file at each SessionStart, so it picks an edit up without a restart. A running
+# Director never sees a change: tell it in its pane.
+goinkyo_consult = "design"
 # A Director's request_decision also marks its row and rings, like a brigade going
 # quiet (read at start). false: the tag only.
 request_attention = true

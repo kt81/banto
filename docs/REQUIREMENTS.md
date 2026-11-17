@@ -2014,7 +2014,7 @@ in code, not a schema constraint" (same comment, verbatim).
 
 **A third role, Goinkyo, exists in `BrigadeRole` and the messaging rules
 below** — the retired elder called back in to arbitrate a Director/Worker
-disagreement, addressable by name but never a broadcast recipient (see
+disagreement or to think a design or a course through, addressable by name but never a broadcast recipient (see
 `send_to_peer` below). A Director calls one in with the `consult_goinkyo`
 MCP tool (see "MCP mediation server" below), which files a written
 consultation request and creates the member row; once a tick observes that
@@ -2402,6 +2402,7 @@ pub struct BrigadeConfig {
     pub relay: RelayMode,           // Auto | Manual, default Auto — see "Auto-relay" below
     pub request_attention: bool,    // a Director's decision request also marks and rings, like a quiet fire; default true, read at start; false = the tag only
     pub director_prompt: String,    // role briefing template for the Director
+    pub goinkyo_consult: String,    // how readily a Director consults the Goinkyo: "off" | "disputes" | "design" | "decisions"; default "design"; "" = no paragraph — see "Role briefings" below
     pub worker_prompt: String,      // role briefing template for each Worker
     pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
     pub goinkyo_model: String,      // --model for a NEW Goinkyo only; "" = no flag; default "fable"; Claude only
@@ -2629,11 +2630,19 @@ how the rendered text reaches the member differs by product:
     backwards. A `compacted` record or a `thread_rolled_back` event delivers: the
     history was rewritten after any copy behind it. A developer message holding
     the rendered briefing, character for character, as one `input_text` part
-    suppresses it: the hook prints `{}`. Every other record, a developer message
-    with other text and a record of a type banto has never seen included, is
-    walked past — the walk is the second line behind the `source` rule, and
-    treating an unfamiliar record as doubt would switch it off the day Codex
-    adds a kind.
+    suppresses it: the hook prints `{}`. A developer message that is a banto
+    briefing with other text — one containing the addendum's final sentence,
+    below — delivers: the briefing changed since,
+    for instance because the operator edited a template or `goinkyo_consult`,
+    and the older copy is not what the member should hold. A real change
+    therefore costs one extra copy in the history, which the addendum's last
+    sentence covers. Every other record, a developer message that is not a banto
+    briefing (another hook's context, a briefing from before banto ended its
+    text with that sentence) and a record of a type banto has never seen
+    included, is walked past — the walk is the second line behind the `source`
+    rule, and treating an unfamiliar record as doubt would switch it off the day
+    Codex adds a kind. This is why the sentence is the very last thing in every
+    Codex briefing: whatever banto appends goes before the addendum.
   - Everything else delivers: no or unreadable `transcript_path`, any I/O
     error, a complete line that is not JSON, a walk that ends without a
     decision (whether the window was capped or reached the start of the file).
@@ -2648,7 +2657,16 @@ how the rendered text reaches the member differs by product:
     9,900 ASCII characters stored whole, 10,500 stored as a preview of about
     10,100 characters with the pointer. Because the limit is in bytes, a Japanese
     template of about 3,500 characters is already over it; the shipped defaults
-    are well under.
+    are well under. The consultation paragraph a Director is given after its
+    template (`goinkyo_consult`, above) and the addendum count toward it, so a
+    custom template near the limit can be pushed over by text the operator did
+    not write. A spilled preview keeps the tail of the text and puts a
+    "Full hook output saved to:" line after it, so the addendum's sentence is near
+    its end, not at it; the walk looks for the sentence anywhere in a developer
+    message, so it recognises the preview as a banto briefing of some other text
+    and delivers (an older exact copy behind it must not suppress). That the
+    preview keeps the tail is from a synthetic reproduction, not re-measured on
+    a real Codex.
   - `briefed_at` is recorded on every firing that carries a `session_id` on its
     stdin, for a member whose brigade and token the environment gives and while
     the store opens — a withheld firing included. It says the hook fired for the
@@ -2667,10 +2685,76 @@ the brigade has gone quiet, so do not announce completion; when he alone can dec
 and work stops on it, write the question in your own output and then call
 `request_decision`, which shows him that you are waiting, not the question; use the
 agent's own question picker only when no Worker is running. These apply to the
-default prompt only: an operator's own `director_prompt` is not touched. That policy
+default prompt only: an operator's own `director_prompt` does not get them. That policy
 is intentionally a setting the operator can change, not a fixed behavior. (No
 placeholder was added for names: the template still substitutes only `{brigade}`,
 `{token}`, `{peers}` and, for a Goinkyo, `{request}`.)
+
+**How readily a Director consults the Goinkyo — `[brigade] goinkyo_consult`.**
+Four levels of how readily the Director consults the Goinkyo *on its own
+initiative*; at every level it also consults when the operator asks. A paragraph
+banto owns, not the template, tells it so. It is appended after the rendered
+`director_prompt` — the shipped one or the operator's own — so an operator who
+writes his own template still gets it. The values:
+  - `"off"`: do not call `consult_goinkyo` on your own initiative, only when the
+    operator asks. A consultation already open is finished and dismissed as usual.
+  - `"disputes"`: consult (kind `arbitration`) for a disagreement with a Worker
+    that one more exchange has not settled, contradictory reports no check can
+    decide between, or a choice the Director cannot make. Nothing else.
+  - `"design"` (the default): `disputes`, and also consult (kind `design`) before
+    the shape of a *lasting change* is settled — something later work will rest on
+    or the operator will live with, or a change in what existing behaviour is
+    meant to be. A shape the operator stated himself, one more of a kind that
+    already exists, a mechanical edit and a plain repair need none. When the
+    operator approved a shape without a consultation, it stands.
+  - `"decisions"`: `design`, and also consult (giving the courses weighed as
+    `alternatives`) whenever the Director itself chooses one course over another in
+    the work: which of several fixes, what to leave out, what to advise the
+    operator to do first. A choice about how it runs the brigade does not count.
+    At this level an approval does not stand in for a consultation.
+  - Every level also says to file an operator-requested consultation as
+    `arbitration` for a disagreement or an impasse and `design` otherwise, and to
+    tell the operator in one line when it goes against what the Goinkyo advised.
+
+**banto enforces none of them.** Every level, `off` included, is an instruction in
+the Director's briefing that moves how often it consults, not a guarantee: `off` is
+an instruction, not a lock, and `consult_goinkyo` works at `off` exactly as at
+any other level. A Director can consult at `off` and can fail to consult at
+`decisions`. The tool is never refused for this setting and `tools/list` is
+unchanged. The paragraph's wording is code, in one place
+(`crates/banto/src/briefing.rs`, each sentence written once and the levels are
+joins of them), which `crate::briefing::compose` calls for both products, so the
+Claude and Codex Directors cannot be told different things.
+
+How the value is read:
+  - It is read as written whatever its TOML type, so `goinkyo_consult = false`
+    does not fail the document (a discovered config that failed to parse falls
+    back to every default). Case and surrounding spaces do not matter.
+  - Anything that is not a level reads as `"design"`, and one line at startup
+    says so: `goinkyo_consult: ignored "<value>" (not off, disputes, design or
+    decisions) — using design`.
+  - `""` (or only spaces) is no paragraph at all, the file's usual empty-string
+    convention: the operator who wants none of banto's policy text writes it.
+  - The paragraph needs a template to follow. **With an empty `director_prompt`
+    the setting does nothing, `off` included**: a Claude Director then launches
+    with no briefing flag at all and a Codex Director gets only the addendum, so
+    `off` cannot be expressed without a briefing. Workers and the Goinkyo never get it.
+
+*When a change takes effect.* The UI reads the config once when banto starts, and
+a Claude Director gets the level in its launch argv, so after an edit **restart
+banto** and the Director is relaunched with it. A Codex Director's `banto _hook`
+re-reads the file at every firing (a fresh process each time), so its next
+`SessionStart` picks an edit up without a restart; a changed briefing is then
+delivered instead of withheld — see "Delivered once" above. A running Director
+never sees a change; the operator's immediate lever is to tell it in its pane, in
+one line. The invalid-value startup notice is shown only by the UI.
+
+*Size.* The paragraph counts toward Codex's spill limit above. Measured: `off` 479
+bytes, `disputes` 1,144, `design` 2,368, `decisions` 3,311. The shipped default
+template, the `decisions` paragraph and the addendum, with a full roster (eight
+Workers and a Goinkyo), come to 8,471 bytes, and a test keeps that under 9,900.
+A custom template near the limit can be pushed over by text the operator did not
+write.
 
 ## MCP mediation server
 
@@ -2877,7 +2961,9 @@ seven tools:
   happens to that row next). `about` names the Worker the disagreement is
   with, which makes `their_case` required too; omit both for an impasse with
   no specific Worker. Refuses if a Goinkyo already exists for the brigade —
-  only one consults at a time; `dismiss_goinkyo` ends the current one.
+  only one consults at a time; `dismiss_goinkyo` ends the current one. It is
+  never refused for the operator's `goinkyo_consult` setting: that is a briefing
+  instruction, not a gate (see "How readily a Director consults the Goinkyo").
 - `dismiss_goinkyo()` — Director-only: ends the brigade's active
   consultation by removing the Goinkyo's member row (see "Brigade" above for
   what that triggers). Refuses if no Goinkyo is currently part of the

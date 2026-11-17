@@ -192,7 +192,7 @@ pub struct BrigadeConfig {
     /// ([`Self::worker_autocompact_ignored`]). Kept as the text the operator
     /// wrote, as every other setting here is; [`Self::worker_autocompact`] is
     /// the one reader.
-    #[serde(deserialize_with = "autocompact_as_written")]
+    #[serde(deserialize_with = "as_written")]
     pub worker_autocompact: String,
     /// The model a Codex Worker launches with when its session is first
     /// created — the Codex sibling of [`Self::worker_model`], same
@@ -309,6 +309,26 @@ pub struct BrigadeConfig {
     /// (`Edit`/`Write`/`NotebookEdit`) — consistent with a role meant to be
     /// called holding nothing of its own, but a real cost, not a free one.
     pub goinkyo_disallowed_tools: String,
+    /// How readily a Director consults the Goinkyo on its own initiative:
+    /// `off`, `disputes`, `design` (built-in) or `decisions`, kept as the text
+    /// the operator wrote ([`Self::goinkyo_consult`] is the one reader). Written
+    /// to a Director as a paragraph after its `director_prompt`
+    /// (`crate::briefing` in the `banto` crate), on both products. At every
+    /// level the Director also consults when the operator asks.
+    ///
+    /// banto enforces none of them: each is an instruction in the briefing that
+    /// moves the rate, `off` included, and `consult_goinkyo` works at `off`
+    /// exactly as at any level. An empty string is the file's usual escape
+    /// hatch, no paragraph. So is an empty `director_prompt`, which leaves
+    /// nothing to append to: `off` cannot be expressed without a briefing. A
+    /// value that is none of the levels is read as the built-in, and only the UI
+    /// process reports it (at startup). The UI reads the config once at start; a
+    /// Claude Director carries the paragraph in its launch argv, so an edit needs
+    /// banto restarted and the Director relaunched. `banto _hook` re-reads the
+    /// file at every firing, so a Codex Director picks an edit up at its next
+    /// `SessionStart` without a restart. A running Director never sees a change.
+    #[serde(deserialize_with = "as_written")]
+    pub goinkyo_consult: String,
     /// Append every brigade message, in full, to a plain-text file under banto's
     /// own data directory (`banto_io::brigade_log`) — for someone developing
     /// banto who wants to audit what the agents told each other. Off by default:
@@ -460,8 +480,8 @@ the disagreement is not the evidence, the Worker's own words and the \
 code are. Where the two accounts differ, say which one the code \
 supports; where neither does, say that instead of picking a side.
 
-**Kind: design.** Nothing is built yet and the Director wants the shape \
-thought through first. Read what already exists around it — the \
+**Kind: design.** Nothing is built or committed to yet and the Director \
+wants the shape, or the course, thought through first. Read what already exists around it — the \
 constraints in the request are what the Director believes it is bound \
 by, and those are checkable. Say where the proposed shape breaks, what \
 it costs later that it does not cost now, and which of the discarded \
@@ -497,6 +517,7 @@ impl Default for BrigadeConfig {
             goinkyo_effort: "max".to_string(),
             goinkyo_permission_mode: "auto".to_string(),
             goinkyo_disallowed_tools: "Edit,Write,NotebookEdit".to_string(),
+            goinkyo_consult: "design".to_string(),
             message_log: false,
             request_attention: true,
         }
@@ -514,13 +535,15 @@ pub fn flag_value(raw: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-/// `[brigade] worker_autocompact` as the operator wrote it, whatever its TOML
-/// type: an integer becomes its digits, a string stays as it is, and anything
-/// else (a boolean, any float, a list, a table) becomes a word for what it was,
-/// which no reader accepts. A field that failed to deserialize would fail the
-/// whole document, and with it every other setting in `config.toml`; this
-/// field's own rule is "a bad value passes nothing", so it never gets to.
-fn autocompact_as_written<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// A `[brigade]` setting as the operator wrote it, whatever its TOML type: an
+/// integer becomes its digits, a string stays as it is, a boolean its word, and
+/// anything else (any float, a list, a table) a word for what it was, which no
+/// reader accepts. A field that failed to deserialize would fail the whole
+/// document, and with it every other setting in `config.toml` (the discovered
+/// path falls back to all defaults, an explicit `--config` refuses to start);
+/// `worker_autocompact` and `goinkyo_consult` each have the rule "a bad value
+/// is reported and does no harm", so neither gets to.
+fn as_written<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -575,6 +598,45 @@ where
 /// The window sizes `--autocompact` takes, in tokens, as the CLI's own help
 /// states them (`auto, or 100k–1M tokens`).
 const AUTOCOMPACT_TOKENS: std::ops::RangeInclusive<u64> = 100_000..=1_000_000;
+
+/// How readily a Director consults the Goinkyo, from never to whenever it
+/// chooses a course. See [`BrigadeConfig::goinkyo_consult`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoinkyoConsult {
+    /// Not on the Director's own initiative; the operator's request still is.
+    Off,
+    /// Only when the Director and a Worker disagree, or it is stuck.
+    Disputes,
+    /// Disputes, and before anything new is built. The built-in.
+    Design,
+    /// Design, and before the Director commits the brigade to a chosen course.
+    Decisions,
+}
+
+enum ConsultReading {
+    Level(GoinkyoConsult),
+    /// Nothing written: no paragraph, the tool allowed.
+    Empty,
+    /// Written, but not a level: read as the built-in, and reported.
+    Invalid,
+}
+
+/// The one rule for `goinkyo_consult`, used by every reader: the UI process,
+/// `banto _mcp` and `banto _hook` each load the config themselves and must not
+/// disagree about what a value means. Trimmed and case-insensitive, like
+/// `worker_autocompact`'s `auto`.
+fn consult_reading(raw: &str) -> ConsultReading {
+    let Some(text) = flag_value(raw) else {
+        return ConsultReading::Empty;
+    };
+    match text.to_ascii_lowercase().as_str() {
+        "off" => ConsultReading::Level(GoinkyoConsult::Off),
+        "disputes" => ConsultReading::Level(GoinkyoConsult::Disputes),
+        "design" => ConsultReading::Level(GoinkyoConsult::Design),
+        "decisions" => ConsultReading::Level(GoinkyoConsult::Decisions),
+        _ => ConsultReading::Invalid,
+    }
+}
 
 enum AutocompactReading {
     /// What goes after `--autocompact`.
@@ -678,6 +740,26 @@ impl BrigadeConfig {
         match autocompact_reading(&self.worker_autocompact) {
             AutocompactReading::Invalid => Some(self.worker_autocompact.trim()),
             AutocompactReading::Pass(_) | AutocompactReading::Empty => None,
+        }
+    }
+
+    /// The level [`Self::goinkyo_consult`] names, or `None` for the empty
+    /// string (no paragraph, the tool allowed). A value that is not a level
+    /// reads as the built-in `design`; [`Self::goinkyo_consult_ignored`] is how
+    /// the startup status line says so.
+    pub fn goinkyo_consult(&self) -> Option<GoinkyoConsult> {
+        match consult_reading(&self.goinkyo_consult) {
+            ConsultReading::Level(level) => Some(level),
+            ConsultReading::Empty => None,
+            ConsultReading::Invalid => Some(GoinkyoConsult::Design),
+        }
+    }
+
+    /// The setting as written when it is not empty and not a level.
+    pub fn goinkyo_consult_ignored(&self) -> Option<&str> {
+        match consult_reading(&self.goinkyo_consult) {
+            ConsultReading::Invalid => Some(self.goinkyo_consult.trim()),
+            ConsultReading::Level(_) | ConsultReading::Empty => None,
         }
     }
 
@@ -920,6 +1002,79 @@ mod tests {
                 codex,
                 "Codex, {written}"
             );
+        }
+    }
+
+    /// `[brigade] goinkyo_consult = <toml>` parsed.
+    fn consult_of(toml_value: &str) -> BrigadeConfig {
+        parse(&format!("[brigade]\ngoinkyo_consult = {toml_value}\n")).brigade
+    }
+
+    #[test]
+    fn goinkyo_consult_defaults_to_design() {
+        let brigade = BrigadeConfig::default();
+        assert_eq!(brigade.goinkyo_consult(), Some(GoinkyoConsult::Design));
+        assert_eq!(brigade.goinkyo_consult_ignored(), None);
+        assert_eq!(
+            parse("[brigade]\nworkers = 2\n").brigade.goinkyo_consult(),
+            Some(GoinkyoConsult::Design)
+        );
+    }
+
+    #[test]
+    fn goinkyo_consult_takes_each_level_by_name() {
+        for (written, level) in [
+            ("off", GoinkyoConsult::Off),
+            ("disputes", GoinkyoConsult::Disputes),
+            ("design", GoinkyoConsult::Design),
+            ("decisions", GoinkyoConsult::Decisions),
+            (" Decisions ", GoinkyoConsult::Decisions),
+            ("OFF", GoinkyoConsult::Off),
+        ] {
+            let brigade = consult_of(&format!("\"{written}\""));
+            assert_eq!(brigade.goinkyo_consult(), Some(level), "{written:?}");
+            assert_eq!(brigade.goinkyo_consult_ignored(), None, "{written:?}");
+        }
+    }
+
+    #[test]
+    fn goinkyo_consult_empty_is_no_policy_at_all() {
+        // The file's empty-string convention: the operator who writes his own
+        // `director_prompt` keeps the policy text, and the tool stays allowed.
+        for written in ["\"\"", "\"  \""] {
+            let brigade = consult_of(written);
+            assert_eq!(brigade.goinkyo_consult(), None, "{written}");
+            assert_eq!(brigade.goinkyo_consult_ignored(), None, "{written}");
+        }
+    }
+
+    #[test]
+    fn goinkyo_consult_that_is_not_a_level_falls_back_to_design_and_is_reported() {
+        // Any TOML type: a value of the wrong type must not fail the document,
+        // or the discovered-path load would fall back to ALL defaults.
+        for (written, shown) in [
+            ("\"sometimes\"", "sometimes"),
+            ("false", "false"),
+            ("true", "true"),
+            ("3", "3"),
+            ("1.5", "a float"),
+            ("[\"off\"]", "a list"),
+            ("{ level = \"off\" }", "a table"),
+        ] {
+            let config = parse(&format!(
+                "[brigade]\nworker_model = \"haiku\"\ngoinkyo_consult = {written}\n"
+            ));
+            assert_eq!(
+                config.brigade.goinkyo_consult(),
+                Some(GoinkyoConsult::Design),
+                "{written}"
+            );
+            assert_eq!(
+                config.brigade.goinkyo_consult_ignored(),
+                Some(shown),
+                "{written}"
+            );
+            assert_eq!(config.brigade.worker_model, "haiku", "{written}");
         }
     }
 

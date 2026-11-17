@@ -15,6 +15,12 @@
 //! The proof is the rollout itself, read read-only (invariant 1 is about
 //! writes): the most recent record that says anything about the briefing must
 //! be a copy of this exact text. Everything else is doubt, and doubt delivers.
+//! "Says anything about the briefing" includes a *different* banto briefing: a
+//! setting set from design to decisions and back leaves the history ending
+//! `[design, decisions]`, and the exact copy behind the later one would
+//! otherwise suppress the firing and leave the member believing decisions. So
+//! the later copy ends the walk with a delivery. A real change costs one extra
+//! copy in the history, which the next compaction clears.
 //!
 //! - `source` other than `resume` (`startup`, `compact`, `clear`, `fork`,
 //!   missing, unknown): deliver, reading nothing. A resume is the only firing
@@ -23,8 +29,12 @@
 //!   line or a `thread_rolled_back` event means the history was rewritten
 //!   after any copy behind it: deliver. A developer message holding the
 //!   rendered text as one `input_text` part: suppress. A developer message
-//!   with other text, and every other record, is not about this question:
-//!   keep walking.
+//!   that contains [`BRIEFING_LAST_SENTENCE`] is a banto briefing of some other
+//!   text: deliver. That includes a spilled preview, which has the sentence
+//!   near its end with a pointer line after it. A developer message without it
+//!   (another hook's context, a banto briefing written before the sentence
+//!   existed) and every other record are not about this question: keep
+//!   walking.
 //! - Records of an unknown type are skipped on purpose. This walk is the
 //!   second line behind the `source` rule; treating an unfamiliar record as
 //!   doubt would switch the whole mechanism off the day Codex adds a record
@@ -43,7 +53,9 @@
 //! preview of about 10,100 characters with the pointer. The limit is in bytes,
 //! so a Japanese template of about 3,500 characters is already over it. The
 //! shipped defaults are well under (a measured Worker briefing was 4,956
-//! characters).
+//! characters). The preview still holds the briefing's last sentence, so a
+//! history ending in one delivers instead of being walked past (a synthetic
+//! shape, not re-measured on a real Codex).
 //!
 //! The decision itself ([`scan_tail`]) is a pure function of bytes; only
 //! [`verdict`] touches the file. It lives here, beside the other rollout
@@ -69,6 +81,13 @@ const START_WINDOW: u64 = 1 << 20;
 /// one extra copy, which the next compaction clears, rather than an unbounded
 /// read in the operator's own startup.
 const MAX_WINDOW: u64 = 32 << 20;
+
+/// The sentence every Codex briefing ends with (`banto::briefing` appends it
+/// last). It is how this walk tells a banto briefing, even a spilled preview of
+/// one, from any other developer message: a briefing whose text differs from the current one is a copy the
+/// member must not be left believing, so it delivers. Defined here and used by
+/// the renderer so the two cannot drift apart.
+pub const BRIEFING_LAST_SENTENCE: &str = "If this conversation holds more than one banto briefing, the most recent one is current and replaces the earlier ones.";
 
 /// What the hook should do with the briefing it rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,13 +235,27 @@ fn judge_payload(briefing: &str, record: &Value) -> Option<Scan> {
                 && payload.get("role").and_then(Value::as_str) == Some("developer") =>
         {
             let parts = payload.get("content").and_then(Value::as_array)?;
-            parts
+            let texts: Vec<&str> = parts
                 .iter()
-                .any(|part| {
-                    part.get("type").and_then(Value::as_str) == Some("input_text")
-                        && part.get("text").and_then(Value::as_str) == Some(briefing)
-                })
-                .then_some(Scan::Suppress)
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            if texts.contains(&briefing) {
+                Some(Scan::Suppress)
+            } else if texts
+                .iter()
+                .any(|text| text.contains(BRIEFING_LAST_SENTENCE))
+            {
+                // A banto briefing, but not this text: what the member holds
+                // last is out of date (a setting or a roster changed since),
+                // and an exact copy further back proves nothing about it.
+                // Contained, not ended with: Codex stores a briefing over the
+                // spill limit as a preview that keeps the tail and then adds a
+                // "Full hook output saved to:" line after it.
+                Some(Scan::Deliver)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -311,8 +344,12 @@ mod tests {
     }
 
     fn on_resume(lines: &[String]) -> Verdict {
+        verdict_over(lines, BRIEFING)
+    }
+
+    fn verdict_over(lines: &[String], briefing: &str) -> Verdict {
         let (_dir, path) = rollout(lines, false);
-        verdict(Some("resume"), Some(&path), BRIEFING)
+        verdict(Some("resume"), Some(&path), briefing)
     }
 
     #[test]
@@ -359,15 +396,133 @@ mod tests {
         );
     }
 
+    /// A briefing as banto's Codex path renders it: ends with the sentence.
+    fn banto_text(body: &str) -> String {
+        format!("{body}\n\n{BRIEFING_LAST_SENTENCE}")
+    }
+
     #[test]
-    fn the_current_text_behind_a_later_different_copy_is_suppressed() {
+    fn a_later_banto_briefing_with_other_text_delivers() {
+        // A setting changed between two firings: the history ends with the
+        // old text, and the member must be told the new one.
+        let current = banto_text("level: design");
         assert_eq!(
-            on_resume(&[
-                copy(BRIEFING),
-                copy("a briefing from some other member"),
-                user_message()
-            ]),
+            verdict_over(
+                &[copy(&current), copy(&banto_text("level: decisions"))],
+                &current
+            ),
+            Verdict::Deliver
+        );
+        // And back again: the text equal to the current one is behind the
+        // other, which is exactly why it proves nothing.
+        assert_eq!(
+            verdict_over(
+                &[
+                    copy(&current),
+                    copy(&banto_text("level: decisions")),
+                    user_message()
+                ],
+                &current
+            ),
+            Verdict::Deliver
+        );
+        // The same text again at the end is the live one.
+        assert_eq!(
+            verdict_over(
+                &[
+                    copy(&current),
+                    copy(&banto_text("level: decisions")),
+                    copy(&current)
+                ],
+                &current
+            ),
             Verdict::Suppress
+        );
+    }
+
+    #[test]
+    fn a_level_changed_and_changed_back_delivers_the_original_again() {
+        // The shape an operator's two edits leave: the history holds off, then
+        // design, and the firing now renders off. The first copy is the same
+        // text, but the last banto briefing is design, so it proves nothing.
+        let off = banto_text("level: off");
+        assert_eq!(
+            verdict_over(
+                &[
+                    copy(&off),
+                    copy(&banto_text("level: design")),
+                    user_message()
+                ],
+                &off
+            ),
+            Verdict::Deliver
+        );
+    }
+
+    #[test]
+    fn a_trailing_newline_after_the_sentence_still_marks_a_banto_briefing() {
+        let current = banto_text("level: design");
+        let other = format!("{}\n \r\n", banto_text("level: off"));
+        assert_eq!(
+            verdict_over(&[copy(&current), copy(&other)], &current),
+            Verdict::Deliver
+        );
+    }
+
+    #[test]
+    fn a_developer_message_that_is_not_a_banto_briefing_is_walked_past() {
+        let current = banto_text("level: design");
+        // Another hook's context.
+        assert_eq!(
+            verdict_over(
+                &[
+                    copy(&current),
+                    copy("context from some other hook"),
+                    user_message()
+                ],
+                &current
+            ),
+            Verdict::Suppress
+        );
+        // A banto briefing from before the sentence existed: nothing marks it.
+        assert_eq!(
+            verdict_over(
+                &[
+                    copy(&current),
+                    copy("You are worker-1 in brigade 7. Old wording."),
+                    user_message()
+                ],
+                &current
+            ),
+            Verdict::Suppress
+        );
+    }
+
+    #[test]
+    fn a_spilled_preview_of_a_banto_briefing_delivers() {
+        // Codex keeps the tail of a hook context over its limit, warns above it
+        // and points to the full text below it, so the sentence is near the end
+        // but not at it. The history ends with that preview, so the exact copy
+        // behind it is not what the member holds.
+        let current = banto_text("level: design");
+        let preview = format!(
+            "Warning: truncated output (original token count: 3000)
+
+...{}
+
+             Full hook output saved to: /tmp/hook-output-1.txt",
+            banto_text("level: decisions")
+        );
+        assert_eq!(
+            verdict_over(&[copy(&current), copy(&preview)], &current),
+            Verdict::Deliver
+        );
+        // The sentence anywhere in a message is enough; a message without it is
+        // still walked past.
+        let quoting = format!("{BRIEFING_LAST_SENTENCE} A quotation, then more text.");
+        assert_eq!(
+            verdict_over(&[copy(&current), copy(&quoting)], &current),
+            Verdict::Deliver
         );
     }
 

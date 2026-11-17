@@ -54,7 +54,7 @@ use std::time::SystemTime;
 use serde_json::{Value, json};
 
 use banto_core::config::Config;
-use banto_core::model::{BrigadeId, BrigadeRole, SessionId};
+use banto_core::model::{AgentKind, BrigadeId, BrigadeRole, SessionId};
 use banto_io::codex_briefing::{self, Verdict};
 use banto_io::store::Store;
 
@@ -94,7 +94,7 @@ fn session_id_from_stdin(stdin: &Value) -> Option<SessionId> {
 /// `member_briefing` (the Claude launch path, where an empty role template
 /// means "no `--append-system-prompt` flag at all"), an empty template here
 /// still yields `Some` — every caller of `banto _hook` is a Codex member (see
-/// this module's doc), and `crate::briefing::with_codex_addendum` appends the
+/// this module's doc), and `crate::briefing::compose` appends the
 /// Codex-only facts regardless of whether the operator gave this role a
 /// template, so the empty-template escape hatch only ever suppresses the
 /// role-specific sentence, never the addendum.
@@ -107,12 +107,18 @@ fn build_briefing(
     let token = identity.token.as_deref()?;
     let role = identity.role?;
     let store = store?;
-    let template = config.brigade.prompt_for(role).unwrap_or("");
     let peers = crate::briefing::peers_of(store, brigade_id, role);
-    // `None`: a Goinkyo is Claude-only, so this hook — Codex's own
+    // No request path: a Goinkyo is Claude-only, so this hook — Codex's own
     // SessionStart briefing path — never renders one.
-    let rendered = crate::briefing::render(template, brigade_id, token, &peers, None);
-    Some(crate::briefing::with_codex_addendum(&rendered, role))
+    crate::briefing::compose(
+        &config.brigade,
+        AgentKind::Codex,
+        role,
+        brigade_id,
+        token,
+        &peers,
+        None,
+    )
 }
 
 /// Resolves banto's own config and database, always leniently — see the module
@@ -468,6 +474,56 @@ mod tests {
                 &format!("I am worker-1 in {brigade_id}, peers: director"),
                 BrigadeRole::Worker,
             ))
+        );
+    }
+
+    #[test]
+    fn a_codex_director_briefing_carries_the_consultation_level_before_the_addendum() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "director", BrigadeRole::Director, None)
+            .unwrap();
+        let identity = HookIdentity {
+            brigade_id: Some(brigade_id),
+            token: Some("director".to_string()),
+            role: Some(BrigadeRole::Director),
+        };
+        let mut config = brigade_config("I lead {brigade}");
+        config.brigade.goinkyo_consult = "disputes".to_string();
+
+        let briefing = build_briefing(&identity, &config, Some(&store)).unwrap();
+        let paragraph =
+            crate::briefing::consult_paragraph(banto_core::config::GoinkyoConsult::Disputes);
+        assert!(
+            briefing.starts_with(&format!("I lead {brigade_id}\n\n{paragraph}\n\n")),
+            "{briefing}"
+        );
+        assert!(briefing.ends_with(codex_briefing::BRIEFING_LAST_SENTENCE));
+
+        // The same level on the same config, as the Claude launch path renders it.
+        let claude = crate::briefing::compose(
+            &config.brigade,
+            AgentKind::ClaudeCode,
+            BrigadeRole::Director,
+            brigade_id,
+            "director",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(claude, format!("I lead {brigade_id}\n\n{paragraph}"));
+
+        // A Worker in the same cell is never given it.
+        let worker = HookIdentity {
+            brigade_id: Some(brigade_id),
+            token: Some("worker-1".to_string()),
+            role: Some(BrigadeRole::Worker),
+        };
+        assert!(
+            !build_briefing(&worker, &config, Some(&store))
+                .unwrap()
+                .contains("When to consult the Goinkyo")
         );
     }
 

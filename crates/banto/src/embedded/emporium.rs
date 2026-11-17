@@ -2810,18 +2810,21 @@ fn member_briefing(
     token: &str,
     role: BrigadeRole,
 ) -> Option<String> {
-    let template = deps.brigade.prompt_for(role)?;
     let peers = crate::briefing::peers_of(&deps.store.borrow(), brigade_id, role);
     let request = (role == BrigadeRole::Goinkyo)
         .then(|| data_dir_of(deps).and_then(|dir| goinkyo_request_path(&dir, brigade_id)))
         .flatten();
-    Some(crate::briefing::render(
-        template,
+    // Always the Claude form: a Codex member discards this string
+    // (`build_open_launch`) and gets its briefing from the hook.
+    crate::briefing::compose(
+        deps.brigade,
+        AgentKind::ClaudeCode,
+        role,
         brigade_id,
         token,
         &peers,
         request.as_deref(),
-    ))
+    )
 }
 
 /// The data directory this emporium works in: the one it resolved at startup
@@ -11701,7 +11704,13 @@ mod tests {
                 "director",
                 BrigadeRole::Director
             ),
-            Some("I am director; my team is worker-1, worker-2".to_string())
+            Some(format!(
+                "I am director; my team is worker-1, worker-2
+
+{}",
+                crate::briefing::consult_paragraph(banto_core::config::GoinkyoConsult::Design)
+            )),
+            "a Director's template is followed by the operator's consultation level"
         );
         assert_eq!(
             member_briefing(&deps(&config), brigade_id, "worker-1", BrigadeRole::Worker),
@@ -11745,6 +11754,8 @@ mod tests {
             // role `render` was not given a request path for.
             director_prompt: "director sees: {request}".to_string(),
             goinkyo_prompt: "read {request} first".to_string(),
+            // No level paragraph, so the Director's text is exactly its template.
+            goinkyo_consult: String::new(),
             ..BrigadeConfig::default()
         };
         let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));

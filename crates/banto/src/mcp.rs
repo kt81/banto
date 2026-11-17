@@ -282,8 +282,8 @@ fn tools_list_result() -> Value {
                 "name": "consult_goinkyo",
                 "description": "Director only. Summon the Goinkyo — banto's retired elder, \
                                 called back in either to arbitrate (a Director/Worker \
-                                disagreement, or an impasse) or to think through an initial \
-                                design with you — by filing a written consultation request; \
+                                disagreement, or an impasse) or to think through a design, or \
+                                a course you are choosing, with you — by filing a written consultation request; \
                                 it reads this once it starts. `kind` says which, and the two \
                                 ask different things of you. send_to_peer(to: \"goinkyo\") \
                                 reaches it directly from then on, for as long as the \
@@ -343,18 +343,20 @@ fn tools_list_result() -> Value {
                             "description": "What you are asking for. \"arbitration\": there is \
                                             a disagreement or an impasse, you want it judged, \
                                             and it is over once you have the answer. \
-                                            \"design\": you are working out an initial design \
-                                            and want it thought through before it is built. \
-                                            One of these is expected to be short and the other \
-                                            to last as long as the design is being settled — \
-                                            which is why you say which it is. \
+                                            \"design\": you are working out a design, or choosing \
+                                            a course, and want it thought through before \
+                                            it is built or committed to. \
+                                            An arbitration, and a design consultation about \
+                                            a choice of course, are over once answered; one \
+                                            about a shape lasts until the design is settled \
+                                            — which is why you say which it is. \
                                             `about`/`their_case` belong to arbitration and are \
                                             refused here; `alternatives` is required instead."
                         },
                         "alternatives": {
                             "type": "string",
-                            "description": "Design only, and required. What other shapes you \
-                                            considered and why you set each aside. If you only \
+                            "description": "Design only, and required. What other shapes or \
+                                            courses you considered and why you set each aside. If you only \
                                             ever saw one shape, say exactly that — a design \
                                             with no discarded alternative is a fact about the \
                                             design, and one the Goinkyo should be told rather \
@@ -978,7 +980,7 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
     if kind != "arbitration" && kind != "design" {
         return tool_error(
             "`kind` must be \"arbitration\" (a disagreement or an impasse, judged and then \
-             over) or \"design\" (an initial design thought through before it is built).",
+             over) or \"design\" (a design or a course thought through before it is built or committed to).",
         );
     }
     let question = match require_string_arg(msg, "question") {
@@ -1027,8 +1029,8 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         }
         if alternatives.is_none() {
             return tool_error(
-                "`alternatives` is required for a design consultation: what other shapes you \
-                 considered and why you set each aside. If you only ever saw one shape, say \
+                "`alternatives` is required for a design consultation: what other shapes or \
+                 courses you considered and why you set each aside. If you only ever saw one shape, say \
                  exactly that.",
             );
         }

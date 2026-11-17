@@ -85,12 +85,12 @@ pub fn agents_ignored_notice(resolved: &ResolvedAgents) -> Option<String> {
     })
 }
 
-/// How much of a rejected `worker_autocompact` the notice quotes. Enough to
-/// recognise a typo, few enough that a pasted blob cannot push the rule far off
-/// the line. Capped, the rule in parentheses can still be clipped on a narrow
+/// How much of a rejected `worker_autocompact` or `goinkyo_consult` the notice
+/// quotes. Enough to recognise a typo, few enough that a pasted blob cannot push
+/// the rule far off the line. Capped, the rule in parentheses can still be clipped on a narrow
 /// terminal; that is accepted because "ignored" and the start of the value come
 /// first.
-const AUTOCOMPACT_SHOWN_CHARS: usize = 24;
+const SHOWN_CHARS: usize = 24;
 
 /// The startup notice for `[brigade] worker_autocompact`, when it is set to
 /// something neither product takes, so Workers launch without it. `None` for a
@@ -103,14 +103,32 @@ const AUTOCOMPACT_SHOWN_CHARS: usize = 24;
 /// The value is quoted with `{:?}`, so a newline, a tab or an escape sequence
 /// in it shows as text instead of breaking the one-line status it is drawn on.
 pub fn autocompact_ignored_notice(brigade: &BrigadeConfig) -> Option<String> {
-    let written = brigade.worker_autocompact_ignored()?;
-    let mut shown: String = written.chars().take(AUTOCOMPACT_SHOWN_CHARS).collect();
-    if written.chars().count() > AUTOCOMPACT_SHOWN_CHARS {
-        shown.push('\u{2026}');
-    }
+    let shown = shown_value(brigade.worker_autocompact_ignored()?);
     Some(format!(
         "worker_autocompact: ignored {shown:?} (not auto or 100000-1000000)"
     ))
+}
+
+/// The startup notice for `[brigade] goinkyo_consult`, when it is set to
+/// something that is not a level. The Director is then briefed at the default
+/// level, which is not what an operator who mistyped `"decision"` meant to
+/// pick, and without the notice the typo is silent. `None` for a level and for
+/// the empty string, which is the policy text turned off on purpose.
+pub fn goinkyo_consult_ignored_notice(brigade: &BrigadeConfig) -> Option<String> {
+    let shown = shown_value(brigade.goinkyo_consult_ignored()?);
+    Some(format!(
+        "goinkyo_consult: ignored {shown:?} (not off, disputes, design or decisions) \u{2014} using design"
+    ))
+}
+
+/// A rejected setting as a notice quotes it: capped, with an ellipsis when cut.
+/// The caller formats it with `{:?}`, so control characters show as text.
+fn shown_value(written: &str) -> String {
+    let mut shown: String = written.chars().take(SHOWN_CHARS).collect();
+    if written.chars().count() > SHOWN_CHARS {
+        shown.push('\u{2026}');
+    }
+    shown
 }
 
 /// Every notice the status line carries at startup, in the order it carries
@@ -127,6 +145,7 @@ pub fn startup_notices(
         trust_notice,
         agents_ignored_notice(resolved_agents),
         autocompact_ignored_notice(brigade),
+        goinkyo_consult_ignored_notice(brigade),
     ]
     .into_iter()
     .flatten()
@@ -753,14 +772,11 @@ mod tests {
         assert!(
             notice.starts_with(&format!(
                 "worker_autocompact: ignored \"{}\u{2026}\"",
-                "x".repeat(AUTOCOMPACT_SHOWN_CHARS)
+                "x".repeat(SHOWN_CHARS)
             )),
             "{notice}"
         );
-        assert!(
-            !notice.contains(&"x".repeat(AUTOCOMPACT_SHOWN_CHARS + 1)),
-            "{notice}"
-        );
+        assert!(!notice.contains(&"x".repeat(SHOWN_CHARS + 1)), "{notice}");
         assert!(
             notice.contains('\u{2026}'),
             "a cut value says it was cut: {notice}"
@@ -769,15 +785,65 @@ mod tests {
         // notice for an empty-looking one.
         let bare = autocompact_ignored_notice(&brigade_with_autocompact("x")).unwrap();
         assert!(
-            notice.chars().count() <= bare.chars().count() + AUTOCOMPACT_SHOWN_CHARS + 1,
+            notice.chars().count() <= bare.chars().count() + SHOWN_CHARS + 1,
             "{notice}"
         );
         // A value exactly at the cap is shown whole, with no ellipsis.
-        let whole = "y".repeat(AUTOCOMPACT_SHOWN_CHARS);
+        let whole = "y".repeat(SHOWN_CHARS);
         let notice = autocompact_ignored_notice(&brigade_with_autocompact(&whole)).unwrap();
         assert!(
             notice.contains(&whole) && !notice.contains('\u{2026}'),
             "{notice}"
+        );
+    }
+
+    #[test]
+    fn goinkyo_consult_notice_names_the_value_and_the_level_used_instead() {
+        let with = |value: &str| BrigadeConfig {
+            goinkyo_consult: value.to_string(),
+            ..BrigadeConfig::default()
+        };
+        for ok in ["off", "disputes", "design", "decisions", "", " Design "] {
+            assert_eq!(goinkyo_consult_ignored_notice(&with(ok)), None, "{ok:?}");
+        }
+        assert_eq!(
+            goinkyo_consult_ignored_notice(&BrigadeConfig::default()),
+            None
+        );
+        assert_eq!(
+            goinkyo_consult_ignored_notice(&with("decision")).as_deref(),
+            Some(
+                "goinkyo_consult: ignored \"decision\" (not off, disputes, design or decisions) \u{2014} using design"
+            )
+        );
+        // One line whatever the value holds, and a long one is cut the way an
+        // autocompact value is.
+        let notice = goinkyo_consult_ignored_notice(&with("a\nb\u{1b}[31m")).unwrap();
+        assert!(
+            !notice.contains('\n') && !notice.contains('\u{1b}'),
+            "{notice:?}"
+        );
+        let long = "z".repeat(SHOWN_CHARS + 5);
+        let notice = goinkyo_consult_ignored_notice(&with(&long)).unwrap();
+        assert!(
+            notice.contains('\u{2026}') && !notice.contains(&long),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn startup_notices_carry_a_goinkyo_consult_typo() {
+        let agents = banto_core::config::resolve_agents("made-up-product");
+        let brigade = BrigadeConfig {
+            goinkyo_consult: "sometimes".to_string(),
+            ..BrigadeConfig::default()
+        };
+        let notices = startup_notices(None, &agents, &brigade);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.starts_with("goinkyo_consult: ignored")),
+            "{notices:?}"
         );
     }
 
