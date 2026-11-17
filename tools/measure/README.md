@@ -56,6 +56,71 @@ the review missed; **(b)** `candidates_b.txt`: Director messages, to the operato
 to a Worker, containing a retraction or correction phrase, not limited by
 `--horizon-h`. Both lists are candidates, not findings.
 
+**`consult_report.py`: how often Directors consult the Goinkyo.** For each Director
+session and each day it counts the consultations the Director filed, split by `kind`
+(`arbitration` or `design`), the `dismiss_goinkyo` calls, and how many consultations the
+session filed in all. It exists to show whether a setting such as `[brigade]
+goinkyo_consult`, which changes how readily a Director is told to consult, changes how often
+it does. It prints a report and writes no file; the table holds counts and the first eight
+characters of a session id, and no conversation text.
+
+- **What is counted.** A consultation is a call of banto's MCP tool `consult_goinkyo`. In a
+  Claude Code transcript that is a `tool_use` named `mcp__banto__consult_goinkyo`, its `kind`
+  taken from `input.kind`. In a Codex rollout it is an `event_msg` record of type
+  `mcp_tool_call_end` whose `invocation.server` is `banto` and `invocation.tool` is
+  `consult_goinkyo`, its `kind` from `invocation.arguments`. A Director is a session that
+  called any Director-only banto tool (`consult_goinkyo`, `dismiss_goinkyo`, `name_member`,
+  `request_decision`, the same rule as `transcripts.py`), so a Director that never consulted
+  still has a row of zeros on each day it was active. A subagent's file is left out.
+- **Refused calls are not consultations.** banto refuses a consultation (a Goinkyo is
+  already in the cell, a missing argument) with an error result. In Claude Code that is a
+  `tool_result` with `is_error: true`, linked to its call by `tool_use_id`, in the call's own
+  file or in any other Claude Code file the run reads (under the matching projects when
+  `--project` is given): a refusal a resumed session wrote into a later file is found even
+  when that file holds no Director-only call; in Codex it is `result.Ok.isError` true, or a `result.Err`. Such a call goes in the
+  `refused` column and in no other. A call whose result cannot be found, or in Codex has a
+  result of a shape not seen, is **counted** (the benefit of the doubt) and also shown in the
+  `nolink` column, so the count's softest part is visible. `dismiss_goinkyo` is treated the
+  same way. A consultation that succeeded but whose `kind` is neither value is counted in
+  `other`; banto's server does not accept one, so it should stay 0.
+- **How a day is cut.** The report counts days in `--utc-offset`: `local` (the machine's own
+  zone, the default) or an offset such as `+09:00`. The other scripts print UTC days; this one
+  takes the zone the operator lives in, since a Director's day is the operator's, and says
+  which it used. A negative offset is written with an equals sign
+  (`--utc-offset=-05:00`), or the argument parser reads it as a flag. A call whose timestamp
+  is missing, or cannot be moved into the zone (the machine's own zone refuses moments far
+  from today on Windows, and a fixed offset overflows at the ends of the calendar), is
+  counted in a row whose day is `?`, even with a window set, so the report never loses it.
+  **`--since` and `--until` are UTC instants, not days in `--utc-offset`**: `--since` is
+  inclusive, `--until` exclusive, and a bare date means 00:00 UTC. To window one JST day, put
+  the zone in the bounds: `--utc-offset +09:00 --since 2026-11-07T15:00:00Z --until
+  2026-11-08T15:00:00Z` is 8 November in Japan. They keep a record or call only when it
+  falls in the window; the `session` column is the session's whole total, on any day.
+- **A resumed session.** Claude Code can write earlier records again into the file of a
+  resumed or forked session. A call belongs to the earliest file that holds its `tool_use` id
+  (a Codex call, its `call_id`), a record to the earliest file with its `uuid`; the report
+  says how many copies it dropped. Two files of one conversation are still two rows: a row is
+  a session file, not a team. A record with no `uuid` (every Codex record) is matched by its
+  whole line, so a copy that was rewritten rather than repeated is not recognised as one by
+  record, though its calls still are by id. A file in which nothing of its own survives
+  that dedupe is that file again: it gets no row and is not counted as a Director on any day.
+  A resumed file that goes on keeps a row for each day of its own records, a day with no
+  consultation included, and counts as a Director on those days.
+- **What it cannot see.** A consultation that should have happened and did not: the count
+  shows how often a Director asked, not how often it ought to have. It sees no Director that
+  called no Director-only tool in its whole file, and it cannot say why a Director consulted
+  or whether the consultation helped. "Active on a day" means the file has any record that
+  day, a relay nudge included. The Codex side follows the `mcp_tool_call_end` shape: its
+  structure was checked on real rollouts on 2026-11-17, for other banto tools
+  (`check_messages`, `send_to_peer`, `brigade_status`). No real `consult_goinkyo` or
+  `dismiss_goinkyo` call exists in any Codex rollout yet, so the reading of those two tools
+  and of an `Err` result is built from that shape alone and has not met a real one. A Codex
+  call that never wrote its end event (the process died mid-call) is not seen, and rollouts
+  are read only from `sessions/` under the Codex root: an archived session kept elsewhere is
+  not read. `--project` narrows the
+  Claude Code side only, since Codex rollouts are not filed by project; `--no-codex` leaves
+  them unread, and `--codex-root` overrides `$CODEX_HOME/sessions`.
+
 ### Effect metrics: what working as a brigade bought the operator
 
 `quality_report.py` also puts seven effect figures beside each change in
@@ -273,8 +338,9 @@ Never commit these files.
 
 ## What the scripts cannot see
 
-- **Codex sessions.** Their transcripts carry no per-call usage, so they are not
-  counted.
+- **Codex sessions.** Their transcripts carry no per-call usage, so the token and cost
+  scripts do not count them. Only `consult_report.py` reads Codex rollouts, and only for
+  Goinkyo consultations.
 - **The summarising call of a compaction.** It is not in any transcript; `ac_measure`
   estimates it, with the model inferred as described above, and says so.
 - **Real billing or limits.** Nothing here reads a plan's usage, quota or invoice.

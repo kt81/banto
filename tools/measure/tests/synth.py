@@ -51,9 +51,11 @@ def user_text(when, text, **extra):
     return d
 
 
-def tool_result(when, tool_use_id, text):
-    return {"type": "user", "timestamp": when,
-            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": text}]}}
+def tool_result(when, tool_use_id, text, is_error=None):
+    block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": text}
+    if is_error is not None:
+        block["is_error"] = is_error
+    return {"type": "user", "timestamp": when, "message": {"role": "user", "content": [block]}}
 
 
 def compact(when, pre, post, dur, trigger="auto"):
