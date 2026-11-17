@@ -323,7 +323,7 @@ impl Store {
     /// stranded Goinkyo, one that never ran a single turn: Claude Code
     /// writes no `projects/*.jsonl` transcript until a session's first turn,
     /// so `session_id` staying set forever (nothing else ever clears it)
-    /// keeps `gather_goinkyo_observation`'s `AwaitingSpawn` check (which
+    /// keeps `gather_goinkyo_observations`' `AwaitingSpawn` check (which
     /// fires only on `session_id: None`) from ever seeing this row as
     /// spawnable again — a member stuck exactly as unreachable-but-not-gone
     /// as it looks, until dismissed. Its consultation request file outlives

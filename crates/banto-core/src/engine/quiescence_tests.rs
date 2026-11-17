@@ -5345,6 +5345,93 @@ fn a_goinkyo_kickoff_check_going_out_on_the_tick_that_would_complete_the_stretch
 }
 
 #[test]
+fn a_goinkyo_spawned_off_stage_holds_the_ring_until_it_has_had_its_kickoff() {
+    // Spawned through the real path for a brigade that is not on stage: from
+    // the placeholder key on, the quiet watch counts the pane (it needs both
+    // ownership maps), so its owed kickoff keeps the brigade from ringing.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    state.stage = Stage::Empty;
+    let cmds = update_goinkyo_awaiting_spawn(
+        &mut state,
+        &BrigadeConfig::default(),
+        GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+            brigade_id: 1,
+            cwd: PathBuf::from("/work"),
+            roster: Vec::new(),
+        }),
+        at,
+    );
+    let [Cmd::OpenEmbedded { key: goinkyo, .. }] = cmds.as_slice() else {
+        panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+    };
+    let goinkyo = goinkyo.clone();
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned {
+            key: goinkyo.clone(),
+            agent: None,
+        },
+        at,
+    );
+
+    let busy = [(&director, NotIdle), (&worker, Idle), (&goinkyo, Idle)];
+    sample(&mut state, &mut app, &busy, at);
+    let all_idle = [(&director, Idle), (&worker, Idle), (&goinkyo, Idle)];
+    let idle_from = at + SECOND;
+    let rang_at = tick_each_second_until(
+        &mut state,
+        &mut app,
+        &all_idle,
+        idle_from,
+        idle_from + 2 * BRIGADE_QUIET_SETTLE,
+    );
+    assert_eq!(
+        rang_at, None,
+        "the Goinkyo's kickoff is still owed, so the brigade is not quiet"
+    );
+}
+
+#[test]
+fn a_goinkyo_spawned_off_stage_that_waits_is_shown_on_its_director() {
+    // The brigade marks find a pane through the ownership maps too: without
+    // the brigade written at the spawn, the wait of an off-stage Goinkyo has
+    // no Director to be shown on until discovery has re-keyed it.
+    let (mut state, mut app, director, _worker, at) = quiet_fixture();
+    state.stage = Stage::Empty;
+    let cmds = update_goinkyo_awaiting_spawn(
+        &mut state,
+        &BrigadeConfig::default(),
+        GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+            brigade_id: 1,
+            cwd: PathBuf::from("/work"),
+            roster: Vec::new(),
+        }),
+        at,
+    );
+    let [Cmd::OpenEmbedded { key: goinkyo, .. }] = cmds.as_slice() else {
+        panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+    };
+    let goinkyo = goinkyo.clone();
+    send(
+        &mut state,
+        &mut app,
+        Event::Spawned {
+            key: goinkyo.clone(),
+            agent: None,
+        },
+        at,
+    );
+    state.latched_attention_panes.insert(goinkyo);
+
+    tick(&mut state, &mut app, at + SECOND);
+    assert!(
+        state.marked_directors.contains(&director),
+        "the wait is shown on its Director"
+    );
+}
+
+#[test]
 fn a_codex_worker_kickoff_check_going_out_on_the_tick_that_would_complete_the_stretch_does_not_ring()
  {
     let (mut state, mut app, director, worker, at) = quiet_fixture();

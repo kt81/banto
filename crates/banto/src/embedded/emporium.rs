@@ -48,7 +48,7 @@ use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgent
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
     GoinkyoObservation, GoinkyoSpawnCandidate, GroupJoinTargetData, LiveStatus, PrefixKey,
-    RelayObservation, SessionKey, Stage, StoreIntent,
+    RelayObservation, SessionKey, StoreIntent,
 };
 use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
@@ -821,9 +821,11 @@ fn event_loop(
             let samples = std::mem::take(&mut glance_gate.quiescence);
             events.push_back(Event::QuiescenceSampled { samples });
             events.push_back(Event::Tick { relay, brigades });
-            let observation =
-                gather_goinkyo_observation(&state, deps.store, app, Some(&mut tick_timings));
-            events.push_back(Event::GoinkyoAwaitingSpawn { observation });
+            for observation in
+                gather_goinkyo_observations(&state, deps.store, app, Some(&mut tick_timings))
+            {
+                events.push_back(Event::GoinkyoAwaitingSpawn { observation });
+            }
         }
         let tick_dur = tick_start.elapsed();
 
@@ -2602,14 +2604,21 @@ fn gather_relay_observations(
     observations
 }
 
-/// What the staged brigade's Goinkyo row (if any) means for
-/// `engine::update_goinkyo_awaiting_spawn` this tick — see
-/// [`GoinkyoObservation`]'s own doc for what each case tells the core to do.
-/// A store read failure is reported as [`GoinkyoObservation::Unchanged`],
-/// same as "no brigade staged": it is not itself evidence the row is gone,
-/// and misreporting it as [`GoinkyoObservation::NoGoinkyo`] would release
-/// the one-shot guard on a transient glitch rather than an actual ended
-/// consultation.
+/// What each live brigade's Goinkyo row (if any) means for
+/// `engine::update_goinkyo_awaiting_spawn` this tick, one observation per
+/// brigade that has something to say — see [`GoinkyoObservation`]'s own doc
+/// for what each case tells the core to do. A brigade is live when its
+/// Director's pane is hosted, on stage or not; a brigade nobody has opened has a Director
+/// with no pane, and a Goinkyo row it holds is not started behind the
+/// operator's back at startup. Brigades banto has a Goinkyo pane recorded for
+/// are asked about whether or not their Director is hosted, so that an ended
+/// consultation is noticed wherever the Director's pane went.
+///
+/// A store read failure for one brigade says nothing about it: it is not
+/// itself evidence the row is gone, and misreporting it as
+/// [`GoinkyoObservation::NoGoinkyo`] would release the one-shot guard on a
+/// transient glitch rather than an actual ended consultation. A brigade whose
+/// row holds a session id is `Unchanged` and is left out.
 ///
 /// Deliberately does *not* also check whether a pane is already open or in
 /// flight for a would-be candidate: that would need the same synthetic key
@@ -2620,67 +2629,73 @@ fn gather_relay_observations(
 /// itself instead, on the core side where the constructor is reachable; see
 /// its own doc for why `EmporiumState::goinkyo_pane` is the primary guard
 /// either way, and that lookup only a defensive second one.
-fn gather_goinkyo_observation(
+fn gather_goinkyo_observations(
     state: &EmporiumState,
     store: &RefCell<Store>,
     app: &App,
     mut timings: Option<&mut TickTimings>,
-) -> GoinkyoObservation {
-    // A consultation that ended, first and independently of the stage: the
-    // Director's session can call `dismiss_goinkyo` while the operator is
-    // looking anywhere at all, and the pane it leaves behind keeps running
-    // (off-stage panes are pumped too). Asked only about brigades banto has
-    // a Goinkyo pane recorded for, so this is one roster read for the one
-    // entry that normally exists, not a scan of the store.
-    for brigade_id in state.goinkyo_brigades() {
+) -> Vec<GoinkyoObservation> {
+    // One observation per brigade rather than one per tick: a brigade with a
+    // spawn to attempt must not hide the next one's. The ids are the brigades
+    // banto has a Goinkyo pane recorded for — so an ended consultation is
+    // noticed wherever its Director's pane went, and a disbanded brigade (an
+    // empty roster, not an error) releases its guard — and the brigades the
+    // store lists. Sorted: a fold that is replayed is handed the same order
+    // every run.
+    let recorded = state.goinkyo_brigades();
+    let mut ids: BTreeSet<BrigadeId> = recorded.iter().copied().collect();
+    let listing_start = Instant::now();
+    if let Ok(brigades) = store.borrow().list_brigades() {
+        ids.extend(brigades.iter().map(|brigade| brigade.id));
+    }
+    if let Some(t) = timings.as_deref_mut() {
+        t.goinkyo_roster += listing_start.elapsed();
+    }
+    let mut observations = Vec::new();
+    for brigade_id in ids {
         let roster_start = Instant::now();
-        let members = store.borrow().brigade_members(brigade_id);
+        let members = store.borrow().brigade_members_in_join_order(brigade_id);
         if let Some(t) = timings.as_deref_mut() {
             t.goinkyo_roster += roster_start.elapsed();
         }
         let Ok(members) = members else {
             continue;
         };
-        if !members.iter().any(|m| m.role == BrigadeRole::Goinkyo) {
-            return GoinkyoObservation::NoGoinkyo { brigade_id };
+        // The Director whose pane makes the brigade live, and the working
+        // directory the rest of the brigade runs in: both from its roster row,
+        // as `stage_brigade` reads them, so that nothing depends on which
+        // brigade is on stage.
+        let director_session = members
+            .iter()
+            .find(|m| m.role == BrigadeRole::Director)
+            .and_then(|m| m.session_id.as_ref());
+        let hosted = director_session
+            .is_some_and(|session| state.screens.contains_key(&SessionKey::from_id(&session.0)));
+        let Some(goinkyo) = members.iter().find(|m| m.role == BrigadeRole::Goinkyo) else {
+            if hosted || recorded.contains(&brigade_id) {
+                observations.push(GoinkyoObservation::NoGoinkyo { brigade_id });
+            }
+            continue;
+        };
+        if goinkyo.session_id.is_some() || !hosted {
+            continue;
         }
+        // Same cwd resolution as `stage_brigade` and `add_worker`: the
+        // Director's own row — a Goinkyo has no cwd of its own to fall back
+        // to — and "." when that row is not resolved.
+        let cwd = director_session
+            .and_then(|session| app.row_for_id(&session.0))
+            .and_then(|row| row.cwd.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        observations.push(GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+            brigade_id,
+            cwd,
+            // Already in join order: what the core needs to place the
+            // consultation among the Workers (see the field's doc).
+            roster: members.iter().map(|m| m.token.clone()).collect(),
+        }));
     }
-    let Stage::Brigade { id, director, .. } = &state.stage else {
-        return GoinkyoObservation::Unchanged;
-    };
-    let brigade_id = *id;
-    let roster_start = Instant::now();
-    let members = store.borrow().brigade_members_in_join_order(brigade_id);
-    if let Some(t) = timings {
-        t.goinkyo_roster += roster_start.elapsed();
-    }
-    let Ok(members) = members else {
-        return GoinkyoObservation::Unchanged;
-    };
-    let Some(goinkyo) = members.iter().find(|m| m.role == BrigadeRole::Goinkyo) else {
-        return GoinkyoObservation::NoGoinkyo { brigade_id };
-    };
-    if goinkyo.session_id.is_some() {
-        return GoinkyoObservation::Unchanged;
-    }
-    // Same cwd resolution as `add_worker`: the Director's own row — a
-    // Goinkyo has no cwd of its own to fall back to, and belongs in the
-    // same working directory the rest of the brigade already runs in.
-    // `director: None` (unresolved, or its own pane closed) falls back to
-    // "." the same as `add_worker`'s does.
-    let director_row = director
-        .as_ref()
-        .and_then(|key| app.row_for_id(key.as_str()));
-    let cwd = director_row
-        .and_then(|row| row.cwd.clone())
-        .unwrap_or_else(|| PathBuf::from("."));
-    GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
-        brigade_id,
-        cwd,
-        // Already in join order: what the core needs to place the
-        // consultation among the Workers (see the field's doc).
-        roster: members.iter().map(|m| m.token.clone()).collect(),
-    })
+    observations
 }
 
 /// How many parent-pid hops [`gather_fork_observations`] walks looking for a
@@ -3658,7 +3673,7 @@ impl StageTimings {
 
 /// Sub-stage durations inside the ~1s tick block — filled in by
 /// `gather_fork_observations`/`gather_relay_observations`/
-/// `gather_goinkyo_observation` as they run, so `tick`'s own cost in
+/// `gather_goinkyo_observations` as they run, so `tick`'s own cost in
 /// [`StageTimings`] is attributed rather than guessed at. Same measurement
 /// discipline as [`StageTimings`]: accumulation is unconditional and cheap
 /// (`Instant::now()` deltas), only the eventual log write is gated. Per-member
@@ -4189,6 +4204,7 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
+    use banto_core::engine::Stage;
     use banto_core::model::{Activity, AgentKind, SessionRow};
     use banto_io::input::mock::MockInputReader;
     use banto_io::pty::mock::MockPtyHost;
@@ -11811,10 +11827,10 @@ mod tests {
         assert_eq!(goinkyo_request_path(&data_dir, 42), Some(written_by_mcp));
     }
 
-    // --- gather_goinkyo_observation ------------------------------------------
+    // --- gather_goinkyo_observations -----------------------------------------
 
-    /// A staged brigade of a Director plus a Goinkyo member row with no
-    /// session id yet — the shape `gather_goinkyo_observation` reads.
+    /// A staged brigade of a hosted Director plus a Goinkyo member row with no
+    /// session id yet — the shape `gather_goinkyo_observations` reads.
     /// `goinkyo_session_id`, when given, is written to the member row
     /// instead, for the "already resolved" case.
     fn staged_goinkyo(goinkyo_session_id: Option<&str>) -> (RefCell<Store>, EmporiumState, App) {
@@ -11845,10 +11861,34 @@ mod tests {
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
+        // The Director's pane is hosted: the relay's notion of a live brigade.
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
         let mut dir_row = test_row("dir", AgentKind::ClaudeCode);
         dir_row.cwd = Some(PathBuf::from("/work/alpha"));
         let app = App::new(vec![dir_row]);
         (RefCell::new(store), state, app)
+    }
+
+    /// The only observation `gather_goinkyo_observations` made, or
+    /// `Unchanged` when it made none. The gatherer itself never emits
+    /// `Unchanged` (asserted here), so a test comparing with `Unchanged`
+    /// is asserting that nothing was observed.
+    fn only_observation(
+        state: &EmporiumState,
+        store: &RefCell<Store>,
+        app: &App,
+    ) -> GoinkyoObservation {
+        let mut observations = gather_goinkyo_observations(state, store, app, None);
+        assert!(observations.len() <= 1, "{observations:?}");
+        assert!(
+            !observations
+                .iter()
+                .any(|o| matches!(o, GoinkyoObservation::Unchanged)),
+            "{observations:?}"
+        );
+        observations.pop().unwrap_or(GoinkyoObservation::Unchanged)
     }
 
     #[test]
@@ -11861,8 +11901,7 @@ mod tests {
             .add_brigade_member(1, "assistant", BrigadeRole::Worker, None)
             .unwrap();
 
-        let GoinkyoObservation::AwaitingSpawn(candidate) =
-            gather_goinkyo_observation(&state, &store, &app, None)
+        let GoinkyoObservation::AwaitingSpawn(candidate) = only_observation(&state, &store, &app)
         else {
             panic!("a Goinkyo row with no session is awaiting a spawn");
         };
@@ -11884,7 +11923,7 @@ mod tests {
 
         // Record the pane the ordinary way: gather says "awaiting spawn",
         // the fold opens it and remembers which brigade it belongs to.
-        let observation = gather_goinkyo_observation(&state, &store, &app, None);
+        let observation = only_observation(&state, &store, &app);
         assert!(matches!(observation, GoinkyoObservation::AwaitingSpawn(_)));
         engine::update(
             &mut state,
@@ -11903,7 +11942,7 @@ mod tests {
 
         assert!(
             matches!(
-                gather_goinkyo_observation(&state, &store, &app, None),
+                only_observation(&state, &store, &app),
                 GoinkyoObservation::NoGoinkyo { brigade_id: id } if id == brigade_id
             ),
             "the ended consultation must be reported whatever is on stage"
@@ -11911,10 +11950,10 @@ mod tests {
     }
 
     #[test]
-    fn a_brigade_with_no_goinkyo_pane_recorded_is_not_asked_about() {
-        // The scan above is over panes banto actually opened, not over the
-        // store: a brigade that never had a consultation must not produce an
-        // observation just because it has no Goinkyo row.
+    fn a_brigade_nobody_is_running_is_not_asked_about() {
+        // Neither a Goinkyo pane recorded nor a hosted Director: a brigade
+        // that is not in use must not produce an observation just because it
+        // has no Goinkyo row.
         let (store, mut state, app) = staged_goinkyo(None);
         let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
         store
@@ -11922,9 +11961,10 @@ mod tests {
             .dismiss_worker(brigade_id, "goinkyo")
             .unwrap();
         state.stage = Stage::Empty;
+        state.screens.clear();
 
         assert!(matches!(
-            gather_goinkyo_observation(&state, &store, &app, None),
+            only_observation(&state, &store, &app),
             GoinkyoObservation::Unchanged
         ));
     }
@@ -11932,8 +11972,7 @@ mod tests {
     #[test]
     fn a_goinkyo_row_with_no_session_id_is_a_spawn_candidate_in_the_directors_cwd() {
         let (store, state, app) = staged_goinkyo(None);
-        let GoinkyoObservation::AwaitingSpawn(candidate) =
-            gather_goinkyo_observation(&state, &store, &app, None)
+        let GoinkyoObservation::AwaitingSpawn(candidate) = only_observation(&state, &store, &app)
         else {
             panic!("a Goinkyo row with no session id must be reported as awaiting spawn");
         };
@@ -11958,8 +11997,7 @@ mod tests {
         worker_row.cwd = Some(PathBuf::from("/work/wrong"));
         let app = App::new(vec![worker_row, dir_row]);
 
-        let GoinkyoObservation::AwaitingSpawn(candidate) =
-            gather_goinkyo_observation(&state, &store, &app, None)
+        let GoinkyoObservation::AwaitingSpawn(candidate) = only_observation(&state, &store, &app)
         else {
             panic!("a Goinkyo row with no session id must be reported as awaiting spawn");
         };
@@ -11974,7 +12012,7 @@ mod tests {
         // released.
         let (store, state, app) = staged_goinkyo(Some("g1"));
         assert_eq!(
-            gather_goinkyo_observation(&state, &store, &app, None),
+            only_observation(&state, &store, &app),
             GoinkyoObservation::Unchanged
         );
     }
@@ -11983,10 +12021,8 @@ mod tests {
     fn no_goinkyo_member_at_all_reports_the_row_as_gone() {
         // Distinct from every other "nothing to report" case: this is what
         // tells `update_goinkyo_awaiting_spawn` a consultation was
-        // dismissed out from under a still-staged brigade, so it can
-        // release `goinkyo_pane` for a later one. Disband does not reach
-        // this case at all — it un-stages the brigade first, so
-        // the next observation is `Unchanged`, not this.
+        // dismissed out from under a live brigade, so it can release
+        // `goinkyo_pane` for a later one.
         let mut store = Store::open_in_memory().unwrap();
         let brigade_id = store.create_brigade("cell").unwrap();
         store
@@ -12004,22 +12040,143 @@ mod tests {
             panes: vec![SessionKey::from_id("dir")],
             focused: 0,
         };
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
         let app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
 
         assert_eq!(
-            gather_goinkyo_observation(&state, &RefCell::new(store), &app, None),
+            only_observation(&state, &RefCell::new(store), &app),
             GoinkyoObservation::NoGoinkyo { brigade_id }
         );
     }
 
     #[test]
-    fn outside_a_staged_brigade_is_always_unchanged() {
+    fn with_no_brigade_at_all_there_is_nothing_to_report() {
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let state = EmporiumState::new(PrefixKey::default());
         let app = App::new(vec![]);
         assert_eq!(
-            gather_goinkyo_observation(&state, &store, &app, None),
+            only_observation(&state, &store, &app),
             GoinkyoObservation::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_brigade_off_stage_with_a_hosted_director_is_a_spawn_candidate() {
+        // The Director consults the Goinkyo while the operator looks at another
+        // brigade, or at none: the spawn does not wait for the stage.
+        let (store, mut state, app) = staged_goinkyo(None);
+        state.stage = Stage::Empty;
+
+        let GoinkyoObservation::AwaitingSpawn(candidate) = only_observation(&state, &store, &app)
+        else {
+            panic!("a hosted Director's brigade is live whatever is on stage");
+        };
+        assert_eq!(candidate.cwd, PathBuf::from("/work/alpha"));
+        assert_eq!(candidate.roster, ["director", "goinkyo"]);
+    }
+
+    #[test]
+    fn a_brigade_whose_director_is_not_hosted_is_left_alone() {
+        // A paneless Goinkyo row can outlive the run that wrote it: it must not
+        // start at banto's startup for a Director that is not running.
+        let (store, mut state, app) = staged_goinkyo(None);
+        state.stage = Stage::Empty;
+        state.screens.clear();
+
+        assert_eq!(
+            gather_goinkyo_observations(&state, &store, &app, None),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_director_row_that_resolves_to_no_session_row_gives_the_current_directory() {
+        let (store, state, _app) = staged_goinkyo(None);
+        let app = App::new(vec![]);
+
+        let GoinkyoObservation::AwaitingSpawn(candidate) = only_observation(&state, &store, &app)
+        else {
+            panic!("the Director is hosted");
+        };
+        assert_eq!(candidate.cwd, PathBuf::from("."));
+    }
+
+    #[test]
+    fn every_live_brigade_is_observed_in_the_same_tick() {
+        // One standing candidate must not hide the next brigade's.
+        let (store, mut state, _app) = staged_goinkyo(None);
+        let second = {
+            let mut store = store.borrow_mut();
+            let id = store.create_brigade("second").unwrap();
+            store
+                .add_brigade_member(
+                    id,
+                    "director",
+                    BrigadeRole::Director,
+                    Some(&SessionId("dir2".to_string())),
+                )
+                .unwrap();
+            store
+                .add_brigade_member(id, "goinkyo", BrigadeRole::Goinkyo, None)
+                .unwrap();
+            id
+        };
+        state.stage = Stage::Empty;
+        state
+            .screens
+            .insert(SessionKey::from_id("dir2"), Screen::new(24, 80));
+        let mut first_row = test_row("dir", AgentKind::ClaudeCode);
+        first_row.cwd = Some(PathBuf::from("/work/alpha"));
+        let mut second_row = test_row("dir2", AgentKind::ClaudeCode);
+        second_row.cwd = Some(PathBuf::from("/work/beta"));
+        let app = App::new(vec![first_row, second_row]);
+
+        let observations = gather_goinkyo_observations(&state, &store, &app, None);
+        let candidates: Vec<(BrigadeId, PathBuf)> = observations
+            .into_iter()
+            .map(|observation| match observation {
+                GoinkyoObservation::AwaitingSpawn(candidate) => {
+                    (candidate.brigade_id, candidate.cwd)
+                }
+                other => panic!("expected candidates only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            [
+                (1, PathBuf::from("/work/alpha")),
+                (second, PathBuf::from("/work/beta"))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_disbanded_brigades_recorded_goinkyo_is_reported_gone() {
+        // The guard of a brigade that no longer exists is released by the
+        // gather's own pass over the brigades it has a pane recorded for: its
+        // roster reads as empty, not as an error, and its Director's pane is
+        // gone with it.
+        let (store, mut state, mut app) = staged_goinkyo(None);
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        let observation = only_observation(&state, &store, &app);
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::GoinkyoAwaitingSpawn { observation },
+            Instant::now(),
+        );
+        assert_eq!(state.goinkyo_brigades(), [brigade_id]);
+
+        store.borrow_mut().delete_brigade(brigade_id).unwrap();
+        state.stage = Stage::Empty;
+        state.screens.clear();
+
+        assert_eq!(
+            only_observation(&state, &store, &app),
+            GoinkyoObservation::NoGoinkyo { brigade_id }
         );
     }
 
@@ -12028,7 +12185,7 @@ mod tests {
         // The other half of the `stage_brigade` fix for a stranded Goinkyo,
         // exercised through the real store round trip `engine.rs`'s own
         // pure unit tests can't reach: does clearing `session_id` actually
-        // flip `gather_goinkyo_observation` back to `AwaitingSpawn`, and
+        // flip `gather_goinkyo_observations` back to `AwaitingSpawn`, and
         // does the existing one-shot guard (`EmporiumState::goinkyo_pane`)
         // still stop it from spawning a second time once it has.
         let (store, mut state, app) = staged_goinkyo(Some("g1"));
@@ -12054,7 +12211,7 @@ mod tests {
         ));
 
         // Next tick: the same consultation is spawnable again.
-        let observation = gather_goinkyo_observation(&state, &store, &app, None);
+        let observation = only_observation(&state, &store, &app);
         let GoinkyoObservation::AwaitingSpawn(candidate) = &observation else {
             panic!("expected AwaitingSpawn once session_id cleared, got {observation:?}");
         };
@@ -12068,14 +12225,17 @@ mod tests {
             Event::GoinkyoAwaitingSpawn { observation },
             Instant::now(),
         );
-        assert!(
-            matches!(cmds.as_slice(), [Cmd::OpenEmbedded { .. }]),
+        assert_eq!(
+            cmds.iter()
+                .filter(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. }))
+                .count(),
+            1,
             "expected exactly one respawn: {cmds:?}"
         );
 
         // A further tick before the respawned pane even reports back
         // (`Event::Spawned`, which is what actually records a session id
-        // and would make `gather_goinkyo_observation` itself report
+        // and would make `gather_goinkyo_observations` itself report
         // `Unchanged`) must not spawn a second one. The store still shows
         // `session_id: None` at this point — the shell's own observation is
         // correctly still `AwaitingSpawn`, same as just above; it's
@@ -12083,7 +12243,7 @@ mod tests {
         // (`EmporiumState::goinkyo_pane`, armed by the first spawn above)
         // that has to be the thing stopping a second one — the guard this
         // whole fix has to respect, not bypass.
-        let observation_again = gather_goinkyo_observation(&state, &store, &app, None);
+        let observation_again = only_observation(&state, &store, &app);
         assert!(
             matches!(observation_again, GoinkyoObservation::AwaitingSpawn(_)),
             "the store genuinely hasn't changed yet, so the shell's own \
@@ -12099,7 +12259,9 @@ mod tests {
             Instant::now(),
         );
         assert!(
-            cmds_again.is_empty(),
+            !cmds_again
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
             "the one-shot spawn guard must stop a second respawn: {cmds_again:?}"
         );
     }

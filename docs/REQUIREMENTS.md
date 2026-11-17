@@ -2019,14 +2019,30 @@ disagreement or to think a design or a course through, addressable by name but n
 MCP tool (see "MCP mediation server" below), which files a written
 consultation request and creates the member row; once a tick observes that
 row with no session id yet, it is auto-spawned the same way a fresh Worker
-is (Claude only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`/
+is, for any brigade whose Director's pane is hosted, on stage or not (Claude
+only — `goinkyo_model`/`goinkyo_effort`/`goinkyo_permission_mode`/
 `goinkyo_disallowed_tools` below; the model and the effort only because this is a
 creation, see "Model and effort: only when a session is created"), briefed from `goinkyo_prompt` with
 `{request}` substituted for the consultation file's path. The spawn is
 attempted at most once per consultation (`EmporiumState::goinkyo_pane`, one
 guard per brigade, mapped
 to the `SessionKey` that spawn used): a failed attempt is not retried
-automatically.
+automatically. A tick looks at every brigade the store lists and every one banto
+has a Goinkyo pane recorded for, and spawns only where the Director's pane is
+hosted; a Goinkyo row of a brigade nobody is running, left by an earlier run, is
+not started at startup. The working directory is the
+Director's, read from its roster row as staging reads it (`.` when that row is
+not resolved yet). The pane is the Goinkyo's from the moment it is spawned, under
+its placeholder key: both ownership maps (its token and its brigade) are written
+with the open, so the quiet-bell watch counts it and holds the brigade's bell
+while its kickoff is owed, staging the brigade once the pane has landed finds it
+instead of counting the member missing (staged in the instant between the spawn
+and its landing, the status line still counts it missing, though the pane joins
+the stage when it lands), and a wait of its own shows on its Director's row. A row with no pane
+(no hosted Director) stays outside the quiet watch, as before. A spawn that fails
+drops the kickoff queued with it. Not measured yet: a Goinkyo off stage that stops
+at Claude's directory-trust dialog may read as unknown, which holds the quiet bell,
+so nothing would ring for that brigade until someone answers the dialog.
 
 **Worker tokens.** A Worker's token (`worker-N`) is its identifier — what every
 address, preference and store row is keyed by — and is never reused within a
@@ -2124,9 +2140,10 @@ gives it its own first turn by typing into its pane themselves, which
 nobody does for an unattended Goinkyo.
 
 **Ending a consultation** removes the Goinkyo's member row, which releases
-the guard above and — the next time a tick observes a still-staged brigade
-with no Goinkyo row at all — unstages and kills whatever pane was tracked
-for it, the same way dismissing a Worker already closes its pane. Two ways
+the guard above and — the next time a tick observes a brigade in use (its
+Director hosted, or a Goinkyo pane recorded for it; on stage or not) with no
+Goinkyo row at all — kills whatever pane was tracked for it (and unstages it
+when it is staged), the same way dismissing a Worker already closes its pane. Two ways
 to end one: the Director's own `dismiss_goinkyo` MCP tool (see "MCP
 mediation server" below), or the operator picking Dismiss from the
 prefix-`x` confirm dialog on the Goinkyo's own pane — the same one-step
@@ -2160,11 +2177,10 @@ what the dialog showed — and, like an answer that names no member at all, now
 says so in the status instead of doing nothing — still the check that actually
 guards deletion; the two stages agreeing is what closes the old UX gap
 (Dismiss missing, or offered, on the wrong pane) that a position-derived
-first stage used to risk. Disband does *not* reach the
-brigade off stage *before* the row disappears, so the next tick's
-observation is "not staged" rather than "no row" — the guard for a
-disbanded brigade is simply never released, harmlessly, since that brigade
-id is never staged (and so never observed) again. **Reopening a
+first stage used to risk. A disband is noticed a tick later too: the
+brigade's roster reads as empty, so its Goinkyo row reads as gone, the guard is
+released and the kill names a pane the disband already closed (a no-op).
+**Reopening a
 brigade around an already-discovered Goinkyo (one that already has a
 session id, resolvable to a real row) already works**, for free, through
 the same resumed-member path a Director's or Worker's own closed pane
@@ -2179,7 +2195,7 @@ model and the effort from the operator's Claude settings, no longer `max`;
 (its pane died before it had a session id) does *not* reopen through that
 path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
 stays a fresh-spawn candidate for the ordinary tick mechanism above for as
-long as the brigade remains staged (a creation, so it gets its model and effort).
+long as the brigade's Director is hosted (a creation, so it gets its model and effort).
 
 **A third case — a stranded Goinkyo — sits between those two.** A Goinkyo
 can have a session id (its own discovery already ran once) that still

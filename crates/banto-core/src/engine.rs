@@ -160,7 +160,7 @@ pub enum Stage {
         id: BrigadeId,
         /// The Director's own key, authoritative — role no longer has to be
         /// derived from position anywhere (`add_worker`, `update_disbanded`,
-        /// `PrefixAction::Kill`, `gather_goinkyo_observation`, `tile_label`
+        /// `PrefixAction::Kill`, `tile_label`
         /// all read this instead of assuming `panes[0]`). `None` is a
         /// legitimate state, not a gap to close: `stage_brigade` sets it
         /// leniently from the store's own member row (no session id
@@ -656,21 +656,25 @@ pub struct GoinkyoSpawnCandidate {
     pub roster: Vec<MemberToken>,
 }
 
-/// What the shell observed about the staged brigade's Goinkyo this tick —
+/// What the shell observed about one brigade's Goinkyo this tick —
 /// [`Event::GoinkyoAwaitingSpawn`]'s payload. A plain `Option<GoinkyoSpawnCandidate>`
 /// cannot say why there's nothing to spawn, and
 /// [`update_goinkyo_awaiting_spawn`] needs that distinction: "no Goinkyo
-/// member row, on a brigade that's still staged" is the one case that means
+/// member row, on a brigade that's in use" is the one case that means
 /// a consultation was dismissed out from under it, and is the signal that
 /// releases (and closes the pane tracked by) [`EmporiumState::goinkyo_pane`]
 /// for that brigade — every other "nothing to report" reason must leave it
-/// untouched. See `goinkyo_pane`'s own doc for why a disbanded brigade
-/// never reaches this case at all.
+/// untouched. A disbanded brigade reads the same way: its roster is empty,
+/// so it has no Goinkyo row either. "In use" is a brigade the shell has a
+/// Goinkyo pane recorded for or whose Director's pane is hosted, staged or
+/// not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoinkyoObservation {
-    /// Not a staged brigade, or the Goinkyo row already has a session id
-    /// (already spawned, or resolved by discovery) — nothing to do either
-    /// way.
+    /// The Goinkyo row already has a session id (already spawned, or
+    /// resolved by discovery), or the brigade is not in use — nothing to do
+    /// either way. The shell no longer sends one per tick: a brigade with
+    /// nothing to say is left out, and a capture made before that still
+    /// replays, since this one does nothing.
     Unchanged,
     /// A brigade with a Goinkyo pane no longer has a Goinkyo member row:
     /// its consultation has ended.
@@ -684,7 +688,8 @@ pub enum GoinkyoObservation {
     /// cannot reach that state: it is a key the operator presses while
     /// looking at the brigade it belongs to.
     NoGoinkyo { brigade_id: BrigadeId },
-    /// A member row exists with no session id yet.
+    /// A member row exists with no session id yet, and the brigade's
+    /// Director is hosted.
     AwaitingSpawn(GoinkyoSpawnCandidate),
 }
 
@@ -1392,10 +1397,10 @@ pub struct EmporiumState {
     /// `end_consultation`/an operator's own dismiss, both of which delete
     /// the row while leaving the brigade staged), the entry is removed —
     /// unblocking a later consultation on the same brigade — and, if the
-    /// pane it names is still actually staged, that pane is unstaged and
-    /// killed right there, the same way [`update_worker_dismissed`] already
+    /// pane it names is staged it is unstaged, and it is killed wherever it
+    /// is, the same way [`update_worker_dismissed`] already
     /// closes a dismissed Worker's. The shell has no way to identify which
-    /// staged pane was the Goinkyo's once its row is gone (nothing else
+    /// pane was the Goinkyo's once its row is gone (nothing else
     /// about a pane says so), which is why this tracks it here instead of
     /// asking the shell to work it out fresh each tick the way every other
     /// gather function does. Kept current across a discovery rename
@@ -1406,12 +1411,11 @@ pub struct EmporiumState {
     /// dropped (not `Cmd::KillPty`'d — nothing to kill twice) if the pane
     /// closes on its own first (`update_pty_exited`).
     ///
-    /// Disband does *not* reach the `NoGoinkyo` removal above: it un-stages
-    /// the brigade first (`update_disbanded`), so the next gather sees no
-    /// staged brigade at all and reports `Unchanged`, never `NoGoinkyo` —
-    /// the entry for a disbanded brigade simply stays here forever,
-    /// harmlessly, since that brigade id is never staged (and so never
-    /// gathered for) again.
+    /// A disband does reach the `NoGoinkyo` removal above, one tick later:
+    /// the gatherer asks about every brigade that has an entry here, and a
+    /// deleted brigade's roster reads as empty (not as an error), so it has
+    /// no Goinkyo row and the entry is released. The kill that arm issues
+    /// names a pane the disband already closed, which costs nothing.
     goinkyo_pane: HashMap<BrigadeId, SessionKey>,
     /// Durable brigade member identity carried alongside a live pane key.
     /// Every key in `Stage::Brigade::panes` has one entry here; `panes`
@@ -4088,7 +4092,8 @@ pub enum Event {
     QuiescenceSampled {
         samples: Vec<(SessionKey, Quiescence)>,
     },
-    /// ~1/s: what the shell observed about the staged brigade's Goinkyo —
+    /// ~1/s, once per brigade with something to say: what the shell
+    /// observed about that brigade's Goinkyo, staged or not —
     /// gathered shell-side alongside `Tick`'s own observations, but its own
     /// event rather than a field added to `Tick`: every existing
     /// `Event::Tick` literal (production and the many in tests) would
@@ -7059,7 +7064,7 @@ fn stage_brigade(
             // Claude Code writes no `projects/*.jsonl` transcript until the
             // Goinkyo's first turn. Left as a plain `missing`, this member
             // is permanently stuck: `session_id` never gets a chance to
-            // clear on its own, so `gather_goinkyo_observation`'s
+            // clear on its own, so `gather_goinkyo_observations`'s
             // `AwaitingSpawn` check (which only fires on `session_id: None`)
             // never sees this row as spawnable again — a member the
             // operator can't restart short of dismissing it outright.
@@ -8513,6 +8518,14 @@ fn update_spawn_failed(
 ) -> Vec<Cmd> {
     state.unresolved_codex.remove(&key);
     state.pending_opens.remove(&key);
+    // A Goinkyo's kickoff was queued with the open (`update_goinkyo_awaiting_
+    // spawn`): left behind, each tick would ask whether to type into a pane
+    // that never existed, and the answer's write would be dropped.
+    if !state.screens.contains_key(&key) {
+        state
+            .pending_goinkyo_kickoffs
+            .retain(|pending| pending.key != key);
+    }
     state.set_status(format!("failed to open: {error}"), now);
     Vec::new()
 }
@@ -8551,7 +8564,7 @@ enum ExitHandling {
 ///   dealt with has nothing left to restart.
 /// - **It is a Worker.** The Director's own pane has two reopen paths of its
 ///   own that run before this, and a Goinkyo's absence is answered by
-///   `gather_goinkyo_observation` against the store rather than here.
+///   `gather_goinkyo_observations` against the store rather than here.
 /// - **Its session resolves to a row**, because this restarts a session
 ///   rather than starting one. A Worker that never spoke has nothing to resume
 ///   and, with no one to ask, leaves the brigade.
@@ -9864,8 +9877,9 @@ fn update_tick(
 }
 
 /// Answers `Event::GoinkyoAwaitingSpawn`: spawn the Goinkyo `observation`
-/// names, at most once per consultation; once a consultation is observed to
-/// have ended, release the guard and close whatever pane it left staged.
+/// names, at most once per consultation, for a brigade on stage or not; once
+/// a consultation is observed to have ended, release the guard and close
+/// whatever pane it left.
 ///
 /// The one-shot guard is [`EmporiumState::goinkyo_pane`], not
 /// [`EmporiumState::pending_opens`] (which this still populates, the same
@@ -9970,8 +9984,8 @@ fn update_goinkyo_awaiting_spawn(
         // that already ended. Discovery and fork-rename both always write a
         // real id back to a row (`update_discovery_result`/`update_member_
         // session_forked`), and a live consultation's own row always keeps
-        // its session id (`gather_goinkyo_observation` reports `Unchanged`
-        // for one, never `AwaitingSpawn`) — so a real key paired with a
+        // its session id (`gather_goinkyo_observations` never reports
+        // `AwaitingSpawn` for one) — so a real key paired with a
         // session-id-less row cannot arise from the same, still-open
         // consultation; the row behind that key was deleted and a new one
         // took its place. Two ways that happens without `NoGoinkyo` ever
@@ -9992,6 +10006,9 @@ fn update_goinkyo_awaiting_spawn(
         // the *next* tick starts the new consultation clean instead of
         // layering it onto a still-running process from the old one.
         state.goinkyo_pane.remove(&candidate.brigade_id);
+        // Ended wherever it is, as `NoGoinkyo` does: a pane off stage is a
+        // running process too, and returning without ending it would let the
+        // next tick spawn a second Goinkyo beside it.
         let staged = matches!(
             &state.stage,
             Stage::Brigade { id, panes, .. }
@@ -9999,9 +10016,8 @@ fn update_goinkyo_awaiting_spawn(
         );
         if staged {
             state.unstage(&existing);
-            return vec![kill_pane(state, existing)];
         }
-        return Vec::new();
+        return vec![kill_pane(state, existing)];
     }
     // A new consultation starts with nothing of the last one's: its end may not
     // have been seen (dismissed and summoned again inside one tick).
@@ -10020,9 +10036,17 @@ fn update_goinkyo_awaiting_spawn(
         return Vec::new();
     }
     state.goinkyo_pane.insert(candidate.brigade_id, key.clone());
+    // Both ownership maps, as `open_worker` writes them, before the open is
+    // issued: until discovery re-keys the pane they are all that says whose it
+    // is, and the quiet watch, `live_panes_of` and the brigade marks each
+    // look a pane up through the pair. With only the token, a Goinkyo spawned
+    // for a brigade that is not on stage was invisible to all three.
     state
         .member_tokens
         .insert(key.clone(), GOINKYO_TOKEN.to_string());
+    state
+        .member_brigades
+        .insert(key.clone(), candidate.brigade_id);
     state.pending_opens.insert(
         key.clone(),
         PendingOpen::BrigadeMember {
@@ -24277,7 +24301,7 @@ mod tests {
         // The gap `NoGoinkyo`'s own guard release can miss entirely:
         // `dismiss_goinkyo` immediately followed by a fresh
         // `consult_goinkyo`, close enough together that the ~1Hz tick's one
-        // `gather_goinkyo_observation` call never observes the row-less
+        // `gather_goinkyo_observations` call never observes the row-less
         // moment in between — it only ever sees the *new* row, session-id-
         // less, which reads as an ordinary `AwaitingSpawn`. `goinkyo_pane`
         // still names the *old* pane's real key at that point, since
@@ -24365,6 +24389,241 @@ mod tests {
         assert!(
             !state.goinkyo_pane.contains_key(&6),
             "the guard must be released, not left pointing at the stale key"
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_spawned_off_stage_is_owned_by_its_brigade_from_the_start() {
+        // Nothing is on stage. The pane's ownership has to be complete before
+        // discovery writes anything: the quiet watch, `live_panes_of` and the
+        // brigade marks all find a pane through both maps.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        let [Cmd::OpenEmbedded { key, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        assert_eq!(
+            state.member_tokens.get(key).map(String::as_str),
+            Some(GOINKYO_TOKEN)
+        );
+        assert_eq!(state.member_brigades.get(key), Some(&6));
+    }
+
+    #[test]
+    fn a_stale_goinkyo_pane_is_ended_where_it_is_when_its_brigade_is_off_stage() {
+        // The off-stage twin of the row-swap test above. Ending the stale pane
+        // only when it is staged leaves the process running with nothing that
+        // still knows which one it is, and the next tick spawns a second
+        // Goinkyo beside it.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+
+        let spawn_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        let [Cmd::OpenEmbedded { key, .. }] = spawn_cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {spawn_cmds:?}");
+        };
+        let synthetic_key = key.clone();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: synthetic_key.clone(),
+                agent: None,
+            },
+            test_instant(),
+        );
+        let old_key = SessionKey::from_id("g1");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: synthetic_key,
+                session_id: "g1".to_string(),
+                member: Some((6, GOINKYO_TOKEN.to_string())),
+            },
+            test_instant(),
+        );
+        assert_eq!(state.goinkyo_pane.get(&6), Some(&old_key));
+        assert!(matches!(state.stage, Stage::Empty), "nothing is staged");
+
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty {
+                key: old_key.clone()
+            }],
+            "the stale pane is ended although it is not staged"
+        );
+        assert!(!state.goinkyo_pane.contains_key(&6));
+        assert!(
+            state.expected_exits.contains(&old_key),
+            "banto asked for this exit, so it is not a pane that fell over"
+        );
+
+        // The next tick starts the new consultation, once.
+        let next = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert!(matches!(next.as_slice(), [Cmd::OpenEmbedded { .. }]));
+        let after = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(6),
+            test_instant(),
+        );
+        assert!(after.is_empty(), "and only once: {after:?}");
+    }
+
+    #[test]
+    fn staging_a_brigade_before_its_goinkyo_is_discovered_finds_the_hosted_pane() {
+        // The pre-discovery window of an off-stage spawn: the Goinkyo's row has
+        // no session id yet and its pane is under the placeholder key. Staging
+        // must take that pane as the member's and neither count it missing nor
+        // open a second one.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir")]);
+        let brigade = brigade_config();
+        state
+            .screens
+            .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
+
+        let spawn_cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            awaiting_spawn(1),
+            test_instant(),
+        );
+        let [Cmd::OpenEmbedded { key, .. }] = spawn_cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {spawn_cmds:?}");
+        };
+        let goinkyo_key = key.clone();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: goinkyo_key.clone(),
+                agent: None,
+            },
+            test_instant(),
+        );
+
+        state.pending_membership = Some(PendingMembership::Activate);
+        let roster = vec![
+            (
+                "director".to_string(),
+                BrigadeRole::Director,
+                Some("dir".to_string()),
+            ),
+            ("goinkyo".to_string(), BrigadeRole::Goinkyo, None),
+        ];
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: "dir".to_string(),
+                membership: Some((1, "director".to_string(), BrigadeRole::Director)),
+                members: Some(roster),
+                layout: None,
+                names: Vec::new(),
+            },
+            test_instant(),
+        );
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
+            "no second Goinkyo is opened: {cmds:?}"
+        );
+        let Stage::Brigade { panes, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert!(panes.contains(&goinkyo_key), "its tile is the hosted pane");
+        assert!(
+            !state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("not found")),
+            "the Goinkyo is not counted missing: {:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_spawn_that_fails_leaves_no_kickoff_to_type_into_a_pane_that_is_not_there() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let now = test_instant();
+
+        let cmds = update(&mut state, &mut app, &brigade, awaiting_spawn(9), now);
+        let [Cmd::OpenEmbedded { key, .. }] = cmds.as_slice() else {
+            panic!("expected exactly one OpenEmbedded, got {cmds:?}");
+        };
+        let key = key.clone();
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::SpawnFailed {
+                key: key.clone(),
+                error: "no such file".to_string(),
+            },
+            now,
+        );
+        assert!(
+            state.pending_goinkyo_kickoffs.is_empty(),
+            "the kickoff belonged to the pane that never opened"
+        );
+
+        let later = now + GOINKYO_KICKOFF_QUIET_PERIOD + Duration::from_secs(1);
+        let tick = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
+            later,
+        );
+        assert!(
+            !tick
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::CheckGoinkyoDirectoryTrust { .. })),
+            "nothing asks whether to type into it: {tick:?}"
         );
     }
 
