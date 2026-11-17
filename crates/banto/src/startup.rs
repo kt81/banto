@@ -234,9 +234,10 @@ impl Resolved {
     /// command line is hashed by Codex to decide whether to trust it, so it
     /// cannot carry them (and cannot be quoted, so a path in it would break on a
     /// space), but it inherits the environment of the agent that runs it. Only
-    /// the config file and the database: the hook reads no agent home and nothing
-    /// in the data directory (it opens the database, which has its own variable),
-    /// so the data directory is not handed to it.
+    /// the config file and the database: the hook resolves no agent home and
+    /// looks in nothing in the data directory (it opens the database, which has
+    /// its own variable), so neither is handed to it. The one other file it
+    /// reads, the session's rollout, is named by Codex on the hook's stdin.
     pub fn child_env(&self) -> Vec<(String, String)> {
         let mut env = Vec::new();
         match &self.config_file {

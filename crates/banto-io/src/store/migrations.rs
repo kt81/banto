@@ -236,9 +236,9 @@ const MIGRATIONS: &[&str] = &[
         WHERE session_id IS NOT NULL;",
     // v13: two nullable columns recording whether/when `banto _hook` (the
     // Codex SessionStart hook process, docs/notes/codex-briefing-spike.md)
-    // delivered this member its briefing. Deliberately separate from
+    // fired for this member. Deliberately separate from
     // `session_id` above: that column is identity, unique-indexed; these are
-    // an observation banto made about a delivery attempt, and can disagree
+    // an observation banto made about a firing, and can disagree
     // with `session_id` momentarily without meaning anything is wrong (see
     // `BrigadeMember::briefed_session_id`'s doc). Every gate the spike
     // measured that can eat a briefing (deferred tool, unapproved MCP call,

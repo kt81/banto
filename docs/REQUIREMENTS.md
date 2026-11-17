@@ -2593,7 +2593,8 @@ how the rendered text reaches the member differs by product:
   `BANTO_ROLE` in the environment, which the hook process inherits.
   `banto _hook` (`crates/banto/src/hook.rs`) renders the same template
   (`crates/banto/src/briefing.rs`) and returns it as the turn's
-  `additionalContext`, appending a Codex-only addendum: banto's own
+  `additionalContext` — unless the session already holds it, see "Delivered
+  once, not on every resume" below — appending a Codex-only addendum: banto's own
   MCP tools are deferred from Codex's own tool list until called by name,
   and Codex's own developer prompt otherwise casts the model as the primary
   agent of a different, unrelated multi-agent feature — measured end to end
@@ -2604,12 +2605,59 @@ how the rendered text reaches the member differs by product:
   Director was never told the four; a test checks every advertised tool
   against the two lists.
 
-  **Known limit:** in a synthetic Codex 0.169.0 session without compaction,
-  identical `SessionStart` additional context appeared once on `codex exec`
-  startup and accumulated in model requests across two `exec resume` runs. A
-  launch-time `developer_instructions` override did not refresh on resume in
-  that test. The current hook delivery is unchanged; the investigation is
-  recorded separately.
+  **Delivered once, not on every resume.** Codex stores every
+  `additionalContext` a hook returns as a developer message and replays all of
+  them on resume, so answering every firing piled identical copies into a
+  member's history (measured on a synthetic Codex 0.169.0 session: one copy at
+  startup, then two, then three across two `exec resume` runs; real Worker
+  rollouts held up to four live copies of a 4956-character text). A launch-time
+  `developer_instructions` override did not refresh on resume either, so it is
+  not a way round. A compaction drops every earlier copy, and the
+  `SessionStart` Codex then queues (source `compact`) runs only at the start of
+  the next regular turn, so a process that ends first never runs it: measured,
+  a compaction followed by an exit leaves zero copies until something delivers
+  again. The briefing therefore has to be delivered whenever the live history
+  may lack it, and withheld only on proof that it holds it. The rule
+  (`banto_io::codex_briefing`; `crates/banto/src/hook.rs` applies it):
+  - A firing whose `source` is anything but `resume` (`startup`, `compact`,
+    `clear`, `fork`, absent, or a value banto does not know) delivers, and
+    reads nothing.
+  - On `resume` the hook reads the end of the session's rollout, at the
+    `transcript_path` Codex gives it on stdin — read-only, at most the last 32
+    MiB, in windows that grow from 1 MiB — ignoring whatever follows the last
+    newline (that is the process still writing it), and walks the complete lines
+    backwards. A `compacted` record or a `thread_rolled_back` event delivers: the
+    history was rewritten after any copy behind it. A developer message holding
+    the rendered briefing, character for character, as one `input_text` part
+    suppresses it: the hook prints `{}`. Every other record, a developer message
+    with other text and a record of a type banto has never seen included, is
+    walked past — the walk is the second line behind the `source` rule, and
+    treating an unfamiliar record as doubt would switch it off the day Codex
+    adds a kind.
+  - Everything else delivers: no or unreadable `transcript_path`, any I/O
+    error, a complete line that is not JSON, a walk that ends without a
+    decision (whether the window was capped or reached the start of the file).
+    A copy further back than the window is delivered again — one extra copy, not
+    an unbounded read on the session's startup path.
+  - **A briefing over the spill limit is never suppressed.** Codex stores a hook
+    context longer than about 10,000 *bytes* (upstream counts `ceil(bytes / 4)`
+    approximate tokens against 2,500) as a truncated preview plus a pointer to a
+    temp file. The stored preview never equals the rendered text, so such a
+    briefing is delivered on every resume: copies accumulate again for that
+    case, and the member sees only the preview. Measured on a synthetic session:
+    9,900 ASCII characters stored whole, 10,500 stored as a preview of about
+    10,100 characters with the pointer. Because the limit is in bytes, a Japanese
+    template of about 3,500 characters is already over it; the shipped defaults
+    are well under.
+  - `briefed_at` is recorded on every firing that carries a `session_id` on its
+    stdin, for a member whose brigade and token the environment gives and while
+    the store opens — a withheld firing included. It says the hook fired for the
+    member (Codex's discovery reads it), not that text was printed.
+  - A complete line that is valid JSON but not an object, or whose `type` is not
+    a string, counts as a line that does not parse: it delivers.
+  - The addendum ends with one sentence for the cases the rule cannot prove:
+    if the conversation holds more than one banto briefing, the most recent one is
+    current and replaces the earlier ones.
 
 The shipped defaults tell a Director to delegate independent, parallelizable work to
 its Workers via `send_to_peer` and keep genuinely sequential work itself, that it
@@ -2671,8 +2719,9 @@ refused next to the hand-off flags.
 string, and that string cannot be quoted, so it carries no argument, and the
 values travel as environment variables on the member's launch, beside its
 identity — `BANTO_PARENT_CONFIG` (or `BANTO_PARENT_NO_CONFIG`) and
-`BANTO_PARENT_DB` (the hook reads no agent home and no file under the data
-directory, so it is not told one). A hook without them (one an
+`BANTO_PARENT_DB` (the hook looks in no agent home and in no file under the data
+directory, so it is not told one; the one other file it reads, a Codex session's
+rollout, is named by Codex on the hook's own stdin, and is only read). A hook without them (one an
 older banto launched) resolves for itself, as does a child started by hand or from
 an MCP config written by an older banto. Only banto's own variables are set;
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched — where an agent

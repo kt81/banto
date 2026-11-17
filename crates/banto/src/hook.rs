@@ -4,10 +4,20 @@
 //! Claude member gets on its launch argv has to reach a Codex member some
 //! other way). Reads the hook's JSON on stdin, prints
 //! `{"hookSpecificOutput": {...}}` on stdout, and records in banto's own
-//! store that the briefing reached this member — see
+//! store that the hook fired for this member — see
 //! `banto_core::model::BrigadeMember::briefed_at`'s doc for why that record
 //! has to exist at all (every gate the spike measured that can eat a
 //! briefing fails silently).
+//!
+//! The briefing is not printed on every firing. Codex keeps each copy a hook
+//! returns and replays all of them on resume, so answering every firing piled
+//! identical copies into a member's history. On a `resume` the hook therefore
+//! reads the session's rollout — the one agent file it touches, read-only, at the
+//! path Codex puts in its own stdin — and prints `{}` when the most recent
+//! thing the rollout says about the briefing is a copy of this exact text;
+//! every other firing, and every doubt, prints it. `store.record_briefing`
+//! runs either way: a withheld briefing still reached the member. The
+//! decision and its grounds are `banto_io::codex_briefing`'s.
 //!
 //! Takes no CLI arguments, on purpose, forever: Codex trusts a hook by
 //! hashing its literal command string, and silently refuses to run one whose
@@ -38,12 +48,14 @@
 //! launched this agent) the hook resolves both for itself, as it always did.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
 
 use banto_core::config::Config;
 use banto_core::model::{BrigadeId, BrigadeRole, SessionId};
+use banto_io::codex_briefing::{self, Verdict};
 use banto_io::store::Store;
 
 /// Member identity as read from the environment. Every field is optional
@@ -145,31 +157,72 @@ pub fn run() {
     let identity = read_identity(|key| std::env::var(key).ok());
     let (config, store) = load_leniently();
 
-    let briefing = build_briefing(&identity, &config, store.as_ref());
-
-    // Recorded independent of whether `briefing` is `Some`: a role briefed
-    // with an intentionally-empty template still had the hook reach it,
-    // which is the fact `briefed_at` exists to prove — see this module's
-    // doc and `BrigadeMember::briefed_at`'s.
-    if let (Some(store), Some(brigade_id), Some(token), Some(session_id)) = (
+    let output = fire(
+        &stdin_json,
+        &identity,
+        &config,
         store.as_ref(),
+        SystemTime::now(),
+    );
+    let _ = writeln!(std::io::stdout(), "{output}");
+}
+
+/// Everything one firing does once its inputs are in hand: record that the hook
+/// fired, and say what to print. [`run`] is only the reading of stdin, the
+/// environment and the store around it, which is what keeps the recording
+/// testable without a process.
+fn fire(
+    stdin: &Value,
+    identity: &HookIdentity,
+    config: &Config,
+    store: Option<&Store>,
+    now: SystemTime,
+) -> Value {
+    let briefing = build_briefing(identity, config, store);
+
+    // Recorded independent of whether `briefing` is `Some`, and of whether it is
+    // then printed: a role briefed with an intentionally-empty template, or a
+    // resume whose history already holds the briefing, still had the hook reach
+    // it, which is the fact `briefed_at` exists to prove — see this module's
+    // doc and `BrigadeMember::briefed_at`'s. What it does need is a store, a
+    // complete identity and a `session_id` on stdin.
+    if let (Some(store), Some(brigade_id), Some(token), Some(session_id)) = (
+        store,
         identity.brigade_id,
         identity.token.as_deref(),
-        session_id_from_stdin(&stdin_json),
+        session_id_from_stdin(stdin),
     ) {
-        let _ = store.record_briefing(brigade_id, token, &session_id, SystemTime::now());
+        let _ = store.record_briefing(brigade_id, token, &session_id, now);
     }
 
-    let output = match briefing {
-        Some(additional_context) => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": additional_context,
-            }
-        }),
-        None => json!({}),
+    hook_output(briefing, stdin)
+}
+
+/// What the hook prints. `{}` when there is no briefing, and also when the
+/// session already holds this exact one — see [`banto_io::codex_briefing`] for
+/// why Codex needs that said, and for what counts as proof. Whatever stdin
+/// does not say (`source`, `transcript_path`) is doubt, and doubt delivers.
+///
+/// The recording in [`fire`] does not depend on this: a firing whose briefing is
+/// withheld still reached the member, which is what `briefed_at` exists to say.
+fn hook_output(briefing: Option<String>, stdin: &Value) -> Value {
+    let Some(additional_context) = briefing else {
+        return json!({});
     };
-    let _ = writeln!(std::io::stdout(), "{output}");
+    let source = stdin.get("source").and_then(Value::as_str);
+    let transcript_path = stdin
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(Path::new);
+    if codex_briefing::verdict(source, transcript_path, &additional_context) == Verdict::Suppress {
+        return json!({});
+    }
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": additional_context,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -231,6 +284,152 @@ mod tests {
             session_id_from_stdin(&serde_json::json!({"session_id": 123})),
             None
         );
+    }
+
+    /// One hook copy of `text` as a rollout line (synthetic; the shape is the
+    /// measured one — see `banto_io::codex_briefing`'s tests).
+    fn rollout_copy(text: &str) -> String {
+        json!({"type": "response_item", "payload": {"type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": text}]}})
+        .to_string()
+    }
+
+    fn rollout_file(lines: &[String]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut text = lines.join("\n");
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        (dir, path)
+    }
+
+    fn delivered(output: &Value) -> Option<&str> {
+        output["hookSpecificOutput"]["additionalContext"].as_str()
+    }
+
+    #[test]
+    fn a_resume_whose_history_holds_the_briefing_prints_nothing() {
+        let (_dir, path) = rollout_file(&[rollout_copy("the briefing")]);
+        let stdin = json!({"source": "resume", "transcript_path": path});
+        assert_eq!(
+            hook_output(Some("the briefing".to_string()), &stdin),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn a_resume_whose_history_lacks_the_briefing_delivers_it() {
+        let (_dir, path) = rollout_file(&[rollout_copy("some other text")]);
+        let stdin = json!({"source": "resume", "transcript_path": path});
+        let output = hook_output(Some("the briefing".to_string()), &stdin);
+        assert_eq!(delivered(&output), Some("the briefing"));
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+    }
+
+    #[test]
+    fn every_firing_that_is_not_a_proven_resume_delivers() {
+        let (_dir, path) = rollout_file(&[rollout_copy("the briefing")]);
+        for stdin in [
+            json!({"source": "startup", "transcript_path": path}),
+            json!({"source": "compact", "transcript_path": path}),
+            json!({"source": "clear", "transcript_path": path}),
+            json!({"source": "fork", "transcript_path": path}),
+            json!({"source": "resume"}),
+            json!({"transcript_path": path}),
+            json!({"source": 7, "transcript_path": path}),
+            json!({"source": "resume", "transcript_path": 7}),
+            json!({"source": "resume", "transcript_path": "/no/such/rollout.jsonl"}),
+            Value::Null,
+        ] {
+            let output = hook_output(Some("the briefing".to_string()), &stdin);
+            assert_eq!(delivered(&output), Some("the briefing"), "stdin {stdin}");
+        }
+    }
+
+    #[test]
+    fn no_briefing_prints_nothing_whatever_stdin_says() {
+        let (_dir, path) = rollout_file(&[rollout_copy("the briefing")]);
+        let stdin = json!({"source": "startup", "transcript_path": path});
+        assert_eq!(hook_output(None, &stdin), json!({}));
+    }
+
+    /// A brigade with a Director and one Worker, and the identity of that Worker.
+    fn worker_in_a_cell() -> (Store, HookIdentity) {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let identity = HookIdentity {
+            brigade_id: Some(brigade_id),
+            token: Some("worker-1".to_string()),
+            role: Some(BrigadeRole::Worker),
+        };
+        (store, identity)
+    }
+
+    #[test]
+    fn a_withheld_firing_still_records_that_the_hook_fired() {
+        let (store, identity) = worker_in_a_cell();
+        let config = brigade_config("I am {token}");
+        let briefing = build_briefing(&identity, &config, Some(&store)).unwrap();
+        let (_dir, path) = rollout_file(&[rollout_copy(&briefing)]);
+        let stdin = json!({"session_id": "s-1", "source": "resume", "transcript_path": path});
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(5_000);
+
+        let output = fire(&stdin, &identity, &config, Some(&store), at);
+
+        assert_eq!(output, json!({}), "the history holds it: nothing printed");
+        let member = store
+            .brigade_member(identity.brigade_id.unwrap(), "worker-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.briefed_at, Some(at));
+        assert_eq!(
+            member.briefed_session_id,
+            Some(SessionId("s-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_delivered_firing_records_too() {
+        let (store, identity) = worker_in_a_cell();
+        let config = brigade_config("I am {token}");
+        let stdin = json!({"session_id": "s-1", "source": "startup"});
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(5_000);
+
+        let output = fire(&stdin, &identity, &config, Some(&store), at);
+
+        assert!(delivered(&output).is_some());
+        let member = store
+            .brigade_member(identity.brigade_id.unwrap(), "worker-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.briefed_at, Some(at));
+    }
+
+    #[test]
+    fn nothing_is_recorded_without_a_session_id_on_stdin() {
+        // Withheld or not, `briefed_at` needs the session the hook ran under.
+        let (store, identity) = worker_in_a_cell();
+        let config = brigade_config("I am {token}");
+        let stdin = json!({"source": "startup"});
+
+        let output = fire(&stdin, &identity, &config, Some(&store), SystemTime::now());
+
+        assert!(delivered(&output).is_some());
+        let member = store
+            .brigade_member(identity.brigade_id.unwrap(), "worker-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.briefed_at, None);
     }
 
     fn brigade_config(worker_prompt: &str) -> Config {

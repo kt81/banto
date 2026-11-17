@@ -520,8 +520,11 @@ pub struct BrigadeMember {
     /// preserves older rows, whose product must still be inferred from a
     /// discovered session row when one exists.
     pub agent: Option<AgentKind>,
-    /// When `banto _hook` last delivered this member its role briefing —
-    /// `None` until the first time it fires (Claude never sets this at all,
+    /// When `banto _hook` last fired for this member — the hook reached it, which
+    /// is not the same as the briefing being printed: a resume whose history
+    /// already holds the briefing prints nothing and records this all the same
+    /// (`banto_io::codex_briefing`). `None` until the first time it fires
+    /// (Claude never sets this at all,
     /// it takes its briefing on launch argv instead; see
     /// `crate::model::AgentKind` — a Codex member with this still `None`
     /// after its session has clearly started is the signal that one of the

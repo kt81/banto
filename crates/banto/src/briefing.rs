@@ -42,6 +42,11 @@ const CODEX_DIRECTOR_TOOLS: [&str; 4] = [
 /// brigade briefing reads as license to spawn sub-agents for work the cell's
 /// own peers exist to do.
 ///
+/// The last sentence is for a history that carries the briefing more than
+/// once. `banto _hook` withholds a copy the session already holds
+/// (`banto_io::codex_briefing`), but not every case can be proven, so a member
+/// can still see two — and the roster in the older one may be out of date.
+///
 /// Kept out of the operator's configurable template deliberately: the
 /// template is where they say what a role is *for*, and these are product
 /// facts they should not have to know or maintain.
@@ -58,7 +63,9 @@ fn codex_addendum(role: BrigadeRole) -> String {
          call them; do not conclude from their absence that you have no channel.\n\n\
          The brigade is not this product's own multi-agent feature, and you are not \
          its primary agent. Do not spawn sub-agents for brigade work: work through \
-         your brigade peers, via banto.",
+         your brigade peers, via banto.\n\n\
+         If this conversation holds more than one banto briefing, the most recent one \
+         is current and replaces the earlier ones.",
         rest.join(", ")
     )
 }
@@ -228,6 +235,21 @@ mod tests {
         assert!(out.starts_with("you are worker-1\n\n"));
         for tool in MEMBER_TOOLS {
             assert!(out.contains(tool), "addendum must name {tool}");
+        }
+    }
+
+    #[test]
+    fn both_roles_are_told_the_latest_briefing_replaces_earlier_ones() {
+        for role in [BrigadeRole::Director, BrigadeRole::Worker] {
+            for template in ["you are someone", ""] {
+                let out = with_codex_addendum(template, role);
+                assert!(
+                    out.ends_with(
+                        "If this conversation holds more than one banto briefing, the most recent one is current and replaces the earlier ones."
+                    ),
+                    "{role:?}: {out}"
+                );
+            }
         }
     }
 
