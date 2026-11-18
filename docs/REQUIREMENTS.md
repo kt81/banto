@@ -1892,7 +1892,7 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   "Brigade"); a Claude Worker, the Director and a resumed member are not, and are
   never owed one. From the moment such a pane is hosted until banto's kickoff
   tracking drops it — the kickoff acknowledged (a session discovered for the pane,
-  or its session row), the pane gone, or the failure reported — a member whose
+  or its session row showing a first user message, which also drops a kickoff nothing was typed for), the pane gone, or the failure reported — a member whose
   sample reads idle counts like an unknown one: it blocks firing and breaks the
   stretch. That covers every state in between (waiting for the boot output to go
   quiet, waiting for the pane to reach its prompt, the line typed and awaiting its
@@ -1906,8 +1906,8 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   shows); the operator has an unsent draft in that pane (the kickoff waits for
   them; a draft is judged as the relay judges one, see "Auto-relay"); a typed line
   got no answer and the pane is not at its prompt to be asked again, or a Codex
-  Worker took its first turn but was not identified, or a Goinkyo took it and no
-  session row appeared (each reported once, below) —
+  Worker took its first turn but was not identified, or a Goinkyo took it and its
+  session shows no first message (each reported once, below) —
   owed again the moment banto types the line again; the last allowed attempt
   (three) was typed and its 15-second acknowledgement window has run out.
 - *Effect:* it records the brigade as wanting the operator (memory only) and, from
@@ -2152,10 +2152,17 @@ still hold the first sentence, which an idle live file cannot rule out). A retry
 due once the acknowledgement window has passed since the line was typed *and* the
 pane has been quiet for the quiet period, and it is never made once the live file
 has read busy after the Enter: a turn ran, so the entry only waits for the
-session's row. If the acknowledgement window has passed since the Enter and no row
-has appeared, it is reported once (`<name>: took its first turn but no session
-appeared for it — banto will not type it again`) and is no longer owed; a row
-that appears later acknowledges and drops the entry as before. A hold is said once in
+session's row. The row is the acknowledgement only once it has a preview, the
+session's first user message: a slash command run in the pane (`/model`, `/help`)
+already gives the session a row, with no preview, before any turn, and neither
+stops the kickoff nor acknowledges a line banto typed. A row with a preview drops
+the entry whether or not banto typed anything. With nothing typed it means the
+operator gave the Goinkyo its own first line, and the kickoff is never typed
+after it. If the acknowledgement window has passed since the Enter and the row has
+no first message, it is reported once (`<name>: took its first turn but its
+session shows no first message — banto will not type it again`) and is no longer
+owed; a row with a first message that appears later drops the entry as before. A
+hold is said once in
 the status line (`<name>: not at its prompt — answer what the pane shows, or
 type its first line yourself`), then reminded on the recurring cycle
 (`kickoff: waiting for <members> to reach its prompt`, naming only a kickoff
@@ -3362,7 +3369,10 @@ marked, a nudge to it is suppressed whatever the focus and however long ago
 the operator last typed, a nudge's own delayed Enter is dropped if the mark
 appeared before it was due, and the status line says the nudge is being held
 (re-shown every 30s, never over another message). A kickoff held by the mark is
-named on that same line and cycle.
+named on that same line and cycle. A member whose own kickoff is still owed with
+nothing typed is not nudged either, for a nudge would be its first turn; the hold
+ends when the kickoff is typed or dropped (for a Goinkyo, when its row shows the
+operator's own first line).
 
 When a known Codex pane has enabled Win32 input mode (`CSI ? 9001 h`), banto
 forwards exactly Shift+Enter and Ctrl+J as Win32 key

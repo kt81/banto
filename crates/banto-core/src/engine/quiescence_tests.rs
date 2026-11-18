@@ -5320,7 +5320,10 @@ fn a_goinkyo_kickoff_typed_on_the_tick_that_would_complete_the_stretch_does_not_
         acknowledged - SECOND,
     );
     assert_eq!(rang_at, None, "still waiting for its acknowledgement");
-    app.replace_rows(vec![row_for("gk")]);
+    app.replace_rows(vec![SessionRow {
+        preview: Some("[banto] first message".to_string()),
+        ..row_for("gk")
+    }]);
     let rang_at = tick_each_second_until(
         &mut state,
         &mut app,
@@ -5509,7 +5512,10 @@ fn a_goinkyo_that_needs_eight_seconds_to_become_ready_holds_the_ring_until_its_k
     let cmds = sample(&mut state, &mut app, &all_idle, checked);
     assert!(typed_into(&cmds, &goinkyo), "{cmds:?}");
     assert!(!rang(&cmds));
-    app.replace_rows(vec![row_for("gk")]);
+    app.replace_rows(vec![SessionRow {
+        preview: Some("[banto] first message".to_string()),
+        ..row_for("gk")
+    }]);
     let acknowledged = checked + SECOND;
     let rang_at = tick_each_second_until(
         &mut state,

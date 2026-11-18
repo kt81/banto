@@ -863,9 +863,11 @@ const GOINKYO_KICKOFF_LINE: &str = "[banto] This pane just started as your briga
 /// Kept after the line is typed (its `\r` is an ordinary [`PendingSubmit`], the
 /// same two-phase shape as a relay nudge or a Codex kickoff), because the typed
 /// line is not yet known to have started a turn: [`update_tick`] drops the entry
-/// once a row for the pane's session exists after a write (the acknowledgement),
-/// or the pane unstages first. Until then it is retried after
-/// [`KICKOFF_ACK_TIMEOUT`].
+/// once the pane's session row has a preview, which is its first user message
+/// (a row without one only says a slash command ran), or the pane unstages
+/// first. After a write that is the acknowledgement; with nothing typed it is
+/// the operator's own first line, and the kickoff is never typed. Until then it
+/// is retried after [`KICKOFF_ACK_TIMEOUT`].
 struct PendingGoinkyoKickoff {
     key: SessionKey,
     /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
@@ -2682,7 +2684,7 @@ impl EmporiumState {
     /// Worker's or a Goinkyo's first line, which is what starts its first turn.
     /// Read from the kickoff tracking the core already keeps. Owed, and so
     /// blocking the brigade-quiet bell, from the moment the pane is hosted until
-    /// the entry is dropped — acknowledged (a discovered session, a session row),
+    /// the entry is dropped — acknowledged (a discovered session, a session row with a first message),
     /// the pane gone, or the briefing reported unconfirmed — through every state
     /// in between: waiting for the boot output to go quiet, waiting for the pane
     /// to reach its prompt, typed and awaiting its acknowledgement, a retry
@@ -9526,10 +9528,16 @@ fn update_tick(
         }
     }
 
-    // A Goinkyo can have been discovered before its first turn starts. Only
-    // a row that appears after a write acknowledges that write.
+    // A Goinkyo's session row can exist before its first turn: a local slash
+    // command (`/model`, `/help`) writes a transcript with no user message, and
+    // that is already a row, with no preview. The row's preview is the first
+    // user message, so only a row that has one says a first turn happened. It
+    // acknowledges a line banto typed, and when nothing was typed it says the
+    // operator gave the Goinkyo its own first line, which banto must not follow
+    // with a kickoff.
     state.pending_goinkyo_kickoffs.retain(|pending| {
-        pending.sent_at.is_none() || app.row_for_id(pending.key.as_str()).is_none()
+        !app.row_for_id(pending.key.as_str())
+            .is_some_and(|row| row.preview.as_deref().is_some_and(|p| !p.trim().is_empty()))
     });
 
     // A line banto typed is in flight until its Enter has gone out; a turn is
@@ -9803,7 +9811,13 @@ fn update_tick(
         {
             pending.stuck = true;
         }
-        notify_kickoff_turn_unidentified(state, app, &key, "no session appeared for it", now);
+        notify_kickoff_turn_unidentified(
+            state,
+            app,
+            &key,
+            "its session shows no first message",
+            now,
+        );
     }
 
     // Members whose nudge only an unsent draft is holding back.
@@ -9851,12 +9865,17 @@ fn update_tick(
             // kickoff loops run first for a reason of their own, so the relay
             // is told here that the pane was not idle: its streak starts over
             // and the pane has to be seen idle twice more, after the line, to be
-            // nudged.
+            // nudged. A member whose own kickoff is still owed with nothing
+            // typed is held the same way: a nudge would be its first turn, and
+            // the kickoff typed behind it a second one. The hold ends when the
+            // kickoff is typed (then the in-flight rule above takes over) or
+            // dropped.
             let line_in_flight = written_this_tick.contains(&obs.key)
                 || state
                     .pending_submits
                     .iter()
-                    .any(|entry| entry.key == obs.key);
+                    .any(|entry| entry.key == obs.key)
+                || kickoff_untyped(state, &obs.key);
             let idle_this_tick = if line_in_flight {
                 Some(false)
             } else {
@@ -10431,6 +10450,20 @@ fn kickoff_gate(
     KickoffGate::Due
 }
 
+/// Whether a kickoff (a Codex Worker's or a Goinkyo's) is still owed for `key`
+/// with nothing typed yet. The relay does not nudge such a pane: the first line
+/// it receives would be the relay's, not the kickoff.
+fn kickoff_untyped(state: &EmporiumState, key: &SessionKey) -> bool {
+    state
+        .pending_kickoffs
+        .iter()
+        .any(|pending| &pending.key == key && pending.sent_at.is_none())
+        || state
+            .pending_goinkyo_kickoffs
+            .iter()
+            .any(|pending| &pending.key == key && pending.sent_at.is_none())
+}
+
 /// Whether the operator has an unsent draft in `key`'s pane, by the same
 /// verdict the relay uses ([`unsent_verdict`]): the keystroke mark says there
 /// may be one, and the pane's own input line — read for `agent` — is allowed to
@@ -10501,7 +10534,7 @@ fn notify_kickoff_unanswered(state: &mut EmporiumState, app: &App, key: &Session
 
 /// Tell the operator, once, that a member took its first turn but its session
 /// was not found in time: `missing` finishes "took its first turn but …" (a
-/// Codex Worker "was not identified", a Goinkyo "no session appeared for it").
+/// Codex Worker "was not identified", a Goinkyo "its session shows no first message").
 /// banto does not type the line again: the turn already ran.
 fn notify_kickoff_turn_unidentified(
     state: &mut EmporiumState,
@@ -10613,6 +10646,16 @@ mod tests {
 
     fn app_with(rows: Vec<SessionRow>) -> App {
         App::new(rows)
+    }
+
+    /// A row whose session has a first user message, which is what
+    /// acknowledges a Goinkyo's kickoff; [`row`] alone is a transcript that so
+    /// far holds only a slash command.
+    fn row_with_first_message(id: &str) -> SessionRow {
+        SessionRow {
+            preview: Some("[banto] first message".to_string()),
+            ..row(id)
+        }
     }
 
     #[test]
@@ -14954,7 +14997,7 @@ mod tests {
     const NOTICE_CODEX_UNIDENTIFIED: &str =
         "took its first turn but was not identified — banto will not type it again";
     const NOTICE_GOINKYO_NO_ROW: &str =
-        "took its first turn but no session appeared for it — banto will not type it again";
+        "took its first turn but its session shows no first message — banto will not type it again";
 
     /// The status line a kickoff notice for `key` must show, whole.
     fn kickoff_notice(state: &EmporiumState, app: &App, key: &SessionKey, tail: &str) -> String {
@@ -15283,7 +15326,7 @@ mod tests {
     #[test]
     fn a_sent_goinkyo_is_acknowledged_by_its_new_row_without_retrying() {
         let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("goinkyo-real")]);
+        let mut app = app_with(vec![row_with_first_message("goinkyo-real")]);
         let brigade = brigade_config();
         let key = SessionKey::from_id("goinkyo-real");
         let now = test_instant();
@@ -17552,6 +17595,146 @@ mod tests {
         }
     }
 
+    // --- a row is acknowledgement only once it has a first message ------------
+
+    #[test]
+    fn a_goinkyo_row_with_no_first_message_neither_stops_the_kickoff_nor_acknowledges_it() {
+        // A slash command run in the pane creates the session's transcript, so
+        // a row exists with no preview before any turn.
+        let (mut state, _, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+        let mut app = app_with(vec![row(key.as_str())]);
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+
+        let typed = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due);
+        assert_eq!(
+            writes_of(&typed),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+        goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due + Duration::from_secs(1));
+        goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due + Duration::from_secs(2));
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1, "not acknowledged");
+
+        let retry = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due + KICKOFF_ACK_TIMEOUT);
+        assert_eq!(
+            writes_of(&retry),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())],
+            "a retry still works"
+        );
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 2);
+    }
+
+    #[test]
+    fn a_first_message_in_the_row_before_anything_was_typed_drops_the_kickoff_for_good() {
+        // The operator gave the Goinkyo its first line themselves.
+        let (mut state, _, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+        let mut app = app_with(vec![row_with_first_message(key.as_str())]);
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due);
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+        for secs in [1, 5, 30] {
+            let later = goinkyo_kickoff_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                due + Duration::from_secs(secs),
+            );
+            assert!(
+                writes_of(&later).is_empty(),
+                "never typed at an idle, empty prompt: {later:?}"
+            );
+        }
+        assert!(!state.kickoff_owed(&key, due));
+    }
+
+    #[test]
+    fn the_relay_holds_a_goinkyo_whose_own_kickoff_is_untyped_until_the_entry_is_dropped() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+        // Not due for the whole test, so only the relay's own rule is in play.
+        state.pending_goinkyo_kickoffs[0].spawned_at = t0 + Duration::from_secs(3600);
+        let observe = || vec![unread_goinkyo_observation(&key, None)];
+        let nudge = RELAY_NUDGE_LINE.as_bytes().to_vec();
+
+        for secs in 1..=6 {
+            let cmds = goinkyo_tick_observing(
+                &mut state,
+                &mut app,
+                &brigade,
+                observe(),
+                t0 + Duration::from_secs(secs),
+            );
+            assert!(writes_of(&cmds).is_empty(), "tick {secs}: {cmds:?}");
+        }
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
+
+        // The operator's own first line shows in the row: the entry goes and the
+        // relay is free to nudge once the pane has been seen idle again.
+        app = app_with(vec![row_with_first_message(key.as_str())]);
+        let mut nudged = false;
+        for secs in 7..=12 {
+            let cmds = goinkyo_tick_observing(
+                &mut state,
+                &mut app,
+                &brigade,
+                observe(),
+                t0 + Duration::from_secs(secs),
+            );
+            nudged |= writes_of(&cmds).contains(&(key.clone(), nudge.clone()));
+        }
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+        assert!(nudged, "nudged after the entry was dropped");
+    }
+
+    #[test]
+    fn a_codex_worker_the_operator_started_is_never_typed_into_and_discovery_drops_its_entry() {
+        // Codex reports `done` after the operator's own first turn, and the
+        // gate asks for `idle`; the hook that discovers the session fires at that
+        // turn.
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_prompt(&mut state, &key, Some("working"));
+        let during = kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            t0 + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert!(writes_of(&during).is_empty(), "{during:?}");
+
+        paint_codex_prompt(&mut state, &key, Some("done"));
+        for secs in [1, 5, 20] {
+            let cmds = kickoff_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                t0 + CODEX_KICKOFF_QUIET_PERIOD + Duration::from_secs(secs),
+            );
+            assert!(writes_of(&cmds).is_empty(), "done at {secs}s: {cmds:?}");
+        }
+        assert_eq!(state.pending_kickoffs.len(), 1, "still waiting");
+        assert!(state.pending_kickoffs[0].sent_at.is_none());
+
+        let at = t0 + Duration::from_secs(30);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::DiscoveryResult {
+                key: key.clone(),
+                session_id: "codex-sess".to_string(),
+                member: Some((1, "worker-1".to_string())),
+            },
+            at,
+        );
+        assert!(state.pending_kickoffs.is_empty());
+        let after = kickoff_tick(&mut state, &mut app, &brigade, at + Duration::from_secs(5));
+        assert!(writes_of(&after).is_empty(), "{after:?}");
+    }
+
     // --- the reminder names only a kickoff with nothing typed ----------------
 
     #[test]
@@ -18230,7 +18413,8 @@ mod tests {
     }
 
     #[test]
-    fn a_goinkyo_that_took_its_turn_with_no_session_row_is_reported_once_and_not_owed() {
+    fn a_goinkyo_that_took_its_turn_with_no_first_message_in_its_session_is_reported_once_and_not_owed()
+     {
         let (mut state, mut app, brigade, key, t0) =
             goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
         goinkyo_tick_observing(
@@ -18282,7 +18466,7 @@ mod tests {
         assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
 
         // A row that appears afterwards acknowledges the entry as before.
-        app = app_with(vec![row(key.as_str())]);
+        app = app_with(vec![row_with_first_message(key.as_str())]);
         goinkyo_tick_observing(
             &mut state,
             &mut app,
