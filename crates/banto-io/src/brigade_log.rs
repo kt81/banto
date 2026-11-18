@@ -4,10 +4,10 @@
 //! reads it back, rotates it or deletes it.
 //!
 //! One file per brigade, `brigade-<id>.log` under a directory the caller names
-//! (in production `DataDir::logs_dir` — inside banto's own data directory, the
-//! location deliberately not configurable, so the log can never be pointed
-//! outside it). Written by the `banto _mcp` processes, one per agent, which
-//! share the file. Each entry is handed to the OS whole, in one `write` on an
+//! (in production `DataDir::logs_dir` — inside banto's own data directory,
+//! wherever the operator put that; the file's place within it is fixed, so the
+//! log can never be pointed anywhere else). Written by the `banto _mcp`
+//! processes, one per agent, which share the file. Each entry is handed to the OS whole, in one `write` on an
 //! append-only handle; entries could interleave only if the OS accepted that
 //! write short and `write_all` needed a second one. Measured on one machine —
 //! local NTFS, 16 processes at once, entries up to 1 MB — that never happened.

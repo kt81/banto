@@ -856,8 +856,15 @@ pub struct Config {
     pub claude_home: Option<PathBuf>,
     /// Overrides the provider's default `~/.codex` location (read-only!).
     pub codex_home: Option<PathBuf>,
-    /// Overrides `banto.db` in `banto_io::data_dir::DataDir::default_root`.
+    /// Overrides `banto.db` in the data directory. May lie outside it, in which
+    /// case the data-directory sweep does not run (it only trusts the database
+    /// it owns). Never inside an agent home.
     pub db_path: Option<PathBuf>,
+    /// Overrides `banto_io::data_dir::DataDir::default_root`: the directory the
+    /// database, the MCP configs, the consultation requests and the message logs
+    /// live in. Top level only: under a `[section]` header it is that table's
+    /// unknown field and is ignored. Never inside an agent home.
+    pub data_dir: Option<PathBuf>,
 }
 
 /// The result of resolving [`Config::agents`]: the working set, plus enough
@@ -1188,6 +1195,7 @@ mod tests {
         assert_eq!(config.claude_home, None);
         assert_eq!(config.codex_home, None);
         assert_eq!(config.db_path, None);
+        assert_eq!(config.data_dir, None);
     }
 
     #[test]
@@ -1874,6 +1882,27 @@ worker_effort_codex = \"\"
             Some(PathBuf::from("C:/synthetic/codex-home"))
         );
         assert_eq!(config.db_path, Some(PathBuf::from("C:/synthetic/banto.db")));
+    }
+
+    #[test]
+    fn data_dir_is_a_top_level_key_and_means_nothing_under_a_section() {
+        let config = parse(
+            "data_dir = \"C:/synthetic/banto-data\"
+",
+        );
+        assert_eq!(
+            config.data_dir,
+            Some(PathBuf::from("C:/synthetic/banto-data"))
+        );
+        // Written after a `[section]` header the key belongs to that table, which
+        // reads it as an unknown field: ignored, not an error, and not the data
+        // directory. The README warns about it, so this is what it relies on.
+        let config = parse(
+            "[brigade]
+data_dir = \"C:/synthetic/banto-data\"
+",
+        );
+        assert_eq!(config.data_dir, None);
     }
 
     #[test]

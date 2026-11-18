@@ -168,12 +168,25 @@ read-only. banto's own data lives under its own directories:
   (Windows: `%APPDATA%\banto\`) by default — see
   [Configuration](#configuration) for the full resolution order
   (`--config`, `$BANTO_CONFIG`, XDG, `~/.config`)
-- Data (sqlite): `dirs::data_local_dir()/banto/banto.db`
-  (Windows: `%LOCALAPPDATA%\banto\`)
+- Data (sqlite and working files): `dirs::data_local_dir()/banto/banto.db`
+  (Windows: `%LOCALAPPDATA%\banto\`) by default; `data_dir` in the config or
+  `$BANTO_DATA_DIR` names another place (see [Configuration](#configuration)).
+  A data directory or `db_path` inside `~/.claude` or `~/.codex` (reached by
+  any name, links included) is refused: the UI and `banto _mcp` fail to start,
+  and the agent hook silently opens no store.
 
 Even the MCP wiring honors this: member `--mcp-config` files are written
 under banto's data dir and passed by argv, never installed into Claude's own
 configuration.
+
+One banto UI per database: a second `banto` that would open a database a running
+one already uses refuses to start, naming the database and, when it can, the
+holder's process id (the lock is `banto.db.lock` beside the database and goes the
+moment its holder exits, however it ends). To run a second banto, give it its own
+data directory or database: `BANTO_DATA_DIR`, `data_dir` in the config, or
+`db_path` (the hidden `--data-dir` / `--db-path` flags work too). A filesystem
+that does no locks cannot be checked; banto then starts and says so on the status
+line.
 
 **One named exception.** Reading a Codex sqlite database (`state_5.sqlite`
 for the session index, `logs_2.sqlite` for liveness — the same strategy was
@@ -324,6 +337,13 @@ defaults, same as today.
 ```toml
 claude_home = "C:/Users/you/.claude"   # optional override
 db_path = "..."                        # optional override; an empty value is a startup error
+# Where banto keeps its database and working files (MCP configs, consultation
+# requests, message logs). Optional; an empty value is a startup error, and so
+# is a path inside the Claude or Codex home. `$BANTO_DATA_DIR` wins over it.
+# It must stay up here, above the first [section]: under [brigade] it would be
+# read as brigade.data_dir and silently ignored. Changing it moves nothing —
+# banto opens an empty database in the new place.
+data_dir = "D:/banto-data"
 
 # "all" (default) | "claude" | "codex" | "claude,codex" — which agent
 # products banto discovers sessions for. A disabled product's own files
@@ -354,7 +374,7 @@ worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
 worker_autocompact = 250000
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
 # For banto developers: append every brigade message, in full, to
-# <data dir>/banto/logs/brigade-<id>.log. Off by default. The file holds real
+# <data dir>/logs/brigade-<id>.log. Off by default. The file holds real
 # conversation content; banto never rotates or deletes it — don't commit it.
 message_log = false
 # Role briefings appended to each member's system prompt at launch.

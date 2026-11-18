@@ -1,4 +1,6 @@
-//! Persistent store: sqlite (rusqlite, bundled) under `dirs::data_local_dir()/banto`.
+//! Persistent store: sqlite (rusqlite, bundled), by default `banto.db` in the data
+//! directory (`dirs::data_local_dir()/banto` unless another is chosen; the
+//! `db_path` key may put the file elsewhere).
 //!
 //! Responsibilities (docs/REQUIREMENTS.md "Module layout"):
 //! - groups / pins / archived sessions (banto-owned; never written to

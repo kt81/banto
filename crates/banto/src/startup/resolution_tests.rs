@@ -7,13 +7,13 @@ use clap::Parser;
 use super::*;
 use crate::Cli;
 
-struct Machine {
+pub(super) struct Machine {
     _tmp: tempfile::TempDir,
-    root: PathBuf,
+    pub(super) root: PathBuf,
 }
 
 impl Machine {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         Self {
             root: tmp.path().to_path_buf(),
@@ -21,11 +21,11 @@ impl Machine {
         }
     }
 
-    fn path(&self, relative: &str) -> PathBuf {
+    pub(super) fn path(&self, relative: &str) -> PathBuf {
         self.root.join(relative)
     }
 
-    fn write(&self, relative: &str, text: &str) -> PathBuf {
+    pub(super) fn write(&self, relative: &str, text: &str) -> PathBuf {
         let path = self.path(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, text).unwrap();
@@ -41,7 +41,7 @@ impl Machine {
         }
     }
 
-    fn inputs(&self) -> Inputs {
+    pub(super) fn inputs(&self) -> Inputs {
         Inputs {
             env: self.env(),
             cwd: Some(self.path("cwd")),
@@ -50,7 +50,7 @@ impl Machine {
     }
 }
 
-fn resolved(inputs: &Inputs) -> Resolved {
+pub(super) fn resolved(inputs: &Inputs) -> Resolved {
     resolve(inputs, Strictness::Strict).unwrap().1
 }
 

@@ -361,6 +361,32 @@ fn children_of_a_parent_with_no_data_directory_have_none_either() {
     assert_agrees("_hook", &parent, &hook, false);
 }
 
+/// A directory chosen by `BANTO_DATA_DIR`, written relative: the parent makes it
+/// absolute against its own working directory, and a child — in another one, with
+/// a variable of its own or none — is handed that answer.
+#[test]
+fn children_of_a_parent_whose_data_directory_was_chosen_by_variable_resolve_what_it_did() {
+    let world = World::new();
+    let (_, parent) = world.parent_in(Env {
+        banto_data_dir: Some(PathBuf::from("chosen data")),
+        ..world.env()
+    });
+    assert_eq!(parent.data_dir, Some(world.parent_cwd.join("chosen data")));
+    let invocations = invocations(&parent);
+    for (label, argv) in [
+        ("claude _mcp", &invocations.claude_mcp),
+        ("codex _mcp", &invocations.codex_mcp),
+    ] {
+        let child = world
+            .resolve_argv(argv, None)
+            .unwrap_or_else(|err| panic!("{label} cannot start: {err:#}"));
+        assert_eq!(child.data_dir, parent.data_dir, "{label}");
+        assert_agrees(label, &parent, &child, true);
+    }
+    let hook = world.resolve_hook(&invocations.hook_env, None);
+    assert_agrees("_hook", &parent, &hook, false);
+}
+
 #[test]
 fn a_hook_resolves_the_config_and_database_its_parent_did() {
     let world = World::new();

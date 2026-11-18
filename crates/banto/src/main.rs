@@ -21,8 +21,10 @@
 //! Everything under the resolved Claude home, and under the resolved Codex
 //! home, is treated as strictly read-only.
 //! banto's own database (groups, pins, archive, brigades) lives under
-//! `Config.db_path`, falling back to `banto.db` in
-//! `banto_io::data_dir::DataDir::default_root`.
+//! `Config.db_path`, falling back to `banto.db` in the data directory. That is
+//! `--data-dir`, else `BANTO_DATA_DIR`, else `Config.data_dir`, else
+//! `banto_io::data_dir::DataDir::default_root`; one inside an agent's home is
+//! refused, as is a `db_path` inside one.
 //!
 //! `config.toml` itself is located by `banto_io::config::resolve_config_path`'s
 //! resolution order. A banto that was itself started by another banto (`_mcp`,
@@ -44,6 +46,7 @@ mod hook;
 mod launch;
 mod mcp;
 mod session;
+mod single_instance;
 mod startup;
 
 use std::collections::BTreeSet;
@@ -278,6 +281,15 @@ fn main() -> Result<()> {
             let claude_home = resolved.claude_home()?;
             let codex_home = resolved.codex_home();
             let thresholds = thresholds_from(&config.activity);
+            // Before the store: opening it migrates, and a migration under a
+            // running older banto would leave that one unable to reopen its own
+            // database. Only this arm claims; `_mcp` and `_hook` are this UI's
+            // own children and open the same database. Held until `run_emporium`
+            // returns, shutdown included.
+            let single_instance::Claim {
+                lock: _instance_lock,
+                notice: instance_notice,
+            } = single_instance::claim_database(resolved.db_path()?)?;
             // `Store`'s write methods take `&mut self` (they wrap a transaction)
             // and the store is shared by the event loop and its executors, so a
             // `RefCell` gives interior mutability without threading `&mut Store`
@@ -294,6 +306,10 @@ fn main() -> Result<()> {
                     agent_binaries: &config.agent_binaries,
                     resolved_agents: &resolved_agents,
                     child: &resolved,
+                    database_notices: startup::split_database_notice(&inputs, &config, &resolved)
+                        .into_iter()
+                        .chain(instance_notice)
+                        .collect(),
                 },
             )
         }

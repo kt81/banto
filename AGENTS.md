@@ -40,7 +40,7 @@ Four crates. The dependency direction is the discipline, not a preference —
 
 ## Invariants (never violate)
 
-1. Every agent's own home is **read-only** — `~/.claude`, and `~/.codex` (or `$CODEX_HOME`) since Codex sessions are indexed the same way. banto may write only to its own config/data directories (`banto/` under dirs::config_dir / data_local_dir)
+1. Every agent's own home is **read-only** — `~/.claude`, and `~/.codex` (or `$CODEX_HOME`) since Codex sessions are indexed the same way. banto may write only to its own config file and data directory — by default `banto/` under dirs::config_dir / data_local_dir, or the data directory (`data_dir` / `BANTO_DATA_DIR` / `--data-dir`) and `db_path` the operator chose — and the UI and `_mcp` refuse to start with any of those inside an agent's home (the hook silently opens no store)
 2. **Never bring real session data into the repository.** Tests must use hand-made synthetic fixtures
 3. Parse JSONL leniently: ignore unknown record types and fields, skip broken lines instead of erroring
 4. Never allow a double resume of the same session (it forks the session history)

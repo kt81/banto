@@ -133,23 +133,24 @@ fn shown_value(written: &str) -> String {
 
 /// Every notice the status line carries at startup, in the order it carries
 /// them: `trust_notice` (already decided, since it needs the store and the
-/// agent's own home), then what config was ignored. Pulled out of
+/// agent's own home), `database_notices` (decided at startup, where the
+/// locations were resolved and the database claimed), then what
+/// config was ignored. Pulled out of
 /// `crate::embedded::run` so that a notice dropped from the line is a failing
 /// test rather than a silent one.
 pub fn startup_notices(
     trust_notice: Option<String>,
+    database_notices: Vec<String>,
     resolved_agents: &ResolvedAgents,
     brigade: &BrigadeConfig,
 ) -> Vec<String> {
-    [
-        trust_notice,
-        agents_ignored_notice(resolved_agents),
-        autocompact_ignored_notice(brigade),
-        goinkyo_consult_ignored_notice(brigade),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    trust_notice
+        .into_iter()
+        .chain(database_notices)
+        .chain(agents_ignored_notice(resolved_agents))
+        .chain(autocompact_ignored_notice(brigade))
+        .chain(goinkyo_consult_ignored_notice(brigade))
+        .collect()
 }
 
 /// Status-line notice telling the operator that Codex has not been asked to
@@ -838,7 +839,7 @@ mod tests {
             goinkyo_consult: "sometimes".to_string(),
             ..BrigadeConfig::default()
         };
-        let notices = startup_notices(None, &agents, &brigade);
+        let notices = startup_notices(None, Vec::new(), &agents, &brigade);
         assert!(
             notices
                 .iter()
@@ -852,6 +853,7 @@ mod tests {
         let agents = banto_core::config::resolve_agents("made-up-product");
         let notices = startup_notices(
             Some("trust".to_string()),
+            Vec::new(),
             &agents,
             &brigade_with_autocompact("abc"),
         );
@@ -862,9 +864,23 @@ mod tests {
     }
 
     #[test]
+    fn startup_notices_carry_the_database_notices_right_after_the_trust_notice() {
+        let agents = banto_core::config::resolve_agents("made-up-product");
+        let notices = startup_notices(
+            Some("trust".to_string()),
+            vec!["database".to_string(), "instance".to_string()],
+            &agents,
+            &BrigadeConfig::default(),
+        );
+        assert_eq!(notices.len(), 4, "{notices:?}");
+        assert_eq!(notices[..3], ["trust", "database", "instance"]);
+        assert!(notices[3].starts_with("agents:"), "{notices:?}");
+    }
+
+    #[test]
     fn startup_notices_are_empty_when_nothing_was_ignored() {
         let agents = banto_core::config::resolve_agents("");
-        assert!(startup_notices(None, &agents, &BrigadeConfig::default()).is_empty());
+        assert!(startup_notices(None, Vec::new(), &agents, &BrigadeConfig::default()).is_empty());
     }
 
     #[test]

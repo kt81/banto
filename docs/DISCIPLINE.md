@@ -337,7 +337,14 @@ These bounds apply to log rows and retained associations, not necessarily the
 number or cost of candidate-session queries.
 File writes: banto's own sqlite DB, per-member `--mcp-config` files, diagnostic logs
 (`BANTO_INPUT_LOG`, `BANTO_BELL_LOG`, one line per executed bell with its cause) —
-all under banto's own config/data dirs, never `~/.claude`.
+all under banto's own config/data dirs (the data dir is the operator's to name, never inside an agent's home), never `~/.claude`.
+The single-instance lock: one more file the UI writes, `<database file>.lock` (an
+exclusive advisory lock, empty, never deleted) and its `<database file>.lock.pid`
+sidecar (the holder's process id, a hint for the refusal message only), both next
+to the database. Taken in `main`'s UI arm, before the store opens, through
+`banto_io::instance_lock`; the decision about what to do with the outcome is the
+plain function `single_instance::claim_database`. Added by reading the code, not by
+repeating the sweep.
 Clocks: `Instant::now()` (event loops, relay ticks, click timing, status
 expiry),
 `SystemTime::now()` (store timestamps, discovery `since` — both the
@@ -358,8 +365,8 @@ Terminal control: raw mode, alt screen, mouse capture, bracketed paste, terminal
 size, the host bell (`Cmd::RingHostBell { cause }`, a bare BEL — also what a brigade
 going quiet rings through; the cause only names the deciding site for
 `BANTO_BELL_LOG` and changes nothing written).
-Environment: the variables startup reads (`BANTO_CONFIG`, `XDG_CONFIG_HOME`,
-`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), gathered into plain values before anything
+Environment: the variables startup reads (`BANTO_CONFIG`, `BANTO_DATA_DIR`,
+`XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`), gathered into plain values before anything
 decides from them — with the relay decision functions, the house pattern to
 imitate; `BANTO_*` diagnostics, `std::env::current_exe()` (mcp-config argv
 construction), `std::env::current_dir()` (cwd fallbacks in the UI).

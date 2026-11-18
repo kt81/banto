@@ -598,6 +598,22 @@ mod tests {
         }
     }
 
+    /// An agent's home is read-only for banto: a hook whose database path was
+    /// pointed into one opens nothing there, so it creates nothing in it either.
+    #[test]
+    fn a_database_path_inside_an_agent_home_means_no_store_and_nothing_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut resolved = resolved_with_db(Some(home.join("banto.db")));
+        resolved.claude_home = Some(home.clone());
+        assert!(open_store_leniently(&resolved).is_none());
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+        // Beside the home is an ordinary place for it.
+        resolved.db_path = Some(dir.path().join("banto.db"));
+        assert!(open_store_leniently(&resolved).is_some());
+    }
+
     #[test]
     fn an_empty_database_path_means_no_store_so_no_briefing_and_nothing_is_created() {
         let dir = tempfile::tempdir().unwrap();

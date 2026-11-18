@@ -4,8 +4,11 @@
 //! hit wins: an explicit `--config`/`BANTO_CONFIG` override, then
 //! `$XDG_CONFIG_HOME/banto/config.toml`, then `~/.config/banto/config.toml`,
 //! then the platform default `dirs::config_dir()/banto/config.toml`. Data
-//! (sqlite) lives in `dirs::data_local_dir()/banto`; banto never writes
-//! outside these two directories of its own.
+//! (sqlite and the working files) lives in the data directory,
+//! `dirs::data_local_dir()/banto` unless `data_dir` (here), `BANTO_DATA_DIR` or
+//! `--data-dir` names another. banto writes only there and to its config file,
+//! never in an agent's home — which is why `banto::startup` refuses a data
+//! directory or database path inside one.
 //!
 //! Loading is tolerant by default: a missing file means all defaults,
 //! unknown keys are ignored. A malformed file is an error only for the

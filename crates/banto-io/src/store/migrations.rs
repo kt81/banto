@@ -339,7 +339,7 @@ const MIGRATIONS: &[&str] = &[
 /// (negative or newer than this build) is rejected.
 ///
 /// Several processes open the same file (the emporium, each agent's `banto`
-/// MCP server, a second banto), so a migration is decided *under the write
+/// MCP server and hook), so a migration is decided *under the write
 /// lock*: `BEGIN IMMEDIATE` first, then `user_version`, then apply or skip,
 /// then commit. Choosing the script from a version read before taking the lock
 /// would use a stale answer — the process that waited on the lock would run an

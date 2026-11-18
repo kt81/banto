@@ -16,7 +16,9 @@
 //!   requests and message logs live, and the sweep of working files nobody owns any more
 //! - [`config`]  loading `banto_core::config`'s types from disk
 //! - [`directory_trust`] advisory-only read of whether Codex/Claude Code has trusted a given cwd
+//! - [`file_identity`] which directory a path leads to, by the filesystem's own identity rather than its spelling
 //! - [`input`] raw terminal events, read and timestamped off their own thread
+//! - [`instance_lock`] the exclusive lock that keeps a second banto UI off one database
 //! - [`lineage`] resolving auto-compaction parent links (beside the provider)
 //! - [`provider`] session discovery + tolerant JSONL parsing (Claude Code) / sqlite (Codex)
 //! - [`pty`]     PTY host abstraction (portable-pty-psmux)
@@ -38,7 +40,9 @@ pub mod codex_trust;
 pub mod config;
 pub mod data_dir;
 pub mod directory_trust;
+pub mod file_identity;
 pub mod input;
+pub mod instance_lock;
 pub mod lineage;
 pub mod provider;
 pub mod pty;

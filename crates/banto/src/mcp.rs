@@ -88,9 +88,10 @@ pub struct Identity {
 /// `claude_home` and (when available) `codex_home` — [`tool_brigade_status`]
 /// checks each product's separate source: Claude's live-state files, and for
 /// Codex its process log and rollout. `goinkyo_dir` is where
-/// [`tool_consult_goinkyo`] writes a consultation request; `None` when the
-/// platform's data-local directory couldn't be determined (see
-/// `banto_io::data_dir::DataDir::default_root`, the same fallibility). `message_log` is
+/// [`tool_consult_goinkyo`] writes a consultation request, under the resolved
+/// data directory; `None` when none was resolved (the parent had none to hand
+/// down because the platform's data-local directory could not be determined: see
+/// `banto_io::data_dir::DataDir::default_root`). `message_log` is
 /// `Some` only when `[brigade] message_log` is on (see [`MessageLog`]).
 struct ServerContext {
     identity: Identity,

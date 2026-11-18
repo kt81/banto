@@ -1123,7 +1123,9 @@ crates/
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
 │  ├─ store/            # rusqlite: groups/pins/archived, brigades, UI preferences
 │  ├─ watch/            # filesystem watching (notify) for live TUI updates — `LiveWatch` (debounced reload trigger) + the raw change source
-│  ├─ data_dir.rs       # banto's own data directory (default `dirs::data_local_dir()/banto`): where each working file lives, the database included, and the sweep of ended members' files
+│  ├─ data_dir.rs       # banto's own data directory (default `dirs::data_local_dir()/banto`, or the one the operator names): where each working file lives, the database included, and the sweep of ended members' files
+│  ├─ instance_lock.rs  # the exclusive lock beside the database that keeps a second banto UI off it, and its pid sidecar
+│  ├─ file_identity.rs  # which directory a path leads to by the filesystem's own identity, for the agent-home check
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ codex_catalog.rs  # the model catalog compiled into the installed Codex: `codex debug models --bundled` behind a trait, bounded by a timeout
@@ -1133,6 +1135,7 @@ crates/
 ├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view (session list, summary), paint (vt100 screen → buffer cells), render_modal, strip (the title status of every tile; the message rows of a collapsed one), hints, text
 └─ banto/               # bin: clap subcommands (banto, banto _mcp, banto _hook, banto list, ...), the one UI's event loop and executors
    ├─ main.rs           # clap CLI and dispatch
+   ├─ single_instance.rs # the claim `main`'s UI arm makes on the database before opening the store, and what a refusal or an unchecked claim says
    ├─ startup.rs        # where config, database, data dir and the agent homes are (and what a child is handed)
    ├─ session.rs        # discovery + activity classification into list rows, and the store loaders the list needs (pins, groups, archive, hidden members, Directors)
    ├─ launch.rs         # how an agent is started: AgentLaunch argv per product (`SessionStart`: a resume carries no model or effort, a creation may), CodexBrigade's `-c` overrides, [agent_binaries] selection, OpenContext, and `is_live` — the double-resume guard
@@ -1930,8 +1933,8 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   that one taken at face value could mark a brigade as observed, or mail as unread,
   through a pane that is not that member (a tick gathered just before a session-id
   change the core has already applied). In a tick without that observation — a
-  roster that could not be read, or the brigade gone from the store by any path,
-  another banto on the same database included — nothing fires and the quiet stretch
+  roster that could not be read, or the brigade gone from the store by any path —
+  nothing fires and the quiet stretch
   starts over; the armed state is kept. A disband in flight does not fire and its
   watch is kept as it was; a successful disband ends the watch (what was kept for it
   is dropped with it); a failed one leaves it watched; and a former Director left
@@ -2862,7 +2865,7 @@ JSON-RPC 2.0 to it (newline-delimited, no Content-Length framing — requests
 carry an `id` and get a response, notifications don't). Because banto controls
 the launch argv, the config file lives under banto's own data directory
 (`<data dir>/mcp/<brigade_id>-<token>.json`, the data directory being
-`dirs::data_local_dir()/banto` unless handed down — below) and is never
+`dirs::data_local_dir()/banto` unless the operator chose another — below) and is never
 installed into Claude Code's own configuration (`crates/banto/src/mcp.rs`
 module doc; `crates/banto/src/embedded/emporium.rs`'s `write_mcp_config`).
 Every path under the data directory is named in one place,
@@ -2884,7 +2887,28 @@ naming the key and the config file, rather than a silently non-persistent sessio
 `_hook` then runs as it does with no store: no briefing, nothing recorded) and
 hands the result on. The data directory is resolved the same way, once, and is
 what the default database (`<data dir>/banto.db`) hangs off, so a database named
-elsewhere does not move it. `_mcp` takes it as hidden global flags straight after the
+elsewhere does not move it. Its sources, first hit wins: the hidden `--data-dir`
+flag, `BANTO_DATA_DIR` (empty means unset), the top-level `data_dir` key of
+`config.toml` (a key under a `[section]` belongs to that section and means
+nothing), `dirs::data_local_dir()/banto`. A relative value is made absolute
+against the working directory; an empty `data_dir` is a startup error naming the
+key and the file; a relative one with no readable working directory is an error
+too. A data directory, and equally a `db_path`, inside the resolved Claude home
+or Codex home is refused, naming the key and the home (invariant 1): the UI and
+`_mcp` fail to start, and the hook, which must never fail the operator's agent,
+silently opens no store. "Inside" is judged on where the path leads: its longest
+existing ancestor is canonicalised (symlinks and junctions followed, 8.3 short
+names and a trailing dot or space resolved on Windows), the rest is read as
+written, and names are compared folded on Windows and macOS. Whatever that
+cannot see, the filesystem's identity does: a path with an existing ancestor that
+is the very directory a home is (same volume and file index, however either was
+spelled: `\\localhost\C$\…`, a computer name, a short name) is inside it
+(`banto_io::file_identity`). Nothing is created,
+and a link made after startup is not seen. Changing the data directory moves
+nothing: the new place starts with an empty database. When both a data directory
+and a `db_path` are named and the database is not `<data dir>/banto.db`, the
+status line says the sweep does not run and that the MCP, request and log files
+stay in the data directory (`startup::split_database_notice`). `_mcp` takes it as hidden global flags straight after the
 subcommand name: `--parent-config <file>` (the file the parent loaded, loaded the
 same way) or `--parent-no-config` (it loaded none), `--db-path`, `--data-dir`,
 `--claude-home` and, when it has one, `--codex-home` — each path absolute and a single argument
@@ -2910,6 +2934,48 @@ keeps its home is not banto's to decide. A member that is already running keeps
 the server it was launched with; the next time its pane is opened (re-staging the
 brigade, a relaunch, a new member) the MCP config file is rewritten and the
 launch argv rebuilt with the hand-off.
+
+**One banto UI per database.** A banto UI that would open a database another
+running banto UI already uses does not start: it exits non-zero with one line on
+standard error naming the database, the holder's process id when known, and the way
+out (quit that banto, or give this one another database through `BANTO_DATA_DIR`,
+or the config keys `data_dir` or `db_path`). The claim
+is `single_instance::claim_database`, called in `main`'s UI arm and nowhere else:
+`_mcp` and `_hook` are the running UI's own children (the hook is the agent's) and
+open the database it holds, and `list` and `versions` open none. It comes after the
+database path is resolved and checked (a path inside an agent's home is refused
+first) and *before* `Store::open`, because opening migrates, and a migration under a
+running older banto would leave that one unable to reopen its own database. It also
+comes before the terminal is touched, so a refusal leaves the screen alone. The
+database's directory is created first so that a first run takes the lock too; the
+lock is held until the event loop returns, the five-second shutdown included.
+
+The lock is the operating system's (`std::fs::File::try_lock`: `LockFileEx` on
+Windows, `flock` on Unix) on `<database file>.lock` beside the database
+(`banto_io::instance_lock`). The path is canonicalised where it can be, so two
+spellings of one database (a relative path, a link, `..`, another case of the same
+name on a case-insensitive filesystem) meet at one lock file. The lock file is
+opened for reading and writing, never deleted, and holds nothing, because Windows
+forbids other processes from reading a locked file. The holder's process id is in a
+sidecar, `<database file>.lock.pid`, written after the lock is taken and read only
+to name the holder in the refusal: a hint, never consulted for the decision, so a
+stale or missing one just leaves the process unnamed. *Measured* (worker-8,
+2026-11-18, Windows 11 NTFS and WSL2 ext4): the lock is released at once, within
+about 24 ms, when its holder exits or is killed hard (20 of 20 cycles); a child
+that outlives its holder does not keep it; an append-only handle cannot take a lock
+on Windows; and the bytes of a locked file are unreadable to other processes there.
+
+*When the check cannot be made* because the lock file cannot be opened or locking
+itself fails (a filesystem with no locks, as some network shares) the UI starts
+anyway and the status line says so with the kind of the I/O error
+(`single-instance check failed (…)`): refusing there would keep banto off a share
+that merely lacks locks and protect nothing. A directory that cannot be created is
+also an unchecked claim, but it does not start the UI: startup stops at the store,
+which meets the same directory, exactly as it did before there was a lock. It also means two bantos on one
+database, which is what this exists to prevent, can run; the notice is the only
+sign. A banto on another database may still run beside this one, in the same data
+directory even; the sweep and the file names are discussed under "Working files of
+ended members". Not measured: the lock on a network filesystem, and on macOS.
 
 **Working files of ended members.** The data directory holds two kinds of
 file per member that nothing used to delete: the MCP config
@@ -2983,8 +3049,8 @@ message `send_to_peer` accepts, and every `consult_goinkyo` request (as the text
 the Goinkyo reads), is appended in full to
 `<data dir>/logs/brigade-<brigade_id>.log`, written by the
 `banto _mcp` process that handled the call (`crates/banto-io/src/brigade_log.rs`).
-The location is not configurable, so the file is always inside banto's own data
-directory. An entry is a header line starting with `@@@` — UTC time, `message
+The file's name is not configurable, so it is always inside banto's own data
+directory (wherever the operator put that). An entry is a header line starting with `@@@` — UTC time, `message
 #<queue id>` or `consultation-request`, `from=<token>` and `to=<token>` or
 `to=role:<role>` (a display name in quotes after its token), and last
 `bytes=<n>` — then the body verbatim, then two newlines:

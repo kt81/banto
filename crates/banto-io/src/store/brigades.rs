@@ -41,12 +41,51 @@ use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 pub const REQUEST_OPEN: &str = "open";
 
 impl Store {
+    /// A brigade with no member yet. Formation does not use this: between this
+    /// commit and the first member's, the janitor would delete the brigade (see
+    /// [`Self::create_brigade_with_director`]).
     pub fn create_brigade(&self, name: &str) -> Result<BrigadeId, StoreError> {
         self.conn.execute(
             "INSERT INTO brigades (name, created_at_ms) VALUES (?1, ?2)",
             params![name, system_time_to_unix_ms(SystemTime::now())],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Creates a brigade and its Director in one transaction, so that no commit
+    /// ever holds a brigade with nobody in it.
+    ///
+    /// As two commits (`create_brigade`, then a member) they would leave a
+    /// window in which the startup janitor ([`Self::delete_empty_brigades`])
+    /// sees an empty brigade and deletes it, and the Director row is then
+    /// written under an id no brigade has any more: the schema has no foreign
+    /// key to refuse it, so the formation would report success for a brigade
+    /// that is not there. Only one banto UI at a time uses a database, so no
+    /// other process runs that janitor now; the single transaction keeps the
+    /// guarantee without leaning on that.
+    pub fn create_brigade_with_director(
+        &mut self,
+        name: &str,
+        director_token: &str,
+        session_id: &SessionId,
+        agent: AgentKind,
+    ) -> Result<BrigadeId, StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO brigades (name, created_at_ms) VALUES (?1, ?2)",
+            params![name, system_time_to_unix_ms(SystemTime::now())],
+        )?;
+        let id = tx.last_insert_rowid();
+        insert_member(
+            &tx,
+            id,
+            director_token,
+            BrigadeRole::Director,
+            Some(session_id),
+            Some(agent),
+        )?;
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Deletes a brigade together with its membership, queued messages, and
@@ -4198,6 +4237,70 @@ mod tests {
 
         assert_eq!(store.delete_empty_brigades().unwrap(), 0);
         assert_eq!(store.list_brigades().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_brigade_is_created_together_with_its_director() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store
+            .create_brigade_with_director("cell", "director", &sid("dir"), AgentKind::Codex)
+            .unwrap();
+
+        assert_eq!(
+            store.list_brigades().unwrap(),
+            [Brigade {
+                id: br,
+                name: "cell".to_string(),
+            }]
+        );
+        let director = store.brigade_member(br, "director").unwrap().unwrap();
+        assert_eq!(director.role, BrigadeRole::Director);
+        assert_eq!(director.session_id, Some(sid("dir")));
+        assert_eq!(director.agent, Some(AgentKind::Codex));
+        // The same rows `add_brigade_member_with_agent` writes: the cursor too.
+        let cursors: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM brigade_cursors WHERE brigade_id = ?1",
+                [br],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursors, 1);
+        // Nothing for the janitor to find.
+        assert_eq!(store.delete_empty_brigades().unwrap(), 0);
+    }
+
+    /// The janitor deletes any brigade without a member, so what is committed
+    /// must never be one. A Director row that cannot be written has to take the
+    /// brigade row with it.
+    #[test]
+    fn a_director_row_that_fails_leaves_no_brigade_behind() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_members BEFORE INSERT ON brigade_members
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+
+        let err = store
+            .create_brigade_with_director("cell", "director", &sid("dir"), AgentKind::ClaudeCode)
+            .unwrap_err();
+        assert!(err.to_string().contains("injected failure"), "{err}");
+        assert_eq!(store.list_brigades().unwrap(), []);
+
+        // Not a poisoned store: with the fault gone the same call succeeds.
+        store
+            .conn
+            .execute_batch("DROP TRIGGER refuse_members;")
+            .unwrap();
+        let br = store
+            .create_brigade_with_director("cell", "director", &sid("dir"), AgentKind::ClaudeCode)
+            .unwrap();
+        assert_eq!(store.list_brigades().unwrap().len(), 1);
+        assert!(store.brigade_member(br, "director").unwrap().is_some());
     }
 
     #[test]

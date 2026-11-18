@@ -355,6 +355,11 @@ pub struct EmporiumSettings<'a> {
     /// every banto process it starts for a brigade member (`_mcp`, `_hook`), so
     /// they read the same ones.
     pub child: &'a crate::startup::Resolved,
+    /// What startup has to say about the database: that it is not in the data
+    /// directory (`crate::startup::split_database_notice`), or that the check for
+    /// another banto on it could not be made (`crate::single_instance`). Shown
+    /// with the other startup notices.
+    pub database_notices: Vec<String>,
 }
 
 /// Run the emporium until the user quits (`q`/Esc from the sidebar; a
@@ -443,7 +448,12 @@ pub fn run(
                 hook_launchable,
             )
         });
-    let startup_notices = session::startup_notices(trust_notice, settings.resolved_agents, brigade);
+    let startup_notices = session::startup_notices(
+        trust_notice,
+        settings.database_notices.clone(),
+        settings.resolved_agents,
+        brigade,
+    );
 
     let deps = Deps {
         claude_home,
@@ -1991,15 +2001,17 @@ fn heal_member_session(
 }
 
 /// Create the brigade, its Director row, and `worker_count` Worker rows
-/// (schema v7). Not one shared transaction — each `add_brigade_member` call
-/// commits on its own (see that method's own doc) — so a failure partway
-/// through the Worker loop leaves the brigade, Director, and however many
-/// Worker rows already succeeded in place; this only stops issuing the
-/// remaining ones and reports the failure, rather than silently skipping
-/// past it and reporting a partial success as if it were complete. Rare
-/// enough (SQLite serializes writers and `Store::open`'s 5s busy_timeout
-/// absorbs ordinary contention between this store's several writer
-/// processes — a mid-loop failure here means that timeout ran out) that
+/// (schema v7). The brigade and its Director are one transaction
+/// ([`Store::create_brigade_with_director`]): the startup janitor deletes
+/// brigades with no member, so a commit between the two would leave one for it
+/// to delete. The Workers are not part of it — each `add_worker` commits
+/// on its own — so a failure partway through the Worker loop leaves the
+/// brigade, Director, and however many Worker rows already succeeded in place;
+/// this only stops issuing the remaining ones and reports the failure, rather
+/// than silently skipping past it and reporting a partial success as if it
+/// were complete. Rare enough (SQLite serializes writers and `Store::open`'s 5s
+/// busy_timeout absorbs ordinary contention between this store's several
+/// writer processes — a mid-loop failure here means that timeout ran out) that
 /// reconciling the partial state isn't worth the complexity.
 fn form_brigade_store(
     store: &RefCell<Store>,
@@ -2010,14 +2022,12 @@ fn form_brigade_store(
     worker_agent: AgentKind,
 ) -> Result<(BrigadeId, Vec<MemberToken>), String> {
     let mut store = store.borrow_mut();
-    let brigade_id = store.create_brigade(name).map_err(|err| err.to_string())?;
-    store
-        .add_brigade_member_with_agent(
-            brigade_id,
+    let brigade_id = store
+        .create_brigade_with_director(
+            name,
             DIRECTOR_TOKEN,
-            BrigadeRole::Director,
-            Some(&SessionId(director_row_id.to_string())),
-            Some(director_agent),
+            &SessionId(director_row_id.to_string()),
+            director_agent,
         )
         .map_err(|err| err.to_string())?;
     // Numbered by the brigade's own counter, like every later Worker: N at

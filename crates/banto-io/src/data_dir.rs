@@ -1,6 +1,9 @@
-//! banto's own data directory (`<data_local>/banto`) and everything banto keeps
-//! in it: the database, the per-member MCP configs and the Goinkyo's consultation
-//! requests under `mcp/`, and the opt-in message logs under `logs/`.
+//! banto's own data directory and everything banto keeps in it: the database,
+//! the per-member MCP configs and the Goinkyo's consultation requests under
+//! `mcp/`, and the opt-in message logs under `logs/`. It is `<data_local>/banto`
+//! unless the operator named another (`--data-dir`, `BANTO_DATA_DIR`, `data_dir`
+//! in `config.toml`); `banto::startup` decides, and refuses one inside an agent's
+//! home.
 //!
 //! Every path under it is derived here, from one [`DataDir`], so that the banto
 //! that decides where the directory is (`banto::startup`) and every banto it
@@ -58,7 +61,8 @@ impl DataDir {
         Self(root)
     }
 
-    /// The platform's location, `dirs::data_local_dir()/banto`.
+    /// The platform's location, `dirs::data_local_dir()/banto`: the one used when
+    /// the operator names none.
     pub fn default_root() -> Option<PathBuf> {
         dirs::data_local_dir().map(|dir| dir.join("banto"))
     }

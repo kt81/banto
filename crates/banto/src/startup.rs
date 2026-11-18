@@ -12,6 +12,13 @@
 //! An empty path is left as it is (it has never named the working directory), and
 //! so is every relative path when the working directory cannot be read.
 //!
+//! The data directory has four sources, in this order: the hidden `--data-dir`
+//! flag (what a parent hands down), `BANTO_DATA_DIR`, the config's `data_dir`,
+//! the platform's `<data_local>/banto`. It is refused when empty or inside an
+//! agent's home (invariant 1: those are read-only for banto), and so is a
+//! database path ([`Resolved::db_path`]); [`resolved_place`] and [`is_within`]
+//! say what "inside" compares.
+//!
 //! A banto that starts other banto processes (`_mcp`, `_hook`) hands
 //! them what it resolved — [`Resolved::child_args`] on their command lines,
 //! [`Resolved::child_env`] for the one that cannot take arguments — and a child
@@ -29,6 +36,7 @@ use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::config as io_config;
 use banto_io::data_dir::DataDir;
+use banto_io::file_identity::directory_identity;
 
 /// The environment a resolution reads, as plain values — never the process
 /// environment itself, so a test names exactly what it depends on.
@@ -46,6 +54,9 @@ pub struct Env {
     pub codex_home: Option<String>,
     /// The platform's `config.toml` location, the last tier of the search.
     pub default_config: Option<PathBuf>,
+    /// `BANTO_DATA_DIR`. Empty means unset; that is decided in [`resolve`], so a
+    /// test can say it.
+    pub banto_data_dir: Option<PathBuf>,
     /// The platform's data directory for banto (`<data_local>/banto`): where the
     /// database lives by default, and where banto keeps its MCP configs,
     /// consultation requests and message logs whatever the database path is.
@@ -61,6 +72,7 @@ impl Env {
             home: dirs::home_dir(),
             claude_config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
             codex_home: std::env::var("CODEX_HOME").ok(),
+            banto_data_dir: std::env::var_os("BANTO_DATA_DIR").map(PathBuf::from),
             default_config: io_config::default_config_path(),
             data_dir: DataDir::default_root(),
         }
@@ -170,7 +182,10 @@ impl Resolved {
     /// opened or created: sqlite would take it for an anonymous temporary
     /// database and the session would silently not persist. Only an empty path
     /// is refused; a whitespace-only one is a (legal) file name, as every other
-    /// path key in the config is taken as written.
+    /// path key in the config is taken as written. A path inside an agent's home
+    /// is refused too: opening it would create a file there. Resolution itself
+    /// carries on past both (`list` and `versions` open no store); this is the
+    /// one door every command that does open it goes through, the hook included.
     pub fn db_path(&self) -> Result<&Path> {
         let path = self
             .db_path
@@ -184,6 +199,30 @@ impl Resolved {
             anyhow::bail!(
                 "the config key `db_path`{from} is empty (or an empty database path was \
                  passed to this banto): remove the key to use the default location, or give a path"
+            );
+        }
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "the database path {} is relative and the working directory could not be \
+                 read to make it absolute: give an absolute path",
+                path.display()
+            );
+        }
+        if let Some((label, home)) = inside_an_agent_home(
+            path,
+            self.claude_home.as_deref(),
+            self.codex_home.as_deref(),
+        ) {
+            let from = match &self.config_file {
+                ConfigFile::File(file) => format!(" in {}", file.display()),
+                ConfigFile::None => String::new(),
+            };
+            anyhow::bail!(
+                "the database path {} (the config key `db_path`{from}, or a path passed to this \
+                 banto) is inside the {label} {}: banto never writes inside an agent's home. \
+                 Remove the key to use the default location, or give a path outside it",
+                path.display(),
+                home.display()
             );
         }
         Ok(path)
@@ -254,6 +293,12 @@ impl Resolved {
 }
 
 impl Inputs {
+    /// Whether a parent banto handed this process its answers. A handed process
+    /// finds nothing for itself that its parent did not pass.
+    fn handed_over(&self) -> bool {
+        self.parent_config.is_some() || self.parent_no_config
+    }
+
     /// Read what a parent set for the `_hook` process (see
     /// [`Resolved::child_env`]) from `get`. Variables that are absent or empty
     /// change nothing, so a hook started without them resolves for itself. If
@@ -300,22 +345,7 @@ pub fn resolve(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Resol
     // A process the parent started was given the parent's answers; where the
     // parent had none of its own (it could determine no Codex home), the child
     // has none either, rather than finding one the parent did not have.
-    let handed_over = inputs.parent_config.is_some() || inputs.parent_no_config;
-    // The same rule as the Codex home: a handed child without `--data-dir` has
-    // none, because its parent had none and passes every directory it has.
-    let data_dir = inputs
-        .cli_data_dir
-        .as_deref()
-        .or((!handed_over)
-            .then_some(inputs.env.data_dir.as_deref())
-            .flatten())
-        .map(|path| absolute(path, cwd));
-    let db_path = inputs
-        .cli_db_path
-        .as_deref()
-        .or(config.db_path.as_deref())
-        .map(|path| absolute(path, cwd))
-        .or_else(|| data_dir.clone().map(|dir| DataDir::new(dir).db_path()));
+    let handed_over = inputs.handed_over();
     let claude_home = inputs
         .cli_claude_home
         .as_deref()
@@ -334,6 +364,26 @@ pub fn resolve(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Resol
                 .then(|| inputs.env.default_home("CODEX_HOME", ".codex", cwd))
                 .flatten()
         });
+    // The hook must never fail the operator's own agent over banto's
+    // configuration, and reads no data directory: where this one is refused it
+    // goes without.
+    let data_dir = match checked_data_dir(
+        inputs,
+        &config,
+        &config_file,
+        claude_home.as_deref(),
+        codex_home.as_deref(),
+    ) {
+        Ok(dir) => dir,
+        Err(err) if strictness == Strictness::Strict => return Err(err),
+        Err(_) => None,
+    };
+    let db_path = inputs
+        .cli_db_path
+        .as_deref()
+        .or(config.db_path.as_deref())
+        .map(|path| absolute(path, cwd))
+        .or_else(|| data_dir.clone().map(|dir| DataDir::new(dir).db_path()));
     Ok((
         config,
         Resolved {
@@ -344,6 +394,318 @@ pub fn resolve(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Resol
             codex_home,
         },
     ))
+}
+
+/// Where the data directory came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataDirSource {
+    /// `--data-dir`: the operator's own, or what a parent passed down.
+    Flag,
+    /// `BANTO_DATA_DIR`.
+    Variable,
+    /// The top-level `data_dir` key of the config.
+    Config,
+    /// `<data_local>/banto`.
+    Platform,
+}
+
+impl DataDirSource {
+    /// The words an error uses for it.
+    fn describe(self, config_file: &ConfigFile) -> String {
+        match self {
+            Self::Flag => "`--data-dir`".to_string(),
+            Self::Variable => "`BANTO_DATA_DIR`".to_string(),
+            Self::Config => match config_file {
+                ConfigFile::File(file) => {
+                    format!("the config key `data_dir` in {}", file.display())
+                }
+                ConfigFile::None => "the config key `data_dir`".to_string(),
+            },
+            Self::Platform => "the platform's default data directory".to_string(),
+        }
+    }
+}
+
+/// The winning source of the data directory and what it said, as written. An
+/// empty `BANTO_DATA_DIR` is no source at all; an empty flag or config value
+/// still is one, so that it can be refused by name rather than be mistaken for
+/// the default. A handed-over process takes the flag alone: its parent resolved
+/// the directory and passes it, so a variable or config of its own is no second
+/// opinion (the Codex home follows the same rule).
+fn data_dir_source<'a>(
+    inputs: &'a Inputs,
+    config: &'a Config,
+) -> Option<(DataDirSource, &'a Path)> {
+    if let Some(flag) = inputs.cli_data_dir.as_deref() {
+        return Some((DataDirSource::Flag, flag));
+    }
+    if inputs.handed_over() {
+        return None;
+    }
+    inputs
+        .env
+        .banto_data_dir
+        .as_deref()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| (DataDirSource::Variable, path))
+        .or_else(|| {
+            config
+                .data_dir
+                .as_deref()
+                .map(|path| (DataDirSource::Config, path))
+        })
+        .or_else(|| {
+            inputs
+                .env
+                .data_dir
+                .as_deref()
+                .map(|path| (DataDirSource::Platform, path))
+        })
+}
+
+/// The data directory, absolute, or why it cannot be used: empty, or inside an
+/// agent's home. Not required to exist.
+fn checked_data_dir(
+    inputs: &Inputs,
+    config: &Config,
+    config_file: &ConfigFile,
+    claude_home: Option<&Path>,
+    codex_home: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let Some((source, written)) = data_dir_source(inputs, config) else {
+        return Ok(None);
+    };
+    let from = source.describe(config_file);
+    if written.as_os_str().is_empty() {
+        anyhow::bail!("{from} is empty: remove it to use the default location, or give a path");
+    }
+    let dir = absolute(written, inputs.cwd.as_deref());
+    if !dir.is_absolute() {
+        anyhow::bail!(
+            "{from} is {}, a relative path, and the working directory could not be read to \
+             make it absolute: give an absolute path",
+            dir.display()
+        );
+    }
+    if let Some((label, home)) = inside_an_agent_home(&dir, claude_home, codex_home) {
+        anyhow::bail!(
+            "{from} is {}, which is inside the {label} {}: banto never writes inside an \
+             agent's home. Name a directory outside it",
+            dir.display(),
+            home.display()
+        );
+    }
+    Ok(Some(dir))
+}
+
+/// The status-line notice for a database that is not in the data directory the
+/// operator chose, or `None`. Only when both were named — the directory by the
+/// flag, the variable or the config (not the platform default), the database
+/// by `db_path` — and they disagree. `db_path` alone is the long-standing way
+/// to point at another database and stays silent. The consequence it states is
+/// real: the sweep only runs on the database that is `<data dir>/banto.db`
+/// ([`Resolved::sweepable_data_dir`]), while the MCP configs, consultation
+/// requests and message logs follow the directory whatever the database is.
+pub fn split_database_notice(
+    inputs: &Inputs,
+    config: &Config,
+    resolved: &Resolved,
+) -> Option<String> {
+    let (source, _) = data_dir_source(inputs, config)?;
+    if source == DataDirSource::Platform {
+        return None;
+    }
+    let dir = resolved.data_dir()?;
+    (resolved.db_path.as_deref()? != dir.db_path()).then(|| {
+        "data_dir: the database is not in it, so the data-directory sweep does not run; \
+         MCP, request and log files stay in the data directory"
+            .to_string()
+    })
+}
+
+/// The agent home that `path` is, or lies inside, with its name for an error.
+/// Only the homes this process resolved are known.
+///
+/// Two questions, and either answering yes is a yes. By spelling: both sides go
+/// through [`resolved_place`] and are compared as names, which is what sees a
+/// home that is not there yet. By identity: some existing ancestor of `path` (the
+/// path itself included) is the very directory a home is, whatever either was
+/// called to reach it. Spelling alone cannot be complete, because Windows gives
+/// one directory unboundedly many names (`\\localhost\C$\…`, a computer name,
+/// an address); see `banto_io::file_identity`. An ancestor or home whose identity
+/// cannot be read — it does not exist, or may not be opened — is not decided by
+/// identity, and the spelling answer stands.
+fn inside_an_agent_home<'a>(
+    path: &Path,
+    claude_home: Option<&'a Path>,
+    codex_home: Option<&'a Path>,
+) -> Option<(&'static str, &'a Path)> {
+    let rules = Rules::of_this_platform();
+    let place = resolved_place(path);
+    let ancestors: Vec<_> = path
+        .ancestors()
+        .filter_map(|ancestor| directory_identity(ancestor).ok())
+        .collect();
+    [("Claude home", claude_home), ("Codex home", codex_home)]
+        .into_iter()
+        .find_map(|(label, home)| {
+            let home = home?;
+            let same_place = is_within(&place, &resolved_place(home), rules);
+            let same_directory =
+                directory_identity(home).is_ok_and(|identity| ancestors.contains(&identity));
+            (same_place || same_directory).then_some((label, home))
+        })
+}
+
+/// `path` as the filesystem names it, without creating anything: the longest
+/// ancestor that exists goes through `canonicalize`, which follows symlinks and
+/// junctions and, on Windows, turns an 8.3 short name (`CLAUDE~1`) into the long
+/// one and drops a trailing dot or space; what is left below it is appended as
+/// written, for [`normal_parts`] to read. A candidate that is not there yet,
+/// which is the usual case for a data directory, is judged by where it would
+/// be made. A home gets the same treatment, so the two sides always agree on
+/// what their common ancestors are (macOS's `/var` is `/private/var` for both).
+///
+/// Not airtight. It is a check made once at startup, so a link made afterwards
+/// is not seen, and a dangling link is a name like any other here — one that is
+/// made good later leads somewhere this did not look.
+fn resolved_place(path: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut probe = path.to_path_buf();
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            let mut place = real;
+            place.extend(tail.iter().rev());
+            return place;
+        }
+        match (probe.components().next_back(), probe.parent()) {
+            (Some(last), Some(parent)) => {
+                tail.push(last.as_os_str().to_os_string());
+                probe = parent.to_path_buf();
+            }
+            // Nothing of it exists, down to the root: it is what it says.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// How two spellings of a path are told to be one place. Only what the path
+/// alone can say: [`resolved_place`] is what asks the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rules {
+    /// Names differing only in case are the same. True where the default volume
+    /// is case-insensitive (NTFS, APFS). On a volume that is not this
+    /// over-refuses, which is the safe direction for a guard.
+    fold_case: bool,
+    /// Win32's reading of a name: a trailing dot or space is dropped
+    /// (`.claude.` and `.claude ` are `.claude`) and so is anything from a
+    /// colon on (`.claude::$INDEX_ALLOCATION` is the directory itself).
+    win32_names: bool,
+}
+
+impl Rules {
+    fn of_this_platform() -> Self {
+        Self {
+            fold_case: cfg!(any(windows, target_os = "macos")),
+            win32_names: cfg!(windows),
+        }
+    }
+
+    /// Every spelling distinct.
+    #[cfg(test)]
+    const EXACT: Self = Self {
+        fold_case: false,
+        win32_names: false,
+    };
+
+    /// One name as these rules read it, or `None` when nothing is left of it.
+    fn name(self, text: &str) -> Option<String> {
+        let mut name = text;
+        if self.win32_names {
+            name = name.split(':').next().unwrap_or("");
+            name = name.trim_end_matches(['.', ' ']);
+        }
+        if name.is_empty() {
+            return None;
+        }
+        Some(if self.fold_case {
+            name.to_lowercase()
+        } else {
+            name.to_string()
+        })
+    }
+}
+
+/// One step of a path, with the spelling differences that do not name another
+/// place taken out.
+#[derive(Debug, PartialEq, Eq)]
+enum Part {
+    /// A drive, a share or the root: where the path starts.
+    Anchor(String),
+    Name(String),
+}
+
+/// `path` as a list of [`Part`]s: separators unified, `.` dropped, `..` applied
+/// lexically, a verbatim drive (`\\?\C:`) read as the drive and a verbatim share
+/// (`\\?\UNC\server\share`) as the plain one, and every name read by `rules`.
+/// Nothing is read from the disk.
+fn normal_parts(path: &Path, rules: Rules) -> Vec<Part> {
+    use std::path::{Component, Prefix};
+    let anchor = |text: String| Part::Anchor(rules.name(&text).unwrap_or(text));
+    let mut parts: Vec<Part> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => parts.push(match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    // Not through `name`: a drive's colon is its own.
+                    let drive = format!("{}:", char::from(letter));
+                    Part::Anchor(if rules.fold_case {
+                        drive.to_lowercase()
+                    } else {
+                        drive
+                    })
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    let share = format!(
+                        r"\\{}\{}",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    );
+                    Part::Anchor(if rules.fold_case {
+                        share.to_lowercase()
+                    } else {
+                        share
+                    })
+                }
+                _ => anchor(prefix.as_os_str().to_string_lossy().into_owned()),
+            }),
+            Component::RootDir => parts.push(Part::Anchor("/".to_string())),
+            Component::CurDir => {}
+            Component::ParentDir => match parts.last() {
+                Some(Part::Name(name)) if name != ".." => {
+                    parts.pop();
+                }
+                // `..` at the root is the root.
+                Some(Part::Anchor(_)) => {}
+                _ => parts.push(Part::Name("..".to_string())),
+            },
+            Component::Normal(name) => {
+                if let Some(name) = rules.name(&name.to_string_lossy()) {
+                    parts.push(Part::Name(name));
+                }
+            }
+        }
+    }
+    parts
+}
+
+/// Whether `path` is `dir` or lies below it, compared as normalised paths
+/// ([`normal_parts`]): by spelling alone, which is why [`inside_an_agent_home`]
+/// asks the filesystem first ([`resolved_place`]). The rules are an argument so every answer can be
+/// tested on any platform. An empty `dir` contains nothing.
+fn is_within(path: &Path, dir: &Path, rules: Rules) -> bool {
+    let dir = normal_parts(dir, rules);
+    !dir.is_empty() && normal_parts(path, rules).starts_with(&dir)
 }
 
 fn resolve_config(inputs: &Inputs, strictness: Strictness) -> Result<(Config, ConfigFile)> {
@@ -397,6 +759,9 @@ fn resolve_config(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Co
 
 #[cfg(test)]
 mod agreement_tests;
+
+#[cfg(test)]
+mod data_dir_tests;
 
 #[cfg(test)]
 mod resolution_tests;
