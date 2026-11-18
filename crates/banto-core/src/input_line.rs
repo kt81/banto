@@ -20,9 +20,28 @@
 //! it. The block grows upward as lines are added and its bottom rule stays
 //! put; after Ctrl+C the whole block sat two rows lower for about 0.8s while
 //! the footer was a single `Press Ctrl-C again to exit` row. The cursor was
-//! visible throughout, so its visibility is not read. Nothing about this is
+//! visible throughout, which is why its visibility is read in one place only
+//! (a blank prompt row, see [`read_input_line`]). Nothing about this is
 //! documented by Claude Code; the rule below fails closed instead of
 //! guessing when any of it stops being true.
+//!
+//! How Claude draws its caret depends on a server-side flag, `tengu_native_cursor`,
+//! which it caches in the Claude home's `.claude.json`: a home with no cache has it
+//! off, and the operator's home caches it on, which can change any day. Measured
+//! 2026-11-18 (Claude Code 2.1.327, a fresh Claude home, a 40x130 pane, focus
+//! reports sent raw): with the flag off Claude draws an inverse caret at column 2
+//! and hides the terminal cursor, which parks in the footer while idle, moves to the
+//! prompt row's last column on a focus-out and to column 3 on a focus-in. Those two
+//! positions read an empty prompt as `HasText` and its nudges were held; with text
+//! typed, a focus-out parks it outside the block, which reads `Unrecognized`. With
+//! `CLAUDE_CODE_NATIVE_CURSOR=1` set on the claude process the cursor stayed visible
+//! at column 2 through focus changes, typing and erasing, with no inverse caret, and
+//! every reading was `Empty` on a blank row and `HasText` with text. The variable
+//! is checked before the flag in the binary, so a home with the flag cached on
+//! should behave the same; that is read from the code, not measured. banto launches
+//! every Claude pane with the variable (`pane_env` in the emporium), and the
+//! hidden-cursor rule in [`read_input_line`] keeps a pane that still shows the
+//! other shape from being read as typed.
 //!
 //! Measured later, on a recording of one Director pane's screen over about 100
 //! minutes, replayed tick by tick against this reader: one pane's input box
@@ -400,6 +419,14 @@ fn locate(pane: &Screen) -> Option<Block> {
 /// or dim, and the cursor at [`EMPTY_CURSOR_COL`]. A recognised block that
 /// fails any of those is `HasText`: a multi-row block means a newline was
 /// typed, and a cursor anywhere else means the line is not the bare prompt.
+///
+/// The exception is a blank prompt row with the cursor hidden and not at
+/// [`EMPTY_CURSOR_COL`], which is `Unrecognized`. Claude hides the terminal
+/// cursor when it draws its own caret (the server-side flag the module doc
+/// names), and a hidden cursor's position says nothing about the line, so
+/// "the cursor is elsewhere" would read every empty prompt as typed text and
+/// hold its nudges for good. Typed text is still `HasText` there: it is read
+/// from the cells, not from the cursor.
 pub fn read_input_line(pane: &Screen) -> InputLine {
     let Some(block) = locate(pane) else {
         return InputLine::Unrecognized;
@@ -412,8 +439,12 @@ pub fn read_input_line(pane: &Screen) -> InputLine {
             .cell(block.prompt_row, col)
             .is_none_or(|cell| is_blank(cell.contents()) || cell.dim())
     });
-    if one_row && rest_is_blank_or_dim && block.cursor.1 == EMPTY_CURSOR_COL {
+    if !(one_row && rest_is_blank_or_dim) {
+        InputLine::HasText
+    } else if block.cursor.1 == EMPTY_CURSOR_COL {
         InputLine::Empty
+    } else if screen.hide_cursor() {
+        InputLine::Unrecognized
     } else {
         InputLine::HasText
     }
@@ -619,6 +650,58 @@ mod tests {
         // prompt.
         let frame = empty_frame(19) + &at(20, 12, "");
         assert_eq!(read_input_line(&pane(&frame)), InputLine::HasText);
+    }
+
+    #[test]
+    fn a_blank_prompt_row_with_the_cursor_hidden_away_from_the_glyph_is_unrecognized() {
+        // Claude with its own caret hides the terminal cursor and leaves it
+        // wherever the last paint ended: not a sign of typed text.
+        for col in [12, 80] {
+            let frame = empty_frame(19) + &at(20, col, "") + "\x1b[?25l";
+            let screen = pane(&frame);
+            assert!(screen.screen().hide_cursor());
+            assert_eq!(
+                read_input_line(&screen),
+                InputLine::Unrecognized,
+                "col {col}"
+            );
+        }
+        let bare = format!(
+            "\x1b[2J{}{}{}{}\x1b[?25l",
+            at(19, 1, &rule()),
+            at(20, 1, "\u{276f}\u{a0}"),
+            at(21, 1, &rule()),
+            at(20, 30, ""),
+        );
+        assert_eq!(read_input_line(&pane(&bare)), InputLine::Unrecognized);
+    }
+
+    #[test]
+    fn the_visible_caret_prompt_is_still_empty_and_a_hidden_cursor_at_the_glyph_is_too() {
+        assert_eq!(read_input_line(&pane(&empty_frame(19))), InputLine::Empty);
+        // At the empty column the old rule answered `Empty` whatever the
+        // visibility, and still does.
+        let hidden_at_col_2 = empty_frame(19) + "\x1b[?25l";
+        assert_eq!(read_input_line(&pane(&hidden_at_col_2)), InputLine::Empty);
+    }
+
+    #[test]
+    fn typed_text_is_has_text_with_the_cursor_hidden_too() {
+        let typed = empty_frame(19) + &at(20, 1, "\x1b[K\u{276f}\u{a0}abc") + &at(20, 30, "");
+        assert_eq!(
+            read_input_line(&pane(&(typed + "\x1b[?25l"))),
+            InputLine::HasText
+        );
+        // A second row of the block means a newline was typed.
+        let multi = format!(
+            "\x1b[2J{}{}{}{}{}\x1b[?25l",
+            at(18, 1, &rule()),
+            at(19, 1, "\u{276f}\u{a0}line1"),
+            at(20, 1, "  "),
+            at(21, 1, &rule()),
+            at(20, 30, ""),
+        );
+        assert_eq!(read_input_line(&pane(&multi)), InputLine::HasText);
     }
 
     #[test]

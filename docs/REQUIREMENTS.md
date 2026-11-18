@@ -2936,9 +2936,12 @@ identity — `BANTO_PARENT_CONFIG` (or `BANTO_PARENT_NO_CONFIG`) and
 directory, so it is not told one; the one other file it reads, a Codex session's
 rollout, is named by Codex on the hook's own stdin, and is only read). A hook without them (one an
 older banto launched) resolves for itself, as does a child started by hand or from
-an MCP config written by an older banto. Only banto's own variables are set;
-`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched — where an agent
-keeps its home is not banto's to decide. A member that is already running keeps
+an MCP config written by an older banto. Only banto's own variables are set, with
+one exception: every Claude Code pane (not a Codex one) also gets
+`CLAUDE_CODE_NATIVE_CURSOR=1`, which fixes how Claude draws its caret so that the
+input line stays readable (the relay draft guard's account of reading the input
+line has why). `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the like are never touched —
+where an agent keeps its home is not banto's to decide. A member that is already running keeps
 the server it was launched with; the next time its pane is opened (re-staging the
 brigade, a relaunch, a new member) the MCP config file is rewritten and the
 launch argv rebuilt with the hand-off.
@@ -3375,6 +3378,18 @@ that name showed the label, and its member then idled for two minutes without th
 to be read; the screen itself was not replayed against the reader, so it is still
 not a cell-by-cell measurement); the half-width floor is margin (the label sat in
 the last eighth, and half keeps a dialog title at the left or in the middle out).
+A blank prompt row with the cursor hidden and not in the empty column is
+`Unrecognized`, not `HasText`: when a server-side flag (`tengu_native_cursor`,
+cached in the Claude home's `.claude.json`, so off in a home with no cache) is off,
+Claude hides the terminal cursor and parks it in the footer or on the prompt row
+depending on focus reports, so its position says nothing about the line (measured
+2026-11-18, Claude Code 2.1.327, a fresh Claude home, a 40x130 pane). banto also
+launches every Claude pane with `CLAUDE_CODE_NATIVE_CURSOR=1`, which the binary
+checks before the flag; set on the claude process directly, it kept the cursor
+visible at column 2 through focus changes, typing and erasing, and every reading
+was right. The rule only guards a pane where that did not take. Not measured: a home
+with the flag cached on plus the variable (read from the code to behave the same),
+other pane sizes, a modal at the prompt.
 `HasText` holds the nudge even with no mark (recalled history is text no keystroke
 announced); `Empty` clears the mark, but only `INPUT_ECHO_SETTLE` (3s) after banto
 last forwarded input to the pane, because a pane's screen lags its keys (36–108ms
