@@ -398,14 +398,7 @@ fn the_exit_the_added_and_the_directory_statuses_use_the_name_when_there_is_one(
     scene.exit("worker-2");
     assert_eq!(status(&scene), "worker worker-2 exited \u{2014} restarting");
 
-    // A Codex Worker whose briefing was not confirmed, and a Claude Worker
-    // whose directory is not trusted.
-    let key = scene.key_of("worker-1");
-    scene.feed(Event::CodexWorkerDiscoveryTimedOut {
-        key,
-        token: "worker-1".to_string(),
-    });
-    assert_eq!(status(&scene), "\"impl\": Codex briefing wasn't confirmed");
+    // A Claude Worker whose directory is not trusted.
     scene.feed(Event::ClaudeWorkerDirectoryUntrusted {
         token: "worker-1".to_string(),
     });

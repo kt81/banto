@@ -510,8 +510,7 @@ struct DiscoveryTracker {
     codex_log_scan: Option<banto_io::codex_liveness::CodexLogScan>,
     /// Which product this is — Claude's own two sources above don't apply
     /// to a Codex child at all (see [`poll_discovery`]'s doc for the
-    /// store-based fallback this gates), and only a Codex tracker ever
-    /// gives up on a [`CODEX_WORKER_DISCOVERY_TIMEOUT`].
+    /// store-based fallback this gates).
     agent: AgentKind,
     /// Whether [`poll_discovery`] has already told the operator this Claude
     /// tracker looks stuck behind an unanswered directory-trust prompt —
@@ -768,7 +767,16 @@ fn event_loop(
         if !discovery.is_empty() {
             let claimed: HashSet<String> =
                 handles.keys().map(|key| key.as_str().to_string()).collect();
-            let live = read_live_sessions(&deps.claude_home.sessions_dir());
+            // Only a Claude tracker looks at the live files, and this runs every
+            // pass; a Codex-only pending set would pay the directory read for nothing.
+            let live = if discovery
+                .iter()
+                .any(|tracker| tracker.agent == AgentKind::ClaudeCode)
+            {
+                read_live_sessions(&deps.claude_home.sessions_dir())
+            } else {
+                Vec::new()
+            };
             events.extend(poll_discovery(
                 &mut discovery,
                 &provider,
@@ -898,7 +906,7 @@ fn event_loop(
         // Whatever the exact contract turns out to be, a teardown that can
         // block must not run on the thread that serves the operator.
         let reaped = reap_pty_handles(&mut handles, &state);
-        discovery.retain(|tracker| state.screens.contains_key(&tracker.key));
+        drop_trackers_of_gone_panes(&mut discovery, &state);
         if !reaped.is_empty() {
             std::thread::spawn(move || drop(reaped));
         }
@@ -2116,15 +2124,15 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     }]
 }
 
-/// How long a Codex-sourced discovery tracker waits for
-/// `BrigadeMember::briefed_session_id` before giving up — a judgment call,
-/// not a measured minimum: the happy path (2026-08-02 investigation)
-/// resolved within a few seconds of the kickoff's submitting `\r`, so this
-/// is generous headroom for slower model latency or a heavier real briefing
-/// prompt, not a tuned floor. Only ever applies to a tracker whose
-/// `DiscoveryTracker::agent` is `AgentKind::Codex` — Claude's own trackers
-/// keep waiting forever, unchanged from before this existed.
-const CODEX_WORKER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+/// Drop the trackers whose pane no longer has a screen. With no tracker
+/// giving up on a clock, this and resolving are the only ways one ends: a
+/// pane that exits, is closed or is dismissed still unidentified would
+/// otherwise keep its tracker — and, through the guard in
+/// [`execute_open_embedded`], the refusal of every Codex resume — for the rest
+/// of the run.
+fn drop_trackers_of_gone_panes(trackers: &mut Vec<DiscoveryTracker>, state: &EmporiumState) {
+    trackers.retain(|tracker| state.screens.contains_key(&tracker.key));
+}
 
 fn poll_solo_codex_discovery(
     trackers: &mut Vec<DiscoveryTracker>,
@@ -2218,12 +2226,14 @@ fn codex_briefed_session_id(
 ///    tried only for a tracker whose `agent` is `AgentKind::Codex`: sources
 ///    1 and 2 don't apply to it at all — see that function's own doc.
 ///
-/// A Codex member tracker still unresolved past [`CODEX_WORKER_DISCOVERY_TIMEOUT`]
-/// gives up: removed the same as a resolved one, but reported as
-/// [`Event::CodexWorkerDiscoveryTimedOut`] instead of
-/// [`Event::DiscoveryResult`], so the operator sees why rather than the
-/// pane just silently never identifying itself. Solo and Claude trackers do
-/// not time out.
+/// No tracker gives up: each lives until it resolves or its pane's screen is
+/// gone (the loop prunes trackers against `state.screens`). A Codex Worker's
+/// used to be dropped 90 s after spawn — even when the kickoff had never been
+/// typed because the trust gate was still holding it — so a first turn taken
+/// later (banto's retry, or one the operator typed) fired the hook into a store
+/// nobody was reading, and the pane stayed unidentified, with
+/// `unresolved_codex` set, until it exited. Whether the kickoff was typed at
+/// all is the core's to report (`PendingKickoff`'s attempts), not this poll's.
 ///
 /// A Claude tracker still unresolved (regardless of how long) whose own cwd
 /// reads as definitively [`banto_io::directory_trust::DirectoryTrust::NotTrusted`]
@@ -2266,7 +2276,6 @@ fn poll_discovery(
 ) -> Vec<Event> {
     let mut used_this_pass: HashSet<String> = HashSet::new();
     let mut resolved: Vec<(usize, String)> = Vec::new();
-    let mut timed_out: Vec<usize> = Vec::new();
     let mut newly_untrusted: Vec<usize> = Vec::new();
     for (i, tracker) in trackers.iter().enumerate() {
         let by_pid = (tracker.agent == AgentKind::ClaudeCode)
@@ -2297,13 +2306,6 @@ fn poll_discovery(
         if let Some(id) = id {
             used_this_pass.insert(id.clone());
             resolved.push((i, id));
-        } else if tracker.agent == AgentKind::Codex
-            && tracker.member.is_some()
-            && SystemTime::now()
-                .duration_since(tracker.since)
-                .is_ok_and(|elapsed| elapsed >= CODEX_WORKER_DISCOVERY_TIMEOUT)
-        {
-            timed_out.push(i);
         } else if tracker.agent == AgentKind::ClaudeCode
             && !tracker.notified_untrusted
             && banto_io::directory_trust::claude_directory_trust_in(
@@ -2315,7 +2317,7 @@ fn poll_discovery(
             newly_untrusted.push(i);
         }
     }
-    if resolved.is_empty() && timed_out.is_empty() && newly_untrusted.is_empty() {
+    if resolved.is_empty() && newly_untrusted.is_empty() {
         return Vec::new();
     }
     let mut events: Vec<Event> = resolved
@@ -2326,15 +2328,6 @@ fn poll_discovery(
             member: trackers[*i].member.clone(),
         })
         .collect();
-    events.extend(timed_out.iter().filter_map(|&i| {
-        trackers[i]
-            .member
-            .as_ref()
-            .map(|(_, token)| Event::CodexWorkerDiscoveryTimedOut {
-                key: trackers[i].key.clone(),
-                token: token.clone(),
-            })
-    }));
     events.extend(newly_untrusted.iter().filter_map(|&i| {
         trackers[i]
             .member
@@ -2346,8 +2339,7 @@ fn poll_discovery(
     for &i in &newly_untrusted {
         trackers[i].notified_untrusted = true;
     }
-    let mut removed_indices: HashSet<usize> = resolved.into_iter().map(|(i, _)| i).collect();
-    removed_indices.extend(timed_out);
+    let removed_indices: HashSet<usize> = resolved.into_iter().map(|(i, _)| i).collect();
     let mut i = 0;
     trackers.retain(|_| {
         let keep = !removed_indices.contains(&i);
@@ -9934,7 +9926,7 @@ mod tests {
         assert!(trackers.is_empty());
     }
 
-    // --- Codex Worker discovery: the store-based source, and giving up -----
+    // --- Codex Worker discovery: the store-based source, and waiting for it --
 
     fn codex_tracker(brigade_id: BrigadeId, token: &str, since: SystemTime) -> DiscoveryTracker {
         DiscoveryTracker {
@@ -9974,16 +9966,12 @@ mod tests {
     }
 
     #[test]
-    fn solo_codex_discovery_keeps_waiting_after_worker_timeout() {
+    fn solo_codex_discovery_keeps_waiting_however_long() {
         let dir = tempfile::tempdir().unwrap();
         let home = ClaudeHome::new(dir.path().to_path_buf());
         let provider = ClaudeCodeProvider::new(home.clone());
         let store = RefCell::new(Store::open_in_memory().unwrap());
-        let mut tracker = codex_tracker(
-            1,
-            "solo",
-            SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1),
-        );
+        let mut tracker = codex_tracker(1, "solo", SystemTime::now() - Duration::from_secs(3600));
         tracker.member = None;
         let mut trackers = vec![tracker];
         assert!(
@@ -10171,14 +10159,47 @@ mod tests {
     }
 
     #[test]
-    fn a_codex_worker_past_the_timeout_gives_up_and_is_removed() {
-        let store = RefCell::new(Store::open_in_memory().unwrap());
+    fn a_codex_worker_is_identified_however_long_after_spawn() {
+        // The hook records the session id when the first turn happens — which may
+        // be long after spawn (the kickoff held behind a trust prompt, or the
+        // operator typing the first turn themselves) — so no amount of waiting
+        // without it drops the tracker.
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let store = RefCell::new(store);
         let claude_home = tempfile::tempdir().unwrap();
         let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
-        let long_ago = SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1);
-        let mut trackers = vec![codex_tracker(1, "worker-1", long_ago)];
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        let mut trackers = vec![codex_tracker(brigade_id, "worker-1", an_hour_ago)];
 
+        for _ in 0..3 {
+            assert!(
+                poll_discovery(
+                    &mut trackers,
+                    &provider,
+                    &HashSet::new(),
+                    &[],
+                    &store,
+                    &claude_home_ref,
+                )
+                .is_empty()
+            );
+            assert_eq!(trackers.len(), 1, "still waiting, nothing reported");
+        }
+
+        store
+            .borrow_mut()
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("w1".to_string()),
+                SystemTime::now(),
+            )
+            .unwrap();
         let events = poll_discovery(
             &mut trackers,
             &provider,
@@ -10188,28 +10209,30 @@ mod tests {
             &claude_home_ref,
         );
 
-        assert!(matches!(
-            events.as_slice(),
-            [Event::CodexWorkerDiscoveryTimedOut { token, .. }] if token == "worker-1"
-        ));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::DiscoveryResult { session_id, member, .. }]
+                    if session_id == "w1" && member.as_ref().unwrap().1 == "worker-1"
+            ),
+            "{events:?}"
+        );
         assert!(trackers.is_empty());
     }
 
     #[test]
-    fn a_claude_worker_never_times_out() {
-        // Regression: the give-up timeout is Codex-only. Unresolved Claude
-        // discovery keeps waiting forever, same as before this existed.
+    fn a_claude_worker_keeps_waiting_however_long() {
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let claude_home = tempfile::tempdir().unwrap();
         let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
-        let long_ago = SystemTime::now() - CODEX_WORKER_DISCOVERY_TIMEOUT - Duration::from_secs(1);
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
             spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
-            since: long_ago,
+            since: an_hour_ago,
             member: Some((1, "worker-1".to_string())),
             pid: None,
             codex_log_scan: None,
@@ -10227,7 +10250,33 @@ mod tests {
             )
             .is_empty()
         );
-        assert_eq!(trackers.len(), 1, "still pending, not timed out");
+        assert_eq!(trackers.len(), 1, "still pending");
+    }
+
+    #[test]
+    fn a_pane_that_ends_unidentified_takes_its_tracker_with_it() {
+        // The tracker has no clock to end it, so the pane's screen going away is
+        // its end — the same `PtyExited` that releases the core's own guard.
+        let key = pending_key("worker-1");
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = App::new(vec![]);
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        let mut trackers = vec![codex_tracker(1, "worker-1", an_hour_ago)];
+
+        drop_trackers_of_gone_panes(&mut trackers, &state);
+        assert_eq!(trackers.len(), 1, "the pane is still there");
+
+        engine::update(
+            &mut state,
+            &mut app,
+            &BrigadeConfig::default(),
+            Event::PtyExited { key, reason: None },
+            Instant::now(),
+        );
+        drop_trackers_of_gone_panes(&mut trackers, &state);
+
+        assert!(trackers.is_empty());
     }
 
     /// Root a [`ClaudeHome`] under `dir` with a `.claude.json` registry

@@ -2302,8 +2302,14 @@ For a solo Codex creation, discovery snapshots the Codex log database before
 spawn and associates later log rows with the spawned PID and its process start
 time; the unique associated thread must also be a new session in the pane's
 cwd. Already claimed identities are excluded. An unavailable, replaced, or
-ambiguous source leaves the pane unidentified rather than guessing, and solo
-discovery has no timeout. Brigade members use their hook-recorded identity.
+ambiguous source leaves the pane unidentified rather than guessing. No
+discovery has a timeout: a tracker lives as long as its pane and ends only when
+the pane is identified or goes away. A brigade member is identified by the
+identity its first turn's hook records, so that turn identifies it whenever it
+happens and whoever takes it — banto's own kickoff or one the operator types.
+While the kickoff is held (an unanswered trust prompt) or failing, the pane
+stays unidentified and the guard above stays on; the operator is told when
+typing fails, by the kickoff's own status, not by a timer.
 
 Solo attribution requires the PTY child PID to identify the Codex process; a
 wrapper or absent PID can leave the pane unresolved. Process start times have

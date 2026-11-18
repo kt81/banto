@@ -3839,19 +3839,6 @@ pub enum Event {
         session_id: String,
         member: Option<(BrigadeId, MemberToken)>,
     },
-    /// The shell's Codex-sourced discovery tracker for `key` gave up: too
-    /// long since spawn with `BrigadeMember::briefed_session_id` still
-    /// `None` (see `docs/notes/codex-briefing-spike.md`'s silent-failure
-    /// list — an untrusted hook, a kickoff line that never got typed, and
-    /// others all look identical from here: nothing ever arrives). Unlike a
-    /// resolved [`Self::DiscoveryResult`], this never rekeys anything — the
-    /// pane stays parked under its synthetic key, same degraded-but-visible
-    /// outcome as an unresolved Claude discovery today, just with a status
-    /// line explaining why instead of silence.
-    CodexWorkerDiscoveryTimedOut {
-        key: SessionKey,
-        token: MemberToken,
-    },
     /// The shell's Claude-sourced discovery tracker for `token` still hasn't
     /// resolved, and its own cwd definitively reads `NotTrusted` (see
     /// `banto_io::directory_trust::claude_directory_trust` — narrower than
@@ -3859,12 +3846,10 @@ pub enum Event {
     /// reasoning) — reported once per tracker (the shell's own dedup,
     /// `DiscoveryTracker::notified_untrusted`), so this pane's silence gets
     /// explained instead of looking broken.
-    /// Unlike [`Self::CodexWorkerDiscoveryTimedOut`], there is no keystroke
-    /// to hold back here (this tracker only looks for the session id, and the
-    /// relay nudge types into a member only once it is identified and seen
-    /// idle) and no give-up timeout either — Claude discovery still waits forever,
-    /// unchanged; this only ever adds a one-time status line on top of that
-    /// wait.
+    /// There is no keystroke to hold back here (this tracker only looks for
+    /// the session id, and the relay nudge types into a member only once it
+    /// is identified and seen idle), and discovery never gives up on a clock:
+    /// this only ever adds a one-time status line on top of the wait.
     ClaudeWorkerDirectoryUntrusted {
         token: MemberToken,
     },
@@ -4197,12 +4182,6 @@ pub fn update(
             session_id,
             member,
         } => update_discovery_result(state, key, session_id, member, now),
-        Event::CodexWorkerDiscoveryTimedOut { key, token } => {
-            state.pending_kickoffs.retain(|pending| pending.key != key);
-            let call = state.member_call(state.member_brigades.get(&key).copied(), &token);
-            state.set_status(format!("{call}: Codex briefing wasn't confirmed"), now);
-            Vec::new()
-        }
         Event::ClaudeWorkerDirectoryUntrusted { token } => {
             // Only the token travels with this event: the staged brigade is the
             // one the operator is looking at when it is raised.
@@ -15061,37 +15040,53 @@ mod tests {
     }
 
     #[test]
-    fn codex_worker_discovery_timed_out_sets_status_and_drops_any_pending_kickoff() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
+    fn an_unidentified_codex_worker_that_ends_releases_the_codex_guard() {
+        // Discovery no longer gives up on a clock, so the pane's end is the only
+        // thing that lets go of this guard for a Worker nobody ever identified —
+        // whether it ended on its own or banto asked for it (a dismissal, a
+        // disband).
+        for banto_asked in [false, true] {
+            let mut state = EmporiumState::new(PrefixKey::default());
+            let mut app = app_with(vec![]);
+            let brigade = brigade_config();
+            let key = SessionKey::new_worker(1, "worker-1");
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+            state.member_brigades.insert(key.clone(), 1);
+            state
+                .member_tokens
+                .insert(key.clone(), "worker-1".to_string());
+            state.unresolved_codex.insert(key.clone());
+            if banto_asked {
+                state.expected_exits.insert(key.clone());
+            }
+            let mut known = row("known");
+            known.agent = AgentKind::Codex;
+            app.replace_rows(vec![known.clone()]);
+            assert!(
+                open_solo(&mut state, &known).is_empty(),
+                "refused while the pane lives, however long that is"
+            );
 
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::CodexWorkerDiscoveryTimedOut {
-                key,
-                token: "worker-1".to_string(),
-            },
-            test_instant(),
-        );
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::PtyExited { key, reason: None },
+                test_instant(),
+            );
 
-        assert!(cmds.is_empty());
-        assert!(state.pending_kickoffs.is_empty());
-        assert_eq!(
-            state.status.as_deref(),
-            Some("worker-1: Codex briefing wasn't confirmed")
-        );
+            assert!(
+                state.unresolved_codex.is_empty(),
+                "banto_asked={banto_asked}"
+            );
+            assert!(
+                matches!(
+                    open_solo(&mut state, &known).as_slice(),
+                    [Cmd::OpenEmbedded { .. }]
+                ),
+                "banto_asked={banto_asked}"
+            );
+        }
     }
 
     #[test]
