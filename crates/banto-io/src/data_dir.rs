@@ -1,6 +1,7 @@
 //! banto's own data directory and everything banto keeps in it: the database,
 //! the per-member MCP configs and the Goinkyo's consultation requests under
-//! `mcp/`, and the opt-in message logs under `logs/`. It is `<data_local>/banto`
+//! `mcp/`, and under `logs/` the opt-in message logs and the pane lifecycle log
+//! `panes.log`. It is `<data_local>/banto`
 //! unless the operator named another (`--data-dir`, `BANTO_DATA_DIR`, `data_dir`
 //! in `config.toml`); `banto::startup` decides, and refuses one inside an agent's
 //! home.
@@ -19,7 +20,7 @@
 //!
 //! Only names banto writes are ever candidates (see [`parse_name`]), only in
 //! `mcp/` and `mcp/goinkyo/`, and only if those two are real directories. The
-//! message logs, the database and anything else are never touched.
+//! logs, the database and anything else are never touched.
 //!
 //! What this does **not** protect against, stated so nobody has to find it out:
 //!
@@ -113,7 +114,7 @@ impl DataDir {
         Some(dir.join(request_name(brigade)?))
     }
 
-    /// `<root>/logs`: the opt-in message logs (never swept).
+    /// `<root>/logs`: the opt-in message logs and `panes.log` (never swept).
     pub fn logs_dir(&self) -> PathBuf {
         self.0.join("logs")
     }

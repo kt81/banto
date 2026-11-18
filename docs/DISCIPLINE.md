@@ -190,9 +190,14 @@ choice only for what `Cmd`s cannot express.
    (Store swappability is served by the existing `Store` type boundary;
    `Cmd`-ization buys replay and ordering, not swapping.)
 2. **Diagnostics may bypass.** Existing diagnostic channels
-   (`BANTO_INPUT_LOG`-style logs; `docs/REQUIREMENTS.md`, "The emporium: hosted
-   panes", says what each records) are `banto-io` concerns and do not need
-   `Cmd` round-trips.
+   (`BANTO_INPUT_LOG`-style logs, `BANTO_BELL_LOG`, and the pane lifecycle log
+   `panes.log`; `docs/REQUIREMENTS.md`, "The emporium: hosted panes", says what
+   each records) are `banto-io` concerns and do not need `Cmd` round-trips.
+   The pane log is written by the dispatch loop beside `update`, from values the
+   loop already holds. What a line says is decided in `banto_core::pane_log`,
+   whose matches have no wildcard arm: a new Event or Cmd variant does not
+   compile until someone has placed it in the written or the unwritten bucket.
+   Writing a line never feeds anything back into `update`.
 
 ## 7. Multi-process reality
 
@@ -358,7 +363,10 @@ replaced log file, rather than creating sidecars or trusting a changed source.
 These bounds apply to log rows and retained associations, not necessarily the
 number or cost of candidate-session queries.
 File writes: banto's own sqlite DB, per-member `--mcp-config` files, diagnostic logs
-(`BANTO_INPUT_LOG`, `BANTO_BELL_LOG`, one line per executed bell with its cause) —
+(`BANTO_INPUT_LOG`, `BANTO_BELL_LOG`, one line per executed bell with its cause), and
+the pane lifecycle log `panes.log` under `logs/` (rotated at 4 MiB to `panes.log.1`,
+written by the UI process alone, content-free: `banto_core::pane_log` chooses the
+lines) —
 all under banto's own config/data dirs (the data dir is the operator's to name, never inside an agent's home), never `~/.claude`.
 The single-instance lock: one more file the UI writes, `<database file>.lock` (an
 exclusive advisory lock, empty, never deleted) and its `<database file>.lock.pid`

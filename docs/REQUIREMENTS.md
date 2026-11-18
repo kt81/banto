@@ -1243,6 +1243,49 @@ it should name a regular file: a FIFO with no reader would block the event loop.
 path comes only from the variable. *Why it exists:* three days of answering "why did
 it ring?" by inference were settled by the first line it wrote.
 
+`<data dir>/logs/panes.log` is always on and needs no variable or key: the pane
+lifecycle log, for "what happened to this pane?" after the fact. Only the UI
+process appends to it. Each file begins with a `start` line, with the banto version,
+the build commit (`crates/banto/build.rs`, `unknown` when git cannot say), the
+store's schema version and the UI's process id. After it, one line per Event or Cmd that
+is written, `<unix ms> panes +<ms since start>ms <Kind> <name=value ...>`:
+`Spawned`, `SpawnFailed` (a refusal word per refusal site and the OS error number,
+never the error text), `PtyExited` (the exit code or signal, `asked=yes|no`, the
+member), `PtyOutputLost`, `PtyWriteDropped`, `Reaped` (a released handle and its
+pid), `DiscoveryResult`, `MemberSessionForked`, `MembershipResolved` and
+`MembershipRoster` (tokens, roles and session ids), `BrigadeFormed`, `WorkerAdded`,
+`WorkerDismissed`, `ExitedWorkerDismissed`, `Disbanded`; and the Cmds `OpenEmbedded`
+(with `replaced=yes` when it displaced a live handle under its key), `OpenCodexTrustPane`
+(the same, with `pid`), `KillPty` and
+`RekeyPty` (with `handle=yes|no`), and the store intents that set, clear or remove a
+member's session or row. Every Cmd line carries `by=<the Event that produced it>`.
+Input, pane output, the bytes sent to a pane, ticks, quiescence samples and row loads
+are never written, nor is any Event or Cmd not named here. A Goinkyo line,
+`goinkyo brigade=<id> row=… director=… roster=… guard=… pane=… opening=…`, is written
+per brigade only when its value changes; it is the same value the spawn decision of
+that tick is made from (`banto_core::engine::decide_goinkyo`). When the brigade's
+roster could not be read the line says `row=unread director=unknown` rather than
+claiming either value.
+
+Nothing in a line is operator or agent text. A line is built from fixed words,
+numbers, flags and identifiers only: no pane bytes, keys, pasted text, message
+bodies or glances, consultation text, titles, previews, display or brigade names,
+working directories, argv or error messages. A test feeds each text-carrying Event
+and Cmd a marker string and asserts that it reaches no line.
+
+Bounds: a line is at most 300 bytes. A longer line is cut back to its last whole
+field, so the fields that name the pane and its cause (`key=`, `by=`) come first and
+are the last to go. At most 200 lines are written per minute; the rest are counted,
+and one `suppressed count=<n>` line is written with the next line that is admitted.
+The file is rotated at 4 MiB to `panes.log.1`. Nothing is deleted first: the rename
+replaces the previous generation, so at most two generations exist, and the `start`
+line is written again at the top of the new file. A rename the OS refuses (a reader
+holds the file without delete sharing) changes nothing: the writer keeps appending
+to the current file and tries the rotation again at the next line. Each line is one
+unbuffered write on a handle kept open for the process. A write that fails is
+ignored: the log never takes the UI down. Nothing per tick, chunk or key is written.
+Nothing in banto reads the file.
+
 **Layout.** A solo session fills the whole pane. A staged brigade (see
 "Brigade" below) tiles Director left / Workers stacked down the right —
 "master + stack". The proportions are the operator's to move with the left

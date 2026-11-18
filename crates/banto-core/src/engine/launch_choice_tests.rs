@@ -2416,6 +2416,8 @@ fn a_resume_that_fails_leaves_nothing_that_blocks_the_member_afterwards() {
         Event::SpawnFailed {
             key: SessionKey::from_id("w1"),
             error: "refused".to_string(),
+            refusal: Default::default(),
+            os_error: None,
         },
         now(),
     );
@@ -2438,6 +2440,8 @@ fn a_resume_that_fails_leaves_nothing_that_blocks_the_member_afterwards() {
         Event::SpawnFailed {
             key: SessionKey::from_id("w1"),
             error: "refused".to_string(),
+            refusal: Default::default(),
+            os_error: None,
         },
         now(),
     );

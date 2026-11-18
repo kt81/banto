@@ -46,6 +46,7 @@ use crate::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
     MessageGlance, PtyExitReason, Quiescence, SessionRow, SessionToOpen, StoredLayout,
 };
+use crate::pane_log::PaneFacts;
 use crate::program_state::ReportedState;
 
 pub use crate::layout::{
@@ -691,6 +692,68 @@ pub enum GoinkyoObservation {
     /// A member row exists with no session id yet, and the brigade's
     /// Director is hosted.
     AwaitingSpawn(GoinkyoSpawnCandidate),
+}
+
+/// A brigade's Goinkyo one-shot guard as [`EmporiumState::goinkyo_guard_facts`]
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoinkyoGuardFacts {
+    pub guard: Option<SessionKey>,
+    pub pane: bool,
+    pub opening: bool,
+}
+
+/// The Goinkyo member row of a brigade, as the shell read it this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoinkyoRow {
+    Absent,
+    NoSession,
+    Session(String),
+}
+
+/// One brigade's Goinkyo situation as the shell read it this tick. The pane log
+/// writes it and [`decide_goinkyo`] decides from it, so the record and the
+/// decision are one reading, not two.
+///
+/// When `roster_read` is false the store could not list the brigade's members,
+/// so `row` and `director_hosted` are placeholders: the decision ignores them,
+/// and the pane log writes `row=unread director=unknown` instead of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoinkyoLook {
+    pub brigade_id: BrigadeId,
+    pub roster_read: bool,
+    pub row: GoinkyoRow,
+    pub director_hosted: bool,
+    pub guard: GoinkyoGuardFacts,
+    /// Only meaningful when the row is awaiting a session and the Director is
+    /// hosted; empty otherwise.
+    pub cwd: PathBuf,
+    pub roster: Vec<MemberToken>,
+}
+
+/// The observation this tick's [`GoinkyoLook`] calls for, or `None` when
+/// there is nothing to tell the core. A brigade whose row already holds a
+/// session id, or whose Director is not hosted, is left out — the
+/// `Unchanged` reading the shell no longer sends.
+pub fn decide_goinkyo(look: &GoinkyoLook) -> Option<GoinkyoObservation> {
+    if !look.roster_read {
+        return None;
+    }
+    match &look.row {
+        GoinkyoRow::Absent => (look.director_hosted || look.guard.guard.is_some()).then_some(
+            GoinkyoObservation::NoGoinkyo {
+                brigade_id: look.brigade_id,
+            },
+        ),
+        GoinkyoRow::NoSession => look.director_hosted.then(|| {
+            GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
+                brigade_id: look.brigade_id,
+                cwd: look.cwd.clone(),
+                roster: look.roster.clone(),
+            })
+        }),
+        GoinkyoRow::Session(_) => None,
+    }
 }
 
 /// Shows a status message again and again for as long as a condition holds,
@@ -1536,8 +1599,10 @@ pub struct EmporiumState {
     /// passive fold is what cleans up), and only this record separates them.
     /// Written by [`kill_pane`] and nowhere else — a `Cmd::KillPty` built by
     /// hand somewhere else would read, correctly as far as this state can
-    /// see, as a child that died on its own.
-    expected_exits: HashSet<SessionKey>,
+    /// see, as a child that died on its own. The member the pane held when the
+    /// kill was issued is kept with it: unstaging removes that membership before
+    /// the exit arrives, and the exit's log line still has to name it.
+    expected_exits: HashMap<SessionKey, Option<(BrigadeId, MemberToken)>>,
     /// When each member's pane was last restarted by [`update_pty_exited`],
     /// so a member that cannot stay up is not restarted forever. Never
     /// cleared on success: a member that dies once an hour should be
@@ -1570,8 +1635,17 @@ const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 /// asymmetry is what this exists to remove; and an exit banto did not ask for is
 /// the one after which a Worker that cannot be relaunched leaves its brigade
 /// (`unrequested_worker_exit`), so the record must never be missing.
+///
+/// The member is read here, not at exit time, because the callers that end a
+/// Worker's pane unstage it, which removes the member's maps. So every caller
+/// issues this before it unstages. A kill already on record keeps the member it
+/// was issued with.
 fn kill_pane(state: &mut EmporiumState, key: SessionKey) -> Cmd {
-    state.expected_exits.insert(key.clone());
+    let member = state.member_of(&key);
+    let recorded = state.expected_exits.entry(key.clone()).or_default();
+    if recorded.is_none() {
+        *recorded = member;
+    }
     Cmd::KillPty { key }
 }
 
@@ -1661,7 +1735,7 @@ impl EmporiumState {
             ring_list_generation: 0,
             previous_ring_set: None,
             last_attention_bell: None,
-            expected_exits: HashSet::new(),
+            expected_exits: HashMap::new(),
             last_relaunch: HashMap::new(),
             spawn_order: HashMap::new(),
             next_spawn: 0,
@@ -1770,8 +1844,8 @@ impl EmporiumState {
         {
             previous.insert(new_key.clone());
         }
-        if self.expected_exits.remove(old_key) {
-            self.expected_exits.insert(new_key.clone());
+        if let Some(record) = self.expected_exits.remove(old_key) {
+            self.expected_exits.insert(new_key.clone(), record);
         }
         if let Some(value) = self.last_relaunch.remove(old_key) {
             self.last_relaunch.insert(new_key.clone(), value);
@@ -2097,6 +2171,47 @@ impl EmporiumState {
     /// own one-shot-guard bookkeeping ever writes to it.
     pub fn goinkyo_pane_for(&self, brigade_id: BrigadeId) -> Option<&SessionKey> {
         self.goinkyo_pane.get(&brigade_id)
+    }
+
+    /// The Goinkyo one-shot guard of `brigade_id` as plain values, for the
+    /// pane log: the key it holds, whether that key has a pane, and whether
+    /// that key is still being opened. Read-only; the guard itself stays
+    /// private to this crate's own bookkeeping.
+    pub fn goinkyo_guard_facts(&self, brigade_id: BrigadeId) -> GoinkyoGuardFacts {
+        let guard = self.goinkyo_pane.get(&brigade_id).cloned();
+        let pane = guard
+            .as_ref()
+            .is_some_and(|key| self.screens.contains_key(key));
+        let opening = guard
+            .as_ref()
+            .is_some_and(|key| self.pending_opens.contains_key(key));
+        GoinkyoGuardFacts {
+            guard,
+            pane,
+            opening,
+        }
+    }
+
+    /// What the pane log says about the pane at `key`, read before the Event
+    /// about it is folded: whether its exit was asked for, and the member it
+    /// belongs to. The shell adds the process id, which only it holds.
+    pub fn pane_facts(&self, key: &SessionKey) -> PaneFacts {
+        let member = self
+            .member_of(key)
+            .or_else(|| self.expected_exits.get(key).cloned().flatten());
+        PaneFacts {
+            asked: self.expected_exits.contains_key(key),
+            member,
+            pid: None,
+        }
+    }
+
+    /// The member a pane is held for now, if its membership is still registered.
+    fn member_of(&self, key: &SessionKey) -> Option<(BrigadeId, MemberToken)> {
+        self.member_brigades
+            .get(key)
+            .zip(self.member_tokens.get(key))
+            .map(|(brigade_id, token)| (*brigade_id, token.clone()))
     }
 
     /// Whether the pane `director` is a Director's and its brigade has an open
@@ -3747,6 +3862,40 @@ impl std::fmt::Display for BellCause {
     }
 }
 
+/// Which site refused or failed a pane open, as the pane log names it. The shell
+/// picks one per refusal site; `Unspecified` is what an older recording (before
+/// this field existed) and a test without a site decode to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnRefusal {
+    #[default]
+    Unspecified,
+    /// The banto executable could not be checked (moved, replaced, or unreadable).
+    ExeUnavailable,
+    /// The agent process could not be started (a PTY open or spawn error).
+    PtyOpen,
+    /// A resume was asked while a Codex pane was still being identified.
+    CodexIdentifying,
+    /// The same session is already hosted in another pane.
+    AlreadyRunning,
+    /// The brigade's MCP channel config could not be written.
+    ChannelWiring,
+}
+
+impl SpawnRefusal {
+    /// The fixed word the pane log writes for this refusal.
+    pub fn as_word(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::ExeUnavailable => "exe_unavailable",
+            Self::PtyOpen => "pty_open",
+            Self::CodexIdentifying => "codex_identifying",
+            Self::AlreadyRunning => "already_running",
+            Self::ChannelWiring => "channel_wiring",
+        }
+    }
+}
+
 /// A fact about the outside world, fed into [`update`]. Derives
 /// `Serialize`/`Deserialize`: this is the one type a record/replay stream
 /// (`crate::replay`, `docs/DISCIPLINE.md` §8) actually writes to and reads
@@ -3806,6 +3955,14 @@ pub enum Event {
     SpawnFailed {
         key: SessionKey,
         error: String,
+        /// Which refusal site produced this, as a fixed word for the pane log:
+        /// `error` is operator-facing text and never reaches the log.
+        #[serde(default)]
+        refusal: SpawnRefusal,
+        /// The OS error number under the failure, when the failure was an I/O
+        /// error (a refusal before any I/O has none).
+        #[serde(default)]
+        os_error: Option<i32>,
     },
     RowsLoaded {
         rows: Vec<SessionRow>,
@@ -4130,7 +4287,7 @@ pub fn update(
             update_new_session_cwd_checked(state, app, cwd, is_dir)
         }
         Event::Spawned { key, agent } => update_spawned(state, brigade, key, agent, now),
-        Event::SpawnFailed { key, error } => update_spawn_failed(state, key, error, now),
+        Event::SpawnFailed { key, error, .. } => update_spawn_failed(state, key, error, now),
         Event::RowsLoaded {
             rows,
             hidden,
@@ -6869,12 +7026,12 @@ fn stage_brigade(
             let survivor = surviving_pane(state, &live, recorded.as_ref());
             // Any others are duplicates of one member — closed through the path
             // that marks the exit as asked for, so they are neither relaunched
-            // nor counted as the Worker leaving the brigade. Ownership goes
-            // first, so the survivor's process is never touched and nothing
-            // else is named by the duplicate's key.
+            // nor counted as the Worker leaving the brigade. The kill is recorded
+            // before the unstage that takes the duplicate's membership away, so
+            // its exit still names the member; the survivor is never touched.
             for duplicate in live.iter().filter(|key| **key != survivor) {
-                state.unstage(duplicate);
                 cmds.push(kill_pane(state, duplicate.clone()));
+                state.unstage(duplicate);
                 duplicates += 1;
             }
             if *role == BrigadeRole::Goinkyo {
@@ -8606,7 +8763,7 @@ fn update_pty_exited(
     reason: Option<PtyExitReason>,
     now: Instant,
 ) -> Vec<Cmd> {
-    let banto_asked = state.expected_exits.remove(&key);
+    let banto_asked = state.expected_exits.remove(&key).is_some();
     // Decided before anything below touches the member's maps: whether this is a
     // Worker that left on its own, so that if it cannot be relaunched it leaves
     // the brigade instead of lingering in the roster with no tile.
@@ -8719,7 +8876,7 @@ fn update_pty_output_lost(
             .unwrap_or_else(|| key.as_str().to_string()),
     };
     let is_member = state.member_tokens.contains_key(&key);
-    let was_expected = state.expected_exits.contains(&key);
+    let was_expected = state.expected_exits.contains_key(&key);
     let cmds = if was_expected {
         Vec::new()
     } else {
@@ -9397,8 +9554,9 @@ fn update_worker_dismissed(
                 .unwrap_or_else(|| key.as_str().to_string());
             state.set_status(format!("{title} dismissed from the brigade"), now);
             if staged {
+                let kill = kill_pane(state, key.clone());
                 state.unstage(&key);
-                vec![kill_pane(state, key)]
+                vec![kill]
             } else {
                 Vec::new()
             }
@@ -10169,10 +10327,11 @@ fn update_goinkyo_awaiting_spawn(
                 &state.stage,
                 Stage::Brigade { id, panes, .. } if *id == brigade_id && panes.contains(&key)
             );
+            let kill = kill_pane(state, key.clone());
             if staged {
                 state.unstage(&key);
             }
-            return vec![kill_pane(state, key)];
+            return vec![kill];
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
@@ -10231,10 +10390,11 @@ fn update_goinkyo_awaiting_spawn(
             Stage::Brigade { id, panes, .. }
                 if *id == candidate.brigade_id && panes.contains(&existing)
         );
+        let kill = kill_pane(state, existing.clone());
         if staged {
             state.unstage(&existing);
         }
-        return vec![kill_pane(state, existing)];
+        return vec![kill];
     }
     // A new consultation starts with nothing of the last one's: its end may not
     // have been seen (dismissed and summoned again inside one tick).
@@ -10726,7 +10886,7 @@ mod tests {
         let key = SessionKey::from_id("dir");
         state.screens.insert(key.clone(), Screen::new(24, 80));
         state.pending_director_reopen = Some("dir".into());
-        state.expected_exits.insert(key.clone());
+        state.expected_exits.insert(key.clone(), None);
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
         let cmds = update(
@@ -11639,6 +11799,8 @@ mod tests {
             Event::SpawnFailed {
                 key,
                 error: "already running elsewhere".to_string(),
+                refusal: Default::default(),
+                os_error: None,
             },
             now,
         );
@@ -15442,7 +15604,7 @@ mod tests {
                 .insert(key.clone(), "worker-1".to_string());
             state.unresolved_codex.insert(key.clone());
             if banto_asked {
-                state.expected_exits.insert(key.clone());
+                state.expected_exits.insert(key.clone(), None);
             }
             let mut known = row("known");
             known.agent = AgentKind::Codex;
@@ -25585,6 +25747,8 @@ mod tests {
             Event::SpawnFailed {
                 key: key.clone(),
                 error: "boom".to_string(),
+                refusal: Default::default(),
+                os_error: None,
             },
             test_instant(),
         );
@@ -26075,7 +26239,7 @@ mod tests {
         );
         assert!(!state.goinkyo_pane.contains_key(&6));
         assert!(
-            state.expected_exits.contains(&old_key),
+            state.expected_exits.contains_key(&old_key),
             "banto asked for this exit, so it is not a pane that fell over"
         );
 
@@ -26195,6 +26359,8 @@ mod tests {
             Event::SpawnFailed {
                 key: key.clone(),
                 error: "no such file".to_string(),
+                refusal: Default::default(),
+                os_error: None,
             },
             now,
         );
@@ -26552,7 +26718,7 @@ mod tests {
         state.latched_attention_panes.insert(old.clone());
         state.ring_list_waiting.insert(old.clone());
         state.previous_ring_set = Some([old.clone()].into_iter().collect());
-        state.expected_exits.insert(old.clone());
+        state.expected_exits.insert(old.clone(), None);
         state.last_relaunch.insert(old.clone(), now);
         state.pending_dismiss = Some(old.clone());
         state.last_focus_notified = Some(old.clone());
@@ -26594,7 +26760,7 @@ mod tests {
         assert!(!state.latched_attention_panes.contains(&old));
         assert!(!state.ring_list_waiting.contains(&old));
         assert!(!state.previous_ring_set.as_ref().unwrap().contains(&old));
-        assert!(!state.expected_exits.contains(&old));
+        assert!(!state.expected_exits.contains_key(&old));
         assert!(!state.last_relaunch.contains_key(&old));
         assert_ne!(state.pending_dismiss.as_ref(), Some(&old));
         assert_ne!(state.last_focus_notified.as_ref(), Some(&old));
@@ -27531,6 +27697,35 @@ mod tests {
             brigade_id,
             result: Ok((HashSet::new(), HashSet::new())),
         }
+    }
+
+    #[test]
+    fn a_dismissed_workers_exit_is_asked_for_and_still_names_its_member() {
+        let (mut state, mut app, brigade, now) = weighted_three_worker_brigade();
+        let key = SessionKey::from_id("w3");
+        // The fixture registers the token; a Worker's brigade is registered beside it.
+        state.member_brigades.insert(key.clone(), 1);
+        state.pending_dismiss = Some(key.clone());
+        state.pending_dismiss_member = Some((1, "worker-3".to_string()));
+        assert_eq!(
+            state.pane_facts(&key).member,
+            Some((1, "worker-3".to_string()))
+        );
+
+        let cmds = update(&mut state, &mut app, &brigade, dismissed(1), now);
+
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::KillPty { key: killed } if *killed == key)),
+            "dismissing a staged Worker kills its pane: {cmds:?}"
+        );
+        let facts = state.pane_facts(&key);
+        assert!(facts.asked, "the kill is on record");
+        assert_eq!(
+            facts.member,
+            Some((1, "worker-3".to_string())),
+            "the member is still named after the unstage"
+        );
     }
 
     #[test]

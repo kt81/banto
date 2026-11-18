@@ -34,6 +34,7 @@ pub mod key_encode;
 pub mod layout;
 pub mod member_name;
 pub mod model;
+pub mod pane_log;
 pub mod program_state;
 pub mod replay;
 pub mod screen;

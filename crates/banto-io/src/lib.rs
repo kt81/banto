@@ -44,6 +44,7 @@ pub mod file_identity;
 pub mod input;
 pub mod instance_lock;
 pub mod lineage;
+pub mod pane_log;
 pub mod provider;
 pub mod pty;
 pub(crate) mod sqlite_ro;

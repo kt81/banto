@@ -47,15 +47,18 @@ use banto_core::app::{App, Mode};
 use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgents};
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
-    GoinkyoObservation, GoinkyoSpawnCandidate, GroupJoinTargetData, LiveStatus, PrefixKey,
-    RelayObservation, SessionKey, StoreIntent,
+    GoinkyoLook, GoinkyoRow, GroupJoinTargetData, LiveStatus, PrefixKey, RelayObservation,
+    SessionKey, SpawnRefusal, StoreIntent, decide_goinkyo,
 };
+#[cfg(test)]
+use banto_core::engine::{GoinkyoObservation, GoinkyoSpawnCandidate};
 use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
 use banto_core::model::{
     AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberGlance, MemberToken, MessageGlance,
     Quiescence, SessionId, SessionToOpen,
 };
+use banto_core::pane_log as pane_lines;
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
 use banto_core::screen::{SPAWN_COLS, SPAWN_ROWS, Screen};
 use banto_core::status::AgeThresholds;
@@ -68,6 +71,7 @@ use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::data_dir::DataDir;
 use banto_io::file_identity::DirectorySpellings;
 use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
+use banto_io::pane_log::PaneLog;
 use banto_io::provider::SessionProvider;
 use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
@@ -77,7 +81,7 @@ use banto_io::status::{
     LiveSession, SysinfoProbe, ancestry_reaches, claude_nudgeable, claude_quiescence,
     live_activity, read_live_sessions, waiting_on_a_dialog,
 };
-use banto_io::store::Store;
+use banto_io::store::{SCHEMA_VERSION, Store};
 use banto_tui::paint;
 use banto_tui::strip::{StripData, StripMessage, render_strip, render_title_status};
 use banto_tui::view::{self, WAITING_ACTIVITY_COLOR};
@@ -641,6 +645,7 @@ fn event_loop(
     let mut input_log = open_input_log();
     let mut stage_log = open_stage_log();
     let mut bell_log = open_bell_log();
+    let mut pane_log = open_pane_log(deps);
     let mut paste_acc = PasteAccumulator::new();
     let run_start = Instant::now();
     let mut event_recorder = open_event_recorder(run_start);
@@ -853,10 +858,13 @@ fn event_loop(
             let samples = std::mem::take(&mut glance_gate.quiescence);
             events.push_back(Event::QuiescenceSampled { samples });
             events.push_back(Event::Tick { relay, brigades });
-            for observation in
-                gather_goinkyo_observations(&state, deps.store, app, Some(&mut tick_timings))
-            {
-                events.push_back(Event::GoinkyoAwaitingSpawn { observation });
+            for look in gather_goinkyo_looks(&state, deps.store, app, Some(&mut tick_timings)) {
+                if let Some(log) = pane_log.as_mut() {
+                    log.goinkyo(&look);
+                }
+                if let Some(observation) = decide_goinkyo(&look) {
+                    events.push_back(Event::GoinkyoAwaitingSpawn { observation });
+                }
             }
         }
         let tick_dur = tick_start.elapsed();
@@ -873,6 +881,13 @@ fn event_loop(
             }
             // Named before the event is consumed, and only when the log will use it.
             let produced_by = bell_log.is_some().then(|| variant_name(&ev));
+            // Read before `update` folds the event: the facts about the pane
+            // the log names are the ones the event found, not the ones it leaves.
+            let by = pane_lines::event_name(&ev);
+            if let Some(log) = pane_log.as_mut() {
+                let facts = pane_facts_for(&state, &handles, &ev);
+                log.emit_all(&pane_lines::event_lines(&ev, &facts));
+            }
             let cmds = engine::update(&mut state, app, brigade, ev, now);
             for cmd in cmds {
                 if let Cmd::RingHostBell { cause } = &cmd {
@@ -884,7 +899,35 @@ fn event_loop(
                     ring_host_bell_to(&mut io::stdout(), cause, entry);
                     continue;
                 }
-                events.extend(execute_cmd(cmd, deps, &mut handles, &mut discovery));
+                // Cloned before `execute_cmd` consumes the Cmd, and only for the
+                // kinds the log records. `handle_present` is read before it runs
+                // for the same reason: the handle may be gone after.
+                let source =
+                    (pane_log.is_some() && pane_lines::is_logged_cmd(&cmd)).then(|| cmd.clone());
+                let handle_present =
+                    pane_lines::cmd_handle_key(&cmd).is_some_and(|key| handles.contains_key(key));
+                let results = execute_cmd(cmd, deps, &mut handles, &mut discovery);
+                if let (Some(log), Some(source)) = (pane_log.as_mut(), source) {
+                    // An open replaces a handle under its key only when it succeeds,
+                    // and a success is the one event an open produces.
+                    let replaced = handle_present
+                        && results
+                            .iter()
+                            .any(|event| matches!(event, Event::Spawned { .. }));
+                    // Read after the open, since the handle it left is what has a pid.
+                    let pid = pane_lines::cmd_handle_key(&source)
+                        .and_then(|key| handles.get(key))
+                        .and_then(PtyHandle::pid);
+                    let facts = pane_lines::CmdFacts {
+                        handle_present,
+                        replaced,
+                        pid,
+                    };
+                    if let Some(line) = pane_lines::cmd_line(&source, by, facts) {
+                        log.emit(&line);
+                    }
+                }
+                events.extend(results);
             }
         }
         let dispatch_dur = dispatch_start.elapsed();
@@ -906,6 +949,11 @@ fn event_loop(
         // Whatever the exact contract turns out to be, a teardown that can
         // block must not run on the thread that serves the operator.
         let reaped = reap_pty_handles(&mut handles, &state);
+        if let Some(log) = pane_log.as_mut() {
+            for (key, handle) in &reaped {
+                log.emit(&pane_lines::reaped_line(key, handle.pid()));
+            }
+        }
         drop_trackers_of_gone_panes(&mut discovery, &state);
         if !reaped.is_empty() {
             std::thread::spawn(move || drop(reaped));
@@ -1366,7 +1414,14 @@ fn execute_open_codex_trust_pane(
 ) -> Vec<Event> {
     let exe = match deps.exe.check() {
         Ok(exe) => exe,
-        Err(error) => return vec![Event::SpawnFailed { key, error }],
+        Err(error) => {
+            return vec![Event::SpawnFailed {
+                key,
+                error,
+                refusal: SpawnRefusal::ExeUnavailable,
+                os_error: None,
+            }];
+        }
     };
     let argv = crate::codex_trust::trust_argv(exe, deps.agent_binaries);
     let cwd = std::env::current_dir().ok();
@@ -1389,6 +1444,8 @@ fn execute_open_codex_trust_pane(
         Err(err) => vec![Event::SpawnFailed {
             key,
             error: err.to_string(),
+            refusal: SpawnRefusal::PtyOpen,
+            os_error: os_error_of(&err),
         }],
     }
 }
@@ -1539,6 +1596,8 @@ fn execute_open_embedded(
         return vec![Event::SpawnFailed {
             key,
             error: "waiting to identify a new Codex pane before resuming".to_string(),
+            refusal: SpawnRefusal::CodexIdentifying,
+            os_error: None,
         }];
     }
     let claude_home = deps.claude_home;
@@ -1573,6 +1632,8 @@ fn execute_open_embedded(
         return vec![Event::SpawnFailed {
             key,
             error: "already running elsewhere".to_string(),
+            refusal: SpawnRefusal::AlreadyRunning,
+            os_error: None,
         }];
     };
     // Each product reaches banto's own MCP server a different way: Claude via
@@ -1586,7 +1647,14 @@ fn execute_open_embedded(
         // would make them another build: refused here, not found out by the agent.
         let exe = match deps.exe.check() {
             Ok(exe) => exe,
-            Err(error) => return vec![Event::SpawnFailed { key, error }],
+            Err(error) => {
+                return vec![Event::SpawnFailed {
+                    key,
+                    error,
+                    refusal: SpawnRefusal::ExeUnavailable,
+                    os_error: None,
+                }];
+            }
         };
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
         let child_args = deps
@@ -1626,6 +1694,8 @@ fn execute_open_embedded(
             return vec![Event::SpawnFailed {
                 key,
                 error: format!("brigade channel wiring failed: {err}"),
+                refusal: SpawnRefusal::ChannelWiring,
+                os_error: os_error_of(&err),
             }];
         }
     }
@@ -1689,6 +1759,8 @@ fn execute_open_embedded(
         Err(err) => vec![Event::SpawnFailed {
             key,
             error: err.to_string(),
+            refusal: SpawnRefusal::PtyOpen,
+            os_error: os_error_of(&err),
         }],
     }
 }
@@ -2611,46 +2683,36 @@ fn gather_relay_observations(
     observations
 }
 
-/// What each live brigade's Goinkyo row (if any) means for
-/// `engine::update_goinkyo_awaiting_spawn` this tick, one observation per
-/// brigade that has something to say — see [`GoinkyoObservation`]'s own doc
-/// for what each case tells the core to do. A brigade is live when its
-/// Director's pane is hosted, on stage or not; a brigade nobody has opened has a Director
-/// with no pane, and a Goinkyo row it holds is not started behind the
-/// operator's back at startup. Brigades banto has a Goinkyo pane recorded for
-/// are asked about whether or not their Director is hosted, so that an ended
-/// consultation is noticed wherever the Director's pane went.
+/// What each live brigade's Goinkyo row looks like this tick, as a value:
+/// [`GoinkyoLook`] is both what [`decide_goinkyo`] decides from and what the
+/// pane log writes, so the record and the decision are one reading. A brigade
+/// is live when its Director's pane is hosted, on stage or not; a brigade
+/// nobody has opened has a Director with no pane, and a Goinkyo row it holds is
+/// not started behind the operator's back at startup. Brigades banto has a
+/// Goinkyo pane recorded for are read whether or not their Director is hosted,
+/// so that an ended consultation is noticed wherever the Director's pane went.
 ///
 /// A store read failure for one brigade says nothing about it: it is not
-/// itself evidence the row is gone, and misreporting it as
-/// [`GoinkyoObservation::NoGoinkyo`] would release the one-shot guard on a
-/// transient glitch rather than an actual ended consultation. A brigade whose
-/// row holds a session id is `Unchanged` and is left out.
+/// itself evidence the row is gone, so it is read as `roster_read: false`,
+/// which decides nothing. Misreporting it as an absent row would release the
+/// one-shot guard on a transient glitch rather than an actual ended
+/// consultation.
 ///
-/// Deliberately does *not* also check whether a pane is already open or in
-/// flight for a would-be candidate: that would need the same synthetic key
-/// `stage_brigade`'s own Worker-awaiting-discovery branch builds
-/// (`SessionKey::new_worker`), which is private to `banto_core::engine` —
-/// this crate has no way to construct one to look `state.screens`/
-/// `pending_opens` up by. `update_goinkyo_awaiting_spawn` does that check
-/// itself instead, on the core side where the constructor is reachable; see
-/// its own doc for why `EmporiumState::goinkyo_pane` is the primary guard
-/// either way, and that lookup only a defensive second one.
-fn gather_goinkyo_observations(
+/// This does not check whether a pane is already open or in flight for a
+/// would-be candidate: that needs the synthetic key `stage_brigade` builds
+/// (`SessionKey::new_worker`), which is private to `banto_core::engine`.
+/// `update_goinkyo_awaiting_spawn` does that check on the core side instead.
+fn gather_goinkyo_looks(
     state: &EmporiumState,
     store: &RefCell<Store>,
     app: &App,
     mut timings: Option<&mut TickTimings>,
-) -> Vec<GoinkyoObservation> {
-    // One observation per brigade rather than one per tick: a brigade with a
-    // spawn to attempt must not hide the next one's. The ids are the brigades
-    // banto has a Goinkyo pane recorded for — so an ended consultation is
-    // noticed wherever its Director's pane went, and a disbanded brigade (an
-    // empty roster, not an error) releases its guard — and the brigades the
-    // store lists. Sorted: a fold that is replayed is handed the same order
-    // every run.
-    let recorded = state.goinkyo_brigades();
-    let mut ids: BTreeSet<BrigadeId> = recorded.iter().copied().collect();
+) -> Vec<GoinkyoLook> {
+    // One look per brigade rather than one per tick: a brigade with a spawn to
+    // attempt must not hide the next one's. The ids are the brigades banto has
+    // a Goinkyo pane recorded for, and the brigades the store lists. Sorted: a
+    // fold that is replayed is handed the same order every run.
+    let mut ids: BTreeSet<BrigadeId> = state.goinkyo_brigades().into_iter().collect();
     let listing_start = Instant::now();
     if let Ok(brigades) = store.borrow().list_brigades() {
         ids.extend(brigades.iter().map(|brigade| brigade.id));
@@ -2658,14 +2720,24 @@ fn gather_goinkyo_observations(
     if let Some(t) = timings.as_deref_mut() {
         t.goinkyo_roster += listing_start.elapsed();
     }
-    let mut observations = Vec::new();
+    let mut looks = Vec::new();
     for brigade_id in ids {
+        let guard = state.goinkyo_guard_facts(brigade_id);
         let roster_start = Instant::now();
         let members = store.borrow().brigade_members_in_join_order(brigade_id);
         if let Some(t) = timings.as_deref_mut() {
             t.goinkyo_roster += roster_start.elapsed();
         }
         let Ok(members) = members else {
+            looks.push(GoinkyoLook {
+                brigade_id,
+                roster_read: false,
+                row: GoinkyoRow::Absent,
+                director_hosted: false,
+                guard,
+                cwd: PathBuf::new(),
+                roster: Vec::new(),
+            });
             continue;
         };
         // The Director whose pane makes the brigade live, and the working
@@ -2676,33 +2748,96 @@ fn gather_goinkyo_observations(
             .iter()
             .find(|m| m.role == BrigadeRole::Director)
             .and_then(|m| m.session_id.as_ref());
-        let hosted = director_session
+        let director_hosted = director_session
             .is_some_and(|session| state.screens.contains_key(&SessionKey::from_id(&session.0)));
-        let Some(goinkyo) = members.iter().find(|m| m.role == BrigadeRole::Goinkyo) else {
-            if hosted || recorded.contains(&brigade_id) {
-                observations.push(GoinkyoObservation::NoGoinkyo { brigade_id });
-            }
-            continue;
+        let row = match members.iter().find(|m| m.role == BrigadeRole::Goinkyo) {
+            None => GoinkyoRow::Absent,
+            Some(goinkyo) => match &goinkyo.session_id {
+                Some(session) => GoinkyoRow::Session(session.0.clone()),
+                None => GoinkyoRow::NoSession,
+            },
         };
-        if goinkyo.session_id.is_some() || !hosted {
-            continue;
-        }
-        // Same cwd resolution as `stage_brigade` and `add_worker`: the
-        // Director's own row — a Goinkyo has no cwd of its own to fall back
-        // to — and "." when that row is not resolved.
-        let cwd = director_session
-            .and_then(|session| app.row_for_id(&session.0))
-            .and_then(|row| row.cwd.clone())
-            .unwrap_or_else(|| PathBuf::from("."));
-        observations.push(GoinkyoObservation::AwaitingSpawn(GoinkyoSpawnCandidate {
-            brigade_id,
-            cwd,
+        // Only the awaiting case reads the cwd and the roster; the decision
+        // uses them there and nowhere else, so the rest skip the work.
+        let awaiting = matches!(row, GoinkyoRow::NoSession) && director_hosted;
+        let (cwd, roster) = if awaiting {
+            // Same cwd resolution as `stage_brigade` and `add_worker`: the
+            // Director's own row, since a Goinkyo has no cwd of its own, and
+            // "." when that row is not resolved.
+            let cwd = director_session
+                .and_then(|session| app.row_for_id(&session.0))
+                .and_then(|row| row.cwd.clone())
+                .unwrap_or_else(|| PathBuf::from("."));
             // Already in join order: what the core needs to place the
             // consultation among the Workers (see the field's doc).
-            roster: members.iter().map(|m| m.token.clone()).collect(),
-        }));
+            (cwd, members.iter().map(|m| m.token.clone()).collect())
+        } else {
+            (PathBuf::new(), Vec::new())
+        };
+        looks.push(GoinkyoLook {
+            brigade_id,
+            roster_read: true,
+            row,
+            director_hosted,
+            guard,
+            cwd,
+            roster,
+        });
     }
-    observations
+    looks
+}
+
+/// The observations the looks call for, one per brigade that has something to
+/// say. Only the tests call this; the loop uses the looks, so that it can record
+/// them.
+#[cfg(test)]
+fn gather_goinkyo_observations(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    app: &App,
+    timings: Option<&mut TickTimings>,
+) -> Vec<GoinkyoObservation> {
+    gather_goinkyo_looks(state, store, app, timings)
+        .iter()
+        .filter_map(decide_goinkyo)
+        .collect()
+}
+
+/// The pane lifecycle log for this UI process, with its start line written
+/// first. `None` when banto has no data directory or the file cannot be opened:
+/// the UI then runs without a log, as it would without this module.
+fn open_pane_log(deps: &Deps) -> Option<PaneLog> {
+    let mut log = PaneLog::open(&data_dir_of(deps)?.logs_dir())?;
+    log.start(&pane_lines::start_line(
+        env!("CARGO_PKG_VERSION"),
+        env!("BANTO_BUILD_COMMIT"),
+        SCHEMA_VERSION,
+        std::process::id(),
+    ));
+    Some(log)
+}
+
+/// The facts the pane log reads about the pane an Event concerns, taken before
+/// the Event is folded. Only the Events that name a pane have any; the rest
+/// carry what they need themselves.
+fn pane_facts_for(
+    state: &EmporiumState,
+    handles: &HashMap<SessionKey, PtyHandle>,
+    ev: &Event,
+) -> pane_lines::PaneFacts {
+    let Some(key) = pane_lines::pane_facts_key(ev) else {
+        return pane_lines::PaneFacts::default();
+    };
+    pane_lines::PaneFacts {
+        pid: handles.get(key).and_then(PtyHandle::pid),
+        ..state.pane_facts(key)
+    }
+}
+
+/// The OS error number under a failed spawn, when the failure was an I/O error.
+fn os_error_of(err: &anyhow::Error) -> Option<i32> {
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
 }
 
 /// How many parent-pid hops [`gather_fork_observations`] walks looking for a
@@ -4209,12 +4344,11 @@ fn pump_pty_handles(handles: &mut HashMap<SessionKey, PtyHandle>, events: &mut V
 fn reap_pty_handles(
     handles: &mut HashMap<SessionKey, PtyHandle>,
     state: &EmporiumState,
-) -> Vec<PtyHandle> {
+) -> Vec<(SessionKey, PtyHandle)> {
     handles
         .extract_if(|key, handle| {
             !state.screens.contains_key(key) && !handle.awaiting_exit_after_output_loss()
         })
-        .map(|(_, handle)| handle)
         .collect()
 }
 
@@ -14807,5 +14941,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Some(path), data_dir.member_config_path(1, "worker-3"));
+    }
+}
+
+#[cfg(test)]
+mod build_commit_tests {
+    /// `unknown` is the fallback `build.rs` writes when git cannot say; any
+    /// other value is a commit id. Either way the start line has something to print.
+    #[test]
+    fn the_build_commit_is_never_empty() {
+        assert!(!env!("BANTO_BUILD_COMMIT").is_empty());
     }
 }
