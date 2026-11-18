@@ -1075,7 +1075,10 @@ mod tests {
             return;
         }
         let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let path = write_session(&root, "proj", "new.jsonl", &head_naming(&real));
+        // What Claude writes is the resolved path, which is not `real` where
+        // the temp dir itself is reached through a link or a short name.
+        let resolved = real.canonicalize().unwrap();
+        let path = write_session(&root, "proj", "new.jsonl", &head_naming(&resolved));
         set_mtime(&path, since + Duration::from_secs(1));
 
         assert_eq!(

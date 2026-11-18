@@ -332,12 +332,14 @@ mod tests {
 
     /// The canonical form is the one Codex stores (`\\?\`-prefixed on Windows,
     /// `/private/tmp/…` on macOS) and the plain one is what banto spawned with.
+    /// Only that direction is claimed: a temp dir's plain spelling can differ
+    /// from its canonical one (`RUNNER~1`, `/var` → `/private/var`), and a
+    /// spawn typed canonically does not name the plain spelling.
     #[test]
-    fn a_directory_and_its_canonical_form_name_each_other() {
+    fn a_directory_spawned_in_names_its_canonical_form() {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         assert!(DirectorySpellings::of(dir.path()).names(&canonical));
-        assert!(DirectorySpellings::of(&canonical).names(dir.path()));
     }
 
     #[test]
