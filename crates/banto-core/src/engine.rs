@@ -793,6 +793,17 @@ struct PendingKickoff {
     notified_not_at_prompt: bool,
     sent_at: Option<Instant>,
     attempts: u32,
+    /// The pane showed, after banto's Enter went out, that a turn ran (OSC 7501
+    /// `working`, `done` or `error`; `idle` was what let the line be typed). The line was
+    /// not lost, so it is never typed again, whether or not the session is
+    /// discovered: a second sentence would start a second turn.
+    turn_seen: bool,
+    /// The operator has been told this kickoff is stuck, and it no longer counts
+    /// as [`EmporiumState::kickoff_owed`] — the brigade is waiting on them, not
+    /// on banto. Set with the notice, so the notice is said once. Cleared when
+    /// the line is typed again (a retry from a prompt the pane came back to),
+    /// which makes a later failure worth its own notice.
+    stuck: bool,
 }
 
 /// How long a freshly-spawned Goinkyo pane's own output must have been
@@ -867,6 +878,12 @@ struct PendingGoinkyoKickoff {
     notified_not_at_prompt: bool,
     sent_at: Option<Instant>,
     attempts: u32,
+    /// The pane's live file read busy after banto's Enter went out: a turn ran.
+    /// Never typed again; the entry waits for the session's row as before
+    /// ([`PendingKickoff::turn_seen`]).
+    turn_seen: bool,
+    /// See [`PendingKickoff::stuck`].
+    stuck: bool,
 }
 
 /// Why an in-flight `Cmd::OpenEmbedded` was requested, so `Spawned`/
@@ -2674,22 +2691,29 @@ impl EmporiumState {
     /// Not owed, though the entry stays: the pane was found not at its prompt
     /// and nothing has been typed (banto looks again every tick but the operator
     /// has to answer what the pane shows); the operator has an unsent draft in the
-    /// pane (the retry waits for them); and the last allowed attempt was typed
-    /// and its acknowledgement window has run out (banto reports the failure).
-    /// In each of those the brigade really is waiting on the operator, which is
+    /// pane (the kickoff waits for them; the tick clears a mark the pane's own
+    /// input line has since overruled, see [`kickoff_draft_held`], so this reads
+    /// the mark as it stands); a line was typed, got no answer, and the pane is
+    /// not at a prompt to be asked again, or a Codex Worker took its turn and was
+    /// not identified ([`PendingKickoff::stuck`], each told to the operator once,
+    /// owed again once banto types the line again); and the last allowed attempt
+    /// was typed and its acknowledgement window has run out (banto reports the
+    /// failure). In each of those the brigade really is waiting on the operator, which is
     /// what the bell is for. Panes that get no typed kickoff — a Claude Worker,
     /// the Director, a resumed member — have no entry and are never owed.
     fn kickoff_owed(&self, key: &SessionKey, now: Instant) -> bool {
         if self.has_unsent_operator_input(key) {
             return false;
         }
-        let outstanding = |sent_at: Option<Instant>, attempts: u32, not_at_prompt: bool| {
-            if attempts >= KICKOFF_MAX_ATTEMPTS {
-                sent_at.is_some_and(|at| now.saturating_duration_since(at) < KICKOFF_ACK_TIMEOUT)
-            } else {
-                !(sent_at.is_none() && not_at_prompt)
-            }
-        };
+        let outstanding =
+            |sent_at: Option<Instant>, attempts: u32, not_at_prompt: bool, stuck: bool| {
+                if attempts >= KICKOFF_MAX_ATTEMPTS {
+                    sent_at
+                        .is_some_and(|at| now.saturating_duration_since(at) < KICKOFF_ACK_TIMEOUT)
+                } else {
+                    !stuck && !(sent_at.is_none() && not_at_prompt)
+                }
+            };
         self.pending_kickoffs
             .iter()
             .filter(|pending| &pending.key == key)
@@ -2698,6 +2722,7 @@ impl EmporiumState {
                     pending.sent_at,
                     pending.attempts,
                     pending.notified_not_at_prompt,
+                    pending.stuck,
                 )
             })
             || self
@@ -2709,6 +2734,7 @@ impl EmporiumState {
                         pending.sent_at,
                         pending.attempts,
                         pending.notified_not_at_prompt,
+                        pending.stuck,
                     )
                 })
     }
@@ -8109,6 +8135,8 @@ fn update_spawned(
                     key,
                     spawned_at: now,
                     notified_not_at_prompt: false,
+                    turn_seen: false,
+                    stuck: false,
                     sent_at: None,
                     attempts: 0,
                 });
@@ -9504,36 +9532,123 @@ fn update_tick(
         pending.sent_at.is_none() || app.row_for_id(pending.key.as_str()).is_none()
     });
 
+    // A line banto typed is in flight until its Enter has gone out; a turn is
+    // only read off the pane after that, so a report from before the Enter
+    // cannot be taken for its effect.
+    let line_in_flight = |state: &EmporiumState, key: &SessionKey| {
+        written_this_tick.contains(key) || state.pending_submits.iter().any(|e| &e.key == key)
+    };
+    let mut turn_seen = Vec::new();
+    for pending in &state.pending_kickoffs {
+        // `idle` is what let the line be typed (`codex_kickoff_at_prompt`), so a
+        // later `working`, `done` or `error` is the turn it started. A pane left at
+        // `idle` with the sentence on its line is the lost Enter, and is not.
+        if pending.sent_at.is_some_and(|at| at < now)
+            && !pending.turn_seen
+            && !line_in_flight(state, &pending.key)
+            && state.screens.get(&pending.key).is_some_and(|screen| {
+                matches!(
+                    screen.reported_state(),
+                    Some(ReportedState::Working | ReportedState::Done | ReportedState::Error)
+                )
+            })
+        {
+            turn_seen.push(pending.key.clone());
+        }
+    }
+    for key in turn_seen {
+        if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
+            pending.turn_seen = true;
+        }
+    }
+    let mut turn_seen = Vec::new();
+    for pending in &state.pending_goinkyo_kickoffs {
+        // The same reading from the live file: busy after the Enter is the turn.
+        let busy = relay
+            .iter()
+            .any(|obs| obs.key == pending.key && obs.is_idle_this_tick == Some(false));
+        if pending.sent_at.is_some_and(|at| at < now)
+            && !pending.turn_seen
+            && busy
+            && !line_in_flight(state, &pending.key)
+        {
+            turn_seen.push(pending.key.clone());
+        }
+    }
+    for key in turn_seen {
+        if let Some(pending) = state
+            .pending_goinkyo_kickoffs
+            .iter_mut()
+            .find(|p| p.key == key)
+        {
+            pending.turn_seen = true;
+        }
+    }
+
+    // Members whose kickoff only an unsent draft is holding back; said in the
+    // same reminder as a held nudge below.
+    let mut kickoff_held: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
+
     // Codex Worker kickoff: once a pending pane's own output has been quiet
     // for CODEX_KICKOFF_QUIET_PERIOD and the pane is at its prompt
     // (`codex_kickoff_at_prompt`), type the fixed line. Never blind: a pane
     // that is not at its prompt gets one notice and is looked at again every
     // tick, so an answer the operator gives in the pane is picked up on its
-    // own, with no separate recovery path.
+    // own, with no separate recovery path. A pane that showed a turn after the
+    // Enter is never typed into again, only reported.
     let mut ready = Vec::new();
     let mut not_at_prompt = Vec::new();
-    for pending in &state.pending_kickoffs {
-        if !kickoff_due(
-            state,
-            &pending.key,
-            pending.spawned_at,
-            pending.sent_at,
-            pending.attempts,
-            CODEX_KICKOFF_QUIET_PERIOD,
-            now,
-        ) {
+    let mut unanswered = Vec::new();
+    let mut turn_ran = Vec::new();
+    let keys: Vec<SessionKey> = state
+        .pending_kickoffs
+        .iter()
+        .map(|pending| pending.key.clone())
+        .collect();
+    for key in keys {
+        let Some(pending) = state.pending_kickoffs.iter().find(|p| p.key == key) else {
             continue;
-        }
-        if codex_kickoff_at_prompt(state, &pending.key) {
-            ready.push(pending.key.clone());
-        } else if !pending.notified_not_at_prompt {
-            not_at_prompt.push(pending.key.clone());
+        };
+        let (sent_at, notified, stuck) = (
+            pending.sent_at,
+            pending.notified_not_at_prompt,
+            pending.stuck,
+        );
+        let input = KickoffGateInput {
+            agent: AgentKind::Codex,
+            spawned_at: pending.spawned_at,
+            sent_at,
+            attempts: pending.attempts,
+            turn_seen: pending.turn_seen,
+            quiet_period: CODEX_KICKOFF_QUIET_PERIOD,
+            own_sentence_typed: false,
+        };
+        match kickoff_gate(state, &key, input, now) {
+            KickoffGate::Wait => {}
+            KickoffGate::TurnRan => {
+                if !stuck {
+                    turn_ran.push(key);
+                }
+            }
+            KickoffGate::HeldByDraft => kickoff_held.push(state.kickoff_member(&key)),
+            KickoffGate::Due => {
+                if codex_kickoff_at_prompt(state, &key) {
+                    ready.push(key);
+                } else if sent_at.is_none() {
+                    if !notified {
+                        not_at_prompt.push(key);
+                    }
+                } else if !stuck {
+                    unanswered.push(key);
+                }
+            }
         }
     }
     for key in ready {
         if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
             pending.sent_at = Some(now);
             pending.attempts += 1;
+            pending.stuck = false;
         }
         written_this_tick.insert(key.clone());
         cmds.extend(type_kickoff(
@@ -9550,49 +9665,93 @@ fn update_tick(
         }
         notify_kickoff_not_at_prompt(state, app, &key, now);
     }
+    for key in unanswered {
+        if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
+            pending.stuck = true;
+        }
+        notify_kickoff_unanswered(state, app, &key, now);
+    }
+    for key in turn_ran {
+        if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
+            pending.stuck = true;
+        }
+        notify_kickoff_turn_unidentified(state, app, &key, "was not identified", now);
+    }
 
     // Goinkyo kickoff: the same shape, once its own quiet period elapses — see
     // `GOINKYO_KICKOFF_QUIET_PERIOD`'s own doc for why this exists, and
     // `goinkyo_kickoff_at_prompt` for what "at its prompt" means for Claude.
     // A retry means the sentence was typed once and no turn followed. If the
-    // input line still holds exactly that sentence — and, by `kickoff_due`, the
-    // operator typed nothing — the Enter is what was lost, and typing the
-    // sentence again would send it twice. That case needs only the `\r` and is
-    // not asked whether the pane is at its prompt: it is not, a sentence is
-    // typed on it. Compared by text, not just "there is some text": the line
-    // could hold something else. Any other retry types the sentence again only
-    // from a prompt the screen shows empty (and the live file, when there is
-    // one, calls idle): a pane whose screen cannot be located may still have
-    // the sentence on a line banto cannot see, and the live file alone cannot
-    // say it is not there.
+    // input line still holds exactly that sentence the Enter is what was lost,
+    // and typing the sentence again would send it twice. That case needs only
+    // the `\r` and is not asked whether the pane is at its prompt: it is not, a
+    // sentence is typed on it. It is also looked for before the draft is
+    // judged, because banto's own sentence reads as text on the line and must
+    // not be taken for the operator's. Compared by text, not just "there is
+    // some text": the line could hold something else. Any other retry types the
+    // sentence again only from a prompt the screen shows empty (and the live
+    // file, when there is one, calls idle): a pane whose screen cannot be
+    // located may still have the sentence on a line banto cannot see, and the
+    // live file alone cannot say it is not there. A pane whose live file read
+    // busy after the Enter is not typed into again: the entry waits for the
+    // session's row, and once the ack window has run out with none it says so
+    // once and stops being owed.
     let mut ready = Vec::new();
     let mut enter_only = Vec::new();
     let mut not_at_prompt = Vec::new();
-    for pending in &state.pending_goinkyo_kickoffs {
-        if !kickoff_due(
-            state,
-            &pending.key,
-            pending.spawned_at,
-            pending.sent_at,
-            pending.attempts,
-            GOINKYO_KICKOFF_QUIET_PERIOD,
-            now,
-        ) {
+    let mut unanswered = Vec::new();
+    let mut turn_ran = Vec::new();
+    let keys: Vec<SessionKey> = state
+        .pending_goinkyo_kickoffs
+        .iter()
+        .map(|pending| pending.key.clone())
+        .collect();
+    for key in keys {
+        let Some(pending) = state.pending_goinkyo_kickoffs.iter().find(|p| p.key == key) else {
             continue;
-        }
-        let sentence_still_typed = pending.sent_at.is_some()
-            && state.screens.get(&pending.key).is_some_and(|pane| {
+        };
+        let (sent_at, notified, stuck) = (
+            pending.sent_at,
+            pending.notified_not_at_prompt,
+            pending.stuck,
+        );
+        let sentence_still_typed = sent_at.is_some()
+            && !pending.turn_seen
+            && state.screens.get(&key).is_some_and(|pane| {
                 read_input_line(pane) == InputLine::HasText
                     && typed_text_without_whitespace(pane).as_deref()
                         == Some(&*GOINKYO_KICKOFF_LINE.replace(char::is_whitespace, ""))
             });
-        if sentence_still_typed {
-            enter_only.push(pending.key.clone());
-        } else if goinkyo_kickoff_at_prompt(state, &relay, &pending.key, pending.sent_at.is_some())
-        {
-            ready.push(pending.key.clone());
-        } else if !pending.notified_not_at_prompt {
-            not_at_prompt.push(pending.key.clone());
+        let input = KickoffGateInput {
+            agent: AgentKind::ClaudeCode,
+            spawned_at: pending.spawned_at,
+            sent_at,
+            attempts: pending.attempts,
+            turn_seen: pending.turn_seen,
+            quiet_period: GOINKYO_KICKOFF_QUIET_PERIOD,
+            own_sentence_typed: sentence_still_typed,
+        };
+        match kickoff_gate(state, &key, input, now) {
+            KickoffGate::Wait => {}
+            KickoffGate::TurnRan => {
+                if !stuck {
+                    turn_ran.push(key);
+                }
+            }
+            KickoffGate::HeldByDraft => kickoff_held.push(state.kickoff_member(&key)),
+            KickoffGate::Due => {
+                if sentence_still_typed {
+                    enter_only.push(key);
+                } else if goinkyo_kickoff_at_prompt(state, &relay, &key, sent_at.is_some()) {
+                    ready.push(key);
+                } else if sent_at.is_none() {
+                    if !notified {
+                        not_at_prompt.push(key);
+                    }
+                } else if !stuck {
+                    unanswered.push(key);
+                }
+            }
         }
     }
     for (keys, only_enter) in [(ready, false), (enter_only, true)] {
@@ -9604,6 +9763,7 @@ fn update_tick(
             {
                 pending.sent_at = Some(now);
                 pending.attempts += 1;
+                pending.stuck = false;
             }
             written_this_tick.insert(key.clone());
             cmds.extend(type_kickoff(
@@ -9624,6 +9784,26 @@ fn update_tick(
             pending.notified_not_at_prompt = true;
         }
         notify_kickoff_not_at_prompt(state, app, &key, now);
+    }
+    for key in unanswered {
+        if let Some(pending) = state
+            .pending_goinkyo_kickoffs
+            .iter_mut()
+            .find(|p| p.key == key)
+        {
+            pending.stuck = true;
+        }
+        notify_kickoff_unanswered(state, app, &key, now);
+    }
+    for key in turn_ran {
+        if let Some(pending) = state
+            .pending_goinkyo_kickoffs
+            .iter_mut()
+            .find(|p| p.key == key)
+        {
+            pending.stuck = true;
+        }
+        notify_kickoff_turn_unidentified(state, app, &key, "no session appeared for it", now);
     }
 
     // Members whose nudge only an unsent draft is holding back.
@@ -9778,15 +9958,30 @@ fn update_tick(
 
     // After the expiry above, so a showing that just ran out can be followed
     // by the cycle's own gap rather than waiting out another tick.
-    if state
-        .draft_hold_reminder
-        .due(!held_by_draft.is_empty(), state.status.is_none(), now)
-    {
-        let members = state.members_phrase(app, &held_by_draft);
-        state.set_status(
-            format!("relay: holding the nudge to {members} — unsent input in the pane"),
-            now,
-        );
+    // One cycle for both: a draft holds a nudge and holds a kickoff for the same
+    // reason, and the operator needs the same thing (the pane's input line)
+    // dealt with. The kickoff's wording carries the way out, because a kickoff
+    // has no peer waiting on a message to hint at it.
+    if state.draft_hold_reminder.due(
+        !held_by_draft.is_empty() || !kickoff_held.is_empty(),
+        state.status.is_none(),
+        now,
+    ) {
+        let mut parts = Vec::new();
+        if !held_by_draft.is_empty() {
+            let members = state.members_phrase(app, &held_by_draft);
+            parts.push(format!(
+                "relay: holding the nudge to {members} — unsent input in the pane"
+            ));
+        }
+        if !kickoff_held.is_empty() {
+            let members = state.members_phrase(app, &kickoff_held);
+            parts.push(format!(
+                "kickoff: not typing the first line into {members} — unsent input in the pane; \
+                 Enter there sends it as the first turn, clearing the line lets banto type its own"
+            ));
+        }
+        state.set_status(parts.join("; "), now);
     }
 
     // Said once per member, and only into a free status line: a member left
@@ -10064,6 +10259,8 @@ fn update_goinkyo_awaiting_spawn(
         key: key.clone(),
         spawned_at: now,
         notified_not_at_prompt: false,
+        turn_seen: false,
+        stuck: false,
         sent_at: None,
         attempts: 0,
     });
@@ -10148,26 +10345,126 @@ fn goinkyo_kickoff_at_prompt(
     }
 }
 
-/// Whether a pending kickoff is due this tick, before the pane is asked
-/// whether it is at its prompt: its own output has been quiet for
-/// `quiet_period` (or, once the line was typed, the acknowledgement window has
-/// run out), it has attempts left, and the operator has no unsent draft in the
-/// pane.
+/// Whether a pending kickoff's time has come, before the pane is asked whether
+/// it is at its prompt: its own output has been quiet for `quiet_period`, and,
+/// once the line was typed, the acknowledgement window has run out too. A retry
+/// meets the quiet period as well as the window: the Codex `idle` + empty-line
+/// pair that says "at its prompt" is stable only on a pane that has stopped
+/// painting ([`codex_kickoff_at_prompt`]), and a pane that is busy answering
+/// has not stopped.
 fn kickoff_due(
     state: &EmporiumState,
     key: &SessionKey,
     spawned_at: Instant,
     sent_at: Option<Instant>,
-    attempts: u32,
     quiet_period: Duration,
     now: Instant,
 ) -> bool {
     let quiet_since = state.last_output_at.get(key).copied().unwrap_or(spawned_at);
-    let due = match sent_at {
-        Some(sent_at) => now.saturating_duration_since(sent_at) >= KICKOFF_ACK_TIMEOUT,
-        None => now.saturating_duration_since(quiet_since) >= quiet_period,
-    };
-    due && attempts < KICKOFF_MAX_ATTEMPTS && !state.has_unsent_operator_input(key)
+    now.saturating_duration_since(quiet_since) >= quiet_period
+        && sent_at.is_none_or(|at| now.saturating_duration_since(at) >= KICKOFF_ACK_TIMEOUT)
+}
+
+/// What a pending kickoff does this tick before its pane is asked about its
+/// prompt.
+enum KickoffGate {
+    /// Nothing to do: not due yet, out of attempts, or a turn ran and the entry
+    /// is only waiting to be acknowledged.
+    Wait,
+    /// The line was typed, its Enter went out, the pane then showed a turn, and
+    /// the acknowledgement window has run out without the session being found.
+    TurnRan,
+    /// Due, but the operator has an unsent draft in the pane.
+    HeldByDraft,
+    /// Due and free of a draft: ask whether the pane is at its prompt.
+    Due,
+}
+
+/// The facts of one pending kickoff that [`kickoff_gate`] reads.
+struct KickoffGateInput {
+    agent: AgentKind,
+    spawned_at: Instant,
+    sent_at: Option<Instant>,
+    attempts: u32,
+    turn_seen: bool,
+    quiet_period: Duration,
+    /// banto's own sentence is the only thing on the input line, which reads
+    /// as text but is not the operator's draft.
+    own_sentence_typed: bool,
+}
+
+/// Decide what a pending kickoff does this tick: the part of the decision that
+/// is the same for a Codex Worker and a Goinkyo. An unsent draft is judged as
+/// the relay judges one ([`kickoff_draft_held`]).
+fn kickoff_gate(
+    state: &mut EmporiumState,
+    key: &SessionKey,
+    input: KickoffGateInput,
+    now: Instant,
+) -> KickoffGate {
+    if input.attempts >= KICKOFF_MAX_ATTEMPTS {
+        return KickoffGate::Wait;
+    }
+    if input.turn_seen {
+        let ack_over = input
+            .sent_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= KICKOFF_ACK_TIMEOUT);
+        return if ack_over {
+            KickoffGate::TurnRan
+        } else {
+            KickoffGate::Wait
+        };
+    }
+    if !kickoff_due(
+        state,
+        key,
+        input.spawned_at,
+        input.sent_at,
+        input.quiet_period,
+        now,
+    ) {
+        return KickoffGate::Wait;
+    }
+    if !input.own_sentence_typed && kickoff_draft_held(state, key, input.agent, now) {
+        return KickoffGate::HeldByDraft;
+    }
+    KickoffGate::Due
+}
+
+/// Whether the operator has an unsent draft in `key`'s pane, by the same
+/// verdict the relay uses ([`unsent_verdict`]): the keystroke mark says there
+/// may be one, and the pane's own input line — read for `agent` — is allowed to
+/// overrule it. A line read empty [`INPUT_ECHO_SETTLE`] after the last key
+/// banto forwarded clears the mark, as it does for the relay. A digit pressed at
+/// a trust dialog sets the mark and puts nothing on any input line, so without
+/// the overrule it would hold the kickoff for good. An unreadable line leaves
+/// the mark in charge.
+fn kickoff_draft_held(
+    state: &mut EmporiumState,
+    key: &SessionKey,
+    agent: AgentKind,
+    now: Instant,
+) -> bool {
+    let reading = state
+        .screens
+        .get(key)
+        .map(|pane| match agent {
+            AgentKind::Codex => read_codex_input_line(pane),
+            AgentKind::ClaudeCode => read_input_line(pane),
+        })
+        .unwrap_or(InputLine::Unrecognized);
+    let (has_unsent, clear_mark) = unsent_verdict(
+        reading,
+        state.has_unsent_operator_input(key),
+        state
+            .last_forwarded_input
+            .get(key)
+            .map(|at| now.saturating_duration_since(*at)),
+    );
+    if clear_mark {
+        state.unsent_operator_input.remove(key);
+    }
+    has_unsent
 }
 
 /// Tell the operator, once per kickoff, that the pane is not at its prompt.
@@ -10185,6 +10482,37 @@ fn notify_kickoff_not_at_prompt(
         format!(
             "{name}: not at its prompt — answer what the pane shows, or type its first line yourself"
         ),
+        now,
+    );
+}
+
+/// Tell the operator, once, that a kickoff's line was typed, got no answer, and
+/// the pane is not at its prompt to be asked again. The same way out as
+/// [`notify_kickoff_not_at_prompt`]; the kickoff is then no longer owed.
+fn notify_kickoff_unanswered(state: &mut EmporiumState, app: &App, key: &SessionKey, now: Instant) {
+    let name = state.kickoff_label(app, key);
+    state.set_status(
+        format!(
+            "{name}: its first line got no answer and it is not at its prompt — answer what the pane shows, or type its first line yourself"
+        ),
+        now,
+    );
+}
+
+/// Tell the operator, once, that a member took its first turn but its session
+/// was not found in time: `missing` finishes "took its first turn but …" (a
+/// Codex Worker "was not identified", a Goinkyo "no session appeared for it").
+/// banto does not type the line again: the turn already ran.
+fn notify_kickoff_turn_unidentified(
+    state: &mut EmporiumState,
+    app: &App,
+    key: &SessionKey,
+    missing: &str,
+    now: Instant,
+) {
+    let name = state.kickoff_label(app, key);
+    state.set_status(
+        format!("{name}: took its first turn but {missing} — banto will not type it again"),
         now,
     );
 }
@@ -14617,6 +14945,22 @@ mod tests {
 
     /// A hosted Codex Worker pane with its kickoff owed, spawned at the
     /// returned instant. The screen is blank: each test paints what it is about.
+    // The whole text of each kickoff notice, written out rather than built from
+    // the source's own pieces, so a stray run of spaces or a changed word in
+    // the status line fails a test.
+    const NOTICE_NOT_AT_PROMPT: &str =
+        "not at its prompt — answer what the pane shows, or type its first line yourself";
+    const NOTICE_UNANSWERED: &str = "its first line got no answer and it is not at its prompt — answer what the pane shows, or type its first line yourself";
+    const NOTICE_CODEX_UNIDENTIFIED: &str =
+        "took its first turn but was not identified — banto will not type it again";
+    const NOTICE_GOINKYO_NO_ROW: &str =
+        "took its first turn but no session appeared for it — banto will not type it again";
+
+    /// The status line a kickoff notice for `key` must show, whole.
+    fn kickoff_notice(state: &EmporiumState, app: &App, key: &SessionKey, tail: &str) -> String {
+        format!("{}: {tail}", state.kickoff_label(app, key))
+    }
+
     fn codex_kickoff_fixture() -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
         let mut state = EmporiumState::new(PrefixKey::default());
         let app = app_with(vec![]);
@@ -14628,6 +14972,8 @@ mod tests {
             key: key.clone(),
             spawned_at: t0,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -14739,9 +15085,9 @@ mod tests {
         assert!(state.pending_kickoffs[0].notified_not_at_prompt);
         let status = state.status.as_deref().unwrap_or_default();
         assert!(status.contains("worker-1"), "{status}");
-        assert!(
-            status.contains("not at its prompt — answer what the pane shows"),
-            "{status}"
+        assert_eq!(
+            status,
+            kickoff_notice(&state, &app, &key, NOTICE_NOT_AT_PROMPT)
         );
     }
 
@@ -14868,19 +15214,32 @@ mod tests {
     fn kickoff_never_overwrites_unsent_operator_input() {
         let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
         paint_codex_prompt(&mut state, &key, Some("idle"));
+        // A key forwarded a moment ago: the empty line the screen shows has not
+        // caught up with it (`INPUT_ECHO_SETTLE`), so the mark stays in charge.
+        let due = t0 + CODEX_KICKOFF_QUIET_PERIOD;
         state.unsent_operator_input.insert(key.clone());
+        state
+            .last_forwarded_input
+            .insert(key.clone(), due - Duration::from_millis(500));
 
-        let cmds = kickoff_tick(
-            &mut state,
-            &mut app,
-            &brigade,
-            t0 + CODEX_KICKOFF_QUIET_PERIOD,
-        );
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, due);
 
         assert!(cmds.is_empty());
         assert!(state.pending_submits.is_empty());
         assert!(
-            state.status.is_none(),
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("unsent input in the pane")),
+            "the operator is told the draft is what holds it: {:?}",
+            state.status
+        );
+        assert!(
+            !state
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("not at its prompt"),
             "the operator's draft is not a pane that is off its prompt"
         );
     }
@@ -14897,6 +15256,8 @@ mod tests {
             key: old.clone(),
             spawned_at: t0 - Duration::from_secs(1),
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -14930,6 +15291,8 @@ mod tests {
             key,
             spawned_at: now,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: Some(now),
             attempts: 1,
         });
@@ -15078,6 +15441,8 @@ mod tests {
             key: key.clone(),
             spawned_at: test_instant(),
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -16754,6 +17119,8 @@ mod tests {
             key: key.clone(),
             spawned_at: t0,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: sent.then_some(t0),
             attempts: u32::from(sent),
         });
@@ -16793,26 +17160,31 @@ mod tests {
     fn a_retried_goinkyo_kickoff_types_the_sentence_again_only_from_an_empty_prompt() {
         // The sentence is not on the line any more: the turn it started is over
         // (or never began) and the prompt is empty, so it is typed again. When
-        // the line holds something else, or is not a readable prompt at all,
-        // nothing is typed over it and the operator is told.
+        // the line holds something else, nothing is typed over it and the
+        // operator is told it is a draft that holds the kickoff; when it is not
+        // a readable prompt at all, nothing is typed and the operator is told
+        // the line got no answer.
         let sentence = GOINKYO_KICKOFF_LINE.as_bytes().to_vec();
-        for (name, screen_setup, types) in [
+        for (name, screen_setup, types, notice) in [
             (
                 "empty line",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, None))
                     as Box<dyn FnOnce(&mut Screen)>,
                 true,
+                "",
             ),
             (
                 "unreadable screen",
                 Box::new(|_: &mut Screen| {}) as Box<dyn FnOnce(&mut Screen)>,
                 false,
+                NOTICE_UNANSWERED,
             ),
             (
                 "some other text",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, Some("something else")))
                     as Box<dyn FnOnce(&mut Screen)>,
                 false,
+                "",
             ),
         ] {
             let (mut state, mut app, brigade, key, t0) =
@@ -16829,10 +17201,16 @@ mod tests {
             } else {
                 assert!(writes_of(&cmds).is_empty(), "{name}: {cmds:?}");
                 assert!(state.pending_submits.is_empty(), "{name}");
-                assert!(
-                    state.pending_goinkyo_kickoffs[0].notified_not_at_prompt,
-                    "{name}"
-                );
+                let expected = if notice.is_empty() {
+                    // Held by an operator's draft: the reminder cycle's text.
+                    format!(
+                        "kickoff: not typing the first line into {} — unsent input in the pane; Enter there sends it as the first turn, clearing the line lets banto type its own",
+                        state.kickoff_label(&app, &key)
+                    )
+                } else {
+                    kickoff_notice(&state, &app, &key, notice)
+                };
+                assert_eq!(state.status.as_deref(), Some(expected.as_str()), "{name}");
                 assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1, "{name}");
             }
         }
@@ -16878,15 +17256,29 @@ mod tests {
 
     #[test]
     fn a_retried_goinkyo_kickoff_does_nothing_over_the_operators_own_draft() {
+        // The line holds the operator's words, not banto's sentence: nothing is
+        // typed and no Enter pressed, and the operator is told why.
         let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
-            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            |screen| draw_prompt_on(screen, Some("my own words")),
             true,
         );
         state.unsent_operator_input.insert(key.clone());
+        let due = t0 + KICKOFF_ACK_TIMEOUT;
+        state
+            .last_forwarded_input
+            .insert(key.clone(), due - Duration::from_millis(500));
 
-        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, t0 + KICKOFF_ACK_TIMEOUT);
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due);
 
         assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("unsent input in the pane")),
+            "{:?}",
+            state.status
+        );
     }
 
     // --- the Goinkyo kickoff gate: its live file, else its input line --------
@@ -16934,7 +17326,7 @@ mod tests {
 
     #[test]
     fn a_goinkyo_kickoff_holds_with_no_live_file_and_a_screen_that_is_not_a_prompt() {
-        let (mut state, mut app, brigade, _key, t0) =
+        let (mut state, mut app, brigade, key, t0) =
             goinkyo_kickoff_retry_state(draw_theme_screen, false);
         let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
 
@@ -16946,11 +17338,9 @@ mod tests {
         assert!(state.pending_goinkyo_kickoffs[0].sent_at.is_none());
         assert!(state.pending_goinkyo_kickoffs[0].notified_not_at_prompt);
         let status = state.status.as_deref().unwrap_or_default();
-        assert!(
-            status.ends_with(
-                "not at its prompt — answer what the pane shows, or type its first line yourself"
-            ),
-            "{status}"
+        assert_eq!(
+            status,
+            kickoff_notice(&state, &app, &key, NOTICE_NOT_AT_PROMPT)
         );
 
         // Said once: a later held tick leaves what the operator is looking at.
@@ -17091,33 +17481,41 @@ mod tests {
         // sentence, and "idle" cannot tell that it does not.
         let sentence = GOINKYO_KICKOFF_LINE.as_bytes().to_vec();
         type Draw = Box<dyn FnOnce(&mut Screen)>;
-        let cases: Vec<(&str, Draw, Option<bool>, bool)> = vec![
+        // The live file reading busy after the Enter is a turn, not a prompt
+        // that is merely not ready: it is never typed again, and once the ack
+        // window has run out the missing session is reported.
+        type Case<'a> = (&'a str, Draw, Option<bool>, bool, Option<&'a str>);
+        let cases: Vec<Case> = vec![
             (
                 "unlocatable screen, live file idle",
                 Box::new(draw_theme_screen),
                 Some(true),
                 false,
+                Some(NOTICE_UNANSWERED),
             ),
             (
                 "empty prompt, live file busy",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, None)),
                 Some(false),
                 false,
+                Some(NOTICE_GOINKYO_NO_ROW),
             ),
             (
                 "empty prompt, live file idle",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, None)),
                 Some(true),
                 true,
+                None,
             ),
             (
                 "empty prompt, no live reading",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, None)),
                 None,
                 true,
+                None,
             ),
         ];
-        for (name, draw, idle, types) in cases {
+        for (name, draw, idle, types, notice) in cases {
             let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(draw, true);
 
             let cmds = goinkyo_tick_observing(
@@ -17139,10 +17537,17 @@ mod tests {
                 assert!(writes_of(&cmds).is_empty(), "{name}: {cmds:?}");
                 assert!(state.pending_submits.is_empty(), "{name}");
                 assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1, "{name}");
-                assert!(
-                    state.pending_goinkyo_kickoffs[0].notified_not_at_prompt,
-                    "{name}: the operator is told"
-                );
+                match notice {
+                    Some(text) => {
+                        assert!(state.pending_goinkyo_kickoffs[0].stuck, "{name}");
+                        assert_eq!(
+                            state.status,
+                            Some(kickoff_notice(&state, &app, &key, text)),
+                            "{name}: the operator is told"
+                        );
+                    }
+                    None => assert_eq!(state.status, None, "{name}: nothing to tell"),
+                }
             }
         }
     }
@@ -17349,6 +17754,569 @@ mod tests {
             t0 + KICKOFF_ACK_TIMEOUT,
         );
         assert_eq!(writes_of(&cmds), vec![(key, b"\r".to_vec())], "{cmds:?}");
+    }
+
+    // --- the kickoff and the operator's unsent mark --------------------------
+
+    /// Feed `key`'s screen one OSC 7501 report, leaving what is drawn alone.
+    fn report_codex_state(state: &mut EmporiumState, key: &SessionKey, report: &str) {
+        let bytes = format!("\x1b]7501;state={report}:app=codex\x07");
+        state
+            .screens
+            .get_mut(key)
+            .unwrap()
+            .process(bytes.as_bytes());
+    }
+
+    /// A Codex line with text on it: a prompt row whose cursor is past the
+    /// placeholder, which `read_codex_input_line` does not call empty.
+    fn paint_codex_prompt_with_text(state: &mut EmporiumState, key: &SessionKey) {
+        let screen = state.screens.get_mut(key).unwrap();
+        let (rows, _) = screen.size();
+        let row = rows - 3;
+        let bytes = format!(
+            "\x1b[2J\x1b[{row};1H\x1b[1m›\x1b[0m the first line, unsent\x1b[{row};26H\
+             \x1b]7501;state=idle:app=codex\x07"
+        );
+        screen.process(bytes.as_bytes());
+    }
+
+    #[test]
+    fn a_digit_pressed_at_a_dialog_holds_the_codex_kickoff_only_until_the_line_reads_empty() {
+        // The key went to a trust dialog, so no input line ever held it; the
+        // mark it left must not outlive the dialog.
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_menu(&mut state, &key, Some("idle"));
+        state.unsent_operator_input.insert(key.clone());
+        state.last_forwarded_input.insert(key.clone(), t0);
+
+        // The dialog is up: its screen is not a line banto can read, however
+        // long ago the key was, so the mark stays in charge.
+        for at in [t0 + CODEX_KICKOFF_QUIET_PERIOD, t0 + INPUT_ECHO_SETTLE * 2] {
+            let held = kickoff_tick(&mut state, &mut app, &brigade, at);
+            assert!(writes_of(&held).is_empty(), "{held:?}");
+            assert!(state.has_unsent_operator_input(&key));
+        }
+
+        // The key answered the dialog and the prompt comes up empty, but not
+        // yet long enough after the key for the screen to be believed over the
+        // mark.
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+        let early = kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            t0 + INPUT_ECHO_SETTLE - Duration::from_millis(1),
+        );
+        assert!(writes_of(&early).is_empty(), "{early:?}");
+        assert!(state.has_unsent_operator_input(&key));
+
+        let at = t0 + INPUT_ECHO_SETTLE;
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(key.clone(), CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+        assert!(
+            !state.has_unsent_operator_input(&key),
+            "the mark is cleared"
+        );
+        assert_eq!(state.pending_kickoffs[0].attempts, 1);
+    }
+
+    #[test]
+    fn a_digit_pressed_at_a_dialog_holds_the_goinkyo_kickoff_only_until_the_line_reads_empty() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(draw_theme_screen, false);
+        state.unsent_operator_input.insert(key.clone());
+        state.last_forwarded_input.insert(key.clone(), t0);
+
+        for at in [
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
+            t0 + INPUT_ECHO_SETTLE * 2,
+        ] {
+            let held = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, at);
+            assert!(writes_of(&held).is_empty(), "{held:?}");
+            assert!(state.has_unsent_operator_input(&key));
+        }
+
+        draw_prompt_on(state.screens.get_mut(&key).unwrap(), None);
+        let early = goinkyo_kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            t0 + INPUT_ECHO_SETTLE - Duration::from_millis(1),
+        );
+        assert!(writes_of(&early).is_empty(), "{early:?}");
+        assert!(state.has_unsent_operator_input(&key));
+
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, t0 + INPUT_ECHO_SETTLE);
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+        assert!(!state.has_unsent_operator_input(&key));
+    }
+
+    #[test]
+    fn an_unreadable_line_leaves_the_mark_in_charge_and_the_hold_is_announced_with_its_way_out() {
+        // A menu is not a line banto can read, however long ago the key was.
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_menu(&mut state, &key, Some("idle"));
+        state.unsent_operator_input.insert(key.clone());
+        state.last_forwarded_input.insert(key.clone(), t0);
+        let due = t0 + Duration::from_secs(10);
+
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, due);
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert!(state.has_unsent_operator_input(&key));
+        let status = state.status.as_deref().unwrap_or_default();
+        assert!(status.contains("unsent input in the pane"), "{status}");
+        assert!(status.contains("worker-1"), "{status}");
+        assert!(
+            status.contains("Enter there sends it as the first turn")
+                && status.contains("clearing the line lets banto type its own"),
+            "the way out: {status}"
+        );
+        assert!(
+            !status.contains("not at its prompt"),
+            "a draft is not a pane off its prompt: {status}"
+        );
+        assert!(
+            !state.pending_kickoffs[0].notified_not_at_prompt,
+            "and does not use up that notice"
+        );
+
+        // The reminder cycle of the relay's own hold: gone when the status
+        // times out, said again after the gap, not every tick.
+        let quiet = kickoff_tick(&mut state, &mut app, &brigade, due + Duration::from_secs(1));
+        assert!(writes_of(&quiet).is_empty());
+        kickoff_tick(&mut state, &mut app, &brigade, due + STATUS_TIMEOUT);
+        assert_eq!(state.status, None);
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            due + STATUS_TIMEOUT + STATUS_REMINDER_GAP,
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("unsent input in the pane")),
+            "{:?}",
+            state.status
+        );
+    }
+
+    #[test]
+    fn a_retried_goinkyo_kickoff_presses_enter_alone_even_with_the_mark_set() {
+        // banto's own sentence reads as text on the line; it is not the
+        // operator's draft, whatever the keystroke mark says.
+        let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
+            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            true,
+        );
+        state.unsent_operator_input.insert(key.clone());
+        let due = t0 + KICKOFF_ACK_TIMEOUT;
+        state
+            .last_forwarded_input
+            .insert(key.clone(), due - Duration::from_millis(500));
+
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due);
+
+        assert_eq!(writes_of(&cmds), vec![(key.clone(), b"\r".to_vec())]);
+        assert!(state.pending_submits.is_empty());
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 2);
+    }
+
+    // --- a retry, a turn that ran, a pane that is not at its prompt ----------
+
+    /// A Codex kickoff typed at `t0 + CODEX_KICKOFF_QUIET_PERIOD` with its Enter
+    /// gone out a second later; returns the time of that Enter's tick.
+    fn codex_kickoff_typed_and_entered(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        t0: Instant,
+    ) -> Instant {
+        paint_codex_prompt(state, key, Some("idle"));
+        let typed_at = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+        let typed = kickoff_tick(state, app, brigade, typed_at);
+        assert_eq!(writes_of(&typed).len(), 1, "{typed:?}");
+        let entered_at = typed_at + Duration::from_secs(1);
+        let entered = kickoff_tick(state, app, brigade, entered_at);
+        assert_eq!(writes_of(&entered), vec![(key.clone(), b"\r".to_vec())]);
+        entered_at
+    }
+
+    #[test]
+    fn a_codex_worker_that_took_its_turn_but_was_not_identified_is_reported_once_and_never_retyped()
+    {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        let entered_at = codex_kickoff_typed_and_entered(&mut state, &mut app, &brigade, &key, t0);
+        let typed_at = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+
+        // The turn runs and ends, and the session is never discovered.
+        report_codex_state(&mut state, &key, "working");
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            entered_at + Duration::from_secs(1),
+        );
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+        assert!(state.pending_kickoffs[0].turn_seen);
+        assert!(
+            state.kickoff_owed(&key, entered_at + Duration::from_secs(2)),
+            "still owed until its window runs out"
+        );
+
+        let at = typed_at + KICKOFF_ACK_TIMEOUT;
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+
+        assert!(writes_of(&cmds).is_empty(), "never typed again: {cmds:?}");
+        assert_eq!(state.pending_kickoffs[0].attempts, 1);
+        let status = state.status.as_deref().unwrap_or_default();
+        assert_eq!(
+            status,
+            kickoff_notice(&state, &app, &key, NOTICE_CODEX_UNIDENTIFIED)
+        );
+        assert!(!state.kickoff_owed(&key, at), "no longer owed");
+
+        // Said once: not again on the ticks after it.
+        kickoff_tick(&mut state, &mut app, &brigade, at + STATUS_TIMEOUT);
+        assert_eq!(state.status, None);
+        let later = kickoff_tick(&mut state, &mut app, &brigade, at + STATUS_TIMEOUT * 4);
+        assert!(writes_of(&later).is_empty(), "{later:?}");
+        assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn a_first_turn_that_ended_in_error_is_a_turn_and_the_line_is_never_retyped() {
+        // `error` is sticky, so once the operator interacts the report goes back
+        // to `idle`: the next look finds an idle pane with an empty prompt, the
+        // same as a lost Enter, unless the error was counted when it showed.
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        let entered_at = codex_kickoff_typed_and_entered(&mut state, &mut app, &brigade, &key, t0);
+        let typed_at = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+
+        report_codex_state(&mut state, &key, "error");
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            entered_at + Duration::from_secs(1),
+        );
+        assert!(state.pending_kickoffs[0].turn_seen);
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+
+        let at = typed_at + KICKOFF_ACK_TIMEOUT;
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+
+        assert!(writes_of(&cmds).is_empty(), "never typed again: {cmds:?}");
+        assert_eq!(state.pending_kickoffs[0].attempts, 1);
+        assert_eq!(
+            state.status,
+            Some(kickoff_notice(
+                &state,
+                &app,
+                &key,
+                NOTICE_CODEX_UNIDENTIFIED
+            ))
+        );
+    }
+
+    #[test]
+    fn a_codex_pane_left_idle_after_the_enter_is_typed_again() {
+        // No report after the Enter: the Enter was lost, not a turn run.
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        codex_kickoff_typed_and_entered(&mut state, &mut app, &brigade, &key, t0);
+
+        let at = t0 + CODEX_KICKOFF_QUIET_PERIOD + KICKOFF_ACK_TIMEOUT;
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(key, CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+        assert_eq!(state.pending_kickoffs[0].attempts, 2);
+    }
+
+    #[test]
+    fn a_report_from_before_the_enter_is_not_a_turn() {
+        // `working` on the tick the line is typed, or before its Enter has gone
+        // out, cannot be the line's doing.
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+        let typed_at = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+        kickoff_tick(&mut state, &mut app, &brigade, typed_at);
+        report_codex_state(&mut state, &key, "working");
+
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            typed_at + Duration::from_millis(100),
+        );
+        assert!(
+            !state.pending_kickoffs[0].turn_seen,
+            "the Enter is still due"
+        );
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            typed_at + RELAY_SUBMIT_DELAY,
+        );
+        assert!(
+            !state.pending_kickoffs[0].turn_seen,
+            "the Enter went out on this very tick"
+        );
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            typed_at + RELAY_SUBMIT_DELAY + Duration::from_secs(1),
+        );
+        assert!(state.pending_kickoffs[0].turn_seen);
+    }
+
+    #[test]
+    fn a_retry_that_finds_the_pane_off_its_prompt_is_reported_not_owed_and_tried_again_at_the_prompt()
+     {
+        type Paint = fn(&mut EmporiumState, &SessionKey);
+        let off_prompt: [(&str, Paint); 2] = [
+            ("a menu", |state, key| {
+                paint_codex_menu(state, key, Some("idle"))
+            }),
+            ("its sentence unsent on the line", |state, key| {
+                paint_codex_prompt_with_text(state, key)
+            }),
+        ];
+        for (name, paint) in off_prompt {
+            let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+            codex_kickoff_typed_and_entered(&mut state, &mut app, &brigade, &key, t0);
+            let typed_at = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+            paint(&mut state, &key);
+
+            let at = typed_at + KICKOFF_ACK_TIMEOUT;
+            let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+
+            assert!(writes_of(&cmds).is_empty(), "{name}: {cmds:?}");
+            let status = state.status.as_deref().unwrap_or_default();
+            assert_eq!(
+                status,
+                kickoff_notice(&state, &app, &key, NOTICE_UNANSWERED),
+                "{name}"
+            );
+            assert!(state.pending_kickoffs[0].stuck, "{name}");
+            assert!(!state.kickoff_owed(&key, at), "{name}: not owed");
+            assert!(
+                !state.pending_kickoffs[0].notified_not_at_prompt,
+                "{name}: not the never-typed notice"
+            );
+
+            // Said once while it stays off its prompt.
+            kickoff_tick(&mut state, &mut app, &brigade, at + STATUS_TIMEOUT);
+            assert_eq!(state.status, None, "{name}");
+            kickoff_tick(&mut state, &mut app, &brigade, at + STATUS_TIMEOUT * 3);
+            assert_eq!(state.status, None, "{name}: not said again");
+
+            // The pane comes back to its prompt: tried again, owed again.
+            paint_codex_prompt(&mut state, &key, Some("idle"));
+            let back = at + STATUS_TIMEOUT * 4;
+            let retried = kickoff_tick(&mut state, &mut app, &brigade, back);
+            assert_eq!(
+                writes_of(&retried),
+                vec![(key.clone(), CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec())],
+                "{name}"
+            );
+            assert_eq!(state.pending_kickoffs[0].attempts, 2, "{name}");
+            assert!(!state.pending_kickoffs[0].stuck, "{name}");
+            assert!(state.kickoff_owed(&key, back), "{name}: owed again");
+        }
+    }
+
+    #[test]
+    fn a_codex_retry_waits_for_the_pane_to_be_quiet() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        codex_kickoff_typed_and_entered(&mut state, &mut app, &brigade, &key, t0);
+        let at = t0 + CODEX_KICKOFF_QUIET_PERIOD + KICKOFF_ACK_TIMEOUT;
+        // The idle-and-empty pair is on screen, but output arrived a moment ago.
+        state
+            .last_output_at
+            .insert(key.clone(), at - Duration::from_millis(100));
+
+        let busy = kickoff_tick(&mut state, &mut app, &brigade, at);
+        assert!(writes_of(&busy).is_empty(), "{busy:?}");
+        assert_eq!(state.status, None, "waiting, not stuck");
+        assert!(!state.pending_kickoffs[0].stuck);
+
+        let quiet = kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            at + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(
+            writes_of(&quiet),
+            vec![(key, CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_retry_waits_for_the_pane_to_be_quiet() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
+        let at = t0 + KICKOFF_ACK_TIMEOUT;
+        state
+            .last_output_at
+            .insert(key.clone(), at - Duration::from_millis(100));
+
+        let busy = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, at);
+        assert!(writes_of(&busy).is_empty(), "{busy:?}");
+        assert_eq!(state.status, None);
+
+        let quiet = goinkyo_kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            at + GOINKYO_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(
+            writes_of(&quiet),
+            vec![(key, GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_whose_live_file_read_busy_after_the_enter_is_never_retyped() {
+        // The row is awaited, and typing the sentence again would start a
+        // second turn; once the ack window has run out the silence is reported
+        // (see the test below).
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
+        goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(false))],
+            t0 + Duration::from_secs(2),
+        );
+        assert!(state.pending_goinkyo_kickoffs[0].turn_seen);
+
+        let at = t0 + KICKOFF_ACK_TIMEOUT;
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            at,
+        );
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
+        let early = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            t0 + KICKOFF_ACK_TIMEOUT - Duration::from_secs(1),
+        );
+        assert!(writes_of(&early).is_empty(), "{early:?}");
+    }
+
+    #[test]
+    fn a_goinkyo_that_took_its_turn_with_no_session_row_is_reported_once_and_not_owed() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
+        goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(false))],
+            t0 + Duration::from_secs(2),
+        );
+        let before = t0 + KICKOFF_ACK_TIMEOUT - Duration::from_secs(1);
+        goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            before,
+        );
+        assert_eq!(state.status, None, "inside the window it is still awaited");
+        assert!(state.kickoff_owed(&key, before));
+
+        let at = t0 + KICKOFF_ACK_TIMEOUT;
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            at,
+        );
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        let status = state.status.clone().expect("reported");
+        assert_eq!(
+            status,
+            kickoff_notice(&state, &app, &key, NOTICE_GOINKYO_NO_ROW)
+        );
+        assert!(state.pending_goinkyo_kickoffs[0].stuck);
+        assert!(!state.kickoff_owed(&key, at), "reported, so not owed");
+
+        // Said once: a later tick neither repeats it nor types the line.
+        state.status = None;
+        let later = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            at + Duration::from_secs(10),
+        );
+        assert!(writes_of(&later).is_empty(), "{later:?}");
+        assert_eq!(state.status, None);
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
+
+        // A row that appears afterwards acknowledges the entry as before.
+        app = app_with(vec![row(key.as_str())]);
+        goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            at + Duration::from_secs(20),
+        );
+        assert!(state.pending_goinkyo_kickoffs.is_empty());
+    }
+
+    #[test]
+    fn a_goinkyo_retry_that_finds_the_pane_off_its_prompt_is_reported_and_tried_again_at_the_prompt()
+     {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(draw_theme_screen, true);
+        let at = t0 + KICKOFF_ACK_TIMEOUT;
+
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, at);
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(
+            state.status,
+            Some(kickoff_notice(&state, &app, &key, NOTICE_UNANSWERED))
+        );
+        assert!(!state.kickoff_owed(&key, at));
+
+        draw_prompt_on(state.screens.get_mut(&key).unwrap(), None);
+        let back = at + STATUS_TIMEOUT * 4;
+        let retried = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, back);
+        assert_eq!(
+            writes_of(&retried),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+        assert!(state.kickoff_owed(&key, back));
     }
 
     // --- dragging a boundary --------------------------------------------------
@@ -21338,6 +22306,8 @@ mod tests {
                 key: key.clone(),
                 spawned_at: now,
                 notified_not_at_prompt: true,
+                turn_seen: false,
+                stuck: false,
                 sent_at: None,
                 attempts: 0,
             });
@@ -21414,6 +22384,8 @@ mod tests {
             key: worker.clone(),
             spawned_at: now,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -21438,6 +22410,8 @@ mod tests {
             key: goinkyo,
             spawned_at: codex_due,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -25209,6 +26183,8 @@ mod tests {
             key: key.clone(),
             spawned_at: test_instant(),
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -25323,6 +26299,8 @@ mod tests {
             key: old_key.clone(),
             spawned_at: t0,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -25407,6 +26385,8 @@ mod tests {
             key: old.clone(),
             spawned_at: now,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });
@@ -25414,6 +26394,8 @@ mod tests {
             key: old.clone(),
             spawned_at: now,
             notified_not_at_prompt: false,
+            turn_seen: false,
+            stuck: false,
             sent_at: None,
             attempts: 0,
         });

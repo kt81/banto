@@ -5270,6 +5270,8 @@ fn goinkyo_fixture(
         key: goinkyo.clone(),
         spawned_at: at + spawned_after,
         notified_not_at_prompt: false,
+        turn_seen: false,
+        stuck: false,
         sent_at: None,
         attempts: 0,
     });
@@ -5425,6 +5427,8 @@ fn a_codex_worker_kickoff_typed_on_the_tick_that_would_complete_the_stretch_does
         key: codex.clone(),
         spawned_at: deadline - CODEX_KICKOFF_QUIET_PERIOD,
         notified_not_at_prompt: false,
+        turn_seen: false,
+        stuck: false,
         sent_at: None,
         attempts: 0,
     });
@@ -5549,6 +5553,8 @@ fn a_kickoff_held_for_the_operator_does_not_hold_the_ring() {
         key: codex.clone(),
         spawned_at: at,
         notified_not_at_prompt: false,
+        turn_seen: false,
+        stuck: false,
         sent_at: None,
         attempts: 0,
     });
@@ -7296,6 +7302,8 @@ fn a_member_added_to_an_armed_brigade_only_delays_the_ring_and_its_own_rules_app
         key: added.clone(),
         spawned_at: idle_from,
         notified_not_at_prompt: false,
+        turn_seen: false,
+        stuck: false,
         sent_at: None,
         attempts: 0,
     });

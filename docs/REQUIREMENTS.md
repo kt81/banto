@@ -1903,9 +1903,13 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   later. Not owed, though the tracking entry stays — the brigade then really is
   waiting on the operator, which is what the bell is for: the pane was found not at
   its prompt and nothing has been typed (the operator has to answer what the pane
-  shows); the operator has an unsent draft in that pane (the retry waits for them);
-  the last allowed attempt (three) was typed and its 15-second acknowledgement
-  window has run out.
+  shows); the operator has an unsent draft in that pane (the kickoff waits for
+  them; a draft is judged as the relay judges one, see "Auto-relay"); a typed line
+  got no answer and the pane is not at its prompt to be asked again, or a Codex
+  Worker took its first turn but was not identified, or a Goinkyo took it and no
+  session row appeared (each reported once, below) —
+  owed again the moment banto types the line again; the last allowed attempt
+  (three) was typed and its 15-second acknowledgement window has run out.
 - *Effect:* it records the brigade as wanting the operator (memory only) and, from
   that record, marks the Director's row in the list (the waiting-colour dot, counted
   in `waiting N`; a staged Director's tile reads the same Waiting row) and rings the
@@ -2144,12 +2148,33 @@ input line decides, and only an empty prompt types (`Unrecognized` — a theme
 picker, a trust dialog, anything not a prompt — holds). A retry asks for both
 witnesses: the sentence is typed again only from a prompt the screen shows empty
 that the live file, when it says anything, calls idle (an unlocatable screen may
-still hold the first sentence, which an idle live file cannot rule out). A hold is said once in
+still hold the first sentence, which an idle live file cannot rule out). A retry is
+due once the acknowledgement window has passed since the line was typed *and* the
+pane has been quiet for the quiet period, and it is never made once the live file
+has read busy after the Enter: a turn ran, so the entry only waits for the
+session's row. If the acknowledgement window has passed since the Enter and no row
+has appeared, it is reported once (`<name>: took its first turn but no session
+appeared for it — banto will not type it again`) and is no longer owed; a row
+that appears later acknowledges and drops the entry as before. A hold is said once in
 the status line (`<name>: not at its prompt — answer what the pane shows, or
 type its first line yourself`), then reminded on the recurring cycle
 (`kickoff: waiting for <members> to reach its prompt`, naming only a kickoff
 with nothing typed yet); nothing is dropped and
 nothing becomes a failure — the line is typed on the tick the prompt appears. A
+retry that finds the pane off its prompt after the window is reported once
+(`<name>: its first line got no answer and it is not at its prompt — answer what
+the pane shows, or type its first line yourself`), is no longer owed (the
+brigade-quiet bell is not held for it), and is tried again, as long as attempts
+are left, on the tick the pane is back at its prompt. An unsent draft in the pane
+holds the kickoff the way it holds a nudge: it is judged by the relay's own
+verdict (the keystroke mark, overruled by the input line reading empty once the
+settle time has passed since the last forwarded key — a digit pressed at a trust
+dialog leaves a mark and no text), banto's own sentence still sitting on the line
+(a retry's lost Enter) is recognised first and is never taken for the operator's
+draft, and the hold is announced on the relay's draft-hold reminder with its way
+out (`kickoff: not typing the first line into <members> — unsent input in the
+pane; Enter there sends it as the first turn, clearing the line lets banto type
+its own`). A
 Worker never needs this: the operator gives it its own first turn by typing
 into its pane themselves, which nobody does for an unattended Goinkyo.
 
@@ -2368,15 +2393,29 @@ tick, with a qualified status reminder repeated while it remains blocked. The
 trust registries gate nothing here (see "Directory trust"). After each typed line
 and its delayed Enter, banto waits 15 seconds for acknowledgement (a discovered
 Codex session, or a Goinkyo row after its send) before retrying, at most three
-times. It asks the same question before every retry and never writes while banto
-has seen unsent operator input in that pane. The Enter transition has not been
-measured, so the interval is deliberately generous; a Codex input line can be
-read only as empty or not (never for the text on it), so a dropped Enter that
-leaves the sentence typed reads as "not at its prompt" and holds the retry, which
-is what keeps a retry from duplicating the bootstrap sentence. (A Goinkyo's input
-line can be read for text, so its retry presses Enter alone when the line still
-holds exactly its sentence.) Exhaustion remains visible as a periodic qualified
-status reminder rather than silently looping.
+times; a retry also waits for the pane's own output to have been quiet for the
+quiet period, since the `idle` + empty-line pair is stable only on a pane that
+has stopped painting. It asks the same question before every retry and never
+writes while the operator has an unsent draft in that pane (judged as the relay
+judges one, see "Auto-relay"; a held kickoff is announced with its way out, as
+for a Goinkyo above). The Enter transition has not been measured, so the interval
+is deliberately generous; a Codex input line can be read only as empty or not
+(never for the text on it), so a dropped Enter that leaves the sentence typed
+reads as not at its prompt and holds the retry, which is what keeps a retry from
+duplicating the bootstrap sentence. (A Goinkyo's input line can be read for text,
+so its retry presses Enter alone when the line still holds exactly its
+sentence.) A retry that finds the pane off its prompt is reported once, as for a
+Goinkyo (`<name>: its first line got no answer and it is not at its prompt —
+answer what the pane shows, or type its first line yourself`), is no longer owed,
+and is tried again when the pane is back at its prompt. Once the pane has
+reported `working`, `done` or `error` (OSC 7501; `error` is sticky, so a first
+turn that failed would otherwise read as `idle` again once the operator touched
+the pane) after banto's Enter went out — it was `idle` when the line was typed —
+a turn ran, and the line is never typed again,
+identified or not: if the session is still not discovered when the window runs
+out it is reported once (`<name>: took its first turn but was not identified —
+banto will not type it again`) and is no longer owed. Exhaustion remains visible
+as a periodic qualified status reminder rather than silently looping.
 
 **Lifecycle.** A Worker is disposable. Prefix-`x` on a Worker's (or the Goinkyo's)
 tile asks once and *dismisses* it: it leaves the brigade for good — membership,
@@ -3322,7 +3361,8 @@ tick before an empty reading clears the mark (below). While a pane is
 marked, a nudge to it is suppressed whatever the focus and however long ago
 the operator last typed, a nudge's own delayed Enter is dropped if the mark
 appeared before it was due, and the status line says the nudge is being held
-(re-shown every 30s, never over another message).
+(re-shown every 30s, never over another message). A kickoff held by the mark is
+named on that same line and cycle.
 
 When a known Codex pane has enabled Win32 input mode (`CSI ? 9001 h`), banto
 forwards exactly Shift+Enter and Ctrl+J as Win32 key
@@ -3422,7 +3462,11 @@ would look like one that works; waiting (a permission dialog) is not counted. Th
 same reading lets a retried Goinkyo kickoff press Enter alone when the line still
 holds exactly its sentence, and is the second caller that asks it: a Goinkyo
 kickoff with no live file to consult, and a Codex Worker kickoff (with the Codex
-reader), type only into an `Empty` prompt.
+reader), type only into an `Empty` prompt. A third asks the whole verdict above
+before a kickoff is typed, with the reader of the pane's own agent: a kickoff is
+held by the mark exactly as a nudge is, and an `Empty` line read after the settle
+time releases it as it releases a nudge, so a key that went to a dialog does not
+hold a first line forever; an unreadable line leaves the mark in charge.
 
 *Incident (2026-11-15): a renamed session's label in its input-box border.* The
 operator kept seeing `relay: cannot read the input line of director of "<brigade>" —

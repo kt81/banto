@@ -117,12 +117,18 @@ callers. Relay asks it only when it decides to nudge. The kickoff of a Codex
 Worker, and of a Goinkyo whose live file does not yet name its pane, asks it on
 each tick the first line is due, because the alternative witness (the product's
 trust registry) was wrong both ways and a typed first line into a screen that is
-not a prompt answers whatever that screen is asking. There an unsure read does
+not a prompt answers whatever that screen is asking. Both kickoffs also ask it
+whether the operator's unsent mark still stands, on the ticks a line is due, with
+the relay's own verdict (the mark, overruled by an `Empty` read after the settle
+time), which closes to the mark when the read is unsure. There an unsure read does
 **not** fall back to what the caller did before: banto does not type, and tells
 the operator once so that they can answer the pane or type the line themselves
 (approved 2026-11-18, a departure from "the caller does what it did before it
-could read"). Nothing is dropped and nothing fails: the kickoff stays owed and
-is typed on the tick the prompt reads `Empty`. A Codex match is not proof of
+could read"). Nothing is dropped and nothing fails: the kickoff is typed on the
+tick the prompt reads `Empty`, and stays owed until a line banto typed has had its
+acknowledgement window and the pane is still not at a prompt, when banto tells the
+operator once and stops counting it as owed (it is typed again the moment the
+prompt reads `Empty`). A Codex match is not proof of
 semantic emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay".
 Reading sends nothing; the operator approved the principle on 2026-11-10. The
 next shortcut that wants the screen cites this paragraph's conditions, not the
@@ -136,7 +142,9 @@ it is unsure (no report, or `clear`, and the earlier signal decides). It is not 
 instance of the paragraph above, so a shortcut must not cite it for one. The
 Codex kickoff reads it too, as one of its two conditions (`idle` and an empty
 prompt), and for that decision no report is not an `idle`: it holds, under the same
-exception as above.
+exception as above. After the line is typed it reads the report once more, only to
+see that a turn ran (`working`, `done` or `error`) and so never type the line again; no
+report there is no turn seen, and the retry rules decide.
 
 ## 4. The core signature
 
