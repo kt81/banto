@@ -1032,26 +1032,26 @@ parent's turn ends without waiting for its children). The `?` query is not answe
 that is the one thing that would make Claude Code report over the same protocol
 (from the 2.1.323 bundle, read and not run; see the decision entry's "Not done").
 
-**Directory trust** (`crate::directory_trust`, advisory-only, read-only):
-before typing anything into a freshly-spawned Codex Worker's pane (see
-"Brigade" below), banto checks whether Codex already trusts that Worker's
-cwd by reading `<codex_home>/config.toml`'s `[projects.'<path>']
-trust_level` — the same record Codex itself writes when an operator answers
-its own directory-trust prompt, keyed by a lowercased, backslash-separated
-path. The module also reads Claude Code's equivalent
-(`~/.claude.json`'s `.projects[<path>].hasTrustDialogAccepted`, keyed by
-whatever exact string a past launch happened to pass as cwd, no
-normalization — the same real directory was found stored under both
-backslash and forward-slash forms disagreeing with each other). That half
-gates nothing — a Claude Worker publishes its session id on its own the
-moment it starts, so banto never types into its pane blind the way Codex's
-kickoff (see "Brigade" below) does. It exists to explain a silence: a Worker
-parked on that prompt starts nothing, is discovered by nothing, and would
-otherwise sit there saying nothing at all, so the emporium's discovery poll
-says so once in the status line. It fires only on a recorded refusal, not on
-the absence of a record, because Claude writes an explicit `false` when an
-operator declines — treating "never seen this directory" as a refusal would
-have meant a warning on every directory opened for the first time.
+**Directory trust** (`crate::directory_trust`, advisory-only, read-only): banto
+reads Claude Code's own record of whether it has been told to trust a directory
+(`~/.claude.json`'s `.projects[<path>].hasTrustDialogAccepted`, keyed by whatever
+exact string a past launch happened to pass as cwd, no normalization — the same
+real directory was found stored under both backslash and forward-slash forms
+disagreeing with each other). It **gates nothing**: no keystroke is typed or held
+on its word. It exists to explain a silence: a Claude Worker parked on that prompt
+starts nothing, is discovered by nothing, and would otherwise sit there saying
+nothing at all, so the emporium's discovery poll says so once in the status line. It
+fires only on a recorded refusal, not on the absence of a record, because Claude
+writes an explicit `false` when an operator declines — treating "never seen this
+directory" as a refusal would have meant a warning on every directory opened for the
+first time.
+
+It used to be the gate on the first line banto types into a Codex Worker (Codex's
+own `config.toml` record) and into a Goinkyo (this one), and it was the wrong
+witness for both: Claude never records trust for the home directory, Codex was seen
+to write no trust key outside a git repository (so an already-trusted pane waited
+for ever), and a stale `true` typed the line into a screen that was not a prompt.
+Both kickoffs now ask the pane itself — see "Brigade" below.
 
 ## The `agents` setting
 
@@ -1895,15 +1895,15 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   or its session row), the pane gone, or the failure reported — a member whose
   sample reads idle counts like an unknown one: it blocks firing and breaks the
   stretch. That covers every state in between (waiting for the boot output to go
-  quiet, the trust check in flight, the line typed and awaiting its acknowledgement,
-  a retry pending). Why: a newly summoned member can sit idle at its prompt for
+  quiet, waiting for the pane to reach its prompt, the line typed and awaiting its
+  acknowledgement, a retry pending). Why: a newly summoned member can sit idle at its prompt for
   longer than the settle time before banto types its kickoff, and the bell must not
   ring while banto itself is about to start it. The stretch then runs from after the
   kickoff stops being owed, or from banto's last write into the member, whichever is
   later. Not owed, though the tracking entry stays — the brigade then really is
-  waiting on the operator, which is what the bell is for: the directory was reported
-  not trusted and nothing has been typed (the operator has to answer the pane's
-  prompt); the operator has an unsent draft in that pane (the retry waits for them);
+  waiting on the operator, which is what the bell is for: the pane was found not at
+  its prompt and nothing has been typed (the operator has to answer what the pane
+  shows); the operator has an unsent draft in that pane (the retry waits for them);
   the last allowed attempt (three) was typed and its 15-second acknowledgement
   window has run out.
 - *Effect:* it records the brigade as wanting the operator (memory only) and, from
@@ -2134,15 +2134,24 @@ not free: it also blocks whatever a scratchpad or memory write would use.
 
 The briefing alone is not a turn: Claude Code does nothing with a system
 prompt until it receives one, so once the Goinkyo's own pane goes quiet
-(`GOINKYO_KICKOFF_QUIET_PERIOD`), banto checks whether Claude has been told
-to trust its cwd (`Cmd::CheckGoinkyoDirectoryTrust` — a different trust
-registry from Codex's own directory-trust check, re-asked every tick until
-trusted, with periodic qualified status reminders) and types a fixed kickoff
-line into it — the same bootstrap
-problem, and the same shape of fix, `CODEX_WORKER_KICKOFF_LINE` solves for
-a freshly-spawned Codex Worker. A Worker never needs this: the operator
-gives it its own first turn by typing into its pane themselves, which
-nobody does for an unattended Goinkyo.
+(`GOINKYO_KICKOFF_QUIET_PERIOD`) and is at its prompt, banto types a fixed
+kickoff line into it — the same bootstrap problem, and the same shape of fix,
+`CODEX_WORKER_KICKOFF_LINE` solves for a freshly-spawned Codex Worker. "At its
+prompt" is asked of the pane, every tick until it holds: if Claude's live file
+names the pane (the same identification the relay's nudge relies on) its word
+is taken, idle types and busy holds; until a live file names it, the painted
+input line decides, and only an empty prompt types (`Unrecognized` — a theme
+picker, a trust dialog, anything not a prompt — holds). A retry asks for both
+witnesses: the sentence is typed again only from a prompt the screen shows empty
+that the live file, when it says anything, calls idle (an unlocatable screen may
+still hold the first sentence, which an idle live file cannot rule out). A hold is said once in
+the status line (`<name>: not at its prompt — answer what the pane shows, or
+type its first line yourself`), then reminded on the recurring cycle
+(`kickoff: waiting for <members> to reach its prompt`, naming only a kickoff
+with nothing typed yet); nothing is dropped and
+nothing becomes a failure — the line is typed on the tick the prompt appears. A
+Worker never needs this: the operator gives it its own first turn by typing
+into its pane themselves, which nobody does for an unattended Goinkyo.
 
 **Ending a consultation** removes the Goinkyo's member row, which releases
 the guard above and — the next time a tick observes a brigade in use (its
@@ -2307,7 +2316,7 @@ discovery has a timeout: a tracker lives as long as its pane and ends only when
 the pane is identified or goes away. A brigade member is identified by the
 identity its first turn's hook records, so that turn identifies it whenever it
 happens and whoever takes it — banto's own kickoff or one the operator types.
-While the kickoff is held (an unanswered trust prompt) or failing, the pane
+While the kickoff is held (the pane is not at its prompt) or failing, the pane
 stays unidentified and the guard above stays on; the operator is told when
 typing fails, by the kickoff's own status, not by a timer.
 
@@ -2341,28 +2350,33 @@ fires its `SessionStart` hook, never gets a `threads` row, never writes a
 rollout file — there is nothing for discovery to find yet. So banto starts
 the first turn itself: once a fresh Worker's pane output has gone quiet for
 `CODEX_KICKOFF_QUIET_PERIOD` (700ms, a threshold measured against this
-product's own boot sequence) *and* Codex is confirmed to already trust the
-Worker's cwd (the "Directory trust" reading above — typing blind into a pane
-that might instead be showing that product's own directory-trust prompt
-risks answering that prompt by accident), banto types a fixed, ASCII-only
+product's own boot sequence) *and* the pane says it is at its prompt (the latest
+OSC 7501 report reads `idle`, and the painted input line reads as an empty
+prompt — a menu or a directory-trust question can report `idle` too, which is why
+both are asked; typing blind into one would answer it by accident), banto types a fixed, ASCII-only
 status line naming itself, then a delayed `\r` in a second PTY write (the
 same two-step "text, then submit" shape the auto-relay nudge uses, and
 deliberately not that same nudge line, since no peer has actually sent mail
 yet). The turn this forces is what fires the hook; the hook's own stdin
 carries the real session id, which `banto _hook` records
 (`store::record_briefing`) for `poll_discovery`'s `codex_briefed_session_id`
-to pick up. If the cwd isn't trusted yet, banto keeps re-checking every tick
-rather than typing blind or giving up — answering the prompt in the pane
-directly lets the kickoff resume on its own next tick, with a qualified
-status reminder repeated while it remains blocked. After each typed line and
-its delayed Enter, banto waits 15 seconds for acknowledgement (a discovered
+to pick up. If the pane is not at its prompt, banto says so once in the
+status line (`<name>: not at its prompt — answer what the pane shows, or type its
+first line yourself`) and keeps re-checking every tick rather than typing blind or
+giving up — answering what the pane shows lets the kickoff resume on its own next
+tick, with a qualified status reminder repeated while it remains blocked. The
+trust registries gate nothing here (see "Directory trust"). After each typed line
+and its delayed Enter, banto waits 15 seconds for acknowledgement (a discovered
 Codex session, or a Goinkyo row after its send) before retrying, at most three
-times. It rechecks trust before every retry and never writes while banto has
-seen unsent operator input in that pane. The Enter transition has not been
-measured, so the interval is deliberately generous: banto cannot inspect the
-terminal's input line, and a dropped Enter with text still present could make
-a retry duplicate the bootstrap sentence. Exhaustion remains visible as a
-periodic qualified status reminder rather than silently looping.
+times. It asks the same question before every retry and never writes while banto
+has seen unsent operator input in that pane. The Enter transition has not been
+measured, so the interval is deliberately generous; a Codex input line can be
+read only as empty or not (never for the text on it), so a dropped Enter that
+leaves the sentence typed reads as "not at its prompt" and holds the retry, which
+is what keeps a retry from duplicating the bootstrap sentence. (A Goinkyo's input
+line can be read for text, so its retry presses Enter alone when the line still
+holds exactly its sentence.) Exhaustion remains visible as a periodic qualified
+status reminder rather than silently looping.
 
 **Lifecycle.** A Worker is disposable. Prefix-`x` on a Worker's (or the Goinkyo's)
 tile asks once and *dismisses* it: it leaves the brigade for good — membership,
@@ -3289,7 +3303,12 @@ suppressed while the member's pane is focused and has just received forwarded
 keystrokes (`RELAY_INPUT_QUIET_PERIOD`), is subject to
 a cooldown between repeat nudges to the same member, and gives up after a
 capped number of attempts on one unseen batch
-(`crates/banto-core/src/engine.rs` relay constants).
+(`crates/banto-core/src/engine.rs` relay constants). It also never lands behind a
+line banto itself has in a pane: while a typed line (a kickoff sentence, or a
+nudge) still waits for its delayed Enter, or an Enter went out into the pane on
+this very tick, the pane counts as not idle for the relay, so its idle streak
+starts over — otherwise one Enter would submit the two lines as a single message,
+and the idle reading would be from before the line.
 
 A time window cannot protect a draft, so the operator's unsent text is
 tracked as a fact instead (`EmporiumState::has_unsent_operator_input`): a
@@ -3401,7 +3420,9 @@ nudge sentence. A Claude pane that stays idle yet `Unrecognized` for
 Claude's layout can change without notice and a reader that stopped recognising it
 would look like one that works; waiting (a permission dialog) is not counted. The
 same reading lets a retried Goinkyo kickoff press Enter alone when the line still
-holds exactly its sentence.
+holds exactly its sentence, and is the second caller that asks it: a Goinkyo
+kickoff with no live file to consult, and a Codex Worker kickoff (with the Codex
+reader), type only into an `Empty` prompt.
 
 *Incident (2026-11-15): a renamed session's label in its input-box border.* The
 operator kept seeing `relay: cannot read the input line of director of "<brigade>" —

@@ -771,31 +771,26 @@ fn cancel_pending_submit_on_input(pending_submits: &mut Vec<PendingSubmit>, key:
 }
 
 /// A freshly-spawned Codex Worker pane awaiting its own boot output going
-/// quiet before [`update_tick`] asks whether it's safe to type
-/// [`CODEX_WORKER_KICKOFF_LINE`] into it — see that constant's doc for why
-/// the kickoff exists at all, and [`Cmd::CheckWorkerDirectoryTrust`]'s for
-/// why quiet alone isn't enough to type it blind. Queued by
-/// [`update_spawned`] the moment such a pane's `PendingOpen::BrigadeMember`
-/// resolves; removed once the kickoff is actually sent (its `\r` becomes an
-/// ordinary [`PendingSubmit`], the same two-phase shape as a relay nudge) or
-/// the pane unstages first.
+/// quiet before [`update_tick`] types [`CODEX_WORKER_KICKOFF_LINE`] into it —
+/// see that constant's doc for why the kickoff exists at all, and
+/// [`codex_kickoff_at_prompt`] for what else must hold: quiet alone is not
+/// enough, since Codex's first-run dialogs print nothing while they wait.
+/// Queued by [`update_spawned`] the moment such a pane's
+/// `PendingOpen::BrigadeMember` resolves; removed once the kickoff is actually
+/// sent and its session found (its `\r` becomes an ordinary
+/// [`PendingSubmit`], the same two-phase shape as a relay nudge) or the pane
+/// unstages first.
 struct PendingKickoff {
     key: SessionKey,
     /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
     /// has no entry yet for this pane (nothing has arrived at all) — the
     /// moment this tracker was created, i.e. spawn time.
     spawned_at: Instant,
-    /// This Worker's own cwd — echoed on [`Cmd::CheckWorkerDirectoryTrust`]
-    /// once the quiet period elapses, since the pure core has no way to read
-    /// Codex's own trust records itself and the shell has no other way to
-    /// know which directory to check.
-    cwd: PathBuf,
-    /// Whether [`update_worker_directory_trust_checked`] has already told
-    /// the operator this pane is waiting on an unanswered trust prompt —
-    /// set the first time the answer comes back "not trusted", so the
-    /// status line states it once instead of restamping the same notice
-    /// every tick while banto keeps quietly re-checking.
-    notified_untrusted: bool,
+    /// Whether [`update_tick`] has already told the operator this pane is not
+    /// at its prompt — set the first tick the kickoff is due and the pane
+    /// does not show one, so the status line states it once instead of
+    /// restamping the same notice every tick.
+    notified_not_at_prompt: bool,
     sent_at: Option<Instant>,
     attempts: u32,
 }
@@ -822,8 +817,9 @@ const GOINKYO_KICKOFF_QUIET_PERIOD: Duration = Duration::from_millis(700);
 /// longer than boot quiet before risking another bootstrap turn.
 const KICKOFF_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// After this many tries, report the failure rather than silently repeating.
-/// Banto cannot read the input line to distinguish a lost Enter from text
-/// still present there, which can duplicate the kickoff sentence.
+/// A Codex input line cannot be read for what is typed in it, so there a retry
+/// cannot tell a lost Enter from text still present, which can duplicate the
+/// kickoff sentence.
 const KICKOFF_MAX_ATTEMPTS: u32 = 3;
 
 /// The fixed, ASCII-only line banto types into a freshly-spawned Goinkyo's
@@ -844,32 +840,31 @@ const KICKOFF_MAX_ATTEMPTS: u32 = 3;
 const GOINKYO_KICKOFF_LINE: &str = "[banto] This pane just started as your brigade's Goinkyo.";
 
 /// A freshly-spawned Goinkyo pane awaiting its own boot output going quiet
-/// before [`update_tick`] asks whether it's safe to type
-/// [`GOINKYO_KICKOFF_LINE`] into it — see that constant's own doc for why
-/// the kickoff exists at all, and [`Cmd::CheckGoinkyoDirectoryTrust`]'s for
-/// why quiet alone isn't enough to type it blind. Queued by
+/// before [`update_tick`] types [`GOINKYO_KICKOFF_LINE`] into it — see that
+/// constant's own doc for why the kickoff exists at all, and
+/// [`goinkyo_kickoff_at_prompt`] for what else must hold: quiet alone is not
+/// enough, since Claude's theme, security and trust screens print nothing
+/// while they wait. Queued by
 /// [`update_goinkyo_awaiting_spawn`]'s own `AwaitingSpawn` success branch —
 /// the exact same moment [`EmporiumState::goinkyo_pane`] records the pane,
 /// so the "attempt once per consultation" guarantee that already covers
 /// the spawn itself covers this too, with no separate marker needed.
-/// Removed once the kickoff is actually sent (its `\r` becomes an ordinary
-/// [`PendingSubmit`], the same two-phase shape as a relay nudge or a Codex
-/// kickoff) or the pane unstages first.
+/// Kept after the line is typed (its `\r` is an ordinary [`PendingSubmit`], the
+/// same two-phase shape as a relay nudge or a Codex kickoff), because the typed
+/// line is not yet known to have started a turn: [`update_tick`] drops the entry
+/// once a row for the pane's session exists after a write (the acknowledgement),
+/// or the pane unstages first. Until then it is retried after
+/// [`KICKOFF_ACK_TIMEOUT`].
 struct PendingGoinkyoKickoff {
     key: SessionKey,
     /// Baseline for the quiet-period check when [`EmporiumState::last_output_at`]
     /// has no entry yet for this pane (nothing has arrived at all) — the
     /// moment this tracker was created, i.e. spawn time.
     spawned_at: Instant,
-    /// This Goinkyo's own cwd — echoed on [`Cmd::CheckGoinkyoDirectoryTrust`]
-    /// once the quiet period elapses, since the pure core has no way to read
-    /// Claude's own trust registry itself and the shell has no other way to
-    /// know which directory to check.
-    cwd: PathBuf,
-    /// Whether [`update_goinkyo_directory_trust_checked`] has already told
-    /// the operator this pane is waiting on an unanswered trust prompt —
-    /// same reasoning as [`PendingKickoff::notified_untrusted`].
-    notified_untrusted: bool,
+    /// Whether [`update_tick`] has already told the operator this pane is not
+    /// at its prompt — same reasoning as
+    /// [`PendingKickoff::notified_not_at_prompt`].
+    notified_not_at_prompt: bool,
     sent_at: Option<Instant>,
     attempts: u32,
 }
@@ -911,12 +906,6 @@ enum PendingOpen {
         /// whose id is already known): it has nothing left to discover and
         /// no reason to spend a turn kicking it off.
         needs_codex_kickoff: bool,
-        /// This member's cwd — carried through unconditionally (even when
-        /// `needs_codex_kickoff` is `false`) since it's cheap to plumb and
-        /// only [`PendingKickoff`] ever reads it back out. Needed there to
-        /// ask the shell whether Codex trusts this exact directory before
-        /// typing into it.
-        cwd: PathBuf,
     },
 }
 
@@ -1224,7 +1213,7 @@ pub struct EmporiumState {
     /// Announces on the status line that a nudge is being held back by
     /// [`Self::unsent_operator_input`]; see [`update_tick`].
     draft_hold_reminder: StatusReminder,
-    kickoff_trust_reminder: StatusReminder,
+    kickoff_prompt_reminder: StatusReminder,
     kickoff_failed_reminder: StatusReminder,
     /// Since when each idle Claude member's input line has read as
     /// [`InputLine::Unrecognized`], unbroken. Keyed by member rather than by
@@ -1245,9 +1234,10 @@ pub struct EmporiumState {
     pending_kickoffs: Vec<PendingKickoff>,
     /// The Goinkyo analog of [`Self::pending_kickoffs`] — see
     /// [`PendingGoinkyoKickoff`]'s own doc for why it's a separate list
-    /// rather than folded into that one (a different underlying trust
-    /// registry, no `needs_codex_kickoff`-style spawn-time flag to key off
-    /// since only [`update_goinkyo_awaiting_spawn`] ever creates one).
+    /// rather than folded into that one (a different witness for "at its
+    /// prompt" — the live file, else Claude's input line, not Codex's report —,
+    /// no `needs_codex_kickoff`-style spawn-time flag to key off since only
+    /// [`update_goinkyo_awaiting_spawn`] ever creates one).
     pending_goinkyo_kickoffs: Vec<PendingGoinkyoKickoff>,
     pending_submits: Vec<PendingSubmit>,
     pending_opens: HashMap<SessionKey, PendingOpen>,
@@ -1593,7 +1583,7 @@ impl EmporiumState {
             last_given_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
-            kickoff_trust_reminder: StatusReminder::default(),
+            kickoff_prompt_reminder: StatusReminder::default(),
             kickoff_failed_reminder: StatusReminder::default(),
             unreadable_since: HashMap::new(),
             unreadable_noticed: HashSet::new(),
@@ -2677,12 +2667,13 @@ impl EmporiumState {
     /// blocking the brigade-quiet bell, from the moment the pane is hosted until
     /// the entry is dropped — acknowledged (a discovered session, a session row),
     /// the pane gone, or the briefing reported unconfirmed — through every state
-    /// in between: waiting for the boot output to go quiet, the trust check in
-    /// flight, typed and awaiting its acknowledgement, a retry pending.
+    /// in between: waiting for the boot output to go quiet, waiting for the pane
+    /// to reach its prompt, typed and awaiting its acknowledgement, a retry
+    /// pending.
     ///
-    /// Not owed, though the entry stays: the directory was reported untrusted
-    /// and nothing has been typed (banto re-checks every tick but the operator
-    /// has to answer the pane's prompt); the operator has an unsent draft in the
+    /// Not owed, though the entry stays: the pane was found not at its prompt
+    /// and nothing has been typed (banto looks again every tick but the operator
+    /// has to answer what the pane shows); the operator has an unsent draft in the
     /// pane (the retry waits for them); and the last allowed attempt was typed
     /// and its acknowledgement window has run out (banto reports the failure).
     /// In each of those the brigade really is waiting on the operator, which is
@@ -2692,11 +2683,11 @@ impl EmporiumState {
         if self.has_unsent_operator_input(key) {
             return false;
         }
-        let outstanding = |sent_at: Option<Instant>, attempts: u32, untrusted: bool| {
+        let outstanding = |sent_at: Option<Instant>, attempts: u32, not_at_prompt: bool| {
             if attempts >= KICKOFF_MAX_ATTEMPTS {
                 sent_at.is_some_and(|at| now.saturating_duration_since(at) < KICKOFF_ACK_TIMEOUT)
             } else {
-                !(sent_at.is_none() && untrusted)
+                !(sent_at.is_none() && not_at_prompt)
             }
         };
         self.pending_kickoffs
@@ -2706,7 +2697,7 @@ impl EmporiumState {
                 outstanding(
                     pending.sent_at,
                     pending.attempts,
-                    pending.notified_untrusted,
+                    pending.notified_not_at_prompt,
                 )
             })
             || self
@@ -2717,7 +2708,7 @@ impl EmporiumState {
                     outstanding(
                         pending.sent_at,
                         pending.attempts,
-                        pending.notified_untrusted,
+                        pending.notified_not_at_prompt,
                     )
                 })
     }
@@ -3593,42 +3584,6 @@ pub enum Cmd {
     OpenCodexTrustPane {
         key: SessionKey,
     },
-    /// Read whether Codex has already been told to trust `cwd` — a
-    /// per-directory record, unrelated to `Cmd::CheckCodexTrust`'s
-    /// machine-wide hook-trust one — before typing
-    /// [`CODEX_WORKER_KICKOFF_LINE`] into `key`'s pane blind. Issued by
-    /// [`update_tick`] once a [`PendingKickoff`]'s quiet period has elapsed,
-    /// every tick, until the answer comes back trusted: a directory Codex
-    /// has never seen shows its own first-run trust prompt on stdin/stdout,
-    /// exactly where the kickoff line would otherwise land — measured
-    /// (worker-3's report) to block on that prompt the same way an
-    /// unanswered approval always has, with no flag banto already passes
-    /// dismissing it. The shell answers with
-    /// `Event::WorkerDirectoryTrustChecked`.
-    CheckWorkerDirectoryTrust {
-        key: SessionKey,
-        cwd: PathBuf,
-    },
-    /// Read whether Claude has already been told to trust `cwd` — before
-    /// typing [`GOINKYO_KICKOFF_LINE`] into `key`'s pane blind. Mirrors
-    /// [`Cmd::CheckWorkerDirectoryTrust`]'s reasoning above, but backed by
-    /// `banto_io::directory_trust::claude_directory_trust` — a different
-    /// underlying trust registry Codex's own check does not read
-    /// (`execute_check_worker_directory_trust` calls `codex_directory_trust`
-    /// specifically). The Goinkyo's `cwd` is ordinarily the Director's own
-    /// already-trusted one, so this is expected to pass immediately in the
-    /// common case — but the kickoff is the one place banto types into a
-    /// *Claude* pane it has not first observed idle (the relay nudge only types
-    /// into a member it has seen idle, which a pane sitting at a trust prompt
-    /// never is), so the same risk `CheckWorkerDirectoryTrust` exists to avoid
-    /// for Codex applies here too, however rarely it actually fires. Issued by [`update_tick`]
-    /// once a [`PendingGoinkyoKickoff`]'s quiet period has elapsed, every
-    /// tick, until the answer comes back trusted. The shell answers with
-    /// `Event::GoinkyoDirectoryTrustChecked`.
-    CheckGoinkyoDirectoryTrust {
-        key: SessionKey,
-        cwd: PathBuf,
-    },
     /// Re-emit a child's OSC 52 clipboard payload on banto's own stdout, so
     /// the real terminal banto is running in performs the copy — banto is a
     /// middleman here, not the clipboard owner (`crate::screen::Screen::
@@ -3841,7 +3796,7 @@ pub enum Event {
     },
     /// The shell's Claude-sourced discovery tracker for `token` still hasn't
     /// resolved, and its own cwd definitively reads `NotTrusted` (see
-    /// `banto_io::directory_trust::claude_directory_trust` — narrower than
+    /// `banto_io::directory_trust::claude_directory_trust_in` — narrower than
     /// `Unknown`-also-counts on purpose, `poll_discovery`'s own doc has the
     /// reasoning) — reported once per tracker (the shell's own dedup,
     /// `DiscoveryTracker::notified_untrusted`), so this pane's silence gets
@@ -3949,23 +3904,6 @@ pub enum Event {
     CodexTrustChecked {
         primed: bool,
         hook_launchable: bool,
-    },
-    /// Answers `Cmd::CheckWorkerDirectoryTrust`: whether Codex has been told
-    /// to trust `key`'s pane's own cwd. `trusted` is already collapsed to a
-    /// plain bool by the shell — `banto_io::directory_trust::DirectoryTrust`'s
-    /// `NotTrusted` and `Unknown` both mean "don't type into this pane yet"
-    /// here, so there is nothing a third state would let
-    /// [`update_worker_directory_trust_checked`] do differently.
-    WorkerDirectoryTrustChecked {
-        key: SessionKey,
-        trusted: bool,
-    },
-    /// Answers `Cmd::CheckGoinkyoDirectoryTrust`: whether Claude has been
-    /// told to trust `key`'s pane's own cwd. Same collapsed-bool reasoning
-    /// as [`Self::WorkerDirectoryTrustChecked`].
-    GoinkyoDirectoryTrustChecked {
-        key: SessionKey,
-        trusted: bool,
     },
     /// The shell's answer to `Cmd::ReadCodexCatalog`: the command's standard
     /// output, or the plain reason it could not be had (not found, a non-zero
@@ -4322,12 +4260,6 @@ pub fn update(
         } => update_codex_trust_checked(state, app, primed, hook_launchable, now),
         Event::CodexCatalogRead { round, result } => {
             update_codex_catalog_read(state, round, result, now)
-        }
-        Event::WorkerDirectoryTrustChecked { key, trusted } => {
-            update_worker_directory_trust_checked(state, app, key, trusted, now)
-        }
-        Event::GoinkyoDirectoryTrustChecked { key, trusted } => {
-            update_goinkyo_directory_trust_checked(state, app, key, trusted, now)
         }
         Event::BrigadeFormed {
             director_row_id,
@@ -6976,7 +6908,6 @@ fn stage_brigade(
                         PendingOpen::BrigadeMember {
                             brigade_id,
                             needs_codex_kickoff: false,
-                            cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                     );
                     let launch = RoleLaunch::of(*role, row.agent, brigade);
@@ -8151,7 +8082,6 @@ fn update_spawned(
         PendingOpen::BrigadeMember {
             brigade_id,
             needs_codex_kickoff,
-            cwd,
         } => {
             if let Stage::Brigade {
                 id,
@@ -8178,8 +8108,7 @@ fn update_spawned(
                 state.pending_kickoffs.push(PendingKickoff {
                     key,
                     spawned_at: now,
-                    cwd,
-                    notified_untrusted: false,
+                    notified_not_at_prompt: false,
                     sent_at: None,
                     attempts: 0,
                 });
@@ -8273,7 +8202,6 @@ fn open_worker(
         PendingOpen::BrigadeMember {
             brigade_id,
             needs_codex_kickoff: agent == AgentKind::Codex,
-            cwd: cwd.to_path_buf(),
         },
     );
     let (model, effort) = (
@@ -8596,7 +8524,6 @@ fn relaunch_member(
             // does — the kickoff only ever belongs to a Codex Worker being
             // started for the first time.
             needs_codex_kickoff: false,
-            cwd: cwd.clone(),
         },
     );
     let launch = RoleLaunch::of(BrigadeRole::Worker, row.agent, brigade);
@@ -9541,6 +9468,11 @@ fn update_tick(
         }
     }
 
+    // Panes banto wrote a line or an Enter into earlier in this very tick (the
+    // delayed Enter below, a kickoff, a kickoff's Enter alone). The relay loop
+    // at the end of the tick consults it; see `line_in_flight` there.
+    let mut written_this_tick: HashSet<SessionKey> = HashSet::new();
+
     // Phase two of a nudge: send the delayed submitting `\r` in its own PTY
     // write. A chunk boundary can carry meaning for the embedded PTY, so
     // bundling it with the nudge text risks the child reading both as one
@@ -9555,6 +9487,7 @@ fn update_tick(
             // was already there.
             if !state.has_unsent_operator_input(&entry.key) {
                 state.last_prompted.insert(entry.key.clone(), now);
+                written_this_tick.insert(entry.key.clone());
                 cmds.push(Cmd::WritePty {
                     key: entry.key,
                     bytes: b"\r".to_vec(),
@@ -9572,57 +9505,125 @@ fn update_tick(
     });
 
     // Codex Worker kickoff: once a pending pane's own output has been quiet
-    // for CODEX_KICKOFF_QUIET_PERIOD, ask the shell whether Codex has been
-    // told to trust this pane's cwd (`Cmd::CheckWorkerDirectoryTrust`) —
-    // never type the fixed line blind. The entry stays queued, re-asked
-    // every tick, until `update_worker_directory_trust_checked` sees a
-    // trusted answer and does the actual typing; this also means trust
-    // granted later (the operator answers the prompt themselves) is picked
-    // up on its own, with no separate recovery path needed.
+    // for CODEX_KICKOFF_QUIET_PERIOD and the pane is at its prompt
+    // (`codex_kickoff_at_prompt`), type the fixed line. Never blind: a pane
+    // that is not at its prompt gets one notice and is looked at again every
+    // tick, so an answer the operator gives in the pane is picked up on its
+    // own, with no separate recovery path.
+    let mut ready = Vec::new();
+    let mut not_at_prompt = Vec::new();
     for pending in &state.pending_kickoffs {
-        let quiet_since = state
-            .last_output_at
-            .get(&pending.key)
-            .copied()
-            .unwrap_or(pending.spawned_at);
-        let due = match pending.sent_at {
-            Some(sent_at) => now.saturating_duration_since(sent_at) >= KICKOFF_ACK_TIMEOUT,
-            None => now.saturating_duration_since(quiet_since) >= CODEX_KICKOFF_QUIET_PERIOD,
-        };
-        if due
-            && pending.attempts < KICKOFF_MAX_ATTEMPTS
-            && !state.has_unsent_operator_input(&pending.key)
-        {
-            cmds.push(Cmd::CheckWorkerDirectoryTrust {
-                key: pending.key.clone(),
-                cwd: pending.cwd.clone(),
-            });
+        if !kickoff_due(
+            state,
+            &pending.key,
+            pending.spawned_at,
+            pending.sent_at,
+            pending.attempts,
+            CODEX_KICKOFF_QUIET_PERIOD,
+            now,
+        ) {
+            continue;
+        }
+        if codex_kickoff_at_prompt(state, &pending.key) {
+            ready.push(pending.key.clone());
+        } else if !pending.notified_not_at_prompt {
+            not_at_prompt.push(pending.key.clone());
         }
     }
-
-    // Goinkyo kickoff: same shape as the Codex Worker kickoff above, once
-    // its own quiet period elapses — see `GOINKYO_KICKOFF_QUIET_PERIOD`'s
-    // own doc for why this exists, and `Cmd::CheckGoinkyoDirectoryTrust`'s
-    // for why quiet alone still isn't enough to type blind.
-    for pending in &state.pending_goinkyo_kickoffs {
-        let quiet_since = state
-            .last_output_at
-            .get(&pending.key)
-            .copied()
-            .unwrap_or(pending.spawned_at);
-        let due = match pending.sent_at {
-            Some(sent_at) => now.saturating_duration_since(sent_at) >= KICKOFF_ACK_TIMEOUT,
-            None => now.saturating_duration_since(quiet_since) >= GOINKYO_KICKOFF_QUIET_PERIOD,
-        };
-        if due
-            && pending.attempts < KICKOFF_MAX_ATTEMPTS
-            && !state.has_unsent_operator_input(&pending.key)
-        {
-            cmds.push(Cmd::CheckGoinkyoDirectoryTrust {
-                key: pending.key.clone(),
-                cwd: pending.cwd.clone(),
-            });
+    for key in ready {
+        if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
+            pending.sent_at = Some(now);
+            pending.attempts += 1;
         }
+        written_this_tick.insert(key.clone());
+        cmds.extend(type_kickoff(
+            state,
+            &key,
+            CODEX_WORKER_KICKOFF_LINE,
+            false,
+            now,
+        ));
+    }
+    for key in not_at_prompt {
+        if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
+            pending.notified_not_at_prompt = true;
+        }
+        notify_kickoff_not_at_prompt(state, app, &key, now);
+    }
+
+    // Goinkyo kickoff: the same shape, once its own quiet period elapses — see
+    // `GOINKYO_KICKOFF_QUIET_PERIOD`'s own doc for why this exists, and
+    // `goinkyo_kickoff_at_prompt` for what "at its prompt" means for Claude.
+    // A retry means the sentence was typed once and no turn followed. If the
+    // input line still holds exactly that sentence — and, by `kickoff_due`, the
+    // operator typed nothing — the Enter is what was lost, and typing the
+    // sentence again would send it twice. That case needs only the `\r` and is
+    // not asked whether the pane is at its prompt: it is not, a sentence is
+    // typed on it. Compared by text, not just "there is some text": the line
+    // could hold something else. Any other retry types the sentence again only
+    // from a prompt the screen shows empty (and the live file, when there is
+    // one, calls idle): a pane whose screen cannot be located may still have
+    // the sentence on a line banto cannot see, and the live file alone cannot
+    // say it is not there.
+    let mut ready = Vec::new();
+    let mut enter_only = Vec::new();
+    let mut not_at_prompt = Vec::new();
+    for pending in &state.pending_goinkyo_kickoffs {
+        if !kickoff_due(
+            state,
+            &pending.key,
+            pending.spawned_at,
+            pending.sent_at,
+            pending.attempts,
+            GOINKYO_KICKOFF_QUIET_PERIOD,
+            now,
+        ) {
+            continue;
+        }
+        let sentence_still_typed = pending.sent_at.is_some()
+            && state.screens.get(&pending.key).is_some_and(|pane| {
+                read_input_line(pane) == InputLine::HasText
+                    && typed_text_without_whitespace(pane).as_deref()
+                        == Some(&*GOINKYO_KICKOFF_LINE.replace(char::is_whitespace, ""))
+            });
+        if sentence_still_typed {
+            enter_only.push(pending.key.clone());
+        } else if goinkyo_kickoff_at_prompt(state, &relay, &pending.key, pending.sent_at.is_some())
+        {
+            ready.push(pending.key.clone());
+        } else if !pending.notified_not_at_prompt {
+            not_at_prompt.push(pending.key.clone());
+        }
+    }
+    for (keys, only_enter) in [(ready, false), (enter_only, true)] {
+        for key in keys {
+            if let Some(pending) = state
+                .pending_goinkyo_kickoffs
+                .iter_mut()
+                .find(|p| p.key == key)
+            {
+                pending.sent_at = Some(now);
+                pending.attempts += 1;
+            }
+            written_this_tick.insert(key.clone());
+            cmds.extend(type_kickoff(
+                state,
+                &key,
+                GOINKYO_KICKOFF_LINE,
+                only_enter,
+                now,
+            ));
+        }
+    }
+    for key in not_at_prompt {
+        if let Some(pending) = state
+            .pending_goinkyo_kickoffs
+            .iter_mut()
+            .find(|p| p.key == key)
+        {
+            pending.notified_not_at_prompt = true;
+        }
+        notify_kickoff_not_at_prompt(state, app, &key, now);
     }
 
     // Members whose nudge only an unsent draft is holding back.
@@ -9661,6 +9662,26 @@ fn update_tick(
             } else {
                 state.unreadable_since.remove(&member);
             }
+            // A pane banto has a line in is not nudged: a nudge typed behind a
+            // kickoff sentence that still waits for its Enter would be submitted
+            // with it by that one `\r`, as a single message, and an Enter that
+            // went out this tick has not shown in the pane's live file yet, so
+            // the idle reading in `obs` is from before the line. `should_nudge`
+            // sees neither (it knows only what its arguments say), and the
+            // kickoff loops run first for a reason of their own, so the relay
+            // is told here that the pane was not idle: its streak starts over
+            // and the pane has to be seen idle twice more, after the line, to be
+            // nudged.
+            let line_in_flight = written_this_tick.contains(&obs.key)
+                || state
+                    .pending_submits
+                    .iter()
+                    .any(|entry| entry.key == obs.key);
+            let idle_this_tick = if line_in_flight {
+                Some(false)
+            } else {
+                obs.is_idle_this_tick
+            };
             let mut input = PaneInput {
                 is_focused: state.focus == Focus::Pane && focused.as_ref() == Some(&obs.key),
                 last_forwarded,
@@ -9671,7 +9692,7 @@ fn update_tick(
                 && would_nudge_on_tick(
                     state.relay_states.get(&(obs.brigade_id, obs.token.clone())),
                     now,
-                    obs.is_idle_this_tick,
+                    idle_this_tick,
                     PaneInput {
                         has_unsent: false,
                         ..input
@@ -9692,7 +9713,7 @@ fn update_tick(
                 obs.brigade_id,
                 &obs.token,
                 now,
-                obs.is_idle_this_tick,
+                idle_this_tick,
                 input,
                 obs.has_unseen,
             );
@@ -9786,26 +9807,29 @@ fn update_tick(
         state.unreadable_noticed.extend(unreadable_due);
     }
 
-    let mut trust_waiting: Vec<(Option<BrigadeId>, MemberToken)> = state
+    // Only a kickoff with nothing typed is "waiting to reach its prompt": the
+    // once-only flag stays set for good, so a Goinkyo that was held at a menu
+    // and then typed would otherwise be named while its line awaits the answer.
+    let mut prompt_waiting: Vec<(Option<BrigadeId>, MemberToken)> = state
         .pending_kickoffs
         .iter()
-        .filter(|pending| pending.notified_untrusted)
+        .filter(|pending| pending.notified_not_at_prompt && pending.sent_at.is_none())
         .map(|pending| state.kickoff_member(&pending.key))
         .collect();
-    trust_waiting.extend(
+    prompt_waiting.extend(
         state
             .pending_goinkyo_kickoffs
             .iter()
-            .filter(|pending| pending.notified_untrusted)
+            .filter(|pending| pending.notified_not_at_prompt && pending.sent_at.is_none())
             .map(|pending| state.kickoff_member(&pending.key)),
     );
     if state
-        .kickoff_trust_reminder
-        .due(!trust_waiting.is_empty(), state.status.is_none(), now)
+        .kickoff_prompt_reminder
+        .due(!prompt_waiting.is_empty(), state.status.is_none(), now)
     {
-        let members = state.members_phrase(app, &trust_waiting);
+        let members = state.members_phrase(app, &prompt_waiting);
         state.set_status(
-            format!("kickoff: waiting for directory trust in {members}"),
+            format!("kickoff: waiting for {members} to reach its prompt"),
             now,
         );
     }
@@ -10034,14 +10058,12 @@ fn update_goinkyo_awaiting_spawn(
             // doc) — a Goinkyo is always Claude, never Codex (see
             // `BrigadeConfig::goinkyo_model`'s doc), so this never applies.
             needs_codex_kickoff: false,
-            cwd: candidate.cwd.clone(),
         },
     );
     state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
         key: key.clone(),
         spawned_at: now,
-        cwd: candidate.cwd.clone(),
-        notified_untrusted: false,
+        notified_not_at_prompt: false,
         sent_at: None,
         attempts: 0,
     });
@@ -10066,136 +10088,133 @@ fn update_goinkyo_awaiting_spawn(
     }]
 }
 
-/// Answers `Cmd::CheckWorkerDirectoryTrust`, always following a
-/// [`PendingKickoff`] whose quiet period has already elapsed.
+/// Whether a Codex Worker's pane is at its prompt, ready for its kickoff line:
+/// its own latest report (OSC 7501) says `idle` AND its input line reads as the
+/// empty prompt. Neither alone is enough, measured on Codex 0.169.0: `idle`
+/// holds for as long as the sandbox menu is up, and the empty-prompt shape
+/// shows briefly before the trust dialog and about 260 ms after the trust answer
+/// with no report yet. The two coincided for only about 22 ms, while output was
+/// still arriving, so asking them on a tick that already passed
+/// [`CODEX_KICKOFF_QUIET_PERIOD`] makes the pair stable.
 ///
-/// `trusted`: types the kickoff line, exactly as [`update_tick`] used to do
-/// unconditionally once quiet — this is that same action, just gated. Not
-/// trusted (or unknown, already collapsed into the same `false` by the
-/// shell): the entry is left in [`EmporiumState::pending_kickoffs`]
-/// untouched, so [`update_tick`] asks again next tick — no separate timeout,
-/// no separate recovery path; trust granted later (the operator answers the
-/// prompt in the pane themselves) is picked up on the very next check. A
-/// missing entry (the pane unstaged between the check being issued and its
-/// answer landing) is a no-op.
-fn update_worker_directory_trust_checked(
-    state: &mut EmporiumState,
-    app: &App,
-    key: SessionKey,
-    trusted: bool,
-    now: Instant,
-) -> Vec<Cmd> {
-    let Some(pos) = state.pending_kickoffs.iter().position(|p| p.key == key) else {
-        return Vec::new();
-    };
-    if !trusted {
-        if !state.pending_kickoffs[pos].notified_untrusted {
-            state.pending_kickoffs[pos].notified_untrusted = true;
-            let name = state.kickoff_label(app, &key);
-            state.set_status(
-                format!(
-                    "{name}: Codex hasn't been told to trust this directory yet — \
-                     answer its prompt in the pane and it will pick up its first turn"
-                ),
-                now,
-            );
-        }
-        return Vec::new();
-    }
-    if state.has_unsent_operator_input(&key)
-        || state.pending_kickoffs[pos].attempts >= KICKOFF_MAX_ATTEMPTS
-        || state.pending_kickoffs[pos]
-            .sent_at
-            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) < KICKOFF_ACK_TIMEOUT)
-    {
-        return Vec::new();
-    }
-    let entry = &mut state.pending_kickoffs[pos];
-    entry.sent_at = Some(now);
-    entry.attempts += 1;
-    state.last_prompted.insert(entry.key.clone(), now);
-    let cmds = vec![Cmd::WritePty {
-        key: entry.key.clone(),
-        bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
-    }];
-    state.pending_submits.push(PendingSubmit {
-        key: entry.key.clone(),
-        nudged_at: now,
-    });
-    cmds
+/// The report is read off the screen directly, not through
+/// [`EmporiumState::codex_report`]: that one believes a pane only once it is
+/// known to be Codex, which a Worker spawned a moment ago is not until its
+/// session is discovered. A [`PendingKickoff`] exists for a Codex pane and no
+/// other.
+fn codex_kickoff_at_prompt(state: &EmporiumState, key: &SessionKey) -> bool {
+    state.screens.get(key).is_some_and(|screen| {
+        screen.reported_state() == Some(ReportedState::Idle)
+            && read_codex_input_line(screen) == InputLine::Empty
+    })
 }
 
-/// Answers `Cmd::CheckGoinkyoDirectoryTrust`, always following a
-/// [`PendingGoinkyoKickoff`] whose quiet period has already elapsed. Same
-/// shape as [`update_worker_directory_trust_checked`] — see its own doc —
-/// typing [`GOINKYO_KICKOFF_LINE`] instead of [`CODEX_WORKER_KICKOFF_LINE`]
-/// once trusted, and re-asked every tick while it isn't.
-fn update_goinkyo_directory_trust_checked(
+/// Whether a Goinkyo's pane is at its prompt, ready for its kickoff line. When
+/// the pane's Claude live file (`sessions/<pid>.json`) names it, the relay's own
+/// idle reading of that file decides, exactly as for any Claude member:
+/// measured on Claude 2.1.327 the file is absent during the theme, security and
+/// trust screens and appears, already idle, within half a second of the trust
+/// answer. The reading exists only once discovery has matched the file to the
+/// pane (its key is then the session id and the relay observes it); while no
+/// observation says anything, the painted input line has to read as the empty
+/// prompt. An observation that says busy holds the kickoff even if the screen
+/// looks empty: the live file is the stronger witness.
+///
+/// A `retry` (the sentence was typed once already) asks for both: the screen
+/// must read as an empty prompt AND the live file, if it says anything, must say
+/// idle. Typing the sentence a second time is what a wrong "yes" costs, and a
+/// screen banto cannot locate (`Unrecognized`) may still hold the first one, so
+/// an idle live file does not stand in for it.
+fn goinkyo_kickoff_at_prompt(
+    state: &EmporiumState,
+    relay: &[RelayObservation],
+    key: &SessionKey,
+    retry: bool,
+) -> bool {
+    let reading = relay
+        .iter()
+        .find(|obs| &obs.key == key)
+        .and_then(|obs| obs.is_idle_this_tick);
+    let screen_empty = || {
+        state
+            .screens
+            .get(key)
+            .is_some_and(|screen| read_input_line(screen) == InputLine::Empty)
+    };
+    match (reading, retry) {
+        (Some(idle), false) => idle,
+        (None, false) => screen_empty(),
+        (reading, true) => reading.unwrap_or(true) && screen_empty(),
+    }
+}
+
+/// Whether a pending kickoff is due this tick, before the pane is asked
+/// whether it is at its prompt: its own output has been quiet for
+/// `quiet_period` (or, once the line was typed, the acknowledgement window has
+/// run out), it has attempts left, and the operator has no unsent draft in the
+/// pane.
+fn kickoff_due(
+    state: &EmporiumState,
+    key: &SessionKey,
+    spawned_at: Instant,
+    sent_at: Option<Instant>,
+    attempts: u32,
+    quiet_period: Duration,
+    now: Instant,
+) -> bool {
+    let quiet_since = state.last_output_at.get(key).copied().unwrap_or(spawned_at);
+    let due = match sent_at {
+        Some(sent_at) => now.saturating_duration_since(sent_at) >= KICKOFF_ACK_TIMEOUT,
+        None => now.saturating_duration_since(quiet_since) >= quiet_period,
+    };
+    due && attempts < KICKOFF_MAX_ATTEMPTS && !state.has_unsent_operator_input(key)
+}
+
+/// Tell the operator, once per kickoff, that the pane is not at its prompt.
+/// The kickoff is not dropped and no failure is recorded: banto keeps looking
+/// every tick, so an answer the operator gives in the pane is picked up on its
+/// own.
+fn notify_kickoff_not_at_prompt(
     state: &mut EmporiumState,
     app: &App,
-    key: SessionKey,
-    trusted: bool,
+    key: &SessionKey,
+    now: Instant,
+) {
+    let name = state.kickoff_label(app, key);
+    state.set_status(
+        format!(
+            "{name}: not at its prompt — answer what the pane shows, or type its first line yourself"
+        ),
+        now,
+    );
+}
+
+/// Type a pending kickoff's line into its pane: record the attempt, stamp the
+/// pane as prompted, write the line and queue the `\r` that submits it (the
+/// same two-phase shape as a relay nudge). With `enter_only`, a retry whose
+/// sentence is still on the input line, write just the `\r`.
+fn type_kickoff(
+    state: &mut EmporiumState,
+    key: &SessionKey,
+    line: &str,
+    enter_only: bool,
     now: Instant,
 ) -> Vec<Cmd> {
-    let Some(pos) = state
-        .pending_goinkyo_kickoffs
-        .iter()
-        .position(|p| p.key == key)
-    else {
-        return Vec::new();
-    };
-    if !trusted {
-        if !state.pending_goinkyo_kickoffs[pos].notified_untrusted {
-            state.pending_goinkyo_kickoffs[pos].notified_untrusted = true;
-            let name = state.kickoff_label(app, &key);
-            state.set_status(
-                format!(
-                    "{name}: Claude hasn't been told to trust this directory yet — \
-                     answer its prompt in the pane and it will pick up its first turn"
-                ),
-                now,
-            );
-        }
-        return Vec::new();
-    }
-    if state.has_unsent_operator_input(&key)
-        || state.pending_goinkyo_kickoffs[pos].attempts >= KICKOFF_MAX_ATTEMPTS
-        || state.pending_goinkyo_kickoffs[pos]
-            .sent_at
-            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) < KICKOFF_ACK_TIMEOUT)
-    {
-        return Vec::new();
-    }
-    // A retry means the sentence was typed once and no turn followed. If the
-    // input line still holds exactly that sentence — and, by the check above,
-    // the operator typed nothing — the Enter is what was lost, and typing the
-    // sentence again would send it twice. Compared by text, not just "there
-    // is some text": the line could hold something else.
-    let sentence_still_typed = state.pending_goinkyo_kickoffs[pos].sent_at.is_some()
-        && state.screens.get(&key).is_some_and(|pane| {
-            read_input_line(pane) == InputLine::HasText
-                && typed_text_without_whitespace(pane).as_deref()
-                    == Some(&*GOINKYO_KICKOFF_LINE.replace(char::is_whitespace, ""))
-        });
-    let entry = &mut state.pending_goinkyo_kickoffs[pos];
-    entry.sent_at = Some(now);
-    entry.attempts += 1;
-    state.last_prompted.insert(entry.key.clone(), now);
-    if sentence_still_typed {
+    state.last_prompted.insert(key.clone(), now);
+    if enter_only {
         return vec![Cmd::WritePty {
-            key: entry.key.clone(),
+            key: key.clone(),
             bytes: b"\r".to_vec(),
         }];
     }
-    let cmds = vec![Cmd::WritePty {
-        key: entry.key.clone(),
-        bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
-    }];
     state.pending_submits.push(PendingSubmit {
-        key: entry.key.clone(),
+        key: key.clone(),
         nudged_at: now,
     });
-    cmds
+    vec![Cmd::WritePty {
+        key: key.clone(),
+        bytes: line.as_bytes().to_vec(),
+    }]
 }
 
 #[cfg(test)]
@@ -14553,7 +14572,6 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
                 needs_codex_kickoff: true,
-                cwd: PathBuf::from("/work"),
             },
         );
 
@@ -14570,7 +14588,6 @@ mod tests {
 
         assert_eq!(state.pending_kickoffs.len(), 1);
         assert_eq!(state.pending_kickoffs[0].key, key);
-        assert_eq!(state.pending_kickoffs[0].cwd, PathBuf::from("/work"));
     }
 
     #[test]
@@ -14584,7 +14601,6 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
                 needs_codex_kickoff: false,
-                cwd: PathBuf::from("/work"),
             },
         );
 
@@ -14599,84 +14615,95 @@ mod tests {
         assert!(state.pending_kickoffs.is_empty());
     }
 
-    #[test]
-    fn tick_checks_directory_trust_once_quiet_long_enough_but_not_before() {
+    /// A hosted Codex Worker pane with its kickoff owed, spawned at the
+    /// returned instant. The screen is blank: each test paints what it is about.
+    fn codex_kickoff_fixture() -> (EmporiumState, App, BrigadeConfig, SessionKey, Instant) {
         let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
+        let app = app_with(vec![]);
         let brigade = brigade_config();
         let key = SessionKey::new_worker(1, "worker-1");
-        let spawned_at = test_instant();
+        let t0 = test_instant();
+        state.screens.insert(key.clone(), Screen::new(24, 80));
         state.pending_kickoffs.push(PendingKickoff {
             key: key.clone(),
-            spawned_at,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            spawned_at: t0,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
+        (state, app, brigade, key, t0)
+    }
 
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
+    fn kickoff_tick(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        at: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
             Event::Tick {
                 relay: vec![],
                 brigades: Vec::new(),
             },
-            spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
-        );
-        assert!(cmds.is_empty(), "not quiet long enough yet");
-        assert_eq!(state.pending_kickoffs.len(), 1);
+            at,
+        )
+    }
 
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::Tick {
-                relay: vec![],
-                brigades: Vec::new(),
-            },
-            spawned_at + CODEX_KICKOFF_QUIET_PERIOD,
+    /// Paint a hand-made Codex empty prompt on `key`'s screen — the shape
+    /// [`read_codex_input_line`] reads as empty — then, when given, an OSC 7501
+    /// report of `report` (`idle`, `working`, ...). The screen is cleared first,
+    /// so a later call replaces what an earlier one drew.
+    pub(super) fn paint_codex_prompt(
+        state: &mut EmporiumState,
+        key: &SessionKey,
+        report: Option<&str>,
+    ) {
+        let screen = state.screens.get_mut(key).unwrap();
+        let (rows, _) = screen.size();
+        let row = rows - 3;
+        let mut bytes = format!(
+            "\x1b[2J\x1b[{row};1H\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\x1b[{row};3H"
         );
-        assert_eq!(
-            cmds,
-            vec![Cmd::CheckWorkerDirectoryTrust {
-                key: key.clone(),
-                cwd: PathBuf::from("/work"),
-            }]
-        );
-        // Never typed blind: the entry stays queued until the trust check
-        // actually answers.
-        assert_eq!(state.pending_kickoffs.len(), 1);
-        assert!(state.pending_submits.is_empty());
+        if let Some(report) = report {
+            bytes.push_str(&format!("\x1b]7501;state={report}:app=codex\x07"));
+        }
+        screen.process(bytes.as_bytes());
+    }
+
+    /// Paint a hand-made two-option menu — what Codex draws for its sandbox and
+    /// trust questions — and, when given, an OSC 7501 report. Measured on Codex
+    /// 0.169.0: such a menu reports `idle` for as long as it is up.
+    fn paint_codex_menu(state: &mut EmporiumState, key: &SessionKey, report: Option<&str>) {
+        let screen = state.screens.get_mut(key).unwrap();
+        let mut bytes =
+            "\x1b[2J\x1b[1;1HAllow this session?\r\n\r\n> 1. Yes, continue\r\n  2. No, quit"
+                .to_string();
+        if let Some(report) = report {
+            bytes.push_str(&format!("\x1b]7501;state={report}:app=codex\x07"));
+        }
+        screen.process(bytes.as_bytes());
     }
 
     #[test]
-    fn a_trusted_directory_answer_types_the_kickoff_line() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
+    fn a_codex_kickoff_is_typed_only_once_the_pane_is_quiet_and_at_its_prompt() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_prompt(&mut state, &key, Some("idle"));
 
-        let cmds = update(
+        let cmds = kickoff_tick(
             &mut state,
             &mut app,
             &brigade,
-            Event::WorkerDirectoryTrustChecked {
-                key: key.clone(),
-                trusted: true,
-            },
-            test_instant(),
+            t0 + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
         );
+        assert!(cmds.is_empty(), "at its prompt, but not quiet long enough");
+        assert!(state.pending_kickoffs[0].sent_at.is_none());
+        assert!(state.status.is_none(), "not due yet, so nothing to say");
 
+        let at = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
         assert_eq!(
             cmds,
             vec![Cmd::WritePty {
@@ -14685,113 +14712,177 @@ mod tests {
             }]
         );
         assert_eq!(state.pending_kickoffs[0].attempts, 1);
-        assert!(state.pending_kickoffs[0].sent_at.is_some());
+        assert_eq!(state.pending_kickoffs[0].sent_at, Some(at));
+        assert_eq!(state.last_prompted.get(&key), Some(&at));
         assert_eq!(state.pending_submits.len(), 1);
         assert_eq!(state.pending_submits[0].key, key);
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn a_codex_kickoff_is_held_at_a_menu_that_reports_idle() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_menu(&mut state, &key, Some("idle"));
+
+        let cmds = kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            t0 + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+
+        assert!(cmds.is_empty(), "never typed into a menu: {cmds:?}");
+        assert!(state.pending_submits.is_empty());
+        assert_eq!(state.pending_kickoffs.len(), 1, "still owed");
+        assert!(state.pending_kickoffs[0].sent_at.is_none());
+        assert_eq!(state.pending_kickoffs[0].attempts, 0);
+        assert!(state.pending_kickoffs[0].notified_not_at_prompt);
+        let status = state.status.as_deref().unwrap_or_default();
+        assert!(status.contains("worker-1"), "{status}");
+        assert!(
+            status.contains("not at its prompt — answer what the pane shows"),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn a_codex_kickoff_is_held_at_an_empty_prompt_that_does_not_report_idle() {
+        // The empty prompt shows before the trust dialog and a moment after its
+        // answer, with no report at all; a pane that says it is working or
+        // blocked is not ready either.
+        for report in [None, Some("working"), Some("blocked")] {
+            let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+            paint_codex_prompt(&mut state, &key, report);
+
+            let cmds = kickoff_tick(
+                &mut state,
+                &mut app,
+                &brigade,
+                t0 + CODEX_KICKOFF_QUIET_PERIOD,
+            );
+
+            assert!(cmds.is_empty(), "report {report:?}: {cmds:?}");
+            assert!(state.pending_submits.is_empty(), "report {report:?}");
+            assert!(
+                state.pending_kickoffs[0].notified_not_at_prompt,
+                "report {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_kickoff_held_off_its_prompt_says_so_once_then_types_when_it_arrives() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_menu(&mut state, &key, Some("idle"));
+        let first = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+        kickoff_tick(&mut state, &mut app, &brigade, first);
+        assert!(state.status.is_some());
+
+        // A second held tick must not restamp the notice or clobber what the
+        // operator is looking at.
+        state.status = Some("something else the operator is looking at".to_string());
+        let cmds = kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            first + Duration::from_secs(1),
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("something else the operator is looking at"),
+            "already said once for this kickoff"
+        );
+
+        // The operator answers the menu; the prompt comes up, idle. Nothing was
+        // dropped while it waited.
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+        let at = first + Duration::from_secs(2);
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+        assert_eq!(
+            cmds,
+            vec![Cmd::WritePty {
+                key: key.clone(),
+                bytes: CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec(),
+            }]
+        );
+        assert_eq!(state.pending_kickoffs[0].attempts, 1);
+        assert_eq!(state.pending_submits.len(), 1);
     }
 
     #[test]
     fn kickoff_retries_only_after_timeout_and_stops_at_the_cap() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        let t0 = test_instant();
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at: t0,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+        let first = t0 + CODEX_KICKOFF_QUIET_PERIOD;
 
         for attempt in 1..=KICKOFF_MAX_ATTEMPTS {
-            let at = t0 + KICKOFF_ACK_TIMEOUT * (attempt - 1);
+            let at = first + KICKOFF_ACK_TIMEOUT * (attempt - 1);
             if attempt > 1 {
-                let cmds = update(
+                let early = kickoff_tick(
                     &mut state,
                     &mut app,
                     &brigade,
-                    Event::Tick {
-                        relay: vec![],
-                        brigades: Vec::new(),
-                    },
-                    at,
+                    at - Duration::from_millis(1),
                 );
-                assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::CheckWorkerDirectoryTrust { key: checked, .. } if checked == &key)));
+                // The previous attempt's queued Enter is the only thing that
+                // may go out ahead of the window.
+                assert!(
+                    writes_of(&early)
+                        .iter()
+                        .all(|(_, bytes)| bytes.as_slice() == b"\r"),
+                    "attempt {attempt}: not due before the window: {early:?}"
+                );
             }
-            let cmds = update(
-                &mut state,
-                &mut app,
-                &brigade,
-                Event::WorkerDirectoryTrustChecked {
-                    key: key.clone(),
-                    trusted: true,
-                },
-                at,
+            let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+            assert!(
+                writes_of(&cmds)
+                    .contains(&(key.clone(), CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec())),
+                "attempt {attempt}: {cmds:?}"
             );
-            assert!(matches!(cmds.as_slice(), [Cmd::WritePty { .. }]));
+            assert_eq!(state.pending_kickoffs[0].attempts, attempt);
         }
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::Tick {
-                relay: vec![],
-                brigades: Vec::new(),
-            },
-            t0 + KICKOFF_ACK_TIMEOUT * KICKOFF_MAX_ATTEMPTS,
-        );
-        assert!(
-            !cmds
-                .iter()
-                .any(|cmd| matches!(cmd, Cmd::CheckWorkerDirectoryTrust { .. }))
-        );
+        // The tick that spent the last attempt is the one that says so.
         assert!(
             state
                 .status
                 .as_deref()
-                .is_some_and(|status| status.contains("no acknowledgement"))
+                .is_some_and(|status| status.contains("no acknowledgement")),
+            "{:?}",
+            state.status
+        );
+        let cmds = kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            first + KICKOFF_ACK_TIMEOUT * KICKOFF_MAX_ATTEMPTS,
+        );
+        assert!(
+            !writes_of(&cmds)
+                .contains(&(key.clone(), CODEX_WORKER_KICKOFF_LINE.as_bytes().to_vec())),
+            "{cmds:?}"
         );
     }
 
     #[test]
     fn kickoff_never_overwrites_unsent_operator_input() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        let t0 = test_instant();
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at: t0,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_prompt(&mut state, &key, Some("idle"));
         state.unsent_operator_input.insert(key.clone());
 
-        let cmds = update(
+        let cmds = kickoff_tick(
             &mut state,
             &mut app,
             &brigade,
-            Event::Tick {
-                relay: vec![],
-                brigades: Vec::new(),
-            },
             t0 + CODEX_KICKOFF_QUIET_PERIOD,
         );
+
         assert!(cmds.is_empty());
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::WorkerDirectoryTrustChecked { key, trusted: true },
-            t0,
+        assert!(state.pending_submits.is_empty());
+        assert!(
+            state.status.is_none(),
+            "the operator's draft is not a pane that is off its prompt"
         );
-        assert!(cmds.is_empty());
     }
 
     #[test]
@@ -14805,8 +14896,7 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: old.clone(),
             spawned_at: t0 - Duration::from_secs(1),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
@@ -14839,8 +14929,7 @@ mod tests {
         state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
             key,
             spawned_at: now,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: Some(now),
             attempts: 1,
         });
@@ -14860,124 +14949,20 @@ mod tests {
     }
 
     #[test]
-    fn trust_waiting_kickoff_reminds_again_after_the_status_expires() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(3, "worker-1");
-        let t0 = test_instant();
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at: t0,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
-        update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::WorkerDirectoryTrustChecked {
-                key,
-                trusted: false,
-            },
-            t0,
-        );
-        update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::Tick {
-                relay: vec![],
-                brigades: Vec::new(),
-            },
-            t0 + STATUS_TIMEOUT,
-        );
+    fn a_kickoff_held_off_its_prompt_reminds_again_after_the_status_expires() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_menu(&mut state, &key, Some("idle"));
+        let noticed = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+        kickoff_tick(&mut state, &mut app, &brigade, noticed);
+
+        kickoff_tick(&mut state, &mut app, &brigade, noticed + STATUS_TIMEOUT);
+
+        let status = state.status.as_deref().unwrap_or_default();
         assert!(
-            state
-                .status
-                .as_deref()
-                .is_some_and(|status| status.contains("waiting for directory trust"))
+            status.starts_with("kickoff: waiting for ") && status.ends_with(" to reach its prompt"),
+            "{status}"
         );
-    }
-
-    #[test]
-    fn an_untrusted_directory_answer_keeps_waiting_and_notifies_once() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
-
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::WorkerDirectoryTrustChecked {
-                key: key.clone(),
-                trusted: false,
-            },
-            test_instant(),
-        );
-
-        assert!(
-            cmds.is_empty(),
-            "must never type the kickoff line into an untrusted/unknown cwd"
-        );
-        assert_eq!(
-            state.pending_kickoffs.len(),
-            1,
-            "stays queued so the next tick asks again"
-        );
-        let first_status = state.status.clone();
-        assert!(first_status.is_some());
-
-        // A second untrusted answer must not restamp the notice (no new
-        // `status_set_at`, and no duplicate wording).
-        state.status = Some("something else the operator is looking at".to_string());
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::WorkerDirectoryTrustChecked {
-                key,
-                trusted: false,
-            },
-            test_instant(),
-        );
-        assert!(cmds.is_empty());
-        assert_eq!(
-            state.status,
-            Some("something else the operator is looking at".to_string()),
-            "already notified once; must not clobber an unrelated status"
-        );
-    }
-
-    #[test]
-    fn a_trust_check_answer_for_an_unstaged_pane_is_a_noop() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        // No entry in pending_kickoffs at all — the pane unstaged before the
-        // answer landed.
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::WorkerDirectoryTrustChecked { key, trusted: true },
-            test_instant(),
-        );
-        assert!(cmds.is_empty());
-        assert!(state.pending_kickoffs.is_empty());
+        assert!(status.contains("worker-1"), "{status}");
     }
 
     #[test]
@@ -14985,19 +14970,10 @@ mod tests {
         // A pane that's still noisy at the original deadline must not get
         // typed into — see CODEX_KICKOFF_QUIET_PERIOD's own doc for why an
         // early write risks the input being dropped.
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, "worker-1");
-        let spawned_at = test_instant();
-        state.pending_kickoffs.push(PendingKickoff {
-            key: key.clone(),
-            spawned_at,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
+        let (mut state, mut app, brigade, key, spawned_at) = codex_kickoff_fixture();
+        // At its prompt throughout, so the quiet period is the only thing that
+        // can hold the line back.
+        paint_codex_prompt(&mut state, &key, Some("idle"));
 
         let output_at = spawned_at + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(50);
         update(
@@ -15010,6 +14986,9 @@ mod tests {
             },
             output_at,
         );
+        // The chunk landed on the screen; paint the prompt back so the output's
+        // only effect under test is its timestamp.
+        paint_codex_prompt(&mut state, &key, Some("idle"));
 
         let cmds = update(
             &mut state,
@@ -15098,8 +15077,7 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: key.clone(),
             spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
@@ -16775,31 +16753,21 @@ mod tests {
         state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
             key: key.clone(),
             spawned_at: t0,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: sent.then_some(t0),
             attempts: u32::from(sent),
         });
         (state, app, brigade, key, t0)
     }
 
-    pub(super) fn goinkyo_trust_answer(
+    /// One tick, with no live-file observation, at `at`.
+    pub(super) fn goinkyo_kickoff_tick(
         state: &mut EmporiumState,
         app: &mut App,
         brigade: &BrigadeConfig,
-        key: &SessionKey,
         at: Instant,
     ) -> Vec<Cmd> {
-        update(
-            state,
-            app,
-            brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key: key.clone(),
-                trusted: true,
-            },
-            at,
-        )
+        kickoff_tick(state, app, brigade, at)
     }
 
     #[test]
@@ -16809,13 +16777,7 @@ mod tests {
             true,
         );
 
-        let cmds = goinkyo_trust_answer(
-            &mut state,
-            &mut app,
-            &brigade,
-            &key,
-            t0 + KICKOFF_ACK_TIMEOUT,
-        );
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, t0 + KICKOFF_ACK_TIMEOUT);
 
         assert_eq!(
             cmds.len(),
@@ -16828,55 +16790,90 @@ mod tests {
     }
 
     #[test]
-    fn a_retried_goinkyo_kickoff_types_the_sentence_again_when_it_is_not_on_the_line() {
+    fn a_retried_goinkyo_kickoff_types_the_sentence_again_only_from_an_empty_prompt() {
+        // The sentence is not on the line any more: the turn it started is over
+        // (or never began) and the prompt is empty, so it is typed again. When
+        // the line holds something else, or is not a readable prompt at all,
+        // nothing is typed over it and the operator is told.
         let sentence = GOINKYO_KICKOFF_LINE.as_bytes().to_vec();
-        for (name, screen_setup) in [
+        for (name, screen_setup, types) in [
             (
                 "empty line",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, None))
                     as Box<dyn FnOnce(&mut Screen)>,
+                true,
             ),
             (
                 "unreadable screen",
                 Box::new(|_: &mut Screen| {}) as Box<dyn FnOnce(&mut Screen)>,
+                false,
             ),
             (
                 "some other text",
                 Box::new(|screen: &mut Screen| draw_prompt_on(screen, Some("something else")))
                     as Box<dyn FnOnce(&mut Screen)>,
+                false,
             ),
         ] {
             let (mut state, mut app, brigade, key, t0) =
                 goinkyo_kickoff_retry_state(screen_setup, true);
-            let cmds = goinkyo_trust_answer(
-                &mut state,
-                &mut app,
-                &brigade,
-                &key,
-                t0 + KICKOFF_ACK_TIMEOUT,
-            );
-            assert_eq!(
-                writes_of(&cmds),
-                vec![(key.clone(), sentence.clone())],
-                "{name}"
-            );
-            assert_eq!(state.pending_submits.len(), 1, "{name}: its Enter follows");
+            let cmds =
+                goinkyo_kickoff_tick(&mut state, &mut app, &brigade, t0 + KICKOFF_ACK_TIMEOUT);
+            if types {
+                assert_eq!(
+                    writes_of(&cmds),
+                    vec![(key.clone(), sentence.clone())],
+                    "{name}"
+                );
+                assert_eq!(state.pending_submits.len(), 1, "{name}: its Enter follows");
+            } else {
+                assert!(writes_of(&cmds).is_empty(), "{name}: {cmds:?}");
+                assert!(state.pending_submits.is_empty(), "{name}");
+                assert!(
+                    state.pending_goinkyo_kickoffs[0].notified_not_at_prompt,
+                    "{name}"
+                );
+                assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1, "{name}");
+            }
         }
     }
 
     #[test]
-    fn a_first_goinkyo_kickoff_is_not_shortened_by_what_the_screen_shows() {
-        let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
-            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
-            false,
-        );
+    fn a_first_goinkyo_kickoff_types_the_whole_sentence_from_an_empty_prompt() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
 
-        let cmds = goinkyo_trust_answer(&mut state, &mut app, &brigade, &key, t0);
+        let cmds = goinkyo_kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
+        );
 
         assert_eq!(
             writes_of(&cmds),
             vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
         );
+    }
+
+    #[test]
+    fn a_first_goinkyo_kickoff_is_not_pressed_or_typed_over_a_sentence_banto_never_sent() {
+        // Not banto's own earlier try, so not "just the Enter": the line is not
+        // an empty prompt and nothing goes into it.
+        let (mut state, mut app, brigade, _key, t0) = goinkyo_kickoff_retry_state(
+            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            false,
+        );
+
+        let cmds = goinkyo_kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
+        );
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(state.pending_goinkyo_kickoffs[0].sent_at.is_none());
     }
 
     #[test]
@@ -16887,15 +16884,471 @@ mod tests {
         );
         state.unsent_operator_input.insert(key.clone());
 
-        let cmds = goinkyo_trust_answer(
+        let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, t0 + KICKOFF_ACK_TIMEOUT);
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+    }
+
+    // --- the Goinkyo kickoff gate: its live file, else its input line --------
+
+    /// What the relay observes of a Goinkyo whose live file has been matched to
+    /// the pane: idle, busy, or (`None`) no live entry naming the session.
+    fn goinkyo_observation(key: &SessionKey, idle: Option<bool>) -> RelayObservation {
+        RelayObservation {
+            live: None,
+            glance: None,
+            brigade_id: 1,
+            token: GOINKYO_TOKEN.to_string(),
+            key: key.clone(),
+            has_unseen: false,
+            is_idle_this_tick: idle,
+            agent: Some(AgentKind::ClaudeCode),
+        }
+    }
+
+    fn goinkyo_tick_observing(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        observations: Vec<RelayObservation>,
+        at: Instant,
+    ) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: observations,
+                brigades: Vec::new(),
+            },
+            at,
+        )
+    }
+
+    /// Claude's first-run theme screen, hand-made: not a prompt of any kind.
+    fn draw_theme_screen(screen: &mut Screen) {
+        screen.process(
+            b"\x1b[2J\x1b[1;1HChoose the text style\r\n\r\n> 1. Dark mode\r\n  2. Light mode",
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_kickoff_holds_with_no_live_file_and_a_screen_that_is_not_a_prompt() {
+        let (mut state, mut app, brigade, _key, t0) =
+            goinkyo_kickoff_retry_state(draw_theme_screen, false);
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+
+        let cmds = goinkyo_tick_observing(&mut state, &mut app, &brigade, Vec::new(), due);
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(state.pending_submits.is_empty());
+        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1, "still owed");
+        assert!(state.pending_goinkyo_kickoffs[0].sent_at.is_none());
+        assert!(state.pending_goinkyo_kickoffs[0].notified_not_at_prompt);
+        let status = state.status.as_deref().unwrap_or_default();
+        assert!(
+            status.ends_with(
+                "not at its prompt — answer what the pane shows, or type its first line yourself"
+            ),
+            "{status}"
+        );
+
+        // Said once: a later held tick leaves what the operator is looking at.
+        state.status = Some("something else the operator is looking at".to_string());
+        let cmds = goinkyo_tick_observing(
             &mut state,
             &mut app,
             &brigade,
-            &key,
-            t0 + KICKOFF_ACK_TIMEOUT,
+            Vec::new(),
+            due + Duration::from_secs(1),
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            state.status.as_deref(),
+            Some("something else the operator is looking at")
+        );
+    }
+
+    #[test]
+    fn a_goinkyo_kickoff_is_typed_once_its_live_file_names_the_pane_idle() {
+        // The screen is not a prompt, and need not be: the live file is the
+        // witness, and it appears already idle.
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(draw_theme_screen, false);
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+
+        let before = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            Vec::new(),
+            due - Duration::from_millis(1),
+        );
+        assert!(before.is_empty());
+
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            due,
+        );
+
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())]
+        );
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
+        assert_eq!(state.pending_submits.len(), 1);
+    }
+
+    #[test]
+    fn a_goinkyo_kickoff_waits_for_the_quiet_period_even_when_its_live_file_says_idle() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(draw_theme_screen, false);
+
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
         );
 
         assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(state.status.is_none(), "not due yet, so nothing to say");
+    }
+
+    #[test]
+    fn a_goinkyo_kickoff_holds_while_its_live_file_says_busy_even_at_an_empty_looking_prompt() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(false))],
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
+        );
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(state.pending_goinkyo_kickoffs[0].notified_not_at_prompt);
+    }
+
+    #[test]
+    fn a_goinkyo_kickoff_with_no_live_file_is_typed_at_an_empty_prompt() {
+        // Neither no observation at all (the pane is not yet matched to its
+        // live file) nor one that names no live entry says anything about the
+        // pane, so the painted input line decides.
+        for observations in [None, Some(None)] {
+            let (mut state, mut app, brigade, key, t0) =
+                goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+            let relay = observations
+                .map(|idle| vec![goinkyo_observation(&key, idle)])
+                .unwrap_or_default();
+
+            let cmds = goinkyo_tick_observing(
+                &mut state,
+                &mut app,
+                &brigade,
+                relay,
+                t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
+            );
+
+            assert_eq!(
+                writes_of(&cmds),
+                vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())],
+                "observation {observations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_goinkyo_kickoff_is_typed_exactly_once_per_attempt_window() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+        let first = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due);
+        assert_eq!(writes_of(&first).len(), 1);
+
+        // The screen still reads as an empty prompt a moment later (the typed
+        // text has not been echoed yet): only the queued Enter goes out, the
+        // sentence does not.
+        let again =
+            goinkyo_kickoff_tick(&mut state, &mut app, &brigade, due + Duration::from_secs(1));
+        assert_eq!(writes_of(&again), vec![(key, b"\r".to_vec())], "{again:?}");
+        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
+    }
+
+    // --- a Goinkyo retry asks the screen as well as the live file -------------
+
+    #[test]
+    fn a_goinkyo_retry_does_not_type_the_sentence_again_on_the_live_files_word_alone() {
+        // A retry (the sentence was typed once) types it again only from a
+        // prompt the screen shows empty that the live file, when it says
+        // anything, calls idle. An unlocatable screen may still hold the first
+        // sentence, and "idle" cannot tell that it does not.
+        let sentence = GOINKYO_KICKOFF_LINE.as_bytes().to_vec();
+        type Draw = Box<dyn FnOnce(&mut Screen)>;
+        let cases: Vec<(&str, Draw, Option<bool>, bool)> = vec![
+            (
+                "unlocatable screen, live file idle",
+                Box::new(draw_theme_screen),
+                Some(true),
+                false,
+            ),
+            (
+                "empty prompt, live file busy",
+                Box::new(|screen: &mut Screen| draw_prompt_on(screen, None)),
+                Some(false),
+                false,
+            ),
+            (
+                "empty prompt, live file idle",
+                Box::new(|screen: &mut Screen| draw_prompt_on(screen, None)),
+                Some(true),
+                true,
+            ),
+            (
+                "empty prompt, no live reading",
+                Box::new(|screen: &mut Screen| draw_prompt_on(screen, None)),
+                None,
+                true,
+            ),
+        ];
+        for (name, draw, idle, types) in cases {
+            let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(draw, true);
+
+            let cmds = goinkyo_tick_observing(
+                &mut state,
+                &mut app,
+                &brigade,
+                vec![goinkyo_observation(&key, idle)],
+                t0 + KICKOFF_ACK_TIMEOUT,
+            );
+
+            if types {
+                assert_eq!(
+                    writes_of(&cmds),
+                    vec![(key.clone(), sentence.clone())],
+                    "{name}"
+                );
+                assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 2, "{name}");
+            } else {
+                assert!(writes_of(&cmds).is_empty(), "{name}: {cmds:?}");
+                assert!(state.pending_submits.is_empty(), "{name}");
+                assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1, "{name}");
+                assert!(
+                    state.pending_goinkyo_kickoffs[0].notified_not_at_prompt,
+                    "{name}: the operator is told"
+                );
+            }
+        }
+    }
+
+    // --- the reminder names only a kickoff with nothing typed ----------------
+
+    #[test]
+    fn a_goinkyo_held_at_a_menu_and_then_typed_is_not_named_as_waiting_for_its_prompt() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(draw_theme_screen, false);
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+        goinkyo_tick_observing(&mut state, &mut app, &brigade, Vec::new(), due);
+        assert!(state.pending_goinkyo_kickoffs[0].notified_not_at_prompt);
+
+        // Its live file appears, idle: the line is typed.
+        let typed = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            due + Duration::from_secs(1),
+        );
+        assert_eq!(writes_of(&typed).len(), 1, "{typed:?}");
+
+        // The notice runs out with the line awaiting its acknowledgement: no
+        // reminder that it is still waiting for a prompt.
+        goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            due + STATUS_TIMEOUT + Duration::from_secs(1),
+        );
+        assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn a_codex_worker_held_at_a_menu_and_then_typed_is_not_named_as_waiting_for_its_prompt() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        paint_codex_menu(&mut state, &key, Some("idle"));
+        let due = t0 + CODEX_KICKOFF_QUIET_PERIOD;
+        kickoff_tick(&mut state, &mut app, &brigade, due);
+        assert!(state.pending_kickoffs[0].notified_not_at_prompt);
+
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+        let typed = kickoff_tick(&mut state, &mut app, &brigade, due + Duration::from_secs(1));
+        assert_eq!(writes_of(&typed).len(), 1, "{typed:?}");
+
+        kickoff_tick(
+            &mut state,
+            &mut app,
+            &brigade,
+            due + STATUS_TIMEOUT + Duration::from_secs(1),
+        );
+        assert_eq!(state.status, None);
+    }
+
+    // --- the relay does not write behind a line banto has in flight ----------
+
+    /// A Goinkyo's observation with mail for it unread: what lets the relay
+    /// decide to nudge it. `agent` is what the relay would read its input line
+    /// for; `None` leaves the screen out of that decision, as a pane no product
+    /// is recorded for does.
+    fn unread_goinkyo_observation(key: &SessionKey, agent: Option<AgentKind>) -> RelayObservation {
+        RelayObservation {
+            has_unseen: true,
+            agent,
+            ..goinkyo_observation(key, Some(true))
+        }
+    }
+
+    #[test]
+    fn a_relay_nudge_is_not_typed_on_the_tick_a_kickoff_is_typed() {
+        // Two idle ticks with mail unread would nudge on the second one, which
+        // is also the tick the kickoff falls due. One Enter would then submit
+        // both lines as one message.
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), false);
+        let observe = || {
+            vec![unread_goinkyo_observation(
+                &key,
+                Some(AgentKind::ClaudeCode),
+            )]
+        };
+        let due = t0 + GOINKYO_KICKOFF_QUIET_PERIOD;
+
+        let early = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            due - Duration::from_millis(500),
+        );
+        assert!(writes_of(&early).is_empty(), "{early:?}");
+
+        let cmds = goinkyo_tick_observing(&mut state, &mut app, &brigade, observe(), due);
+        assert_eq!(
+            writes_of(&cmds),
+            vec![(key.clone(), GOINKYO_KICKOFF_LINE.as_bytes().to_vec())],
+            "the kickoff alone"
+        );
+
+        // Its Enter goes out on the next tick, and no nudge behind that either.
+        let enter = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            due + Duration::from_secs(1),
+        );
+        assert_eq!(writes_of(&enter), vec![(key.clone(), b"\r".to_vec())]);
+
+        // The pane has to be seen idle twice more after that, and then the
+        // nudge is still free to go: the rule delays it, it does not forbid it.
+        let after = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            due + Duration::from_secs(2),
+        );
+        assert!(writes_of(&after).is_empty(), "{after:?}");
+        let nudged = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            due + Duration::from_secs(3),
+        );
+        assert_eq!(
+            writes_of(&nudged),
+            vec![(key, RELAY_NUDGE_LINE.as_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_relay_nudge_waits_while_a_line_banto_wrote_has_not_had_its_enter() {
+        // A line awaiting its delayed Enter: the nudge text would land behind it
+        // and be submitted with it.
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
+        state.pending_submits.push(PendingSubmit {
+            key: key.clone(),
+            nudged_at: t0,
+        });
+        let observe = || {
+            vec![unread_goinkyo_observation(
+                &key,
+                Some(AgentKind::ClaudeCode),
+            )]
+        };
+
+        for millis in [50, 100, 150] {
+            let cmds = goinkyo_tick_observing(
+                &mut state,
+                &mut app,
+                &brigade,
+                observe(),
+                t0 + Duration::from_millis(millis),
+            );
+            assert!(writes_of(&cmds).is_empty(), "+{millis}ms: {cmds:?}");
+        }
+
+        let released = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            t0 + RELAY_SUBMIT_DELAY + Duration::from_millis(100),
+        );
+        assert_eq!(
+            writes_of(&released),
+            vec![(key, b"\r".to_vec())],
+            "the Enter, and nothing typed behind it"
+        );
+    }
+
+    #[test]
+    fn a_relay_nudge_is_not_typed_on_the_tick_a_kickoff_enter_goes_out_alone() {
+        // The Enter-alone retry queues no delayed Enter, so nothing in the
+        // pending list says a line is in flight. The pane reads as no product's
+        // (`agent: None`), so the screen's own "a sentence is typed here" does
+        // not hold the nudge either: only the rule does.
+        let (mut state, mut app, brigade, key, t0) = goinkyo_kickoff_retry_state(
+            |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
+            true,
+        );
+        let observe = || vec![unread_goinkyo_observation(&key, None)];
+
+        let early = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            t0 + KICKOFF_ACK_TIMEOUT - Duration::from_secs(1),
+        );
+        assert!(writes_of(&early).is_empty(), "{early:?}");
+
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            observe(),
+            t0 + KICKOFF_ACK_TIMEOUT,
+        );
+        assert_eq!(writes_of(&cmds), vec![(key, b"\r".to_vec())], "{cmds:?}");
     }
 
     // --- dragging a boundary --------------------------------------------------
@@ -20884,8 +21337,7 @@ mod tests {
             state.pending_kickoffs.push(PendingKickoff {
                 key: key.clone(),
                 spawned_at: now,
-                cwd: PathBuf::from("/work"),
-                notified_untrusted: true,
+                notified_not_at_prompt: true,
                 sent_at: None,
                 attempts: 0,
             });
@@ -20904,16 +21356,16 @@ mod tests {
         assert_eq!(
             state.status.as_deref(),
             Some(
-                "kickoff: waiting for directory trust in worker-1, worker-3 of \"Fix the relay draft guard\" \
-                 and worker-1 of \"Second task\""
+                "kickoff: waiting for worker-1, worker-3 of \"Fix the relay draft guard\" \
+                 and worker-1 of \"Second task\" to reach its prompt"
             )
         );
 
-        // The acknowledgement family (the trust one is gone from the list).
+        // The acknowledgement family (the not-at-its-prompt one is gone from the list).
         state.status = None;
         state.status_set_at = None;
         for pending in &mut state.pending_kickoffs {
-            pending.notified_untrusted = false;
+            pending.notified_not_at_prompt = false;
             pending.attempts = KICKOFF_MAX_ATTEMPTS;
         }
         update(
@@ -20945,7 +21397,7 @@ mod tests {
     }
 
     #[test]
-    fn the_single_member_trust_notices_use_the_same_wording_for_codex_and_claude() {
+    fn the_single_member_prompt_notices_use_the_same_wording_for_codex_and_claude() {
         let mut state = state_with_facts(vec![name_facts(1, "Frozen", Some("dir"))]);
         let mut app = app_with(vec![titled("dir", Some("Fix the relay draft guard"))]);
         let brigade = brigade_config();
@@ -20955,60 +21407,53 @@ mod tests {
             .member_tokens
             .insert(worker.clone(), "worker-1".to_string());
         state.member_brigades.insert(worker.clone(), 1);
+        // A Codex Worker whose pane shows a menu, not its prompt.
+        state.screens.insert(worker.clone(), Screen::new(24, 80));
+        paint_codex_menu(&mut state, &worker, Some("idle"));
         state.pending_kickoffs.push(PendingKickoff {
             key: worker.clone(),
             spawned_at: now,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
-        update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::WorkerDirectoryTrustChecked {
-                key: worker,
-                trusted: false,
-            },
-            now,
-        );
+        let codex_due = now + CODEX_KICKOFF_QUIET_PERIOD;
+        kickoff_tick(&mut state, &mut app, &brigade, codex_due);
         assert_eq!(
             state
                 .status
                 .as_deref()
                 .map(|s| s.split(" — ").next().unwrap()),
-            Some(
-                "worker-1 of \"Fix the relay draft guard\": Codex hasn't been told to trust this directory yet"
-            )
+            Some("worker-1 of \"Fix the relay draft guard\": not at its prompt")
         );
 
+        // A Goinkyo whose pane shows something that is not a prompt either.
         let goinkyo = key_of("g1");
         state
             .member_tokens
             .insert(goinkyo.clone(), "goinkyo".to_string());
         state.member_brigades.insert(goinkyo.clone(), 1);
+        state.screens.insert(goinkyo.clone(), Screen::new(24, 80));
         state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
-            key: goinkyo.clone(),
-            spawned_at: now,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            key: goinkyo,
+            spawned_at: codex_due,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
-        update(
+        kickoff_tick(
             &mut state,
             &mut app,
             &brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key: goinkyo,
-                trusted: false,
-            },
-            now,
+            codex_due + GOINKYO_KICKOFF_QUIET_PERIOD,
         );
         assert!(
-            state.status.as_deref().is_some_and(|s| s
-                .starts_with("goinkyo of \"Fix the relay draft guard\": Claude hasn't been told")),
+            state
+                .status
+                .as_deref()
+                .is_some_and(|s| s.starts_with(
+                    "goinkyo of \"Fix the relay draft guard\": not at its prompt — answer what the pane shows"
+                )),
             "{:?}",
             state.status
         );
@@ -21933,7 +22378,6 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
                 needs_codex_kickoff: false,
-                cwd: PathBuf::from("/work"),
             },
         );
         state
@@ -22351,7 +22795,6 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 1,
                 needs_codex_kickoff: false,
-                cwd: PathBuf::from("/work"),
             },
         );
         state
@@ -24046,7 +24489,6 @@ mod tests {
             PendingOpen::BrigadeMember {
                 brigade_id: 5,
                 needs_codex_kickoff: false,
-                cwd: PathBuf::from("/work/alpha"),
             },
         );
         let mut app = app_with(vec![]);
@@ -24615,10 +25057,8 @@ mod tests {
             later,
         );
         assert!(
-            !tick
-                .iter()
-                .any(|cmd| matches!(cmd, Cmd::CheckGoinkyoDirectoryTrust { .. })),
-            "nothing asks whether to type into it: {tick:?}"
+            !tick.iter().any(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            "nothing is typed into it: {tick:?}"
         );
     }
 
@@ -24702,7 +25142,7 @@ mod tests {
         assert!(!panes.iter().any(|k| k.as_str() == "g1"));
     }
 
-    // --- Goinkyo kickoff: PendingGoinkyoKickoff / CheckGoinkyoDirectoryTrust --
+    // --- Goinkyo kickoff: PendingGoinkyoKickoff and its gate ---------------
 
     #[test]
     fn spawning_a_goinkyo_queues_a_pending_kickoff() {
@@ -24719,11 +25159,7 @@ mod tests {
         assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
         assert_eq!(&state.pending_goinkyo_kickoffs[0].key, key);
         assert_eq!(state.pending_goinkyo_kickoffs[0].spawned_at, now);
-        assert_eq!(
-            state.pending_goinkyo_kickoffs[0].cwd,
-            PathBuf::from("/work/alpha")
-        );
-        assert!(!state.pending_goinkyo_kickoffs[0].notified_untrusted);
+        assert!(!state.pending_goinkyo_kickoffs[0].notified_not_at_prompt);
     }
 
     #[test]
@@ -24760,154 +25196,6 @@ mod tests {
     }
 
     #[test]
-    fn tick_checks_goinkyo_directory_trust_once_quiet_long_enough_but_not_before() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
-        let spawned_at = test_instant();
-        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
-            key: key.clone(),
-            spawned_at,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
-
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::Tick {
-                relay: vec![],
-                brigades: Vec::new(),
-            },
-            spawned_at + GOINKYO_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
-        );
-        assert!(cmds.is_empty(), "not quiet long enough yet");
-        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
-
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::Tick {
-                relay: vec![],
-                brigades: Vec::new(),
-            },
-            spawned_at + GOINKYO_KICKOFF_QUIET_PERIOD,
-        );
-        assert_eq!(
-            cmds,
-            vec![Cmd::CheckGoinkyoDirectoryTrust {
-                key: key.clone(),
-                cwd: PathBuf::from("/work"),
-            }]
-        );
-        // Never typed blind: the entry stays queued until the trust check
-        // actually answers.
-        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
-        assert!(state.pending_submits.is_empty());
-    }
-
-    #[test]
-    fn a_trusted_goinkyo_directory_answer_types_the_kickoff_line_exactly_once() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
-        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
-            key: key.clone(),
-            spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
-
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key: key.clone(),
-                trusted: true,
-            },
-            test_instant(),
-        );
-
-        assert_eq!(
-            cmds,
-            vec![Cmd::WritePty {
-                key: key.clone(),
-                bytes: GOINKYO_KICKOFF_LINE.as_bytes().to_vec(),
-            }]
-        );
-        assert_eq!(state.pending_goinkyo_kickoffs[0].attempts, 1);
-        assert_eq!(state.pending_submits.len(), 1);
-        assert_eq!(state.pending_submits[0].key, key);
-
-        // A stale answer before the acknowledgement timeout cannot create a
-        // duplicate turn.
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::GoinkyoDirectoryTrustChecked { key, trusted: true },
-            test_instant(),
-        );
-        assert!(cmds.is_empty());
-    }
-
-    #[test]
-    fn an_untrusted_goinkyo_directory_answer_keeps_waiting_and_notifies_once() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![]);
-        let brigade = brigade_config();
-        let key = SessionKey::new_worker(1, GOINKYO_TOKEN);
-        state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
-            key: key.clone(),
-            spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
-            sent_at: None,
-            attempts: 0,
-        });
-
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key: key.clone(),
-                trusted: false,
-            },
-            test_instant(),
-        );
-        assert!(cmds.is_empty(), "never types blind on an untrusted answer");
-        assert_eq!(state.pending_goinkyo_kickoffs.len(), 1);
-        assert!(state.pending_goinkyo_kickoffs[0].notified_untrusted);
-        let status = state.status.clone().unwrap();
-        assert!(status.contains("Claude hasn't been told to trust"));
-
-        // A second untrusted answer must not restamp the same notice.
-        state.status = None;
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key,
-                trusted: false,
-            },
-            test_instant(),
-        );
-        assert!(cmds.is_empty());
-        assert!(state.status.is_none());
-    }
-
-    #[test]
     fn a_goinkyo_pane_unstaging_before_its_kickoff_fires_drops_the_pending_entry() {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Brigade {
@@ -24920,8 +25208,7 @@ mod tests {
         state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
             key: key.clone(),
             spawned_at: test_instant(),
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
@@ -24989,6 +25276,8 @@ mod tests {
         assert!(state.screens.contains_key(&real_key));
         assert!(!state.screens.contains_key(&syn_key));
 
+        // The renamed pane is at an empty prompt by now.
+        draw_prompt_on(state.screens.get_mut(&real_key).unwrap(), None);
         let cmds = update(
             &mut state,
             &mut app,
@@ -24998,25 +25287,6 @@ mod tests {
                 brigades: Vec::new(),
             },
             t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
-        );
-        assert_eq!(
-            cmds,
-            vec![Cmd::CheckGoinkyoDirectoryTrust {
-                key: real_key.clone(),
-                cwd: PathBuf::from("/work/alpha"),
-            }],
-            "the quiet-period check must ask about the renamed key"
-        );
-
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key: real_key.clone(),
-                trusted: true,
-            },
-            t0,
         );
         let [Cmd::WritePty { key: write_key, .. }] = cmds.as_slice() else {
             panic!("expected exactly one WritePty, got {cmds:?}");
@@ -25052,8 +25322,7 @@ mod tests {
         state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
             key: old_key.clone(),
             spawned_at: t0,
-            cwd: PathBuf::from("/work/alpha"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
@@ -25078,17 +25347,21 @@ mod tests {
         assert!(state.screens.contains_key(&new_key));
         assert!(!state.screens.contains_key(&old_key));
 
+        let mut prompt = Screen::new(24, 80);
+        draw_prompt_on(&mut prompt, None);
+        state.screens.insert(new_key.clone(), prompt);
         let cmds = update(
             &mut state,
             &mut app,
             &brigade,
-            Event::GoinkyoDirectoryTrustChecked {
-                key: new_key.clone(),
-                trusted: true,
+            Event::Tick {
+                relay: vec![],
+                brigades: Vec::new(),
             },
-            t0,
+            t0 + GOINKYO_KICKOFF_QUIET_PERIOD,
         );
-        let [Cmd::WritePty { key: write_key, .. }] = cmds.as_slice() else {
+        let writes = writes_of(&cmds);
+        let [(write_key, _)] = writes.as_slice() else {
             panic!("expected exactly one WritePty, got {cmds:?}");
         };
         assert_eq!(
@@ -25133,16 +25406,14 @@ mod tests {
         state.pending_kickoffs.push(PendingKickoff {
             key: old.clone(),
             spawned_at: now,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });
         state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
             key: old.clone(),
             spawned_at: now,
-            cwd: PathBuf::from("/work"),
-            notified_untrusted: false,
+            notified_not_at_prompt: false,
             sent_at: None,
             attempts: 0,
         });

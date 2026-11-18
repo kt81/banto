@@ -514,15 +514,15 @@ struct DiscoveryTracker {
     agent: AgentKind,
     /// Whether [`poll_discovery`] has already told the operator this Claude
     /// tracker looks stuck behind an unanswered directory-trust prompt —
-    /// set the first time `claude_directory_trust` reports anything but
-    /// `Trusted`, so the status line states it once instead of restamping
-    /// the same notice every poll (~every loop iteration, not just once a
-    /// second). The Codex-side equivalent (`PendingKickoff::notified_untrusted`)
-    /// lives in `engine.rs` instead, because that one also gates an actual
-    /// keystroke and needs the core's own quiet-period timing; this one only
-    /// ever gates a notice, and this tracker — already the shell's own
-    /// discovery bookkeeping, never seen by the core (see this struct's own
-    /// doc) — is exactly where that one bit belongs.
+    /// set the first time `claude_directory_trust_in` reports `NotTrusted`, so
+    /// the status line states it once instead of restamping the same notice
+    /// every poll (~every loop iteration, not just once a second). The
+    /// kickoffs' own once-only bit (`PendingKickoff::notified_not_at_prompt`)
+    /// lives in `engine.rs` instead, because that one belongs to the core's
+    /// own typing decision; this one only ever gates a notice, and this
+    /// tracker — already the shell's own discovery bookkeeping, never seen by
+    /// the core (see this struct's own doc) — is exactly where that one bit
+    /// belongs.
     notified_untrusted: bool,
 }
 
@@ -1188,12 +1188,6 @@ fn execute_cmd(
         Cmd::ReadCodexCatalog { round } => execute_read_codex_catalog(round, deps),
         Cmd::SweepDataDir => execute_sweep_data_dir(deps),
         Cmd::OpenCodexTrustPane { key } => execute_open_codex_trust_pane(key, deps, handles),
-        Cmd::CheckWorkerDirectoryTrust { key, cwd } => {
-            execute_check_worker_directory_trust(key, &cwd, deps)
-        }
-        Cmd::CheckGoinkyoDirectoryTrust { key, cwd } => {
-            execute_check_goinkyo_directory_trust(key, &cwd, deps)
-        }
         Cmd::Store(intent) => execute_store_intent(intent, deps.store),
         Cmd::Reload => gather_reload(deps),
         Cmd::ForwardClipboardToHost { bytes } => {
@@ -1356,41 +1350,6 @@ fn execute_read_codex_catalog(round: u64, deps: &Deps) -> Vec<Event> {
         round,
         result: deps.codex_catalog.bundled_catalog(&binary),
     }]
-}
-
-/// Read whether Codex has been told to trust `cwd` — freshly, not cached,
-/// since the operator may answer its prompt in the pane at any moment while
-/// `engine::update_tick` keeps re-asking. `deps.codex_home` absent reads as
-/// untrusted (`false`), the same "can't tell must not read as safe" rule
-/// [`execute_check_codex_trust`] follows: this Cmd only exists to gate
-/// typing into a Codex pane, so an unknowable answer must not accidentally
-/// permit it.
-fn execute_check_worker_directory_trust(
-    key: SessionKey,
-    cwd: &std::path::Path,
-    deps: &Deps,
-) -> Vec<Event> {
-    let trusted = deps.codex_home.is_some_and(|home| {
-        banto_io::directory_trust::codex_directory_trust(home, cwd)
-            == banto_io::directory_trust::DirectoryTrust::Trusted
-    });
-    vec![Event::WorkerDirectoryTrustChecked { key, trusted }]
-}
-
-/// Same shape as [`execute_check_worker_directory_trust`], but reads
-/// Claude's own trust registry (`banto_io::directory_trust::claude_directory_trust`)
-/// instead of Codex's — a different underlying file, not just a different
-/// product label; `deps.claude_home` is never optional the way
-/// `deps.codex_home` is, so there is no "product absent" case to fold in
-/// here.
-fn execute_check_goinkyo_directory_trust(
-    key: SessionKey,
-    cwd: &std::path::Path,
-    deps: &Deps,
-) -> Vec<Event> {
-    let trusted = banto_io::directory_trust::claude_directory_trust(deps.claude_home, cwd)
-        == banto_io::directory_trust::DirectoryTrust::Trusted;
-    vec![Event::GoinkyoDirectoryTrustChecked { key, trusted }]
 }
 
 /// Spawn Codex's own trust-review startup (`crate::codex_trust::trust_argv`
@@ -2229,7 +2188,7 @@ fn codex_briefed_session_id(
 /// No tracker gives up: each lives until it resolves or its pane's screen is
 /// gone (the loop prunes trackers against `state.screens`). A Codex Worker's
 /// used to be dropped 90 s after spawn — even when the kickoff had never been
-/// typed because the trust gate was still holding it — so a first turn taken
+/// typed because its pane was still not at its prompt — so a first turn taken
 /// later (banto's retry, or one the operator typed) fired the hook into a store
 /// nobody was reading, and the pane stayed unidentified, with
 /// `unresolved_codex` set, until it exited. Whether the kickoff was typed at
@@ -2239,30 +2198,25 @@ fn codex_briefed_session_id(
 /// reads as definitively [`banto_io::directory_trust::DirectoryTrust::NotTrusted`]
 /// reports [`Event::ClaudeWorkerDirectoryUntrusted`] once — this pane isn't
 /// silent because anything is broken, it's sitting behind an unanswered
-/// trust prompt the same as a fresh Codex Worker would, just with nothing
-/// *here* to gate: `poll_discovery` itself never types into a pane — a
-/// Worker's own first turn is always the operator's, and a Goinkyo's own
-/// kickoff (which does type, once its own `Cmd::CheckGoinkyoDirectoryTrust`
-/// answers trusted) already checks this same condition independently, on
-/// its own schedule — so this report is only ever a silence to explain,
-/// never an action to hold back. (Not true of banto as a whole: an
-/// already-*discovered* Claude Worker's pane does get typed into, by the
-/// relay nudge — but this paragraph is about a tracker that never got that
+/// trust prompt, and nothing *here* is held back by it: `poll_discovery`
+/// itself never types into a pane — a Worker's own first turn is always the
+/// operator's, and a Goinkyo's kickoff decides for itself, from its live file
+/// or its painted input line, whether the pane is at its prompt (the registry
+/// read here gates no keystroke anywhere) — so this report is only ever a
+/// silence to explain, never an action to hold back. (Not true of banto as a
+/// whole: an already-*discovered* Claude Worker's pane does get typed into, by
+/// the relay nudge — but this paragraph is about a tracker that never got that
 /// far.)
 ///
-/// Deliberately narrower than Codex's own gate
-/// ([`execute_check_worker_directory_trust`] collapses `NotTrusted` and
-/// `Unknown` together, since an unknowable answer must not accidentally
-/// permit a keystroke): `Unknown` just means no record exists yet, which is
+/// `Unknown` does not fire it: that just means no record exists yet, which is
 /// the ordinary shape of "never opened this directory before" and would
 /// fire on nearly every fresh Worker for the second or so before its first
-/// launch even finishes settling — this only gates a notice, not an action,
-/// so a false positive costs real annoyance with nothing gained. `NotTrusted`
-/// alone is not a guess at "maybe still pending": a real `~/.claude.json`
-/// on this machine has entries recording `hasTrustDialogAccepted: false`
-/// independent of any `true` one, so a directory sitting at an unanswered
-/// prompt is expected to read as `NotTrusted`, not `Unknown`, by the time
-/// this ever fires.
+/// launch even finishes settling, a false positive that costs real annoyance
+/// with nothing gained. `NotTrusted` alone is not a guess at "maybe still
+/// pending": a real `~/.claude.json` on this machine has entries recording
+/// `hasTrustDialogAccepted: false` independent of any `true` one, so a
+/// directory sitting at an unanswered prompt is expected to read as
+/// `NotTrusted`, not `Unknown`, by the time this ever fires.
 ///
 /// All three discovery sources skip ids already claimed by an open session
 /// or taken earlier in this same pass.
@@ -10408,10 +10362,9 @@ mod tests {
 
     #[test]
     fn a_codex_worker_in_a_not_trusted_cwd_never_reports_the_claude_specific_event() {
-        // Defends the `agent == AgentKind::ClaudeCode` gate itself: a Codex
-        // tracker has its own, unrelated trust gate
-        // (`execute_check_worker_directory_trust`, core-side, per-Worker
-        // kickoff); this notice exists only to explain Claude's silence.
+        // Defends the `agent == AgentKind::ClaudeCode` gate itself: Claude's
+        // registry says nothing about a Codex pane, and this notice exists
+        // only to explain Claude's silence.
         let dir = tempfile::tempdir().unwrap();
         let claude_home = claude_home_with_trust_registry(
             &dir,
@@ -10435,7 +10388,7 @@ mod tests {
         assert_eq!(
             trackers.len(),
             1,
-            "still pending — Codex has its own gate, not this one"
+            "still pending — this notice is Claude's alone"
         );
     }
 

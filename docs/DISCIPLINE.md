@@ -108,21 +108,35 @@ jsonl mtime. When enumerating `Event`s, hunt for these specifically.
 pane's screen may be read for a fact the agent publishes nowhere else, only at
 the moment a decision needs it, and only so that it closes when unsure: a
 shape it does not recognise answers `Unrecognized`, and the caller does what
-it did before it could read. It is never used to estimate or keep track of
-state — that is the disguised input above in a new coat. The relay's input-line
+it did before it could read — except where there was no "before" worth keeping,
+see the kickoff below. It is never used to estimate or keep track of
+state — that is the disguised input above in a new coat. The input-line
 reader (`banto_core::input_line`) is one instance: it reads Claude's line for
-text and recognises one bounded empty-looking Codex prompt shape. Both are
-asked only when relay decides to nudge. A Codex match is not proof of semantic
-emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay". Reading sends nothing;
-the operator approved the principle on 2026-11-10. The next shortcut that
-wants the screen cites this paragraph's conditions, not the instance.
+text and recognises one bounded empty-looking Codex prompt shape. It has two
+callers. Relay asks it only when it decides to nudge. The kickoff of a Codex
+Worker, and of a Goinkyo whose live file does not yet name its pane, asks it on
+each tick the first line is due, because the alternative witness (the product's
+trust registry) was wrong both ways and a typed first line into a screen that is
+not a prompt answers whatever that screen is asking. There an unsure read does
+**not** fall back to what the caller did before: banto does not type, and tells
+the operator once so that they can answer the pane or type the line themselves
+(approved 2026-11-18, a departure from "the caller does what it did before it
+could read"). Nothing is dropped and nothing fails: the kickoff stays owed and
+is typed on the tick the prompt reads `Empty`. A Codex match is not proof of
+semantic emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay".
+Reading sends nothing; the operator approved the principle on 2026-11-10. The
+next shortcut that wants the screen cites this paragraph's conditions, not the
+instance.
 
 Reading a program's own state report out of its output stream is not a read of
 the painted screen: it is the child's explicit announcement (OSC 7501, for a
 hosted Codex pane), arriving in an event that already exists (`PtyOutput`),
 recorded and replayed like the rest, and it closes to the previous rule whenever
 it is unsure (no report, or `clear`, and the earlier signal decides). It is not an
-instance of the paragraph above, so a shortcut must not cite it for one.
+instance of the paragraph above, so a shortcut must not cite it for one. The
+Codex kickoff reads it too, as one of its two conditions (`idle` and an empty
+prompt), and for that decision no report is not an `idle`: it holds, under the same
+exception as above.
 
 ## 4. The core signature
 

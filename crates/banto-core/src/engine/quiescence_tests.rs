@@ -4964,7 +4964,7 @@ fn a_brigade_that_is_gone_leaves_nothing_for_the_next_one() {
 
 #[test]
 fn the_retry_enter_of_a_kickoff_counts_the_pane_for_the_quit_question() {
-    use super::tests::{draw_prompt_on, goinkyo_kickoff_retry_state, goinkyo_trust_answer};
+    use super::tests::{draw_prompt_on, goinkyo_kickoff_retry_state, goinkyo_kickoff_tick};
     let setup = || {
         goinkyo_kickoff_retry_state(
             |screen| draw_prompt_on(screen, Some(GOINKYO_KICKOFF_LINE)),
@@ -4977,7 +4977,7 @@ fn the_retry_enter_of_a_kickoff_counts_the_pane_for_the_quit_question() {
     let (mut state, mut app, brigade, pane, t0) = setup();
     state.focus = Focus::Sidebar;
     let enter_at = t0 + KICKOFF_ACK_TIMEOUT;
-    let cmds = goinkyo_trust_answer(&mut state, &mut app, &brigade, &pane, enter_at);
+    let cmds = goinkyo_kickoff_tick(&mut state, &mut app, &brigade, enter_at);
     assert!(
         cmds.iter()
             .any(|cmd| matches!(cmd, Cmd::WritePty { bytes, .. } if bytes == b"\r")),
@@ -5003,7 +5003,7 @@ fn the_retry_enter_of_a_kickoff_counts_the_pane_for_the_quit_question() {
     let (mut state, mut app, brigade, pane, t0) = setup();
     state.focus = Focus::Sidebar;
     let enter_at = t0 + KICKOFF_ACK_TIMEOUT;
-    goinkyo_trust_answer(&mut state, &mut app, &brigade, &pane, enter_at);
+    goinkyo_kickoff_tick(&mut state, &mut app, &brigade, enter_at);
     sample(&mut state, &mut app, &[(&pane, Idle)], enter_at);
     press(
         &mut state,
@@ -5269,32 +5269,20 @@ fn goinkyo_fixture(
     state.pending_goinkyo_kickoffs.push(PendingGoinkyoKickoff {
         key: goinkyo.clone(),
         spawned_at: at + spawned_after,
-        cwd: PathBuf::from("/work"),
-        notified_untrusted: false,
+        notified_not_at_prompt: false,
         sent_at: None,
         attempts: 0,
     });
+    // At its empty prompt: the quiet period is what the kickoff waits for.
+    super::tests::draw_prompt_on(state.screens.get_mut(&goinkyo).unwrap(), None);
     app.replace_rows(Vec::new());
     (state, app, director, worker, goinkyo, at)
 }
 
-fn trust_answer(state: &mut EmporiumState, app: &mut App, pane: &SessionKey, at: Instant) {
-    let cmds = send(
-        state,
-        app,
-        Event::GoinkyoDirectoryTrustChecked {
-            key: pane.clone(),
-            trusted: true,
-        },
-        at,
-    );
-    assert!(typed_into(&cmds, pane), "the kickoff was typed: {cmds:?}");
-}
-
 #[test]
-fn a_goinkyo_kickoff_check_going_out_on_the_tick_that_would_complete_the_stretch_does_not_ring() {
+fn a_goinkyo_kickoff_typed_on_the_tick_that_would_complete_the_stretch_does_not_ring() {
     // The Goinkyo's boot output has been quiet for exactly long enough that its
-    // trust check becomes due on the tick the all-idle stretch would complete.
+    // kickoff becomes due on the tick the all-idle stretch would complete.
     let (mut state, mut app, director, worker, goinkyo, at) =
         goinkyo_fixture(SECOND + BRIGADE_QUIET_SETTLE - GOINKYO_KICKOFF_QUIET_PERIOD);
     let deadline = at + SECOND + BRIGADE_QUIET_SETTLE;
@@ -5314,16 +5302,13 @@ fn a_goinkyo_kickoff_check_going_out_on_the_tick_that_would_complete_the_stretch
 
     let cmds = sample(&mut state, &mut app, &all_idle, deadline);
     assert!(
-        cmds.iter()
-            .any(|cmd| matches!(cmd, Cmd::CheckGoinkyoDirectoryTrust { .. })),
-        "the check went out on this tick: {cmds:?}"
+        typed_into(&cmds, &goinkyo),
+        "the kickoff was typed on this tick: {cmds:?}"
     );
     assert!(!rang(&cmds), "rang first, typed into afterwards: {cmds:?}");
 
-    // The shell's answer arrives after the tick: the kickoff is typed, the
-    // Goinkyo's first turn shows up as a session row, and only then does the
-    // all-idle stretch run again.
-    trust_answer(&mut state, &mut app, &goinkyo, deadline);
+    // The Goinkyo's first turn shows up as a session row, and only then does
+    // the all-idle stretch run again.
     let acknowledged = deadline + 2 * SECOND;
     let rang_at = tick_each_second_until(
         &mut state,
@@ -5432,19 +5417,19 @@ fn a_goinkyo_spawned_off_stage_that_waits_is_shown_on_its_director() {
 }
 
 #[test]
-fn a_codex_worker_kickoff_check_going_out_on_the_tick_that_would_complete_the_stretch_does_not_ring()
- {
+fn a_codex_worker_kickoff_typed_on_the_tick_that_would_complete_the_stretch_does_not_ring() {
     let (mut state, mut app, director, worker, at) = quiet_fixture();
     let deadline = at + SECOND + BRIGADE_QUIET_SETTLE;
     let codex = host(&mut state, 1, "worker-2", "w2");
     state.pending_kickoffs.push(PendingKickoff {
         key: codex.clone(),
         spawned_at: deadline - CODEX_KICKOFF_QUIET_PERIOD,
-        cwd: PathBuf::from("/work"),
-        notified_untrusted: false,
+        notified_not_at_prompt: false,
         sent_at: None,
         attempts: 0,
     });
+    // At its prompt and idle: the quiet period is what the kickoff waits for.
+    super::tests::paint_codex_prompt(&mut state, &codex, Some("idle"));
     tick(&mut state, &mut app, at);
     let busy = [(&director, NotIdle), (&worker, Idle), (&codex, Idle)];
     sample(&mut state, &mut app, &busy, at);
@@ -5460,22 +5445,10 @@ fn a_codex_worker_kickoff_check_going_out_on_the_tick_that_would_complete_the_st
 
     let cmds = sample(&mut state, &mut app, &all_idle, deadline);
     assert!(
-        cmds.iter()
-            .any(|cmd| matches!(cmd, Cmd::CheckWorkerDirectoryTrust { .. })),
-        "the check went out on this tick: {cmds:?}"
+        typed_into(&cmds, &codex),
+        "the kickoff was typed on this tick: {cmds:?}"
     );
     assert!(!rang(&cmds), "{cmds:?}");
-
-    let cmds = send(
-        &mut state,
-        &mut app,
-        Event::WorkerDirectoryTrustChecked {
-            key: codex.clone(),
-            trusted: true,
-        },
-        deadline,
-    );
-    assert!(typed_into(&cmds, &codex), "{cmds:?}");
     // Not acknowledged for a long while (well past the settle): still blocked.
     let rang_at = tick_each_second_until(
         &mut state,
@@ -5525,16 +5498,13 @@ fn a_goinkyo_that_needs_eight_seconds_to_become_ready_holds_the_ring_until_its_k
         let cmds = sample(&mut state, &mut app, &all_idle, when);
         assert!(!rang(&cmds), "at +{secs}s: {cmds:?}");
     }
-    // Quiet at last: the check goes out, the kickoff is typed, then acknowledged.
+    // Quiet at last, and the prompt is up (the boot output covered it until
+    // now): the kickoff is typed, then acknowledged.
+    super::tests::draw_prompt_on(state.screens.get_mut(&goinkyo).unwrap(), None);
     let checked = at + 9 * SECOND;
     let cmds = sample(&mut state, &mut app, &all_idle, checked);
-    assert!(
-        cmds.iter()
-            .any(|cmd| matches!(cmd, Cmd::CheckGoinkyoDirectoryTrust { .. })),
-        "{cmds:?}"
-    );
+    assert!(typed_into(&cmds, &goinkyo), "{cmds:?}");
     assert!(!rang(&cmds));
-    trust_answer(&mut state, &mut app, &goinkyo, checked);
     app.replace_rows(vec![row_for("gk")]);
     let acknowledged = checked + SECOND;
     let rang_at = tick_each_second_until(
@@ -5569,13 +5539,29 @@ fn a_kickoff_that_banto_has_given_up_on_no_longer_holds_the_ring() {
 
 #[test]
 fn a_kickoff_held_for_the_operator_does_not_hold_the_ring() {
-    // The directory was reported untrusted: nothing is typed until the operator
-    // answers the prompt in the pane, and a bell is what tells them.
-    let (mut state, mut app, director, worker, goinkyo, at) = goinkyo_fixture(Duration::ZERO);
-    state.pending_goinkyo_kickoffs[0].notified_untrusted = true;
+    // A Codex Worker whose pane is not at its prompt (a question, a menu): the
+    // first due tick finds that out and says so, nothing is typed until the
+    // operator answers what the pane shows, and the brigade is really waiting
+    // on them.
+    let (mut state, mut app, director, worker, at) = quiet_fixture();
+    let codex = host(&mut state, 1, "worker-2", "w2");
+    state.pending_kickoffs.push(PendingKickoff {
+        key: codex.clone(),
+        spawned_at: at,
+        notified_not_at_prompt: false,
+        sent_at: None,
+        attempts: 0,
+    });
+    state
+        .screens
+        .get_mut(&codex)
+        .unwrap()
+        .process(b"[2J[1;1HDo you trust the contents of this directory?");
     tick(&mut state, &mut app, at);
-    let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director, &goinkyo], at);
-    let all_idle = [(&director, Idle), (&worker, Idle), (&goinkyo, Idle)];
+    let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director, &codex], at);
+    assert!(state.pending_kickoffs[0].notified_not_at_prompt);
+    assert!(state.pending_kickoffs[0].sent_at.is_none());
+    let all_idle = [(&director, Idle), (&worker, Idle), (&codex, Idle)];
     let rang_at = tick_each_second_until(
         &mut state,
         &mut app,
@@ -5588,6 +5574,12 @@ fn a_kickoff_held_for_the_operator_does_not_hold_the_ring() {
     // The same when the operator has a draft in the pane: the retry waits for
     // them, not the other way round.
     let (mut state, mut app, director, worker, goinkyo, at) = goinkyo_fixture(Duration::ZERO);
+    let all_idle = [(&director, Idle), (&worker, Idle), (&goinkyo, Idle)];
+    // The draft is on the pane's input line, where the screen reader sees it.
+    super::tests::draw_prompt_on(
+        state.screens.get_mut(&goinkyo).unwrap(),
+        Some("a note for later"),
+    );
     state.unsent_operator_input.insert(goinkyo.clone());
     tick(&mut state, &mut app, at);
     let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director, &goinkyo], at);
@@ -7303,8 +7295,7 @@ fn a_member_added_to_an_armed_brigade_only_delays_the_ring_and_its_own_rules_app
     state.pending_kickoffs.push(PendingKickoff {
         key: added.clone(),
         spawned_at: idle_from,
-        cwd: PathBuf::from("/work"),
-        notified_untrusted: false,
+        notified_not_at_prompt: false,
         sent_at: None,
         attempts: 0,
     });
@@ -7335,6 +7326,9 @@ fn a_member_added_to_an_armed_brigade_only_delays_the_ring_and_its_own_rules_app
         },
         idle_from + 3 * SECOND,
     );
+    // The pane is at its prompt and reports idle: it is typed when the quiet
+    // period is over, and owed until the turn is acknowledged.
+    super::tests::paint_codex_prompt(&mut state, &added, Some("idle"));
     let with_added =
         |added_state: Quiescence| [(&director, Idle), (&worker, Idle), (&added, added_state)];
     for secs in 3..=4 {

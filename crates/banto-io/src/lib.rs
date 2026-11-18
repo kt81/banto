@@ -15,7 +15,7 @@
 //! - [`data_dir`] banto's own data directory: where the database, MCP configs, consultation
 //!   requests and message logs live, and the sweep of working files nobody owns any more
 //! - [`config`]  loading `banto_core::config`'s types from disk
-//! - [`directory_trust`] advisory-only read of whether Codex/Claude Code has trusted a given cwd
+//! - [`directory_trust`] advisory-only read of whether Claude Code has trusted a given cwd (feeds one status notice, gates nothing)
 //! - [`file_identity`] which directory or file a path leads to, by the filesystem's own identity rather than its spelling
 //! - [`input`] raw terminal events, read and timestamped off their own thread
 //! - [`instance_lock`] the exclusive lock that keeps a second banto UI off one database
