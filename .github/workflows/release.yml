@@ -387,6 +387,9 @@ jobs:
             if ((Get-FileHash $banto).Hash -ne $first) { throw 'a bad checksum changed the file' }
             $env:Path = $path
           }
+          # The runner's pwsh wrapper ends the step with `exit $LASTEXITCODE`, and the refused
+          # install above left that at 1: the first tag's run failed here with every check passed.
+          exit 0
 
   # Build provenance for the archives exactly as they will be published. It runs after the
   # installers have accepted them, only for a real tag (a dry run would leave attestations
