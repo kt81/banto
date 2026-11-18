@@ -43,6 +43,18 @@ The release workflow runs the same scan on the freshly built exe and writes the 
 to the job summary; it is informational and never blocks (see
 [RELEASING.md](../RELEASING.md)).
 
+## 2026-11-18: v0.1.0, the first release
+
+Nothing flagged it at any step. The binary is unsigned.
+
+| Step | What Windows said |
+|---|---|
+| Workflow scan of the freshly built exe (run 44249173198, hosted runner, real-time protection off), definitions 1.463.351.0 | no threats, exit 0 |
+| The draft's zip downloaded with `gh`, extracted, `banto.exe` (sha256 `883ffd827d3bd1a6eca6e0dbecb1cbc076136df67efd7e4e88aac7432208ab6d`) scanned with the command above, definitions 1.463.347.0 | no threats, exit 0; real-time protection (on) did nothing on extraction |
+| The operator's machine: the zip downloaded with a browser (whether that directory is covered by an exclusion: unknown), extracted, `banto.exe` started from a terminal | Defender silent; nothing in Windows stopped it (banto itself refused the start, because the operator's own banto held the database) |
+| The same exe double-clicked in Explorer | SmartScreen "Windows protected your PC"; "More info" → "Run anyway" started it |
+| The draft's `install.ps1` run as `Get-Content -Raw .\install.ps1 \| iex` on the browser-downloaded files | installed; `banto` resolved on `PATH`; nothing from Defender or SmartScreen |
+
 ## How to record the next one
 
 Add a section like the ones above, with a heading of the date. Copy this table and fill

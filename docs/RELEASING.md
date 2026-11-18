@@ -17,7 +17,9 @@ checks below, and it publishes the exact files the workflow produced.
    exactly**, prerelease suffix included: tag `v0.2.0-rc.1` needs version `0.2.0-rc.1`.
    The first job fails otherwise, because `banto --version` prints the Cargo version and
    a binary must not name a different release than the page it is downloaded from. A tag
-   with a `-` in it becomes a prerelease.
+   with a `-` in it becomes a prerelease. Push the tag with git, not from GitHub's "Draft
+   a new release" page: v0.1.0 was first tagged there, which also published an empty
+   release for the tag, and the workflow's own draft step would have failed on it.
 
 You can rehearse everything except the draft without a tag: run the workflow by hand
 (`workflow_dispatch`). It uses a throwaway tag name and stops before attesting and
@@ -53,7 +55,11 @@ drafting.
 
 Do these on the draft's own files. **Never rebuild between the gate and publishing**: what
 you checked must be the bytes users get. If a check fails, fix the cause and start again
-with a new tag; do not edit the draft's assets.
+with a new tag; do not edit the draft's assets. A run that fails before it drafts has put
+nothing where anyone can download it, so there the tag can move instead: fix the cause on
+`main`, rehearse with `workflow_dispatch`, then `git tag -f v<version> <fixed commit>` and
+`git push -f origin v<version>` (v0.1.0 went out this way after its first run failed in a
+test step).
 
 ### a. Defender scan of the Windows archive
 
@@ -78,7 +84,11 @@ administrator):
 
 1. Download the Windows archive **with a browser** into that directory, so the file
    carries the web's mark (SmartScreen).
-2. Extract it, run `banto.exe --version`, then start banto.
+2. Extract it, run `banto.exe --version`, then start banto, once from a terminal and once
+   by double-clicking it in Explorer: for v0.1.0, SmartScreen spoke only when it was
+   started from Explorer. On a machine where a banto is already running on the same
+   database the start is refused (one banto per database), which still shows whether
+   Windows let it run.
 3. Run the documented install line in a plain PowerShell window. A draft's files are not
    public, so the line as printed (`irm .../releases/latest/download/install.ps1 | iex`)
    cannot reach them yet: download the draft's `install.ps1`, `SHA256SUMS` and the Windows
@@ -90,8 +100,13 @@ administrator):
 
 ### c. macOS, on a real Mac
 
-CI only builds and runs the installer there. On a real Mac: install with the one-liner,
-note any Gatekeeper message, then check that a session starts in a pane and resumes
+CI only builds and runs the installer there. On a real Mac, install the draft the way the
+one-liner would (the one-liner itself cannot reach a draft's files): download the
+draft's `install.sh`, `SHA256SUMS` and the macOS archive into one directory with
+`gh release download v<version> --repo kt81/banto -p install.sh -p SHA256SUMS -p '*darwin*'`
+(the one-liner fetches with curl, not a browser, so a browser download is not the same
+test), then run `BANTO_INSTALL_SOURCE="$PWD" BANTO_VERSION=v<version> sh install.sh`. Note
+any Gatekeeper message, then check that a session starts in a pane and resumes
 (PTY launch), that the list updates when session files change (file watch), and that
 drawing and input behave. Record the results, and update the macOS line in the README's
 Install section.

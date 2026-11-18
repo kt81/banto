@@ -222,9 +222,11 @@ Ubuntu 22.04, and the build fails if the binary needs a newer glibc; musl system
 as Alpine build from source), and macOS on Apple silicon. Intel Macs and Windows on ARM
 have no prebuilt binary. Windows is where banto is developed and used every day.
 
-> **TODO (maintainer): macOS status.** Not yet checked on a real Mac; it is built and
-> tested in CI only. Replace this line with what the check finds (install, PTY launch
-> and resume, file-watch updates, drawing, input).
+**macOS is lightly checked.** On one Apple silicon Mac, v0.1.0 installed with
+`install.sh` and nothing stopped it (no Gatekeeper prompt); sessions opened and closed in
+panes, and text selected in a pane copied out. Resume, the list following session-file
+changes, and input in detail have not been checked there yet, nor a binary downloaded
+with a browser.
 
 ### One line
 
@@ -286,6 +288,10 @@ together with `SHA256SUMS`. Compare the archive's sha256 with its line in `SHA25
 (`(Get-FileHash <archive>).Hash` in PowerShell; `grep <archive> SHA256SUMS | sha256sum -c -`
 on Linux, `grep <archive> SHA256SUMS | shasum -a 256 -c -` on macOS), then extract the single `banto` / `banto.exe`
 into the directory you chose. Make sure it is the one directory banto lives in (below).
+The binaries are not signed, so a `banto.exe` downloaded with a browser and started by
+double-clicking it in Explorer meets SmartScreen's "Windows protected your PC": "More info"
+→ "Run anyway" starts it. Started from a terminal, or installed with `install.ps1`, v0.1.0
+met no prompt on the maintainer's machine.
 
 Each archive also carries a build-provenance attestation that says which commit and
 workflow built it. With the [GitHub CLI](https://cli.github.com/):
