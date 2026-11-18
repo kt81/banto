@@ -16,6 +16,7 @@ pub mod codex;
 use std::path::Path;
 use std::time::SystemTime;
 
+use crate::file_identity::DirectorySpellings;
 use banto_core::model::{AgentKind, SessionId, SessionMeta};
 
 /// A source of sessions (Claude Code today, other agents later).
@@ -41,6 +42,10 @@ pub trait SessionProvider {
     /// directory name: Claude's cwd-to-directory-name encoding is lossy
     /// (`:`, `\`, `/`, and `.` all collapse to `-`), so a renamed project can
     /// leave files with different recorded cwd values in the same directory.
+    /// The recorded cwd is compared with [`DirectorySpellings::names`], not with
+    /// `==`: an agent reports a symlink's target, the case it was typed in, or
+    /// Codex's `\\?\` canonical form. That is a text comparison, so a recorded
+    /// path on a share that is down costs nothing.
     ///
     /// `since` is compared against each file's filesystem mtime, which can
     /// have coarse resolution; callers should capture `since` a moment
@@ -55,7 +60,21 @@ pub trait SessionProvider {
     /// every match once via this method and assign candidates to pending
     /// entries themselves, excluding ids already claimed elsewhere — see
     /// [`Self::find_new_session`] for the single-best case.
-    fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId>;
+    ///
+    /// Asked again and again about one directory (discovery polls every pass),
+    /// build its [`DirectorySpellings`] once and use
+    /// [`Self::find_new_sessions_in`]; this form does that for a single ask.
+    fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
+        self.find_new_sessions_in(&DirectorySpellings::of(cwd), since)
+    }
+
+    /// [`Self::find_new_sessions`] for a spawn directory whose spellings are
+    /// already known: the one method an implementation provides.
+    fn find_new_sessions_in(
+        &self,
+        spawned: &DirectorySpellings,
+        since: SystemTime,
+    ) -> Vec<SessionId>;
 
     /// Find the single most-recently created/updated session for `cwd` at or
     /// after `since` — the newest element of [`Self::find_new_sessions`]

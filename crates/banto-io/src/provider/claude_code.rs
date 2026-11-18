@@ -20,6 +20,7 @@ use serde_json::Value;
 use super::cache::{MetaCache, Parsed};
 use super::{ProviderError, SessionProvider};
 use crate::claude_home::ClaudeHome;
+use crate::file_identity::DirectorySpellings;
 use banto_core::model::{AgentKind, SessionId, SessionMeta};
 
 /// Maximum number of bytes read from the head of each session file.
@@ -115,12 +116,19 @@ impl SessionProvider for ClaudeCodeProvider {
         self.walk(None)
     }
 
-    fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
+    fn find_new_sessions_in(
+        &self,
+        spawned: &DirectorySpellings,
+        since: SystemTime,
+    ) -> Vec<SessionId> {
         let projects = self.claude_home.projects_dir();
         let Ok(entries) = fs::read_dir(&projects) else {
             return Vec::new();
         };
 
+        // Claude records the directory it resolved (a symlink followed), in the
+        // case it was typed: a spelling `spawned` lists, so the comparison is
+        // text, with nothing opened for a transcript's recorded cwd.
         let mut matches: Vec<(SystemTime, SessionId)> = Vec::new();
         for project in entries {
             let Ok(project) = project else { continue };
@@ -156,7 +164,11 @@ impl SessionProvider for ClaudeCodeProvider {
                     continue;
                 };
                 let fields = extract_head_fields(&head);
-                if fields.cwd.as_deref() != Some(cwd) {
+                if !fields
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|reported| spawned.names(reported))
+                {
                     continue;
                 }
                 matches.push((mtime, SessionId(id.to_string())));
@@ -1036,6 +1048,64 @@ mod tests {
             provider(&root)
                 .find_new_sessions(Path::new("/work/proj"), since)
                 .is_empty()
+        );
+    }
+
+    /// A transcript head naming `cwd`, with the path JSON-escaped the way Claude
+    /// writes it (backslashes on Windows).
+    fn head_naming(cwd: &Path) -> String {
+        format!(
+            "{}
+",
+            serde_json::json!({"type": "user", "cwd": cwd, "message": {"content": "hi"}})
+        )
+    }
+
+    /// Claude resolves a symlink before it records the cwd, so a pane banto
+    /// started through one reports the target.
+    #[test]
+    fn find_new_sessions_matches_a_cwd_reached_through_a_symlink() {
+        let root = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let real = work.path().join("real");
+        let link = work.path().join("link");
+        fs::create_dir(&real).unwrap();
+        fs::create_dir(work.path().join("elsewhere")).unwrap();
+        if !crate::file_identity::test_support::symlink_dir(&real, &link) {
+            return;
+        }
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let path = write_session(&root, "proj", "new.jsonl", &head_naming(&real));
+        set_mtime(&path, since + Duration::from_secs(1));
+
+        assert_eq!(
+            provider(&root).find_new_sessions(&link, since),
+            vec![SessionId("new".to_string())]
+        );
+        assert!(
+            provider(&root)
+                .find_new_sessions(&work.path().join("elsewhere"), since)
+                .is_empty()
+        );
+    }
+
+    /// Claude records the cwd in the case it was typed.
+    #[test]
+    fn find_new_sessions_matches_a_cwd_in_another_letter_case() {
+        let root = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let real = work.path().join("Proj");
+        fs::create_dir(&real).unwrap();
+        let Some(recased) = crate::file_identity::test_support::recased(&real) else {
+            return;
+        };
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let path = write_session(&root, "proj", "new.jsonl", &head_naming(&recased));
+        set_mtime(&path, since + Duration::from_secs(1));
+
+        assert_eq!(
+            provider(&root).find_new_sessions(&real, since),
+            vec![SessionId("new".to_string())]
         );
     }
 

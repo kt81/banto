@@ -23,6 +23,7 @@ use rusqlite::types::ValueRef;
 
 use super::{ProviderError, SessionProvider};
 use crate::codex_home::CodexHome;
+use crate::file_identity::DirectorySpellings;
 use crate::sqlite_ro::open_read_only;
 #[cfg(test)]
 use crate::sqlite_ro::wal_sidecar_path;
@@ -272,7 +273,11 @@ impl SessionProvider for CodexProvider {
         Ok(sessions)
     }
 
-    fn find_new_sessions(&self, cwd: &Path, since: SystemTime) -> Vec<SessionId> {
+    fn find_new_sessions_in(
+        &self,
+        spawned: &DirectorySpellings,
+        since: SystemTime,
+    ) -> Vec<SessionId> {
         let db_path = self.codex_home.threads_db_path();
         if !db_path.exists() {
             return Vec::new();
@@ -298,6 +303,14 @@ impl SessionProvider for CodexProvider {
             return Vec::new();
         };
 
+        // `threads.cwd` is the canonical path (symlinks resolved, the on-disk
+        // letter case, a `\\?\` or `\\?\UNC\` prefix on Windows), which `spawned`
+        // lists beside the spelling banto typed. The raw column goes to `names`,
+        // which writes the verbatim prefixes plainly itself: through
+        // `normalize_windows_extended_prefix`, `\\?\UNC\s\x` would arrive as the
+        // relative `UNC\s\x`. The query above already narrowed to rows touched
+        // since the spawn, and what is compared is text, so a row on a dead
+        // share costs nothing.
         let mut matches: Vec<(i64, SessionId)> = rows
             .flatten()
             // A fresh Worker is found by "the oldest thread in its cwd since it
@@ -309,8 +322,7 @@ impl SessionProvider for CodexProvider {
                 let id = id?;
                 let matched = raw_cwd
                     .as_deref()
-                    .map(normalize_windows_extended_prefix)
-                    .is_some_and(|p| p == cwd);
+                    .is_some_and(|reported| spawned.names(Path::new(reported)));
                 matched.then_some((updated_at_ms, SessionId(id)))
             })
             .collect();
@@ -360,7 +372,9 @@ fn session_meta_from_row(
 /// from anywhere else in banto. Normalized once, here, at the point a raw
 /// column value becomes a path banto holds — not inside a narrower helper
 /// only one caller would reach — so every comparison anyone writes later
-/// sees the same value.
+/// sees the same value. `find_new_sessions` is the exception: it hands the raw
+/// column to `DirectorySpellings::names`, which also handles `\\?\UNC\…`, that
+/// this function leaves as a relative `UNC\…`.
 fn normalize_windows_extended_prefix(raw: &str) -> PathBuf {
     PathBuf::from(raw.strip_prefix(r"\\?\").unwrap_or(raw))
 }
@@ -717,6 +731,106 @@ mod tests {
                 SessionId("older".to_string()),
                 SessionId("newer".to_string())
             ]
+        );
+    }
+
+    /// A provider over a database holding one fresh thread whose `cwd` column
+    /// is `stored`, the way Codex 0.169.0 writes it: canonical, and on Windows
+    /// behind a `\\?\` prefix, which `canonicalize` produces there too.
+    fn provider_with_one_thread_in(dir: &TempDir, stored: &Path) -> CodexProvider {
+        let home = codex_home(dir);
+        let rollout = dir.path().join("rollout.jsonl");
+        fs::write(&rollout, "x").unwrap();
+        let stored = stored.to_string_lossy().into_owned();
+        write_thread(
+            &home,
+            ThreadRow {
+                cwd: Some(&stored),
+                updated_at_ms: 2_000,
+                ..ThreadRow::new("fresh", &rollout)
+            },
+            true,
+        );
+        CodexProvider::new(home)
+    }
+
+    fn spawned_before_the_thread() -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(1_000)
+    }
+
+    /// A pane started through a symlink: the row names the target.
+    #[test]
+    fn find_new_sessions_matches_a_cwd_reached_through_a_symlink() {
+        let dir = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let real = work.path().join("real");
+        let link = work.path().join("link");
+        let elsewhere = work.path().join("elsewhere");
+        fs::create_dir(&real).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        if !crate::file_identity::test_support::symlink_dir(&real, &link) {
+            return;
+        }
+        let provider = provider_with_one_thread_in(&dir, &real.canonicalize().unwrap());
+
+        assert_eq!(
+            provider.find_new_sessions(&link, spawned_before_the_thread()),
+            vec![SessionId("fresh".to_string())]
+        );
+        assert!(
+            provider
+                .find_new_sessions(&elsewhere, spawned_before_the_thread())
+                .is_empty()
+        );
+    }
+
+    /// A pane typed in another letter case: the row has the on-disk case.
+    #[test]
+    fn find_new_sessions_matches_a_cwd_in_another_letter_case() {
+        let dir = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let real = work.path().join("Proj");
+        fs::create_dir(&real).unwrap();
+        let Some(recased) = crate::file_identity::test_support::recased(&real) else {
+            return;
+        };
+        let provider = provider_with_one_thread_in(&dir, &real.canonicalize().unwrap());
+
+        assert_eq!(
+            provider.find_new_sessions(&recased, spawned_before_the_thread()),
+            vec![SessionId("fresh".to_string())]
+        );
+    }
+
+    /// The spelling banto spawned with is the plain one; the row's is canonical.
+    #[test]
+    fn find_new_sessions_matches_the_canonical_row_of_a_plainly_spelled_cwd() {
+        let dir = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let provider = provider_with_one_thread_in(&dir, &work.path().canonicalize().unwrap());
+
+        assert_eq!(
+            provider.find_new_sessions(work.path(), spawned_before_the_thread()),
+            vec![SessionId("fresh".to_string())]
+        );
+    }
+
+    /// A directory on a share, or on a mapped drive whose canonical form is one:
+    /// Codex stores `\\?\UNC\srv\share\x`, banto spawned in `\\srv\share\x`.
+    /// Neither exists here, which is the point: only text is compared.
+    #[test]
+    fn find_new_sessions_matches_a_unc_row_of_a_plainly_spelled_share_cwd() {
+        let dir = TempDir::new().unwrap();
+        let provider = provider_with_one_thread_in(&dir, Path::new(r"\\?\UNC\srv\share\proj"));
+
+        assert_eq!(
+            provider.find_new_sessions(Path::new(r"\\srv\share\proj"), spawned_before_the_thread()),
+            vec![SessionId("fresh".to_string())]
+        );
+        assert!(
+            provider
+                .find_new_sessions(Path::new(r"\\srv\share\other"), spawned_before_the_thread())
+                .is_empty()
         );
     }
 

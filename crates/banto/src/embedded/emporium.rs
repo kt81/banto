@@ -66,6 +66,7 @@ use banto_io::codex_catalog::{CodexCatalogSource, CodexCli};
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::SysinfoStartTime;
 use banto_io::data_dir::DataDir;
+use banto_io::file_identity::DirectorySpellings;
 use banto_io::input::{CrosstermInputReader, InputReader, StampedEvent};
 use banto_io::provider::SessionProvider;
 use banto_io::provider::cache::MetaCache;
@@ -496,6 +497,10 @@ pub fn run(
 struct DiscoveryTracker {
     key: SessionKey,
     cwd: PathBuf,
+    /// `cwd`'s spellings, measured once at spawn — the directory is reachable
+    /// then, and every poll after compares the paths agents report against
+    /// them as text (see [`DirectorySpellings`]).
+    spawned: DirectorySpellings,
     since: SystemTime,
     member: Option<(BrigadeId, MemberToken)>,
     /// The spawned child's pid, when the platform reports one — the exact
@@ -1700,6 +1705,7 @@ fn execute_open_embedded(
                 discovery.push(DiscoveryTracker {
                     key: key.clone(),
                     agent: target.agent,
+                    spawned: DirectorySpellings::of(&target.cwd),
                     cwd: target.cwd,
                     since: discovery_since,
                     member: brigade.map(|(brigade_id, token, _)| (brigade_id, token)),
@@ -2141,7 +2147,7 @@ fn poll_solo_codex_discovery(
             return true;
         };
         let candidates = provider
-            .find_new_sessions(&tracker.cwd, tracker.since)
+            .find_new_sessions_in(&tracker.spawned, tracker.since)
             .into_iter()
             .map(|id| id.0)
             .collect::<Vec<_>>();
@@ -2266,7 +2272,7 @@ fn poll_discovery(
         let by_pid = (tracker.agent == AgentKind::ClaudeCode)
             .then_some(tracker.pid)
             .flatten()
-            .and_then(|pid| live_session_id(live, pid, &tracker.cwd));
+            .and_then(|pid| live_session_id(live, pid, &tracker.spawned));
         let id = by_pid
             .filter(|id| !claimed.contains(id) && !used_this_pass.contains(id))
             .or_else(|| {
@@ -2274,7 +2280,7 @@ fn poll_discovery(
                     return None;
                 }
                 provider
-                    .find_new_sessions(&tracker.cwd, tracker.since)
+                    .find_new_sessions_in(&tracker.spawned, tracker.since)
                     .into_iter()
                     .map(|id| id.0)
                     .find(|id| !claimed.contains(id) && !used_this_pass.contains(id))
@@ -2300,8 +2306,11 @@ fn poll_discovery(
             timed_out.push(i);
         } else if tracker.agent == AgentKind::ClaudeCode
             && !tracker.notified_untrusted
-            && banto_io::directory_trust::claude_directory_trust(claude_home, &tracker.cwd)
-                == banto_io::directory_trust::DirectoryTrust::NotTrusted
+            && banto_io::directory_trust::claude_directory_trust_in(
+                claude_home,
+                &tracker.cwd,
+                &tracker.spawned,
+            ) == banto_io::directory_trust::DirectoryTrust::NotTrusted
         {
             newly_untrusted.push(i);
         }
@@ -2349,7 +2358,7 @@ fn poll_discovery(
 }
 
 /// The session id `claude` published for the process at `pid`, if that
-/// live-state entry is really the child banto spawned into `cwd`.
+/// live-state entry is really the child banto spawned into `spawned`.
 ///
 /// The cwd check is the guard against a stale file: a `sessions/<pid>.json`
 /// left behind by a session whose pid the OS has since recycled would
@@ -2357,9 +2366,20 @@ fn poll_discovery(
 /// on to `--resume` it — the one thing it must never do twice. A mismatch
 /// (or a file with no cwd recorded) simply declines, leaving the session-file
 /// scan to answer.
-fn live_session_id(live: &[LiveSession], pid: u32, cwd: &Path) -> Option<String> {
+///
+/// The cwd comparison is [`DirectorySpellings::names`], not `==`: Claude
+/// records the directory it resolved, so a pane started through a symlink
+/// reports the target, in the case it was typed. It is text only, whatever the
+/// file holds.
+fn live_session_id(live: &[LiveSession], pid: u32, spawned: &DirectorySpellings) -> Option<String> {
     live.iter()
-        .find(|entry| entry.pid == pid && entry.cwd.as_deref() == Some(cwd))
+        .find(|entry| {
+            entry.pid == pid
+                && entry
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|reported| spawned.names(reported))
+        })
         .and_then(|entry| entry.session_id.clone())
 }
 
@@ -9761,6 +9781,7 @@ mod tests {
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(&cwd),
             cwd: cwd.clone(),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
@@ -9810,6 +9831,7 @@ mod tests {
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
@@ -9855,6 +9877,7 @@ mod tests {
         let tracker = |token: &str| DiscoveryTracker {
             key: pending_key(token),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(&cwd),
             cwd: cwd.clone(),
             since,
             member: Some((1, token.to_string())),
@@ -9917,6 +9940,7 @@ mod tests {
         DiscoveryTracker {
             key: pending_key(token),
             agent: AgentKind::Codex,
+            spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
             since,
             member: Some((brigade_id, token.to_string())),
@@ -10119,6 +10143,7 @@ mod tests {
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
             since: SystemTime::now(),
             member: Some((brigade_id, "worker-1".to_string())),
@@ -10182,6 +10207,7 @@ mod tests {
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
             since: long_ago,
             member: Some((1, "worker-1".to_string())),
@@ -10228,6 +10254,7 @@ mod tests {
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
@@ -10284,6 +10311,7 @@ mod tests {
         let mut trackers = vec![DiscoveryTracker {
             key: pending_key("worker-1"),
             agent: AgentKind::ClaudeCode,
+            spawned: DirectorySpellings::of(Path::new("/work/alpha")),
             cwd: PathBuf::from("/work/alpha"),
             since: SystemTime::now(),
             member: Some((1, "worker-1".to_string())),
@@ -11518,6 +11546,108 @@ mod tests {
                 &test_ctx(&probe, &live),
             )
             .is_some()
+        );
+    }
+
+    fn live_entry(pid: u32, cwd: Option<&Path>) -> LiveSession {
+        LiveSession {
+            pid,
+            session_id: Some("sess-live".to_string()),
+            cwd: cwd.map(Path::to_path_buf),
+            status: None,
+            waiting_for: None,
+            kind: None,
+            name: None,
+            proc_start: None,
+            version: None,
+        }
+    }
+
+    /// Creates a directory symlink, or says why it could not and returns
+    /// false: the test then skips, unless `BANTO_TEST_ALLOW_SKIPS` is unset, in
+    /// which case a silent pass would hide the gap and it fails instead. The
+    /// same convention as `banto_io::file_identity`'s tests, whose helper is
+    /// `cfg(test)` of another crate and so out of reach here.
+    fn try_symlink_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(target, link);
+        match made {
+            Ok(()) => true,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("BANTO_TEST_ALLOW_SKIPS").is_some_and(|v| v == "1"),
+                    "cannot create a directory symlink here ({error}); set \
+                     BANTO_TEST_ALLOW_SKIPS=1 to let that pass"
+                );
+                eprintln!("skipped: cannot create a directory symlink here ({error})");
+                false
+            }
+        }
+    }
+
+    /// Claude reports the directory it resolved; banto spawned through a
+    /// symlink, so the two spellings differ while the directory is one.
+    #[test]
+    fn live_session_id_matches_a_cwd_reached_through_a_symlink() {
+        let work = tempfile::TempDir::new().unwrap();
+        let real = work.path().join("real");
+        let link = work.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(work.path().join("elsewhere")).unwrap();
+        if !try_symlink_dir(&real, &link) {
+            return;
+        }
+        let live = [live_entry(4242, Some(&real.canonicalize().unwrap()))];
+
+        assert_eq!(
+            live_session_id(&live, 4242, &DirectorySpellings::of(&link)),
+            Some("sess-live".to_string())
+        );
+        assert_eq!(
+            live_session_id(
+                &live,
+                4242,
+                &DirectorySpellings::of(&work.path().join("elsewhere"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn live_session_id_declines_another_pid_a_missing_cwd_and_a_vanished_directory() {
+        let work = tempfile::TempDir::new().unwrap();
+        let dir = work.path().to_path_buf();
+        let spawned = DirectorySpellings::of(&dir);
+        assert_eq!(
+            live_session_id(&[live_entry(1, Some(&dir))], 2, &spawned),
+            None,
+            "another process's file"
+        );
+        assert_eq!(
+            live_session_id(&[live_entry(1, None)], 1, &spawned),
+            None,
+            "a file with no cwd"
+        );
+        let gone = work.path().join("gone");
+        assert_eq!(
+            live_session_id(
+                &[live_entry(1, Some(&dir))],
+                1,
+                &DirectorySpellings::of(&gone)
+            ),
+            None,
+            "a spawn directory that no longer exists"
+        );
+        assert_eq!(
+            live_session_id(
+                &[live_entry(1, Some(&gone))],
+                1,
+                &DirectorySpellings::of(&gone)
+            ),
+            Some("sess-live".to_string()),
+            "equal spellings need no directory on disk"
         );
     }
 
