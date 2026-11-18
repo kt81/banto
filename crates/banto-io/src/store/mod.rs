@@ -17,6 +17,7 @@
 //! unavailable.
 
 mod archive;
+mod backup;
 mod brigades;
 mod groups;
 mod lineage;
@@ -29,6 +30,7 @@ pub use banto_core::model::{
 };
 pub use brigades::{MAX_WORKER_NUMBER, MemberNaming, glance_line};
 pub use groups::{Group, GroupId};
+pub use migrations::SCHEMA_VERSION;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,9 +60,32 @@ pub enum StoreError {
     },
     /// The database file reports a `PRAGMA user_version` this build does not
     /// know, i.e. it was written by a newer banto. Refusing to touch it avoids
-    /// corrupting a newer schema.
-    #[error("unsupported database schema version {0}")]
+    /// corrupting a newer schema. The text names the way out: the newer build, or
+    /// the copy the upgrade left (`backup`'s naming: `before-v<K + 1>` holds
+    /// schema `K`, and this build reads schemas up to `SCHEMA_VERSION`).
+    #[error(
+        "unsupported database schema version {0}: it was upgraded by a newer banto; run that \
+         build, or go back with this build and the newest banto.db.before-v<N> backup beside the \
+         database (N at most {newest_backup})",
+        newest_backup = SCHEMA_VERSION + 1
+    )]
     UnsupportedSchemaVersion(i64),
+    /// The copy taken before a migration could not be written, so the migration
+    /// did not run and the database is as it was.
+    #[error(
+        "could not write the backup {} that precedes a database upgrade ({cause}); the database \
+         was not migrated",
+        path.display()
+    )]
+    Backup { path: PathBuf, cause: String },
+    /// A process that must not migrate (`_mcp`, `_hook`) found a schema other
+    /// than the one it was built for: the banto on disk is not the one that
+    /// started it, or not the one running the UI.
+    #[error(
+        "banto was replaced on disk; restart banto (database schema {found}, this build \
+         {SCHEMA_VERSION})"
+    )]
+    SchemaMismatch { found: i64 },
     /// The brigade has issued every Worker number there is
     /// (nine digits); nothing was created.
     #[error("this brigade has run out of Worker numbers")]
@@ -76,8 +101,10 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) the database at `path`, creating the parent
-    /// directory if missing, and applies pending migrations.
+    /// The UI's door: opens (or creates) the database at `path`, creating the
+    /// parent directory if missing, and applies pending migrations — after a copy
+    /// of the database as it was (`backup`). Only the UI migrates; the processes it
+    /// starts use [`Store::open_current`].
     pub fn open(path: &Path) -> Result<Store, StoreError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -87,7 +114,32 @@ impl Store {
                 source,
             })?;
         }
-        Self::from_connection(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        backup::before_migration(&conn, path)?;
+        Self::from_connection(conn)
+    }
+
+    /// The door of the processes a UI starts (`_mcp`, `_hook`): opens the
+    /// existing database and uses it only if it is at exactly the schema this
+    /// build knows. It never creates the file, never migrates and never copies.
+    ///
+    /// A running UI holds the single-instance lock precisely so that nothing
+    /// migrates a database under it. On Unix the banto executable can be replaced
+    /// while the UI runs, and the next child it starts is then the new build: if
+    /// that one migrated, the running UI would find a schema it does not know.
+    /// Any other version is therefore [`StoreError::SchemaMismatch`].
+    pub fn open_current(path: &Path) -> Result<Store, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found != SCHEMA_VERSION {
+            return Err(StoreError::SchemaMismatch { found });
+        }
+        Ok(Store { conn })
     }
 
     /// Opens a fresh in-memory database (for tests).
@@ -207,5 +259,92 @@ mod tests {
         let ms = system_time_to_unix_ms(t);
         assert_eq!(ms, -12_345);
         assert_eq!(unix_ms_to_system_time(ms), t);
+    }
+
+    fn set_version(path: &Path, version: i64) {
+        Connection::open(path)
+            .unwrap()
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+    }
+
+    fn version_of(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_child_opens_a_current_database_and_uses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        drop(Store::open(&db).unwrap());
+        let child = Store::open_current(&db).unwrap();
+        child.pin(&SessionId("s1".to_string())).unwrap();
+    }
+
+    #[test]
+    fn a_child_never_migrates_an_older_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        drop(Store::open(&db).unwrap());
+        set_version(&db, SCHEMA_VERSION - 1);
+
+        let Err(err) = Store::open_current(&db) else {
+            panic!("an older schema is not this build's");
+        };
+
+        assert!(matches!(err, StoreError::SchemaMismatch { found } if found == SCHEMA_VERSION - 1));
+        assert!(
+            err.to_string()
+                .starts_with("banto was replaced on disk; restart banto")
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "banto was replaced on disk; restart banto (database schema {}, this build {})",
+                SCHEMA_VERSION - 1,
+                SCHEMA_VERSION
+            )
+        );
+        assert_eq!(version_of(&db), SCHEMA_VERSION - 1, "untouched");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no copy");
+    }
+
+    #[test]
+    fn a_child_refuses_a_newer_database_with_the_same_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        drop(Store::open(&db).unwrap());
+        set_version(&db, SCHEMA_VERSION + 1);
+        let Err(err) = Store::open_current(&db) else {
+            panic!("a newer schema is not this build's");
+        };
+        assert!(matches!(err, StoreError::SchemaMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_child_never_creates_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        assert!(Store::open_current(&db).is_err());
+        assert!(!db.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_child_reads_an_empty_file_as_a_replaced_build_and_leaves_it_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        std::fs::write(&db, b"").unwrap();
+        let Err(err) = Store::open_current(&db) else {
+            panic!("version 0 is not this build's");
+        };
+        assert!(
+            matches!(err, StoreError::SchemaMismatch { found: 0 }),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), 0);
     }
 }

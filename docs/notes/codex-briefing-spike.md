@@ -284,3 +284,19 @@ applies to *every* hook in the merged config for that invocation — including a
 hook whose command changed since a human last reviewed it. Passing it on every
 launch would mean banto silently running whatever else the operator's or the
 project's config happens to contain.
+
+## Addendum, 2026-11-18: replacing banto at the same path keeps the trust
+
+One observation, relayed from the maintainer's dogfood machine (Codex 0.169-era); not
+re-measured by anyone else. On 2026-11-18 the dogfood `banto.exe` was replaced in place
+at 08:41 JST. Codex's `config.toml`, where the `[hooks.state…]` trust record lives, had
+last been written on 2026-11-16 at 18:31 and was not rewritten. A Codex Worker's
+`SessionStart` hook then fired at 09:32:52 (banto's `briefed_at` for it moved). So
+replacing the binary at the same path kept the hook trusted, which fits the key and hash
+described above: the hash covers the hook's command text, and that text holds banto's
+path, not its contents. Codex documents trust as a hash of the exact hook definition.
+
+What this does not show: what happens with a different path (that a second path is a
+different command and so takes the record from the first is inferred from the hash, not
+observed here), or whether a later Codex keeps behaving this way. The installer's
+"replace where it stands" rule rests on this one observation.

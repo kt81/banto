@@ -16,7 +16,7 @@
 //!   requests and message logs live, and the sweep of working files nobody owns any more
 //! - [`config`]  loading `banto_core::config`'s types from disk
 //! - [`directory_trust`] advisory-only read of whether Codex/Claude Code has trusted a given cwd
-//! - [`file_identity`] which directory a path leads to, by the filesystem's own identity rather than its spelling
+//! - [`file_identity`] which directory or file a path leads to, by the filesystem's own identity rather than its spelling
 //! - [`input`] raw terminal events, read and timestamped off their own thread
 //! - [`instance_lock`] the exclusive lock that keeps a second banto UI off one database
 //! - [`lineage`] resolving auto-compaction parent links (beside the provider)

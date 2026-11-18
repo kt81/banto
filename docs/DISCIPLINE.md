@@ -345,6 +345,11 @@ to the database. Taken in `main`'s UI arm, before the store opens, through
 `banto_io::instance_lock`; the decision about what to do with the outcome is the
 plain function `single_instance::claim_database`. Added by reading the code, not by
 repeating the sweep.
+The pre-migration copy: `<database file>.before-v<N>` (and, while it is being written,
+`<database file>.before-v<N>.partial`), beside the database, written by `Store::open`
+only. A finished copy is never overwritten or deleted by banto; a `.partial` is its own
+working name, removed by the next start or by the attempt that failed. Same reading of
+the code.
 Clocks: `Instant::now()` (event loops, relay ticks, click timing, status
 expiry),
 `SystemTime::now()` (store timestamps, discovery `since` — both the

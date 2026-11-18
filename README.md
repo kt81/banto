@@ -30,7 +30,7 @@ merchant house, who stays on the premises and runs the shop.*
 **Cross-platform, raised on Windows.** Development and the heaviest
 dogfooding happen on Windows Terminal + ConPTY, which makes Windows a
 first-class citizen — the workshop, though, not the goal. The codebase
-stays cross-platform (CI builds and tests both Windows and Linux), and
+stays cross-platform (CI builds and tests on Windows, Ubuntu and macOS), and
 Linux dogfooding is underway.
 
 ## Why not just tmux?
@@ -139,9 +139,10 @@ trusted.
 ## Status & caveats
 
 - A personal tool, pre-1.0, moving fast. Interfaces and the on-disk schema
-  migrate forward but nothing is promised yet: banto takes no backup before
-  migrating its database, and an older build cannot open one a newer build has
-  migrated.
+  migrate forward but nothing is promised yet. Before the UI migrates a database it
+  copies it to `banto.db.before-v<N>` beside it (the database as it was at schema
+  `N - 1`; `banto --version` shows the schema a build carries), and an older build
+  cannot open one a newer build has migrated: restore a copy, or run the newer build.
 - **No supervisor, by design.** Sessions hosted in banto's panes end when
   banto does. Each one gets an ordinary console-close first, so `claude`
   finalizes its history exactly as it would on any window close and the
@@ -204,9 +205,111 @@ data, and one Codex's own next run would create regardless. Named here
 rather than smoothed over, because "banto never writes" should mean exactly
 what it says everywhere else.
 
-## Install & run
+## Install & upgrade
 
-Requires a recent stable Rust toolchain (edition 2024).
+**What you need.** `claude` (Claude Code) and/or `codex` on your `PATH` — banto hosts
+the real CLIs and does not bundle them. If either lives somewhere else, name it in
+`config.toml`:
+
+```toml
+[agent_binaries]
+claude = "C:/tools/claude.exe"
+codex = "C:/tools/codex.exe"
+```
+
+**Platforms.** Windows x64, Linux x64 with glibc 2.35 or newer (the release is built on
+Ubuntu 22.04, and the build fails if the binary needs a newer glibc; musl systems such
+as Alpine build from source), and macOS on Apple silicon. Intel Macs and Windows on ARM
+have no prebuilt binary. Windows is where banto is developed and used every day.
+
+> **TODO (maintainer): macOS status.** Not yet checked on a real Mac; it is built and
+> tested in CI only. Replace this line with what the check finds (install, PTY launch
+> and resume, file-watch updates, drawing, input).
+
+### One line
+
+Windows — type this into an open PowerShell (Windows PowerShell 5.1 or PowerShell 7;
+no `-ExecutionPolicy` wrapper is needed):
+
+```powershell
+irm https://github.com/kt81/banto/releases/latest/download/install.ps1 | iex
+```
+
+Linux and macOS:
+
+```sh
+curl -fsSL https://github.com/kt81/banto/releases/latest/download/install.sh | sh
+```
+
+The installer downloads the archive for your platform and `SHA256SUMS` from the release,
+checks the archive against it, and installs nothing if they disagree. (`SHA256SUMS`
+comes from the same release as the archive, so this check shows the download arrived
+intact, not who built it; for that, see the attestation under [By hand](#by-hand).) It
+runs the new binary once before it replaces anything, so a build that cannot start on
+your machine (on Linux, a glibc older than 2.35) leaves the banto you had untouched. Any
+`--version` run it makes is cut off after 10 seconds, with or without a `timeout` command on
+the system, so a banto that hangs is refused rather than waited for. Staging files an earlier killed install left in the target
+directory (`.banto.<random>`, `.banto-<hex>.exe`, over an hour old) are removed. It
+refuses to overwrite a `banto` that is not a banto, whether it is the one on your `PATH`
+or a file already at the install location (a wrapper script, a package manager's shim:
+it must run and answer `--version` with `banto ...`), and warns when more than one banto
+is on `PATH`: only the first is replaced and the others are left for you to remove. It
+prints `banto --version` before and after (`(not installed)` before a first install). It never edits your `PATH` or
+any shell profile: when the directory is not on `PATH` it prints the one line that adds
+it.
+
+Where banto lands, in this order:
+
+1. the `banto` already on your `PATH`, replaced where it is;
+2. `BANTO_INSTALL_DIR`, when no banto is on `PATH` yet;
+3. `%USERPROFILE%\.local\bin\banto.exe` on Windows, `~/.local/bin/banto` elsewhere.
+
+Two environment variables change what the line does. In PowerShell, set them first in
+the same window; in a Unix shell, put them on the `sh` side of the pipe:
+
+```powershell
+$env:BANTO_VERSION = 'v0.1.0'            # a release tag instead of the latest
+$env:BANTO_INSTALL_DIR = 'C:\tools\banto' # where, if no banto is on PATH yet
+irm https://github.com/kt81/banto/releases/latest/download/install.ps1 | iex
+```
+
+```sh
+curl -fsSL https://github.com/kt81/banto/releases/latest/download/install.sh | BANTO_VERSION=v0.1.0 BANTO_INSTALL_DIR="$HOME/bin" sh
+```
+
+### By hand
+
+Download the archive for your platform from the
+[Releases page](https://github.com/kt81/banto/releases) (`banto-<tag>-x86_64-pc-windows-msvc.zip`,
+`banto-<tag>-x86_64-unknown-linux-gnu.tar.gz`, `banto-<tag>-aarch64-apple-darwin.tar.gz`)
+together with `SHA256SUMS`. Compare the archive's sha256 with its line in `SHA256SUMS`
+(`(Get-FileHash <archive>).Hash` in PowerShell; `grep <archive> SHA256SUMS | sha256sum -c -`
+on Linux, `grep <archive> SHA256SUMS | shasum -a 256 -c -` on macOS), then extract the single `banto` / `banto.exe`
+into the directory you chose. Make sure it is the one directory banto lives in (below).
+
+Each archive also carries a build-provenance attestation that says which commit and
+workflow built it. With the [GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify banto-v0.1.0-x86_64-pc-windows-msvc.zip --repo kt81/banto
+```
+
+That verifies the archive you downloaded, not an exe you extracted from it, so run it
+before you unpack. It is the only check here that says where the file came from: the
+`SHA256SUMS` check compares the archive with a list published in the same release, so it
+only tells you the file arrived intact.
+
+### From source
+
+```sh
+cargo install --git https://github.com/kt81/banto banto --locked
+```
+
+This needs a recent stable Rust toolchain (edition 2024) and a C compiler (the bundled
+SQLite is compiled from C). It installs into `~/.cargo/bin`. A later run of the
+installer above finds that copy on your `PATH` and replaces it where it is.
+
+For development, from a checkout:
 
 ```sh
 cargo build --release
@@ -223,6 +326,77 @@ cargo run -- --claude-home /path/to/.claude
 
 (`--emporium` and its alias `--oodana`, from when banto had two modes, are
 still accepted, do nothing, and will be removed.)
+
+### One banto per machine
+
+Keep exactly one banto binary, at one path, with no space in it. Codex reviews banto's
+`SessionStart` hook for trust by the hook's full command, which contains banto's own
+path, so a copy of banto at another path is a different hook to Codex. What that does to
+the trust of the first copy is inferred from how the trust hash is built, not observed
+(see the note below). A path
+containing a space cannot be written into the hook at all, so Codex members would
+launch without their role briefing (Claude Code members are unaffected). Replacing the
+file at the same path kept the trust in the one case that was watched (2026-11-18; see
+[the note](docs/notes/codex-briefing-spike.md#addendum-2026-11-18-replacing-banto-at-the-same-path-keeps-the-trust)),
+which is why the installer always replaces in place instead of installing a second copy.
+The installer warns about a path with a space and about a second banto on `PATH`; it
+refuses neither.
+
+### Upgrading
+
+Quit banto, run the same install line, start banto again.
+
+- **Why quit first.** Both installers refuse while a banto is running from the target
+  file. Windows would not let the file be replaced anyway. On Linux and macOS it can be
+  replaced under a running banto, but that banto then refuses to open members
+  (`banto was replaced on disk; restart banto`) until you restart it, because the
+  helpers it launches would be a different build from the UI. (The release workflow
+  exercises the running-banto refusal on Windows and Linux; on macOS that step is
+  allowed to fail, because the `lsof`-based detection has not run there yet.)
+- **The first start after an upgrade** migrates the database in place. Before it does,
+  it copies the database to `banto.db.before-v<N>` beside it (the database as it was at
+  schema `N - 1`; see [Status & caveats](#status--caveats)). An older build cannot open
+  a database a newer one has migrated, so going back means the older build plus that
+  copy.
+- **One banto UI per database.** A second `banto` that would open a database a running
+  one already uses refuses to start; see [Read-only guarantee](#read-only-guarantee)
+  for how to run two.
+
+### Windows Defender
+
+On 2026-11-06 Microsoft Defender's real-time protection flagged a locally built release
+`banto.exe` as `Trojan:Win32/Bearfoos.A!ml`, a machine-learning detection, and
+remediated it. Remediation ends the process: banto and every session it was hosting
+were closed at once. The debug build was not flagged, and the detection arrived with a
+same-day definitions update. The full account is in [docs/notes/windows-defender.md](docs/notes/windows-defender.md).
+
+What it means for you: a flag on a release build ends banto and its sessions, so it is
+worth knowing it can happen. If Defender flags a banto you downloaded from a release,
+compare its sha256 with `SHA256SUMS` (and, with `gh`, run the attestation check above),
+and [open an issue](https://github.com/kt81/banto/issues) with the detection name and
+your definitions version. Please do not "fix" it by adding an exclusion: an excluded
+directory would also hide a file that really had been tampered with.
+
+### Uninstall
+
+Delete the one `banto` binary (`where.exe banto` / `command -v banto` finds it). To
+remove banto's data as well, delete its config directory (`config.toml`) and its data
+directory (the database `banto.db`, its lock files `banto.db.lock` and
+`banto.db.lock.pid`, the `banto.db.before-v<N>` copies, and the working files: MCP
+configs, consultation requests, message logs) — the locations are under
+[Read-only guarantee](#read-only-guarantee) and [Configuration](#configuration);
+`data_dir`, `BANTO_DATA_DIR` or `db_path` may have put them elsewhere. Sessions stay
+where their agents keep them.
+
+banto writes nothing into `~/.claude` or `~/.codex` (or `$CODEX_HOME`), with the one named
+exception under [Read-only guarantee](#read-only-guarantee): reading a Codex database
+can leave a ~32 KB `-shm` file beside it. One record there does concern banto, though not banto's doing: when you approve banto's Codex hook (the trust
+prompt that appears when a brigade forms), Codex itself records the approval as a
+`[hooks.state.'…<session-flags>…:session_start:0:0']` table with a `trusted_hash` in
+`<codex home>/config.toml`. It is harmless to leave; it only says that hook was approved.
+To remove it, delete that table by hand in Codex's `config.toml`. (Deleting it has not
+been tried here, so what Codex then does is unverified; banto's own check would simply
+read the hook as not yet approved.)
 
 ## Keys
 

@@ -355,6 +355,9 @@ pub struct EmporiumSettings<'a> {
     /// every banto process it starts for a brigade member (`_mcp`, `_hook`), so
     /// they read the same ones.
     pub child: &'a crate::startup::Resolved,
+    /// The banto executable, resolved once at start (`crate::exe`): what every
+    /// brigade member's banto children are started from.
+    pub exe: &'a crate::exe::BantoExe,
     /// What startup has to say about the database: that it is not in the data
     /// directory (`crate::startup::split_database_notice`), or that the check for
     /// another banto on it could not be made (`crate::single_instance`). Shown
@@ -434,13 +437,7 @@ pub fn run(
                 .list_brigades()
                 .unwrap_or_default()
                 .is_empty();
-            // An unknowable executable path counts as launchable: blaming a
-            // space nothing has established is there would be worse than
-            // leaving the trust question to speak for itself.
-            let hook_launchable = match std::env::current_exe() {
-                Ok(exe) => launch::hook_command_is_launchable(&launch::forward_slash_path(&exe)),
-                Err(_) => true,
-            };
+            let hook_launchable = hook_launchable(settings.exe);
             session::codex_trust_notice(
                 banto_io::codex_trust::hook_trust_state(home),
                 true,
@@ -448,9 +445,16 @@ pub fn run(
                 hook_launchable,
             )
         });
+    // The executable's is told with the database's: both are about what banto
+    // stands on, decided before the first frame.
     let startup_notices = session::startup_notices(
         trust_notice,
-        settings.database_notices.clone(),
+        settings
+            .database_notices
+            .iter()
+            .cloned()
+            .chain(settings.exe.watch_notice())
+            .collect(),
         settings.resolved_agents,
         brigade,
     );
@@ -469,6 +473,7 @@ pub fn run(
         enabled_agents,
         codex_catalog: &CodexCli,
         child: Some(settings.child),
+        exe: settings.exe,
     };
     let (mut terminal, mut frame_output) = setup_terminal()?;
     let result = event_loop(
@@ -573,6 +578,9 @@ struct Deps<'a> {
     /// [`EmporiumSettings::child`]); `None` in a test, which then builds the
     /// argv and environment a hand-started child would get.
     child: Option<&'a crate::startup::Resolved>,
+    /// The executable those children are started from, as it was at start; see
+    /// [`crate::exe::BantoExe::check`] for what a member open asks of it.
+    exe: &'a crate::exe::BantoExe,
 }
 
 fn event_loop(
@@ -1296,6 +1304,15 @@ fn sweep_data_dir_with(dir: &DataDir, store: &RefCell<Store>, now: std::time::Sy
     });
 }
 
+/// Whether the hook command could carry the executable's path (no space in it),
+/// by the path resolved at start. An unknowable path counts as launchable:
+/// blaming a space nothing has established is there would be worse than leaving
+/// the trust question to speak for itself.
+fn hook_launchable(exe: &crate::exe::BantoExe) -> bool {
+    exe.path()
+        .is_none_or(|exe| launch::hook_command_is_launchable(&launch::forward_slash_path(exe)))
+}
+
 /// Read whether banto's `SessionStart` hook looks trusted right now —
 /// freshly, not cached, since the operator may have approved it in a pane
 /// since this run started — and whether it could even fire from this
@@ -1308,10 +1325,7 @@ fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
         banto_io::codex_trust::hook_trust_state(home)
             == banto_io::codex_trust::HookTrustState::Primed
     });
-    let hook_launchable = match std::env::current_exe() {
-        Ok(exe) => launch::hook_command_is_launchable(&launch::forward_slash_path(&exe)),
-        Err(_) => true,
-    };
+    let hook_launchable = hook_launchable(deps.exe);
     vec![Event::CodexTrustChecked {
         primed,
         hook_launchable,
@@ -1378,16 +1392,11 @@ fn execute_open_codex_trust_pane(
     deps: &Deps,
     handles: &mut HashMap<SessionKey, PtyHandle>,
 ) -> Vec<Event> {
-    let exe = match std::env::current_exe() {
+    let exe = match deps.exe.check() {
         Ok(exe) => exe,
-        Err(err) => {
-            return vec![Event::SpawnFailed {
-                key,
-                error: err.to_string(),
-            }];
-        }
+        Err(error) => return vec![Event::SpawnFailed { key, error }],
     };
-    let argv = crate::codex_trust::trust_argv(&exe, deps.agent_binaries);
+    let argv = crate::codex_trust::trust_argv(exe, deps.agent_binaries);
     let cwd = std::env::current_dir().ok();
     match PtyHandle::open(
         deps.pty_host,
@@ -1600,6 +1609,13 @@ fn execute_open_embedded(
     // executable, ...) — refused outright rather than spawned wireless (see
     // this function's own doc for why).
     if let Some((brigade_id, token, role)) = &brigade {
+        // This pane's agent is about to start banto children from the path
+        // resolved at start. A file that is no longer the one this UI runs from
+        // would make them another build: refused here, not found out by the agent.
+        let exe = match deps.exe.check() {
+            Ok(exe) => exe,
+            Err(error) => return vec![Event::SpawnFailed { key, error }],
+        };
         let known_id = (!target.id.is_empty()).then_some(target.id.as_str());
         let child_args = deps
             .child
@@ -1609,23 +1625,30 @@ fn execute_open_embedded(
             launch::AgentLaunch::Claude { mcp_config, .. } => data_dir_of(deps)
                 .ok_or_else(|| anyhow::anyhow!("could not determine banto's data directory"))
                 .and_then(|data_dir| {
-                    write_mcp_config(&data_dir, *brigade_id, token, *role, known_id, &child_args)
+                    write_mcp_config(
+                        &data_dir,
+                        exe,
+                        *brigade_id,
+                        token,
+                        *role,
+                        known_id,
+                        &child_args,
+                    )
                 })
                 .map(|path| {
                     *mcp_config = Some(path);
                 }),
-            launch::AgentLaunch::Codex { brigade: slot, .. } => std::env::current_exe()
-                .map_err(anyhow::Error::from)
-                .map(|exe| {
-                    *slot = Some(launch::CodexBrigade {
-                        exe,
-                        brigade_id: *brigade_id,
-                        token: token.clone(),
-                        role: *role,
-                        session: known_id.map(str::to_string),
-                        child_args: child_args.clone(),
-                    });
-                }),
+            launch::AgentLaunch::Codex { brigade: slot, .. } => {
+                *slot = Some(launch::CodexBrigade {
+                    exe: exe.to_path_buf(),
+                    brigade_id: *brigade_id,
+                    token: token.clone(),
+                    role: *role,
+                    session: known_id.map(str::to_string),
+                    child_args: child_args.clone(),
+                });
+                Ok(())
+            }
         };
         if let Err(err) = wiring {
             return vec![Event::SpawnFailed {
@@ -2977,14 +3000,14 @@ pub(crate) fn brigade_env(
 /// `~/.claude`.
 fn write_mcp_config(
     data_dir: &DataDir,
+    exe: &Path,
     brigade_id: BrigadeId,
     token: &str,
     role: BrigadeRole,
     session_id: Option<&str>,
     child_args: &[String],
 ) -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let config = mcp_config_json(&exe, child_args, brigade_id, token, role, session_id);
+    let config = mcp_config_json(exe, child_args, brigade_id, token, role, session_id);
     // A token banto did not issue (a hand-edited store) gets no file rather than
     // one the sweep could not tell from a stranger's: the spawn fails instead.
     let path = data_dir
@@ -9488,6 +9511,7 @@ mod tests {
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
             child: None,
+            exe: crate::exe::test_support::current(),
         };
         let mut handles = HashMap::new();
 
@@ -9557,6 +9581,7 @@ mod tests {
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
             child: None,
+            exe: crate::exe::test_support::current(),
         };
 
         let events = execute_cmd(
@@ -9612,6 +9637,7 @@ mod tests {
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
             child: None,
+            exe: crate::exe::test_support::current(),
         };
 
         let events = execute_cmd(
@@ -9663,6 +9689,7 @@ mod tests {
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
             child: None,
+            exe: crate::exe::test_support::current(),
         };
 
         let events = execute_cmd(
@@ -11786,6 +11813,7 @@ mod tests {
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
             child: None,
+            exe: crate::exe::test_support::current(),
         };
 
         assert_eq!(
@@ -11866,6 +11894,7 @@ mod tests {
             enabled_agents: &enabled_agents,
             codex_catalog: &NoCatalog,
             child: None,
+            exe: crate::exe::test_support::current(),
         };
 
         let goinkyo_briefing = member_briefing(&deps, brigade_id, "goinkyo", BrigadeRole::Goinkyo)
@@ -13088,6 +13117,7 @@ mod tests {
                 enabled_agents: &self.enabled_agents,
                 codex_catalog: &NoCatalog,
                 child: None,
+                exe: crate::exe::test_support::current(),
             }
         }
 
@@ -13729,6 +13759,202 @@ mod tests {
         ("goinkyo", BrigadeRole::Goinkyo),
     ];
 
+    impl BriefingRig {
+        /// Opens `token` as a member of this brigade with `exe` as the banto
+        /// executable the UI resolved at start.
+        fn open_member_with(
+            &self,
+            exe: &crate::exe::BantoExe,
+            agent: AgentKind,
+            token: &str,
+            role: BrigadeRole,
+        ) -> Vec<Event> {
+            let resolved = self.resolved();
+            let deps = Deps {
+                child: Some(&resolved),
+                exe,
+                ..self.fixture.deps()
+            };
+            let Cmd::OpenEmbedded {
+                key,
+                target,
+                model,
+                effort,
+                permission_mode,
+                disallowed_tools,
+                autocompact,
+                ..
+            } = open_embedded_cmd(agent, "", self.data_dir.path())
+            else {
+                unreachable!()
+            };
+            execute_cmd(
+                Cmd::OpenEmbedded {
+                    key,
+                    target,
+                    brigade: Some((self.brigade_id, token.to_string(), role)),
+                    model,
+                    effort,
+                    permission_mode,
+                    disallowed_tools,
+                    autocompact,
+                },
+                &deps,
+                &mut HashMap::new(),
+                &mut Vec::new(),
+            )
+        }
+    }
+
+    /// A stand-in for the installed banto: a file, and the executable resolved
+    /// from it as the UI does at start.
+    fn installed_exe() -> (tempfile::TempDir, PathBuf, crate::exe::BantoExe) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto");
+        std::fs::write(&path, b"v1").unwrap();
+        let exe = crate::exe::BantoExe::at(path.clone());
+        (dir, path, exe)
+    }
+
+    /// An upgrade in place: the new build renamed over the installed path.
+    fn replace_on_disk(path: &Path) {
+        let next = path.with_file_name("banto.new");
+        std::fs::write(&next, b"v2").unwrap();
+        std::fs::rename(&next, path).unwrap();
+    }
+
+    #[test]
+    fn a_member_open_hands_the_agent_the_path_resolved_at_start() {
+        let (_dir, installed, exe) = installed_exe();
+        let rig = BriefingRig::new();
+
+        let events =
+            rig.open_member_with(&exe, AgentKind::ClaudeCode, "worker-1", BrigadeRole::Worker);
+        assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+        let argv = rig.fixture.launches().last().unwrap().argv.clone();
+        let config_path = &argv[argv.iter().position(|a| a == "--mcp-config").unwrap() + 1];
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["banto"]["command"],
+            installed.to_string_lossy().as_ref()
+        );
+
+        let events = rig.open_member_with(&exe, AgentKind::Codex, "worker-1", BrigadeRole::Worker);
+        assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+        let argv = rig.fixture.launches().last().unwrap().argv.clone();
+        let forward = launch::forward_slash_path(&installed);
+        assert!(
+            argv.iter().any(|arg| arg.contains(&forward)),
+            "the Codex overrides carry {forward}: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_member_open_is_refused_once_the_executable_was_replaced_and_starts_nothing() {
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            let (_dir, installed, exe) = installed_exe();
+            let rig = BriefingRig::new();
+            replace_on_disk(&installed);
+
+            let events = rig.open_member_with(&exe, agent, "worker-1", BrigadeRole::Worker);
+
+            assert!(
+                matches!(
+                    &events[..],
+                    [Event::SpawnFailed { error, .. }]
+                        if error == "banto was replaced on disk; restart banto"
+                ),
+                "{agent:?}: {events:?}"
+            );
+            assert!(
+                rig.fixture.launches().is_empty(),
+                "{agent:?}: nothing spawned"
+            );
+            assert!(
+                !rig.data_dir.path().join("mcp").exists(),
+                "{agent:?}: no member config written"
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_open_is_refused_when_the_executable_is_gone() {
+        let (_dir, installed, exe) = installed_exe();
+        let rig = BriefingRig::new();
+        std::fs::remove_file(&installed).unwrap();
+        let events = rig.open_member_with(
+            &exe,
+            AgentKind::ClaudeCode,
+            "director",
+            BrigadeRole::Director,
+        );
+        assert!(
+            matches!(&events[..], [Event::SpawnFailed { error, .. }] if error.contains("replaced on disk")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_trust_pane_is_refused_once_the_executable_was_replaced() {
+        let (_dir, installed, exe) = installed_exe();
+        let rig = BriefingRig::new();
+        replace_on_disk(&installed);
+        let deps = Deps {
+            exe: &exe,
+            ..rig.fixture.deps()
+        };
+        let events = execute_cmd(
+            Cmd::OpenCodexTrustPane {
+                key: SessionKey::from_id("trust"),
+            },
+            &deps,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(&events[..], [Event::SpawnFailed { error, .. }] if error.contains("replaced on disk")),
+            "{events:?}"
+        );
+        assert!(rig.fixture.launches().is_empty());
+    }
+
+    /// Whether the hook can carry the path is judged on the path resolved at
+    /// start, however the file under it has changed since.
+    #[test]
+    fn the_hook_launchable_answer_comes_from_the_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("a folder").join("banto");
+        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
+        std::fs::write(&spaced, b"v1").unwrap();
+        assert!(!hook_launchable(&crate::exe::BantoExe::at(spaced.clone())));
+        replace_on_disk(&spaced);
+        assert!(!hook_launchable(&crate::exe::BantoExe::at(spaced)));
+        assert!(hook_launchable(&crate::exe::BantoExe::Unknown(
+            "x".to_string()
+        )));
+    }
+
+    /// A pane that is not a brigade member starts no banto child, so an upgrade
+    /// does not stop it opening.
+    #[test]
+    fn a_session_that_is_not_a_member_still_opens_after_a_replacement() {
+        let (_dir, installed, exe) = installed_exe();
+        let rig = BriefingRig::new();
+        replace_on_disk(&installed);
+        let deps = Deps {
+            exe: &exe,
+            ..rig.fixture.deps()
+        };
+        let events = execute_cmd(
+            open_embedded_cmd(AgentKind::ClaudeCode, "", rig.data_dir.path()),
+            &deps,
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        );
+        assert!(matches!(&events[..], [Event::Spawned { .. }]), "{events:?}");
+    }
+
     #[test]
     fn a_resumed_member_whose_transcript_holds_its_briefing_gets_no_flag() {
         for (token, role) in MEMBERS {
@@ -14268,6 +14494,7 @@ mod tests {
         let deps = Deps {
             store: &world.store,
             child: None,
+            exe: crate::exe::test_support::current(),
             ..fixture.deps()
         };
         execute_cmd(
@@ -14340,13 +14567,29 @@ mod tests {
         // not tell from a stranger's.
         let dir = tempfile::tempdir().unwrap();
         let data_dir = DataDir::new(dir.path().join("banto"));
-        let err = write_mcp_config(&data_dir, 1, "evil", BrigadeRole::Worker, None, &[])
-            .unwrap_err()
-            .to_string();
+        let err = write_mcp_config(
+            &data_dir,
+            Path::new("banto"),
+            1,
+            "evil",
+            BrigadeRole::Worker,
+            None,
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("evil"), "{err}");
         assert!(!data_dir.root().exists());
-        let path =
-            write_mcp_config(&data_dir, 1, "worker-3", BrigadeRole::Worker, None, &[]).unwrap();
+        let path = write_mcp_config(
+            &data_dir,
+            Path::new("banto"),
+            1,
+            "worker-3",
+            BrigadeRole::Worker,
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(Some(path), data_dir.member_config_path(1, "worker-3"));
     }
 }

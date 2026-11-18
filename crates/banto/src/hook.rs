@@ -149,8 +149,11 @@ fn load_leniently() -> (Config, Option<Store>) {
 /// empty one (refused by [`crate::startup::Resolved::db_path`], so nothing is
 /// opened or created), or a file that will not open. The hook then runs exactly
 /// as it does without a store: no briefing, nothing recorded, `{}` on stdout.
+/// That includes a database at a schema other than this build's: the hook never
+/// migrates (`Store::open_current`), so a banto replaced on disk under a running
+/// UI briefs nobody rather than upgrading the database beneath it.
 fn open_store_leniently(resolved: &crate::startup::Resolved) -> Option<Store> {
-    Store::open(resolved.db_path().ok()?).ok()
+    Store::open_current(resolved.db_path().ok()?).ok()
 }
 
 /// Entry point for `banto _hook`. Always exits 0 (falls off the end of
@@ -611,6 +614,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
         // Beside the home is an ordinary place for it.
         resolved.db_path = Some(dir.path().join("banto.db"));
+        drop(Store::open(resolved.db_path.as_ref().unwrap()).unwrap());
         assert!(open_store_leniently(&resolved).is_some());
     }
 
@@ -632,10 +636,43 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_database_path_still_opens_a_store() {
+    fn a_current_database_still_opens_a_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("banto.db");
-        assert!(open_store_leniently(&resolved_with_db(Some(path.clone()))).is_some());
-        assert!(path.exists());
+        drop(Store::open(&path).unwrap());
+        assert!(open_store_leniently(&resolved_with_db(Some(path))).is_some());
+    }
+
+    /// The hook is a child of the agent a UI started, never the one that creates
+    /// the database: with none there is no store, and nothing appears.
+    #[test]
+    fn a_database_that_does_not_exist_is_not_created_by_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        assert!(open_store_leniently(&resolved_with_db(Some(path.clone()))).is_none());
+        assert!(!path.exists());
+    }
+
+    /// A banto replaced on disk under a running UI: this build's hook must not
+    /// migrate the database beneath that UI. No store, so no briefing, exit 0.
+    #[test]
+    fn a_database_at_another_schema_is_left_alone_and_means_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("banto.db");
+        drop(Store::open(&path).unwrap());
+        let older = banto_io::store::SCHEMA_VERSION - 1;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", older)
+            .unwrap();
+
+        assert!(open_store_leniently(&resolved_with_db(Some(path.clone()))).is_none());
+
+        let version: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, older);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no copy");
     }
 }

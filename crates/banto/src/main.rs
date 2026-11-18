@@ -40,8 +40,10 @@
 //! startup — see `session::agents_ignored_notice`.
 
 mod briefing;
+mod build_info;
 mod codex_trust;
 mod embedded;
+mod exe;
 mod hook;
 mod launch;
 mod mcp;
@@ -73,7 +75,7 @@ use session::{activity_tag, load_rows, thresholds_from};
 
 /// Search and resume local Claude Code sessions.
 #[derive(Parser)]
-#[command(name = "banto", version, about, long_about = None)]
+#[command(name = "banto", version = build_info::version(), about, long_about = None)]
 struct Cli {
     /// Override the Claude home directory (default: config, else
     /// $CLAUDE_CONFIG_DIR, else ~/.claude). Read-only: banto never writes
@@ -248,7 +250,12 @@ fn main() -> Result<()> {
             member,
             role,
         }) => {
-            let store = open_store(&resolved)?;
+            // Never migrates: only the UI does. A schema that is not this
+            // build's is served as a refusal the agent can read.
+            let store = match Store::open_current(resolved.db_path()?) {
+                Ok(store) => store,
+                Err(err) => return mcp::run_refusing_server(&err.to_string()),
+            };
             let claude_home = resolved.claude_home()?;
             let codex_home = resolved.codex_home();
             // The data directory is the parent's (`--data-dir`), so the consultation
@@ -286,6 +293,11 @@ fn main() -> Result<()> {
             // database. Only this arm claims; `_mcp` and `_hook` are this UI's
             // own children and open the same database. Held until `run_emporium`
             // returns, shutdown included.
+            // Before the claim and the store: backing up and migrating a database
+            // can take a while, and a banto replaced meanwhile would otherwise
+            // become the baseline (Windows) or resolve to `<path> (deleted)`
+            // (Linux); see `exe`.
+            let banto_exe = exe::BantoExe::resolve();
             let single_instance::Claim {
                 lock: _instance_lock,
                 notice: instance_notice,
@@ -306,6 +318,7 @@ fn main() -> Result<()> {
                     agent_binaries: &config.agent_binaries,
                     resolved_agents: &resolved_agents,
                     child: &resolved,
+                    exe: &banto_exe,
                     database_notices: startup::split_database_notice(&inputs, &config, &resolved)
                         .into_iter()
                         .chain(instance_notice)
@@ -316,7 +329,8 @@ fn main() -> Result<()> {
     }
 }
 
-/// Open (creating if needed) banto's own sqlite database at the resolved path.
+/// Open (creating and migrating if needed) banto's own sqlite database at the
+/// resolved path. The UI's only: its children use `Store::open_current`.
 fn open_store(resolved: &startup::Resolved) -> Result<Store> {
     Store::open(resolved.db_path()?).context("failed to open banto's database")
 }

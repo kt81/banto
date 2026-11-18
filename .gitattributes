@@ -1,0 +1,4 @@
+# The installers are run as files and piped (`curl | sh`, `irm | iex`): LF everywhere, so a
+# Windows checkout with core.autocrlf cannot hand `sh` a script whose lines end in CR.
+*.sh  text eol=lf
+*.ps1 text eol=lf

@@ -1121,11 +1121,11 @@ crates/
 ├─ banto-io/            # the outside world: everything that touches a filesystem, spawns a process, or talks to sqlite
 │  ├─ provider/         # SessionProvider trait + claude_code impl (JSONL) + codex impl (sqlite)
 │  ├─ status/           # live state (sessions/<pid>.json + PID liveness) — Claude Code only so far
-│  ├─ store/            # rusqlite: groups/pins/archived, brigades, UI preferences
+│  ├─ store/            # rusqlite: groups/pins/archived, brigades, UI preferences; migrations, and backup.rs (the copy taken before one)
 │  ├─ watch/            # filesystem watching (notify) for live TUI updates — `LiveWatch` (debounced reload trigger) + the raw change source
 │  ├─ data_dir.rs       # banto's own data directory (default `dirs::data_local_dir()/banto`, or the one the operator names): where each working file lives, the database included, and the sweep of ended members' files
 │  ├─ instance_lock.rs  # the exclusive lock beside the database that keeps a second banto UI off it, and its pid sidecar
-│  ├─ file_identity.rs  # which directory a path leads to by the filesystem's own identity, for the agent-home check
+│  ├─ file_identity.rs  # which directory or file a path leads to by the filesystem's own identity: the agent-home check, and the executable a UI resolved at start
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ codex_catalog.rs  # the model catalog compiled into the installed Codex: `codex debug models --bundled` behind a trait, bounded by a timeout
@@ -1135,6 +1135,8 @@ crates/
 ├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view (session list, summary), paint (vt100 screen → buffer cells), render_modal, strip (the title status of every tile; the message rows of a collapsed one), hints, text
 └─ banto/               # bin: clap subcommands (banto, banto _mcp, banto _hook, banto list, ...), the one UI's event loop and executors
    ├─ main.rs           # clap CLI and dispatch
+   ├─ exe.rs            # the banto executable, resolved once at UI start with its file identity, and re-checked at each member open
+   ├─ build_info.rs     # what `banto --version` prints: package version, build commit, database schema
    ├─ single_instance.rs # the claim `main`'s UI arm makes on the database before opening the store, and what a refusal or an unchecked claim says
    ├─ startup.rs        # where config, database, data dir and the agent homes are (and what a child is handed)
    ├─ session.rs        # discovery + activity classification into list rows, and the store loaders the list needs (pins, groups, archive, hidden members, Directors)
@@ -1146,10 +1148,10 @@ crates/
 ```
 
 **The store's schema** is versioned by `PRAGMA user_version`; `store/migrations.rs`
-holds one script per version (18 today) and every open applies what is pending,
-under the write lock. banto takes **no backup** before migrating, and an older build
-cannot open a database a newer one has migrated: it reports `unsupported database
-schema version <n>` rather than guess. v17 dropped `panes`, the map of a session to
+holds one script per version (18 today) and the UI's open applies what is pending,
+under the write lock, after a copy of the database (see "Upgrading banto"). An older
+build cannot open a database a newer one has migrated: it reports `unsupported database
+schema version <n>` rather than guess, with the way out in the same line. v17 dropped `panes`, the map of a session to
 its external-terminal pane, which nothing records or reads once banto opens sessions
 only in its own panes; any rows went with it. v18 added
 `brigade_members.joined_after_id`, the highest message id that existed when the
@@ -2942,7 +2944,8 @@ out (quit that banto, or give this one another database through `BANTO_DATA_DIR`
 or the config keys `data_dir` or `db_path`). The claim
 is `single_instance::claim_database`, called in `main`'s UI arm and nowhere else:
 `_mcp` and `_hook` are the running UI's own children (the hook is the agent's) and
-open the database it holds, and `list` and `versions` open none. It comes after the
+open the database it holds without migrating it (see "Upgrading banto"), and `list` and
+`versions` open none. It comes after the
 database path is resolved and checked (a path inside an agent's home is refused
 first) and *before* `Store::open`, because opening migrates, and a migration under a
 running older banto would leave that one unable to reopen its own database. It also
@@ -2971,11 +2974,89 @@ anyway and the status line says so with the kind of the I/O error
 (`single-instance check failed (…)`): refusing there would keep banto off a share
 that merely lacks locks and protect nothing. A directory that cannot be created is
 also an unchecked claim, but it does not start the UI: startup stops at the store,
-which meets the same directory, exactly as it did before there was a lock. It also means two bantos on one
-database, which is what this exists to prevent, can run; the notice is the only
-sign. A banto on another database may still run beside this one, in the same data
+which meets the same directory, exactly as it did before there was a lock. It also
+means two bantos on one database, which is what this exists to prevent, can run; the
+notice is the only sign. A banto on another database may still run beside this one, in the same data
 directory even; the sweep and the file names are discussed under "Working files of
 ended members". Not measured: the lock on a network filesystem, and on macOS.
+
+**Upgrading banto.** A newer banto replacing an older one on disk touches three things
+that outlive the binary, and each has a rule.
+
+*The database is copied before it is migrated.* When the UI (`Store::open`, in `main`'s
+UI arm) opens a database whose `PRAGMA user_version` is above 0 and below the schema
+this build carries, it first writes `<database file>.before-v<N>` beside the database
+(`banto.db.before-v15`; the file name of a `db_path` elsewhere is kept). `N` is the
+version the migration reaches *first*, so the copy always holds schema `N - 1`: a v14
+database becomes `banto.db.before-v15` even when this build goes on to v18. That is the
+reading of the operator's hand-made `before-v15`, `-v16` and `-v17` beside a v18
+database (each is the database before it became that version), and it lets a build
+that carries schema `K` name the copy it can go back to, `before-v<K + 1>`, without
+knowing which build wrote it. The copy is `VACUUM INTO` (a consistent snapshot) to
+`<name>.partial` in the same directory, synced, then given its name by a hard link
+(which fails where the name is taken, on NTFS and Unix, where a rename would replace
+the file on Windows; a filesystem with no hard links falls back to looking and then
+renaming), so a crash leaves at most a `.partial`, which the next start replaces. A
+copy that already exists is never overwritten and no other is written: the older one is
+the better one, and the start goes on. A copy that appears while this one is being
+written is kept too, except on a filesystem with no hard links (FAT, some SMB shares):
+there the look-then-rename is not atomic, and a copy that appears between the look and
+the rename can be replaced. A brand-new database (no file, an empty one, version 0) and
+a current one are not copied. If the copy cannot be written the start fails with one
+error naming the intended path and the cause, and the database is untouched, *not
+migrated*. A `.partial` is removed by the next start or by the attempt that failed; a finished copy
+is never deleted. A database *newer* than the build (`UnsupportedSchemaVersion`) is
+refused with the fix in the error: it was upgraded by a newer banto; run that build, or
+go back with this build and the newest `banto.db.before-v<N>` beside the database with
+`N` at most this build's schema plus one.
+
+*Only the UI migrates.* `Store::open_current` is the door of `_mcp` and `_hook`: it
+opens an existing database (never creating one), never migrates, never copies, and uses
+it only when `user_version` is exactly the schema this build carries; any other value
+(older or newer) is the refusal `banto was replaced on disk; restart banto`, followed by
+the two schema numbers. `_hook` stays lenient (a refusal is "no store": no briefing,
+nothing recorded, `{}` on stdout, exit 0). `_mcp` completes the MCP handshake, lists its
+tools as usual and answers every tool call with that sentence as a tool error, so the
+agent can show it rather than only find a server that failed to start. The reason: on
+Unix a running banto's executable can be replaced, and the next child the UI starts is
+then the new build; if that one migrated, the single-instance lock, which exists so that
+nothing migrates a database under a running banto, would be defeated by the UI's own
+children.
+
+*The executable is resolved once.* At UI start, before the single-instance claim and the
+store (backing up and migrating can take a while, and a banto replaced meanwhile would
+otherwise become the baseline on Windows, or resolve to `<path> (deleted)` on Linux),
+`exe::BantoExe::resolve` reads
+`std::env::current_exe()` and the file's identity (`banto_io::file_identity::file_identity`:
+volume and file index through `GetFileInformationByHandle` on Windows, device and inode
+on Unix: the probe used for directories, which opens nothing for reading and so works
+on a running executable). That value is handed down in `EmporiumSettings::exe` and
+`Deps::exe`, and everything that names the executable uses it instead of asking the
+system again: the `--mcp-config` file's `command`, the Codex `-c` overrides (the `_mcp`
+server and the `_hook` command), the trust pane's argv, and the "can the hook carry this
+path" judgment. At each *member open* (a spawn or resume of a brigade member, which will
+start `banto _mcp` or the Codex hook) and at the trust pane's open, `BantoExe::check`
+reads the identity of that path again: a file that is gone or is another file refuses
+the open with the status line `failed to open: banto was replaced on disk; restart
+banto`, before any member config is written or anything is spawned. A pane that is not
+a brigade member starts no banto child and is not checked. The reason is measured (Linux
+under WSL, 2026-11-18): once a binary is replaced by a rename, `/proc/<pid>/exe` reads
+`<path> (deleted)`, a path with a space in it, and a `current_exe()` asked at each use
+would have handed the Codex hook command a path it cannot carry and dropped the hook
+without a sign. A banto that cannot name its own executable at all still starts; each
+member open then fails with the system's reason. One that names it but cannot read the
+file's identity also starts, and shows one startup notice that a replacement cannot be
+noticed this run (with the error kind); its member opens are not refused. Not
+measured: what replacing a *running* executable does on Windows (the check covers a
+rename-aside, which Windows allows); an in-place rewrite keeps the file's identity and
+is not noticed (Unix refuses that while the executable runs).
+
+*`banto --version`* prints `banto <package version> (commit <commit>, schema <n>)`, for
+example `banto 0.1.0 (commit abc1234, schema 18)`. The commit is
+`option_env!("BANTO_BUILD_COMMIT")`, set by the release workflow when it compiles, and
+printed as given; absent or blank it is `commit unknown` (a `cargo build` or
+`cargo install --git` build). There is no `build.rs`. The schema is
+`banto_io::store::SCHEMA_VERSION`, the number the migrations end at. `-V` prints the same.
 
 **Working files of ended members.** The data directory holds two kinds of
 file per member that nothing used to delete: the MCP config

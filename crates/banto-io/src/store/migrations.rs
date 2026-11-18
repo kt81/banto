@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-const MIGRATIONS: &[&str] = &[
+pub(super) const MIGRATIONS: &[&str] = &[
     // v1: initial schema.
     //
     // `sessions` is a cache mirror of provider discovery; `sessions_fts` is a
@@ -335,12 +335,18 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE brigades ADD COLUMN request_at_ms INTEGER;",
 ];
 
+/// The schema version this build migrates to and knows how to read.
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
 /// Applies all pending migrations. A `user_version` outside the known range
 /// (negative or newer than this build) is rejected.
 ///
-/// Several processes open the same file (the emporium, each agent's `banto`
-/// MCP server and hook), so a migration is decided *under the write
-/// lock*: `BEGIN IMMEDIATE` first, then `user_version`, then apply or skip,
+/// Only the UI migrates (`Store::open`; the processes it starts use
+/// `Store::open_current`), and only one UI uses a database at a time. The
+/// migration is still decided defensively, because several connections do open
+/// the same file (the emporium, each agent's `banto` MCP server and hook) and
+/// the single-instance lock can be unavailable on a filesystem with no locks: it
+/// is decided *under the write lock*: `BEGIN IMMEDIATE` first, then `user_version`, then apply or skip,
 /// then commit. Choosing the script from a version read before taking the lock
 /// would use a stale answer — the process that waited on the lock would run an
 /// `ALTER TABLE ... ADD COLUMN` on a database the other one had already

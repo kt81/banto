@@ -1,0 +1,433 @@
+name: Release
+
+# A tag `v*` builds banto for three targets, installs the result into an empty home with
+# the very installers that ship beside it, attests the three archives (build provenance,
+# verifiable with `gh attestation verify <archive> --repo kt81/banto`), and only then drafts
+# a GitHub Release. The operator publishes the draft; nothing here publishes anything.
+#
+# Run by hand (workflow_dispatch) it does everything except the draft, under a throwaway
+# tag name: a dry run of the whole pipeline without pushing a tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The tag a release is named after. A dry run has no tag, so it gets a throwaway one.
+  TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v0.0.0-dryrun.{0}', github.run_number) }}
+
+permissions:
+  contents: read
+
+jobs:
+  # banto --version prints the Cargo version, so a tag that disagrees would ship a binary
+  # that names a different release than the page it is downloaded from. The comparison is
+  # exact, prerelease suffix included: v0.2.0-rc.1 needs Cargo.toml at 0.2.0-rc.1. A dry run
+  # has no real tag and only reports the version.
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the version of the banto crate
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "banto") | .version')
+          test -n "$version"
+          echo "banto crate version: $version, tag: $TAG"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${TAG#v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match the banto crate version $version; fix Cargo.toml or tag again"
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: check-tag
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # The oldest hosted Ubuntu on purpose: a binary links against the glibc of the
+          # machine that built it, so building on 22.04 (glibc 2.35) runs on anything
+          # newer and not on anything older. The check below fails the build if the
+          # binary needs more than that. musl is not used because rusqlite bundles C that
+          # would need a musl cross toolchain.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      # banto reads this with option_env! to say which commit a binary was built from.
+      BANTO_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # No rust-cache: a release is built from nothing, so a stale cache cannot reach it.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p banto
+      - name: glibc floor of the Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          floor=$(objdump -T "target/${{ matrix.target }}/release/banto" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)
+          echo "The binary needs ${floor:-no versioned glibc symbol} or newer (built on $(ldd --version | head -n 1))"
+          echo "glibc floor: ${floor:-none}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$floor" ] && [ "$(printf '%s\n' "$floor" GLIBC_2.35 | sort -V | tail -n 1)" != "GLIBC_2.35" ]; then
+            echo "::error::the binary needs $floor, newer than the 2.35 this workflow promises"
+            exit 1
+          fi
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -LiteralPath "target/${{ matrix.target }}/release/banto.exe" -DestinationPath "dist/banto-$env:TAG-${{ matrix.target }}.zip"
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          tar -czf "dist/banto-${TAG}-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" banto
+      # Informational only: the hosted runner may not have a usable Defender, and what a
+      # scan of a freshly built, unsigned banto.exe says is exactly what this step is here to
+      # learn. It never fails the job; the verdict goes to the job summary (and a warning
+      # annotation when Defender flags the file).
+      - name: Microsoft Defender scan of banto.exe (informational)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          EXE: target/${{ matrix.target }}/release/banto.exe
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = (Resolve-Path -LiteralPath $env:EXE).Path
+          $lines = @('### Microsoft Defender scan of banto.exe (informational)', '')
+          $mp = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+          if (-not (Test-Path -LiteralPath $mp)) {
+            $newest = Get-ChildItem (Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform') -Directory -ErrorAction SilentlyContinue |
+              Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending | Select-Object -First 1
+            if ($newest) { $mp = Join-Path $newest.FullName 'MpCmdRun.exe' }
+          }
+          if (-not (Test-Path -LiteralPath $mp)) {
+            $lines += 'MpCmdRun.exe is not present on this runner: no scan was run.'
+          } else {
+            $lines += "Scanner: ``$mp``"
+            try {
+              $st = Get-MpComputerStatus -ErrorAction Stop
+              $lines += "- Antivirus signature version: $($st.AntivirusSignatureVersion) (updated $($st.AntivirusSignatureLastUpdated))"
+              $lines += "- Antimalware engine: $($st.AMEngineVersion), service $($st.AMServiceVersion), service enabled: $($st.AMServiceEnabled), real-time protection: $($st.RealTimeProtectionEnabled)"
+            } catch {
+              $lines += "- Get-MpComputerStatus is not available: $($_.Exception.Message)"
+            }
+            $out = @(& $mp -Scan -ScanType 3 -File $exe -DisableRemediation 2>&1 | ForEach-Object { "$_" })
+            $code = $LASTEXITCODE
+            $lines += "- Scan exit code: $code (0 = nothing found, 2 = threat found, anything else = the scan did not run properly)"
+            $lines += '', '```', $out, '```'
+            if ($code -ne 0) { Write-Host "::warning::Defender scan of banto.exe exited with $code; see the job summary" }
+          }
+          $lines | ForEach-Object { Write-Host $_ }
+          if ($env:GITHUB_STEP_SUMMARY) { $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      # An archive with a second file in it, or the binary under another name, is not what
+      # the installers and the attestation were written for.
+      - name: Each archive holds exactly the one binary
+        working-directory: dist
+        run: |
+          python3 - <<'EOF'
+          import glob, sys, tarfile, zipfile
+          archives = sorted(glob.glob("banto-*"))
+          if len(archives) != 3:
+              sys.exit("expected 3 archives, found %r" % (archives,))
+          bad = False
+          for f in archives:
+              if f.endswith(".zip"):
+                  names, want = zipfile.ZipFile(f).namelist(), ["banto.exe"]
+              elif f.endswith(".tar.gz"):
+                  names, want = tarfile.open(f).getnames(), ["banto"]
+              else:
+                  print("::error::unexpected file " + f)
+                  bad = True
+                  continue
+              print(f, names)
+              if names != want:
+                  print("::error::%s holds %r, expected exactly %r" % (f, names, want))
+                  bad = True
+          sys.exit(1 if bad else 0)
+          EOF
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum banto-* > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: dist/*
+          if-no-files-found: error
+
+  # The installers that ship with the release, run against the archives just built, in a
+  # home that has never seen banto: a fresh HOME / USERPROFILE and no banto on PATH.
+  install-test:
+    name: install (${{ matrix.os }})
+    needs: checksums
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+
+      - name: install.sh into an empty home, then upgrade in place
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          dist="$PWD/dist"
+          home=$(mktemp -d)
+          export HOME="$home" BANTO_INSTALL_SOURCE="$dist" BANTO_VERSION="$TAG"
+          unset BANTO_INSTALL_DIR
+          sh install.sh
+          banto="$HOME/.local/bin/banto"
+          test -x "$banto"
+          "$banto" --version | grep -q '^banto '
+          first=$(shasum -a 256 "$banto" | cut -d' ' -f1)
+          # With banto on PATH the second run takes the "replace that file" branch.
+          PATH="$HOME/.local/bin:$PATH" sh install.sh
+          test "$(shasum -a 256 "$banto" | cut -d' ' -f1)" = "$first"
+          test "$(PATH="$HOME/.local/bin:$PATH" command -v banto)" = "$banto"
+          # The same script, piped, the way a user runs it.
+          PATH="$HOME/.local/bin:$PATH" sh < install.sh
+          # A tampered checksum installs nothing and says so.
+          sed 's/^..../0000/' dist/SHA256SUMS > "$home/SHA256SUMS.bad"
+          mkdir "$home/bad"
+          cp dist/banto-* "$home/bad/"
+          cp "$home/SHA256SUMS.bad" "$home/bad/SHA256SUMS"
+          if BANTO_INSTALL_SOURCE="$home/bad" sh install.sh; then
+            echo "::error::a bad checksum was accepted"
+            exit 1
+          fi
+          test "$(shasum -a 256 "$banto" | cut -d' ' -f1)" = "$first"
+
+      # The installer checks that a banto on its target answers `--version` with "banto ...",
+      # so a stand-in has to do that and then stay alive: a tiny program that prints
+      # $STUBV (default "banto 0.0.1-stub") for --version and otherwise sleeps. A copy of
+      # a system shell would be refused as "not a banto" before the running check is reached,
+      # and the test would pass for the wrong reason, so the messages are checked too.
+      # macOS is allowed to fail here: it finds the process with lsof, which no run has
+      # exercised yet, and a wrong guess about it must not block a release.
+      - name: install.sh refuses a running banto, and a file that is not a banto
+        if: runner.os != 'Windows'
+        continue-on-error: ${{ runner.os == 'macOS' }}
+        run: |
+          set -eu
+          home=$(mktemp -d)
+          cat > "$home/stub.c" <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+                  const char *v = getenv("STUBV");
+                  puts(v ? v : "banto 0.0.1-stub");
+                  return 0;
+              }
+              sleep(60);
+              return 0;
+          }
+          EOF
+          mkdir "$home/running"
+          cc -o "$home/running/banto" "$home/stub.c"
+          "$home/running/banto" run &
+          pid=$!
+          sleep 1
+          before=$(shasum -a 256 "$home/running/banto" | cut -d' ' -f1)
+          rc=0
+          out=$(HOME="$home" BANTO_INSTALL_DIR="$home/running" BANTO_INSTALL_SOURCE="$PWD/dist" BANTO_VERSION="$TAG" sh install.sh 2>&1) || rc=$?
+          kill "$pid" || true
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::install.sh replaced a banto that was running"
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q 'is running from' || { echo "::error::refused, but not because banto was running"; exit 1; }
+          test "$(shasum -a 256 "$home/running/banto" | cut -d' ' -f1)" = "$before"
+          # Stopped, the same file is an old banto and is replaced; made to say something else
+          # on --version it is not a banto and is left alone.
+          rc=0
+          out=$(STUBV='hello world' PATH="$home/running:$PATH" HOME="$home" BANTO_INSTALL_SOURCE="$PWD/dist" BANTO_VERSION="$TAG" sh install.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::install.sh overwrote a file that is not a banto"
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q 'does not look like banto' || { echo "::error::refused, but not as a non-banto"; exit 1; }
+          test "$(shasum -a 256 "$home/running/banto" | cut -d' ' -f1)" = "$before"
+          HOME="$home" PATH="$home/running:$PATH" BANTO_INSTALL_SOURCE="$PWD/dist" BANTO_VERSION="$TAG" sh install.sh
+          test "$(shasum -a 256 "$home/running/banto" | cut -d' ' -f1)" != "$before"
+          "$home/running/banto" --version | grep -q '^banto '
+
+      - name: install.ps1 into an empty home, then upgrade in place (Windows PowerShell 5.1 and PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path install.ps1).Path
+          $dist = (Resolve-Path dist).Path
+          # The stand-in for a banto (see the Unix step): Windows PowerShell 5.1 can compile it,
+          # PowerShell 7 cannot.
+          @'
+          using System;
+          using System.Threading;
+          public static class Stub {
+              public static int Main(string[] args) {
+                  if (args.Length > 0 && args[0] == "--version") {
+                      string v = Environment.GetEnvironmentVariable("STUBV");
+                      Console.WriteLine(v != null ? v : "banto 0.0.1-stub");
+                      return 0;
+                  }
+                  Thread.Sleep(60000);
+                  return 0;
+              }
+          }
+          '@ | Set-Content -LiteralPath "$env:RUNNER_TEMP\stub.cs"
+          $stubExe = "$env:RUNNER_TEMP\banto-stub.exe"
+          powershell -NoProfile -Command "Add-Type -TypeDefinition (Get-Content -Raw '$env:RUNNER_TEMP\stub.cs') -OutputType ConsoleApplication -OutputAssembly '$stubExe'"
+          if (-not (Test-Path $stubExe)) { throw 'could not build the stand-in banto' }
+          foreach ($ps in 'powershell', 'pwsh') {
+            $home_ = Join-Path $env:RUNNER_TEMP "home-$ps"
+            New-Item -ItemType Directory -Force "$home_\AppData\Local", "$home_\AppData\Roaming" | Out-Null
+            $env:USERPROFILE = $home_; $env:HOME = $home_
+            $env:LOCALAPPDATA = "$home_\AppData\Local"; $env:APPDATA = "$home_\AppData\Roaming"
+            $env:BANTO_INSTALL_SOURCE = $dist; $env:BANTO_VERSION = $env:TAG
+            Remove-Item Env:BANTO_INSTALL_DIR -ErrorAction SilentlyContinue
+            $path = $env:Path
+
+            & $ps -NoProfile -ExecutionPolicy Bypass -File $installer
+            if ($LASTEXITCODE -ne 0) { throw "$ps install.ps1 failed" }
+            $banto = "$home_\.local\bin\banto.exe"
+            if (-not (Test-Path $banto)) { throw "$ps install.ps1 did not create $banto" }
+            if ((& $banto --version) -notmatch '^banto ') { throw "$banto --version is not banto's" }
+            $first = (Get-FileHash $banto).Hash
+
+            # A banto running from the target blocks the install. The stand-in answers
+            # --version like a banto (the installer checks that first) and then stays alive;
+            # the message is checked too, so a refusal for another reason cannot pass.
+            $running = "$home_\running"
+            New-Item -ItemType Directory $running | Out-Null
+            Copy-Item $stubExe "$running\banto.exe"
+            $p = Start-Process "$running\banto.exe" -ArgumentList 'run' -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 1
+            $env:BANTO_INSTALL_DIR = $running
+            $out = (& $ps -NoProfile -ExecutionPolicy Bypass -File $installer 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+            Stop-Process -Id $p.Id -Force
+            Remove-Item Env:BANTO_INSTALL_DIR
+            Write-Host $out
+            if ($code -eq 0) { throw "$ps install.ps1 replaced a banto that was running" }
+            if ($out -notmatch 'is running from') { throw "$ps install.ps1 refused, but not because banto was running" }
+            Start-Sleep -Seconds 1
+
+            # Stopped, the stand-in is a file that is not a banto once it says something else
+            # on --version: left alone. As an old banto it is replaced.
+            $stubHash = (Get-FileHash "$running\banto.exe").Hash
+            $env:BANTO_INSTALL_DIR = $running
+            $env:STUBV = 'hello world'
+            $out = (& $ps -NoProfile -ExecutionPolicy Bypass -File $installer 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+            Remove-Item Env:STUBV
+            Write-Host $out
+            if ($code -eq 0) { throw "$ps install.ps1 overwrote a file that is not a banto" }
+            if ($out -notmatch 'does not look like banto') { throw "$ps install.ps1 refused, but not as a non-banto" }
+            if ((Get-FileHash "$running\banto.exe").Hash -ne $stubHash) { throw "$ps install.ps1 changed a file that is not a banto" }
+            & $ps -NoProfile -ExecutionPolicy Bypass -File $installer
+            if ($LASTEXITCODE -ne 0) { throw "$ps install.ps1 did not replace an old banto" }
+            Remove-Item Env:BANTO_INSTALL_DIR
+            if ((Get-FileHash "$running\banto.exe").Hash -eq $stubHash) { throw "$ps install.ps1 left the old banto in place" }
+
+            # With banto on PATH the second run takes the "replace that file" branch.
+            $env:Path = "$home_\.local\bin;$path"
+            & $ps -NoProfile -ExecutionPolicy Bypass -File $installer
+            if ($LASTEXITCODE -ne 0) { throw "$ps install.ps1 upgrade failed" }
+            if ((Get-FileHash $banto).Hash -ne $first) { throw 'the upgrade changed the file' }
+            if ((Get-Command banto).Source -ne $banto) { throw 'banto on PATH is not the installed file' }
+
+            # A tampered checksum installs nothing and says so.
+            $bad = "$home_\bad"
+            New-Item -ItemType Directory $bad | Out-Null
+            Copy-Item "$dist\banto-*" $bad
+            $line = (Get-Content "$dist\SHA256SUMS" | Where-Object { $_ -like '*windows*' } | Select-Object -First 1)
+            Set-Content -LiteralPath "$bad\SHA256SUMS" -Value ('0000' + $line.Substring(4))
+            $env:BANTO_INSTALL_SOURCE = $bad
+            & $ps -NoProfile -ExecutionPolicy Bypass -File $installer
+            if ($LASTEXITCODE -eq 0) { throw 'a bad checksum was accepted' }
+            if ((Get-FileHash $banto).Hash -ne $first) { throw 'a bad checksum changed the file' }
+            $env:Path = $path
+          }
+
+  # Build provenance for the archives exactly as they will be published. It runs after the
+  # installers have accepted them, only for a real tag (a dry run would leave attestations
+  # for throwaway archives in the public record), and carries the only token that can sign.
+  attest:
+    if: ${{ success() && startsWith(github.ref, 'refs/tags/') }}
+    needs: [checksums, install-test]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/banto-*
+
+  release:
+    name: draft the release
+    # A dry run stops before this: there is no tag to attach a release to. success() is
+    # written out so that no later edit of `needs` can leave this running after a failure.
+    if: ${{ success() && startsWith(github.ref, 'refs/tags/') }}
+    needs: [checksums, install-test, attest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "$TAG" in *-*) flags="--prerelease" ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft $flags \
+            --title "banto $TAG" --generate-notes \
+            dist/* install.sh install.ps1

@@ -155,6 +155,19 @@ pub fn run_stdio_server(
         goinkyo_dir,
         message_log: message_log.map(|log| MessageLog { log, warned: false }),
     };
+    serve_stdio(|line| handle_line(line, &mut ctx))
+}
+
+/// What the server answers when it has no store to use: the handshake and the
+/// tool list as usual, and every tool call an error saying why. Exiting instead
+/// would show the agent only a server that failed to start, with none of the
+/// words that tell the operator what to do (`Store::open_current`'s refusal,
+/// "banto was replaced on disk; restart banto").
+pub fn run_refusing_server(reason: &str) -> Result<()> {
+    serve_stdio(|line| handle_refusing_line(line, reason))
+}
+
+fn serve_stdio(mut handle: impl FnMut(&str) -> Option<String>) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let stdout = io::stdout();
@@ -170,13 +183,37 @@ pub fn run_stdio_server(
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(trimmed, &mut ctx) {
+        if let Some(response) = handle(trimmed) {
             writer.write_all(response.as_bytes())?;
             writer.write_all(b"\n")?;
             writer.flush()?;
         }
     }
     Ok(())
+}
+
+/// [`handle_line`] for a server with no store: see [`run_refusing_server`].
+fn handle_refusing_line(line: &str, reason: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    let method = msg.get("method").and_then(Value::as_str)?;
+    let id = match msg.get("id") {
+        Some(id) if !id.is_null() => id.clone(),
+        _ => return None,
+    };
+    let result = match method {
+        "initialize" => initialize_result(&msg),
+        "tools/list" => tools_list_result(),
+        "tools/call" => tool_error(reason),
+        "ping" => json!({}),
+        other => {
+            return Some(error_response(
+                id,
+                -32601,
+                &format!("method not found: {other}"),
+            ));
+        }
+    };
+    Some(success_response(id, result))
 }
 
 /// Handle one JSON-RPC message line, returning the response line to write back
@@ -4534,5 +4571,30 @@ mod tests {
         assert!(broken.message_log.as_ref().unwrap().warned);
         let second = call(&mut broken, &send_call("again", Some("worker-1")));
         assert!(!is_error(&second));
+    }
+
+    #[test]
+    fn a_server_with_no_store_still_answers_and_gives_the_reason_to_every_tool_call() {
+        let reason = "banto was replaced on disk; restart banto";
+        let answer = |request: Value| -> Value {
+            let line = handle_refusing_line(&request.to_string(), reason).expect("a reply");
+            serde_json::from_str(&line).unwrap()
+        };
+        let init = answer(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+        assert!(
+            init["result"]["capabilities"]["tools"].is_object(),
+            "{init}"
+        );
+        let list = answer(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+        assert!(
+            !list["result"]["tools"].as_array().unwrap().is_empty(),
+            "the agent still sees the tools"
+        );
+        let call = answer(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"send_to_peer","arguments":{"to":"director","message":"x"}}}));
+        assert_eq!(call["result"]["isError"], true);
+        assert_eq!(call["result"]["content"][0]["text"], reason);
+        let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(handle_refusing_line(notification, reason).is_none());
     }
 }
