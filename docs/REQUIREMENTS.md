@@ -991,6 +991,20 @@ Codex (`codex-cli 0.168.0`):* a command left running stayed alive for 108 s afte
 `task_complete`, with no rollout or sqlite change and no re-invocation at its end.
 Read from the rollout alone, such a session reads as idle.
 
+**Limitation, read from the code and not observed:** a Codex process that dies inside
+a turn leaves `task_started` with no end in its rollout. While no process runs on that
+session nothing reads the stale marker: the pane's screen is gone (`update_pty_exited`),
+so the relay's gather skips the member and `mail_pending` holds no bell for it, and
+`brigade_status` checks that the thread is alive first and says `not running`. It
+bites once a process runs on that session again (an in-place relaunch, or a
+re-stage) and until that session's next turn ends: `is_thread_idle` then reads the
+rollout alone, so the relay reads the member as busy and never nudges it,
+`brigade_status` says `busy (turn in progress)`, and its unread mail holds the
+brigade-quiet bell (`mail_pending`: mail the relay is still going to deliver does
+not count as the brigade waiting on the operator). Not seen: on this machine, a count
+of 773 Codex turns on 2026-11-19 found none cut off, so the consequences above
+follow from how the readers are written and have not happened.
+
 **The pane's own report (OSC 7501).** The Codex TUI announces its lifecycle state in
 its terminal output, and banto reads that announcement. The format is the Program
 Status Protocol, a published protocol and not Codex's own: `ESC ] 7501 ;
@@ -1282,7 +1296,7 @@ store's schema version and the UI's process id. After it, one line per Event or 
 is written, `<unix ms> panes +<ms since start>ms <Kind> <name=value ...>`:
 `Spawned`, `SpawnFailed` (a refusal word per refusal site and the OS error number,
 never the error text), `PtyExited` (the exit code or signal, `asked=yes|no`, the
-member), `PtyOutputLost`, `PtyWriteDropped`, `Reaped` (a released handle and its
+member, `was=idle|not_idle|background|unknown`, and `input_ago_ms=<n>|none`), `PtyOutputLost`, `PtyWriteDropped`, `Reaped` (a released handle and its
 pid), `DiscoveryResult`, `MemberSessionForked` and `PaneSessionMoved` (a brigade member's
 or a solo pane's own process now reports another session id; `held_by_row=yes|no`), `MembershipResolved` and
 `MembershipRoster` (tokens, roles and session ids), `BrigadeFormed`, `WorkerAdded`,
@@ -1297,7 +1311,14 @@ are never written, nor is any Event or Cmd not named here. A Goinkyo line,
 per brigade only when its value changes; it is the same value the spawn decision of
 that tick is made from (`banto_core::engine::decide_goinkyo`). When the brigade's
 roster could not be read the line says `row=unread director=unknown` rather than
-claiming either value.
+claiming either value. `was=` is what the pane's activity read as just before the
+exit, by the reading the quit question and the tiles use (a Codex pane's own report
+first, otherwise the shell's sample; `not_idle` covers both working and waiting on
+the operator, which the reading does not tell apart, and `unknown` is nothing usable
+read). `input_ago_ms=` is the time since the operator last
+gave that pane a key or a paste, `none` when there is no such record (never typed
+into, or the pane was unstaged first). Both are fixed words and an integer: they
+answer "was it mid-turn when it died, and was someone typing" without any pane text.
 
 Nothing in a line is operator or agent text. A line is built from fixed words,
 numbers, flags and identifiers only: no pane bytes, keys, pasted text, message
@@ -1309,9 +1330,12 @@ Bounds: a line is at most 300 bytes. A longer line is cut back to its last whole
 field, so the fields that name the pane and its cause (`key=`, `by=`) come first and
 are the last to go. At most 200 lines are written per minute; the rest are counted,
 and one `suppressed count=<n>` line is written with the next line that is admitted.
-The file is rotated at 4 MiB to `panes.log.1`. Nothing is deleted first: the rename
+A Goinkyo line held by the limit is counted once, however many ticks offer it again
+unchanged before it is admitted. The file is rotated at 4 MiB to `panes.log.1`. Nothing is deleted first: the rename
 replaces the previous generation, so at most two generations exist, and the `start`
-line is written again at the top of the new file. A rename the OS refuses (a reader
+line is written again at the top of the new file, and so is each brigade's current
+Goinkyo line, on the next tick that offers it (the changed-only memory is reset by
+a rotation), so a file can be read on its own. A rename the OS refuses (a reader
 holds the file without delete sharing) changes nothing: the writer keeps appending
 to the current file and tries the rotation again at the next line. Each line is one
 unbuffered write on a handle kept open for the process. A write that fails is
@@ -1984,7 +2008,8 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   Worker took its first turn but was not identified, or a Goinkyo took it and its
   session shows no first message (each reported once, below) —
   owed again the moment banto types the line again; the last allowed attempt
-  (three) was typed and its 15-second acknowledgement window has run out.
+  (three) was typed, no turn was seen after it, and its 15-second acknowledgement
+  window has run out.
 - *Effect:* it records the brigade as wanting the operator (memory only) and, from
   that record, marks the Director's row in the list (the waiting-colour dot, counted
   in `waiting N`; a staged Director's tile reads the same Waiting row) and rings the
@@ -2236,7 +2261,8 @@ operator gave the Goinkyo its own first line, and the kickoff is never typed
 after it. If the acknowledgement window has passed since the Enter and the row has
 no first message, it is reported once (`<name>: took its first turn but its
 session shows no first message — banto will not type it again`) and is no longer
-owed; a row with a first message that appears later drops the entry as before. A
+owed, whatever the attempt count (a turn that ran after the last allowed attempt is
+reported this way, not as "no acknowledgement"); a row with a first message that appears later drops the entry as before. A
 hold is said once in
 the status line (`<name>: not at its prompt — answer what the pane shows, or
 type its first line yourself`), then reminded on the recurring cycle
@@ -2467,7 +2493,12 @@ deliberately not that same nudge line, since no peer has actually sent mail
 yet). The turn this forces is what fires the hook; the hook's own stdin
 carries the real session id, which `banto _hook` records
 (`store::record_briefing`) for `poll_discovery`'s `codex_briefed_session_id`
-to pick up. If the pane is not at its prompt, banto says so once in the
+to pick up. Only a briefing recorded at or after the moment the pane's process was
+spawned counts: the column is never cleared, so a member resumed or re-staged still
+holds the previous process's session id, and taking that one would identify the
+fresh pane as the old session on the first poll (the pane rekeyed to the old id,
+the kickoff dropped as acknowledged with nothing typed, the relay reading the old
+rollout). A briefing with no recorded time cannot show it is newer and is ignored. If the pane is not at its prompt, banto says so once in the
 status line (`<name>: not at its prompt — answer what the pane shows, or type its
 first line yourself`) and keeps re-checking every tick rather than typing blind or
 giving up — answering what the pane shows lets the kickoff resume on its own next
@@ -2496,7 +2527,10 @@ the pane) after banto's Enter went out — it was `idle` when the line was typed
 a turn ran, and the line is never typed again,
 identified or not: if the session is still not discovered when the window runs
 out it is reported once (`<name>: took its first turn but was not identified —
-banto will not type it again`) and is no longer owed. Exhaustion remains visible
+banto will not type it again`) and is no longer owed. This holds at any attempt
+count: a turn that ran after the third and last attempt is reported so, and is
+never told "no acknowledgement after 3 attempts", which is for a line that was typed
+three times with no turn seen. Exhaustion remains visible
 as a periodic qualified status reminder rather than silently looping.
 
 **Lifecycle.** A Worker is disposable. Prefix-`x` on a Worker's (or the Goinkyo's)

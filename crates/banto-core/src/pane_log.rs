@@ -17,7 +17,7 @@ use std::fmt::Display;
 use std::hash::Hash;
 
 use crate::engine::{Cmd, Event, GoinkyoLook, GoinkyoRow, SessionKey, StoreIntent};
-use crate::model::{AgentKind, BrigadeId, MemberToken, PtyExitReason};
+use crate::model::{AgentKind, BrigadeId, MemberToken, PtyExitReason, Quiescence};
 
 /// No line is longer than this. A line over it loses its trailing fields, whole
 /// (see [`Line::render`]). The prefix, the kind, a `key=` and a `by=` are placed
@@ -160,6 +160,12 @@ pub struct PaneFacts {
     pub asked: bool,
     pub member: Option<(BrigadeId, MemberToken)>,
     pub pid: Option<u32>,
+    /// What the pane's activity read as just before the Event, by the reading the
+    /// quit question and the tiles use. `None` for an Event that reads no pane.
+    pub was: Option<Quiescence>,
+    /// Milliseconds since the operator last gave the pane a key or a paste, when
+    /// the state still holds a stamp for it.
+    pub input_ago_ms: Option<u128>,
 }
 
 /// What the shell adds to a Cmd: whether the pane's key held a handle before
@@ -281,6 +287,8 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
                 &facts.member,
             )
             .flag("asked", facts.asked)
+            .word("was", was_word(facts.was))
+            .input_ago(facts.input_ago_ms)
             .exit(reason.as_ref()),
         ],
         Event::PtyOutputLost { key } => vec![with_member(
@@ -688,7 +696,25 @@ fn agent_word(agent: Option<AgentKind>) -> &'static str {
     }
 }
 
+/// The fixed word for what a pane's activity read as. A pane nothing was read for
+/// is `unknown`, as one the reading could not tell.
+fn was_word(was: Option<Quiescence>) -> &'static str {
+    match was {
+        Some(Quiescence::Idle) => "idle",
+        Some(Quiescence::NotIdle) => "not_idle",
+        Some(Quiescence::Background) => "background",
+        Some(Quiescence::Unknown) | None => "unknown",
+    }
+}
+
 impl Line {
+    fn input_ago(self, ago_ms: Option<u128>) -> Self {
+        match ago_ms {
+            Some(ms) => self.num("input_ago_ms", ms),
+            None => self.word("input_ago_ms", "none"),
+        }
+    }
+
     fn exit(self, reason: Option<&PtyExitReason>) -> Self {
         match reason {
             Some(PtyExitReason::Code(code)) => self.word("exit", "code").num("code", code),
@@ -730,6 +756,18 @@ pub enum Admission {
 
 impl RateLimit {
     pub fn admit(&mut self, now_ms: u128) -> Admission {
+        self.admit_counting(now_ms, true)
+    }
+
+    /// [`Self::admit`] for a line that was already counted as suppressed when it
+    /// was first dropped and is offered again unchanged: a state line held by the
+    /// limit is offered again on every tick, and counting each offer would report
+    /// one held line as many. It still uses a slot of the window when admitted.
+    pub fn readmit(&mut self, now_ms: u128) -> Admission {
+        self.admit_counting(now_ms, false)
+    }
+
+    fn admit_counting(&mut self, now_ms: u128, count_drop: bool) -> Admission {
         let in_window = self
             .window_start_ms
             .is_some_and(|start| now_ms.saturating_sub(start) < WINDOW_MS);
@@ -743,7 +781,9 @@ impl RateLimit {
                 suppressed: std::mem::take(&mut self.suppressed),
             }
         } else {
-            self.suppressed += 1;
+            if count_drop {
+                self.suppressed += 1;
+            }
             Admission::Drop
         }
     }
@@ -777,6 +817,12 @@ impl<K: Hash + Eq> ChangedOnly<K> {
     /// Records `body` as the state `key` was last written in.
     pub fn remember(&mut self, key: K, body: &str) {
         self.last.insert(key, body.to_string());
+    }
+
+    /// Forgets every body, so each key reads as changed again and is written
+    /// again the next time it is offered.
+    pub fn clear(&mut self) {
+        self.last.clear();
     }
 }
 

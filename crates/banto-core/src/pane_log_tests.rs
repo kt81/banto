@@ -8,7 +8,7 @@ use crate::engine::{
     SpawnRefusal, StoreIntent, decide_goinkyo,
 };
 use crate::input::InputEvent;
-use crate::model::{BrigadeRole, PtyExitReason, SessionToOpen, StoredLayout};
+use crate::model::{BrigadeRole, PtyExitReason, Quiescence, SessionToOpen, StoredLayout};
 
 /// Text that must never reach a line. It is token-shaped on purpose: a text field
 /// passed through `token()` or `id()` by mistake would let it through, and this
@@ -40,6 +40,8 @@ fn every_text_carrying_variant_leaves_its_marker_out() {
         asked: true,
         member: Some((9, "worker-a".to_string())),
         pid: Some(4321),
+        was: Some(Quiescence::NotIdle),
+        input_ago_ms: Some(1234),
     };
     let text_events = vec![
         Event::Input(InputEvent::Paste(MARKER.to_string())),
@@ -272,13 +274,45 @@ fn pty_exit_line_names_the_pane_its_member_and_the_reason() {
         asked: false,
         member: Some((7, "worker-a".to_string())),
         pid: Some(4321),
+        was: Some(Quiescence::Idle),
+        input_ago_ms: Some(2500),
     };
     let lines = event_lines(&ev, &facts);
     assert_eq!(lines.len(), 1);
     assert_eq!(
         lines[0].render(1_000, 5),
-        "1000 panes +5ms PtyExited key=sess-1 pid=4321 brigade=7 member=worker-a asked=no exit=code code=0"
+        "1000 panes +5ms PtyExited key=sess-1 pid=4321 brigade=7 member=worker-a asked=no was=idle input_ago_ms=2500 exit=code code=0"
     );
+}
+
+#[test]
+fn pty_exit_line_says_what_the_pane_was_doing_in_one_fixed_word() {
+    let ev = Event::PtyExited {
+        key: SessionKey::from_id("sess-1"),
+        reason: None,
+    };
+    let body = |was, input_ago_ms| {
+        let facts = PaneFacts {
+            was,
+            input_ago_ms,
+            ..PaneFacts::default()
+        };
+        event_lines(&ev, &facts)[0].body()
+    };
+    for (was, word) in [
+        (Some(Quiescence::Idle), "idle"),
+        (Some(Quiescence::NotIdle), "not_idle"),
+        (Some(Quiescence::Background), "background"),
+        (Some(Quiescence::Unknown), "unknown"),
+        (None, "unknown"),
+    ] {
+        assert!(
+            body(was, None).contains(&format!(" was={word} input_ago_ms=none ")),
+            "{was:?}: {}",
+            body(was, None)
+        );
+    }
+    assert!(body(None, Some(0)).contains(" input_ago_ms=0 "));
 }
 
 #[test]

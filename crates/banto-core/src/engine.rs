@@ -2200,9 +2200,12 @@ impl EmporiumState {
     }
 
     /// What the pane log says about the pane at `key`, read before the Event
-    /// about it is folded: whether its exit was asked for, and the member it
-    /// belongs to. The shell adds the process id, which only it holds.
-    pub fn pane_facts(&self, key: &SessionKey) -> PaneFacts {
+    /// about it is folded: whether its exit was asked for, the member it
+    /// belongs to, what its activity read as ([`Self::quiescence_of`], the reading
+    /// the quit question uses) and how long ago the operator last gave it a key
+    /// or a paste ([`Self::last_given_input`]). The shell adds the process id,
+    /// which only it holds.
+    pub fn pane_facts(&self, app: &App, key: &SessionKey, now: Instant) -> PaneFacts {
         let member = self
             .member_of(key)
             .or_else(|| self.expected_exits.get(key).cloned().flatten());
@@ -2210,6 +2213,11 @@ impl EmporiumState {
             asked: self.expected_exits.contains_key(key),
             member,
             pid: None,
+            was: Some(self.quiescence_of(app, key)),
+            input_ago_ms: self
+                .last_given_input
+                .get(key)
+                .map(|at| now.saturating_duration_since(*at).as_millis()),
         }
     }
 
@@ -2822,7 +2830,8 @@ impl EmporiumState {
     /// not identified ([`PendingKickoff::stuck`], each told to the operator once,
     /// owed again once banto types the line again); and the last allowed attempt
     /// was typed and its acknowledgement window has run out (banto reports the
-    /// failure). In each of those the brigade really is waiting on the operator, which is
+    /// failure, or, when its turn ran, that it was not identified). In each of
+    /// those the brigade really is waiting on the operator, which is
     /// what the bell is for. Panes that get no typed kickoff — a Claude Worker,
     /// the Director, a resumed member — have no entry and are never owed.
     fn kickoff_owed(&self, key: &SessionKey, now: Instant) -> bool {
@@ -10355,17 +10364,19 @@ fn update_tick(
         );
     }
 
+    // A member whose turn was seen is not in this list however many attempts it
+    // took: its turn ran, and the gate above reports that it was not identified.
     let mut failures: Vec<(Option<BrigadeId>, MemberToken)> = state
         .pending_kickoffs
         .iter()
-        .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS)
+        .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS && !pending.turn_seen)
         .map(|pending| state.kickoff_member(&pending.key))
         .collect();
     failures.extend(
         state
             .pending_goinkyo_kickoffs
             .iter()
-            .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS)
+            .filter(|pending| pending.attempts >= KICKOFF_MAX_ATTEMPTS && !pending.turn_seen)
             .map(|pending| state.kickoff_member(&pending.key)),
     );
     if state
@@ -10696,8 +10707,8 @@ fn kickoff_due(
 /// What a pending kickoff does this tick before its pane is asked about its
 /// prompt.
 enum KickoffGate {
-    /// Nothing to do: not due yet, out of attempts, or a turn ran and the entry
-    /// is only waiting to be acknowledged.
+    /// Nothing to do: not due yet, out of attempts with no turn seen, or a turn
+    /// ran and the entry is only waiting to be acknowledged.
     Wait,
     /// The line was typed, its Enter went out, the pane then showed a turn, and
     /// the acknowledgement window has run out without the session being found.
@@ -10730,9 +10741,9 @@ fn kickoff_gate(
     input: KickoffGateInput,
     now: Instant,
 ) -> KickoffGate {
-    if input.attempts >= KICKOFF_MAX_ATTEMPTS {
-        return KickoffGate::Wait;
-    }
+    // Before the attempt cap: a turn that ran after the last allowed attempt is
+    // a member that took its turn and was not identified, which is not the
+    // "no acknowledgement" failure the cap reports.
     if input.turn_seen {
         let ack_over = input
             .sent_at
@@ -10742,6 +10753,9 @@ fn kickoff_gate(
         } else {
             KickoffGate::Wait
         };
+    }
+    if input.attempts >= KICKOFF_MAX_ATTEMPTS {
+        return KickoffGate::Wait;
     }
     if !kickoff_due(
         state,
@@ -18464,6 +18478,58 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_worker_whose_last_attempt_took_its_turn_is_not_told_it_got_no_acknowledgement() {
+        let (mut state, mut app, brigade, key, t0) = codex_kickoff_fixture();
+        // The third and last attempt was typed and its turn ran; no session was found.
+        state.pending_kickoffs[0].attempts = KICKOFF_MAX_ATTEMPTS;
+        state.pending_kickoffs[0].sent_at = Some(t0);
+        state.pending_kickoffs[0].turn_seen = true;
+        paint_codex_prompt(&mut state, &key, Some("idle"));
+
+        let at = t0 + KICKOFF_ACK_TIMEOUT;
+        let cmds = kickoff_tick(&mut state, &mut app, &brigade, at);
+
+        assert!(writes_of(&cmds).is_empty(), "never typed again: {cmds:?}");
+        assert_eq!(
+            state.status,
+            Some(kickoff_notice(
+                &state,
+                &app,
+                &key,
+                NOTICE_CODEX_UNIDENTIFIED
+            )),
+            "its turn ran, so it is not the max-attempts failure"
+        );
+
+        // Nor on the ticks after it, once the notice has gone.
+        for step in 1..=3u32 {
+            kickoff_tick(&mut state, &mut app, &brigade, at + STATUS_TIMEOUT * step);
+            assert!(
+                state
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| !status.contains("no acknowledgement")),
+                "{:?}",
+                state.status
+            );
+        }
+
+        // The same entry with no turn seen is still the failure.
+        let (mut state, mut app, brigade, _key, t0) = codex_kickoff_fixture();
+        state.pending_kickoffs[0].attempts = KICKOFF_MAX_ATTEMPTS;
+        state.pending_kickoffs[0].sent_at = Some(t0);
+        kickoff_tick(&mut state, &mut app, &brigade, t0 + KICKOFF_ACK_TIMEOUT);
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("kickoff: no acknowledgement after 3")),
+            "{:?}",
+            state.status
+        );
+    }
+
+    #[test]
     fn a_first_turn_that_ended_in_error_is_a_turn_and_the_line_is_never_retyped() {
         // `error` is sticky, so once the operator interacts the report goes back
         // to `idle`: the next look finds an idle pane with an empty prompt, the
@@ -18696,6 +18762,71 @@ mod tests {
             t0 + KICKOFF_ACK_TIMEOUT - Duration::from_secs(1),
         );
         assert!(writes_of(&early).is_empty(), "{early:?}");
+    }
+
+    #[test]
+    fn a_goinkyo_whose_last_attempt_took_its_turn_is_not_told_it_got_no_acknowledgement() {
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
+        state.pending_goinkyo_kickoffs[0].attempts = KICKOFF_MAX_ATTEMPTS;
+        state.pending_goinkyo_kickoffs[0].turn_seen = true;
+
+        let at = t0 + KICKOFF_ACK_TIMEOUT;
+        let cmds = goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            at,
+        );
+
+        assert!(writes_of(&cmds).is_empty(), "{cmds:?}");
+        assert_eq!(
+            state.status,
+            Some(kickoff_notice(&state, &app, &key, NOTICE_GOINKYO_NO_ROW)),
+            "its turn ran, so it is not the max-attempts failure"
+        );
+        assert!(!state.kickoff_owed(&key, at), "reported, so not owed");
+
+        // Nor on the ticks after it, once the notice has gone: the failed
+        // reminder can only fire when no status is showing.
+        for step in 1..=3u32 {
+            goinkyo_tick_observing(
+                &mut state,
+                &mut app,
+                &brigade,
+                vec![goinkyo_observation(&key, Some(true))],
+                at + STATUS_TIMEOUT * step,
+            );
+            assert!(
+                state
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| !status.contains("no acknowledgement")),
+                "{:?}",
+                state.status
+            );
+        }
+
+        // The same entry with no turn seen is still the failure.
+        let (mut state, mut app, brigade, key, t0) =
+            goinkyo_kickoff_retry_state(|screen| draw_prompt_on(screen, None), true);
+        state.pending_goinkyo_kickoffs[0].attempts = KICKOFF_MAX_ATTEMPTS;
+        goinkyo_tick_observing(
+            &mut state,
+            &mut app,
+            &brigade,
+            vec![goinkyo_observation(&key, Some(true))],
+            t0 + KICKOFF_ACK_TIMEOUT,
+        );
+        assert!(
+            state
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("kickoff: no acknowledgement after 3")),
+            "{:?}",
+            state.status
+        );
     }
 
     #[test]
@@ -27833,7 +27964,7 @@ mod tests {
         state.pending_dismiss = Some(key.clone());
         state.pending_dismiss_member = Some((1, "worker-3".to_string()));
         assert_eq!(
-            state.pane_facts(&key).member,
+            state.pane_facts(&app, &key, now).member,
             Some((1, "worker-3".to_string()))
         );
 
@@ -27844,12 +27975,38 @@ mod tests {
                 .any(|cmd| matches!(cmd, Cmd::KillPty { key: killed } if *killed == key)),
             "dismissing a staged Worker kills its pane: {cmds:?}"
         );
-        let facts = state.pane_facts(&key);
+        let facts = state.pane_facts(&app, &key, now);
         assert!(facts.asked, "the kill is on record");
         assert_eq!(
             facts.member,
             Some((1, "worker-3".to_string())),
             "the member is still named after the unstage"
+        );
+    }
+
+    #[test]
+    fn the_pane_facts_carry_the_activity_reading_and_the_age_of_the_operators_last_input() {
+        let (mut state, app, _brigade, now) = weighted_three_worker_brigade();
+        let key = SessionKey::from_id("w3");
+
+        // A pane nothing was read for, and one the operator never typed into.
+        let facts = state.pane_facts(&app, &key, now);
+        assert_eq!(facts.was, Some(Quiescence::Unknown));
+        assert_eq!(facts.input_ago_ms, None);
+
+        state.quiescence.insert(key.clone(), Quiescence::NotIdle);
+        state
+            .last_given_input
+            .insert(key.clone(), now - Duration::from_millis(2500));
+        let facts = state.pane_facts(&app, &key, now);
+        assert_eq!(facts.was, Some(Quiescence::NotIdle));
+        assert_eq!(facts.input_ago_ms, Some(2500));
+
+        // The reading is the one the quit question uses, not a second one.
+        state.quiescence.insert(key.clone(), Quiescence::Background);
+        assert_eq!(
+            state.pane_facts(&app, &key, now).was,
+            Some(state.quiescence_of(&app, &key))
         );
     }
 

@@ -871,7 +871,7 @@ fn event_loop(
             // the log names are the ones the event found, not the ones it leaves.
             let by = pane_lines::event_name(&ev);
             if let Some(log) = pane_log.as_mut() {
-                let facts = pane_facts_for(&state, &handles, &ev);
+                let facts = pane_facts_for(&state, app, &handles, &ev, now);
                 log.emit_all(&pane_lines::event_lines(&ev, &facts));
             }
             let cmds = engine::update(&mut state, app, brigade, ev, now);
@@ -2163,17 +2163,27 @@ fn poll_solo_codex_discovery(
 /// `threads` row, nothing), so this is that same fact reaching the store
 /// instead, once `crate::engine`'s kickoff mechanism has forced that first
 /// turn to happen.
+///
+/// Only a briefing recorded at or after `since`, the moment this pane's child
+/// was spawned. Nothing clears the column, so a member that was resumed or
+/// re-staged still carries the id of its previous process; taking that one
+/// identified the fresh pane as the old session on the first poll, before the
+/// new process had taken a turn, and the pane was then rekeyed to the old id
+/// with its kickoff dropped as acknowledged. A row with no `briefed_at` cannot
+/// show it is newer, so it is not used either.
 fn codex_briefed_session_id(
     store: &RefCell<Store>,
     brigade_id: BrigadeId,
     token: &str,
+    since: SystemTime,
 ) -> Option<String> {
     store
         .borrow()
         .brigade_members(brigade_id)
         .ok()?
         .into_iter()
-        .find(|member| member.token == token)?
+        .find(|member| member.token == token)
+        .filter(|member| member.briefed_at.is_some_and(|at| at >= since))?
         .briefed_session_id
         .map(|session_id| session_id.0)
 }
@@ -2199,7 +2209,8 @@ fn codex_briefed_session_id(
 ///    child isn't the `claude` process itself (see `PtyIo::pid`).
 /// 3. **The store's `briefed_session_id`** ([`codex_briefed_session_id`]),
 ///    tried only for a tracker whose `agent` is `AgentKind::Codex`: sources
-///    1 and 2 don't apply to it at all — see that function's own doc.
+///    1 and 2 don't apply to it at all — see that function's own doc. Only a
+///    briefing recorded since the tracker's spawn counts.
 ///
 /// No tracker gives up: each lives until it resolves or its pane's screen is
 /// gone (the loop prunes trackers against `state.screens`). A Codex Worker's
@@ -2269,7 +2280,7 @@ fn poll_discovery(
                     .then_some(tracker.member.as_ref())
                     .flatten()
                     .and_then(|(brigade_id, token)| {
-                        codex_briefed_session_id(store, *brigade_id, token)
+                        codex_briefed_session_id(store, *brigade_id, token, tracker.since)
                     })
                     .filter(|id| !claimed.contains(id) && !used_this_pass.contains(id))
             });
@@ -2746,15 +2757,17 @@ fn open_pane_log(deps: &Deps) -> Option<PaneLog> {
 /// carry what they need themselves.
 fn pane_facts_for(
     state: &EmporiumState,
+    app: &App,
     handles: &HashMap<SessionKey, PtyHandle>,
     ev: &Event,
+    now: Instant,
 ) -> pane_lines::PaneFacts {
     let Some(key) = pane_lines::pane_facts_key(ev) else {
         return pane_lines::PaneFacts::default();
     };
     pane_lines::PaneFacts {
         pid: handles.get(key).and_then(PtyHandle::pid),
-        ..state.pane_facts(key)
+        ..state.pane_facts(app, key, now)
     }
 }
 
@@ -10426,7 +10439,9 @@ mod tests {
         let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
         let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
 
-        let mut trackers = vec![codex_tracker(brigade_id, "worker-1", SystemTime::now())];
+        // Spawned before the hook recorded the briefing above.
+        let spawned = SystemTime::now() - Duration::from_secs(5);
+        let mut trackers = vec![codex_tracker(brigade_id, "worker-1", spawned)];
 
         let events = poll_discovery(
             &mut trackers,
@@ -10444,6 +10459,72 @@ mod tests {
                     if session_id == "w1" && member.as_ref().unwrap().1 == "worker-1"
             ),
             "no live-state file or session file exists for Codex; the store is the only source: {events:?}"
+        );
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn a_briefing_left_over_from_an_earlier_process_does_not_identify_a_fresh_pane() {
+        let mut store = Store::open_in_memory().unwrap();
+        let brigade_id = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(brigade_id, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let spawned = SystemTime::now();
+        store
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("old".to_string()),
+                spawned - Duration::from_secs(60),
+            )
+            .unwrap();
+        let store = RefCell::new(store);
+        let claude_home = tempfile::tempdir().unwrap();
+        let provider = ClaudeCodeProvider::new(ClaudeHome::new(claude_home.path().to_path_buf()));
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut trackers = vec![codex_tracker(brigade_id, "worker-1", spawned)];
+
+        for _ in 0..2 {
+            assert!(
+                poll_discovery(
+                    &mut trackers,
+                    &provider,
+                    &HashSet::new(),
+                    &[],
+                    &store,
+                    &claude_home_ref,
+                )
+                .is_empty(),
+                "the old process's briefing is not this pane's session"
+            );
+            assert_eq!(trackers.len(), 1, "still waiting for the new process");
+        }
+
+        // The new process takes its first turn and its hook records its own id.
+        store
+            .borrow_mut()
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("new".to_string()),
+                spawned + Duration::from_secs(5),
+            )
+            .unwrap();
+        let events = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &[],
+            &store,
+            &claude_home_ref,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::DiscoveryResult { session_id, .. }] if session_id == "new"
+            ),
+            "a briefing written after the spawn identifies the pane: {events:?}"
         );
         assert!(trackers.is_empty());
     }

@@ -18,6 +18,7 @@
 //! the next line. Every file begins with the start line, written again after
 //! each rotation, so each file can be read on its own.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,9 @@ pub struct PaneLog {
     started: Instant,
     rate: RateLimit,
     goinkyo: ChangedOnly<BrigadeId>,
+    /// The Goinkyo state body per brigade that the rate limit last dropped, so the
+    /// same held line, offered again every tick, is counted as suppressed once.
+    held: HashMap<BrigadeId, String>,
     /// The start line every file begins with.
     start: Option<Line>,
     /// Whether the file in use still has to begin with [`Self::start`].
@@ -78,6 +82,7 @@ impl PaneLog {
             started: Instant::now(),
             rate: RateLimit::default(),
             goinkyo: ChangedOnly::default(),
+            held: HashMap::new(),
             start: None,
             start_pending: false,
         })
@@ -119,16 +124,32 @@ impl PaneLog {
             return;
         }
         // Remembered only once it is written, so a line the rate limit drops is
-        // still a change on the next tick, and is written then.
-        if self.emit_at(&line, since) {
+        // still a change on the next tick, and is written then. The offer that
+        // follows a drop is the same line again, and is not counted again.
+        let already_counted = self.held.get(&look.brigade_id) == Some(&body);
+        if self.emit_counted(&line, since, !already_counted) {
+            self.held.remove(&look.brigade_id);
             self.goinkyo.remember(look.brigade_id, &body);
+        } else {
+            self.held.insert(look.brigade_id, body);
         }
     }
 
     /// Admits and writes `line` at `since` milliseconds from the start. Returns
     /// whether it was admitted.
     fn emit_at(&mut self, line: &Line, since: u128) -> bool {
-        match self.rate.admit(since) {
+        self.emit_counted(line, since, true)
+    }
+
+    /// [`Self::emit_at`], with `count_drop` false for a line already counted as
+    /// suppressed when it was first dropped.
+    fn emit_counted(&mut self, line: &Line, since: u128, count_drop: bool) -> bool {
+        let admission = if count_drop {
+            self.rate.admit(since)
+        } else {
+            self.rate.readmit(since)
+        };
+        match admission {
             Admission::Drop => false,
             Admission::Write { suppressed } => {
                 if suppressed > 0 {
@@ -187,6 +208,10 @@ impl PaneLog {
             self.file = None;
             self.written = 0;
             self.start_pending = self.start.is_some();
+            // A state line written only when it changes is in the file that was
+            // just renamed. Forgotten, the next offer of each brigade's state
+            // writes it again, so the new file can be read on its own.
+            self.goinkyo.clear();
         }
     }
 
@@ -303,6 +328,48 @@ mod tests {
     }
 
     #[test]
+    fn a_rotation_writes_the_unchanged_goinkyo_state_again_in_the_new_file() {
+        let dir = TempDir::new().unwrap();
+        let mut log = PaneLog::with_limit(dir.path(), 500).expect("opens");
+        log.start(&start_line("0.1.0", "unknown", 23, 1));
+        log.goinkyo(&look("no_pane"));
+        log.goinkyo(&look("no_pane"));
+        let is_state = |line: &&str| line.contains(" goinkyo brigade=3 ");
+        assert_eq!(
+            read(dir.path(), FILE_NAME).lines().filter(is_state).count(),
+            1,
+            "unchanged, so written once"
+        );
+
+        for n in 0..20 {
+            log.emit(&sample(n));
+        }
+        assert!(
+            !read(dir.path(), ROTATED_NAME).is_empty(),
+            "a rotation happened"
+        );
+        let before = read(dir.path(), FILE_NAME);
+        assert_eq!(
+            before.lines().filter(is_state).count(),
+            0,
+            "nothing re-offered it yet: {before}"
+        );
+
+        // The next tick offers the same state; the new file has not got it.
+        log.goinkyo(&look("no_pane"));
+        let text = read(dir.path(), FILE_NAME);
+        assert_eq!(text.lines().filter(is_state).count(), 1, "{text}");
+        assert!(text.lines().next().unwrap().ends_with(START_BODY));
+
+        // And it is back to changed-only afterwards.
+        log.goinkyo(&look("no_pane"));
+        assert_eq!(
+            read(dir.path(), FILE_NAME).lines().filter(is_state).count(),
+            1
+        );
+    }
+
+    #[test]
     fn rotation_replaces_an_older_generation() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(ROTATED_NAME), "older generation\n").unwrap();
@@ -347,6 +414,34 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_goinkyo_change_held_by_the_rate_limit_is_counted_as_suppressed_once() {
+        let dir = TempDir::new().unwrap();
+        let mut log = PaneLog::open(dir.path()).expect("opens");
+        for n in 0..RATE_LIMIT_PER_MINUTE {
+            log.emit_at(&sample(n), 0);
+        }
+        // One held line, offered again on each of five ticks.
+        for _ in 0..5 {
+            log.goinkyo_at(&look("pane"), 0);
+        }
+        log.goinkyo_at(&look("pane"), WINDOW_MS);
+        let text = read(dir.path(), FILE_NAME);
+        assert_eq!(text.matches("suppressed count=1").count(), 1, "{text}");
+        assert!(!text.contains("suppressed count=5"), "{text}");
+
+        // A different state held in turn is one more, not one per offer.
+        for n in 0..RATE_LIMIT_PER_MINUTE {
+            log.emit_at(&sample(n), 2 * WINDOW_MS);
+        }
+        for _ in 0..3 {
+            log.goinkyo_at(&look("no_pane"), 2 * WINDOW_MS);
+        }
+        log.emit_at(&sample(9_999), 3 * WINDOW_MS);
+        let text = read(dir.path(), FILE_NAME);
+        assert_eq!(text.matches("suppressed count=1").count(), 2, "{text}");
     }
 
     #[test]
