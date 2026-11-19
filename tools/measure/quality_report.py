@@ -65,12 +65,16 @@ KIND_LETTER = {"implementation": "I", "review": "R", "docs": "D", "measurement/i
 OTHER_RX = re.compile(r"(channel check|live-check|pause request|welcome|\bsleep 180\b)", re.I)
 # 'measurement/investigation': survey, diagnosis, design-report and measurement errands.
 INV_RX = re.compile(r"(^\W*go [A-Z]\b|^\W*phase [A-Z]\d?\b|survey errand|research errand|diagnos|investigat|design report|code-reading|report-only|measurement errand|measurement script|what-if|new measurement|follow-up measurement|measurement,|picker measurement|usage measurement)", re.I)
-REVIEW_RX = re.compile(r"(re-?review|review errand|review request|review of |review round|independent review|delta review|final review|final gate run|confirmation (round|review)|short confirmation|short closing check|closing check)", re.I)
+# "review of " is the broadest review phrase: an implementation errand can mention a review in passing
+# ("...; review of the old notes is below"). It beats a Worker's name only when it opens the instruction.
+REVIEW_RX = re.compile(r"(re-?review|review errand|review request|review round|independent review|delta review|final review|final gate run|confirmation (round|review)|short confirmation|short closing check|closing check)", re.I)
 DOCS_RX = re.compile(r"(docs? errand|documentation errand|documents? —|docs follow-up|docs touch|docs tidy|docs correction|\.md\b|md only|one more sentence|one sentence to|one clause|a number to correct|one statement|brigade-bell docs)", re.I)
 IMPL_RX = re.compile(r"(implementation errand|new errand|follow-on errand|\bfix\b|fixes|implement|go for|unfrozen|fix round|next item|one more item|work resumes|blocker|decisions on|addition to|change to part|two small codex parts)", re.I)
 # A Director thanking a Worker for a finished review ("Your review of X was ...")
 # opens a follow-up, not a new review: strip that opening before matching.
 THANKS_REVIEW_RX = re.compile(r"^\W*(?:thanks[^.]*?[—-]\s*)?your review of", re.I)
+REVIEW_OF_RX = re.compile(r"review of ", re.I)
+OPENING_REVIEW_OF_RX = re.compile(r"^\W*review of ", re.I)
 
 # A review report's verdict: an explicit PASS/FAIL, else a DERIVED mark (suffix *).
 VERDICT_RX = re.compile(r"\b(PASS|FAIL)\b")
@@ -238,17 +242,28 @@ def window_events(s, lo, hi):
 
 
 def classify(text, name, role_by_name):
-    """(kind, how) of an errand from its instruction text and the Worker's display name."""
+    """(kind, how) of an errand from its instruction text and the Worker's display name.
+
+    Order: housekeeping and investigation keywords, then a review instruction, then the display
+    name, then the docs and implementation keywords. A review instruction outranks a name because
+    a name is a standing label and an instruction is what the Worker was asked this time: a Worker
+    named for implementation that is sent to review is doing a review. "review of " counts before
+    the name only when it opens the instruction: mid-instruction it is often a passing mention, as
+    in "Fix the parser; review of the old notes is below", which is implementation. The docs and
+    implementation words stay below the name, since a name is the better evidence than a loose
+    word such as "fix"."""
     head = THANKS_REVIEW_RX.sub("", text[:400])
     if OTHER_RX.search(head):
         return "other", "keyword"
     if INV_RX.search(head):
         return "measurement/investigation", "keyword"
+    if REVIEW_RX.search(head) or OPENING_REVIEW_OF_RX.search(head):
+        return "review", "keyword"
     if name in role_by_name:
         return role_by_name[name], "worker-name"
     if name and name.lower() in role_by_name:
         return role_by_name[name.lower()], "worker-name"
-    for rx, kind in ((REVIEW_RX, "review"), (DOCS_RX, "docs"), (IMPL_RX, "implementation")):
+    for rx, kind in ((REVIEW_OF_RX, "review"), (DOCS_RX, "docs"), (IMPL_RX, "implementation")):
         if rx.search(head):
             return kind, "keyword"
     return "other", "default"
@@ -348,15 +363,20 @@ class Analysis:
     def __init__(self, since, until, fix_days, role_by_name):
         self.since, self.until, self.fix_days = since, until, fix_days
         self.role_by_name = role_by_name
-        self.name_at = defaultdict(list)   # worker -> [(ts, display name the Director saw)]
+        self.name_at = defaultdict(list)   # worker -> [(ts, display name the Director saw, None once cleared)]
         self.errands = []
 
     def learn_names(self, director_events):
+        """The name each sender carried in each delivery, None where it carried none. banto prints a
+        member's display name in the header of its messages and prints none once the Director has
+        cleared it, so a header without a name is the evidence that the name is gone: skipping it
+        kept a cleared name on every later errand (a Worker whose name had been cleared stayed a
+        docs Worker in this report for days). A member that sends nothing after the clearing keeps
+        its old name here, since nothing shows that it was cleared."""
         for e in director_events:
             if e[0] == "deliver":
                 for sender, name, _scope, _body in e[2]:
-                    if name:
-                        self.name_at[sender].append((e[1], name))
+                    self.name_at[sender].append((e[1], name or None))
 
     def name_of(self, worker, ts):
         cands = [n for t, n in self.name_at.get(worker, []) if t <= ts]
@@ -427,6 +447,7 @@ def aggregate(changes, an, commits, sessions, label_of):
     Returns the calls whose cost went into some change's usage."""
     since = an.since
     usage = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))  # change id -> label -> [calls, weighted]
+    ran = defaultdict(lambda: defaultdict(lambda: [0, 0.0]))    # change id -> (role, model, effort) -> [calls, weighted]
     counted = []
     for s in sessions:
         lab = label_of.get(s.id, "unattributed")
@@ -439,6 +460,10 @@ def aggregate(changes, an, commits, sessions, label_of):
             a = usage[ch["id"]][lab]
             a[0] += 1
             a[1] += c.weighted
+            if tr.ran_call(c):
+                r = ran[ch["id"]][(s.role, c.model, c.effort)]
+                r[0] += 1
+                r[1] += c.weighted
             counted.append(c)
     for ch in changes:
         ch["errands"] = [e for e in an.errands if change_of(changes, since, e["start"]) is ch]
@@ -446,6 +471,7 @@ def aggregate(changes, an, commits, sessions, label_of):
         ch["carried_in"] = [e for e in an.errands if e["start"] <= ch["start"] < e["end"]
                             and change_of(changes, since, e["start"]) is not ch and e["start"] > since - timedelta(days=30)]
         ch["usage"] = usage[ch["id"]]
+        ch["ran"] = ran[ch["id"]]
         ch["reviews"] = []
         for e in ch["errands"]:
             if e["kind"] != "review":
@@ -882,6 +908,8 @@ def render_report(args, w, unmatched, director_id, brigade, since, until, commit
         u = ch["usage"]
         tot = sum(a[1] for a in u.values()) or 1
         P("  weighted cost " + kfmt(tot) + ": " + ", ".join(f"{lab} {kfmt(a[1])}/{a[0]}c" for lab, a in sorted(u.items(), key=lambda kv: -kv[1][1])))
+        P("  what ran (role model/effort: calls, weighted): "
+          + (", ".join(f"{role} {model}/{effort}: {a[0]}c {kfmt(a[1])}" for (role, model, effort), a in sorted(ch["ran"].items(), key=lambda kv: -kv[1][1])) or "-"))
         lf = ch["later_fixes"]
         P(f"  later fix commits (<= {args.fix_days:g} d, 'fix' subject, same files): {len(lf)}"
           + "".join(f"\n     {h} {sj[:70]} ({n} shared files)" for h, sj, n, _ in lf))
@@ -960,6 +988,8 @@ def write_changes_json(out, changes, weights, unmatched, summary=None):
             "start": ch["start"], "end": ch["end"],
             "errands": [(e["worker"], e["kind"], e["how"], e["start"].isoformat(), e["end"].isoformat(), len(e["reports"])) for e in ch["errands"]],
             "reviews": ch["reviews"], "rework": ch["rework"], "usage": dict(ch["usage"]),
+            "ran": [{"role": role, "model": model, "effort": effort, "calls": a[0], "weighted": round(a[1], 1)}
+                    for (role, model, effort), a in sorted(ch["ran"].items(), key=lambda kv: -kv[1][1])],
             "later_fixes": [(h, sj, n) for h, sj, n, _ in ch["later_fixes"]],
         }
         if "effect" in ch:

@@ -60,12 +60,54 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(qr.classify("implement the thing", "reviewer", self.NAMES), ("review", "worker-name"))
         self.assertEqual(qr.classify("welcome, reviewer", "reviewer", self.NAMES), ("other", "keyword"))
 
+    def test_a_review_instruction_beats_a_worker_name(self):
+        """A Worker named for implementation, or docs, that is sent to review is doing a review."""
+        for name in ("実装", "implementation", "docs", "builder"):
+            names = dict(self.NAMES, builder="implementation")
+            self.assertEqual(qr.classify("independent review of the change", name, names), ("review", "keyword"), name)
+            self.assertEqual(qr.classify("Re-review of the fix round", name, names), ("review", "keyword"), name)
+
+    def test_a_name_still_beats_the_docs_and_implementation_words_and_loses_to_the_first_two_lists(self):
+        self.assertEqual(qr.classify("fix the typo in README.md", "実装", self.NAMES), ("implementation", "worker-name"))
+        self.assertEqual(qr.classify("implement the thing", "docs", self.NAMES), ("docs", "worker-name"))
+        self.assertEqual(qr.classify("go A: survey the parser", "reviewer", self.NAMES), ("measurement/investigation", "keyword"))
+        self.assertEqual(qr.classify("welcome aboard", "実装", self.NAMES), ("other", "keyword"))
+
+    def test_review_of_beats_a_name_only_when_it_opens_the_instruction(self):
+        names = dict(self.NAMES, builder="implementation")
+        self.assertEqual(qr.classify("Fix the parser; review of the old notes is below", "builder", names), ("implementation", "worker-name"))
+        self.assertEqual(qr.classify("Review of the README wording, then apply the fix", "docs", names), ("review", "keyword"))
+        self.assertEqual(qr.classify("Fix the parser; review of the old notes is below", None, self.NAMES), ("review", "keyword"))
+
     def test_thanks_for_a_review_does_not_make_a_review(self):
         self.assertEqual(qr.classify("Your review of X was useful. Now implement Y", None, self.NAMES), ("implementation", "keyword"))
 
     def test_role_name_extension(self):
         names = dict(self.NAMES, builder="implementation")
         self.assertEqual(qr.classify("anything", "builder", names), ("implementation", "worker-name"))
+
+
+class NameLearningTests(unittest.TestCase):
+    def analysis(self):
+        return qr.Analysis(tr.parse_ts(ts(0)), None, 7, dict(qr.ROLE_BY_NAME))
+
+    def deliver(self, minute, *senders):
+        return ("deliver", tr.parse_ts(ts(minute)), [(s, n, "to you", "text") for s, n in senders])
+
+    def test_a_cleared_name_is_forgotten(self):
+        """banto prints no name in the header of a member whose name the Director cleared."""
+        an = self.analysis()
+        an.learn_names([self.deliver(1, ("worker-1", "reviewer"), ("worker-2", "docs")),
+                        self.deliver(5, ("worker-1", None)),
+                        self.deliver(9, ("worker-1", "docs"))])
+        at = lambda w, m: an.name_of(w, tr.parse_ts(ts(m)))
+        self.assertEqual([at("worker-1", m) for m in (0, 1, 4, 5, 8, 9, 30)], [None, "reviewer", "reviewer", None, None, "docs", "docs"])
+        self.assertEqual(at("worker-2", 30), "docs")           # worker-2 sent nothing since: nothing shows its name is gone
+
+    def test_a_worker_that_never_had_a_name_has_none(self):
+        an = self.analysis()
+        an.learn_names([self.deliver(1, ("worker-3", None))])
+        self.assertIsNone(an.name_of("worker-3", tr.parse_ts(ts(2))))
 
 
 class ChangeGroupingTests(unittest.TestCase):
@@ -243,6 +285,29 @@ class QualityEndToEnd(unittest.TestCase):
         self.assertAlmostEqual(ch["usage"]["worker-1"][1], 8870)
         for name in ("report.txt", "candidates_a.txt", "candidates_b.txt", "errands_dump.txt"):
             self.assertTrue(os.path.exists(os.path.join(self.out, name)), name)
+
+    def test_a_cleared_name_no_longer_classifies_the_errand(self):
+        d = []
+        d += call_lines("d1", ts(0, 10), usage(cr=50), tools=[(TOOL + "name_member", "n1", {})])
+        d += call_lines("d2", ts(0, 30), usage(cr=60), tools=[(TOOL + "check_messages", "c1", {})])
+        d.append(synth.tool_result(ts(0, 40), "c1", delivery(('worker-1 "builder" — to you', "ready"))))
+        d += call_lines("d3", ts(0, 45), usage(cr=60), tools=[(TOOL + "check_messages", "c2", {})])
+        d.append(synth.tool_result(ts(0, 50), "c2", delivery(('worker-1 — to you', "ready again"))))       # the name was cleared
+        write_jsonl(os.path.join(self.proj, "director-session.jsonl"), d)
+        rc, _, err = self.run_quality("--role-name", "builder=implementation")
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(self.out, "changes.json"), encoding="utf-8") as fh:
+            ch = json.load(fh)["changes"][0]
+        self.assertEqual([(e[1], e[2]) for e in ch["errands"]], [("implementation", "keyword")])      # by the instruction's own word, not the old name
+
+    def test_the_change_says_what_ran(self):
+        rc, stdout, err = self.run_quality()
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(self.out, "changes.json"), encoding="utf-8") as fh:
+            ch = json.load(fh)["changes"][0]
+        ran = {(r["role"], r["model"], r["effort"]): r["calls"] for r in ch["ran"]}
+        self.assertEqual(ran, {("worker", "model-a", "?"): 3, ("director", "model-a", "?"): 3})
+        self.assertIn("what ran (role model/effort: calls, weighted): ", stdout)
 
     def test_a_bad_model_weight_is_refused_before_anything_is_written(self):
         for value in ("fable", "fable=nan", "=2", "fable=1001"):

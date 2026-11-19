@@ -165,6 +165,15 @@ def print_report(args, weights, since, until, sessions, live, dups, erows, srows
     for m, a in sorted(by_model.items(), key=lambda kv: -kv[1][5]):
         P(f"  {m:28} {a[0]:>7} {kfmt(a[1]):>12} {kfmt(a[2]):>12} {kfmt(a[3]):>14} {kfmt(a[4]):>16} {kfmt(a[5]):>16}")
     P("")
+    P("TOTALS BY ROLE  (calls, weighted, share of weighted)")
+    by_role = defaultdict(lambda: [0, 0.0])
+    for s in sessions:
+        for c in tr.live_calls(s):
+            by_role[s.role][0] += 1
+            by_role[s.role][1] += c.weighted
+    for role, a in sorted(by_role.items(), key=lambda kv: -kv[1][1]):
+        P(f"  {role:10} {a[0]:>7} {kfmt(a[1]):>16} {100 * a[1] / total_w:5.1f}%")
+    P("")
     P("TOTALS BY DAY (UTC)  (calls, weighted)")
     by_day = defaultdict(lambda: [0, 0.0])
     for c in live:
@@ -214,7 +223,8 @@ def print_report(args, weights, since, until, sessions, live, dups, erows, srows
       f"calls with no errand logic applied: {len(una)}")
     roles = Counter(s.role for s in sessions_used)
     P(f"  sessions by role guess: {dict(roles)}  (role is inferred: Director = uses a director-only banto tool; "
-      "Worker = uses banto tools only; solo = no banto tool; subagent = path under 'subagents')")
+      "Worker = uses banto tools only; Goinkyo = uses banto tools only and its first system-prompt snapshot carries the Goinkyo briefing; "
+      "solo = no banto tool; subagent = path under 'subagents')")
     P(f"CSV files written to {out}: calls.csv sessions.csv errands.csv context_series.csv")
 
 

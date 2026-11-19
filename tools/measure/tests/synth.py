@@ -32,16 +32,20 @@ def usage(inp=0, out=0, cc=0, cr=0):
             "cache_creation_input_tokens": cc, "cache_read_input_tokens": cr}
 
 
-def assistant(mid, when, blocks, model="model-a", u=None, side=False):
-    return {"type": "assistant", "timestamp": when, "isSidechain": side,
-            "message": {"id": mid, "model": model, "content": blocks, "usage": u or usage(), "stop_reason": None}}
+def assistant(mid, when, blocks, model="model-a", u=None, side=False, effort=None):
+    """`effort` goes where Claude Code writes it: at the top level of the record, beside message."""
+    rec = {"type": "assistant", "timestamp": when, "isSidechain": side,
+           "message": {"id": mid, "model": model, "content": blocks, "usage": u or usage(), "stop_reason": None}}
+    if effort is not None:
+        rec["effort"] = effort
+    return rec
 
 
-def call_lines(mid, when, u, model="model-a", tools=(), text="working"):
+def call_lines(mid, when, u, model="model-a", tools=(), text="working", effort=None):
     """One call as real transcripts write it: a text block, then one line per tool_use."""
-    lines = [assistant(mid, when, [{"type": "text", "text": text}], model, u)]
+    lines = [assistant(mid, when, [{"type": "text", "text": text}], model, u, effort=effort)]
     for name, tid, inp in tools:
-        lines.append(assistant(mid, when, [{"type": "tool_use", "id": tid, "name": name, "input": inp}], model, u))
+        lines.append(assistant(mid, when, [{"type": "tool_use", "id": tid, "name": name, "input": inp}], model, u, effort=effort))
     return lines
 
 
@@ -56,6 +60,12 @@ def tool_result(when, tool_use_id, text, is_error=None):
     if is_error is not None:
         block["is_error"] = is_error
     return {"type": "user", "timestamp": when, "message": {"role": "user", "content": [block]}}
+
+
+def prompt_snapshot(when, system_prompt):
+    """The record Claude Code (2.1.265+) writes with the system prompt a session started with."""
+    return {"type": "attachment", "timestamp": when,
+            "attachment": {"type": "prompt_snapshot", "systemPrompt": system_prompt}}
 
 
 def compact(when, pre, post, dur, trigger="auto"):

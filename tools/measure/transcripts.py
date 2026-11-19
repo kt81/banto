@@ -467,7 +467,7 @@ def add_out_args(ap):
 # ---------------------------------------------------------------------------
 
 class Call:
-    __slots__ = ("id", "session", "ts", "model", "inp", "out", "cc", "cr", "side",
+    __slots__ = ("id", "session", "ts", "model", "effort", "inp", "out", "cc", "cr", "side",
                  "stop", "dropped", "where", "weighted", "in_window")
 
     @property
@@ -504,6 +504,9 @@ class Session:
         self.cwd = None
         self.role = "solo"
         self.evidence = ""
+        # [(member, brigade)] named by the briefings in this file's prompt snapshots, in file order,
+        # for a session that uses banto tools without a Director-only one (see snapshot_members).
+        self.members = []
         self.lines = self.parsed = self.skipped = self.ignored = 0
 
 
@@ -652,6 +655,12 @@ def _read_assistant(s, d, ts, check_ids, detail):
         c = Call()
         c.id, c.session, c.ts = mid, s.id, ts
         c.model = model or "?"
+        # Claude Code writes the reasoning effort a call ran with at the top level of the assistant
+        # record, beside message.model, back to 2.1.224 (the oldest version checked). A record
+        # without one, or with one that is not a string, reads "?": the field is the one thing
+        # here that a malformed value must not cost the whole record.
+        eff = d.get("effort")
+        c.effort = eff.strip() if isinstance(eff, str) and eff.strip() else "?"
         c.inp = int(usage.get("input_tokens") or 0)
         c.out = int(usage.get("output_tokens") or 0)
         c.cc = int(usage.get("cache_creation_input_tokens") or 0)
@@ -751,6 +760,35 @@ def _read_user(s, d, ts, check_ids, detail):
     s.events.append(("user", ts, text, is_nudge, not is_nudge and not is_tag, is_tag, origin))
 
 
+def snapshot_members(path):
+    """[(member, brigade)] for the briefings in the system prompt of the file's FIRST `prompt_snapshot`
+    record, in that order: member is "worker-N" or "goinkyo". A later snapshot is not read, and a
+    first snapshot with no briefing gives [], whatever a later one carries.
+
+    Only the system prompt of a snapshot counts. briefings() above counts every line that quotes a
+    briefing, and a Director's file, or a Worker that read the briefing text while working on it,
+    quotes it dozens of times: of 21 banto sessions from one project, whole-file counts gave a
+    Director a Worker's briefing and a Worker a Goinkyo's. Claude Code writes the snapshot from
+    2.1.265; an older file has none, and a Goinkyo in one stays filed as a Worker."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if "prompt_snapshot" not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            att = d.get("attachment") if isinstance(d, dict) else None
+            if not isinstance(att, dict) or att.get("type") != "prompt_snapshot":
+                continue
+            prompt = att.get("systemPrompt")
+            text = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
+            found = [m.groups() for m in WORKER_BRIEFING_RE.finditer(text)]
+            found += [("goinkyo", m.group(1)) for m in GOINKYO_BRIEFING_RE.finditer(text)]
+            return found
+    return []
+
+
 def _assign_role(s):
     if s.subagent:
         s.role, s.evidence = "subagent", "path contains 'subagents'"
@@ -760,6 +798,13 @@ def _assign_role(s):
     elif s.tools:
         s.role = "worker"
         s.evidence = "banto tools: " + ",".join(sorted(s.tools)) + " (no director-only tool)"
+        # The Goinkyo uses the same banto tools as a Worker and no Director-only one: only its
+        # briefing tells them apart. A file that was launched as a Goinkyo says so in its first
+        # snapshot; a later one (a resume) can only repeat it.
+        s.members = snapshot_members(s.path)
+        if s.members and s.members[0][0] == "goinkyo":
+            s.role = "goinkyo"
+            s.evidence = "banto tools: " + ",".join(sorted(s.tools)) + "; its first system-prompt snapshot carries the Goinkyo briefing"
     else:
         s.role, s.evidence = "solo", "no banto tool call"
 
@@ -827,6 +872,12 @@ def live_calls(s):
     return [c for c in s.calls.values() if not c.dropped and c.in_window]
 
 
+def ran_call(c):
+    """A call that ran something: not a synthetic placeholder and with tokens. A record with no tokens
+    is a placeholder (ac_measure skips them too) and would count as a call that ran nothing."""
+    return c.model != "<synthetic>" and (c.inp + c.out + c.cc + c.cr) > 0
+
+
 def unmatched_in(calls, weights):
     """{model: {"calls": n, "tokens": n}} for those of `calls` whose model matches no multiplier
     key and so weighs 1.0. A call with no tokens is left out: it weighs nothing at any multiplier,
@@ -888,7 +939,7 @@ def build_errands(s):
             errands.append(cur)
             cur = None
 
-    if s.role == "worker":
+    if s.role in ("worker", "goinkyo"):
         for ev in s.events:
             kind = ev[0]
             if kind in MARK_EVENTS:
@@ -979,7 +1030,7 @@ def label_sessions(sessions, brigade, director_id):
         if s.id == director_id:
             label_of[s.id] = "director"
             continue
-        if s.role not in ("worker", "solo"):
+        if s.role not in ("worker", "solo", "goinkyo"):
             continue
         mine = Counter({w: n for (w, b), n in briefings(s.path).items() if b == brigade})
         if mine:

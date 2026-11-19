@@ -18,7 +18,59 @@ delegated work as the Director and its Workers exchange it: for a Worker, it
 opens at the delivery of an instruction and closes at the Worker's first
 `send_to_peer`, the report it sends back; for the Director, a solo session and a
 subagent, a turn opens at each operator message or relay nudge and runs to the
-next.
+next. A session's role is `director`, `worker`, `goinkyo`, `subagent` or `solo`. The
+Goinkyo uses the same banto tools as a Worker and no Director-only one, so only its
+briefing tells them apart: the scripts read it from the system prompt in the file's first
+`prompt_snapshot` record (Claude Code 2.1.265 and later; a Goinkyo file from an older
+version reads as a worker). `usage_report` also prints the weighted cost totalled by role.
+
+**`what_ran.py`: which model and effort actually ran.** For each role it reports which
+model and which reasoning effort the calls ran with, what they weighed, whether that is
+what banto's config launches the role with, and what the same tokens would weigh on
+another model. It exists because nothing else shows that a Worker ran a model other than
+the one the brigade was set up with. It prints a report and writes `ledger_roles.csv`,
+`ledger_sessions.csv` and `ledger_errands.csv` (counts, session ids and dates, no
+conversation text; still real session metadata, so keep them out of any repository).
+
+- **What it reads.** The model is `message.model`; the effort is the `effort` field at the
+  top level of each assistant record, beside `message` (read in Claude Code transcripts as
+  far back as 2.1.224; a record without a usable one reads `?`, and a `?` is never flagged
+  as a difference). A call with no tokens and a `<synthetic>` placeholder are left out and
+  counted in the header. The weights and multipliers are the ones described below.
+- **Sections 1 to 3.** Role by model by effort; the same per session (a member is named
+  from its briefing, e.g. `worker-7 b19`); the same per errand or turn, with the number of
+  errands that changed model or effort inside themselves and the dearest few
+  (`--top`). Every errand's own split is in `ledger_errands.csv`. A per-change split is in
+  `quality_report.py` (below), which owns the notion of a change.
+- **Section 4, configured versus observed.** Per session and UTC day, with the first and
+  last call time: what it ran, and whether that differs from what was expected. The
+  expectation comes, in this order, from `--expect ROLE=MODEL[/EFFORT]` (repeatable); the
+  `worker_model`, `worker_effort`, `goinkyo_model` and `goinkyo_effort` keys in the
+  `[brigade]` table of banto's `config.toml`. An explicit file (`--config FILE`, else
+  `$BANTO_CONFIG`, even when empty) is used as it is: when it is missing, section 4 says
+  so and the built-in defaults are used, as banto's strict startup would refuse to run
+  and not read another file. Without one, the first of `$XDG_CONFIG_HOME/banto/` and
+  `~/.config/banto/` that exists, then `%APPDATA%\banto\` on Windows or Application
+  Support on macOS. An empty string in the file means banto passes no flag, read as
+  nothing expected; then the built-in defaults, copied from
+  `BrigadeConfig::default` in `crates/banto-core/src/config.rs` and not checked against it
+  by any test, so they can go stale. A Director has no setting (banto passes it neither
+  flag), so its rows read `-`; `--expect director=opus/xhigh` gives it something to differ
+  from. A model matches when the configured word occurs in the model name (`sonnet` in
+  `claude-sonnet-5-5`); an effort matches when the words are equal.
+  **What a flag does not say.** The config is read as it is now (the report prints the
+  file's modification time), banto gives a model and effort only when it creates a
+  session, never on a resume, and an operator can change either inside the session. A
+  flagged row is what ran, not proof that banto launched it wrong.
+- **Section 5, price what-if.** `--reprice ROLE=MODEL` (repeatable) prices every call of the
+  role as if it had run on MODEL, a key of the model multipliers (`opus`, `sonnet`, `fable`,
+  `haiku`, or one added with `--model-weight`; anything else is refused rather than priced
+  at 1.0), keeping the tokens. The table gives each role's weighted cost and share now and
+  re-priced. It reprices what happened; it does not say what another model would have done,
+  which would read and write other amounts and make other cache hits.
+- **Limits.** Claude Code transcripts only; a Codex member has no row (see the last
+  section). The Goinkyo needs the 2.1.265 snapshot. A `/model` change in the middle of a
+  day shows as two rows, which is the point.
 
 **`usage_whatif.py`: counterfactuals.** It estimates what the same transcripts
 would have cost under two alternatives, and says nothing about a setup that did
@@ -48,7 +100,9 @@ commits of a repository into changes (commits no more than `--merge-gap-min`
 minutes apart form one change) and, for each change, gives the errands by kind
 (implementation, review, docs, measurement/investigation, other), the review
 verdicts, the rework rounds, the weighted cost per change by session label, and the
-fix commits that touched the same files within `--fix-days`. It also writes two
+fix commits that touched the same files within `--fix-days`, and, per change, which role
+ran which model at which effort (`what ran` in `report.txt`, `ran` in `changes.json`: calls
+and weighted cost over the calls inside the change's window). It also writes two
 candidate lists that a person must read and judge, each to its own file:
 **(a)** `candidates_a.txt`: operator messages with a problem word within
 `--horizon-h` hours after a review PASS or a release build, which may be problems
@@ -259,7 +313,8 @@ Each script is run as `python tools/measure/<script>.py`. Full flag lists are in
   temp directory, and print its path; the suffix keeps two runs in the same second
   apart. The directory is private to the user where the OS supports it (Python makes
   it mode 0700 on POSIX; Windows does not apply that mode). `usage_whatif` writes only
-  `whatif_A.csv`, and only when `--out` is given. `ac_measure` has no `--out`.
+  `whatif_A.csv`, and only when `--out` is given. `what_ran` defaults like
+  `usage_report` and writes its three `ledger_*.csv`. `ac_measure` has no `--out`.
   An `--out` inside an agent home (`~/.claude`, `~/.codex`, `$CLAUDE_CONFIG_DIR`,
   `$CODEX_HOME`) is refused, whatever `--force-out` says, because those are
   read-only. An output directory inside a git working tree is refused unless
@@ -283,6 +338,17 @@ Each script's own flags are in its `--help`. Two to know: `ac_measure` requires
 `--since T`, and `--session` (repeatable) selects the Worker sessions for its
 per-errand sections; `quality_report` takes `--director` and `--brigade` to pick
 the team, and `--role-name NAME=KIND` to map a display name to an errand kind.
+
+An errand's kind is decided in this order, first match winning: housekeeping words,
+investigation words, a review instruction, the Worker's display name (`--role-name` or the
+built-in names), then the docs and implementation words. A review instruction beats a name
+because the instruction is what the Worker was asked this time and the name is a standing
+label. The phrase `review of` counts as a review instruction only when it opens the
+instruction: mid-instruction it is usually a passing mention, so the name stands. The display name is the one the Director last saw on a message from that Worker.
+banto prints no name in the header once the Director has cleared it, so a message without a
+name forgets the old one; a Worker that has sent nothing since keeps its name here, since
+nothing shows it was cleared. Before this was fixed a cleared name stayed for good, and a
+Worker cleared on 17 November kept counting as a docs Worker.
 
 Numeric flags are bounded, and a value outside its bound is refused with exit 2;
 each bound is in that flag's `--help`. The script-specific ones: `--like-for-like-hours`
@@ -317,7 +383,8 @@ ratio (1 : 0.68) is the outside report's and is unchecked here. Haiku is unknown
 Every CSV that carries a weighted cost ends with a `weights_assumed` column naming
 the weights and multipliers, so a file shared on its own still shows them.
 `usage_report` writes it in `calls.csv`, `errands.csv` and `sessions.csv`;
-`usage_whatif` in `whatif_A.csv`. `context_series.csv` has no weighted column.
+`usage_whatif` in `whatif_A.csv`; `what_ran` in the three `ledger_*.csv` files.
+`context_series.csv` has no weighted column.
 `quality_report`'s `changes.json` is an object with `assumption`, `weights`,
 `unmatched_models`, `changes` (each with an `effect` object) and `summary` keys.
 
@@ -338,9 +405,16 @@ Never commit these files.
 
 ## What the scripts cannot see
 
-- **Codex sessions.** Their transcripts carry no per-call usage, so the token and cost
-  scripts do not count them. Only `consult_report.py` reads Codex rollouts, and only for
-  Goinkyo consultations.
+- **Codex sessions.** The token and cost scripts do not count them. A Codex rollout does
+  carry what they would need: `turn_context` records with a `model` (and, in the ones read,
+  usually an `effort`), and `token_count` events whose `info.last_token_usage` holds
+  `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens` and
+  `reasoning_output_tokens` (read on three rollouts on 2026-11-19; one of them had no `effort`
+  in the first `turn_context`). No script reads them yet. Only `consult_report.py` reads
+  Codex rollouts, and only for Goinkyo consultations.
+- **A Goinkyo from before Claude Code 2.1.265.** It left no system-prompt snapshot, so it
+  reads as a worker. `usage_whatif.py` and `ac_measure.py` treat a recognised Goinkyo as
+  neither a Worker nor a Director.
 - **The summarising call of a compaction.** It is not in any transcript; `ac_measure`
   estimates it, with the model inferred as described above, and says so.
 - **Real billing or limits.** Nothing here reads a plan's usage, quota or invoice.
