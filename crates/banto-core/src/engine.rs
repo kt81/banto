@@ -1398,7 +1398,7 @@ pub struct EmporiumState {
     /// Layout preferences per brigade, keyed by [`BrigadeId`] and — inside —
     /// by member token, so a brigade that goes off-stage and is staged again
     /// in the same run gets its split back, and a pane's key changing
-    /// (discovery, a compaction fork) loses nothing. Dropped only when the
+    /// (discovery, a `/clear`) loses nothing. Dropped only when the
     /// brigade is disbanded.
     brigade_layouts: HashMap<BrigadeId, BrigadeLayout>,
     /// The boundary drag in progress, if any. While it is `Some` the real
@@ -1476,8 +1476,8 @@ pub struct EmporiumState {
     /// about a pane says so), which is why this tracks it here instead of
     /// asking the shell to work it out fresh each tick the way every other
     /// gather function does. Kept current across a discovery rename
-    /// (`update_discovery_result`) or a compact fork
-    /// (`update_member_session_forked`) — both know the renamed member's
+    /// (`update_discovery_result`) or a session move
+    /// (`update_member_session_moved`) — both know the renamed member's
     /// own token, so both update this entry in place when that token is
     /// `"goinkyo"` and an entry for its brigade already exists — and
     /// dropped (not `Cmd::KillPty`'d — nothing to kill twice) if the pane
@@ -1495,6 +1495,12 @@ pub struct EmporiumState {
     /// rather than deriving a member name from a tile position. Rekey paths
     /// keep the token attached when a live key changes.
     member_tokens: HashMap<SessionKey, MemberToken>,
+    /// Moves of a pane to a session id another pane already holds that were
+    /// refused, as (the pane's key, the id it reported). The shell repeats the
+    /// observation every tick for as long as the process reports that id, and
+    /// the refusal says so on the status line once, not once a second. Pruned to
+    /// the panes that still exist whenever one is added.
+    refused_session_moves: HashSet<(SessionKey, String)>,
     /// Brigade ownership travels with a pane even while another brigade is
     /// displayed. The exit handler needs it to reopen a Worker whose cell is
     /// off-stage; `Stage` only describes the one currently visible cell.
@@ -1714,6 +1720,7 @@ impl EmporiumState {
             last_focus_notified: None,
             goinkyo_pane: HashMap::new(),
             member_tokens: HashMap::new(),
+            refused_session_moves: HashSet::new(),
             member_brigades: HashMap::new(),
             attention_panes: HashSet::new(),
             visible_waiting_count: 0,
@@ -1769,7 +1776,7 @@ impl EmporiumState {
     }
 
     /// Move every pane-owned fact as one transaction when discovery or
-    /// compaction replaces its key. Keeping this list here makes a new
+    /// a session move (`/clear`, `/branch`, `/resume`) replaces its key. Keeping this list here makes a new
     /// `SessionKey`-indexed field reviewable at its only migration point.
     fn rekey_pane_state(&mut self, old_key: &SessionKey, new_key: &SessionKey) -> bool {
         let had_screen = if let Some(screen) = self.screens.remove(old_key) {
@@ -2057,7 +2064,7 @@ impl EmporiumState {
     ///
     /// The Director's session is looked for first in what the core already
     /// holds (the staged brigade's `director`, then any pane whose member is
-    /// the Director of this brigade — kept through a compaction fork, which
+    /// the Director of this brigade — kept through a session move, which
     /// re-keys them at once), and only then in the id the last tick read from
     /// the store, which is the one source that still answers when the
     /// Director's pane is closed. A title is used only if the row has one: a
@@ -3917,8 +3924,7 @@ pub enum Event {
         /// `PtyExited` only with a reason — the report is what proves the process
         /// ended; a pane whose output merely stopped is [`Self::PtyOutputLost`].
         /// `None` therefore only appears in a stream recorded before this field
-        /// existed (`#[serde(default)]`, same precedent as
-        /// `RowsLoaded::superseded`), which still means an exit.
+        /// existed (`#[serde(default)]`), which still means an exit.
         /// A historical stream may contain [`PtyExitReason::Unknown`], which
         /// replay continues to treat as an exit. A live wait error is retried
         /// and does not become `PtyExited`.
@@ -3968,11 +3974,6 @@ pub enum Event {
         rows: Vec<SessionRow>,
         hidden: HashSet<String>,
         directors: HashSet<String>,
-        /// Session ids with a known auto-compaction continuation (see
-        /// `App::superseded`). `#[serde(default)]` so a record/replay
-        /// stream captured before this field existed still deserializes.
-        #[serde(default)]
-        superseded: HashSet<String>,
     },
     DiscoveryResult {
         key: SessionKey,
@@ -4077,7 +4078,10 @@ pub enum Event {
     /// when the status line is free (the previous showing timed out, or
     /// nothing else was on it), so none is overwritten before it was seen.
     /// Shown messages block nothing. A stream recorded before this event
-    /// existed does not contain it, and replays as before.
+    /// existed does not contain it, and replays as before. The shell also uses
+    /// it later in a run for a condition it watched for (session tracking
+    /// paused because the roster stays unread), since the queue is exactly the
+    /// "one line, never over another" a notice of that kind needs.
     StartupNotices {
         notices: Vec<String>,
     },
@@ -4159,22 +4163,47 @@ pub enum Event {
         hidden: HashSet<String>,
         directors: HashSet<String>,
     },
-    /// A live member's Claude session forked in place: AUTO-compaction
-    /// assigns a *new* session id to the same live process (manual
-    /// `/compact` does not) — the process's own `sessions/<pid>.json` live
-    /// file simply starts reporting a different `sessionId`, still under
-    /// the same pid. `old_id` is what the store/pane still know the member
-    /// by; `new_id` is what the process now reports. Gathered shell-side
-    /// (`emporium::gather_fork_observations`) alongside the relay tick, one
-    /// per tick a live member's recorded id disagrees with its own live
-    /// process — so this may repeat for the same fork until the store row
-    /// (and the pane it keys) actually catch up; the handler must tolerate
-    /// that.
+    /// A live brigade member's own process now reports a different Claude
+    /// session id than the one the store and the pane know it by: `/clear`,
+    /// `/branch` or an in-pane `/resume` moved it, still under the same pid, and
+    /// its `sessions/<pid>.json` live file names the new id. Auto-compaction
+    /// does not do this (2.1.318 and later compact in place, under the same
+    /// id). `old_id` is what the store/pane still know the member by; `new_id` is
+    /// what the process now reports. Gathered shell-side
+    /// (`emporium::gather_session_moves`) alongside the relay tick: once the
+    /// disagreement has held for two ticks, and again every few ticks for as long
+    /// as the process still reports the new id and the pane still has the old
+    /// key. An applied move ends that, so only a refused one repeats (the hold may
+    /// let go later); the handler must tolerate the repeat either way.
+    ///
+    /// `held_by_row`: another member's store row already records `new_id` (the
+    /// shell read the roster), so the move is refused like one onto a pane that
+    /// holds it. `#[serde(default)]`: a stream recorded before it existed read the
+    /// roster for nothing.
+    ///
+    /// The variant keeps the name it was recorded under: it is in the record/replay
+    /// format and in the pane log, and a rename would orphan both.
     MemberSessionForked {
         brigade_id: BrigadeId,
         token: MemberToken,
         old_id: String,
         new_id: String,
+        #[serde(default)]
+        held_by_row: bool,
+    },
+    /// The same fact for a pane that is not a brigade member: a hosted Claude
+    /// pane's own process now reports `new_id`, not the `old_id` the pane is keyed
+    /// by. No store write follows, since a solo pane has no row of its own to
+    /// move; the pane is renamed so that its activity, the quit confirmation and
+    /// the next resume all read the conversation the process is in now. Refused,
+    /// once, when `new_id` is already another pane's key (see
+    /// `update_pane_session_moved`). `held_by_row` as for
+    /// [`Event::MemberSessionForked`].
+    PaneSessionMoved {
+        old_id: String,
+        new_id: String,
+        #[serde(default)]
+        held_by_row: bool,
     },
     /// ~1/s: relay observations for every live brigade member (gathered
     /// shell-side — store + live-session reads), plus the trigger to flush
@@ -4292,12 +4321,10 @@ pub fn update(
             rows,
             hidden,
             directors,
-            superseded,
         } => {
             app.replace_rows(rows);
             app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
-            app.set_superseded(superseded);
             Vec::new()
         }
         Event::DiscoveryResult {
@@ -4510,7 +4537,20 @@ pub fn update(
             token,
             old_id,
             new_id,
-        } => update_member_session_forked(state, brigade_id, token, old_id, new_id, now),
+            held_by_row,
+        } => update_member_session_moved(
+            state,
+            brigade_id,
+            token,
+            (old_id, new_id),
+            held_by_row,
+            now,
+        ),
+        Event::PaneSessionMoved {
+            old_id,
+            new_id,
+            held_by_row,
+        } => update_pane_session_moved(state, (old_id, new_id), held_by_row, now),
         Event::Tick { relay, brigades } => update_tick(state, app, brigade, relay, brigades, now),
         Event::QuiescenceSampled { samples } => {
             // Only stored: the brigade-quiet decision is made by the tick that
@@ -4807,7 +4847,7 @@ struct QuietWatch {
     /// hosted member ([`EmporiumState::spawn_order`]). A stretch is a statement
     /// about these members, so when the set changes — one joins, one ends, one
     /// is relaunched under the same key (a new process, a new number) — it
-    /// starts over. A key that merely changes (discovery, a compaction fork)
+    /// starts over. A key that merely changes (discovery, a session move)
     /// moves the number with it and is the same member.
     members: HashSet<u64>,
 }
@@ -6852,7 +6892,7 @@ impl RoleLaunch {
 /// a key whose ownership maps name that member — whatever the key is. A member's
 /// identity is its brigade and token, never its key: the key is a placeholder
 /// until discovery re-keys it to a session id, and is renamed again by a
-/// compaction fork.
+/// session move.
 fn live_panes_of(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> Vec<SessionKey> {
     let mut keys: Vec<SessionKey> = state
         .screens
@@ -6869,7 +6909,7 @@ fn live_panes_of(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> V
 
 /// Whether any hosted pane belongs to the member `(brigade_id, token)`, under
 /// whatever key it is held ([`live_panes_of`]). A pane is the member's wherever
-/// discovery or a compaction fork has renamed it to, so looking for it only
+/// discovery or a session move has renamed it to, so looking for it only
 /// under the placeholder key a creation was made for would miss it.
 fn member_has_pane(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> bool {
     !live_panes_of(state, brigade_id, token).is_empty()
@@ -8967,7 +9007,7 @@ fn unrequested_worker_exit(
 /// `PendingKickoff`, a relay nudge's `PendingSubmit`) and executed at a
 /// later one, after that key might have been renamed or the pane closed in
 /// between. This is exactly the shape of the bug `update_discovery_result`/
-/// `update_member_session_forked`'s `pending_goinkyo_kickoffs` follow now
+/// `update_member_session_moved`'s `pending_goinkyo_kickoffs` follow now
 /// fixes for the Goinkyo kickoff specifically — this status line is the
 /// generic backstop for that whole class, Goinkyo or otherwise, so a future
 /// instance of it is never silent again. Never fires on an ordinary
@@ -9061,55 +9101,115 @@ fn update_discovery_result(
     cmds
 }
 
-/// A live member's Claude session forked in place (see
-/// [`Event::MemberSessionForked`]'s doc for why). The store write always
-/// happens — the fork is real regardless of what the emporium's own panes
-/// look like right now — but the pane/screen rename applies whenever the
-/// pane is still alive, including while another brigade is displayed.
-/// `focused` needs no fixing of its own, since renaming `panes[i]`'s *value*
-/// in place never moves what index it lives at. Idempotent under a repeated fact (the
-/// observation that produces this repeats until the store row changes):
-/// once `old_id`'s pane has already been renamed to `new_id`, `old_id` is no
-/// longer in `panes` and this becomes a store-only no-op, same as the
-/// "not staged" case below.
-fn update_member_session_forked(
+/// Whether something already holds the conversation a move would land on: a pane
+/// hosted under `new_key`, an open for it in flight, or another member's row
+/// (`held_by_row`).
+fn conversation_is_held(state: &EmporiumState, new_key: &SessionKey, held_by_row: bool) -> bool {
+    held_by_row || state.screens.contains_key(new_key) || state.pending_opens.contains_key(new_key)
+}
+
+/// Whether a pane's move to `new_key` is refused because something else holds that
+/// conversation, and the refusal is new. `Some(announce)` is a refusal (nothing may
+/// be renamed or written), `announce` true the first time for this pane and id.
+/// `None`: the conversation is free.
+///
+/// Held means any of: another pane is hosted under that key, an open for it is in
+/// flight (the operator pressed Enter on its row just before the in-pane
+/// `/resume`), or another member's store row records it (`held_by_row`, read by the
+/// shell) with its pane closed.
+///
+/// The case is real: an in-pane `/resume` of a session this banto hosts in another
+/// pane puts two processes on one conversation, which is the double resume
+/// (REQUIREMENTS, invariant 4) done from inside a pane. Renaming onto the other
+/// pane would also collapse two panes into one key, which is what
+/// `update_discovery_result`'s collision guard refuses for the same reason. A
+/// member's row is no safer: `SetMemberSession` moves a session id between rows, so
+/// writing a held one would silently unlink the member that has it, and the next
+/// re-stage would resume it beside the pane that took it.
+fn refuse_move_onto_a_held_key(
+    state: &mut EmporiumState,
+    old_key: &SessionKey,
+    new_key: &SessionKey,
+    new_id: &str,
+    held_by_row: bool,
+) -> Option<bool> {
+    if !conversation_is_held(state, new_key, held_by_row) {
+        return None;
+    }
+    let screens = &state.screens;
+    state
+        .refused_session_moves
+        .retain(|(key, _)| screens.contains_key(key));
+    Some(
+        state
+            .refused_session_moves
+            .insert((old_key.clone(), new_id.to_string())),
+    )
+}
+
+/// A live member's own process now reports another Claude session id (see
+/// [`Event::MemberSessionForked`]'s doc). The store write and the pane/screen
+/// rename go together: the pane is renamed whenever it is still alive, including
+/// while another brigade is displayed, and the store row follows. `focused` needs
+/// no fixing of its own, since renaming `panes[i]`'s *value* in place never moves
+/// what index it lives at. Idempotent under a repeated fact: once `old_id`'s pane
+/// has been renamed, `old_id` is no longer a pane and this becomes a store-only
+/// write, same as the "not staged" case below.
+///
+/// If `new_id` is held (see [`refuse_move_onto_a_held_key`]) nothing changes, the
+/// store included: writing it would make the member's row claim a conversation
+/// something else is running, and the next re-stage would resume it a second time.
+/// That holds for a member whose pane is gone too, which is the store-only write
+/// below. The refusal is not final: the shell sends the move again while the
+/// process stays on the new id, so the rename happens once what held it lets go.
+/// It is said once per pane and id.
+fn update_member_session_moved(
     state: &mut EmporiumState,
     brigade_id: BrigadeId,
     token: MemberToken,
-    old_id: String,
-    new_id: String,
+    (old_id, new_id): (String, String),
+    held_by_row: bool,
     now: Instant,
 ) -> Vec<Cmd> {
     let old_key = SessionKey::from_id(&old_id);
     let new_key = SessionKey::from_id(&new_id);
     let mut cmds = Vec::new();
     if state.screens.contains_key(&old_key) {
-        // Same refusal precedent as `update_discovery_result`'s collision
-        // guard just above: if `new_key` is already a live pane (the
-        // operator opened the continuation separately as a solo session,
-        // say), renaming onto it would collapse two panes into one. Unlike
-        // that guard, the store write below still goes through — a later
-        // re-stage heals the pane once the collision clears, but the store
-        // must record the truth now regardless.
-        if state.screens.contains_key(&new_key) {
-            state.set_status(
-                format!("session fork collision on {new_id} — pane not renamed"),
-                now,
-            );
-        } else {
-            state.rekey_pane_state(&old_key, &new_key);
-            state
-                .member_tokens
-                .entry(new_key.clone())
-                .or_insert_with(|| token.clone());
-            state
-                .member_brigades
-                .entry(new_key.clone())
-                .or_insert(brigade_id);
-            cmds.push(Cmd::RekeyPty {
-                from: old_key,
-                to: new_key,
-            });
+        if let Some(announce) =
+            refuse_move_onto_a_held_key(state, &old_key, &new_key, &new_id, held_by_row)
+        {
+            if announce {
+                state.set_status(
+                    format!(
+                        "session moved onto {new_id}, which is already in use — pane not renamed"
+                    ),
+                    now,
+                );
+            }
+            return cmds;
+        }
+        state.rekey_pane_state(&old_key, &new_key);
+        state
+            .member_tokens
+            .entry(new_key.clone())
+            .or_insert_with(|| token.clone());
+        state
+            .member_brigades
+            .entry(new_key.clone())
+            .or_insert(brigade_id);
+        cmds.push(Cmd::RekeyPty {
+            from: old_key,
+            to: new_key,
+        });
+    } else {
+        // No pane to rename, only the row to move, and the row is not free to move
+        // onto a conversation something else holds. The pane that took the id
+        // under this member's own name (an earlier send of the same move, the
+        // rename already applied) is not another holder.
+        let own_pane = state.member_tokens.get(&new_key) == Some(&token)
+            && state.member_brigades.get(&new_key) == Some(&brigade_id);
+        if !own_pane && conversation_is_held(state, &new_key, held_by_row) {
+            return cmds;
         }
     }
     cmds.push(Cmd::Store(StoreIntent::SetMemberSession {
@@ -9118,6 +9218,48 @@ fn update_member_session_forked(
         session_id: new_id,
     }));
     cmds
+}
+
+/// A hosted pane that is no brigade member now runs another Claude session (see
+/// [`Event::PaneSessionMoved`]): the pane takes the new id as its key and nothing is
+/// written to the store. Without this a `/clear` in a solo pane leaves it keyed by
+/// the conversation it left: its activity reads unknown (no live file names that
+/// id), the quit confirmation counts it as "not idle (unknown)", and the next
+/// resume of the row opens the conversation before the `/clear`.
+///
+/// Idempotent under the repeated observation like the member handler: once the pane
+/// has the new key, `old_id` is no pane and this does nothing. A member's key (the
+/// roster changed under the observation) is left to the member handler.
+fn update_pane_session_moved(
+    state: &mut EmporiumState,
+    (old_id, new_id): (String, String),
+    held_by_row: bool,
+    now: Instant,
+) -> Vec<Cmd> {
+    let old_key = SessionKey::from_id(&old_id);
+    let new_key = SessionKey::from_id(&new_id);
+    if old_key == new_key
+        || !state.screens.contains_key(&old_key)
+        || state.member_tokens.contains_key(&old_key)
+    {
+        return Vec::new();
+    }
+    if let Some(announce) =
+        refuse_move_onto_a_held_key(state, &old_key, &new_key, &new_id, held_by_row)
+    {
+        if announce {
+            state.set_status(
+                format!("session moved onto {new_id}, which is already in use — pane not renamed"),
+                now,
+            );
+        }
+        return Vec::new();
+    }
+    state.rekey_pane_state(&old_key, &new_key);
+    vec![Cmd::RekeyPty {
+        from: old_key,
+        to: new_key,
+    }]
 }
 
 /// `Event::BrigadeFormed`'s successful-formation payload, bundled so
@@ -9603,6 +9745,13 @@ fn update_tick(
     now: Instant,
 ) -> Vec<Cmd> {
     let mut cmds = Vec::new();
+
+    // A refused session move is latched per pane so that it is said once; the
+    // latch goes with its pane, not only when another refusal comes along.
+    let screens = &state.screens;
+    state
+        .refused_session_moves
+        .retain(|(key, _)| screens.contains_key(key));
 
     cmds.extend(give_up_on_codex_catalog(state, now));
 
@@ -10357,9 +10506,9 @@ fn update_goinkyo_awaiting_spawn(
         // A *real* key here, while this observation is `AwaitingSpawn` (the
         // row it's looking at right now has no session id), can only mean
         // one thing: `goinkyo_pane` still names a pane from a consultation
-        // that already ended. Discovery and fork-rename both always write a
+        // that already ended. Discovery and a session move both always write a
         // real id back to a row (`update_discovery_result`/`update_member_
-        // session_forked`), and a live consultation's own row always keeps
+        // session_moved`), and a live consultation's own row always keeps
         // its session id (`gather_goinkyo_observations` never reports
         // `AwaitingSpawn` for one) — so a real key paired with a
         // session-id-less row cannot arise from the same, still-open
@@ -11756,34 +11905,6 @@ mod tests {
     }
 
     #[test]
-    fn rows_loaded_applies_the_superseded_set() {
-        let mut state = EmporiumState::new(PrefixKey::default());
-        let mut app = app_with(vec![row("a"), row("b")]);
-        let brigade = brigade_config();
-        let now = test_instant();
-        assert!(!app.is_selected_superseded());
-
-        update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::RowsLoaded {
-                rows: vec![row("a"), row("b")],
-                hidden: HashSet::new(),
-                directors: HashSet::new(),
-                superseded: ["a".to_string()].into_iter().collect(),
-            },
-            now,
-        );
-
-        // `row()` fixtures are `Activity::Alive`, so "a" stays visible
-        // (selected, since it sorts first) despite being superseded —
-        // this only checks the set reaches `App`, not the hidden-by-default
-        // interaction (covered by `App`'s own tests).
-        assert!(app.is_selected_superseded());
-    }
-
-    #[test]
     fn spawn_failed_sets_status_and_leaves_stage_untouched() {
         let mut state = EmporiumState::new(PrefixKey::default());
         state.stage = Stage::Empty;
@@ -12032,10 +12153,10 @@ mod tests {
         assert_eq!(panes, &[director, worker]);
     }
 
-    // --- compact-fork tracking: Event::MemberSessionForked -----------------
+    // --- session-move tracking: Event::MemberSessionForked, PaneSessionMoved -----------------
 
     #[test]
-    fn member_session_forked_renames_the_pane_preserving_order_focus_and_screen() {
+    fn member_session_moved_renames_the_pane_preserving_order_focus_and_screen() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let old = SessionKey::from_id("w1-old");
@@ -12057,6 +12178,7 @@ mod tests {
                 token: "worker-1".to_string(),
                 old_id: "w1-old".to_string(),
                 new_id: "w1-new".to_string(),
+                held_by_row: false,
             },
             now,
         );
@@ -12084,10 +12206,10 @@ mod tests {
     }
 
     #[test]
-    fn member_session_forked_on_the_directors_own_session_renames_the_director_field() {
-        // Genuinely reachable, unlike discovery's own version of this: an
-        // auto-compaction fork can happen to any already-running Claude
-        // session, the Director's own included.
+    fn member_session_moved_on_the_directors_own_session_renames_the_director_field() {
+        // Genuinely reachable, unlike discovery's own version of this: a
+        // `/clear` can happen to any already-running Claude session, the
+        // Director's own included.
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir-old");
         let worker = SessionKey::from_id("w1");
@@ -12105,6 +12227,7 @@ mod tests {
                 token: "director".to_string(),
                 old_id: "dir-old".to_string(),
                 new_id: "dir-new".to_string(),
+                held_by_row: false,
             },
             now,
         );
@@ -12121,32 +12244,28 @@ mod tests {
     }
 
     #[test]
-    fn member_session_forked_collision_skips_the_rename_but_still_updates_the_store() {
+    fn a_member_session_move_onto_a_held_key_changes_nothing_and_is_said_once() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let old = SessionKey::from_id("w1-old");
         staged_brigade(&mut state, &director, std::slice::from_ref(&old));
-        // The operator separately opened the continuation as its own solo
-        // pane before banto ever noticed the fork.
+        // The operator separately opened the target as its own solo pane
+        // before banto ever noticed the move (an in-pane `/resume` onto it).
         state
             .screens
             .insert(SessionKey::from_id("w1-new"), Screen::new(24, 80));
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
         let now = test_instant();
+        let moved = || Event::MemberSessionForked {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            old_id: "w1-old".to_string(),
+            new_id: "w1-new".to_string(),
+            held_by_row: false,
+        };
 
-        let cmds = update(
-            &mut state,
-            &mut app,
-            &brigade,
-            Event::MemberSessionForked {
-                brigade_id: 1,
-                token: "worker-1".to_string(),
-                old_id: "w1-old".to_string(),
-                new_id: "w1-new".to_string(),
-            },
-            now,
-        );
+        let cmds = update(&mut state, &mut app, &brigade, moved(), now);
 
         assert!(
             state.screens.contains_key(&old),
@@ -12157,22 +12276,23 @@ mod tests {
         };
         assert_eq!(panes, &[director, old]);
         assert!(
-            !cmds.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })),
-            "a collision must not rekey: {cmds:?}"
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RekeyPty { .. } | Cmd::Store(_))),
+            "a held key changes nothing, the store included: {cmds:?}"
         );
-        assert!(
-            cmds.iter().any(|cmd| matches!(
-                cmd,
-                Cmd::Store(StoreIntent::SetMemberSession { session_id, .. })
-                    if session_id == "w1-new"
-            )),
-            "the store must still learn the truth: {cmds:?}"
-        );
-        assert!(state.status.unwrap().contains("collision"));
+        assert!(state.status.as_deref().unwrap().contains("already in use"));
+
+        // The shell repeats the observation every tick while the process
+        // reports that id; the refusal is not said again.
+        state.status = None;
+        let again = update(&mut state, &mut app, &brigade, moved(), now);
+        assert!(!again.iter().any(|cmd| matches!(cmd, Cmd::Store(_))));
+        assert_eq!(state.status, None, "said once, not once a second");
     }
 
     #[test]
-    fn member_session_forked_when_old_id_is_not_staged_updates_only_the_store() {
+    fn member_session_moved_when_old_id_is_not_staged_updates_only_the_store() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -12187,6 +12307,7 @@ mod tests {
                 token: "worker-1".to_string(),
                 old_id: "w1-old".to_string(),
                 new_id: "w1-new".to_string(),
+                held_by_row: false,
             },
             now,
         );
@@ -12199,7 +12320,7 @@ mod tests {
     }
 
     #[test]
-    fn member_session_forked_fact_is_idempotent_under_duplicate_delivery() {
+    fn member_session_moved_fact_is_idempotent_under_duplicate_delivery() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let old = SessionKey::from_id("w1-old");
@@ -12213,14 +12334,16 @@ mod tests {
             token: "worker-1".to_string(),
             old_id: "w1-old".to_string(),
             new_id: "w1-new".to_string(),
+            held_by_row: false,
         };
 
         let first = update(&mut state, &mut app, &brigade, fact(), now);
         assert!(first.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })));
 
-        // The observation that produces this fact repeats until the store
-        // row catches up: a second delivery must not panic, double-rename,
-        // or emit a second RekeyPty — `old_id`'s pane is already gone.
+        // The shell sends a move again every few ticks while it still sees
+        // it (and a tick can overlap the store write): a second delivery must
+        // not panic, double-rename, or emit a second RekeyPty — `old_id`'s
+        // pane is already gone.
         let second = update(&mut state, &mut app, &brigade, fact(), now);
         assert!(
             !second.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })),
@@ -16259,7 +16382,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unsent_draft_survives_a_compaction_fork_renaming_the_pane() {
+    fn an_unsent_draft_survives_a_session_move_renaming_the_pane() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let old = SessionKey::from_id("w1-old");
@@ -16290,6 +16413,7 @@ mod tests {
                 token: "worker-1".to_string(),
                 old_id: "w1-old".to_string(),
                 new_id: "w1-new".to_string(),
+                held_by_row: false,
             },
             now,
         );
@@ -22331,7 +22455,7 @@ mod tests {
     #[test]
     fn the_name_prefers_what_the_core_holds_about_the_director_over_a_stale_tick() {
         // The store (and so the last tick) still says the Director is `old`;
-        // a compaction fork re-keyed the live pane to `new`, whose row has the
+        // a session move re-keyed the live pane to `new`, whose row has the
         // current title. State-first is what covers the tick's one-second gap.
         let mut state = state_with_facts(vec![name_facts(1, "Frozen", Some("old"))]);
         let new = key_of("new");
@@ -26628,11 +26752,11 @@ mod tests {
     }
 
     #[test]
-    fn a_kickoff_queued_before_an_auto_compaction_fork_still_reaches_the_pane_after_it_renames() {
+    fn a_kickoff_queued_before_a_session_move_still_reaches_the_pane_after_it_renames() {
         // Same guarantee as the discovery-side test above, for the other of
         // the two rename-following paths: a Goinkyo's own Claude session can
-        // auto-compaction-fork before its kickoff ever fires, same as any
-        // other member's can (`update_member_session_forked`'s own doc).
+        // `/clear` before its kickoff ever fires, same as any other member's
+        // can (`update_member_session_moved`'s own doc).
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -26665,12 +26789,13 @@ mod tests {
                 token: GOINKYO_TOKEN.to_string(),
                 old_id: old_key.as_str().to_string(),
                 new_id: "goinkyo-forked-id".to_string(),
+                held_by_row: false,
             },
             t0,
         );
         assert_eq!(
             state.pending_goinkyo_kickoffs[0].key, new_key,
-            "the pending kickoff must follow the fork's rename too"
+            "the pending kickoff must follow the session move's rename too"
         );
         assert!(state.screens.contains_key(&new_key));
         assert!(!state.screens.contains_key(&old_key));
@@ -26856,8 +26981,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_submit_queued_before_an_auto_compaction_fork_still_reaches_the_pane_after_it_renames()
-     {
+    fn a_pending_submit_queued_before_a_session_move_still_reaches_the_pane_after_it_renames() {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
@@ -26885,12 +27009,13 @@ mod tests {
                 token: "worker-1".to_string(),
                 old_id: "w1-old".to_string(),
                 new_id: "w1-new".to_string(),
+                held_by_row: false,
             },
             t0,
         );
         assert_eq!(
             state.pending_submits[0].key, new_key,
-            "the pending submit must follow the fork's rename too"
+            "the pending submit must follow the session move's rename too"
         );
         assert!(state.screens.contains_key(&new_key));
         assert!(!state.screens.contains_key(&old_key));
@@ -29493,7 +29618,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offstage_members_compaction_fork_rekeys_its_live_pane() {
+    fn an_offstage_members_session_move_rekeys_its_live_pane() {
         let (mut state, mut app) = staged_brigade_with_worker();
         let brigade = brigade_config();
         let visible = SessionKey::from_id("other-director");
@@ -29516,6 +29641,7 @@ mod tests {
                 token: "worker-1".to_string(),
                 old_id: "w1".to_string(),
                 new_id: "w1-new".to_string(),
+                held_by_row: false,
             },
             test_instant(),
         );

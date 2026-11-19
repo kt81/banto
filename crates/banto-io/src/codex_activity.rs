@@ -131,7 +131,7 @@ pub struct CodexActivityTiming {
 /// four call sites (three tests, one real) that do not care about it stay
 /// exactly as clean as the result alone would leave them, and so this
 /// matches the shape `banto::embedded::emporium`'s own
-/// `gather_fork_observations`/`gather_relay_observations`/
+/// `gather_session_moves`/`gather_relay_observations`/
 /// `gather_goinkyo_observations` already use for the identical concern:
 /// `Option<&mut Timings>`, accumulated into by the callee, not returned —
 /// one shape for "does anyone want to know how long this took" across the

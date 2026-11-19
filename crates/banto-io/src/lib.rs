@@ -19,7 +19,6 @@
 //! - [`file_identity`] which directory or file a path leads to, by the filesystem's own identity rather than its spelling
 //! - [`input`] raw terminal events, read and timestamped off their own thread
 //! - [`instance_lock`] the exclusive lock that keeps a second banto UI off one database
-//! - [`lineage`] resolving auto-compaction parent links (beside the provider)
 //! - [`provider`] session discovery + tolerant JSONL parsing (Claude Code) / sqlite (Codex)
 //! - [`pty`]     PTY host abstraction (portable-pty-psmux)
 //! - [`sqlite_ro`] read-only access to a Codex sqlite database Codex may be actively writing
@@ -43,7 +42,6 @@ pub mod directory_trust;
 pub mod file_identity;
 pub mod input;
 pub mod instance_lock;
-pub mod lineage;
 pub mod pane_log;
 pub mod provider;
 pub mod pty;

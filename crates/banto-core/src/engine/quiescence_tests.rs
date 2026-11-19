@@ -7720,7 +7720,7 @@ fn a_reports_life_follows_its_process_and_its_pane() {
     let (mut state, mut app, pane, at) = solo_fixture(codex_row("cx"));
     said(&mut state, &mut app, &pane, REPORT_WORKING, at + SECOND);
 
-    // Rekeyed (discovery, a compaction fork): the report stays with the pane.
+    // Rekeyed (discovery, a session move): the report stays with the pane.
     let renamed = key("cx-renamed");
     state.rekey_pane_state(&pane, &renamed);
     app.replace_rows(vec![codex_row("cx-renamed")]);
@@ -8031,7 +8031,6 @@ fn rows_loaded(rows: Vec<SessionRow>) -> Event {
         rows,
         hidden: HashSet::new(),
         directors: HashSet::new(),
-        superseded: HashSet::new(),
     }
 }
 
@@ -10105,8 +10104,8 @@ fn a_wait_that_began_on_stage_does_not_ring_again_when_its_brigade_leaves_the_st
 
 #[test]
 fn a_director_pane_that_is_renamed_keeps_its_mark_without_ringing_again() {
-    // R2. An off-stage brigade fires and rings once. Its Director's session forks
-    // (compaction) or is discovered: its pane and its row change key, and the next
+    // R2. An off-stage brigade fires and rings once. Its Director's session moves
+    // (`/clear`) or is discovered: its pane and its row change key, and the next
     // tick must not take the mark for a new one.
     let mut off_stage = OffStage::new(OffStageSays::QuietFire, true);
     assert_eq!(off_stage.rings_before, 1);
@@ -10120,6 +10119,7 @@ fn a_director_pane_that_is_renamed_keeps_its_mark_without_ringing_again() {
             token: DIRECTOR_TOKEN.to_string(),
             old_id: "dir2".to_string(),
             new_id: "dir2b".to_string(),
+            held_by_row: false,
         },
         at,
     ));
@@ -10138,7 +10138,6 @@ fn a_director_pane_that_is_renamed_keeps_its_mark_without_ringing_again() {
                 .map(str::to_string)
                 .collect(),
             directors: ["dir", "dir2b"].into_iter().map(str::to_string).collect(),
-            superseded: Default::default(),
         },
         at,
     ));
@@ -10333,7 +10332,7 @@ fn a_new_goinkyo_hosted_before_it_has_a_session_starts_with_no_facts_even_if_the
 #[test]
 fn a_members_pane_that_is_renamed_keeps_its_announcement_and_does_not_ring_again() {
     // The same one-event rule for a member: an off-stage Worker's wait rang
-    // through its Director's row; its session forks, its pane and row change key.
+    // through its Director's row; its session moves, its pane and row change key.
     let mut off_stage = OffStage::new(OffStageSays::ClaudeWaiting, false);
     assert_eq!(off_stage.rings_before, 1);
     let at = off_stage.at + 30 * SECOND;
@@ -10345,6 +10344,7 @@ fn a_members_pane_that_is_renamed_keeps_its_announcement_and_does_not_ring_again
             token: "worker-1".to_string(),
             old_id: "w2".to_string(),
             new_id: "w2b".to_string(),
+            held_by_row: false,
         },
         at,
     ));
@@ -10360,7 +10360,6 @@ fn a_members_pane_that_is_renamed_keeps_its_announcement_and_does_not_ring_again
                 .map(str::to_string)
                 .collect(),
             directors: ["dir", "dir2"].into_iter().map(str::to_string).collect(),
-            superseded: Default::default(),
         },
         at,
     ));
@@ -10375,7 +10374,7 @@ fn a_members_pane_that_is_renamed_keeps_its_announcement_and_does_not_ring_again
 
 #[test]
 fn a_wait_shown_on_its_tile_keeps_its_announcement_when_its_pane_is_renamed_on_stage() {
-    // Brigade 1's Worker waits on stage (rang on its own tile), its session forks
+    // Brigade 1's Worker waits on stage (rang on its own tile), its session moves
     // and its pane and row change key, and then the brigade leaves the stage:
     // still the one wait, still no second ring.
     let mut off_stage = OffStage::new(OffStageSays::OnStageWait, false);
@@ -10394,6 +10393,7 @@ fn a_wait_shown_on_its_tile_keeps_its_announcement_when_its_pane_is_renamed_on_s
             token: "worker-1".to_string(),
             old_id: "w1".to_string(),
             new_id: "w1b".to_string(),
+            held_by_row: false,
         },
         at,
     );
@@ -10407,7 +10407,6 @@ fn a_wait_shown_on_its_tile_keeps_its_announcement_when_its_pane_is_renamed_on_s
                 .map(str::to_string)
                 .collect(),
             directors: ["dir", "dir2"].into_iter().map(str::to_string).collect(),
-            superseded: Default::default(),
         },
         at,
     );
@@ -10569,6 +10568,7 @@ fn a_bell_latched_member_renamed_keeps_its_latch_and_its_announcement() {
             token: "worker-2".to_string(),
             old_id: "w3".to_string(),
             new_id: "w3b".to_string(),
+            held_by_row: false,
         },
         at + 5 * SECOND,
     ));
@@ -10581,4 +10581,382 @@ fn a_bell_latched_member_renamed_keeps_its_latch_and_its_announcement() {
     let renamed = key("w3b");
     assert!(off_stage.state.latched_attention_panes.contains(&renamed));
     assert!(off_stage.state.row_announced_waits.contains(&renamed));
+}
+
+// --- a solo pane whose process moved to another session ---------------------------------
+
+fn session_moved(old_id: &str, new_id: &str) -> Event {
+    Event::PaneSessionMoved {
+        old_id: old_id.to_string(),
+        new_id: new_id.to_string(),
+        held_by_row: false,
+    }
+}
+
+#[test]
+fn a_clear_in_a_solo_pane_renames_it_and_the_quit_question_reads_the_new_id() {
+    let (mut state, mut app, a, b, at) = quit_fixture();
+    // After `/clear` no live file names `a` any more: the pane reads unknown,
+    // and the quit confirmation says so.
+    sample(&mut state, &mut app, &[(&a, Unknown), (&b, Idle)], at);
+    press(&mut state, &mut app, KeyCode::Esc, at);
+    assert_eq!(
+        state.displayed_status(),
+        Some("Esc again to quit \u{2014} 1 not idle: a (unknown)")
+    );
+    state.focus = Focus::Sidebar;
+    state.pending_quit = None;
+    state.status = None;
+
+    let cmds = send(&mut state, &mut app, session_moved("a", "a2"), at);
+
+    // The pane is renamed and nothing is written: a solo pane has no store row.
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::RekeyPty { from, to }] if *from == a && *to == key("a2")),
+        "{cmds:?}"
+    );
+    assert!(!state.screens.contains_key(&a));
+    assert!(state.screens.contains_key(&key("a2")));
+
+    // The next sample reads it under the new id, and the count is right.
+    let a2 = key("a2");
+    sample(
+        &mut state,
+        &mut app,
+        &[(&a2, Idle), (&b, Idle)],
+        at + Duration::from_secs(1),
+    );
+    press(
+        &mut state,
+        &mut app,
+        KeyCode::Esc,
+        at + Duration::from_secs(1),
+    );
+    assert!(app.should_quit(), "nothing is left to ask about");
+}
+
+#[test]
+fn a_branch_in_a_solo_pane_is_followed_with_its_screen_and_its_place_on_the_stage() {
+    // `/branch` moves the process to a copy of the conversation under a new id:
+    // to the pane that is the same event as `/clear`.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let a = host_solo(&mut state, "a");
+    state.stage = Stage::Solo(a.clone());
+    let at = t0();
+
+    send(&mut state, &mut app, session_moved("a", "a-branch"), at);
+
+    let branch = key("a-branch");
+    assert!(matches!(&state.stage, Stage::Solo(k) if *k == branch));
+    assert!(state.screens.contains_key(&branch));
+    assert!(!state.screens.contains_key(&a));
+    // A repeat of the observation (the shell sends a move again every few ticks
+    // while it still sees it) finds no pane under the old key and does nothing.
+    let again = send(&mut state, &mut app, session_moved("a", "a-branch"), at);
+    assert!(again.is_empty(), "{again:?}");
+}
+
+#[test]
+fn an_in_pane_resume_onto_a_session_open_elsewhere_is_refused_and_said_once() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let a = host_solo(&mut state, "a");
+    let b = host_solo(&mut state, "b");
+    let at = t0();
+
+    let first = send(&mut state, &mut app, session_moved("a", "b"), at);
+
+    // Renaming `a` onto `b` would put two panes on one key, and a resume of a
+    // conversation another pane is running is the double resume.
+    assert!(first.is_empty(), "{first:?}");
+    assert!(state.screens.contains_key(&a) && state.screens.contains_key(&b));
+    let said = state.status.clone().expect("the refusal is said");
+    assert!(said.contains("already in use"), "{said}");
+
+    state.status = None;
+    let second = send(
+        &mut state,
+        &mut app,
+        session_moved("a", "b"),
+        at + Duration::from_secs(1),
+    );
+    assert!(second.is_empty());
+    assert_eq!(state.status, None, "not said again every tick");
+
+    // A different id for the same pane is a new fact and is said.
+    state.screens.insert(key("c"), Screen::new(24, 80));
+    send(
+        &mut state,
+        &mut app,
+        session_moved("a", "c"),
+        at + Duration::from_secs(2),
+    );
+    assert!(state.status.is_some());
+}
+
+#[test]
+fn an_in_pane_resume_onto_a_session_that_is_being_opened_is_refused_and_said_once() {
+    // The operator pressed Enter on the row of `p` (an open is in flight, no pane
+    // yet) and then resumed `p` from inside pane `a`: renaming `a` onto `p` would
+    // meet the spawn's own pane under the same key.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let a = host_solo(&mut state, "a");
+    state.pending_opens.insert(key("p"), PendingOpen::Solo);
+    let at = t0();
+
+    let first = send(&mut state, &mut app, session_moved("a", "p"), at);
+
+    assert!(first.is_empty(), "{first:?}");
+    assert!(state.screens.contains_key(&a) && !state.screens.contains_key(&key("p")));
+    assert!(state.status.is_some(), "the refusal is said");
+    state.status = None;
+    send(
+        &mut state,
+        &mut app,
+        session_moved("a", "p"),
+        at + Duration::from_secs(1),
+    );
+    assert_eq!(state.status, None, "not said again every tick");
+}
+
+fn session_moved_onto_a_row(old_id: &str, new_id: &str) -> Event {
+    Event::PaneSessionMoved {
+        old_id: old_id.to_string(),
+        new_id: new_id.to_string(),
+        held_by_row: true,
+    }
+}
+
+#[test]
+fn a_solo_pane_is_not_renamed_onto_a_session_another_members_row_holds() {
+    // The member's pane is closed, so no pane holds the id: only the roster does.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let a = host_solo(&mut state, "a");
+    let at = t0();
+
+    let first = send(
+        &mut state,
+        &mut app,
+        session_moved_onto_a_row("a", "held"),
+        at,
+    );
+
+    assert!(first.is_empty(), "{first:?}");
+    assert!(state.screens.contains_key(&a) && !state.screens.contains_key(&key("held")));
+    assert!(state.status.is_some(), "the refusal is said");
+    state.status = None;
+    send(
+        &mut state,
+        &mut app,
+        session_moved_onto_a_row("a", "held"),
+        at + Duration::from_secs(1),
+    );
+    assert_eq!(state.status, None, "not said again every tick");
+}
+
+#[test]
+fn a_member_whose_process_moved_onto_a_session_another_members_row_holds_writes_nothing() {
+    // `SetMemberSession` moves an id between rows, so writing it would silently
+    // clear the link of the member that has it.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let w = host(&mut state, 1, "worker-1", "w1");
+    let at = t0();
+    let moved = || Event::MemberSessionForked {
+        brigade_id: 1,
+        token: "worker-1".to_string(),
+        old_id: "w1".to_string(),
+        new_id: "held".to_string(),
+        held_by_row: true,
+    };
+
+    let first = send(&mut state, &mut app, moved(), at);
+
+    assert!(first.is_empty(), "no rename and no store write: {first:?}");
+    assert!(state.screens.contains_key(&w));
+    assert!(state.status.is_some(), "the refusal is said");
+    state.status = None;
+    send(&mut state, &mut app, moved(), at + Duration::from_secs(1));
+    assert_eq!(state.status, None, "not said again every tick");
+}
+
+fn member_moved(new_id: &str, held_by_row: bool) -> Event {
+    Event::MemberSessionForked {
+        brigade_id: 1,
+        token: "worker-1".to_string(),
+        old_id: "w1".to_string(),
+        new_id: new_id.to_string(),
+        held_by_row,
+    }
+}
+
+#[test]
+fn a_refused_solo_move_is_renamed_when_the_open_that_held_it_fails() {
+    // Enter on row `p`, then an in-pane `/resume p` in pane `a`: refused while
+    // the open is in flight. The open fails (it says "already running
+    // elsewhere"), the process stays on `p`, and the shell sends the move again.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let a = host_solo(&mut state, "a");
+    state.pending_opens.insert(key("p"), PendingOpen::Solo);
+    let at = t0();
+
+    let refused = send(&mut state, &mut app, session_moved("a", "p"), at);
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(state.screens.contains_key(&a));
+    state.status = None;
+
+    state.pending_opens.remove(&key("p"));
+    let renamed = send(
+        &mut state,
+        &mut app,
+        session_moved("a", "p"),
+        at + Duration::from_secs(5),
+    );
+
+    assert!(
+        matches!(renamed.as_slice(), [Cmd::RekeyPty { from, to }] if *from == a && *to == key("p")),
+        "{renamed:?}"
+    );
+    assert!(state.screens.contains_key(&key("p")) && !state.screens.contains_key(&a));
+    assert_eq!(state.status, None, "the retry that succeeds says nothing");
+}
+
+#[test]
+fn a_refused_member_move_is_renamed_and_written_when_the_other_pane_closes() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let w = host(&mut state, 1, "worker-1", "w1");
+    let other = host_solo(&mut state, "other");
+    let at = t0();
+
+    let refused = send(&mut state, &mut app, member_moved("other", false), at);
+    assert!(refused.is_empty(), "no rename, no store write: {refused:?}");
+    state.status = None;
+
+    state.screens.remove(&other);
+    let applied = send(
+        &mut state,
+        &mut app,
+        member_moved("other", false),
+        at + Duration::from_secs(5),
+    );
+
+    assert!(
+        matches!(
+            applied.as_slice(),
+            [
+                Cmd::RekeyPty { from, to },
+                Cmd::Store(StoreIntent::SetMemberSession { session_id, .. }),
+            ] if *from == w && *to == key("other") && session_id == "other"
+        ),
+        "{applied:?}"
+    );
+    assert_eq!(state.status, None);
+}
+
+#[test]
+fn a_member_move_is_renamed_when_the_row_that_held_it_lets_go() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let w = host(&mut state, 1, "worker-1", "w1");
+    let at = t0();
+
+    let refused = send(&mut state, &mut app, member_moved("held", true), at);
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(state.screens.contains_key(&w));
+
+    let applied = send(
+        &mut state,
+        &mut app,
+        member_moved("held", false),
+        at + Duration::from_secs(5),
+    );
+    assert_eq!(applied.len(), 2, "{applied:?}");
+    assert!(state.screens.contains_key(&key("held")));
+}
+
+#[test]
+fn a_member_whose_pane_is_gone_is_not_written_onto_a_session_something_holds() {
+    // The store-only branch: no pane under the old key, only the row to move.
+    // `SetMemberSession` would take the id from whoever holds it.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let at = t0();
+
+    let by_row = send(&mut state, &mut app, member_moved("held", true), at);
+    assert!(by_row.is_empty(), "a row holds it: {by_row:?}");
+
+    let other = host_solo(&mut state, "other");
+    let by_pane = send(&mut state, &mut app, member_moved("other", false), at);
+    assert!(by_pane.is_empty(), "a pane holds it: {by_pane:?}");
+    state.screens.remove(&other);
+
+    state.pending_opens.insert(key("p"), PendingOpen::Solo);
+    let by_open = send(&mut state, &mut app, member_moved("p", false), at);
+    assert!(by_open.is_empty(), "an open holds it: {by_open:?}");
+
+    let free = send(&mut state, &mut app, member_moved("free", false), at);
+    assert!(
+        matches!(
+            free.as_slice(),
+            [Cmd::Store(StoreIntent::SetMemberSession { session_id, .. })] if session_id == "free"
+        ),
+        "{free:?}"
+    );
+}
+
+#[test]
+fn a_repeated_member_move_after_the_rename_still_writes_the_row() {
+    // The rename took the id for this member's own pane; the same fact arriving
+    // again (before the row follows) must not read that pane as another holder.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    host(&mut state, 1, "worker-1", "w1");
+    let at = t0();
+    send(&mut state, &mut app, member_moved("w1-new", false), at);
+
+    let again = send(&mut state, &mut app, member_moved("w1-new", false), at);
+
+    assert!(
+        matches!(
+            again.as_slice(),
+            [Cmd::Store(StoreIntent::SetMemberSession { session_id, .. })] if session_id == "w1-new"
+        ),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn a_refusal_latch_goes_with_its_pane_at_the_next_tick() {
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let a = host_solo(&mut state, "a");
+    host_solo(&mut state, "b");
+    let at = t0();
+    send(&mut state, &mut app, session_moved("a", "b"), at);
+    assert_eq!(state.refused_session_moves.len(), 1);
+
+    // The pane exits; no further refusal comes along to prune the latch.
+    state.screens.remove(&a);
+    tick(&mut state, &mut app, at + Duration::from_secs(1));
+
+    assert!(state.refused_session_moves.is_empty());
+}
+
+#[test]
+fn a_session_move_never_renames_a_brigade_members_pane() {
+    // A member is followed by `MemberSessionForked`, which also writes the store;
+    // the solo event must not rename it behind the roster's back.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let w = host(&mut state, 1, "worker-1", "w1");
+
+    let cmds = send(&mut state, &mut app, session_moved("w1", "w1-new"), t0());
+
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(state.screens.contains_key(&w));
 }

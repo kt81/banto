@@ -216,6 +216,7 @@ pub fn event_name(ev: &Event) -> &'static str {
         Event::ExitedWorkerDismissed { .. } => "ExitedWorkerDismissed",
         Event::MemberSessionRecorded { .. } => "MemberSessionRecorded",
         Event::MemberSessionForked { .. } => "MemberSessionForked",
+        Event::PaneSessionMoved { .. } => "PaneSessionMoved",
         Event::Tick { .. } => "Tick",
         Event::QuiescenceSampled { .. } => "QuiescenceSampled",
         Event::GoinkyoAwaitingSpawn { .. } => "GoinkyoAwaitingSpawn",
@@ -259,6 +260,7 @@ pub fn pane_facts_key(ev: &Event) -> Option<&SessionKey> {
         | Event::ExitedWorkerDismissed { .. }
         | Event::MemberSessionRecorded { .. }
         | Event::MemberSessionForked { .. }
+        | Event::PaneSessionMoved { .. }
         | Event::Tick { .. }
         | Event::QuiescenceSampled { .. }
         | Event::GoinkyoAwaitingSpawn { .. }
@@ -321,12 +323,24 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
             token,
             old_id,
             new_id,
+            held_by_row,
         } => vec![
             Line::new("MemberSessionForked")
                 .num("brigade", brigade_id)
                 .token("member", token)
                 .session("old", old_id)
-                .session("new", new_id),
+                .session("new", new_id)
+                .flag("held_by_row", *held_by_row),
+        ],
+        Event::PaneSessionMoved {
+            old_id,
+            new_id,
+            held_by_row,
+        } => vec![
+            Line::new("PaneSessionMoved")
+                .session("old", old_id)
+                .session("new", new_id)
+                .flag("held_by_row", *held_by_row),
         ],
         Event::MembershipResolved {
             session_id,

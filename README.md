@@ -363,7 +363,8 @@ Quit banto, run the same install line, start banto again.
   it copies the database to `banto.db.before-v<N>` beside it (the database as it was at
   schema `N - 1`; see [Status & caveats](#status--caveats)). An older build cannot open
   a database a newer one has migrated, so going back means the older build plus that
-  copy.
+  copy. The upgrade to schema 19 also stops hiding the ancestors of compactions made
+  before Claude Code 2.1.318: they show in the ordinary list beside their continuations.
 - **One banto UI per database.** A second `banto` that would open a database a running
   one already uses refuses to start; see [Read-only guarantee](#read-only-guarantee)
   for how to run two.
@@ -445,7 +446,7 @@ finish.
 | `/` | Search (fuzzy, title + cwd) |
 | `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
-| `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
+| `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run) → also archived ones |
 | `D` | Restore (un-archive) the selected session, while archived ones are revealed |
 | `q` / `Esc` | Quit (a second press is needed while a session is not idle or is running a background command, see above) |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |

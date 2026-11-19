@@ -73,6 +73,12 @@ fn every_text_carrying_variant_leaves_its_marker_out() {
             token: "worker-a".to_string(),
             old_id: "sess-1".to_string(),
             new_id: "sess-2".to_string(),
+            held_by_row: false,
+        },
+        Event::PaneSessionMoved {
+            old_id: "sess-1".to_string(),
+            new_id: "sess-2".to_string(),
+            held_by_row: false,
         },
         Event::MembershipResolved {
             session_id: "sess-1".to_string(),

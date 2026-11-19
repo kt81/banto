@@ -830,6 +830,32 @@ falls back to scanning session files only when the direct child isn't
 is invisible to the relay engine, so it can never be nudged into the first
 turn that would create the very file discovery is waiting for.
 
+**A hosted Claude pane follows its process to another session id.** `/clear`, `/branch`
+and an in-pane `/resume` move a running `claude` to a different session id while its pid
+stays, and its live file starts naming the new id (auto-compaction does not: 2.1.318 and
+later compact in place, same file and id). Each tick banto reads, once for the whole tick,
+the roster and the live files, and for every hosted Claude pane whose own process
+(its pid, or the nearest `claude` below it) reports an id other than its key: a brigade
+member is renamed and its row moved (`MemberSessionForked`, the name the event keeps in
+the record/replay format and the pane log); any other pane is renamed with no store write
+(`PaneSessionMoved`). Without it the pane would read unknown (no live file names its key),
+the quit confirmation would count it, and its next resume would open the conversation it
+left. A move onto an id **another pane already holds** (an in-pane `/resume` of a session
+open elsewhere) changes nothing, the store included, since renaming would put two panes
+on one key and writing it would resume the conversation twice (invariant 4); the status
+line says so once per pane and id. "Already holds" covers a pane being opened and another
+member's row whose pane is closed (`SetMemberSession` moves a session id between rows); it
+covers a member whose own pane is gone too, since that write would take the id as well. The
+refusal is not final: the move is sent again every few ticks while the process still reports
+the new id, so the pane is renamed once what held the conversation lets go (the open fails,
+the other pane closes, the other row changes). A move is believed only after the same one has
+held for two consecutive ticks (a live file missing or torn for one tick while a nested
+`claude -p` runs must not rename the pane onto the nested session and back), and only from a
+live file whose process is alive, a dead file naming the pane's own key included. A tick that
+could not read every brigade's members names no move at all, member or solo: the missing
+brigade could be where the pane belongs or the row that holds the id. A Codex pane is never
+examined: the live file is Claude's.
+
 Note: the format is undocumented and subject to change. Defend with **lenient
 parsing** (ignore unknown records/fields, skip broken lines) plus tests against
 synthetic fixtures. **Never bring real session data into the repository.**
@@ -1129,7 +1155,6 @@ crates/
 │  ├─ claude_home.rs    # the Claude Code home root + its projects/sessions subdirs
 │  ├─ codex_home.rs     # the Codex home root + its threads/logs db paths and rollout tree
 │  ├─ codex_catalog.rs  # the model catalog compiled into the installed Codex: `codex debug models --bundled` behind a trait, bounded by a timeout
-│  ├─ lineage.rs        # auto-compaction parent-link resolution
 │  ├─ pty.rs            # PTY host abstraction (portable-pty)
 │  └─ config.rs         # config.toml: loading it, and where it is looked for (--config/BANTO_CONFIG/XDG/~/.config/dirs::config_dir)
 ├─ banto-tui/           # rendering from &State (ratatui, no terminal backend) — view (session list, summary), paint (vt100 screen → buffer cells), render_modal, strip (the title status of every tile; the message rows of a collapsed one), hints, text
@@ -1148,12 +1173,18 @@ crates/
 ```
 
 **The store's schema** is versioned by `PRAGMA user_version`; `store/migrations.rs`
-holds one script per version (18 today) and the UI's open applies what is pending,
+holds one script per version (19 today) and the UI's open applies what is pending,
 under the write lock, after a copy of the database (see "Upgrading banto"). An older
 build cannot open a database a newer one has migrated: it reports `unsupported database
 schema version <n>` rather than guess, with the way out in the same line. v17 dropped `panes`, the map of a session to
 its external-terminal pane, which nothing records or reads once banto opens sessions
-only in its own panes; any rows went with it. v18 added
+only in its own panes; any rows went with it. v19 dropped `session_lineage`, the
+child → parent links of auto-compaction continuations: Claude Code 2.1.318 and later
+compacts in place, in the same file under the same session id, so there is no
+continuation to link, and the list no longer hides "superseded" ancestors, so after the
+upgrade the ancestors of compactions made before 2.1.318 show in the ordinary list
+beside their continuations (the migration took `banto.db.before-v19` first, which still
+holds the links). v18 added
 `brigade_members.joined_after_id`, the highest message id that existed when the
 member joined (0 for a member that joined before v18, which means no bound; it lives
 on the member's own row, so a dismissed member's value goes with it, and a migration
@@ -1252,7 +1283,8 @@ is written, `<unix ms> panes +<ms since start>ms <Kind> <name=value ...>`:
 `Spawned`, `SpawnFailed` (a refusal word per refusal site and the OS error number,
 never the error text), `PtyExited` (the exit code or signal, `asked=yes|no`, the
 member), `PtyOutputLost`, `PtyWriteDropped`, `Reaped` (a released handle and its
-pid), `DiscoveryResult`, `MemberSessionForked`, `MembershipResolved` and
+pid), `DiscoveryResult`, `MemberSessionForked` and `PaneSessionMoved` (a brigade member's
+or a solo pane's own process now reports another session id; `held_by_row=yes|no`), `MembershipResolved` and
 `MembershipRoster` (tokens, roles and session ids), `BrigadeFormed`, `WorkerAdded`,
 `WorkerDismissed`, `ExitedWorkerDismissed`, `Disbanded`; and the Cmds `OpenEmbedded`
 (with `replaced=yes` when it displaced a live handle under its key), `OpenCodexTrustPane`
@@ -1513,7 +1545,7 @@ A Worker added later gets the mean of the others' height.
 | `/` | Search (fuzzy, title + cwd) |
 | `p` / `d` / `g` | Pin / archive (soft-hide) / join group |
 | `Tab` | Toggle grouped view (Pinned / groups / Ungrouped) |
-| `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run, superseded ancestors) → also archived ones |
+| `a` | Cycle what the list reveals: ordinary sessions → also hidden ones (agent-run) → also archived ones |
 | `D` | Restore (un-archive) the selected session, while archived ones are revealed |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
@@ -1809,8 +1841,8 @@ not waiting; or, for one that stood only on a BEL latch, when the latch is clear
 whatever is known about its activity (a BEL has no activity word to say it is over);
 or when its pane is gone (a pane later hosted under the same key is a new one). A
 wait that begins again rings anew. A pane about which nothing is known for the
-moment (a compaction fork or discovery renamed it and its row is not yet under the
-new id) says nothing either way, so a rename is not an event and the same wait does
+moment (discovery renamed it, or its process moved to another session id with `/clear`,
+`/branch` or an in-pane `/resume`, and its row is not yet under the new id) says nothing either way, so a rename is not an event and the same wait does
 not ring twice. Every ring is under the same 3-second cooldown as every attention
 bell, which may swallow it.
 
@@ -1842,7 +1874,7 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   the unbroken all-idle stretch — the last member becoming idle, or the set of
   hosted members last changing (a member hosted, gone, or relaunched under the same
   key restarts it; a key that merely changes for the same process, as discovery or a
-  compaction fork do, does not); and (b) the last time banto itself wrote into a
+  `/clear` do, does not); and (b) the last time banto itself wrote into a
   hosted member of that brigade to start or continue a turn (the relay's nudge line
   and its submitting Enter, a kickoff line, a kickoff retry). It also needs the
   brigade to have been *armed* by real work since it last fired or since banto began
@@ -3100,7 +3132,7 @@ UI arm) opens a database whose `PRAGMA user_version` is above 0 and below the sc
 this build carries, it first writes `<database file>.before-v<N>` beside the database
 (`banto.db.before-v15`; the file name of a `db_path` elsewhere is kept). `N` is the
 version the migration reaches *first*, so the copy always holds schema `N - 1`: a v14
-database becomes `banto.db.before-v15` even when this build goes on to v18. That is the
+database becomes `banto.db.before-v15` even when this build goes on to v19. That is the
 reading of the operator's hand-made `before-v15`, `-v16` and `-v17` beside a v18
 database (each is the database before it became that version), and it lets a build
 that carries schema `K` name the copy it can go back to, `before-v<K + 1>`, without
@@ -3617,10 +3649,7 @@ process (step 5, dormant) is shown as live (`Alive`) while the pane lasts
 of the logs database runs only on a list reload, which a pane at its prompt never
 causes. A busy or waiting activity stands, a reload does not lose it, and ending the
 pane gives the row its own word back; the rows of sessions not hosted here, and
-`banto list`, are unchanged. A side effect, intended and pinned by a test: a live
-superseded row is never hidden, so a resumed ancestor that the list hid as
-superseded is listed, and not counted as hidden, for as long as its pane lasts, and
-is hidden again after. The stricter question "is this session known to be doing
+`banto list`, are unchanged. The stricter question "is this session known to be doing
 nothing?" — asked by the quit confirmation and the brigade bell (see "The emporium:
 hosted panes") — reads the same file the other way round: only `idle` is idle,
 `shell` is not (it is told apart as *background*, not idle for that one reason

@@ -344,7 +344,6 @@ mod tests {
             size,
             is_agent: false,
             preview: None,
-            continuation_of_uuid: None,
             source_archived: false,
         }
     }

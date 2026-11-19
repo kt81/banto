@@ -169,7 +169,7 @@ pub enum Modal {
 ///
 /// The order is the taxonomy, not a preference: **who hid a row decides
 /// where it reappears.** `Hidden` reveals what banto hid on its own
-/// judgment — agent-run sessions and superseded ancestors, presumed noise.
+/// judgment — agent-run sessions, presumed noise.
 /// `Archived` additionally reveals what the *operator* buried one row at a
 /// time with `d`, which is a different kind of fact and so sits a step
 /// further in rather than beside it.
@@ -186,7 +186,7 @@ pub enum Modal {
 pub enum Reveal {
     /// Ordinary sessions only.
     Ordinary,
-    /// Plus what banto hid: agent-run and non-live superseded sessions.
+    /// Plus what banto hid: agent-run sessions.
     Hidden,
     /// Plus what the operator archived.
     Archived,
@@ -923,18 +923,9 @@ pub struct App {
     /// (mirrors `pinned`'s cache-only role); see
     /// [`Self::with_directors`]/[`Self::set_directors`].
     directors: HashSet<String>,
-    /// Session ids superseded by an auto-compaction continuation (every id
-    /// with a known successor; see `banto_io::lineage`/`Store::lineage_parent_ids`).
-    /// Hidden from `filtered` like `hidden`, gated by [`Self::reveal`]
-    /// rather than always-off, UNLESS the session is currently live (see
-    /// [`Self::compute_filtered`]) — a running resumed ancestor must stay
-    /// visible, hiding it would lie about what's actually running. A cache
-    /// loaded from the store at startup and on every reload; see
-    /// [`Self::with_superseded`]/[`Self::set_superseded`].
-    superseded: HashSet<String>,
     /// `Config.agents`, resolved — display-only here, not a name-doubling
     /// coincidence with [`Self::reveal`]: that one hides/reveals
-    /// already-loaded *rows* (agent-run, superseded and archived ones), this one only
+    /// already-loaded *rows* (agent-run and archived ones), this one only
     /// explains why [`Self::rows`] can be short to begin with — the actual
     /// filtering happened before discovery ever produced a row (see
     /// `crate::config::resolve_agents`'s doc). Never affects `filtered`.
@@ -944,8 +935,8 @@ pub struct App {
     enabled_agents: BTreeSet<AgentKind>,
     /// How much of the list `filtered` includes (see [`Reveal`]). Ordinary
     /// sessions only by default: a human browsing their own sessions doesn't
-    /// usually want every spawned-agent or superseded-ancestor session, or what
-    /// they archived, cluttering the list.
+    /// usually want every spawned-agent session, or what they archived,
+    /// cluttering the list.
     reveal: Reveal,
     /// Every known group, alphabetical by name — a cache for sorting/display
     /// only, the store is the durable source of truth; see [`Self::with_groups`].
@@ -1005,10 +996,6 @@ pub struct VisibleRow<'a> {
     /// ([`App::set_request_rows`]): the fixed tag is drawn on line two in place of
     /// the cwd.
     pub request: bool,
-    /// True when this session has a known auto-compaction continuation —
-    /// shown regardless of *why* the row is visible (still live, or the
-    /// `a` cycle has revealed what banto hid).
-    pub superseded: bool,
 }
 
 /// One item in the rendered list, in display order: either a real session
@@ -1064,7 +1051,6 @@ impl App {
             dialog_rows: HashSet::new(),
             hidden: HashSet::new(),
             directors: HashSet::new(),
-            superseded: HashSet::new(),
             enabled_agents: AgentKind::ALL.into_iter().collect(),
             reveal: Reveal::Ordinary,
             groups: Vec::new(),
@@ -1659,9 +1645,7 @@ impl App {
     }
 
     /// Number of sessions matching the current query that the current
-    /// [`Reveal`] level is hiding: agent-run sessions, superseded
-    /// (auto-compaction ancestor) sessions that aren't currently live (see
-    /// [`Self::is_hidden_superseded`]), and archived ones. Always `0` at
+    /// [`Reveal`] level is hiding: agent-run sessions and archived ones. Always `0` at
     /// [`Reveal::Archived`]. Only the tests count what is hidden.
     #[cfg(test)]
     fn hidden_count(&self) -> usize {
@@ -1676,26 +1660,13 @@ impl App {
     /// `compute_filtered` and `hidden_count` can never drift apart about
     /// what "hidden" means.
     fn revealed(&self, i: usize) -> bool {
-        let machine_hidden = self.rows[i].is_agent || self.is_hidden_superseded(i);
+        let machine_hidden = self.rows[i].is_agent;
         let operator_hidden = self.rows[i].archived;
         match self.reveal {
             Reveal::Ordinary => !machine_hidden && !operator_hidden,
             Reveal::Hidden => !operator_hidden,
             Reveal::Archived => true,
         }
-    }
-
-    /// True when `rows[i]` has a known auto-compaction continuation and is
-    /// not currently live — the condition under which [`Self::compute_filtered`]
-    /// hides it (subject to [`Self::reveal`]). A live superseded row
-    /// (a resumed ancestor still running) is never hidden: hiding a running
-    /// session would lie about what's actually going on.
-    fn is_hidden_superseded(&self, i: usize) -> bool {
-        self.superseded.contains(&self.rows[i].id)
-            && !matches!(
-                self.rows[i].activity,
-                Activity::Busy | Activity::Waiting | Activity::Alive
-            )
     }
 
     /// Seed the initial pinned-id set (loaded once from the store at
@@ -1769,27 +1740,6 @@ impl App {
     /// brigade is formed/disbanded).
     pub fn set_directors(&mut self, directors: HashSet<String>) {
         self.directors = directors;
-    }
-
-    /// Seed the initial superseded-session-id set (loaded from the store at
-    /// startup — see [`Self::set_superseded`] for reloads). Unlike
-    /// [`Self::with_directors`], this affects filtering (see
-    /// [`Self::compute_filtered`]), so — like [`Self::with_hidden_member_ids`]
-    /// — it re-filters and keeps the current selection if it's still visible.
-    pub fn with_superseded(mut self, superseded: HashSet<String>) -> Self {
-        self.superseded = superseded;
-        let selected_id = self.selected_row().map(|row| row.id.clone());
-        self.refilter_keeping_selected(selected_id);
-        self
-    }
-
-    /// Replace the superseded-session-id set (e.g. after a reload resolves
-    /// more lineage links), keeping the current selection if it's still
-    /// visible.
-    pub fn set_superseded(&mut self, superseded: HashSet<String>) {
-        self.superseded = superseded;
-        let selected_id = self.selected_row().map(|row| row.id.clone());
-        self.refilter_keeping_selected(selected_id);
     }
 
     /// Open the emporium's disband confirm dialog for the given brigade
@@ -1918,11 +1868,6 @@ impl App {
     /// like [`Self::set_reported_activity`], so a reload cannot lose it and ending
     /// the pane gives the row its own word back; and costs a comparison when
     /// nothing changed.
-    ///
-    /// A side effect, intended: a live superseded row is never hidden
-    /// ([`Self::is_hidden_superseded`]), so a resumed ancestor whose pane this
-    /// banto hosts is listed, and not counted as hidden, for as long as the pane
-    /// lasts.
     pub fn set_hosted_ids(&mut self, hosted: HashSet<String>) {
         if self.hosted_ids == hosted {
             return;
@@ -2057,8 +2002,8 @@ impl App {
     }
 
     /// Rank `rows` against the current query, then drop what the current
-    /// [`Reveal`] level hides (agent-run, hidden-superseded and archived
-    /// sessions; see [`Self::is_hidden_superseded`]), and always drop brigade Workers
+    /// [`Reveal`] level hides (agent-run and archived sessions), and always
+    /// drop brigade Workers
     /// (banto's own implementation detail, not something the user picks
     /// directly — see `hidden`). Ranking (and, with an empty query, the
     /// pinned-first base order) always runs first and is never affected by
@@ -2475,14 +2420,6 @@ impl App {
             .is_some_and(|row| self.pinned.contains(&row.id))
     }
 
-    /// Whether the currently selected session has a known auto-compaction
-    /// continuation (for the summary panel's marker); `false` when nothing
-    /// is selected.
-    pub fn is_selected_superseded(&self) -> bool {
-        self.selected_row()
-            .is_some_and(|row| self.superseded.contains(&row.id))
-    }
-
     /// Whether the currently selected session is a brigade Director (for the
     /// summary panel's marker); `false` when nothing is selected.
     pub fn is_selected_director(&self) -> bool {
@@ -2534,7 +2471,6 @@ impl App {
                         director: self.directors.contains(&row.id),
                         brigade_mark: self.brigade_marks.contains(&row.id),
                         request: self.request_rows.contains(&row.id),
-                        superseded: self.superseded.contains(&row.id),
                     })
                 }
             })
@@ -2663,36 +2599,6 @@ mod tests {
         assert!(got.contains(&"a".to_string()));
         assert!(got.contains(&"c".to_string()));
         assert_eq!(app.selected(), 0);
-    }
-
-    #[test]
-    fn a_superseded_ancestor_is_listed_while_it_is_hosted_and_hidden_again_after() {
-        // Intended: a live superseded row is never hidden ("hiding a running
-        // session would lie"), and a hosted session is live whatever its files
-        // can prove, so while its pane lasts it is listed and not counted hidden.
-        let dormant = Activity::Idle(AgeBucket::Today);
-        let rows = vec![
-            SessionRow {
-                activity: dormant,
-                ..row("old", "old", "")
-            },
-            SessionRow {
-                activity: Activity::Alive,
-                ..row("new", "new", "")
-            },
-        ];
-        let mut app = App::new(rows).with_superseded(["old".to_string()].into_iter().collect());
-        app.set_viewport_height(10);
-        assert_eq!(ids(&app), vec!["new"]);
-        assert_eq!(app.hidden_count(), 1);
-
-        app.set_hosted_ids(["old".to_string()].into_iter().collect());
-        assert_eq!(ids(&app), vec!["old", "new"]);
-        assert_eq!(app.hidden_count(), 0);
-
-        app.set_hosted_ids(HashSet::new());
-        assert_eq!(ids(&app), vec!["new"]);
-        assert_eq!(app.hidden_count(), 1);
     }
 
     #[test]
@@ -4191,37 +4097,6 @@ mod tests {
         assert_eq!(director_flags, vec![false, true, false]);
     }
 
-    #[test]
-    fn superseded_sessions_are_hidden_by_default() {
-        let mut app = App::new(numbered(3)); // id0, id1, id2
-        app.set_viewport_height(10);
-
-        app = app.with_superseded(["id1".to_string()].into_iter().collect());
-
-        assert_eq!(ids(&app), vec!["id0", "id2"]);
-        // Still resolvable by id, just not listed.
-        assert!(app.row_for_id("id1").is_some());
-    }
-
-    #[test]
-    fn a_live_superseded_session_stays_visible() {
-        let rows = vec![
-            row("id0", "title 0", ""),
-            SessionRow {
-                activity: Activity::Busy,
-                ..row("id1", "title 1", "")
-            },
-        ];
-        let mut app = App::new(rows);
-        app.set_viewport_height(10);
-
-        app = app.with_superseded(["id1".to_string()].into_iter().collect());
-
-        // A resumed, still-running ancestor must not be hidden — hiding it
-        // would lie about what's actually running.
-        assert_eq!(ids(&app), vec!["id0", "id1"]);
-    }
-
     fn archived_row(id: &str, title: &str) -> SessionRow {
         SessionRow {
             archived: true,
@@ -4308,94 +4183,6 @@ mod tests {
         }
 
         assert!(!app.any_archived_visible());
-    }
-
-    #[test]
-    fn the_reveal_cycle_shows_superseded_sessions_too() {
-        let mut app = App::new(numbered(2)); // id0, id1
-        app.set_viewport_height(10);
-        app = app.with_superseded(["id1".to_string()].into_iter().collect());
-        assert_eq!(ids(&app), vec!["id0"]);
-
-        app.cycle_reveal();
-        assert_eq!(ids(&app), vec!["id0", "id1"]);
-
-        // Still shown one step further in — the levels stack rather than
-        // trading one hidden class for another.
-        app.cycle_reveal();
-        assert_eq!(ids(&app), vec!["id0", "id1"]);
-
-        app.cycle_reveal();
-        assert_eq!(ids(&app), vec!["id0"]);
-    }
-
-    #[test]
-    fn set_superseded_updates_the_filter_after_a_reload() {
-        let mut app = App::new(numbered(2)); // id0, id1
-        app.set_viewport_height(10);
-        assert_eq!(ids(&app), vec!["id0", "id1"]);
-
-        app.set_superseded(["id0".to_string()].into_iter().collect());
-        assert_eq!(ids(&app), vec!["id1"]);
-
-        // A newly-resolved lineage link disappearing again (shouldn't
-        // happen in practice, but the setter is symmetric) brings it back.
-        app.set_superseded(HashSet::new());
-        assert_eq!(ids(&app), vec!["id0", "id1"]);
-    }
-
-    #[test]
-    fn hidden_count_includes_hidden_superseded_sessions() {
-        let mut app = App::new(numbered(3)); // id0, id1, id2
-        app.set_viewport_height(10);
-        app = app.with_superseded(["id1".to_string()].into_iter().collect());
-
-        assert_eq!(app.hidden_count(), 1);
-        app.cycle_reveal();
-        assert_eq!(app.hidden_count(), 0);
-    }
-
-    #[test]
-    fn is_selected_superseded_reflects_the_current_selection() {
-        // "a" is live so marking it superseded doesn't also hide it —
-        // keeping the focus purely on `is_selected_superseded` itself
-        // rather than the hidden-by-default interaction (covered by
-        // `superseded_sessions_are_hidden_by_default`).
-        let rows = vec![
-            SessionRow {
-                activity: Activity::Alive,
-                ..row("a", "Alpha", "")
-            },
-            row("b", "Beta", ""),
-        ];
-        let mut app = App::new(rows);
-        app.set_viewport_height(10);
-        assert!(!app.is_selected_superseded());
-
-        app = app.with_superseded(["a".to_string()].into_iter().collect());
-        assert!(app.is_selected_superseded());
-
-        app.select_next();
-        assert!(!app.is_selected_superseded()); // now on "b"
-    }
-
-    #[test]
-    fn visible_reports_superseded_status_per_row() {
-        let mut app = App::new(numbered(3));
-        app.set_viewport_height(10);
-        app = app.with_superseded(["id1".to_string()].into_iter().collect());
-        app.cycle_reveal(); // reveal it so it shows up in `visible()`
-        app.toggle_grouped_view(); // flat: unrelated to sections
-
-        let flags: Vec<bool> = app
-            .visible()
-            .iter()
-            .filter_map(|line| match line {
-                ListLine::Row(r) => Some(r.superseded),
-                ListLine::Header { .. } => None,
-            })
-            .collect();
-        assert_eq!(flags, vec![false, true, false]);
     }
 
     #[test]

@@ -10,9 +10,8 @@
 //! Exactly six, fixed: 🤝 director (the partnership metaphor — Director and
 //! Worker as a cell — not royalty; a prior busts-in-silhouette choice was
 //! a dark, low-contrast glyph that all but vanished on a dark terminal
-//! background), 🧬 superseded (an auto-compaction ancestor with a known
-//! continuation), 📌 pinned, 🤖 agent, 📂 named-group header, 📁 Ungrouped
-//! header — all single-codepoint, East-Asian-Width=Wide,
+//! background), 📌 pinned, 🤖 agent, 🗃 archived, 📂 named-group header,
+//! 📁 Ungrouped header — all single-codepoint, East-Asian-Width=Wide,
 //! default-emoji-presentation characters (2 display columns, no VS16
 //! sequence), so they hold their column budget in a grid exactly like a
 //! full-width CJK character would. The activity dot stays the plain "●"
@@ -71,7 +70,6 @@ use crate::text::{truncate_to_width, truncate_to_width_leading};
 
 const PIN_EMOJI: &str = "\u{1F4CC}"; // 📌
 const DIRECTOR_EMOJI: &str = "\u{1F91D}"; // 🤝
-const SUPERSEDED_EMOJI: &str = "\u{1F9EC}"; // 🧬
 const AGENT_EMOJI: &str = "\u{1F916}"; // 🤖
 const GROUP_EMOJI: &str = "\u{1F4C2}"; // 📂
 const UNGROUPED_EMOJI: &str = "\u{1F4C1}"; // 📁
@@ -223,8 +221,6 @@ fn row_line(
         Some(ARCHIVED_EMOJI)
     } else if visible.director {
         Some(DIRECTOR_EMOJI)
-    } else if visible.superseded {
-        Some(SUPERSEDED_EMOJI)
     } else if visible.row.is_agent {
         Some(AGENT_EMOJI)
     } else {
@@ -377,10 +373,9 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
 
     let pinned = app.is_selected_pinned();
     let director = app.is_selected_director();
-    let superseded = app.is_selected_superseded();
 
-    // Marker slots after the dot — same 📌/🤝/🧬/🤖 priority as the list row
-    // (director beats superseded beats agent), but as free-flowing spans
+    // Marker slots after the dot — same 📌/🤝/🤖 priority as the list row
+    // (director beats agent), but as free-flowing spans
     // with no blank-slot padding: this is prose, not a column-aligned grid.
     let mut title_spans = vec![Span::styled(
         "\u{25cf} ",
@@ -391,8 +386,6 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
     }
     if director {
         title_spans.push(Span::raw(format!("{DIRECTOR_EMOJI} ")));
-    } else if superseded {
-        title_spans.push(Span::raw(format!("{SUPERSEDED_EMOJI} ")));
     } else if row.is_agent {
         title_spans.push(Span::raw(format!("{AGENT_EMOJI} ")));
     }
@@ -411,7 +404,7 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
         Style::default().fg(Color::DarkGray),
     ));
     let meta_line = Line::from(Span::styled(
-        summary_meta(row, pinned, director, superseded, now),
+        summary_meta(row, pinned, director, now),
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(
@@ -421,15 +414,9 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
 }
 
 /// Build the summary panel's meta line: relative age, size, short id, and any
-/// markers (pinned/director/superseded/agent) that apply. Textual, not
+/// markers (pinned/director/agent) that apply. Textual, not
 /// iconic, by design (the title line above carries the icons).
-fn summary_meta(
-    row: &SessionRow,
-    pinned: bool,
-    director: bool,
-    superseded: bool,
-    now: SystemTime,
-) -> String {
+fn summary_meta(row: &SessionRow, pinned: bool, director: bool, now: SystemTime) -> String {
     let mut parts = vec![
         model::humanize_age(row.mtime, now),
         model::humanize_size(row.size),
@@ -443,9 +430,6 @@ fn summary_meta(
     }
     if director {
         parts.push("director".to_string());
-    }
-    if superseded {
-        parts.push("superseded".to_string());
     }
     if row.is_agent {
         parts.push("agent".to_string());
@@ -905,48 +889,6 @@ mod tests {
     }
 
     #[test]
-    fn superseded_marker_shown_for_a_superseded_row() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![row("s", "Superseded Row", "", now)])
-            .with_superseded(["s".to_string()].into_iter().collect());
-        app.set_viewport_height(10);
-        app.cycle_reveal(); // superseded rows are hidden by default too
-
-        let text = draw_list(&app, 60, 10, now);
-        let line = text.lines().find(|l| l.contains("Superseded Row")).unwrap();
-        assert!(line.contains(SUPERSEDED_EMOJI));
-    }
-
-    #[test]
-    fn director_marker_takes_priority_over_superseded_marker() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![row("both", "Both Row", "", now)])
-            .with_directors(["both".to_string()].into_iter().collect())
-            .with_superseded(["both".to_string()].into_iter().collect());
-        app.set_viewport_height(10);
-        app.cycle_reveal(); // reveal the superseded row
-
-        let text = draw_list(&app, 60, 10, now);
-        let line = text.lines().find(|l| l.contains("Both Row")).unwrap();
-        assert!(line.contains(DIRECTOR_EMOJI));
-        assert!(!line.contains(SUPERSEDED_EMOJI));
-    }
-
-    #[test]
-    fn superseded_marker_takes_priority_over_agent_marker() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![agent_row("both", "Both Row", "", now)])
-            .with_superseded(["both".to_string()].into_iter().collect());
-        app.set_viewport_height(10);
-        app.cycle_reveal(); // agents/superseded are hidden by default
-
-        let text = draw_list(&app, 60, 10, now);
-        let line = text.lines().find(|l| l.contains("Both Row")).unwrap();
-        assert!(line.contains(SUPERSEDED_EMOJI));
-        assert!(!line.contains(AGENT_EMOJI));
-    }
-
-    #[test]
     fn summary_panel_title_line_shows_markers_with_no_blank_padding() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut app = App::new(vec![row("p", "Pinned Session", "", now)])
@@ -981,30 +923,6 @@ mod tests {
         assert!(
             (0..buf.area.width).any(|x| buf.cell((x, title_row)).unwrap().symbol() == PIN_EMOJI),
             "pin marker missing from the title row"
-        );
-    }
-
-    #[test]
-    fn summary_panel_shows_the_superseded_marker_and_meta_text() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let mut app = App::new(vec![row("s", "Superseded Session", "", now)])
-            .with_superseded(["s".to_string()].into_iter().collect());
-        app.set_viewport_height(10);
-        app.cycle_reveal(); // reveal the superseded row so it can be selected
-
-        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
-        terminal
-            .draw(|frame| render_summary(frame, &app, frame.area(), now))
-            .unwrap();
-        let text = buffer_text(terminal.backend().buffer());
-
-        assert!(
-            text.contains(SUPERSEDED_EMOJI),
-            "expected the DNA marker in the summary panel:\n{text}"
-        );
-        assert!(
-            text.contains("superseded"),
-            "expected \"superseded\" in the meta line:\n{text}"
         );
     }
 

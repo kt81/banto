@@ -122,11 +122,6 @@ pub struct SessionMeta {
     /// Short single-line excerpt of the first user message, for the summary
     /// panel. Independent of `title` (which may come from custom/ai titles).
     pub preview: Option<String>,
-    /// The `logicalParentUuid` of the first `compact_boundary` record found
-    /// in the file head, if this session is an auto-compaction continuation
-    /// of another one. `None` for an ordinary session (including a manually
-    /// `/compact`-ed one, which keeps its original id rather than forking).
-    pub continuation_of_uuid: Option<String>,
     /// Whether the session's own product considers it archived — Codex's
     /// `threads.archived` column (set by `codex archive`); Claude Code has
     /// no equivalent yet and always reports `false`. Distinct from banto's
@@ -253,10 +248,10 @@ pub struct SessionRow {
     /// banto can only ever read. A row carrying this is listed only at
     /// [`crate::app::Reveal::Archived`].
     ///
-    /// `#[serde(default)]` for the same reason as `Event::PtyExited::reason`
-    /// and `RowsLoaded::superseded`: a `docs/DISCIPLINE.md` §8 stream
-    /// recorded before this field existed still replays, and "not archived"
-    /// is the honest reading of a recording made when banto could not say.
+    /// `#[serde(default)]` for the same reason as `Event::PtyExited::reason`:
+    /// a `docs/DISCIPLINE.md` §8 stream recorded before this field existed
+    /// still replays, and "not archived" is the honest reading of a recording
+    /// made when banto could not say.
     #[serde(default)]
     pub archived: bool,
     /// Short single-line excerpt of the first user message, for the summary
@@ -269,7 +264,7 @@ pub struct SessionRow {
     pub size: u64,
     /// See [`SessionMeta::source_archived`]. `#[serde(default)]` so a
     /// record/replay stream captured before this field existed still
-    /// deserializes (same reasoning as `Event::RowsLoaded::superseded`).
+    /// deserializes (same reasoning as `archived` above).
     #[serde(default)]
     pub source_archived: bool,
 }
@@ -405,7 +400,7 @@ pub const DIRECTOR_TOKEN: &str = "director";
 /// actually chosen), `mcp::tool_dismiss_goinkyo`,
 /// `engine::update_goinkyo_awaiting_spawn` (both the synthetic key and the
 /// `Cmd::OpenEmbedded` member tuple), and `engine::update_discovery_result`/
-/// `update_member_session_forked` (recognizing a rename as the Goinkyo's
+/// `update_member_session_moved` (recognizing a rename as the Goinkyo's
 /// own, to keep `EmporiumState::goinkyo_pane` pointed at the right pane).
 /// Before this constant, all six hardcoded the literal independently;
 /// letting even one of them drift from the rest would have broken

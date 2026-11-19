@@ -348,18 +348,30 @@ pub fn ancestry_reaches(
     probe: &dyn ProcessProbe,
     max_depth: u32,
 ) -> bool {
+    ancestry_distance(live_pid, target_pid, probe, max_depth).is_some()
+}
+
+/// How many parent hops from `live_pid` up to `target_pid` (`0` when they are
+/// the same process), or `None` when [`ancestry_reaches`] would say no. For
+/// choosing the nearest of several processes that all descend from one pane.
+pub fn ancestry_distance(
+    live_pid: u32,
+    target_pid: u32,
+    probe: &dyn ProcessProbe,
+    max_depth: u32,
+) -> Option<u32> {
     if live_pid == target_pid {
-        return true;
+        return Some(0);
     }
     let mut pid = live_pid;
-    for _ in 0..max_depth {
+    for hops in 1..=max_depth {
         match probe.parent_pid(pid) {
-            Some(parent) if parent == target_pid => return true,
+            Some(parent) if parent == target_pid => return Some(hops),
             Some(parent) => pid = parent,
-            None => return false,
+            None => return None,
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]

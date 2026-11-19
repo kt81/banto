@@ -20,7 +20,6 @@ mod archive;
 mod backup;
 mod brigades;
 mod groups;
-mod lineage;
 mod migrations;
 mod pins;
 mod ui_prefs;
@@ -174,32 +173,6 @@ fn unix_ms_to_system_time(ms: i64) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(ms as u64)
     } else {
         UNIX_EPOCH - Duration::from_millis(ms.unsigned_abs())
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_util {
-    use std::path::PathBuf;
-    use std::time::{Duration, UNIX_EPOCH};
-
-    use banto_core::model::{AgentKind, SessionId, SessionMeta};
-
-    /// Builds a synthetic `SessionMeta` fixture (never real session data).
-    /// The mtime is aligned to whole milliseconds so it round-trips exactly.
-    pub fn meta(id: &str, title: Option<&str>, cwd: Option<&str>) -> SessionMeta {
-        SessionMeta {
-            id: SessionId(id.to_string()),
-            agent: AgentKind::ClaudeCode,
-            title: title.map(str::to_string),
-            cwd: cwd.map(PathBuf::from),
-            source_path: PathBuf::from(format!("C:/synthetic-fixtures/{id}.jsonl")),
-            mtime: UNIX_EPOCH + Duration::from_millis(1_750_000_000_000),
-            size: 42,
-            is_agent: false,
-            preview: None,
-            continuation_of_uuid: None,
-            source_archived: false,
-        }
     }
 }
 

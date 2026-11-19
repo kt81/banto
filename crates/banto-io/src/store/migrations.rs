@@ -196,13 +196,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
          WHERE claude_session_id IS NOT NULL;",
     // v10: session lineage — resolved auto-compaction parent links
     // (child_id -> parent_id), populated by a streaming uuid scan run
-    // outside this module (see banto_io's lineage resolution step). Only
-    // resolved links are ever written; a scan that finds nothing is
-    // retried later, never persisted as a failure. Lineage is immutable
-    // once discovered, so this table only ever grows. `parent_id` is
-    // indexed because the leaf-following read (newest descendant of a
-    // given id) walks child->child, i.e. the reverse of how the link was
-    // discovered.
+    // outside this module. Only resolved links were ever written; a scan
+    // that found nothing was retried later, never persisted as a failure.
+    // Lineage was immutable once discovered, so this table only grew.
+    // `parent_id` is indexed because the leaf-following read (newest
+    // descendant of a given id) walked child->child, i.e. the reverse of
+    // how the link was discovered. v19 below drops the table and the code
+    // that filled it; v10 stays as it is for the reason v11 gives.
     "CREATE TABLE session_lineage (
         child_id  TEXT PRIMARY KEY,
         parent_id TEXT NOT NULL
@@ -333,6 +333,15 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE brigades ADD COLUMN request_text TEXT;
     ALTER TABLE brigades ADD COLUMN request_seq INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE brigades ADD COLUMN request_at_ms INTEGER;",
+    // v19: drops `session_lineage`, the child -> parent links v10 created for
+    // auto-compaction continuations. Claude Code 2.1.318 and later compacts in
+    // place: the same file, the same session id, so a compaction no longer makes
+    // a session that has a parent. What the table held described files from
+    // before that, and nothing reads it any more: banto neither resolves a
+    // parent nor hides an ancestor. The rows go with it, and the copy
+    // `Store::open` keeps (`banto.db.before-v19`) still has them. v10 above
+    // still creates the table — DO NOT "clean up" v10, for the reason v11 gives.
+    "DROP TABLE IF EXISTS session_lineage;",
 ];
 
 /// The schema version this build migrates to and knows how to read.
@@ -1014,31 +1023,87 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
+    fn table_exists(store: &Store, name: &str) -> bool {
+        store
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
     #[test]
-    fn v9_to_v10_upgrade_adds_session_lineage_table() {
+    fn v18_to_v19_upgrade_drops_the_lineage_table_and_keeps_everything_else() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("banto.db");
 
+        // A database as v18 code left it: two lineage links, and a brigade with a
+        // member whose session is one of the parents.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            for script in &MIGRATIONS[0..9] {
+            for script in &MIGRATIONS[0..18] {
                 conn.execute_batch(script).unwrap();
             }
-            conn.pragma_update(None, "user_version", 9).unwrap();
+            conn.execute_batch(
+                "INSERT INTO session_lineage (child_id, parent_id) VALUES ('c1', 'p1'), ('c2', 'p2');
+                 INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 3000);
+                 INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
+                 VALUES (1, 'director', 'director', 'p1');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 18).unwrap();
         }
 
         let store = Store::open(&db).unwrap();
-        assert!(store.lineage_parent_ids().unwrap().is_empty());
-        let child = SessionId("child".to_string());
-        let parent = SessionId("parent".to_string());
-        store.record_lineage(&child, &parent).unwrap();
-        assert_eq!(store.lineage_leaf(&parent).unwrap(), child);
-
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(!table_exists(&store, "session_lineage"));
+        assert!(!table_exists(&store, "session_lineage_parent"));
+        let members = store.brigade_members(1).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].session_id.as_ref().map(|id| id.0.as_str()),
+            Some("p1"),
+            "a member's session is its own row, not a lineage entry"
+        );
+
+        // The copy kept before the upgrade still holds the links.
+        let before = rusqlite::Connection::open(dir.path().join("banto.db.before-v19")).unwrap();
+        let links: i64 = before
+            .query_row("SELECT COUNT(*) FROM session_lineage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(links, 2);
+    }
+
+    #[test]
+    fn a_v18_database_that_already_lacks_the_lineage_table_still_upgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..18] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute_batch("DROP TABLE session_lineage;").unwrap();
+            conn.pragma_update(None, "user_version", 18).unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn a_fresh_database_has_no_lineage_table() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(!table_exists(&store, "session_lineage"));
     }
 
     #[test]

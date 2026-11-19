@@ -27,7 +27,7 @@ mod live;
 mod probe;
 
 pub use live::{LiveSession, read_live_sessions};
-pub use probe::{ProcessProbe, SysinfoProbe, ancestry_reaches};
+pub use probe::{ProcessProbe, SysinfoProbe, ancestry_distance, ancestry_reaches};
 
 use std::collections::HashSet;
 use std::time::SystemTime;
@@ -378,7 +378,6 @@ mod tests {
             size: 0,
             is_agent: false,
             preview: None,
-            continuation_of_uuid: None,
             source_archived: false,
         }
     }

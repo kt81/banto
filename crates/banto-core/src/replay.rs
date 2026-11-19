@@ -414,7 +414,6 @@ mod tests {
                     rows: vec![],
                     hidden: Default::default(),
                     directors: Default::default(),
-                    superseded: Default::default(),
                 },
             },
             TimedEvent {
@@ -442,9 +441,10 @@ mod tests {
     // Same authoring discipline as `CANONICAL_FIXTURE` above, scoped to the
     // one rename-following path that a real recording can actually produce:
     // a brigade forms with zero Workers, the Director's own pane spawns,
-    // then its Claude session auto-compaction-forks in place
-    // (`Event::MemberSessionForked`) — pinning that `Stage::Brigade`'s
-    // `director` field follows the rename, not just `panes`.
+    // then its Claude process starts reporting another session id (what a
+    // `/clear` does; `Event::MemberSessionForked`, which keeps the name it was
+    // recorded under) — pinning that `Stage::Brigade`'s `director` field follows
+    // the rename, not just `panes`.
     // `update_discovery_result`'s own version of this same follow (see its
     // doc) has no equivalent here: it only fires for a key
     // `SessionKey::is_synthetic()` still calls true, and the Director's key

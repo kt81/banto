@@ -247,7 +247,6 @@ fn parse_session(path: &Path, mtime: SystemTime, size: u64) -> Parsed {
         size,
         is_agent: fields.is_agent,
         preview,
-        continuation_of_uuid: fields.continuation_of_uuid,
         // No equivalent signal exists yet — see SessionMeta::source_archived's
         // doc for why false, not a guess, is the correct value here.
         source_archived: false,
@@ -331,9 +330,6 @@ struct HeadFields {
     user_text: Option<String>,
     cwd: Option<PathBuf>,
     is_agent: bool,
-    /// `logicalParentUuid` of the first `compact_boundary` record seen, if
-    /// any (see `SessionMeta::continuation_of_uuid`).
-    continuation_of_uuid: Option<String>,
 }
 
 impl HeadFields {
@@ -391,23 +387,8 @@ fn extract_head_fields(head: &str) -> HeadFields {
                     .and_then(Value::as_str)
                     .map(str::to_string);
             }
-            Some("user") if fields.user_text.is_none() => {
-                fields.user_text = message_text(&record);
-            }
-            // An auto-compaction continuation's head carries this record,
-            // which is also the record that sets `cwd` for such a file (no
-            // earlier record in a continuation's head does) — so it is
-            // always processed before the break below can fire, even though
-            // the break does not itself check `continuation_of_uuid`.
-            Some("system")
-                if fields.continuation_of_uuid.is_none()
-                    && record.get("subtype").and_then(Value::as_str)
-                        == Some("compact_boundary") =>
-            {
-                fields.continuation_of_uuid = record
-                    .get("logicalParentUuid")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+            Some("user") if fields.user_text.is_none() && !is_local_command_record(&record) => {
+                fields.user_text = message_text(&record).filter(|text| !is_command_wrapper(text));
             }
             _ => {}
         }
@@ -418,6 +399,25 @@ fn extract_head_fields(head: &str) -> HeadFields {
         }
     }
     fields
+}
+
+/// A `user` record Claude Code writes for a slash command the operator ran
+/// (`/clear`, `/model`, `/help`, ...), not for something the operator said to
+/// the model. `/clear` opens its new conversation with one flagged `isMeta`
+/// (`<local-command-caveat>...`), then a wrapper record
+/// (`<command-name>/clear</command-name>...`); a command that prints something
+/// adds a `<local-command-stdout>` one. Read as the first user message they gave
+/// the list a title of `<local-command-caveat...`, and made a Goinkyo whose
+/// operator had run `/clear` before its kickoff look as if it had been spoken to.
+fn is_local_command_record(record: &Value) -> bool {
+    record.get("isMeta").and_then(Value::as_bool) == Some(true)
+}
+
+/// The text of a slash command's wrapper record, which is not flagged `isMeta`
+/// (see [`is_local_command_record`]) and is told by its tags alone.
+fn is_command_wrapper(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<local-command-") || text.starts_with("<command-name>")
 }
 
 /// Extract the text of a user record's `message.content`, which is either
@@ -541,81 +541,117 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_boundary_head_sets_continuation_of_uuid() {
-        let root = TempDir::new().unwrap();
-        write_session(
-            &root,
-            "proj",
-            "s1.jsonl",
-            r#"{"type":"custom-title","customTitle":"Custom title"}
-{"type":"mode","mode":"default"}
-{"type":"system","subtype":"compact_boundary","logicalParentUuid":"94cc49bf-5dc1-4930-a942-7f3413594b86","cwd":"/tmp/proj","compactMetadata":{"trigger":"auto"}}
-"#,
-        );
-        let sessions = discover_sorted(&root);
-        assert_eq!(
-            sessions[0].continuation_of_uuid.as_deref(),
-            Some("94cc49bf-5dc1-4930-a942-7f3413594b86")
-        );
-    }
+    // The record shapes below were measured on a real Claude Code; the ids,
+    // paths and text here are invented.
 
     #[test]
-    fn ordinary_session_has_no_continuation_of_uuid() {
+    fn a_typed_first_line_is_the_title_and_the_preview() {
         let root = TempDir::new().unwrap();
         write_session(
             &root,
             "proj",
             "s1.jsonl",
             r#"{"type":"mode","mode":"default","cwd":"/tmp/proj"}
-{"type":"user","message":{"content":"hello"}}
+{"type":"user","message":{"role":"user","content":"fix the parser"}}
 "#,
         );
         let sessions = discover_sorted(&root);
-        assert_eq!(sessions[0].continuation_of_uuid, None);
+        assert_eq!(sessions[0].title.as_deref(), Some("fix the parser"));
+        assert_eq!(sessions[0].preview.as_deref(), Some("fix the parser"));
     }
 
     #[test]
-    fn a_system_record_with_a_different_subtype_is_not_mistaken_for_a_continuation() {
+    fn clears_own_records_are_not_the_first_message() {
         let root = TempDir::new().unwrap();
         write_session(
             &root,
             "proj",
             "s1.jsonl",
-            r#"{"type":"system","subtype":"other","logicalParentUuid":"should-be-ignored","cwd":"/tmp/proj"}
+            r#"{"type":"user","isMeta":true,"cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-caveat>Caveat: the messages below were generated by the user while running local commands.</local-command-caveat>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"<command-name>/clear</command-name>
+<command-message>clear</command-message>
+<command-args></command-args>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}}
 "#,
         );
         let sessions = discover_sorted(&root);
-        assert_eq!(sessions[0].continuation_of_uuid, None);
+        assert_eq!(sessions[0].preview, None);
+        assert_eq!(sessions[0].title, None);
     }
 
     #[test]
-    fn a_compact_boundary_missing_logical_parent_uuid_is_tolerated() {
+    fn what_is_typed_after_a_clear_is_the_first_message() {
         let root = TempDir::new().unwrap();
         write_session(
             &root,
             "proj",
             "s1.jsonl",
-            r#"{"type":"system","subtype":"compact_boundary","cwd":"/tmp/proj"}
+            r#"{"type":"user","isMeta":true,"cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"<command-name>/clear</command-name>
+<command-message>clear</command-message>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-stdout></local-command-stdout>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"now the real question"}}
 "#,
         );
         let sessions = discover_sorted(&root);
-        assert_eq!(sessions[0].continuation_of_uuid, None);
+        assert_eq!(sessions[0].title.as_deref(), Some("now the real question"));
+        assert_eq!(
+            sessions[0].preview.as_deref(),
+            Some("now the real question")
+        );
     }
 
     #[test]
-    fn only_the_first_compact_boundary_uuid_is_captured() {
+    fn a_model_command_before_the_first_message_is_skipped_too() {
         let root = TempDir::new().unwrap();
         write_session(
             &root,
             "proj",
             "s1.jsonl",
-            r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"first","cwd":"/tmp/proj"}
-{"type":"system","subtype":"compact_boundary","logicalParentUuid":"second"}
+            r#"{"type":"user","isMeta":true,"cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"<command-name>/model</command-name>
+<command-message>model</command-message>
+<command-args>sonnet</command-args>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-stdout>Set model to sonnet</local-command-stdout>"}}
+{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":[{"type":"text","text":"  review this diff "}]}}
 "#,
         );
         let sessions = discover_sorted(&root);
-        assert_eq!(sessions[0].continuation_of_uuid.as_deref(), Some("first"));
+        assert_eq!(sessions[0].preview.as_deref(), Some("review this diff"));
+    }
+
+    #[test]
+    fn a_branched_head_copies_the_parents_first_message() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"user","forkedFrom":{"sessionId":"parent-1","messageUuid":"u1"},"cwd":"/tmp/proj","message":{"role":"user","content":"the parent's first line"}}
+{"type":"assistant","forkedFrom":{"sessionId":"parent-1","messageUuid":"a1"},"message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(
+            sessions[0].preview.as_deref(),
+            Some("the parent's first line")
+        );
+    }
+
+    #[test]
+    fn a_custom_title_still_ends_the_scan_past_slash_command_records() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"custom-title","customTitle":"Named by the operator"}
+{"type":"user","isMeta":true,"cwd":"/tmp/proj","message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}
+"#,
+        );
+        let sessions = discover_sorted(&root);
+        assert_eq!(sessions[0].title.as_deref(), Some("Named by the operator"));
+        assert_eq!(sessions[0].preview, None);
     }
 
     #[test]

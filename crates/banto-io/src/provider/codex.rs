@@ -359,9 +359,6 @@ fn session_meta_from_row(
         // for why false, not a guess, is the correct value here.
         is_agent: false,
         preview: first_user_message.filter(|p| !p.is_empty()),
-        // Codex has no auto-compaction-continuation concept banto tracks —
-        // not "unknown", genuinely nothing to substitute.
-        continuation_of_uuid: None,
         source_archived: archived,
     }
 }
@@ -551,7 +548,6 @@ mod tests {
         assert_eq!(meta.preview.as_deref(), Some("first message"));
         assert_eq!(meta.size, 5);
         assert!(!meta.is_agent);
-        assert_eq!(meta.continuation_of_uuid, None);
         assert!(!meta.source_archived);
         assert_eq!(
             meta.mtime,

@@ -6,19 +6,17 @@
 //! here writes to disk. Everything under `claude_home` is treated as
 //! strictly read-only.
 
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::{ActivityConfig, BrigadeConfig, ResolvedAgents};
 pub use banto_core::model::SessionRow;
-use banto_core::model::{Activity, AgeBucket, AgentKind, SessionId, SessionMeta};
+use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::{AgeThresholds, age_bucket};
 use banto_io::claude_home::ClaudeHome;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::live_candidate_thread_ids;
 use banto_io::codex_trust::HookTrustState;
-use banto_io::lineage::resolve_lineage;
 use banto_io::provider::cache::MetaCache;
 use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
@@ -272,11 +270,10 @@ pub(crate) fn alive_claude_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<
 
 /// The conversion half of [`load_rows`] — classify and sort already-
 /// discovered `metas` into [`SessionRow`]s — extracted so a caller that has
-/// its own discover() pass to feed elsewhere too (e.g. lineage resolution —
-/// see [`superseded_from_metas`]) doesn't need a second discover()
-/// just for this. `claude_home`/`thresholds` are still needed here: they
-/// drive the live-status read and activity classification, neither of which
-/// discovery itself touches.
+/// its own discover() pass doesn't need a second one just for this.
+/// `claude_home`/`thresholds` are still needed here: they drive the
+/// live-status read and activity classification, neither of which discovery
+/// itself touches.
 pub fn rows_from_metas(
     mut metas: Vec<SessionMeta>,
     claude_home: &ClaudeHome,
@@ -463,31 +460,6 @@ pub(crate) fn load_directors(store: &Store) -> HashSet<String> {
         .collect()
 }
 
-/// Spend this reload's lineage-resolution budget against already-discovered
-/// `metas`, then return every session id with a known auto-compaction
-/// continuation — [`App`] hides these (see `App::superseded`). Takes
-/// `metas` rather than discovering its own: `SessionMeta`'s
-/// `continuation_of_uuid` doesn't survive into [`session::load_rows`]'s
-/// `SessionRow`s, but `banto_io::lineage::resolve_lineage` already wants
-/// exactly `&[SessionMeta]`, so every call site — which already needs a
-/// discover() pass for the rows anyway — can hand the same one here instead
-/// of paying for a second. Tolerant: a lineage-resolution failure just means
-/// no progress this pass, not a blocked TUI.
-pub(crate) fn superseded_from_metas(
-    metas: &[SessionMeta],
-    store: &Store,
-    failed: &RefCell<HashSet<SessionId>>,
-) -> HashSet<String> {
-    let mut failed = failed.borrow_mut();
-    let _ = resolve_lineage(store, metas, &mut failed);
-    store
-        .lineage_parent_ids()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|id| id.0)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -509,7 +481,6 @@ mod tests {
             size: 42,
             is_agent: false,
             preview: None,
-            continuation_of_uuid: None,
             source_archived: false,
         }
     }
@@ -1170,91 +1141,6 @@ mod tests {
             source_archived: false,
             archived: false,
         }
-    }
-
-    /// A synthetic [`SessionMeta`] fixture with no continuation.
-    fn plain_meta(id: &str) -> SessionMeta {
-        SessionMeta {
-            id: SessionId(id.to_string()),
-            agent: AgentKind::ClaudeCode,
-            title: None,
-            cwd: None,
-            source_path: PathBuf::from(format!("{id}.jsonl")),
-            mtime: SystemTime::UNIX_EPOCH,
-            size: 0,
-            is_agent: false,
-            preview: None,
-            continuation_of_uuid: None,
-            source_archived: false,
-        }
-    }
-
-    /// Same as [`plain_meta`], but flagged as an auto-compaction
-    /// continuation of `parent_uuid`, at a real `source_path` on disk (so
-    /// `resolve_lineage`'s streaming scan, invoked through
-    /// [`superseded_from_metas`], has a project directory to search).
-    fn continuation_meta(id: &str, source_path: PathBuf, parent_uuid: &str) -> SessionMeta {
-        SessionMeta {
-            continuation_of_uuid: Some(parent_uuid.to_string()),
-            source_path,
-            ..plain_meta(id)
-        }
-    }
-
-    #[test]
-    fn superseded_from_metas_resolves_a_continuation_from_the_shared_discover_pass() {
-        // No independent discover() here: `metas` is handed in directly, the
-        // same way every call site now shares one discover() pass between
-        // rows and lineage — see `superseded_from_metas`'s doc.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("parent.jsonl"),
-            "{\"type\":\"user\",\"uuid\":\"P1\"}\n",
-        )
-        .unwrap();
-        let child_path = dir.path().join("child.jsonl");
-        std::fs::write(&child_path, "{\"type\":\"mode\"}\n").unwrap();
-        let metas = vec![continuation_meta("child", child_path, "P1")];
-
-        let store = Store::open_in_memory().unwrap();
-        let failed = RefCell::new(HashSet::new());
-
-        let superseded = superseded_from_metas(&metas, &store, &failed);
-
-        assert_eq!(superseded, HashSet::from(["parent".to_string()]));
-        assert!(failed.borrow().is_empty());
-    }
-
-    #[test]
-    fn superseded_from_metas_is_empty_for_sessions_without_a_continuation() {
-        let store = Store::open_in_memory().unwrap();
-        let failed = RefCell::new(HashSet::new());
-        let metas = vec![plain_meta("a"), plain_meta("b")];
-
-        let superseded = superseded_from_metas(&metas, &store, &failed);
-
-        assert!(superseded.is_empty());
-        assert!(failed.borrow().is_empty());
-    }
-
-    #[test]
-    fn superseded_from_metas_records_an_unresolvable_continuation_as_failed() {
-        let dir = tempfile::tempdir().unwrap();
-        let child_path = dir.path().join("child.jsonl");
-        std::fs::write(&child_path, "{\"type\":\"mode\"}\n").unwrap();
-        let metas = vec![continuation_meta(
-            "child",
-            child_path,
-            "nowhere-to-be-found",
-        )];
-
-        let store = Store::open_in_memory().unwrap();
-        let failed = RefCell::new(HashSet::new());
-
-        let superseded = superseded_from_metas(&metas, &store, &failed);
-
-        assert!(superseded.is_empty());
-        assert!(failed.borrow().contains(&SessionId("child".to_string())));
     }
 
     #[test]

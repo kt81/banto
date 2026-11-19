@@ -55,8 +55,8 @@ use banto_core::engine::{GoinkyoObservation, GoinkyoSpawnCandidate};
 use banto_core::input::InputEvent;
 use banto_core::layout::title_text;
 use banto_core::model::{
-    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, MemberGlance, MemberToken, MessageGlance,
-    Quiescence, SessionId, SessionToOpen,
+    AgentKind, Brigade, BrigadeId, BrigadeMember, BrigadeRole, DIRECTOR_TOKEN, MemberGlance,
+    MemberToken, MessageGlance, Quiescence, SessionId, SessionToOpen,
 };
 use banto_core::pane_log as pane_lines;
 use banto_core::replay::{STREAM_VERSION, TimedEvent};
@@ -78,8 +78,8 @@ use banto_io::provider::claude_code::ClaudeCodeProvider;
 use banto_io::provider::codex::CodexProvider;
 use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
-    LiveSession, SysinfoProbe, ancestry_reaches, claude_nudgeable, claude_quiescence,
-    live_activity, read_live_sessions, waiting_on_a_dialog,
+    LiveSession, ProcessProbe, SysinfoProbe, ancestry_distance, claude_nudgeable,
+    claude_quiescence, live_activity, read_live_sessions, waiting_on_a_dialog,
 };
 use banto_io::store::{SCHEMA_VERSION, Store};
 use banto_tui::paint;
@@ -389,24 +389,16 @@ pub fn run(
     // empty brigade is never user-visible, so there's nothing to report.
     let _ = store.borrow_mut().delete_empty_brigades();
 
-    // Same lifetime and the same reason as `superseded_failed` below: created
-    // once here so the bootstrap walk's parses are already in it when the
-    // loop's first `gather_reload` runs a second later.
+    // Created once here so the bootstrap walk's parses are already in it when
+    // the loop's first `gather_reload` runs a second later.
     let meta_cache = MetaCache::new();
     let metas = session::discover_all(claude_home, codex_home, enabled_agents, Some(&meta_cache))?;
-    // In-memory only, for this process's lifetime — see
-    // `crate::session::superseded_from_metas`'s doc. Created once here and
-    // threaded through every reload (the bootstrap below and every later
-    // `gather_reload`) rather than per-call, so a permanently-unresolvable
-    // continuation is scanned at most once per banto run.
-    let superseded_failed = RefCell::new(HashSet::new());
     // The store-backed state the sidebar shows: grouping, pins, archived-hiding
     // and brigade hiding. This
     // one-time bootstrap stays outside `update`: `App::with_*` are
     // construction-only builders, not a repeating decision.
-    let (rows, pinned, groups, session_groups, hidden, directors, superseded) = {
+    let (rows, pinned, groups, session_groups, hidden, directors) = {
         let store = store.borrow();
-        let superseded = crate::session::superseded_from_metas(&metas, &store, &superseded_failed);
         let rows = session::rows_from_metas(metas, claude_home, codex_home, thresholds);
         let rows = crate::session::mark_archived(rows, &store);
         let pinned = crate::session::load_pinned(&store);
@@ -414,22 +406,13 @@ pub fn run(
         let session_groups = crate::session::load_session_groups(&store, &groups);
         let hidden = crate::session::load_hidden_member_ids(&store);
         let directors = crate::session::load_directors(&store);
-        (
-            rows,
-            pinned,
-            groups,
-            session_groups,
-            hidden,
-            directors,
-            superseded,
-        )
+        (rows, pinned, groups, session_groups, hidden, directors)
     };
     let mut app = App::new(rows)
         .with_pinned(pinned)
         .with_groups(groups, session_groups)
         .with_hidden_member_ids(hidden)
         .with_directors(directors)
-        .with_superseded(superseded)
         .with_enabled_agents(enabled_agents.clone());
     // Both are shown when both apply, the trust notice first: an untrusted hook
     // is a cell about to form with members nothing will ever brief, while an
@@ -469,7 +452,6 @@ pub fn run(
         codex_home,
         thresholds,
         store,
-        superseded_failed: &superseded_failed,
         meta_cache: &meta_cache,
         pty_host: &PortablePtyHost,
         input_reader: &CrosstermInputReader,
@@ -536,17 +518,14 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read-only shell dependencies that don't change across an [`event_loop`]
 /// iteration — bundled so `event_loop`/`execute_cmd`/`gather_reload`'s argument
-/// lists don't keep growing one-by-one as more reload-path state (like
-/// [`Self::superseded_failed`]) gets threaded through.
+/// lists don't keep growing one-by-one as more reload-path state gets
+/// threaded through.
 struct Deps<'a> {
     claude_home: &'a ClaudeHome,
     /// `None` degrades to no Codex sessions in the sidebar, not an error.
     codex_home: Option<&'a CodexHome>,
     thresholds: &'a AgeThresholds,
     store: &'a RefCell<Store>,
-    /// See [`crate::session::superseded_from_metas`]'s doc: in-memory only, for
-    /// this process's lifetime.
-    superseded_failed: &'a RefCell<HashSet<SessionId>>,
     /// Transcript parses carried between reloads (`banto_io::provider::cache`).
     /// Measured here: the watcher fires with as little as half a second
     /// between reloads, almost always because a session banto does not own
@@ -611,6 +590,7 @@ fn event_loop(
     let provider = ClaudeCodeProvider::new(deps.claude_home.clone());
     let mut last_tick: Option<Instant> = None;
     let mut glance_gate = GlanceGate::default();
+    let mut session_moves = SessionMoveWatch::default();
     // The stored sidebar width, fed as the very first event of the very first
     // iteration (see the loop) so it is part of the recorded stream.
     let mut stored_sidebar_width = Some(Event::SidebarWidthLoaded {
@@ -831,18 +811,24 @@ fn event_loop(
                     });
                 }
             }
-            events.extend(gather_fork_observations(
+            let tick_read = TickRead::read(deps.store, deps.claude_home, Some(&mut tick_timings));
+            let alive = |pid: u32| tick_read.alive_claude().contains(&pid);
+            events.extend(gather_session_moves(
+                &tick_read,
                 &state,
-                deps.store,
-                deps.claude_home,
                 &handles,
                 app,
+                &mut session_moves,
+                &ProcessView {
+                    probe: &SysinfoProbe,
+                    alive: &alive,
+                },
                 Some(&mut tick_timings),
             ));
-            let relay = gather_relay_observations(
+            let relay = gather_relay_observations_from(
+                &tick_read,
                 &state,
                 deps.store,
-                deps.claude_home,
                 deps.codex_home,
                 app,
                 Some(&mut tick_timings),
@@ -1840,9 +1826,7 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             }]
         }
         StoreIntent::ResolveMembership { session_id } => {
-            // `&mut` (not `&`): healing a member below persists a moved
-            // session_id (`set_member_session`), not just reads one.
-            let mut store = store.borrow_mut();
+            let store = store.borrow();
             let membership = store
                 .brigade_of_session(&SessionId(session_id.clone()))
                 .ok()
@@ -1861,23 +1845,12 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
                 .flatten()
                 .filter_map(|member| Some((member.token.clone(), member.display_name.clone()?)))
                 .collect();
-            let members = membership
-                .as_ref()
-                .zip(roster)
-                .map(|((brigade_id, _, _), roster)| {
-                    roster
-                        .into_iter()
-                        .map(|member| {
-                            let healed_id = heal_member_session(
-                                &mut store,
-                                *brigade_id,
-                                &member.token,
-                                member.session_id,
-                            );
-                            (member.token, member.role, healed_id)
-                        })
-                        .collect()
-                });
+            let members = membership.as_ref().and(roster).map(|roster| {
+                roster
+                    .into_iter()
+                    .map(|member| (member.token, member.role, member.session_id.map(|id| id.0)))
+                    .collect()
+            });
             // The brigade's stored arrangement rides the same round trip, so
             // it is in core state before the stage (and its first PTY sizes)
             // is built. A failed read is no arrangement, not a failed resolve.
@@ -2043,31 +2016,6 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
     }
 }
 
-/// Follow `session_id` to its newest known auto-compaction continuation
-/// (`Store::lineage_leaf`) and, if it moved, persist the move
-/// (`Store::set_member_session`, v9 move semantics: any other row
-/// holding the healed id is cleared) — closing the zombie loop for forks the
-/// live watcher missed (banto wasn't running when they happened), so
-/// re-staging resumes the true continuation instead of a stale ancestor.
-/// `None` in, `None` out: a member still awaiting discovery has nothing to
-/// heal. Tolerant: a lookup/write failure just leaves the id as recorded,
-/// rather than blocking membership resolution over it.
-fn heal_member_session(
-    store: &mut Store,
-    brigade_id: BrigadeId,
-    token: &str,
-    session_id: Option<SessionId>,
-) -> Option<String> {
-    let recorded = session_id?;
-    let leaf = store
-        .lineage_leaf(&recorded)
-        .unwrap_or_else(|_| recorded.clone());
-    if leaf != recorded {
-        let _ = store.set_member_session(brigade_id, token, &leaf);
-    }
-    Some(leaf.0)
-}
-
 /// Create the brigade, its Director row, and `worker_count` Worker rows
 /// (schema v7). The brigade and its Director are one transaction
 /// ([`Store::create_brigade_with_director`]): the startup janitor deletes
@@ -2129,9 +2077,7 @@ fn add_worker_store(
 
 /// Reload the session list from disk. A read failure is tolerated (yields no
 /// event, keeping the previous rows) rather than erroring the whole loop out
-/// over a transient filesystem hiccup. Also spends this reload's
-/// lineage-resolution budget against the same discover() pass (see
-/// [`crate::session::superseded_from_metas`]).
+/// over a transient filesystem hiccup.
 fn gather_reload(deps: &Deps) -> Vec<Event> {
     let Ok(metas) = session::discover_all(
         deps.claude_home,
@@ -2142,7 +2088,6 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
         return Vec::new();
     };
     let store = deps.store.borrow();
-    let superseded = crate::session::superseded_from_metas(&metas, &store, deps.superseded_failed);
     let rows = session::rows_from_metas(metas, deps.claude_home, deps.codex_home, deps.thresholds);
     let rows = crate::session::mark_archived(rows, &store);
     let hidden = crate::session::load_hidden_member_ids(&store);
@@ -2151,7 +2096,6 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
         rows,
         hidden,
         directors,
-        superseded,
     }]
 }
 
@@ -2435,10 +2379,10 @@ fn live_session_id(live: &[LiveSession], pid: u32, spawned: &DirectorySpellings)
 /// nothing in this crate reads a Codex-side signal finer than "mid-turn or
 /// not", so a human-facing wait that begins *after* `task_complete` (if one
 /// exists) would be as invisible to this function as it was before.
-fn gather_relay_observations(
+fn gather_relay_observations_from(
+    read: &TickRead,
     state: &EmporiumState,
     store: &RefCell<Store>,
-    claude_home: &ClaudeHome,
     codex_home: Option<&CodexHome>,
     app: &App,
     mut timings: Option<&mut TickTimings>,
@@ -2449,40 +2393,25 @@ fn gather_relay_observations(
     // previous tick's brigade facts behind — a brigade disbanded in between
     // would be handed to the core again, and named in a status, a second late.
     glance_gate.begin_tick();
-    let roster_start = Instant::now();
     // A roster that cannot be read leaves nothing to observe about brigade
     // members, but still the panes' own state: what the live files and the
     // session list say about a pane does not depend on it. So the rest runs
     // with no brigades, and each hosted pane is sampled from what is left; one
     // that needed the roster to be understood reads as unknown.
-    let (brigades, roster_read) = match store.borrow().list_brigades() {
-        Ok(brigades) => (brigades, true),
-        Err(_) => (Vec::new(), false),
-    };
-    if let Some(t) = timings.as_deref_mut() {
-        t.relay_roster += roster_start.elapsed();
-    }
-    let live_scan_start = Instant::now();
-    let live = read_live_sessions(&claude_home.sessions_dir());
-    if let Some(t) = timings.as_deref_mut() {
-        t.relay_live_scan += live_scan_start.elapsed();
-    }
+    let roster_read = read.brigades.is_some();
+    let brigades = read.brigades.as_deref().unwrap_or_default();
+    let live = &read.live;
     // One shared process-table refresh for every Claude member this tick,
     // not one per member: `SysinfoProbe::is_alive` was costing a full
     // `CreateToolhelp32Snapshot`-and-walk-every-process pass PER CALL on
     // Windows (sysinfo 0.39.6 — `ProcessesToUpdate::Some` still enumerates
     // the whole table before filtering), so a brigade with several Claude
-    // members paid that multiple times a second. `alive_claude` is a plain
-    // local, scoped to this one call of this function and never stored
-    // anywhere with a longer lifetime (not in `EmporiumState`, not in
-    // `TickTimings`, not returned) — it cannot outlive this tick, and
-    // `gather_relay_observations` runs fresh every `TICK_INTERVAL`, so a
-    // member's liveness answer is never more than one tick stale, same as
-    // before this change (this function was already only checked once a
-    // tick; batching how the OS is asked doesn't change how often the
-    // answer itself is asked for).
+    // members paid that multiple times a second. The set is the tick's
+    // (`TickRead::alive_claude`, shared with the session-move gather, which may
+    // have asked first and been charged for it), so it is never older than the
+    // tick that read the live files.
     let claude_snapshot_start = Instant::now();
-    let alive_claude = session::alive_claude_pids(live.iter().map(|entry| entry.pid));
+    let alive_claude = read.alive_claude();
     if let Some(t) = timings.as_deref_mut() {
         t.relay_claude_snapshot += claude_snapshot_start.elapsed();
     }
@@ -2502,15 +2431,10 @@ fn gather_relay_observations(
     if let Some(t) = timings.as_deref_mut() {
         t.relay_glance += glance_start.elapsed();
     }
-    for brigade in brigades {
-        let roster_start = Instant::now();
-        let members = match store.borrow().brigade_members(brigade.id) {
-            Ok(members) => members,
-            Err(_) => continue,
+    for (brigade, members) in brigades {
+        let Some(members) = members else {
+            continue;
         };
-        if let Some(t) = timings.as_deref_mut() {
-            t.relay_roster += roster_start.elapsed();
-        }
         // What names this brigade to the operator, from the roster just read:
         // no further query. A brigade whose roster could not be read is not
         // listed (core keeps what it had). The members' display names are the
@@ -2539,7 +2463,7 @@ fn gather_relay_observations(
                 .collect(),
             request,
         });
-        for member in &members {
+        for member in members {
             let Some(session_id) = member.session_id.as_ref() else {
                 continue;
             };
@@ -2567,7 +2491,7 @@ fn gather_relay_observations(
                     // The relay's reading of the raw status lives in one place,
                     // with the reason a `waiting` session of any kind (a dialog
                     // included) is never nudged.
-                    let idle = claude_nudgeable(&live, &session_id.0, &alive_claude);
+                    let idle = claude_nudgeable(live, &session_id.0, alive_claude);
                     if let Some(t) = timings.as_deref_mut() {
                         t.relay_activity_claude += claude_start.elapsed();
                     }
@@ -2596,7 +2520,7 @@ fn gather_relay_observations(
                 // No product on record and no live file is `Unknown` too, so
                 // an unresolved member is never read as idle.
                 Some(AgentKind::ClaudeCode) | None => {
-                    claude_quiescence(&live, &session_id.0, &alive_claude)
+                    claude_quiescence(live, &session_id.0, alive_claude)
                 }
             };
             samples.push((key.clone(), quiescence));
@@ -2606,11 +2530,11 @@ fn gather_relay_observations(
             // row yet (no transcript before its first turn). Display only: the
             // relay and the watch read the file through the two functions above.
             let live_status = match agent {
-                Some(AgentKind::ClaudeCode) => live_activity(&live, &session_id.0, &alive_claude)
+                Some(AgentKind::ClaudeCode) => live_activity(live, &session_id.0, alive_claude)
                     .map(|activity| LiveStatus {
                         activity,
                         dialog_open: activity == banto_core::model::Activity::Waiting
-                            && waiting_on_a_dialog(&live, &session_id.0, &alive_claude),
+                            && waiting_on_a_dialog(live, &session_id.0, alive_claude),
                     }),
                 Some(AgentKind::Codex) | None => None,
             };
@@ -2668,7 +2592,7 @@ fn gather_relay_observations(
                     None => Quiescence::Unknown,
                 },
                 Some(AgentKind::ClaudeCode) | None => {
-                    claude_quiescence(&live, key.as_str(), &alive_claude)
+                    claude_quiescence(live, key.as_str(), alive_claude)
                 }
             }
         };
@@ -2840,121 +2764,506 @@ fn os_error_of(err: &anyhow::Error) -> Option<i32> {
         .and_then(std::io::Error::raw_os_error)
 }
 
-/// How many parent-pid hops [`gather_fork_observations`] walks looking for a
-/// staged pane's own child pid in a live entry's ancestry — covers `claude`
+/// Every brigade with its members, `None` where reading them failed.
+type Roster = Vec<(Brigade, Option<Vec<BrigadeMember>>)>;
+
+/// What one tick reads once and every gather of that tick shares: the roster
+/// and the live-state files. The relay and the session-move gather each read both
+/// a few lines apart, and the live scan is a directory read per tick.
+struct TickRead {
+    /// Every brigade with its roster, `None` where a read failed; the outer
+    /// `None` is a brigade list that could not be read at all.
+    brigades: Option<Roster>,
+    live: Vec<LiveSession>,
+    /// Which of the live files' pids are running, asked of the OS at most once a
+    /// tick and by whichever gather needs it first ([`Self::alive_claude`]).
+    alive: std::cell::OnceCell<HashSet<u32>>,
+}
+
+impl TickRead {
+    fn read(
+        store: &RefCell<Store>,
+        claude_home: &ClaudeHome,
+        mut timings: Option<&mut TickTimings>,
+    ) -> Self {
+        let roster_start = Instant::now();
+        let brigades = store.borrow().list_brigades().ok().map(|brigades| {
+            brigades
+                .into_iter()
+                .map(|brigade| {
+                    let members = store.borrow().brigade_members(brigade.id).ok();
+                    (brigade, members)
+                })
+                .collect()
+        });
+        if let Some(t) = timings.as_deref_mut() {
+            t.roster += roster_start.elapsed();
+        }
+        let live_scan_start = Instant::now();
+        let live = read_live_sessions(&claude_home.sessions_dir());
+        if let Some(t) = timings {
+            t.live_scan += live_scan_start.elapsed();
+        }
+        Self {
+            brigades,
+            live,
+            alive: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The live files' pids that are running right now. One process-table
+    /// refresh per tick however many gathers ask: it is the costly part of a
+    /// tick on Windows (see `gather_relay_observations_from`), and the relay asks
+    /// every tick, so the session-move gather's use of it is free.
+    fn alive_claude(&self) -> &HashSet<u32> {
+        self.alive
+            .get_or_init(|| session::alive_claude_pids(self.live.iter().map(|entry| entry.pid)))
+    }
+}
+
+/// How many parent-pid hops [`gather_session_moves`] walks looking for a
+/// pane's own child pid in a live entry's ancestry — covers `claude`
 /// launched through a cmd/npm shim (a couple of hops) with headroom to
 /// spare, without letting a pathological chain spin forever.
-const FORK_ANCESTRY_DEPTH: u32 = 5;
+const MOVE_ANCESTRY_DEPTH: u32 = 5;
 
-/// Detect a live brigade member's Claude session having forked in place.
+/// The id a hosted Claude pane's own process now reports, when it is not the
+/// one the pane is keyed by: the same `sessions/<pid>.json` the process has
+/// always published starts naming another `sessionId`. `/clear`, `/branch` and
+/// an in-pane `/resume` do that; auto-compaction does not (2.1.318 and later
+/// compact in place, under the same id).
 ///
-/// Claude Code's AUTO-compaction assigns a session a *new* id while leaving
-/// the process itself running (manual `/compact` does not) — the same
-/// `sessions/<pid>.json` live-state file the process has always published
-/// simply starts reporting a different `sessionId`. One
-/// `Event::MemberSessionForked` per staged Claude member whose recorded id
-/// no longer matches what its own pane's process is actually reporting; the
-/// pid match tries the pane's direct child first, falling back to an
-/// ancestry walk for the cmd/npm-shim case (see [`FORK_ANCESTRY_DEPTH`]).
-/// Repeats every tick until the store row (and the core's rename it
-/// triggers) catch up — `engine::update_member_session_forked` is written
-/// to tolerate that. A non-Claude member (resolved via `app`) never reaches
-/// any of this — see the per-member gate's own comment for why the
-/// mechanism cannot apply to one at all, not just why skipping it is fast.
-fn gather_fork_observations(
+/// Returns the pid of the live entry that said so along with the id.
+///
+/// `None` while some live entry of a running process still reports `id`: a process cannot report two
+/// ids at once, so that is the steady state, and it keeps the (sysinfo-backed)
+/// ancestry walks off the every-second path until something changes. Among the
+/// entries that descend from `pid` the nearest one wins, so a `claude` the pane's
+/// own process started (a `claude -p` from a tool call) is not mistaken for it.
+///
+/// An entry whose process is gone (`alive`) is a leftover file, not a report, in
+/// either direction: a `claude -p` that has exited leaves one behind until its
+/// directory is swept, and its pid can sit below the pane; and a dead file still
+/// naming the pane's own key would otherwise hide a real `/clear` for as long as
+/// it lay there. `held` is the entry an earlier tick named the move on: while it
+/// is still alive and still says the same, nothing is walked again.
+fn moved_session_id(
+    live: &[LiveSession],
+    id: &str,
+    pid: u32,
+    view: &ProcessView,
+    held: Option<(u32, &str)>,
+) -> Option<(u32, String)> {
+    if live
+        .iter()
+        .any(|entry| entry.session_id.as_deref() == Some(id) && (view.alive)(entry.pid))
+    {
+        return None;
+    }
+    if let Some((entry_pid, new_id)) = held
+        && (view.alive)(entry_pid)
+        && live
+            .iter()
+            .any(|entry| entry.pid == entry_pid && entry.session_id.as_deref() == Some(new_id))
+    {
+        return Some((entry_pid, new_id.to_string()));
+    }
+    live.iter()
+        .filter_map(|entry| {
+            let new_id = entry.session_id.as_deref().filter(|new| !new.is_empty())?;
+            if !(view.alive)(entry.pid) {
+                return None;
+            }
+            let hops = ancestry_distance(entry.pid, pid, view.probe, MOVE_ANCESTRY_DEPTH)?;
+            Some((hops, entry.pid, new_id))
+        })
+        .min_by_key(|(hops, _, _)| *hops)
+        .map(|(_, entry_pid, new_id)| (entry_pid, new_id.to_string()))
+}
+
+/// What [`moved_session_id`] asks the operating system: the process table (parent
+/// links) and which pids are running.
+struct ProcessView<'a> {
+    probe: &'a dyn ProcessProbe,
+    alive: &'a dyn Fn(u32) -> bool,
+}
+
+/// A probe that asks the probe it wraps for each pid's parent once and remembers
+/// the answer. A pane with no live file of its own (just started, or one nobody
+/// reports) never reaches the steady-state check, so it walks every live entry's
+/// ancestry, and each hop is a process-table refresh. Panes and entries share
+/// most of their chains, so the walk is paid once per pid per gather instead of
+/// once per pane and entry. The cache lives for one gather, so a parent that
+/// changes is never stale for longer than a tick. Not done: skipping panes
+/// younger than a few seconds, which would also delay the first rename of a
+/// `/clear` typed right after a start.
+struct CachedParents<'a> {
+    inner: &'a dyn ProcessProbe,
+    parents: RefCell<HashMap<u32, Option<u32>>>,
+}
+
+impl ProcessProbe for CachedParents<'_> {
+    fn is_alive(&self, pid: u32) -> bool {
+        self.inner.is_alive(pid)
+    }
+
+    fn parent_pid(&self, pid: u32) -> Option<u32> {
+        *self
+            .parents
+            .borrow_mut()
+            .entry(pid)
+            .or_insert_with(|| self.inner.parent_pid(pid))
+    }
+
+    fn is_alive_matching(&self, pid: u32, proc_start: &str) -> bool {
+        self.inner.is_alive_matching(pid, proc_start)
+    }
+}
+
+/// How many consecutive ticks a pane's process must report the same other id
+/// before the move is believed. A live file that goes missing or is read torn for
+/// one tick while a nested `claude -p` runs below the pane leaves the nested
+/// session as the only entry under it, which one tick alone cannot tell from the
+/// pane having moved there; renaming on that and back a second later would rekey
+/// the pane, write the member's row and then undo both.
+const MOVE_CONFIRM_TICKS: u32 = 2;
+
+/// How many ticks pass before a move that is still observed is sent again. The
+/// core refuses a move onto a conversation something else holds (another pane, an
+/// open in flight, another member's row) and says so once; what held it can let go
+/// later (the open fails, the other pane closes, the row changes), and only the
+/// shell can see that the pane's process is still on the new id. Sent every tick,
+/// as it was before the watch existed, the refusal also wrote a pane-log line and
+/// walked the process tree each second; every fifth tick keeps the retry within a
+/// few seconds of the release at a fifth of that. The core's latch keeps the
+/// status line to one message however often it is sent.
+const MOVE_RESEND_TICKS: u32 = 5;
+
+/// How many consecutive ticks the roster may stay unread before the operator is
+/// told that session tracking is paused. One brigade row the store cannot decode
+/// (an unrecognised role token) fails the whole roster read for as long as it
+/// exists, and with it every pane's tracking, member and solo, without a word.
+/// A read that fails for a tick or two (a locked database) is routine and not
+/// worth a line.
+const MOVE_PAUSED_NOTICE_TICKS: u32 = 10;
+
+/// What [`gather_session_moves`] has seen of each pane across ticks: which id it
+/// reported, for how many ticks, and when the move was last sent.
+///
+/// A move is sent when it is believed ([`MOVE_CONFIRM_TICKS`]) and again every
+/// [`MOVE_RESEND_TICKS`] while it is still observed, which only a move the core did
+/// not apply can be: an applied rename takes the old key away from the pane, so the
+/// move is no longer observed under it. The map is rebuilt from each tick's
+/// observations, so a pane that went away, or whose process stopped reporting the
+/// move, leaves no entry behind; a move that reappears is observed afresh.
+#[derive(Default)]
+struct SessionMoveWatch {
+    seen: HashMap<SessionKey, WatchedMove>,
+    /// Consecutive ticks the roster was not read in full, and whether this
+    /// stretch has been told about already.
+    unread_ticks: u32,
+    paused_said: bool,
+}
+
+struct WatchedMove {
+    new_id: String,
+    entry_pid: u32,
+    ticks: u32,
+    /// The tick count at which the move was last sent; `None` until it is.
+    sent_at: Option<u32>,
+}
+
+/// A move this tick's live files show, before [`SessionMoveWatch`] decides whether
+/// to send it.
+struct ObservedMove {
+    key: SessionKey,
+    entry_pid: u32,
+    new_id: String,
+    event: Event,
+}
+
+impl SessionMoveWatch {
+    /// The entry an earlier tick sent this pane's move on, so that its ancestry
+    /// is not walked again.
+    fn named_entry(&self, key: &SessionKey) -> Option<(u32, &str)> {
+        self.seen
+            .get(key)
+            .filter(|watched| watched.sent_at.is_some())
+            .map(|watched| (watched.entry_pid, watched.new_id.as_str()))
+    }
+
+    /// This tick's roster read, whole or not: the notice to show once the roster
+    /// has stayed unread for [`MOVE_PAUSED_NOTICE_TICKS`] ticks, said once per
+    /// stretch (a complete tick ends the stretch, so it can be said again).
+    fn roster_notice(&mut self, complete: bool) -> Option<Event> {
+        if complete {
+            self.unread_ticks = 0;
+            self.paused_said = false;
+            return None;
+        }
+        self.unread_ticks = self.unread_ticks.saturating_add(1);
+        if self.paused_said || self.unread_ticks < MOVE_PAUSED_NOTICE_TICKS {
+            return None;
+        }
+        self.paused_said = true;
+        Some(Event::StartupNotices {
+            notices: vec![
+                "session tracking paused: the brigade roster could not be read".to_string(),
+            ],
+        })
+    }
+
+    /// This tick's observations in; the events to send out.
+    fn admit(&mut self, observed: Vec<ObservedMove>) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut next = HashMap::new();
+        for ObservedMove {
+            key,
+            entry_pid,
+            new_id,
+            event,
+        } in observed
+        {
+            let mut watched = match self.seen.remove(&key) {
+                Some(watched) if watched.new_id == new_id => watched,
+                _ => WatchedMove {
+                    new_id,
+                    entry_pid,
+                    ticks: 0,
+                    sent_at: None,
+                },
+            };
+            watched.entry_pid = entry_pid;
+            watched.ticks = watched.ticks.saturating_add(1);
+            let due = match watched.sent_at {
+                None => watched.ticks >= MOVE_CONFIRM_TICKS,
+                Some(at) => watched.ticks - at >= MOVE_RESEND_TICKS,
+            };
+            if due {
+                watched.sent_at = Some(watched.ticks);
+                events.push(event);
+            }
+            next.insert(key, watched);
+        }
+        self.seen = next;
+        events
+    }
+}
+
+/// Whether the roster of some member other than `own` (the member a move is being
+/// named for, if it is one) already records `new_id`: that member's pane may be
+/// closed, so no pane holds the id, but `SetMemberSession` moves a session id
+/// between rows and would take it from them.
+fn row_holds(
+    brigades: &[(Brigade, Option<Vec<BrigadeMember>>)],
+    new_id: &str,
+    own: Option<(BrigadeId, &str)>,
+) -> bool {
+    brigades.iter().any(|(brigade, members)| {
+        members.iter().flatten().any(|member| {
+            member.session_id.as_ref().is_some_and(|id| id.0 == new_id)
+                && own != Some((brigade.id, member.token.as_str()))
+        })
+    })
+}
+
+/// Detect a hosted Claude pane whose process now reports another session id
+/// (see [`moved_session_id`]): [`Event::MemberSessionForked`] for a brigade
+/// member, [`Event::PaneSessionMoved`] for any other pane. Each is sent after the
+/// move has held for [`MOVE_CONFIRM_TICKS`] ticks and again every
+/// [`MOVE_RESEND_TICKS`] while it is still observed ([`SessionMoveWatch`]); the
+/// core's handlers tolerate a repeat. A non-Claude pane never
+/// reaches any of this: `sessions/<pid>.json` is Claude's own file and a Codex
+/// session id is never in it, so its permanent absence would read every tick as
+/// "the id moved" on a mechanism that cannot apply. A pane whose product is not
+/// known yet (`app` has no row for it) is skipped the same way and caught on a
+/// later tick.
+///
+/// A tick that could not read every brigade's members names no move at all. Which
+/// panes are members is read off the roster, and so is whether another member's
+/// row already records the id a pane moved onto (`held_by_row`): with one brigade
+/// missing, a solo pane might be its member, and a member's move might be onto an
+/// id the missing brigade's row holds, which `SetMemberSession` would then take
+/// from it without a word. The streaks restart on the next complete tick. A
+/// roster that stays unread is told once ([`MOVE_PAUSED_NOTICE_TICKS`]).
+fn gather_session_moves(
+    read: &TickRead,
     state: &EmporiumState,
-    store: &RefCell<Store>,
-    claude_home: &ClaudeHome,
     handles: &HashMap<SessionKey, PtyHandle>,
     app: &App,
-    mut timings: Option<&mut TickTimings>,
+    watch: &mut SessionMoveWatch,
+    view: &ProcessView,
+    timings: Option<&mut TickTimings>,
 ) -> Vec<Event> {
-    let roster_start = Instant::now();
-    let brigades = match store.borrow().list_brigades() {
-        Ok(brigades) => brigades,
-        Err(_) => return Vec::new(),
+    let per_pane_start = Instant::now();
+    let parents = CachedParents {
+        inner: view.probe,
+        parents: RefCell::new(HashMap::new()),
     };
-    if let Some(t) = timings.as_deref_mut() {
-        t.fork_roster += roster_start.elapsed();
-    }
-    let live_scan_start = Instant::now();
-    let live = read_live_sessions(&claude_home.sessions_dir());
-    if let Some(t) = timings.as_deref_mut() {
-        t.fork_live_scan += live_scan_start.elapsed();
-    }
-    let probe = SysinfoProbe;
-    let mut events = Vec::new();
-    let per_member_start = Instant::now();
-    for brigade in brigades {
-        let roster_start = Instant::now();
-        let members = match store.borrow().brigade_members(brigade.id) {
-            Ok(members) => members,
-            Err(_) => continue,
-        };
-        if let Some(t) = timings.as_deref_mut() {
-            t.fork_roster += roster_start.elapsed();
+    let view = ProcessView {
+        probe: &parents,
+        alive: view.alive,
+    };
+    let mut observed = Vec::new();
+    let roster = read
+        .brigades
+        .as_ref()
+        .filter(|brigades| roster_is_complete(brigades));
+    let notice = watch.roster_notice(roster.is_some());
+    if let Some(roster) = roster {
+        let mut member_keys: HashSet<SessionKey> = HashSet::new();
+        let is_claude =
+            |id: &str| app.row_for_id(id).map(|row| row.agent) == Some(AgentKind::ClaudeCode);
+        for (brigade, members) in roster {
+            for member in members.iter().flatten() {
+                let Some(session_id) = member.session_id.as_ref() else {
+                    continue;
+                };
+                let old_key = SessionKey::from_id(&session_id.0);
+                member_keys.insert(old_key.clone());
+                if !is_claude(&session_id.0) || !state.screens.contains_key(&old_key) {
+                    continue;
+                }
+                let Some(pid) = handles.get(&old_key).and_then(PtyHandle::pid) else {
+                    continue;
+                };
+                if let Some((entry_pid, new_id)) = moved_session_id(
+                    &read.live,
+                    &session_id.0,
+                    pid,
+                    &view,
+                    watch.named_entry(&old_key),
+                ) {
+                    let held_by_row = row_holds(roster, &new_id, Some((brigade.id, &member.token)));
+                    observed.push(ObservedMove {
+                        key: old_key,
+                        entry_pid,
+                        event: Event::MemberSessionForked {
+                            brigade_id: brigade.id,
+                            token: member.token.clone(),
+                            old_id: session_id.0.clone(),
+                            new_id: new_id.clone(),
+                            held_by_row,
+                        },
+                        new_id,
+                    });
+                }
+            }
         }
-        for member in &members {
-            let Some(session_id) = member.session_id.as_ref() else {
-                continue;
-            };
-            // Auto-compaction — the only thing this function ever detects — is
-            // a Claude Code behavior: `sessions/<pid>.json` (what `live` reads)
-            // is Claude's own live-state file, and a Codex member's session id
-            // is never in it. Without this gate, that permanent absence read
-            // every tick as "the id vanished," this function's own fork
-            // signal, so a Codex member fell through to the ancestry walk
-            // below on a mechanism that can never apply to it — not a slow
-            // path for it, a meaningless one. Unresolved (`None`, discovery
-            // hasn't caught up to this session yet) is treated the same as
-            // Codex: skip rather than guess: the next tick's re-check catches
-            // it once the product is known, the same tolerance this function's
-            // own doc already claims for the fork signal itself.
-            if app.row_for_id(&session_id.0).map(|row| row.agent) != Some(AgentKind::ClaudeCode) {
+        for (key, handle) in handles {
+            if key.is_synthetic() || member_keys.contains(key) || !state.screens.contains_key(key) {
                 continue;
             }
-            let old_key = SessionKey::from_id(&session_id.0);
-            if !state.screens.contains_key(&old_key) {
-                continue;
-            }
-            let Some(pid) = handles.get(&old_key).and_then(PtyHandle::pid) else {
+            let (true, Some(pid)) = (is_claude(key.as_str()), handle.pid()) else {
                 continue;
             };
-            // Steady-state short-circuit: as long as *some* live entry still
-            // reports the recorded id, no fork has happened to this member — a
-            // process can't report the old and the new id at once, and a fork
-            // flips its one `sessions/<pid>.json` in place, so the recorded id
-            // vanishing from the live set is a precondition of a fork. Checking
-            // that first keeps the (sysinfo-backed) ancestry walks below off
-            // the every-second tick path entirely until something actually
-            // changed.
-            if live
-                .iter()
-                .any(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+            if let Some((entry_pid, new_id)) =
+                moved_session_id(&read.live, key.as_str(), pid, &view, watch.named_entry(key))
             {
-                continue;
-            }
-            let forked = live.iter().find(|entry| {
-                entry
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|id| !id.is_empty() && id != session_id.0)
-                    && ancestry_reaches(entry.pid, pid, &probe, FORK_ANCESTRY_DEPTH)
-            });
-            if let Some(new_id) = forked.and_then(|entry| entry.session_id.clone()) {
-                events.push(Event::MemberSessionForked {
-                    brigade_id: brigade.id,
-                    token: member.token.clone(),
-                    old_id: session_id.0.clone(),
+                let held_by_row = row_holds(roster, &new_id, None);
+                observed.push(ObservedMove {
+                    key: key.clone(),
+                    entry_pid,
+                    event: Event::PaneSessionMoved {
+                        old_id: key.as_str().to_string(),
+                        new_id: new_id.clone(),
+                        held_by_row,
+                    },
                     new_id,
                 });
             }
         }
     }
+    let mut events = watch.admit(observed);
+    events.extend(notice);
     if let Some(t) = timings {
-        t.fork_per_member += per_member_start.elapsed();
+        t.session_moves += per_pane_start.elapsed();
     }
     events
+}
+
+/// Whether every brigade's members were read: only then is a pane that is in none
+/// of the rosters known to be in no brigade, and only then is "no member's row holds
+/// this id" known.
+fn roster_is_complete(brigades: &Roster) -> bool {
+    brigades.iter().all(|(_, members)| members.is_some())
+}
+
+/// One tick of the move gather against `watch`, every process alive but those
+/// `dead` names, the real process table asked for parents.
+#[cfg(test)]
+fn gather_session_moves_tick(
+    watch: &mut SessionMoveWatch,
+    dead: &[u32],
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    claude_home: &ClaudeHome,
+    handles: &HashMap<SessionKey, PtyHandle>,
+    app: &App,
+) -> Vec<Event> {
+    gather_session_moves_viewing(
+        watch,
+        &ProcessView {
+            probe: &SysinfoProbe,
+            alive: &|pid| !dead.contains(&pid),
+        },
+        state,
+        store,
+        claude_home,
+        handles,
+        app,
+    )
+}
+
+/// One tick of the move gather with the process table `view` names.
+#[cfg(test)]
+fn gather_session_moves_viewing(
+    watch: &mut SessionMoveWatch,
+    view: &ProcessView,
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    claude_home: &ClaudeHome,
+    handles: &HashMap<SessionKey, PtyHandle>,
+    app: &App,
+) -> Vec<Event> {
+    let read = TickRead::read(store, claude_home, None);
+    gather_session_moves(&read, state, handles, app, watch, view, None)
+}
+
+/// What the loop sends for a move that has held: the second tick's events, with
+/// every process alive. The first tick alone sends nothing
+/// (`a_move_is_believed_only_when_it_holds_for_two_ticks`).
+#[cfg(test)]
+fn gather_session_moves_reading(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    claude_home: &ClaudeHome,
+    handles: &HashMap<SessionKey, PtyHandle>,
+    app: &App,
+    timings: Option<&mut TickTimings>,
+) -> Vec<Event> {
+    let mut watch = SessionMoveWatch::default();
+    let read = TickRead::read(store, claude_home, None);
+    let view = ProcessView {
+        probe: &SysinfoProbe,
+        alive: &|_| true,
+    };
+    gather_session_moves(&read, state, handles, app, &mut watch, &view, None);
+    gather_session_moves(&read, state, handles, app, &mut watch, &view, timings)
+}
+
+#[cfg(test)]
+fn gather_relay_observations(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    claude_home: &ClaudeHome,
+    codex_home: Option<&CodexHome>,
+    app: &App,
+    mut timings: Option<&mut TickTimings>,
+    glance_gate: &mut GlanceGate,
+) -> Vec<RelayObservation> {
+    let read = TickRead::read(store, claude_home, timings.as_deref_mut());
+    gather_relay_observations_from(&read, state, store, codex_home, app, timings, glance_gate)
 }
 
 /// This member's role briefing, or `None` when the configured template for
@@ -3894,7 +4203,7 @@ impl StageTimings {
 }
 
 /// Sub-stage durations inside the ~1s tick block — filled in by
-/// `gather_fork_observations`/`gather_relay_observations`/
+/// `gather_session_moves`/`gather_relay_observations`/
 /// `gather_goinkyo_observations` as they run, so `tick`'s own cost in
 /// [`StageTimings`] is attributed rather than guessed at. Same measurement
 /// discipline as [`StageTimings`]: accumulation is unconditional and cheap
@@ -3904,11 +4213,12 @@ impl StageTimings {
 /// same as everything else this file measures.
 #[derive(Default)]
 struct TickTimings {
-    fork_roster: Duration,
-    fork_live_scan: Duration,
-    fork_per_member: Duration,
-    relay_roster: Duration,
-    relay_live_scan: Duration,
+    /// The brigade list and every roster, read once for the whole tick
+    /// ([`TickRead`]).
+    roster: Duration,
+    /// The live-state directory scan, read once for the whole tick.
+    live_scan: Duration,
+    session_moves: Duration,
     /// The one shared `SysinfoProbe::alive_pids` refresh every Claude
     /// member's activity check now reads from, instead of each paying its
     /// own — see that call site's own comment. Kept as its own field
@@ -4131,15 +4441,13 @@ fn log_slow_iteration(
     if tick_is_dominant {
         let _ = writeln!(
             file,
-            "{ms} emporium: slow tick fork_roster={}us fork_live_scan={}us fork_per_member={}us \
-             relay_roster={}us relay_live_scan={}us relay_claude_snapshot={}us relay_unseen={}us \
+            "{ms} emporium: slow tick roster={}us live_scan={}us session_moves={}us \
+             relay_claude_snapshot={}us relay_unseen={}us \
              relay_glance={}us relay_activity_claude={}us relay_activity_codex_sqlite={}us \
              relay_activity_codex_rollout={}us goinkyo_roster={}us",
-            tick_timings.fork_roster.as_micros(),
-            tick_timings.fork_live_scan.as_micros(),
-            tick_timings.fork_per_member.as_micros(),
-            tick_timings.relay_roster.as_micros(),
-            tick_timings.relay_live_scan.as_micros(),
+            tick_timings.roster.as_micros(),
+            tick_timings.live_scan.as_micros(),
+            tick_timings.session_moves.as_micros(),
             tick_timings.relay_claude_snapshot.as_micros(),
             tick_timings.relay_unseen.as_micros(),
             tick_timings.relay_glance.as_micros(),
@@ -5396,7 +5704,6 @@ mod tests {
             size: 0,
             is_agent: false,
             preview: None,
-            continuation_of_uuid: None,
             source_archived: false,
         };
         let rows = crate::session::rows_from_metas(
@@ -6851,7 +7158,6 @@ mod tests {
             rows,
             hidden: HashSet::new(),
             directors: HashSet::new(),
-            superseded: HashSet::new(),
         };
         let both = |state: &EmporiumState, app: &App| {
             let buffer = render_at(state, app, 160, now);
@@ -9000,71 +9306,6 @@ mod tests {
         assert_eq!(*kills_b.lock().unwrap(), 1, "b outlived the deadline");
     }
 
-    // --- brigade member auto-heal: resolve_membership follows lineage ----
-
-    #[test]
-    fn resolve_membership_heals_a_members_session_id_to_its_lineage_leaf() {
-        let mut store = Store::open_in_memory().unwrap();
-        let brigade_id = store.create_brigade("cell").unwrap();
-        store
-            .add_brigade_member(
-                brigade_id,
-                "worker-1",
-                BrigadeRole::Worker,
-                Some(&SessionId("w1-old".to_string())),
-            )
-            .unwrap();
-        store
-            .record_lineage(
-                &SessionId("w1-new".to_string()),
-                &SessionId("w1-old".to_string()),
-            )
-            .unwrap();
-        let store = RefCell::new(store);
-
-        // Resolve membership from the OLD id — the exact situation the live
-        // watcher misses: the fork happened while banto wasn't watching, so
-        // nothing ever rekeyed the pane, and the member row still records
-        // the ancestor.
-        let events = execute_store_intent(
-            StoreIntent::ResolveMembership {
-                session_id: "w1-old".to_string(),
-            },
-            &store,
-        );
-
-        let [
-            Event::MembershipResolved {
-                members: Some(members),
-                ..
-            },
-        ] = events.as_slice()
-        else {
-            panic!("expected a resolved membership with a roster: {events:?}");
-        };
-        let worker = members
-            .iter()
-            .find(|(token, ..)| token == "worker-1")
-            .unwrap();
-        assert_eq!(
-            worker.2.as_deref(),
-            Some("w1-new"),
-            "the roster handed to the engine must carry the healed id"
-        );
-
-        // Persisted, not just reported this once — a later re-stage must
-        // see it too.
-        assert_eq!(
-            store
-                .borrow()
-                .brigade_member(brigade_id, "worker-1")
-                .unwrap()
-                .unwrap()
-                .session_id,
-            Some(SessionId("w1-new".to_string()))
-        );
-    }
-
     /// Name a member the way the Director's `name_member` tool does.
     fn name_it(
         store: &mut Store,
@@ -9611,7 +9852,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let mut discovery = Vec::new();
-        let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
         let input_reader = MockInputReader::default();
@@ -9625,7 +9865,6 @@ mod tests {
             codex_home: None,
             thresholds: &thresholds,
             store: &store,
-            superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
             input_reader: &input_reader,
@@ -9681,7 +9920,6 @@ mod tests {
         handles.insert(pending.clone(), open(&host));
         let store = RefCell::new(Store::open_in_memory().unwrap());
         let mut discovery = Vec::new();
-        let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
         let input_reader = MockInputReader::default();
@@ -9695,7 +9933,6 @@ mod tests {
             codex_home: None,
             thresholds: &thresholds,
             store: &store,
-            superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
             input_reader: &input_reader,
@@ -9737,7 +9974,6 @@ mod tests {
         handles.insert(key.clone(), open(&host));
         let mut discovery = Vec::new();
         let store = RefCell::new(Store::open_in_memory().unwrap());
-        let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
         let input_reader = MockInputReader::default();
@@ -9751,7 +9987,6 @@ mod tests {
             codex_home: None,
             thresholds: &thresholds,
             store: &store,
-            superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
             input_reader: &input_reader,
@@ -9789,7 +10024,6 @@ mod tests {
         let mut handles = HashMap::new();
         let mut discovery = Vec::new();
         let store = RefCell::new(Store::open_in_memory().unwrap());
-        let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
         let input_reader = MockInputReader::default();
@@ -9803,7 +10037,6 @@ mod tests {
             codex_home: None,
             thresholds: &thresholds,
             store: &store,
-            superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
             input_reader: &input_reader,
@@ -10526,10 +10759,10 @@ mod tests {
         );
     }
 
-    // --- compact-fork tracking: gather_fork_observations ------------------
+    // --- session-move tracking: gather_session_moves ------------------
 
     #[test]
-    fn gather_fork_observations_detects_a_forked_worker_by_exact_pid_match() {
+    fn gather_session_moves_detects_a_moved_worker_by_exact_pid_match() {
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
         write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
@@ -10541,7 +10774,7 @@ mod tests {
         };
         handles.insert(SessionKey::from_id("w1-old"), open(&host));
 
-        let events = gather_fork_observations(
+        let events = gather_session_moves_reading(
             &state,
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
@@ -10556,12 +10789,12 @@ mod tests {
                 [Event::MemberSessionForked { token, old_id, new_id, .. }]
                     if token == "worker-1" && old_id == "w1-old" && new_id == "w1-new"
             ),
-            "expected exactly one fork observation: {events:?}"
+            "expected exactly one move observation: {events:?}"
         );
     }
 
     #[test]
-    fn gather_fork_observations_detects_an_offstage_members_compaction_fork() {
+    fn gather_session_moves_detects_an_offstage_members_session_move() {
         let claude_home = tempfile::tempdir().unwrap();
         let (store, mut state, _app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         let offstage_brigade = store.borrow_mut().create_brigade("offstage").unwrap();
@@ -10590,7 +10823,7 @@ mod tests {
         let mut handles = HashMap::new();
         handles.insert(old_key, open(&host));
 
-        let events = gather_fork_observations(
+        let events = gather_session_moves_reading(
             &state,
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
@@ -10606,6 +10839,7 @@ mod tests {
                 token,
                 old_id,
                 new_id,
+                held_by_row: false,
             }] if *brigade_id == offstage_brigade
                 && token == "worker-1"
                 && old_id == "w2-old"
@@ -10614,7 +10848,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_fork_observations_is_silent_when_the_live_entry_still_reports_the_recorded_id() {
+    fn gather_session_moves_is_silent_when_the_live_entry_still_reports_the_recorded_id() {
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1", Some(AgentKind::ClaudeCode));
         write_live_state(claude_home.path(), 4242, "w1", Path::new("/work/alpha"));
@@ -10626,7 +10860,7 @@ mod tests {
         };
         handles.insert(SessionKey::from_id("w1"), open(&host));
 
-        let events = gather_fork_observations(
+        let events = gather_session_moves_reading(
             &state,
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
@@ -10635,17 +10869,17 @@ mod tests {
             None,
         );
 
-        assert!(events.is_empty(), "no fork happened: {events:?}");
+        assert!(events.is_empty(), "no move happened: {events:?}");
     }
 
     #[test]
-    fn gather_fork_observations_never_enters_the_ancestry_path_for_a_codex_member() {
+    fn gather_session_moves_never_enters_the_ancestry_path_for_a_codex_member() {
         // Same exact-pid-match setup as
-        // `gather_fork_observations_detects_a_forked_worker_by_exact_pid_match`
+        // `gather_session_moves_detects_a_moved_worker_by_exact_pid_match`
         // — `entry.pid == pid` would trip `ancestry_reaches` at depth 0
         // with no real OS lookup at all, so if the Claude-only gate above
         // this test's own body ever regressed, this would reliably produce
-        // a (wrong) fork observation for a Codex member instead of quietly
+        // a (wrong) move observation for a Codex member instead of quietly
         // doing nothing. The only difference from the Claude test is the
         // agent tag `staged_worker` puts in `App`'s row.
         let claude_home = tempfile::tempdir().unwrap();
@@ -10659,7 +10893,7 @@ mod tests {
         };
         handles.insert(SessionKey::from_id("w1-old"), open(&host));
 
-        let events = gather_fork_observations(
+        let events = gather_session_moves_reading(
             &state,
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
@@ -10670,12 +10904,12 @@ mod tests {
 
         assert!(
             events.is_empty(),
-            "a Codex member must never produce a fork observation: {events:?}"
+            "a Codex member must never produce a move observation: {events:?}"
         );
     }
 
     #[test]
-    fn gather_fork_observations_ignores_a_pane_with_no_known_child_pid() {
+    fn gather_session_moves_ignores_a_pane_with_no_known_child_pid() {
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
         write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
@@ -10684,7 +10918,7 @@ mod tests {
         // never be known — this must not panic, just find nothing.
         let handles = HashMap::new();
 
-        let events = gather_fork_observations(
+        let events = gather_session_moves_reading(
             &state,
             &store,
             &ClaudeHome::new(claude_home.path().to_path_buf()),
@@ -10694,6 +10928,764 @@ mod tests {
         );
 
         assert!(events.is_empty());
+    }
+
+    /// A hosted Claude pane that is in no brigade, with the pane's own process
+    /// (`pid`) and the row the list would have for it.
+    fn solo_pane(
+        id: &str,
+        pid: u32,
+    ) -> (
+        RefCell<Store>,
+        EmporiumState,
+        App,
+        HashMap<SessionKey, PtyHandle>,
+        MockPtyHost,
+    ) {
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state
+            .screens
+            .insert(SessionKey::from_id(id), Screen::new(24, 80));
+        let app = App::new(vec![test_row(id, AgentKind::ClaudeCode)]);
+        let host = MockPtyHost {
+            pid: Some(pid),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id(id), open(&host));
+        (store, state, app, handles, host)
+    }
+
+    #[test]
+    fn a_solo_pane_whose_process_reports_another_session_is_named_as_moved() {
+        // `/clear` and `/branch` both read like this: the pane's own process
+        // publishes a different `sessionId`, still under its pid.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = solo_pane("solo-old", 4242);
+        write_live_state(
+            claude_home.path(),
+            4242,
+            "solo-new",
+            Path::new("/work/alpha"),
+        );
+
+        let events = gather_session_moves_reading(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+            &app,
+            None,
+        );
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::PaneSessionMoved { old_id, new_id, held_by_row: false }]
+                    if old_id == "solo-old" && new_id == "solo-new"
+            ),
+            "expected one move: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_solo_pane_whose_process_still_reports_its_key_is_silent() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = solo_pane("solo", 4242);
+        write_live_state(claude_home.path(), 4242, "solo", Path::new("/work/alpha"));
+
+        let events = gather_session_moves_reading(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+            &app,
+            None,
+        );
+
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_solo_codex_pane_and_a_pane_with_no_row_are_never_named_as_moved() {
+        let claude_home = tempfile::tempdir().unwrap();
+        write_live_state(claude_home.path(), 4242, "other", Path::new("/work/alpha"));
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let (store, state, _app, handles, _host) = solo_pane("solo", 4242);
+
+        let codex = App::new(vec![test_row("solo", AgentKind::Codex)]);
+        assert!(
+            gather_session_moves_reading(&state, &store, &home, &handles, &codex, None).is_empty()
+        );
+        let no_row = App::new(Vec::new());
+        assert!(
+            gather_session_moves_reading(&state, &store, &home, &handles, &no_row, None).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_brigade_member_is_named_by_the_member_event_and_never_as_a_solo_pane() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
+        write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+
+        let events = gather_session_moves_reading(
+            &state,
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            &handles,
+            &app,
+            None,
+        );
+
+        assert!(
+            matches!(events.as_slice(), [Event::MemberSessionForked { .. }]),
+            "{events:?}"
+        );
+    }
+
+    /// The staged worker `w1-old` with its process (pid 4242) and a live file
+    /// naming `w1-new` — a member that `/clear`ed.
+    fn moved_member(
+        claude_home: &Path,
+    ) -> (
+        RefCell<Store>,
+        EmporiumState,
+        App,
+        HashMap<SessionKey, PtyHandle>,
+        MockPtyHost,
+    ) {
+        let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
+        write_live_state(claude_home, 4242, "w1-new", Path::new("/work/alpha"));
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+        (store, state, app, handles, host)
+    }
+
+    #[test]
+    fn a_move_is_believed_only_when_it_holds_for_two_ticks() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = moved_member(claude_home.path());
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+
+        let first =
+            gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+        let second =
+            gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+
+        assert!(first.is_empty(), "one tick is not enough: {first:?}");
+        assert!(
+            matches!(second.as_slice(), [Event::MemberSessionForked { new_id, .. }] if new_id == "w1-new"),
+            "{second:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_file_missing_for_one_tick_cannot_rename_the_pane_onto_a_nested_session() {
+        // The pane's claude (pid 20) runs under the pane's process (pid 10) and
+        // has started a `claude -p` (pid 30) of its own. Pid 20's file is
+        // unreadable for a tick, so the nested session is the only entry under
+        // the pane: that one tick alone looks like a move onto it.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
+        let host = MockPtyHost {
+            pid: Some(10),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let tree = Tree(vec![(20, 10), (30, 20)]);
+        let view = ProcessView {
+            probe: &tree,
+            alive: &|_| true,
+        };
+        let mut watch = SessionMoveWatch::default();
+        let cwd = Path::new("/work/alpha");
+        let tick = |watch: &mut SessionMoveWatch| {
+            gather_session_moves_viewing(watch, &view, &state, &store, &home, &handles, &app)
+        };
+
+        // Tick 1: only the nested session's file is there.
+        write_live_state(claude_home.path(), 30, "nested", cwd);
+        let first = tick(&mut watch);
+        assert_eq!(
+            watch.seen.values().map(|w| w.ticks).collect::<Vec<_>>(),
+            [1]
+        );
+        // Tick 2: the pane's own file is back and says what it always said.
+        write_live_state(claude_home.path(), 20, "w1-old", cwd);
+        let second = tick(&mut watch);
+        assert!(
+            watch.seen.is_empty(),
+            "nothing moved, so nothing is watched"
+        );
+        // Tick 3: the nested session shows up alone again.
+        std::fs::remove_file(claude_home.path().join("sessions").join("20.json")).unwrap();
+        let third = tick(&mut watch);
+
+        assert!(first.is_empty() && second.is_empty() && third.is_empty());
+        assert_eq!(
+            watch.seen.values().map(|w| w.ticks).collect::<Vec<_>>(),
+            [1],
+            "the streak started over; carried across tick 2 it would have been sent here"
+        );
+    }
+
+    #[test]
+    fn a_live_file_whose_process_is_gone_names_no_move() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = moved_member(claude_home.path());
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+
+        for _ in 0..3 {
+            let events = gather_session_moves_tick(
+                &mut watch,
+                &[4242],
+                &state,
+                &store,
+                &home,
+                &handles,
+                &app,
+            );
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
+    #[test]
+    fn a_move_that_stays_observed_is_sent_again_every_few_ticks() {
+        // What a refused move looks like from here: the pane stays under its old
+        // key and the process keeps reporting the new id.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = moved_member(claude_home.path());
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+
+        let sent_on: Vec<usize> = (1..=13)
+            .filter(|_| {
+                let events = gather_session_moves_tick(
+                    &mut watch,
+                    &[],
+                    &state,
+                    &store,
+                    &home,
+                    &handles,
+                    &app,
+                );
+                !events.is_empty()
+            })
+            .collect();
+
+        let first = MOVE_CONFIRM_TICKS as usize;
+        let every = MOVE_RESEND_TICKS as usize;
+        assert_eq!(sent_on, [first, first + every, first + 2 * every]);
+        // The process moves on: that is a new fact, believed after two ticks.
+        write_live_state(
+            claude_home.path(),
+            4242,
+            "w1-third",
+            Path::new("/work/alpha"),
+        );
+        let next =
+            gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+        assert!(next.is_empty());
+        let next =
+            gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+        assert!(
+            matches!(next.as_slice(), [Event::MemberSessionForked { new_id, .. }] if new_id == "w1-third"),
+            "{next:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_move_is_renamed_within_a_few_ticks_of_the_hold_letting_go() {
+        // The regression this guards: a conversation another pane holds is
+        // resumed from inside this pane. The core refuses, the other pane closes,
+        // and with the move sent only once this pane would stay on its old key
+        // for good (the same goes for an open that fails, which the core tests
+        // cover: `pending_opens` is not reachable from here).
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, mut state, app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
+        let host = MockPtyHost {
+            pid: Some(4242),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+        write_live_state(claude_home.path(), 4242, "p", Path::new("/work/alpha"));
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+        let mut core_app = App::new(Vec::new());
+        state
+            .screens
+            .insert(SessionKey::from_id("p"), Screen::new(24, 80));
+        let mut now = Instant::now();
+        let mut renamed_on = None;
+
+        for tick in 1..=20 {
+            if tick == 8 {
+                // The other pane closed: nothing holds `p` any more.
+                state.screens.remove(&SessionKey::from_id("p"));
+            }
+            for event in
+                gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app)
+            {
+                now += Duration::from_secs(1);
+                let cmds = engine::update(
+                    &mut state,
+                    &mut core_app,
+                    &BrigadeConfig::default(),
+                    event,
+                    now,
+                );
+                if cmds.iter().any(|cmd| matches!(cmd, Cmd::RekeyPty { .. })) {
+                    renamed_on = Some(tick);
+                }
+            }
+            if renamed_on.is_some() {
+                break;
+            }
+        }
+
+        let renamed_on = renamed_on.expect("the pane is renamed once the hold is gone");
+        assert!(
+            renamed_on > 8 && renamed_on <= 8 + MOVE_RESEND_TICKS,
+            "renamed on tick {renamed_on}"
+        );
+        assert!(state.screens.contains_key(&SessionKey::from_id("p")));
+    }
+
+    #[test]
+    fn the_watch_forgets_a_pane_that_is_gone() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, mut state, app, handles, _host) = moved_member(claude_home.path());
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+        gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+        gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+        assert_eq!(watch.seen.len(), 1);
+
+        state.screens.remove(&SessionKey::from_id("w1-old"));
+        gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+
+        assert!(watch.seen.is_empty());
+    }
+
+    #[test]
+    fn a_move_onto_an_id_another_members_row_holds_is_marked_held() {
+        // The other member's pane is closed (no pane holds `held`), but its row
+        // records it, so the member and the solo event both say so.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = moved_member(claude_home.path());
+        write_live_state(claude_home.path(), 4242, "held", Path::new("/work/alpha"));
+        let other = store.borrow_mut().create_brigade("other").unwrap();
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                other,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("held".to_string())),
+            )
+            .unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+        gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+
+        let events =
+            gather_session_moves_tick(&mut watch, &[], &state, &store, &home, &handles, &app);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::MemberSessionForked { new_id, held_by_row: true, .. }] if new_id == "held"
+            ),
+            "{events:?}"
+        );
+
+        // A pane that is in no brigade, moving onto the same id.
+        let (solo_store, solo_state, solo_app, solo_handles, _solo_host) = solo_pane("solo", 4242);
+        let brigade = solo_store.borrow_mut().create_brigade("holder").unwrap();
+        solo_store
+            .borrow_mut()
+            .add_brigade_member(
+                brigade,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("held".to_string())),
+            )
+            .unwrap();
+        let mut solo_watch = SessionMoveWatch::default();
+        gather_session_moves_tick(
+            &mut solo_watch,
+            &[],
+            &solo_state,
+            &solo_store,
+            &home,
+            &solo_handles,
+            &solo_app,
+        );
+        let solo = gather_session_moves_tick(
+            &mut solo_watch,
+            &[],
+            &solo_state,
+            &solo_store,
+            &home,
+            &solo_handles,
+            &solo_app,
+        );
+        assert!(
+            matches!(
+                solo.as_slice(),
+                [Event::PaneSessionMoved { new_id, held_by_row: true, .. }] if new_id == "held"
+            ),
+            "{solo:?}"
+        );
+    }
+
+    #[test]
+    fn a_members_own_row_is_not_another_rows_hold() {
+        // The row that holds `w1-new` is the member's own (the store already
+        // follows the move): not a reason to refuse.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, _state, _app, _handles, _host) = moved_member(claude_home.path());
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        store
+            .borrow_mut()
+            .set_member_session(brigade_id, "worker-1", &SessionId("w1-new".to_string()))
+            .unwrap();
+        let read = TickRead::read(
+            &store,
+            &ClaudeHome::new(claude_home.path().to_path_buf()),
+            None,
+        );
+        let roster = read.brigades.as_deref().unwrap();
+
+        assert!(!row_holds(roster, "w1-new", Some((brigade_id, "worker-1"))));
+        assert!(row_holds(roster, "w1-new", None));
+    }
+
+    /// Three ticks of the gather, enough for any move to have held, against a
+    /// roster read once.
+    fn moves_over_three_ticks(
+        read: &TickRead,
+        state: &EmporiumState,
+        handles: &HashMap<SessionKey, PtyHandle>,
+        app: &App,
+    ) -> Vec<Event> {
+        let mut watch = SessionMoveWatch::default();
+        let view = ProcessView {
+            probe: &SysinfoProbe,
+            alive: &|_| true,
+        };
+        (0..3)
+            .flat_map(|_| gather_session_moves(read, state, handles, app, &mut watch, &view, None))
+            .collect()
+    }
+
+    #[test]
+    fn a_tick_that_could_not_read_one_brigades_roster_names_no_solo_move() {
+        // One of two brigades' members failed to read. A pane in none of the
+        // rosters that were read might be one of that brigade's, whose row would
+        // then name the id it left.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = solo_pane("solo-old", 4242);
+        write_live_state(
+            claude_home.path(),
+            4242,
+            "solo-new",
+            Path::new("/work/alpha"),
+        );
+        store.borrow_mut().create_brigade("readable").unwrap();
+        store.borrow_mut().create_brigade("unreadable").unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut read = TickRead::read(&store, &home, None);
+
+        let complete = moves_over_three_ticks(&read, &state, &handles, &app);
+        assert_eq!(
+            complete.len(),
+            1,
+            "the roster as read is complete: {complete:?}"
+        );
+
+        read.brigades.as_mut().unwrap()[1].1 = None;
+        let events = moves_over_three_ticks(&read, &state, &handles, &app);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_roster_that_stays_unread_is_told_once_per_stretch() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = solo_pane("solo", 4242);
+        store.borrow_mut().create_brigade("unreadable").unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let complete = TickRead::read(&store, &home, None);
+        let mut unread = TickRead::read(&store, &home, None);
+        unread.brigades.as_mut().unwrap()[0].1 = None;
+        let mut watch = SessionMoveWatch::default();
+        let view = ProcessView {
+            probe: &SysinfoProbe,
+            alive: &|_| true,
+        };
+        let mut notices = |read: &TickRead, ticks: u32| -> usize {
+            (0..ticks)
+                .flat_map(|_| {
+                    gather_session_moves(read, &state, &handles, &app, &mut watch, &view, None)
+                })
+                .filter(|event| matches!(event, Event::StartupNotices { .. }))
+                .count()
+        };
+
+        assert_eq!(
+            notices(&unread, MOVE_PAUSED_NOTICE_TICKS - 1),
+            0,
+            "a short gap is routine"
+        );
+        assert_eq!(notices(&unread, 1), 1, "said when it has lasted");
+        assert_eq!(notices(&unread, 30), 0, "once per stretch");
+        assert_eq!(notices(&complete, 3), 0);
+        assert_eq!(
+            notices(&unread, MOVE_PAUSED_NOTICE_TICKS),
+            1,
+            "a complete tick ended the stretch, so the next one is told again"
+        );
+    }
+
+    #[test]
+    fn a_tick_that_could_not_read_one_brigades_roster_names_no_member_move() {
+        // The member's move is onto `held`, which the unreadable brigade's member
+        // may hold: with that row unread, `held_by_row` would read false and the
+        // core would rename the pane and write the row, taking the id from it.
+        let claude_home = tempfile::tempdir().unwrap();
+        let (store, state, app, handles, _host) = moved_member(claude_home.path());
+        write_live_state(claude_home.path(), 4242, "held", Path::new("/work/alpha"));
+        let other = store.borrow_mut().create_brigade("unreadable").unwrap();
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                other,
+                "worker-1",
+                BrigadeRole::Worker,
+                Some(&SessionId("held".to_string())),
+            )
+            .unwrap();
+        let home = ClaudeHome::new(claude_home.path().to_path_buf());
+        let mut read = TickRead::read(&store, &home, None);
+
+        let complete = moves_over_three_ticks(&read, &state, &handles, &app);
+        assert!(
+            matches!(
+                complete.as_slice(),
+                [Event::MemberSessionForked {
+                    held_by_row: true,
+                    ..
+                }]
+            ),
+            "{complete:?}"
+        );
+
+        let unreadable = read
+            .brigades
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|(brigade, _)| brigade.id == other)
+            .unwrap();
+        unreadable.1 = None;
+        let events = moves_over_three_ticks(&read, &state, &handles, &app);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// A process table of `(pid, parent)` pairs.
+    struct Tree(Vec<(u32, u32)>);
+
+    impl ProcessProbe for Tree {
+        fn is_alive(&self, _pid: u32) -> bool {
+            true
+        }
+        fn parent_pid(&self, pid: u32) -> Option<u32> {
+            self.0
+                .iter()
+                .find(|(child, _)| *child == pid)
+                .map(|(_, parent)| *parent)
+        }
+        fn is_alive_matching(&self, _pid: u32, _proc_start: &str) -> bool {
+            true
+        }
+    }
+
+    fn reporting(pid: u32, session_id: &str) -> LiveSession {
+        LiveSession {
+            pid,
+            session_id: Some(session_id.to_string()),
+            cwd: None,
+            status: None,
+            waiting_for: None,
+            kind: None,
+            name: None,
+            proc_start: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn the_nearest_process_under_the_pane_names_the_new_session() {
+        // The pane's claude (pid 20, behind a shim, pid 10 is the pane's child)
+        // started a `claude -p` (pid 30) of its own; both are below the pane,
+        // and the nearer one is the pane's.
+        let tree = Tree(vec![(20, 10), (30, 20)]);
+        let live = vec![reporting(30, "nested"), reporting(20, "cleared")];
+        let view = ProcessView {
+            probe: &tree,
+            alive: &|_| true,
+        };
+
+        assert_eq!(
+            moved_session_id(&live, "old", 10, &view, None),
+            Some((20, "cleared".to_string()))
+        );
+        // Still reporting its key: nothing moved, whatever else is below it.
+        let live = vec![reporting(30, "nested"), reporting(20, "old")];
+        assert_eq!(moved_session_id(&live, "old", 10, &view, None), None);
+        // An unrelated claude is not under the pane at all.
+        let live = vec![reporting(99, "elsewhere")];
+        assert_eq!(moved_session_id(&live, "old", 10, &view, None), None);
+    }
+
+    #[test]
+    fn a_live_file_left_by_a_dead_process_is_not_a_report() {
+        // The pane's claude (pid 20) reports nothing readable this tick; the file a
+        // finished `claude -p` (pid 30, below it) left behind is all there is.
+        let tree = Tree(vec![(20, 10), (30, 20)]);
+        let live = vec![reporting(30, "nested")];
+        let pid30_gone = ProcessView {
+            probe: &tree,
+            alive: &|pid| pid != 30,
+        };
+        let all_alive = ProcessView {
+            probe: &tree,
+            alive: &|_| true,
+        };
+
+        assert_eq!(moved_session_id(&live, "old", 10, &pid30_gone, None), None);
+        assert_eq!(
+            moved_session_id(&live, "old", 10, &all_alive, None),
+            Some((30, "nested".to_string())),
+            "the same file from a live process is a report"
+        );
+    }
+
+    #[test]
+    fn a_dead_file_still_naming_the_panes_own_id_does_not_hide_a_move() {
+        // The pane's own file (pid 15, gone) still says `old`; the live process
+        // under the pane (pid 20) has cleared to `new`. Counting the dead file as
+        // the pane still reporting its key would hold the move back for as long as
+        // the leftover lay there.
+        let tree = Tree(vec![(15, 10), (20, 10)]);
+        let live = vec![reporting(15, "old"), reporting(20, "new")];
+        let view = ProcessView {
+            probe: &tree,
+            alive: &|pid| pid != 15,
+        };
+
+        assert_eq!(
+            moved_session_id(&live, "old", 10, &view, None),
+            Some((20, "new".to_string()))
+        );
+        let all_alive = ProcessView {
+            probe: &tree,
+            alive: &|_| true,
+        };
+        assert_eq!(
+            moved_session_id(&live, "old", 10, &all_alive, None),
+            None,
+            "a live process still on its key means nothing moved"
+        );
+    }
+
+    #[test]
+    fn a_named_entry_is_trusted_without_walking_while_it_is_alive_and_says_the_same() {
+        // `Tree` knows no parents, so a walk finds nothing: only the carried entry
+        // can answer, and it must not once the process is gone or has moved again.
+        let tree = Tree(Vec::new());
+        let live = vec![reporting(20, "cleared")];
+        let held = Some((20, "cleared"));
+        let alive = ProcessView {
+            probe: &tree,
+            alive: &|_| true,
+        };
+        let gone = ProcessView {
+            probe: &tree,
+            alive: &|_| false,
+        };
+
+        assert_eq!(
+            moved_session_id(&live, "old", 10, &alive, held),
+            Some((20, "cleared".to_string()))
+        );
+        assert_eq!(
+            moved_session_id(&live, "old", 10, &gone, held),
+            None,
+            "the process is gone"
+        );
+        let moved_again = vec![reporting(20, "third")];
+        assert_eq!(
+            moved_session_id(&moved_again, "old", 10, &alive, held),
+            None,
+            "it reports another id now, which the walk (finding no ancestry here) cannot place"
+        );
+    }
+
+    #[test]
+    fn a_pane_with_no_live_file_walks_each_pid_once_however_many_entries_ask() {
+        // Panes without a file of their own never stop at the steady-state check:
+        // every entry's chain is walked for each of them.
+        struct Counting(RefCell<HashMap<u32, u32>>);
+        impl ProcessProbe for Counting {
+            fn is_alive(&self, _pid: u32) -> bool {
+                true
+            }
+            fn parent_pid(&self, pid: u32) -> Option<u32> {
+                *self.0.borrow_mut().entry(pid).or_insert(0) += 1;
+                Some(pid + 1)
+            }
+            fn is_alive_matching(&self, _pid: u32, _proc_start: &str) -> bool {
+                true
+            }
+        }
+        let counting = Counting(RefCell::new(HashMap::new()));
+        let cached = CachedParents {
+            inner: &counting,
+            parents: RefCell::new(HashMap::new()),
+        };
+        let view = ProcessView {
+            probe: &cached,
+            alive: &|_| true,
+        };
+        let live = vec![reporting(100, "a"), reporting(101, "b")];
+
+        for pane in [1, 2, 3] {
+            moved_session_id(&live, "none", pane, &view, None);
+        }
+
+        assert!(
+            counting.0.borrow().values().all(|asked| *asked == 1),
+            "{:?}",
+            counting.0.borrow()
+        );
     }
 
     // --- relay observations: gather_relay_observations ---------------------
@@ -12071,7 +13063,6 @@ mod tests {
                 .unwrap();
             id
         };
-        let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
         let input_reader = MockInputReader::default();
@@ -12093,7 +13084,6 @@ mod tests {
             codex_home: None,
             thresholds: &thresholds,
             store: &store,
-            superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
             input_reader: &input_reader,
@@ -12151,7 +13141,6 @@ mod tests {
                 .unwrap();
             id
         };
-        let superseded_failed = RefCell::new(HashSet::new());
         let meta_cache = MetaCache::new();
         let pty_host = MockPtyHost::default();
         let input_reader = MockInputReader::default();
@@ -12174,7 +13163,6 @@ mod tests {
             codex_home: None,
             thresholds: &thresholds,
             store: &store,
-            superseded_failed: &superseded_failed,
             meta_cache: &meta_cache,
             pty_host: &pty_host,
             input_reader: &input_reader,
@@ -13364,7 +14352,6 @@ mod tests {
     /// it alone would borrow locals that die at the end of the helper.
     struct SpawnFixture {
         store: RefCell<Store>,
-        superseded_failed: RefCell<HashSet<SessionId>>,
         meta_cache: MetaCache,
         pty_host: MockPtyHost,
         input_reader: MockInputReader,
@@ -13379,7 +14366,6 @@ mod tests {
         fn new(claude_home: PathBuf) -> Self {
             Self {
                 store: RefCell::new(Store::open_in_memory().unwrap()),
-                superseded_failed: RefCell::new(HashSet::new()),
                 meta_cache: MetaCache::new(),
                 pty_host: MockPtyHost::default(),
                 input_reader: MockInputReader::default(),
@@ -13397,7 +14383,6 @@ mod tests {
                 codex_home: None,
                 thresholds: &self.thresholds,
                 store: &self.store,
-                superseded_failed: &self.superseded_failed,
                 meta_cache: &self.meta_cache,
                 pty_host: &self.pty_host,
                 input_reader: &self.input_reader,
