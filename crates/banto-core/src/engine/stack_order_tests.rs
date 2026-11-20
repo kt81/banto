@@ -195,6 +195,7 @@ impl Scene {
                     agent: None,
                     live: None,
                     glance: None,
+                    briefed_since_launch: None,
                 })
             })
             .collect();

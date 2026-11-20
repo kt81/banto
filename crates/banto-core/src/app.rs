@@ -145,7 +145,7 @@ pub enum Modal {
     /// two is in [`WorkerAgentPickerState::purpose`], and the dialog says so.
     WorkerAgentPicker(WorkerAgentPickerState),
     /// Shown instead of forming a brigade (or the `Select` picker above)
-    /// when the brigade's resolved Worker product is Codex and banto's
+    /// when the brigade's Director or resolved Worker product is Codex and banto's
     /// `SessionStart` hook doesn't look trusted yet — Enter opens a solo
     /// pane running Codex's own trust-review startup
     /// (`Cmd::OpenCodexTrustPane`), Esc cancels. Either way, forming the

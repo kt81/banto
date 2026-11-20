@@ -11,7 +11,7 @@
 //! pane quickly leaves that member silently briefing-less — worse, that
 //! choice doesn't persist, so the same pane asks again next launch too.
 //! `Modal::ConfirmCodexTrust` (opened by `banto_core::engine` the moment a
-//! brigade formation resolves to a Codex Worker and the hook doesn't look
+//! brigade formation has a Codex Director or Worker and the hook doesn't look
 //! trusted — see `update_codex_trust_checked`'s doc) moves the one approval
 //! this needs to a deliberate moment before formation, so every later
 //! brigade launch finds it already trusted. This used to be a standalone

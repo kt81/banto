@@ -607,6 +607,14 @@ pub struct RelayObservation {
     /// absence included: it is what the tick observed and nothing older.
     #[serde(default)]
     pub live: Option<LiveStatus>,
+    /// Whether the briefing the member's row records was recorded at or after
+    /// the moment this pane's process was spawned: `Some(false)` when the row has
+    /// none at all or an older one, `None` when the shell could not tell (not a
+    /// Codex member, no pane handle, a roster that named no such member), which
+    /// reads as "do not say anything". Only a Codex member is briefed by a hook
+    /// that records itself in the row, so only its absence means anything.
+    #[serde(default)]
+    pub briefed_since_launch: Option<bool>,
 }
 
 /// What a Claude member's live file said this tick, classified as the session
@@ -1041,8 +1049,9 @@ struct PendingWorkerAddition {
 
 /// A brigade formation waiting on a fresh `Cmd::CheckCodexTrust` round trip
 /// before `StoreIntent::FormBrigade` is issued — everything `FormBrigade`
-/// needs, stashed the moment the resolved Worker product turns out to be
-/// [`AgentKind::Codex`] (`update_membership_resolved`'s non-`Select` branch,
+/// needs, stashed the moment the Director's product or the resolved Worker
+/// product turns out to be [`AgentKind::Codex`] ([`forms_a_codex_member`];
+/// `update_membership_resolved`'s non-`Select` branch,
 /// or [`confirm_worker_agent_modal`] once `Select`'s own picker resolves).
 /// Unlike [`PendingBrigadeFormation`], `worker_agent`/`worker_model` are
 /// already known by the time this exists — the whole point of this stash is
@@ -1322,6 +1331,16 @@ pub struct EmporiumState {
     /// than checking membership first. Dropped when its pane unstages, same
     /// as [`Self::last_forwarded_input`].
     last_output_at: HashMap<SessionKey, Instant>,
+    /// Panes whose own OSC 7501 report has shown `done` or `error` since this
+    /// process started: proof that a turn ran in them. Latched, because a sticky
+    /// report must not have to be caught on one particular tick, and never
+    /// `working`, which also blips at start-up and at `/new`, `/clear` and
+    /// `/resume`. Cleared when the pane spawns, so a relaunch starts without it.
+    /// Read only by the unbriefed-member notice ([`say_unbriefed_codex_members`]).
+    codex_turn_ran: HashSet<SessionKey>,
+    /// Panes the unbriefed-member notice has already been said for, so it is
+    /// said once per launch. Cleared with [`Self::codex_turn_ran`].
+    unbriefed_told: HashSet<SessionKey>,
     pending_kickoffs: Vec<PendingKickoff>,
     /// The Goinkyo analog of [`Self::pending_kickoffs`] — see
     /// [`PendingGoinkyoKickoff`]'s own doc for why it's a separate list
@@ -1698,6 +1717,8 @@ impl EmporiumState {
             unreadable_since: HashMap::new(),
             unreadable_noticed: HashSet::new(),
             last_output_at: HashMap::new(),
+            codex_turn_ran: HashSet::new(),
+            unbriefed_told: HashSet::new(),
             pending_kickoffs: Vec::new(),
             pending_goinkyo_kickoffs: Vec::new(),
             pending_submits: Vec::new(),
@@ -1833,6 +1854,12 @@ impl EmporiumState {
         if let Some(value) = self.last_output_at.remove(old_key) {
             self.last_output_at.insert(new_key.clone(), value);
         }
+        if self.codex_turn_ran.remove(old_key) {
+            self.codex_turn_ran.insert(new_key.clone());
+        }
+        if self.unbriefed_told.remove(old_key) {
+            self.unbriefed_told.insert(new_key.clone());
+        }
         if let Some(value) = self.pending_opens.remove(old_key) {
             self.pending_opens.insert(new_key.clone(), value);
         }
@@ -1935,6 +1962,8 @@ impl EmporiumState {
         self.process_started.remove(key);
         self.unsent_operator_input.remove(key);
         self.last_output_at.remove(key);
+        self.codex_turn_ran.remove(key);
+        self.unbriefed_told.remove(key);
         self.latched_attention_panes.remove(key);
         self.pending_kickoffs.retain(|pending| &pending.key != key);
         self.pending_goinkyo_kickoffs
@@ -3732,8 +3761,8 @@ pub enum Cmd {
     /// Read whether banto's own `SessionStart` hook looks trusted right now
     /// (fresh, not cached — the operator may have approved it in a pane
     /// since this run started) and whether `std::env::current_exe()` can
-    /// even launch it at all. Issued only when a brigade formation's already-
-    /// resolved Worker product is [`AgentKind::Codex`] — see
+    /// even launch it at all. Issued only when a brigade formation's Director
+    /// or already-resolved Worker product is [`AgentKind::Codex`] — see
     /// `update_membership_resolved`/`confirm_worker_agent_modal`, which stash
     /// a [`PendingCodexTrustFormation`] alongside it. The shell answers with
     /// `Event::CodexTrustChecked`.
@@ -6222,9 +6251,10 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
 /// shouldn't happen structurally, but doing nothing is the only safe
 /// fallback if it ever does, not guessing at a product.
 ///
-/// Formation alone routes a Codex choice through a trust check first
+/// Formation alone routes a Codex member through a trust check first
 /// (`update_codex_trust_checked`) before `FormBrigade`, same as its own
-/// non-`Select` path. `add_worker`'s non-`Select` path has never done this
+/// non-`Select` path — a Codex Worker chosen here, or a Codex Director whatever
+/// Workers were chosen ([`forms_a_codex_member`]). `add_worker`'s non-`Select` path has never done this
 /// (see [`PendingWorkerAddition`]'s own doc for why `Select` doesn't gain
 /// it here either) — adding one more Worker to an already-running brigade
 /// is the lower-stakes case, and by the time one exists to add to, any
@@ -6271,7 +6301,7 @@ fn confirm_worker_agent_modal(state: &mut EmporiumState, app: &mut App) -> Vec<C
         return Vec::new();
     }
     state.last_worker_agent = Some(worker_agent);
-    if worker_agent == AgentKind::Codex {
+    if forms_a_codex_member(formation.director_agent, worker_agent) {
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
             director_row_id: formation.director_row_id,
             director_agent: formation.director_agent,
@@ -6626,15 +6656,25 @@ fn update_membership_resolved(
     }
 }
 
+/// Whether a brigade formed from this Director and these Workers will hold a
+/// Codex member, and so needs banto's hook trusted before it forms. The
+/// Director is briefed by the same hook as a Worker, so a Codex Director with
+/// Claude Workers needs the review as much as the reverse; checking only the
+/// Workers' product let such a brigade form with its Director silently
+/// unbriefed.
+fn forms_a_codex_member(director: AgentKind, workers: AgentKind) -> bool {
+    director == AgentKind::Codex || workers == AgentKind::Codex
+}
+
 /// The formation decision proper, once nothing needs to reopen first (see
 /// `update_membership_resolved`'s `None` branch, and `update_pty_exited` for
 /// the resumed-after-reopen path): `Select` interrupts with a picker instead
 /// of issuing `FormBrigade` right away — the operator has to choose a
 /// product (and, given the product, a model) before there's anything to
 /// form, see `confirm_worker_agent_modal` for the other half of that round
-/// trip. Otherwise the Worker product resolves immediately, and — if it's
-/// Codex — routes through a trust check first, same reasoning, see
-/// `update_codex_trust_checked`.
+/// trip. Otherwise the Worker product resolves immediately, and — if either it
+/// or the Director's is Codex ([`forms_a_codex_member`]) — routes through a
+/// trust check first, same reasoning, see `update_codex_trust_checked`.
 fn begin_brigade_formation(
     state: &mut EmporiumState,
     app: &mut App,
@@ -6670,7 +6710,7 @@ fn begin_brigade_formation(
         .worker_effort_for(worker_agent)
         .unwrap_or("")
         .to_string();
-    if worker_agent == AgentKind::Codex {
+    if forms_a_codex_member(row.agent, worker_agent) {
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
             director_row_id: row.id.clone(),
             director_agent: row.agent,
@@ -8283,6 +8323,10 @@ fn update_spawned(
     state.last_given_input.remove(&key);
     state.last_prompted.remove(&key);
     state.process_started.insert(key.clone(), now);
+    // A turn the previous process ran is not one this process ran, and what was
+    // said about that process is not said about this one.
+    state.codex_turn_ran.remove(&key);
+    state.unbriefed_told.remove(&key);
     state.screens.insert(
         key.clone(),
         crate::screen::Screen::new(crate::screen::SPAWN_ROWS, crate::screen::SPAWN_COLS),
@@ -10027,7 +10071,13 @@ fn update_tick(
         if let Some(pending) = state.pending_kickoffs.iter_mut().find(|p| p.key == key) {
             pending.stuck = true;
         }
-        notify_kickoff_turn_unidentified(state, app, &key, "was not identified", now);
+        notify_kickoff_turn_unidentified(
+            state,
+            app,
+            &key,
+            "was not identified: banto's hook did not run, most likely because Codex does not trust it",
+            now,
+        );
     }
 
     // Goinkyo kickoff: the same shape, once its own quiet period elapses — see
@@ -10163,6 +10213,10 @@ fn update_tick(
             now,
         );
     }
+
+    // Before the relay below consumes the observations: a notice about a member
+    // that was never briefed does not depend on the relay being on.
+    say_unbriefed_codex_members(state, app, &relay, now);
 
     // Members whose nudge only an unsent draft is holding back.
     let mut held_by_draft: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
@@ -10484,6 +10538,81 @@ fn update_tick(
     ));
 
     cmds
+}
+
+/// Say, once per launch, that a hosted Codex member ran a turn and was never
+/// briefed.
+///
+/// A Codex member is briefed by banto's own `SessionStart` hook, which Codex
+/// runs only if it trusts the hook, and which fires at the member's first typed
+/// turn rather than at launch (`docs/REQUIREMENTS.md`, "Delivered once, not on
+/// every resume"). A hook Codex does not run fails without a word anywhere, and
+/// trust can be lost without the operator doing anything: it is keyed by the
+/// executable's path, and banto can run from two. So the one place the failure
+/// shows is the row the hook would have written: a briefing recorded no later
+/// than the launch ([`RelayObservation::briefed_since_launch`]) once a turn is
+/// known to have run.
+///
+/// A turn is known by the pane's own report, latched in
+/// [`EmporiumState::codex_turn_ran`]. An interrupted turn can end in neither
+/// `done` nor `error`, so the notice may come late, never early. It is decided
+/// from a latch an earlier tick set: the tick that sees `done` has a roster read
+/// that may be older than the hook's write, and a turn short enough to end in
+/// the same second the hook ran would otherwise be called unbriefed.
+///
+/// Said only when the status line is free, and marked said only then, so a busy
+/// line delays it instead of losing it. Every member that qualifies in the tick
+/// is named in the one message.
+fn say_unbriefed_codex_members(
+    state: &mut EmporiumState,
+    app: &App,
+    relay: &[RelayObservation],
+    now: Instant,
+) {
+    let mut latch = Vec::new();
+    let mut unbriefed: Vec<(SessionKey, Option<BrigadeId>, MemberToken)> = Vec::new();
+    for observation in relay {
+        if observation.agent != Some(AgentKind::Codex) {
+            continue;
+        }
+        let Some(screen) = state.screens.get(&observation.key) else {
+            continue;
+        };
+        if matches!(
+            screen.reported_state(),
+            Some(ReportedState::Done | ReportedState::Error)
+        ) {
+            latch.push(observation.key.clone());
+        }
+        if state.codex_turn_ran.contains(&observation.key)
+            && observation.briefed_since_launch == Some(false)
+            && !state.unbriefed_told.contains(&observation.key)
+        {
+            unbriefed.push((
+                observation.key.clone(),
+                Some(observation.brigade_id),
+                observation.token.clone(),
+            ));
+        }
+    }
+    state.codex_turn_ran.extend(latch);
+    if unbriefed.is_empty() || state.status.is_some() {
+        return;
+    }
+    let members: Vec<(Option<BrigadeId>, MemberToken)> = unbriefed
+        .iter()
+        .map(|(_, brigade_id, token)| (*brigade_id, token.clone()))
+        .collect();
+    let phrase = state.members_phrase(app, &members);
+    state
+        .unbriefed_told
+        .extend(unbriefed.into_iter().map(|(key, ..)| key));
+    state.set_status(
+        format!(
+            "codex: no briefing reached {phrase} — banto's hook did not run, most likely because Codex does not trust it (Codex trusts one banto.exe path at a time)"
+        ),
+        now,
+    );
 }
 
 /// Answers `Event::GoinkyoAwaitingSpawn`: spawn the Goinkyo `observation`
@@ -10971,8 +11100,10 @@ fn notify_kickoff_unanswered(state: &mut EmporiumState, app: &App, key: &Session
 
 /// Tell the operator, once, that a member took its first turn but its session
 /// was not found in time: `missing` finishes "took its first turn but …" (a
-/// Codex Worker "was not identified", a Goinkyo "its session shows no first message").
-/// banto does not type the line again: the turn already ran.
+/// Codex Worker "was not identified" and says why, a Goinkyo "its session shows no
+/// first message"). banto does not type the line again: the turn already ran. A
+/// Codex Worker's only discovery source is banto's own hook, so unidentified after
+/// a turn means the hook did not run.
 fn notify_kickoff_turn_unidentified(
     state: &mut EmporiumState,
     app: &App,
@@ -13757,6 +13888,98 @@ mod tests {
         assert!(state.pending_codex_trust_formation.is_some());
     }
 
+    /// `B` on `director`, resolved as a brigade formation under `worker_agent`.
+    fn press_brigade_key(director: SessionRow, worker_agent: WorkerAgentSetting) -> Vec<Cmd> {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let id = director.id.clone();
+        let mut app = app_with(vec![director]);
+        let brigade = BrigadeConfig {
+            worker_agent,
+            ..BrigadeConfig::default()
+        };
+        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::MembershipResolved {
+                session_id: id,
+                membership: None,
+                members: None,
+                layout: None,
+                names: Vec::new(),
+            },
+            test_instant(),
+        )
+    }
+
+    fn codex_row(id: &str) -> SessionRow {
+        SessionRow {
+            agent: AgentKind::Codex,
+            ..row(id)
+        }
+    }
+
+    #[test]
+    fn a_codex_director_with_claude_workers_goes_through_the_trust_check() {
+        // The Director is briefed by the same hook as a Worker, so the review is
+        // owed whatever the Workers run as.
+        let cmds = press_brigade_key(codex_row("dir"), WorkerAgentSetting::Claude);
+        assert_eq!(cmds, vec![Cmd::CheckCodexTrust]);
+    }
+
+    #[test]
+    fn a_claude_only_brigade_forms_without_the_trust_check() {
+        let cmds = press_brigade_key(row("dir"), WorkerAgentSetting::Claude);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Store(StoreIntent::FormBrigade {
+                    director_agent: AgentKind::ClaudeCode,
+                    worker_agent: AgentKind::ClaudeCode,
+                    ..
+                })]
+            ),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_claude_director_with_codex_workers_still_goes_through_the_trust_check() {
+        let cmds = press_brigade_key(row("dir"), WorkerAgentSetting::Codex);
+        assert_eq!(cmds, vec![Cmd::CheckCodexTrust]);
+    }
+
+    #[test]
+    fn the_pickers_claude_pick_still_checks_trust_for_a_codex_director() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        state.pending_brigade_formation = Some(PendingBrigadeFormation {
+            director_row_id: "dir".to_string(),
+            director_agent: AgentKind::Codex,
+            name: "cell".to_string(),
+            cwd: PathBuf::from("/work"),
+            worker_count: 2,
+        });
+        app.open_worker_agent_modal(
+            WorkerPickerFor::FormBrigade,
+            AgentKind::ClaudeCode,
+            WorkerDefaults {
+                claude_model: "sonnet".to_string(),
+                claude_effort: "high".to_string(),
+                codex_model: "gpt-5.6-terra".to_string(),
+                codex_effort: "high".to_string(),
+            },
+        );
+
+        let cmds = confirm_worker_agent_modal(&mut state, &mut app);
+
+        assert_eq!(cmds, vec![Cmd::CheckCodexTrust]);
+        let stashed = state.pending_codex_trust_formation.as_ref().unwrap();
+        assert_eq!(stashed.director_agent, AgentKind::Codex);
+        assert_eq!(stashed.worker_agent, AgentKind::ClaudeCode);
+    }
+
     #[test]
     fn brigade_key_opens_the_worker_agent_modal_when_select_is_configured() {
         let mut state = EmporiumState::new(PrefixKey::default());
@@ -15149,6 +15372,7 @@ mod tests {
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
+            briefed_since_launch: None,
         };
         // Isolates the WritePty cmds from any incidental ResizePty (the
         // fresh 24x80 `Screen`s almost certainly don't match the pane
@@ -15257,6 +15481,7 @@ mod tests {
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
+            briefed_since_launch: None,
         };
         let now = test_instant();
 
@@ -15407,8 +15632,7 @@ mod tests {
     const NOTICE_NOT_AT_PROMPT: &str =
         "not at its prompt — answer what the pane shows, or type its first line yourself";
     const NOTICE_UNANSWERED: &str = "its first line got no answer and it is not at its prompt — answer what the pane shows, or type its first line yourself";
-    const NOTICE_CODEX_UNIDENTIFIED: &str =
-        "took its first turn but was not identified — banto will not type it again";
+    const NOTICE_CODEX_UNIDENTIFIED: &str = "took its first turn but was not identified: banto's hook did not run, most likely because Codex does not trust it — banto will not type it again";
     const NOTICE_GOINKYO_NO_ROW: &str =
         "took its first turn but its session shows no first message — banto will not type it again";
 
@@ -15997,6 +16221,7 @@ mod tests {
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
+            briefed_since_launch: None,
         };
         now += Duration::from_millis(10);
         update(
@@ -16056,6 +16281,7 @@ mod tests {
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
+            briefed_since_launch: None,
         };
         now += Duration::from_millis(10);
         update(
@@ -16132,6 +16358,7 @@ mod tests {
                         has_unseen: true,
                         is_idle_this_tick: Some(true),
                         agent: None,
+                        briefed_since_launch: None,
                     }],
                     brigades: Vec::new(),
                 },
@@ -16574,6 +16801,7 @@ mod tests {
                     has_unseen,
                     is_idle_this_tick: Some(true),
                     agent: None,
+                    briefed_since_launch: None,
                 }],
                 brigades: Vec::new(),
             },
@@ -16943,6 +17171,7 @@ mod tests {
                     has_unseen: seen.has_unseen,
                     is_idle_this_tick: seen.idle,
                     agent: seen.agent,
+                    briefed_since_launch: None,
                 }],
                 brigades: Vec::new(),
             },
@@ -18002,6 +18231,7 @@ mod tests {
             has_unseen: false,
             is_idle_this_tick: idle,
             agent: Some(AgentKind::ClaudeCode),
+            briefed_since_launch: None,
         }
     }
 
@@ -18626,6 +18856,258 @@ mod tests {
              \x1b]7501;state=idle:app=codex\x07"
         );
         screen.process(bytes.as_bytes());
+    }
+
+    // --- a Codex member that ran a turn and was never briefed -----------------
+
+    /// The whole notice for `worker-1` of a brigade the app holds no title for,
+    /// written out rather than built from the source's pieces.
+    const NOTICE_UNBRIEFED: &str = "codex: no briefing reached worker-1 of brigade 1 — banto's hook did not run, most likely because Codex does not trust it (Codex trusts one banto.exe path at a time)";
+
+    /// A hosted Codex pane, spawned and answered for by `Event::Spawned` the way
+    /// the shell does, with the screen blank.
+    fn unbriefed_fixture() -> (EmporiumState, App, BrigadeConfig, SessionKey) {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let brigade = brigade_config();
+        let key = SessionKey::from_id("codex-1");
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: key.clone(),
+                agent: Some(AgentKind::Codex),
+            },
+            test_instant(),
+        );
+        (state, app, brigade, key)
+    }
+
+    fn briefed_observation(
+        key: &SessionKey,
+        agent: AgentKind,
+        briefed_since_launch: Option<bool>,
+    ) -> RelayObservation {
+        RelayObservation {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            key: key.clone(),
+            has_unseen: false,
+            is_idle_this_tick: None,
+            agent: Some(agent),
+            glance: None,
+            live: None,
+            briefed_since_launch,
+        }
+    }
+
+    /// One tick at `second` seconds past the fixture's start that observed
+    /// `key`'s Codex member with `briefed_since_launch`.
+    fn unbriefed_tick(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        key: &SessionKey,
+        briefed_since_launch: Option<bool>,
+        second: u64,
+    ) {
+        let relay = vec![briefed_observation(
+            key,
+            AgentKind::Codex,
+            briefed_since_launch,
+        )];
+        update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay,
+                brigades: Vec::new(),
+            },
+            test_instant() + Duration::from_secs(second),
+        );
+    }
+
+    #[test]
+    fn a_codex_member_that_finished_a_turn_unbriefed_is_told_once() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+
+        // The tick that sees the turn has ended only latches it: its roster may
+        // be older than the hook's write.
+        unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), 0);
+        assert_eq!(state.status, None);
+
+        unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), 1);
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+
+        // Said once per launch: the line cleared, the same facts again say nothing.
+        state.status = None;
+        for second in 2..6 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn a_codex_member_that_errored_unbriefed_is_told() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "error");
+        for second in 0..2 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+    }
+
+    #[test]
+    fn a_codex_member_briefed_since_its_launch_is_never_told() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        for second in 0..4 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(true), second);
+        }
+        assert_eq!(state.status, None);
+    }
+
+    #[test]
+    fn working_alone_does_not_prove_a_turn_ran() {
+        // `working` blips at start-up and at /new, /clear and /resume.
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "working");
+        for second in 0..4 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status, None);
+        report_codex_state(&mut state, &key, "idle");
+        for second in 4..8 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status, None, "idle after working is still no turn");
+    }
+
+    #[test]
+    fn a_turn_seen_on_one_tick_still_counts_after_the_report_moves_on() {
+        // The latch is the point: a sticky report need not be caught on the tick
+        // the notice is decided.
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), 0);
+        report_codex_state(&mut state, &key, "working");
+        unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), 1);
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+    }
+
+    #[test]
+    fn nothing_is_said_when_the_shell_could_not_tell_or_the_member_is_not_codex() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        for second in 0..3 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, None, second);
+        }
+        assert_eq!(state.status, None, "`None` is not `Some(false)`");
+
+        for second in 3..6 {
+            update(
+                &mut state,
+                &mut app,
+                &brigade,
+                Event::Tick {
+                    relay: vec![briefed_observation(
+                        &key,
+                        AgentKind::ClaudeCode,
+                        Some(false),
+                    )],
+                    brigades: Vec::new(),
+                },
+                test_instant() + Duration::from_secs(second),
+            );
+        }
+        assert_eq!(
+            state.status, None,
+            "only a Codex member is briefed by a hook"
+        );
+    }
+
+    #[test]
+    fn a_relaunch_gets_a_fresh_latch_and_is_told_again() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        for second in 0..2 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+        state.status = None;
+
+        // The pane's process is spawned again under the same key.
+        update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: key.clone(),
+                agent: Some(AgentKind::Codex),
+            },
+            test_instant() + Duration::from_secs(10),
+        );
+        for second in 10..14 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(
+            state.status, None,
+            "the earlier process's turn does not count for this one"
+        );
+
+        report_codex_state(&mut state, &key, "done");
+        for second in 14..16 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+    }
+
+    #[test]
+    fn a_busy_status_line_delays_the_notice_instead_of_losing_it() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        state.status = Some("something else".to_string());
+        for second in 0..3 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status.as_deref(), Some("something else"));
+
+        state.status = None;
+        unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), 3);
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+    }
+
+    #[test]
+    fn the_latch_follows_its_pane_to_a_new_key() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), 0);
+
+        let moved = SessionKey::from_id("codex-2");
+        state.rekey_pane_state(&key, &moved);
+        unbriefed_tick(&mut state, &mut app, &brigade, &moved, Some(false), 1);
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+    }
+
+    #[test]
+    fn the_told_mark_follows_its_pane_to_a_new_key() {
+        let (mut state, mut app, brigade, key) = unbriefed_fixture();
+        report_codex_state(&mut state, &key, "done");
+        for second in 0..2 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &key, Some(false), second);
+        }
+        assert_eq!(state.status.as_deref(), Some(NOTICE_UNBRIEFED));
+        state.status = None;
+
+        let moved = SessionKey::from_id("codex-2");
+        state.rekey_pane_state(&key, &moved);
+        for second in 2..6 {
+            unbriefed_tick(&mut state, &mut app, &brigade, &moved, Some(false), second);
+        }
+        assert_eq!(state.status, None, "the same launch is not told twice");
     }
 
     #[test]
@@ -23148,6 +23630,7 @@ mod tests {
                         agent: CLAUDE,
                         live: None,
                         glance: Some(said_by(Some("worker-3"), "stage 2 is done")),
+                        briefed_since_launch: None,
                     }],
                     // The roster's names, as the gather sends them: the sender's,
                     // and the nudged member's (a stand-in for a Worker: the core
@@ -23477,6 +23960,7 @@ mod tests {
                     has_unseen: true,
                     is_idle_this_tick: Some(true),
                     agent: CLAUDE,
+                    briefed_since_launch: None,
                 }],
                 brigades: Vec::new(),
             },
@@ -23684,6 +24168,7 @@ mod tests {
                     has_unseen: true,
                     is_idle_this_tick: Some(true),
                     agent: None,
+                    briefed_since_launch: None,
                 })
                 .collect();
             (obs, now + at)
@@ -23984,6 +24469,7 @@ mod tests {
             agent,
             live: None,
             glance,
+            briefed_since_launch: None,
         }
     }
 
@@ -26005,6 +26491,7 @@ mod tests {
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
+            briefed_since_launch: None,
         };
 
         update(

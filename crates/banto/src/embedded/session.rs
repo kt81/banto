@@ -45,6 +45,10 @@ pub(crate) fn disconnect_event(key: SessionKey, reason: Option<PtyExitReason>) -
 /// `engine::SessionKey` — never touched from `update`.
 pub(crate) struct PtyHandle {
     io: PtyIo,
+    /// Read just before the host was asked to start the child, so nothing the
+    /// child writes can be dated earlier than it. Moves with the handle when its
+    /// pane is rekeyed, and is why a relaunch has a later one.
+    spawned_at: std::time::SystemTime,
     /// A confirmed exit is shared by `poll`, `exit_reason`, and `has_exited`
     /// after any one of them consumes it. `Unknown` is not an exit.
     exit_reason: Option<PtyExitReason>,
@@ -74,8 +78,10 @@ impl PtyHandle {
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
+        let spawned_at = std::time::SystemTime::now();
         Ok(Self {
             io: host.open(argv, cwd, env, env_remove, rows, cols)?,
+            spawned_at,
             exit_reason: None,
             output_lost_since: None,
             output_loss_reported: false,
@@ -134,6 +140,12 @@ impl PtyHandle {
         }
         self.latch_exit();
         PtyPoll::Empty
+    }
+
+    /// When this process was spawned, on the wall clock — the clock the store's
+    /// `briefed_at` is on.
+    pub(crate) fn spawned_at(&self) -> std::time::SystemTime {
+        self.spawned_at
     }
 
     pub(crate) fn awaiting_exit_after_output_loss(&self) -> bool {

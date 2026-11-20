@@ -381,7 +381,7 @@ fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
 }
 
 /// Render the emporium's Codex-hook-trust confirm dialog — shown instead of
-/// forming a brigade whose resolved Worker product is Codex, when banto's
+/// forming a brigade whose Director or resolved Worker product is Codex, when banto's
 /// `SessionStart` hook doesn't look trusted yet. Static text throughout: the
 /// modal carries no data of its own (see `Modal::ConfirmCodexTrust`'s doc).
 fn render_confirm_codex_trust_modal(frame: &mut Frame, area: Rect) {

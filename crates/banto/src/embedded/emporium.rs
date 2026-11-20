@@ -825,7 +825,7 @@ fn event_loop(
                 },
                 Some(&mut tick_timings),
             ));
-            let relay = gather_relay_observations_from(
+            let mut relay = gather_relay_observations_from(
                 &tick_read,
                 &state,
                 deps.store,
@@ -834,6 +834,7 @@ fn event_loop(
                 Some(&mut tick_timings),
                 &mut glance_gate,
             );
+            note_briefed_since_launch(&mut relay, &tick_read, &handles);
             let brigades = std::mem::take(&mut glance_gate.brigades);
             // Ahead of the tick: the core decides the brigade-quiet bell on
             // the sample, but only in the tick that follows it (the same
@@ -1359,8 +1360,8 @@ fn hook_launchable(exe: &crate::exe::BantoExe) -> bool {
 /// since this run started — and whether it could even fire from this
 /// executable's path. `deps.codex_home` absent (Codex unresolved) reads as
 /// unprimed: `Cmd::CheckCodexTrust` is only ever issued once a brigade
-/// formation already resolved to a Codex Worker, so "can't tell" must not
-/// read as "trusted".
+/// formation already resolved to a Codex Director or Codex Workers, so
+/// "can't tell" must not read as "trusted".
 fn execute_check_codex_trust(deps: &Deps) -> Vec<Event> {
     let primed = deps.codex_home.is_some_and(|home| {
         banto_io::codex_trust::hook_trust_state(home)
@@ -2188,6 +2189,51 @@ fn codex_briefed_session_id(
         .map(|session_id| session_id.0)
 }
 
+/// Whether `token`'s row records a briefing made at or after `spawned_at`, the
+/// moment its pane's process was spawned; `None` when `members` does not hold
+/// the token. A row with no `briefed_at` is not briefed: the column is only
+/// ever written by the hook, and nothing clears it, so an older value is a
+/// previous process's. The same comparison as [`codex_briefed_session_id`].
+fn briefed_since_launch(
+    members: &[BrigadeMember],
+    token: &str,
+    spawned_at: SystemTime,
+) -> Option<bool> {
+    let member = members.iter().find(|member| member.token == token)?;
+    Some(member.briefed_at.is_some_and(|at| at >= spawned_at))
+}
+
+/// Fill [`RelayObservation::briefed_since_launch`] for every Codex member this
+/// tick observed, from the roster the tick already read and the moment each
+/// pane's process was spawned. Left `None` where either is missing — a roster
+/// that could not be read, a member with no hosted process — which the core
+/// reads as having nothing to say. Not done in the gather itself, which is
+/// handed no pane handles.
+fn note_briefed_since_launch(
+    relay: &mut [RelayObservation],
+    read: &TickRead,
+    handles: &HashMap<SessionKey, PtyHandle>,
+) {
+    let Some(roster) = read.brigades.as_deref() else {
+        return;
+    };
+    for observation in relay {
+        if observation.agent != Some(AgentKind::Codex) {
+            continue;
+        }
+        let (Some(handle), Some((_, Some(members)))) = (
+            handles.get(&observation.key),
+            roster
+                .iter()
+                .find(|(brigade, _)| brigade.id == observation.brigade_id),
+        ) else {
+            continue;
+        };
+        observation.briefed_since_launch =
+            briefed_since_launch(members, &observation.token, handle.spawned_at());
+    }
+}
+
 /// Poll every pending discovery tracker for the id its child was assigned.
 ///
 /// Three sources, tried in that order — the first two Claude-only, mirrored
@@ -2573,6 +2619,7 @@ fn gather_relay_observations_from(
                 agent,
                 live: live_status,
                 glance,
+                briefed_since_launch: None,
             });
         }
     }
@@ -6984,6 +7031,7 @@ mod tests {
                     agent: Some(AgentKind::Codex),
                     live: None,
                     glance: None,
+                    briefed_since_launch: None,
                 }],
                 brigades: Vec::new(),
             },
@@ -7154,6 +7202,7 @@ mod tests {
                     agent: Some(AgentKind::Codex),
                     live: None,
                     glance: None,
+                    briefed_since_launch: None,
                 }],
                 brigades: Vec::new(),
             },
@@ -7268,6 +7317,7 @@ mod tests {
                                 agent: Some(AgentKind::ClaudeCode),
                                 live: Some(live),
                                 glance: None,
+                                briefed_since_launch: None,
                             }]
                         })
                         .unwrap_or_default(),
@@ -8487,6 +8537,7 @@ mod tests {
             agent,
             live: None,
             glance,
+            briefed_since_launch: None,
         };
         let now_ms = i64::try_from(
             SystemTime::now()
@@ -9239,6 +9290,126 @@ mod tests {
 
     fn open(host: &MockPtyHost) -> PtyHandle {
         PtyHandle::open(host, &["child".to_string()], None, &[], &[], 24, 80).unwrap()
+    }
+
+    // --- whether a Codex member was briefed since its pane's launch ---------
+
+    fn roster_member(token: &str, briefed_at: Option<SystemTime>) -> BrigadeMember {
+        BrigadeMember {
+            token: token.to_string(),
+            role: BrigadeRole::Worker,
+            session_id: None,
+            agent: None,
+            briefed_at,
+            briefed_session_id: None,
+            display_name: None,
+        }
+    }
+
+    #[test]
+    fn a_briefing_counts_only_from_the_moment_the_process_was_spawned() {
+        let spawned = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let second = Duration::from_secs(1);
+        let members = [
+            roster_member("never", None),
+            roster_member("before", Some(spawned - second)),
+            roster_member("at", Some(spawned)),
+            roster_member("after", Some(spawned + second)),
+        ];
+        for (token, expected) in [
+            ("never", Some(false)),
+            ("before", Some(false)),
+            ("at", Some(true)),
+            ("after", Some(true)),
+            ("nobody", None),
+        ] {
+            assert_eq!(
+                briefed_since_launch(&members, token, spawned),
+                expected,
+                "{token}"
+            );
+        }
+    }
+
+    /// A tick's read holding one brigade with `members`, or a roster that could
+    /// not be read.
+    fn read_with(members: Option<Vec<BrigadeMember>>) -> TickRead {
+        TickRead {
+            brigades: members.map(|members| {
+                vec![(
+                    Brigade {
+                        id: 1,
+                        name: "cell".to_string(),
+                    },
+                    Some(members),
+                )]
+            }),
+            live: Vec::new(),
+            alive: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// A hosted pane for each of `keys`, whose process was spawned a moment ago.
+    fn hosted(keys: &[&str]) -> HashMap<SessionKey, PtyHandle> {
+        let host = MockPtyHost::default();
+        keys.iter()
+            .map(|key| (SessionKey::from_id(key), open(&host)))
+            .collect()
+    }
+
+    fn observation_of(token: &str, key: &str, agent: AgentKind) -> RelayObservation {
+        RelayObservation {
+            brigade_id: 1,
+            token: token.to_string(),
+            key: SessionKey::from_id(key),
+            has_unseen: false,
+            is_idle_this_tick: None,
+            agent: Some(agent),
+            glance: None,
+            live: None,
+            briefed_since_launch: None,
+        }
+    }
+
+    #[test]
+    fn a_codex_observation_is_told_whether_its_row_was_briefed_since_the_pane_spawned() {
+        let handles = hosted(&["fresh", "stale", "never"]);
+        let spawned = |key: &str| handles[&SessionKey::from_id(key)].spawned_at();
+        let read = read_with(Some(vec![
+            roster_member("fresh", Some(spawned("fresh") + Duration::from_secs(1))),
+            roster_member("stale", Some(spawned("stale") - Duration::from_secs(1))),
+            roster_member("never", None),
+        ]));
+        let mut relay = vec![
+            observation_of("fresh", "fresh", AgentKind::Codex),
+            observation_of("stale", "stale", AgentKind::Codex),
+            observation_of("never", "never", AgentKind::Codex),
+        ];
+
+        note_briefed_since_launch(&mut relay, &read, &handles);
+
+        let told: Vec<Option<bool>> = relay.iter().map(|obs| obs.briefed_since_launch).collect();
+        assert_eq!(told, [Some(true), Some(false), Some(false)]);
+    }
+
+    #[test]
+    fn nothing_is_told_for_a_claude_member_a_missing_pane_or_an_unread_roster() {
+        let handles = hosted(&["claude"]);
+        let read = read_with(Some(vec![
+            roster_member("claude", None),
+            roster_member("no-pane", None),
+        ]));
+        let mut relay = vec![
+            observation_of("claude", "claude", AgentKind::ClaudeCode),
+            observation_of("no-pane", "no-pane", AgentKind::Codex),
+        ];
+        note_briefed_since_launch(&mut relay, &read, &handles);
+        assert!(relay.iter().all(|obs| obs.briefed_since_launch.is_none()));
+
+        let unread = read_with(None);
+        let mut relay = vec![observation_of("claude", "claude", AgentKind::Codex)];
+        note_briefed_since_launch(&mut relay, &unread, &handles);
+        assert_eq!(relay[0].briefed_since_launch, None);
     }
 
     /// Every product this build supports — the "nothing restricted" `Deps`

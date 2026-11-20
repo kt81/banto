@@ -105,6 +105,7 @@ fn observed(state: &EmporiumState, relay: Vec<RelayObservation>) -> Vec<RelayObs
                 has_unseen: false,
                 is_idle_this_tick: Some(true),
                 agent: None,
+                briefed_since_launch: None,
             })
         })
         .filter(|default| !relay.iter().any(|given| given.key == default.key))
@@ -4689,6 +4690,7 @@ fn a_relay_nudge_just_typed_into_a_pane_counts_it() {
         has_unseen: true,
         is_idle_this_tick: Some(true),
         agent: None,
+        briefed_since_launch: None,
     };
     let tick_with_mail = |state: &mut EmporiumState, app: &mut App, when: Instant| {
         send(
@@ -5027,6 +5029,7 @@ fn mail_for(brigade: BrigadeId, token: &str, member: &SessionKey) -> RelayObserv
         has_unseen: true,
         is_idle_this_tick: Some(true),
         agent: None,
+        briefed_since_launch: None,
     }
 }
 
@@ -8058,6 +8061,7 @@ fn observed_as(
         has_unseen: false,
         is_idle_this_tick: Some(true),
         agent,
+        briefed_since_launch: None,
     }
 }
 
@@ -9793,6 +9797,7 @@ fn a_marked_directors_row_does_not_change_what_the_relay_decides() {
             has_unseen: true,
             is_idle_this_tick: Some(true),
             agent: None,
+            briefed_since_launch: None,
         };
         let idle = [(&director, Idle), (&worker, Idle)];
         let mut written = Vec::new();
@@ -10274,6 +10279,7 @@ fn a_goinkyos_glance_lines_do_not_outlive_its_consultation() {
         has_unseen: false,
         is_idle_this_tick: Some(true),
         agent: None,
+        briefed_since_launch: None,
     };
     let at = t0();
     let brigades = listed(&state);

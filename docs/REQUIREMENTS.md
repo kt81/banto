@@ -2413,8 +2413,13 @@ them:
    Confirming creates those Workers with what the fields hold, once: only the agent
    is stored. With any other `worker_agent` there is no picker and the Workers get
    the resolved product's configured defaults.
-3. **The resolved Worker product is Codex, and banto's own hook doesn't look
-   trusted.** `Modal::ConfirmCodexTrust` — Enter opens a solo pane running
+3. **The Director's product or the resolved Worker product is Codex, and
+   banto's own hook doesn't look trusted.** The Director is briefed by the
+   same hook as a Worker, so a Codex Director with Claude Workers (`worker_agent
+   = "claude"`, or `"select"` and Claude picked) is checked as much as Codex
+   Workers under a Claude Director. A Claude Director with Claude Workers is not
+   checked.
+   `Modal::ConfirmCodexTrust` — Enter opens a solo pane running
    Codex's own trust-review startup and abandons this formation attempt
    outright, rather than waiting to resume it: Codex records trust as a hash
    of its own hook command, which banto has no way to reproduce or compare
@@ -2527,8 +2532,10 @@ turn that failed would otherwise read as `idle` again once the operator touched
 the pane) after banto's Enter went out — it was `idle` when the line was typed —
 a turn ran, and the line is never typed again,
 identified or not: if the session is still not discovered when the window runs
-out it is reported once (`<name>: took its first turn but was not identified —
-banto will not type it again`) and is no longer owed. This holds at any attempt
+out it is reported once (`<name>: took its first turn but was not identified:
+banto's hook did not run, most likely because Codex does not trust it — banto
+will not type it again`; a Codex Worker is found only through the hook's own
+record) and is no longer owed. This holds at any attempt
 count: a turn that ran after the third and last attempt is reported so, and is
 never told "no acknowledgement after 3 attempts", which is for a line that was typed
 three times with no turn seen. Exhaustion remains visible
@@ -2949,6 +2956,47 @@ how the rendered text reaches the member differs by product:
     stdin, for a member whose brigade and token the environment gives and while
     the store opens — a withheld firing included. It says the hook fired for the
     member (Codex's discovery reads it), not that text was printed.
+  - **A Codex member is never silently unbriefed.** Codex runs a hook only if it
+    trusts it, and a hook that does not run says nothing anywhere. Codex trusts one
+    banto executable path at a time (measured 2026-11-17 with a synthetic
+    `CODEX_HOME` on Codex 0.169.0), and banto can run from two, so trust can be lost
+    without the operator doing anything; and the formation check (gate 3 above) is
+    only as good as `hook_trust_state`'s reading of `config.toml` — it reads
+    `Primed` when some `<session-flags>` `session_start` record holds a hash, not
+    when that record matches this executable. "Never silent" means one of two
+    notices, each said once:
+    - *A member whose session banto knows.* For a hosted Codex member (any role)
+      whose pane has shown a turn since its process was spawned, and whose row's
+      `briefed_at` is older than that spawn or empty, the status line says
+      `codex: no briefing reached <member> — banto's hook did not run, most likely
+      because Codex does not trust it (Codex trusts one banto.exe path at a time)`,
+      once per launch. It names no key: the only way to Codex's trust-review pane is
+      gate 3, which is reached by `B`, and `B` on a session that is not a Director
+      forms a brigade (and on a Director disbands one), so pointing at it would
+      send the operator into a side effect. A direct entry to the review pane is
+      undecided.
+    - *A fresh Codex Worker.* Its only discovery source is the hook, so a hook that
+      did not run leaves it without a session id and it never reaches the notice
+      above. The kickoff's report for a turn that ran with the Worker still
+      unidentified says why: `<name>: took its first turn but was not identified:
+      banto's hook did not run, most likely because Codex does not trust it — banto
+      will not type it again` (the Worker kickoff's own report, above).
+    The pane showed a turn when its own OSC 7501 report said `done` or `error` —
+    never `working`, which also blips at start-up and at `/new`, `/clear` and
+    `/resume`. The core latches that per pane (`EmporiumState::codex_turn_ran`),
+    cleared when the pane spawns, so a sticky report need not be caught on a
+    particular tick and a relaunch starts again; an interrupted turn can end in
+    neither, so the first notice can be late, not early. The shell compares
+    `briefed_at` with the moment the pane's process was spawned
+    (`PtyHandle::spawned_at`, the same `>=` comparison as the session-id discovery
+    above) every tick and hands the core the answer with the observation
+    (`RelayObservation::briefed_since_launch`); the core only decides from a latch
+    an earlier tick set, since the tick that sees `done` may hold a roster read from
+    before the hook wrote its row. It waits for a free status line rather than
+    overwriting one. This reads, and does not change, how the briefing is
+    delivered. Not covered by the first notice: a member whose session id banto has
+    not yet learned has no observation (the second notice is the one for a fresh
+    Worker; a Codex Director or Goinkyo in that state is not covered).
   - A complete line that is valid JSON but not an object, or whose `type` is not
     a string, counts as a line that does not parse: it delivers.
   - The addendum ends with one sentence for the cases the rule cannot prove:
