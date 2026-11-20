@@ -50,9 +50,9 @@ use std::time::SystemTime;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use banto_core::consultation::check_title;
 use banto_core::model::{
-    AgentKind, BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken,
-    SessionId,
+    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken, SessionId,
 };
 use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
@@ -391,6 +391,21 @@ fn tools_list_result() -> Value {
                                             `about`/`their_case` belong to arbitration and are \
                                             refused here; `alternatives` is required instead."
                         },
+                        "title": {
+                            "type": "string",
+                            "description": "A short title for this consultation, one line of \
+                                            plain text, at most 24 display columns (a wide \
+                                            character counts two). It is what the operator's \
+                                            session list calls the Goinkyo's session once the \
+                                            consultation has ended, after a \"Goinkyo: \" that \
+                                            banto adds, so do not write the word yourself. Put \
+                                            what identifies the consultation FIRST: at the \
+                                            default sidebar width a row shows only about the \
+                                            first 12 columns of it (15 when the list is \
+                                            grouped), and the rest is cut. \"Layout drag\" is a \
+                                            title; \"Consultation about how we should handle the \
+                                            layout\" is not."
+                        },
                         "alternatives": {
                             "type": "string",
                             "description": "Design only, and required. What other shapes or \
@@ -402,7 +417,8 @@ fn tools_list_result() -> Value {
                         }
                     },
                     "required": [
-                        "kind", "question", "my_case", "settled", "unsettled", "blind_spot"
+                        "kind", "title", "question", "my_case", "settled", "unsettled",
+                        "blind_spot"
                     ],
                     "additionalProperties": false,
                 },
@@ -995,7 +1011,7 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
     // This read, not the later insert's primary key, is what a normal
     // "already consulting" refusal goes through — it's just for a message
     // that names the reason, not the actual guard. Two calls racing between
-    // this check and `add_brigade_member` below (unconfirmed whether that's
+    // this check and `add_goinkyo_member` below (unconfirmed whether that's
     // reachable at all — a Director's own tool calls are sequential) would
     // still leave only one Goinkyo row: `(brigade_id, member_token)` is a
     // primary key, so the loser's insert fails there regardless of what
@@ -1021,6 +1037,13 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
              over) or \"design\" (a design or a course thought through before it is built or committed to).",
         );
     }
+    let title = match require_string_arg(msg, "title") {
+        Ok(value) => match check_title(value) {
+            Ok(title) => title,
+            Err(rejection) => return tool_error(&rejection.to_string()),
+        },
+        Err(message) => return tool_error(&message),
+    };
     let question = match require_string_arg(msg, "question") {
         Ok(value) => value,
         Err(message) => return tool_error(&message),
@@ -1126,13 +1149,7 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
         Ok(path) => path,
         Err(err) => return tool_error(&format!("failed to file the consultation: {err}")),
     };
-    let registered = ctx.store.add_brigade_member_with_agent(
-        brigade,
-        GOINKYO_TOKEN,
-        BrigadeRole::Goinkyo,
-        None,
-        Some(AgentKind::ClaudeCode),
-    );
+    let registered = ctx.store.add_goinkyo_member(brigade, &title);
     // Logged as what the Goinkyo reads, and only once the call has succeeded: a
     // call that returns an error leaves no entry.
     if registered.is_ok()
@@ -1591,6 +1608,7 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_core::model::AgentKind;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3714,6 +3732,7 @@ mod tests {
     fn full_goinkyo_args() -> Value {
         json!({
             "kind": "arbitration",
+            "title": "Refactor landing",
             "question": "Should worker-1's refactor land as-is?",
             "my_case": "It simplifies the module and every test still passes.",
             "their_case": "It changes behavior a caller relies on.",
@@ -3750,6 +3769,7 @@ mod tests {
     fn full_design_args() -> Value {
         json!({
             "kind": "design",
+            "title": "Parse cache key",
             "question": "Should the parse cache be keyed on the path or the session id?",
             "my_case": "Path, because the walk already has it and an id needs a parse.",
             "settled": "Live state is never cached (docs/DISCIPLINE.md).",
@@ -3779,6 +3799,127 @@ mod tests {
 
         assert!(response.contains("arbitration"), "{response}");
         assert!(response.contains("design"), "{response}");
+    }
+
+    /// One `consult_goinkyo` call against a Director context that is kept, so a
+    /// test can read the store afterwards.
+    fn consult_in(ctx: &mut ServerContext, arguments: Value) -> (bool, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        ctx.goinkyo_dir = Some(tmp.path().to_path_buf());
+        let response = call(ctx, &goinkyo_call(arguments));
+        (
+            response["result"]["isError"] == true,
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    fn director_ctx() -> ServerContext {
+        ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        )
+    }
+
+    fn has_goinkyo_row(ctx: &ServerContext) -> bool {
+        ctx.store
+            .brigade_members(1)
+            .unwrap()
+            .iter()
+            .any(|m| m.role == BrigadeRole::Goinkyo)
+    }
+
+    #[test]
+    fn a_consultation_without_a_title_is_refused_and_files_nothing() {
+        let mut ctx = director_ctx();
+        let mut args = full_goinkyo_args();
+        args.as_object_mut().unwrap().remove("title");
+
+        let (is_error, text) = consult_in(&mut ctx, args);
+
+        assert!(is_error, "{text}");
+        assert!(text.contains("`title` is required"), "{text}");
+        assert!(
+            !has_goinkyo_row(&ctx),
+            "a refused call must not add the row"
+        );
+    }
+
+    #[test]
+    fn a_title_with_nothing_visible_is_refused() {
+        for blank in ["", "   ", "\n\t", "\u{200b}\u{1b}"] {
+            let mut ctx = director_ctx();
+            let mut args = full_goinkyo_args();
+            args["title"] = json!(blank);
+
+            let (is_error, text) = consult_in(&mut ctx, args);
+
+            assert!(is_error, "{blank:?}: {text}");
+            // The empty string is refused by the argument reader, the rest by
+            // the title rule; either way the call names the argument.
+            assert!(text.contains("`title`"), "{blank:?}: {text}");
+            assert!(!has_goinkyo_row(&ctx), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn a_title_wider_than_the_limit_is_refused_and_one_at_the_limit_is_filed() {
+        let mut ctx = director_ctx();
+        let mut args = full_goinkyo_args();
+        args["title"] = json!("a".repeat(25));
+
+        let (is_error, text) = consult_in(&mut ctx, args);
+
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains("25 columns") && text.contains("limit is 24"),
+            "{text}"
+        );
+        assert!(!has_goinkyo_row(&ctx));
+
+        let mut args = full_design_args();
+        args["title"] = json!("a".repeat(24));
+        let (is_error, text) = consult_in(&mut ctx, args);
+        assert!(!is_error, "{text}");
+        assert!(has_goinkyo_row(&ctx));
+    }
+
+    #[test]
+    fn a_wide_character_counts_two_columns_against_the_title_limit() {
+        let mut ctx = director_ctx();
+        let mut args = full_goinkyo_args();
+        args["title"] = json!("\u{3042}".repeat(13));
+
+        let (is_error, text) = consult_in(&mut ctx, args);
+
+        assert!(is_error, "{text}");
+        assert!(text.contains("26 columns"), "{text}");
+    }
+
+    #[test]
+    fn the_title_is_reduced_and_kept_through_the_consultation_to_its_end() {
+        let mut ctx = director_ctx();
+        let mut args = full_design_args();
+        args["title"] = json!("  Layout\n drag ");
+        let (is_error, text) = consult_in(&mut ctx, args);
+        assert!(!is_error, "{text}");
+        // The Goinkyo's session id arrives the way discovery gives it.
+        ctx.store
+            .set_member_session(1, "goinkyo", &SessionId("g-title".to_string()))
+            .unwrap();
+
+        let response = call(&mut ctx, &dismiss_call());
+
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+        assert_eq!(
+            ctx.store.consultation_titles().unwrap(),
+            [(SessionId("g-title".to_string()), "Layout drag".to_string())],
+            "the reduced title, not the raw argument"
+        );
     }
 
     #[test]
@@ -4277,6 +4418,27 @@ mod tests {
             ctx.store.archived_ids().unwrap(),
             [SessionId("g1".to_string())]
         );
+    }
+
+    #[test]
+    fn dismiss_goinkyo_leaves_no_title_behind_for_a_row_that_had_none() {
+        // A Goinkyo filed before titles existed has a session and no title: the
+        // session is archived, and nothing is recorded to name it by.
+        let mut ctx = director_ctx();
+        ctx.store
+            .add_brigade_member(
+                1,
+                "goinkyo",
+                BrigadeRole::Goinkyo,
+                Some(&SessionId("g1".to_string())),
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &dismiss_call());
+
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+        assert_eq!(ctx.store.archived_ids().unwrap().len(), 1);
+        assert!(ctx.store.consultation_titles().unwrap().is_empty());
     }
 
     #[test]

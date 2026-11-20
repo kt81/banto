@@ -174,7 +174,8 @@ pub enum Modal {
 /// time with `d`, and a dismissed Goinkyo's session, which banto archives
 /// itself on the operator's standing instruction. That is a different kind of
 /// fact from banto's own judgment and so sits a step further in rather than
-/// beside it. (The archive cannot say which of the two buried a row.)
+/// beside it. (The archive cannot say which of the two buried a row; the store's
+/// consultation record can for a Goinkyo's session, and nothing here asks it.)
 ///
 /// Monotonic on purpose: each level is a strict superset of the one before,
 /// so the count of what is still hidden means the same thing at every step

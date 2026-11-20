@@ -810,7 +810,7 @@ tests, not here.
 | Source | Content |
 |---|---|
 | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | Session body. One JSON per line |
-| First few records of the jsonl | `{"type":"custom-title","customTitle":...}` / `{"type":"ai-title","aiTitle":...}` — the title can be extracted by reading only the head chunk. Older formats fall back to the first user message |
+| First few records of the jsonl | `{"type":"custom-title","customTitle":...}` / `{"type":"ai-title","aiTitle":...}` — the title can be extracted by reading only the head chunk. Older formats fall back to the first user message. A `custom-title` also sets `SessionMeta.title_is_custom`, so that banto's own title for a consultation's session (see "Ending a consultation") never replaces the operator's `/rename` |
 | First record of the jsonl | `{"type":"agent-setting",...}` marks a session run by a spawned agent (subagent / Agent-Teams teammate); interactive sessions open with a `mode` record instead. Sets `SessionMeta.is_agent`, persisted in the store (schema v2) |
 | `~/.claude/sessions/<pid>.json` | Live state of a running session: `pid`, `sessionId`, `cwd`, `status` (`busy`, `waiting`, `idle`; and, measured on Claude Code 2.1.323, 2026-11-13, `shell` — the turn has ended but a background shell command of the session, or of one of its sub-agents, is still running; when that work ends Claude is re-invoked, reads `busy` again and then `idle`), and `waitingFor` beside `waiting` (measured the same day on 2.1.323: `"input needed"` while the session sat in the picker of a question the model had asked, `"dialog open"` while the OPERATOR had a slash-command picker such as `/model` open that he had opened himself, after which `status` went back to `idle`; **not measured:** the value for a permission prompt, for a dialog the product opens on its own, and what `status` says when a dialog is opened over a running turn; a table of reason strings — `permission prompt`, `sandbox request`, `worker request`, `goal proposal`, `input needed`, `dialog open` — was only read in the Claude Code bundle; banto reads the field leniently, a value that is not a string is ignored and keeps the record, and only the exact string `dialog open` means anything), `kind` ("interactive"/"bg"), `name`, `updatedAt` — observed present on both Windows and Linux/WSL. `procStart` is the process's own kernel-reported start time: Linux/WSL records `/proc/<pid>/stat`'s raw `starttime` ticks, while Windows records the raw creation FILETIME (each matched directly against a live process on this machine, 2026-11-10). `RawLiveSession` carries it as optional, so an absent or unrecognized value falls back to bare pid liveness; when it is comparable, banto rejects a recycled PID that belongs to a different process. (Observed directly on this machine's installed Claude Code version; not claimed for every version or platform.) |
 | `~/.claude/history.jsonl` and others | Unused in the MVP |
@@ -1234,7 +1234,7 @@ crates/
 ```
 
 **The store's schema** is versioned by `PRAGMA user_version`; `store/migrations.rs`
-holds one script per version (19 today) and the UI's open applies what is pending,
+holds one script per version (20 today) and the UI's open applies what is pending,
 under the write lock, after a copy of the database (see "Upgrading banto"). An older
 build cannot open a database a newer one has migrated: it reports `unsupported database
 schema version <n>` rather than guess, with the way out in the same line. v17 dropped `panes`, the map of a session to
@@ -1245,7 +1245,12 @@ compacts in place, in the same file under the same session id, so there is no
 continuation to link, and the list no longer hides "superseded" ancestors, so after the
 upgrade the ancestors of compactions made before 2.1.318 show in the ordinary list
 beside their continuations (the migration took `banto.db.before-v19` first, which still
-holds the links). v18 added
+holds the links). v20 added `brigade_members.consult_title` (nullable; the title the
+Director gave a consultation, on the Goinkyo's own row so a dismissal takes it along;
+NULL is "no title", which is every consultation filed before v20) and the
+`consultations` table (`session_id` primary key, `title`, `ended_at_ms`), where the
+dismissal's transaction copies the title before it deletes the row ("Ending a
+consultation"). v18 added
 `brigade_members.joined_after_id`, the highest message id that existed when the
 member joined (0 for a member that joined before v18, which means no bound; it lives
 on the member's own row, so a dismissed member's value goes with it, and a migration
@@ -2361,7 +2366,7 @@ is already gone (a no-op). Neither removes the consultation's request file at
 once; the data directory sweep does (see "Working files of ended members"
 below), and the next consultation overwrites it in the meantime.
 
-**The Goinkyo's session is archived when its row goes.** Once the row is
+**The Goinkyo's session is archived, and named, when its row goes.** Once the row is
 deleted nothing hides the session any more, and it would come back to the list as
 an ordinary row titled with banto's own kickoff sentence ("[banto] This pane just
 started as your brigade's Goinkyo."); the operator had been burying every one of
@@ -2394,8 +2399,12 @@ This is always on and has no setting: it is the operator's standing instruction
 from how it is done:
 
 - The `archived` table holds one fact per session and cannot tell the
-  operator's `d` from banto's archive, so "restore every consultation" cannot be
-  answered from it; `D` restores the sessions one at a time.
+  operator's `d` from banto's archive. The `consultations` table can: a session
+  listed there had its consultation ended by banto, which archived it in that same
+  transaction, and the record stays when `D` removes the archived row. So an
+  archived session with no `consultations` row is the operator's own `d` (or an
+  old or unnamed consultation, below). Nothing yet lists "every consultation" as
+  one action; `D` restores the sessions one at a time.
 - Some Goinkyo sessions stay unarchived and show as ordinary rows: one
   dismissed before a session id was bound to its row (it has no session to bury
   yet), and an *earlier* id of one whose session moved in place — `/clear` in its
@@ -2407,6 +2416,56 @@ from how it is done:
   it was spawned (`poll_discovery`). A session the operator started in the same
   directory in that window could be bound to the Goinkyo, and would be archived
   at its dismissal; it is not deleted, and `D` restores it.
+
+**A consultation's title.** The Director gives each consultation a `title` when it
+files it (`consult_goinkyo`), which is stored on the Goinkyo's member row
+(`brigade_members.consult_title`, written in the transaction that adds the row).
+Deleting the row would lose it, so the transaction that archives the session
+(`archive_goinkyo_sessions`, in `Store::dismiss_worker` and `Store::delete_brigade`)
+also copies the session id, the title and the time into `consultations`, only for a
+row that has a session id and a title, with `ON CONFLICT DO NOTHING` like the archive.
+The title is not stored on `archived` because `D` deletes that row, and restoring
+the session is exactly when the name is wanted.
+
+Every load of the session list, the startup one and each reload, then names those
+sessions: `apply_consultation_titles` sets the title of a session that has a
+`consultations` row to "Goinkyo: <title>", the label being code
+(`banto_core::consultation::CONSULT_TITLE_LABEL`), not stored data, so the word can
+change later. It acts on the sessions as the provider found them, before they become
+list rows, because it needs one fact the rows no longer carry
+(`SessionMeta::title_is_custom`) and `SessionRow` is unchanged. Search matches the
+title like any other, so typing "goinkyo" lists every consultation. The precedence is
+the operator's own `/rename` (a Claude `custom-title` record, which sets
+`title_is_custom` and is never replaced), then banto's title, then what the provider
+derived (Claude's `ai-title`, the first user message). `title_is_custom` is `false`
+for every Codex session: Codex's title is already a pick among three sources and
+nothing in the chosen string says whether a person wrote it, and a consultation's
+title is only ever recorded for a Claude session (the `goinkyo_*` settings are Claude
+only). The title is read before the hidden ids and the archive marks, so a
+dismissal landing in between yields a session archived and not yet named in that
+load, never named and not archived; the next reload has both.
+
+The limit of 24 columns is the member display name's (`MEMBER_NAME_COLUMNS`, which has
+to fit a tile's title row), and with the 9-column label the whole is 33, inside the
+34 the list has at the default sidebar width (36 less the border). A row has fewer
+columns than that for the title: the fixed slots (dot, pin and role) are 8 columns in
+the flat view and 5 when the list is grouped, the gap before the age is at least 2,
+and the age is 2 or 3 columns ("5m", "now", "12m"). The title therefore gets 21 to 22
+columns flat and 24 to 25 grouped, and a row shows 12 to 13 (flat) or 15 to 16
+(grouped) columns of the Director's words behind the label; 12 and 15 are the
+figures that always hold, and the tool's description quotes them. A limit that fit
+there would be 12, too few to say what a consultation is about, so the description
+instead tells the Director to put what identifies it first. Only the 9 + 24 ≤ 34
+arithmetic is pinned by a test; the row widths are read from the list's layout.
+
+`banto list` does not name them: it reads the sessions with no store, so it prints
+the provider's title for a consultation's session, not "Goinkyo: <title>".
+
+The naming covers what the archive covers, and no more: a consultation filed before
+v20 (no title), one dismissed before its session id was bound (no session to name), and
+an id the session was moved away from (the earlier id after `/clear` or
+`MemberSessionForked`; only the id the row holds at the end is named) keep the
+provider's title. Those are the same gaps as the archive's.
 
 That dialog decides in two separate stages, not one, both role-based now:
 *whether the confirm dismisses* anything reads the focused pane's member token
@@ -3319,7 +3378,7 @@ UI arm) opens a database whose `PRAGMA user_version` is above 0 and below the sc
 this build carries, it first writes `<database file>.before-v<N>` beside the database
 (`banto.db.before-v15`; the file name of a `db_path` elsewhere is kept). `N` is the
 version the migration reaches *first*, so the copy always holds schema `N - 1`: a v14
-database becomes `banto.db.before-v15` even when this build goes on to v19. That is the
+database becomes `banto.db.before-v15` even when this build goes on to v20. That is the
 reading of the operator's hand-made `before-v15`, `-v16` and `-v17` beside a v18
 database (each is the database before it became that version), and it lets a build
 that carries schema `K` name the copy it can go back to, `before-v<K + 1>`, without
@@ -3531,10 +3590,21 @@ seven tools:
   because it reads the pane's own OSC 7501 report first, and that report lives in the
   UI process, which this tool (answered by the separate `_mcp` process) cannot see.
   The relay's nudge reads the same rollout marker, so the nudge and this tool agree.
-- `consult_goinkyo(question, my_case, settled, unsettled, blind_spot[,
-  their_case][, about])` — Director-only: files a written consultation
-  request and creates the Goinkyo's member row (see "Brigade" above for what
-  happens to that row next). `about` names the Worker the disagreement is
+- `consult_goinkyo(kind, title, question, my_case, settled, unsettled, blind_spot[,
+  their_case][, about][, alternatives])` — Director-only: files a written
+  consultation request and creates the Goinkyo's member row (see "Brigade" above
+  for what happens to that row next). `kind` is `arbitration` or `design`; a
+  design consultation requires `alternatives`, and `their_case` and `about`
+  belong to an arbitration. `title` is required: a short one-line title for the
+  consultation, reduced like any text someone else wrote (`display_text`: control
+  characters and invisible format characters dropped, whitespace folded) and
+  refused when nothing visible is left or when it is wider than 24 display columns
+  (a wide character counts two). The operator's list shows it, once the
+  consultation has ended, as "Goinkyo: <title>" ("Ending a consultation"); the
+  field's description tells the Director not to write the word itself and to put
+  what identifies the consultation first, because a row shows only the first 12
+  columns of it at the default sidebar width. The Goinkyo's own briefing and request
+  file do not carry it. `about` names the Worker the disagreement is
   with, which makes `their_case` required too; omit both for an impasse with
   no specific Worker. Refuses if a Goinkyo already exists for the brigade —
   only one consults at a time; `dismiss_goinkyo` ends the current one. It is

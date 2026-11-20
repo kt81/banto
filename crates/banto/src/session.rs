@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use banto_core::config::{ActivityConfig, BrigadeConfig, ResolvedAgents};
+use banto_core::consultation;
 pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
 use banto_core::status::{AgeThresholds, age_bucket};
@@ -358,6 +359,38 @@ fn activity_from_observations(
     }
 }
 
+/// Names the sessions of ended consultations: each one the store holds a title
+/// for is listed as "Goinkyo: <title>" ([`consultation::list_title`]) instead of
+/// whatever the provider derived — banto's own kickoff sentence, or Claude's
+/// generated title, which read alike for every consultation.
+///
+/// Precedence is the operator's `/rename` first
+/// (`SessionMeta::title_is_custom`, left alone), then banto's title, then what
+/// the provider derived (`ai-title`, the first user message). It works on the
+/// metas, before [`rows_from_metas`], because that flag does not survive into a
+/// [`SessionRow`], whose `title` is already the winner of the provider's own
+/// precedence.
+///
+/// Reads `consultations`, not `archived`: `D` deletes only the archived row, so a
+/// restored session keeps its name. A store read failure is tolerated, like
+/// [`mark_archived`]'s: the sessions keep the titles the provider gave them.
+pub(crate) fn apply_consultation_titles(metas: &mut [SessionMeta], store: &Store) {
+    let titles: HashMap<String, String> = store
+        .consultation_titles()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, title)| (id.0, title))
+        .collect();
+    if titles.is_empty() {
+        return;
+    }
+    for meta in metas.iter_mut().filter(|meta| !meta.title_is_custom) {
+        if let Some(title) = titles.get(&meta.id.0) {
+            meta.title = Some(consultation::list_title(title));
+        }
+    }
+}
+
 /// Drop archived sessions from `rows` — the union of two independent facts:
 /// banto's own archive (soft-hide via `d` — see
 /// `App::open_confirm_archive_modal`/`confirm_modal`), and, for Codex,
@@ -475,6 +508,7 @@ mod tests {
             id: SessionId(id.to_string()),
             agent: AgentKind::ClaudeCode,
             title: Some(format!("Title {id}")),
+            title_is_custom: false,
             cwd: None,
             source_path: PathBuf::from(format!("{id}.jsonl")),
             mtime,
@@ -1142,6 +1176,97 @@ mod tests {
             source_archived: false,
             archived: false,
         }
+    }
+
+    fn store_with_ended_consultation(session: &str, title: &str) -> Store {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store.add_goinkyo_member(br, title).unwrap();
+        store
+            .set_member_session(br, "goinkyo", &SessionId(session.to_string()))
+            .unwrap();
+        store.dismiss_worker(br, "goinkyo").unwrap();
+        store
+    }
+
+    fn titled(id: &str, title: Option<&str>, is_custom: bool) -> SessionMeta {
+        SessionMeta {
+            title: title.map(str::to_string),
+            title_is_custom: is_custom,
+            ..meta(id, SystemTime::UNIX_EPOCH)
+        }
+    }
+
+    #[test]
+    fn an_ended_consultation_is_listed_under_its_title_behind_the_label() {
+        let store = store_with_ended_consultation("g1", "Layout drag");
+        // A derived title (Claude's ai-title or the first user line: the provider
+        // has already folded them into one string) is replaced; a session nobody
+        // consulted is left alone.
+        let mut metas = vec![
+            titled("g1", Some("Banto brigade Goinkyo pane"), false),
+            titled("other", Some("Fix the parser"), false),
+        ];
+
+        apply_consultation_titles(&mut metas, &store);
+
+        assert_eq!(metas[0].title.as_deref(), Some("Goinkyo: Layout drag"));
+        assert_eq!(metas[1].title.as_deref(), Some("Fix the parser"));
+    }
+
+    #[test]
+    fn a_title_is_given_to_a_session_that_has_none() {
+        let store = store_with_ended_consultation("g1", "Layout drag");
+        let mut metas = vec![titled("g1", None, false)];
+
+        apply_consultation_titles(&mut metas, &store);
+
+        assert_eq!(metas[0].title.as_deref(), Some("Goinkyo: Layout drag"));
+    }
+
+    #[test]
+    fn the_operators_own_rename_wins_over_the_consultations_title() {
+        let store = store_with_ended_consultation("g1", "Layout drag");
+        let mut metas = vec![titled("g1", Some("my own name"), true)];
+
+        apply_consultation_titles(&mut metas, &store);
+
+        assert_eq!(metas[0].title.as_deref(), Some("my own name"));
+    }
+
+    #[test]
+    fn the_name_survives_restoring_the_session_with_d() {
+        let store = store_with_ended_consultation("g1", "Layout drag");
+        store
+            .unarchive_session(&SessionId("g1".to_string()))
+            .unwrap();
+        let mut metas = vec![titled("g1", Some("Banto brigade Goinkyo pane"), false)];
+
+        apply_consultation_titles(&mut metas, &store);
+        let rows = mark_archived(
+            metas
+                .into_iter()
+                .map(|meta| SessionRow {
+                    title: meta.title,
+                    ..row(&meta.id.0, "", "", Activity::Alive)
+                })
+                .collect(),
+            &store,
+        );
+
+        assert!(!rows[0].archived, "restored");
+        assert_eq!(rows[0].title.as_deref(), Some("Goinkyo: Layout drag"));
+    }
+
+    #[test]
+    fn with_no_consultations_every_title_is_untouched() {
+        let store = Store::open_in_memory().unwrap();
+        let mut metas = vec![titled("a", Some("A"), false), titled("b", None, false)];
+
+        apply_consultation_titles(&mut metas, &store);
+
+        assert_eq!(metas[0].title.as_deref(), Some("A"));
+        assert_eq!(metas[1].title, None);
     }
 
     #[test]

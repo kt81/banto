@@ -351,6 +351,14 @@ fn session_meta_from_row(
         id: SessionId(id),
         agent: AgentKind::Codex,
         title: title.filter(|t| !t.is_empty()),
+        // False for every Codex session, and not for lack of a rename source:
+        // the title above is already a pick among `threads.title`, the
+        // `session_index.jsonl` rename and the canonical `name`, and from the
+        // chosen string nothing says whether a person or Codex's own naming
+        // wrote it. A consultation's title is only ever recorded for a Claude
+        // session (`goinkyo_*` settings are Claude only), so no Codex row is
+        // ever one the flag would have to protect.
+        title_is_custom: false,
         cwd: cwd.as_deref().map(normalize_windows_extended_prefix),
         source_path: rollout_path,
         mtime: unix_ms_to_system_time(updated_at_ms),

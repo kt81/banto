@@ -372,6 +372,7 @@ mod tests {
             id: SessionId(SESSION_ID.to_string()),
             agent: AgentKind::ClaudeCode,
             title: Some("synthetic".to_string()),
+            title_is_custom: false,
             cwd: None,
             source_path: PathBuf::from("synthetic.jsonl"),
             mtime: fixed_now() - age,

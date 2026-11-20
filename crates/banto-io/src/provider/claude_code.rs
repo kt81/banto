@@ -235,12 +235,13 @@ fn parse_session(path: &Path, mtime: SystemTime, size: u64) -> Parsed {
             Err(_) => settled = false,
         }
     }
-    let title = fields.title();
+    let (title, title_is_custom) = fields.title_and_source();
     let preview = fields.preview();
     let meta = Some(SessionMeta {
         id: SessionId(id.to_string()),
         agent: AgentKind::ClaudeCode,
         title,
+        title_is_custom,
         cwd: fields.cwd,
         source_path: path.to_path_buf(),
         mtime,
@@ -335,11 +336,25 @@ struct HeadFields {
 impl HeadFields {
     /// Pick the title by priority: custom-title > ai-title > first user
     /// message. Candidates that normalize to an empty string are skipped.
-    fn title(&self) -> Option<String> {
-        [&self.custom_title, &self.ai_title, &self.user_text]
+    ///
+    /// Also says whether it came from a `custom-title` record: the
+    /// operator's own `/rename`, the one source banto's own naming must not
+    /// override (`SessionMeta::title_is_custom`). A custom title that normalizes
+    /// to nothing is skipped like any other, so it does not make the next
+    /// source count as custom.
+    fn title_and_source(&self) -> (Option<String>, bool) {
+        if let Some(title) = self
+            .custom_title
+            .as_deref()
+            .and_then(|raw| normalize_single_line(raw, TITLE_MAX_CHARS))
+        {
+            return (Some(title), true);
+        }
+        let title = [&self.ai_title, &self.user_text]
             .into_iter()
             .flatten()
-            .find_map(|raw| normalize_single_line(raw, TITLE_MAX_CHARS))
+            .find_map(|raw| normalize_single_line(raw, TITLE_MAX_CHARS));
+        (title, false)
     }
 
     /// The first user message, normalized for the summary panel.
@@ -488,6 +503,89 @@ mod tests {
     fn missing_projects_dir_yields_empty() {
         let root = TempDir::new().unwrap();
         assert!(discover_sorted(&root).is_empty());
+    }
+
+    #[test]
+    fn only_a_custom_title_is_marked_as_given() {
+        // The operator's `/rename` is a name someone gave; the other two sources
+        // are derived. The flag is what lets banto's own naming of a Goinkyo's
+        // session leave the first alone and replace the others.
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "custom.jsonl",
+            r#"{"type":"ai-title","aiTitle":"AI title"}
+{"type":"custom-title","customTitle":"Custom title"}
+"#,
+        );
+        write_session(
+            &root,
+            "proj",
+            "ai.jsonl",
+            r#"{"type":"ai-title","aiTitle":"AI title"}
+{"type":"user","message":{"content":"first line"}}
+"#,
+        );
+        write_session(
+            &root,
+            "proj",
+            "first.jsonl",
+            r#"{"type":"user","message":{"content":"first line"}}
+"#,
+        );
+        write_session(&root, "proj", "none.jsonl", "{\"type\":\"mode\"}\n");
+
+        let given: Vec<(String, Option<String>, bool)> = discover_sorted(&root)
+            .into_iter()
+            .map(|meta| (meta.id.0, meta.title, meta.title_is_custom))
+            .collect();
+
+        assert_eq!(
+            given,
+            [
+                ("ai".to_string(), Some("AI title".to_string()), false),
+                ("custom".to_string(), Some("Custom title".to_string()), true),
+                ("first".to_string(), Some("first line".to_string()), false),
+                ("none".to_string(), None, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_custom_title_with_nothing_in_it_does_not_make_the_next_source_custom() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            r#"{"type":"custom-title","customTitle":"  "}
+{"type":"ai-title","aiTitle":"AI title"}
+"#,
+        );
+
+        let sessions = discover_sorted(&root);
+
+        assert_eq!(sessions[0].title.as_deref(), Some("AI title"));
+        assert!(!sessions[0].title_is_custom);
+    }
+
+    #[test]
+    fn a_rename_past_the_head_is_marked_as_given_too() {
+        let root = TempDir::new().unwrap();
+        write_session(
+            &root,
+            "proj",
+            "s1.jsonl",
+            &padded_past_head_cap(
+                "{\"type\":\"custom-title\",\"customTitle\":\"renamed later\"}\n",
+            ),
+        );
+
+        let sessions = discover_sorted(&root);
+
+        assert_eq!(sessions[0].title.as_deref(), Some("renamed later"));
+        assert!(sessions[0].title_is_custom);
     }
 
     #[test]

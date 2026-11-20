@@ -392,13 +392,16 @@ pub fn run(
     // Created once here so the bootstrap walk's parses are already in it when
     // the loop's first `gather_reload` runs a second later.
     let meta_cache = MetaCache::new();
-    let metas = session::discover_all(claude_home, codex_home, enabled_agents, Some(&meta_cache))?;
+    let mut metas =
+        session::discover_all(claude_home, codex_home, enabled_agents, Some(&meta_cache))?;
     // The store-backed state the sidebar shows: grouping, pins, archived-hiding
     // and brigade hiding. This
     // one-time bootstrap stays outside `update`: `App::with_*` are
     // construction-only builders, not a repeating decision.
     let (rows, pinned, groups, session_groups, hidden, directors) = {
         let store = store.borrow();
+        // Same two calls as `gather_reload`, same reason for the order.
+        session::apply_consultation_titles(&mut metas, &store);
         let rows = session::rows_from_metas(metas, claude_home, codex_home, thresholds);
         // Before the archive marks, for the reason `gather_reload` gives.
         let hidden = crate::session::load_hidden_member_ids(&store);
@@ -2093,7 +2096,7 @@ fn add_worker_store(
 /// event, keeping the previous rows) rather than erroring the whole loop out
 /// over a transient filesystem hiccup.
 fn gather_reload(deps: &Deps) -> Vec<Event> {
-    let Ok(metas) = session::discover_all(
+    let Ok(mut metas) = session::discover_all(
         deps.claude_home,
         deps.codex_home,
         deps.enabled_agents,
@@ -2102,6 +2105,12 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
         return Vec::new();
     };
     let store = deps.store.borrow();
+    // Names are applied to the metas, which still know whether a title was the
+    // operator's own (`SessionMeta::title_is_custom`); a row no longer does. This
+    // read is before the hidden ids and the archive marks below, so a Goinkyo
+    // dismissed in between is archived and not yet named for this load, never
+    // named and not archived; the next reload has both.
+    session::apply_consultation_titles(&mut metas, &store);
     let rows = session::rows_from_metas(metas, deps.claude_home, deps.codex_home, deps.thresholds);
     // The hidden member ids come BEFORE the archive marks, and an innocent
     // reorder would reintroduce a race. The Director's `_mcp` process ends a
@@ -5947,6 +5956,7 @@ mod tests {
             id: banto_core::model::SessionId("w1".to_string()),
             agent: AgentKind::ClaudeCode,
             title: None,
+            title_is_custom: false,
             cwd: None,
             source_path: PathBuf::from("w1.jsonl"),
             mtime: SystemTime::UNIX_EPOCH,

@@ -338,6 +338,7 @@ mod tests {
             id: SessionId(id.to_string()),
             agent: AgentKind::ClaudeCode,
             title: Some(id.to_string()),
+            title_is_custom: false,
             cwd: None,
             source_path: PathBuf::from(format!("{id}.jsonl")),
             mtime: SystemTime::UNIX_EPOCH,

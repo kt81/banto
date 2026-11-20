@@ -99,6 +99,13 @@ pub struct SessionMeta {
     pub agent: AgentKind,
     /// Best-effort title: custom-title > ai-title > first user message.
     pub title: Option<String>,
+    /// Whether [`Self::title`] is a name its owner gave the session — Claude
+    /// Code's `custom-title`, written by the operator's `/rename` — rather than
+    /// one derived for it (`ai-title`, the first user message). The one fact
+    /// banto's own naming of a Goinkyo's session needs from the provider: its
+    /// title replaces a derived one and never a given one. `false` where the
+    /// provider cannot tell, and always for Codex (see the Codex provider).
+    pub title_is_custom: bool,
     /// Working directory the session ran in, if it could be determined.
     pub cwd: Option<PathBuf>,
     /// Path to the session's source file: the `.jsonl` for Claude Code, the
@@ -246,7 +253,9 @@ pub struct SessionRow {
     pub is_agent: bool,
     /// True when this session is archived in banto: by the operator (`d`), or by
     /// banto itself for a dismissed Goinkyo's session, on the operator's standing
-    /// instruction. The store keeps no record of which of the two did it. It is
+    /// instruction. The archive itself keeps no record of which of the two did
+    /// it; for a Goinkyo's session the store's `consultations` record does (see
+    /// `Store::consultation_titles`), and the list does not use it for this. It is
     /// banto's own per-session fact and reversible from within banto (`D`) —
     /// unlike [`Self::source_archived`], which the source product owns and
     /// banto can only ever read. A row carrying this is listed only at

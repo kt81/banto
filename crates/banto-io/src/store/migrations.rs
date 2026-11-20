@@ -342,6 +342,22 @@ pub(super) const MIGRATIONS: &[&str] = &[
     // `Store::open` keeps (`banto.db.before-v19`) still has them. v10 above
     // still creates the table — DO NOT "clean up" v10, for the reason v11 gives.
     "DROP TABLE IF EXISTS session_lineage;",
+    // v20: what a Goinkyo's session is called in the list. The Director gives a
+    // consultation a short title when it files it (`consult_goinkyo`); it rides
+    // on the Goinkyo's own member row, like a Worker's display name, and
+    // `consultations` is where it goes when banto ends the consultation and
+    // deletes that row (`Store::dismiss_worker`, `Store::delete_brigade`), keyed
+    // by the session so the list can name it long after the brigade is gone.
+    // NULL on the row is "no title" (a consultation filed before this version),
+    // and such a row leaves nothing behind. A table of its own rather than a
+    // column on `archived`, because `D` deletes the archived row and the title
+    // must outlive that.
+    "ALTER TABLE brigade_members ADD COLUMN consult_title TEXT;
+    CREATE TABLE consultations (
+        session_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        ended_at_ms INTEGER NOT NULL
+    );",
 ];
 
 /// The schema version this build migrates to and knows how to read.
@@ -1078,6 +1094,58 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM session_lineage", [], |row| row.get(0))
             .unwrap();
         assert_eq!(links, 2);
+    }
+
+    #[test]
+    fn v19_to_v20_upgrade_adds_the_consultation_title_and_table_and_keeps_the_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v19 code left it: a Director, and a Goinkyo whose
+        // consultation was filed before titles existed.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..19] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 3000);
+                 INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
+                 VALUES (1, 'director', 'director', 'dir-1'),
+                        (1, 'goinkyo', 'goinkyo', 'old-consult');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 19).unwrap();
+        }
+
+        let mut store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(table_exists(&store, "consultations"));
+        assert_eq!(store.brigade_members(1).unwrap().len(), 2);
+        assert!(store.consultation_titles().unwrap().is_empty());
+
+        // The old row has no title, so ending it archives the session and
+        // records no consultation: there is nothing to name it by.
+        store.dismiss_worker(1, "goinkyo").unwrap();
+        assert_eq!(store.archived_ids().unwrap().len(), 1);
+        assert!(store.consultation_titles().unwrap().is_empty());
+
+        // The copy kept before the upgrade is a v19 database.
+        let before = rusqlite::Connection::open(dir.path().join("banto.db.before-v20")).unwrap();
+        let version: i64 = before
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 19);
+        assert!(
+            before
+                .prepare("SELECT consult_title FROM brigade_members")
+                .is_err(),
+            "the copy is from before the column existed"
+        );
     }
 
     #[test]

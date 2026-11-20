@@ -19,6 +19,7 @@
 mod archive;
 mod backup;
 mod brigades;
+mod consultations;
 mod groups;
 mod migrations;
 mod pins;

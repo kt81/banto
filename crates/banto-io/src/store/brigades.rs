@@ -33,6 +33,7 @@ use banto_core::model::{
 };
 
 use super::archive::archive_on;
+use super::consultations::record_on;
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 
 /// What `brigades.request_text` holds while a Director's request is open. A
@@ -58,25 +59,35 @@ pub const REQUEST_OPEN: &str = "open";
 /// A row with no id yet archives nothing — it has
 /// no session to bury — and only the id the row holds *now* is covered, not one
 /// it held before a session move.
+///
+/// The same rows also leave the consultation's title behind
+/// ([`record_on`]), because the row that holds it is about to go: only a row that
+/// has a title, which every consultation filed since v20 does, so a Goinkyo from
+/// before titles is archived and records nothing. The two writes are one
+/// transaction with the delete, so no reader sees a session archived and not yet
+/// titled, or the reverse.
 fn archive_goinkyo_sessions(
     tx: &rusqlite::Transaction<'_>,
     brigade_id: BrigadeId,
     token: Option<&str>,
 ) -> Result<(), StoreError> {
     let mut stmt = tx.prepare(
-        "SELECT session_id FROM brigade_members
+        "SELECT session_id, consult_title FROM brigade_members
          WHERE brigade_id = ?1 AND role = ?2 AND session_id IS NOT NULL
            AND (?3 IS NULL OR member_token = ?3)",
     )?;
-    let ids = stmt
+    let rows = stmt
         .query_map(
             params![brigade_id, BrigadeRole::Goinkyo.as_token(), token],
-            |row| row.get::<_, String>(0).map(SessionId),
+            |row| Ok((SessionId(row.get(0)?), row.get::<_, Option<String>>(1)?)),
         )?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
-    for id in &ids {
+    for (id, title) in &rows {
         archive_on(tx, id)?;
+        if let Some(title) = title {
+            record_on(tx, id, title)?;
+        }
     }
     Ok(())
 }
@@ -266,8 +277,8 @@ impl Store {
     ///
     /// Not how a Worker is added: a Worker's token is numbered by the brigade's
     /// counter, which only [`Self::add_worker`] advances. This is for the
-    /// Director (formation), the Goinkyo (whose token is the fixed `goinkyo`,
-    /// legitimately reused by the next consultation) and fixtures.
+    /// Director (formation) and fixtures. The Goinkyo has its own door,
+    /// [`Self::add_goinkyo_member`], because its row carries a title.
     pub fn add_brigade_member_with_agent(
         &mut self,
         brigade_id: BrigadeId,
@@ -1239,7 +1250,7 @@ fn worker_number(token: &str) -> Option<i64> {
 /// value (`joined_after_id`) because the cursor moves on as the member reads,
 /// while the glances need to know where its mail began; the two are written from
 /// the same expression, in one transaction, so they start equal.
-fn insert_member(
+pub(super) fn insert_member(
     tx: &rusqlite::Transaction,
     brigade_id: BrigadeId,
     token: &str,
@@ -2025,6 +2036,200 @@ mod tests {
         store.unarchive_session(&sid("g1")).unwrap();
 
         assert!(store.archived_ids().unwrap().is_empty());
+    }
+
+    /// A brigade with its Director and a Goinkyo filed with `title`, whose session
+    /// id is `session` once discovery has bound one (`None`: not yet).
+    fn consulting(title: &str, session: Option<&str>) -> (Store, BrigadeId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+            .unwrap();
+        store.add_goinkyo_member(br, title).unwrap();
+        if let Some(session) = session {
+            store
+                .set_member_session(br, "goinkyo", &sid(session))
+                .unwrap();
+        }
+        (store, br)
+    }
+
+    #[test]
+    fn ending_a_goinkyo_records_the_title_its_row_held_against_its_session() {
+        for how in BOTH {
+            let (mut store, br) = consulting("Layout drag", Some("g1"));
+            assert!(store.consultation_titles().unwrap().is_empty());
+
+            end_goinkyo(&mut store, br, how);
+
+            assert_eq!(
+                store.consultation_titles().unwrap(),
+                [(sid("g1"), "Layout drag".to_string())],
+                "{how:?}"
+            );
+            assert_eq!(store.archived_ids().unwrap(), [sid("g1")], "{how:?}");
+        }
+    }
+
+    #[test]
+    fn a_goinkyo_with_no_session_id_leaves_no_title_either() {
+        for how in BOTH {
+            let (mut store, br) = consulting("Layout drag", None);
+
+            end_goinkyo(&mut store, br, how);
+
+            assert!(store.consultation_titles().unwrap().is_empty(), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn a_goinkyo_row_with_no_title_archives_its_session_and_records_nothing() {
+        // The shape of a consultation filed before v20.
+        for how in BOTH {
+            let mut store = Store::open_in_memory().unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+                .unwrap();
+
+            end_goinkyo(&mut store, br, how);
+
+            assert_eq!(store.archived_ids().unwrap(), [sid("g1")], "{how:?}");
+            assert!(store.consultation_titles().unwrap().is_empty(), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn ending_a_worker_records_no_title() {
+        // Not by the token it is dismissed by, and not for a Worker whose row
+        // somehow carries a title: the role is read from the row.
+        for how in BOTH {
+            let mut store = Store::open_in_memory().unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+                .unwrap();
+            store
+                .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE brigade_members SET consult_title = 'stray' WHERE member_token = 'worker-1'",
+                    [],
+                )
+                .unwrap();
+            match how {
+                EndedBy::Dismissal => {
+                    store.dismiss_worker(br, "worker-1").unwrap();
+                }
+                EndedBy::Disband => store.delete_brigade(br).unwrap(),
+            }
+
+            assert!(store.consultation_titles().unwrap().is_empty(), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn disbanding_one_brigade_records_only_its_own_goinkyos_title() {
+        let (mut store, one) = consulting("First", Some("g1"));
+        let other = store.create_brigade("other").unwrap();
+        store.add_goinkyo_member(other, "Second").unwrap();
+        store
+            .set_member_session(other, "goinkyo", &sid("g2"))
+            .unwrap();
+
+        store.delete_brigade(one).unwrap();
+
+        assert_eq!(
+            store.consultation_titles().unwrap(),
+            [(sid("g1"), "First".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_title_survives_restoring_the_session_and_the_brigade_going_away() {
+        // `D` deletes the archived row. The title is the one thing that must
+        // outlive that: restoring the session is when it is wanted.
+        let (mut store, br) = consulting("Layout drag", Some("g1"));
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        store.unarchive_session(&sid("g1")).unwrap();
+        store.delete_brigade(br).unwrap();
+
+        assert!(store.archived_ids().unwrap().is_empty());
+        assert_eq!(
+            store.consultation_titles().unwrap(),
+            [(sid("g1"), "Layout drag".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_title_carries_to_the_session_the_row_holds_after_a_move() {
+        let (mut store, br) = consulting("Layout drag", Some("old"));
+        store
+            .set_member_session(br, "goinkyo", &sid("new"))
+            .unwrap();
+
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        assert_eq!(
+            store.consultation_titles().unwrap(),
+            [(sid("new"), "Layout drag".to_string())],
+            "only the id the row holds at the end is named, as with the archive"
+        );
+    }
+
+    #[test]
+    fn the_next_consultation_starts_without_the_last_ones_title() {
+        let (mut store, br) = consulting("First", Some("g1"));
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        store.add_goinkyo_member(br, "Second").unwrap();
+        store.set_member_session(br, "goinkyo", &sid("g2")).unwrap();
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        assert_eq!(
+            store.consultation_titles().unwrap(),
+            [
+                (sid("g1"), "First".to_string()),
+                (sid("g2"), "Second".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_ended_twice_keeps_the_first_title() {
+        let (mut store, br) = consulting("First", Some("g1"));
+        store.dismiss_worker(br, "goinkyo").unwrap();
+        store.add_goinkyo_member(br, "Second").unwrap();
+        store.set_member_session(br, "goinkyo", &sid("g1")).unwrap();
+
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        assert_eq!(
+            store.consultation_titles().unwrap(),
+            [(sid("g1"), "First".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_consultation_is_told_from_the_operators_own_archive_by_its_record() {
+        // The archived table cannot say who archived a session; this one can.
+        let (mut store, br) = consulting("Layout drag", Some("g1"));
+        store.archive_session(&sid("mine")).unwrap();
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        let ended: Vec<SessionId> = store
+            .consultation_titles()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ended.contains(&sid("g1")));
+        assert!(!ended.contains(&sid("mine")));
+        assert_eq!(store.archived_ids().unwrap().len(), 2);
     }
 
     #[test]
