@@ -240,13 +240,13 @@ impl Screen {
     /// into — what would be "back" is whatever was on screen before the app
     /// took over, which is exactly what the alternate screen exists to hide.
     ///
-    /// Which children this actually applies to is worth not guessing at.
-    /// Codex was assumed to be one of them and is not: raw PTY captures
-    /// found no `\x1b[?1049h` at cold start or through a full turn, both
-    /// before and after the ConPTY crate swap
-    /// (`banto_io::pty::PortablePtyHost`'s doc). It scrolls in the normal
-    /// buffer like a shell does, which is the case this scrollback exists
-    /// to serve.
+    /// Which children this applies to has changed with the child's version.
+    /// Raw PTY captures of older Codex found no `\x1b[?1049h` at cold start
+    /// or through a full turn, before and after the ConPTY crate swap
+    /// (`banto_io::pty::PortablePtyHost`'s doc): it scrolled in the normal
+    /// buffer like a shell does, the case this scrollback exists to serve.
+    /// Codex 0.169.0 enters the alternate screen at start-up, so for it this
+    /// is a no-op, as for any full-screen TUI.
     pub fn scroll(&mut self, delta: isize) {
         let target = self.screen().scrollback().saturating_add_signed(delta);
         self.parser.screen_mut().set_scrollback(target);

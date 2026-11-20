@@ -277,7 +277,9 @@ const INPUT_ECHO_SETTLE: Duration = Duration::from_secs(3);
 /// Code's screen layout changes without notice, and a reader that quietly
 /// stopped recognising it would look exactly like one that works. A minute
 /// outlasts the menus and pickers that legitimately replace the input block
-/// for a while; nothing measured it.
+/// for a while; nothing measured it. A Codex member's mail held because its pane
+/// is not at its prompt waits the same minute for the same reason before the
+/// operator is told, and stops holding the brigade bell then.
 const INPUT_LINE_UNREADABLE_AFTER: Duration = Duration::from_secs(60);
 /// Minimum gap between nudges to the same member.
 const RELAY_NUDGE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -1295,6 +1297,13 @@ pub struct EmporiumState {
     /// Announces on the status line that a nudge is being held back by
     /// [`Self::unsent_operator_input`]; see [`update_tick`].
     draft_hold_reminder: StatusReminder,
+    /// Since when each Codex member's nudge has been held because its pane is not
+    /// at its prompt, unbroken (see [`codex_relay_at_prompt`]). Keyed by member
+    /// like [`Self::unreadable_since`].
+    prompt_held_since: HashMap<(BrigadeId, MemberToken), Instant>,
+    /// Announces that a Codex member's mail waits on the operator's answer to its
+    /// pane; see [`update_tick`].
+    prompt_hold_reminder: StatusReminder,
     kickoff_prompt_reminder: StatusReminder,
     kickoff_failed_reminder: StatusReminder,
     /// Since when each idle Claude member's input line has read as
@@ -1682,6 +1691,8 @@ impl EmporiumState {
             last_given_input: HashMap::new(),
             unsent_operator_input: HashSet::new(),
             draft_hold_reminder: StatusReminder::default(),
+            prompt_held_since: HashMap::new(),
+            prompt_hold_reminder: StatusReminder::default(),
             kickoff_prompt_reminder: StatusReminder::default(),
             kickoff_failed_reminder: StatusReminder::default(),
             unreadable_since: HashMap::new(),
@@ -2901,20 +2912,36 @@ impl EmporiumState {
     /// operator's recent input, the idle streak, the cooldown, a member that is
     /// not idle) does not matter — it will go out when that passes. Mail the
     /// relay will not deliver (relay off, attempts exhausted) is not counted: the
-    /// brigade is then waiting on the operator. A member this tick did not
-    /// observe has no mail as far as the bell knows.
+    /// brigade is then waiting on the operator. Neither is mail for a Codex member
+    /// held for [`INPUT_LINE_UNREADABLE_AFTER`] because its pane is not at its
+    /// prompt: the operator has been told (see [`update_tick`]) and the mail
+    /// waits on their answer. (A pane carrying the operator's unsent mark keeps
+    /// holding the bell, as any draft does.) A member this tick did not observe
+    /// has no mail as far as the bell knows.
     fn mail_pending(
         &self,
         key: &SessionKey,
         relay_auto: bool,
         observed: &TickObservations,
+        now: Instant,
     ) -> bool {
         relay_auto
             && observed.unread.get(key).is_some_and(|(brigade_id, token)| {
+                let member = (*brigade_id, token.clone());
                 self.relay_states
-                    .get(&(*brigade_id, token.clone()))
+                    .get(&member)
                     .is_none_or(|relay| relay.nudge.attempts < RELAY_MAX_ATTEMPTS)
+                    && !(self.prompt_held_past_notice(&member, now)
+                        && !self.unsent_operator_input.contains(key))
             })
+    }
+
+    /// Whether a Codex member's nudge has been held back for not being at its
+    /// prompt for the time that earns the operator a notice.
+    fn prompt_held_past_notice(&self, member: &(BrigadeId, MemberToken), now: Instant) -> bool {
+        self.prompt_held_since.get(member).is_some_and(|since| {
+            now.saturating_duration_since(*since) >= INPUT_LINE_UNREADABLE_AFTER
+        })
     }
 
     /// `last_given_input` is stamped for every key forwarded from pane focus,
@@ -4970,7 +4997,8 @@ fn update_brigade_quiet(
         // sense that matters: it is about to be started.
         brigade.members.push(
             if sampled == Quiescence::Idle
-                && (state.kickoff_owed(key, now) || state.mail_pending(key, relay_auto, observed))
+                && (state.kickoff_owed(key, now)
+                    || state.mail_pending(key, relay_auto, observed, now))
             {
                 Quiescence::Unknown
             } else {
@@ -10138,6 +10166,9 @@ fn update_tick(
 
     // Members whose nudge only an unsent draft is holding back.
     let mut held_by_draft: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
+    // Codex members whose nudge has been held for long enough, because the pane
+    // is not at its prompt, to tell the operator.
+    let mut held_off_prompt: Vec<(Option<BrigadeId>, MemberToken)> = Vec::new();
     // Idle Claude members whose input line has been unreadable long enough
     // to say so.
     let mut unreadable_due: Vec<(BrigadeId, MemberToken)> = Vec::new();
@@ -10202,10 +10233,20 @@ fn update_tick(
                 last_forwarded,
                 has_unsent,
             };
-            let release_codex = obs.agent == Some(AgentKind::Codex)
-                && input.has_unsent
+            // A Codex pane is typed into only when it is at its prompt, mark or no
+            // mark (`codex_relay_at_prompt`), and only on a tick that would nudge
+            // otherwise, so the screen is read when a decision needs it. At its
+            // prompt the operator's mark is released (kept until the nudge goes out,
+            // below); off it, a marked pane keeps the draft wording and an unmarked
+            // one is held with no attempt spent, and told about after
+            // INPUT_LINE_UNREADABLE_AFTER. There is no blind fallback.
+            let member = (obs.brigade_id, obs.token.clone());
+            let mut release_codex = false;
+            let mut held_off = false;
+            let mut at_prompt = false;
+            if obs.agent == Some(AgentKind::Codex)
                 && would_nudge_on_tick(
-                    state.relay_states.get(&(obs.brigade_id, obs.token.clone())),
+                    state.relay_states.get(&member),
                     now,
                     idle_this_tick,
                     PaneInput {
@@ -10214,14 +10255,31 @@ fn update_tick(
                     },
                     obs.has_unseen,
                 )
-                && last_forwarded
-                    .is_none_or(|at| now.saturating_duration_since(at) >= INPUT_ECHO_SETTLE)
-                && state
-                    .screens
-                    .get(&obs.key)
-                    .is_some_and(|screen| read_codex_input_line(screen) == InputLine::Empty);
-            if release_codex {
-                input.has_unsent = false;
+            {
+                if codex_relay_at_prompt(state, &obs.key, last_forwarded, now) {
+                    at_prompt = true;
+                    release_codex = input.has_unsent;
+                    input.has_unsent = false;
+                } else if !input.has_unsent {
+                    held_off = true;
+                    input.has_unsent = true;
+                }
+            }
+            // The clock ends only when the pane reads at its prompt or the mail is
+            // gone. A tick on which the member is merely not eligible (not idle
+            // that tick, the operator's keystroke quiet window, which typing into
+            // the picker starts) says nothing about the pane and must not restart
+            // the minute: the bell would be held again for a pane still waiting on
+            // the operator.
+            if held_off {
+                state.prompt_held_since.entry(member.clone()).or_insert(now);
+            } else if at_prompt || !obs.has_unseen || obs.agent != Some(AgentKind::Codex) {
+                state.prompt_held_since.remove(&member);
+            }
+            if state.prompt_held_past_notice(&member, now)
+                && !state.unsent_operator_input.contains(&obs.key)
+            {
+                held_off_prompt.push((Some(obs.brigade_id), obs.token.clone()));
             }
             let nudge = tick_relay_decision(
                 &mut state.relay_states,
@@ -10257,6 +10315,7 @@ fn update_tick(
                     .unwrap_or_default();
                 state.set_status(format!("relay: nudged {member}{prompt}"), now);
             } else if input.has_unsent
+                && !held_off
                 && state
                     .relay_states
                     .get(&(obs.brigade_id, obs.token.clone()))
@@ -10317,6 +10376,22 @@ fn update_tick(
             ));
         }
         state.set_status(parts.join("; "), now);
+    }
+
+    // A Codex member whose mail waits on the operator's answer to its pane. The
+    // same cycle as the draft hold: a nudge is never typed into a screen that is
+    // not a prompt, so the operator is the only way out.
+    if state
+        .prompt_hold_reminder
+        .due(!held_off_prompt.is_empty(), state.status.is_none(), now)
+    {
+        let members = state.members_phrase(app, &held_off_prompt);
+        state.set_status(
+            format!(
+                "relay: {members}: not at its prompt \u{2014} answer what the pane shows; its mail waits"
+            ),
+            now,
+        );
     }
 
     // Said once per member, and only into a free status line: a member left
@@ -10639,10 +10714,49 @@ fn update_goinkyo_awaiting_spawn(
 /// session is discovered. A [`PendingKickoff`] exists for a Codex pane and no
 /// other.
 fn codex_kickoff_at_prompt(state: &EmporiumState, key: &SessionKey) -> bool {
+    codex_pane_at_prompt(state, key, |report| report == ReportedState::Idle)
+}
+
+/// A Codex pane's own report is one `accepts` and its input line reads as the
+/// empty prompt: the pair [`codex_kickoff_at_prompt`] explains, with the report
+/// condition left to the caller. A pane that has reported nothing is never at its
+/// prompt, for either caller.
+fn codex_pane_at_prompt(
+    state: &EmporiumState,
+    key: &SessionKey,
+    accepts: impl Fn(ReportedState) -> bool,
+) -> bool {
     state.screens.get(key).is_some_and(|screen| {
-        screen.reported_state() == Some(ReportedState::Idle)
+        screen.reported_state().is_some_and(accepts)
             && read_codex_input_line(screen) == InputLine::Empty
     })
+}
+
+/// Whether a Codex member's pane is at its prompt, so that the relay may type its
+/// nudge: output quiet for [`CODEX_KICKOFF_QUIET_PERIOD`] (the report and the
+/// painted line agree only on a pane that has stopped painting), a report that is
+/// not `blocked`, an empty prompt, and [`INPUT_ECHO_SETTLE`] since banto last
+/// forwarded a key (the screen lags its keys). Any report but `blocked` will do:
+/// a pane that ran a turn sits in `done` until touched, and the relay's own idle
+/// reading from the rollout is asked separately. A picker reports `idle` and a
+/// dialog `blocked`; it is the painted line that tells a picker from a prompt
+/// (measured on Codex 0.169.0: the nudge's `k` moved a picker's selection and its
+/// Enter applied it).
+fn codex_relay_at_prompt(
+    state: &EmporiumState,
+    key: &SessionKey,
+    last_forwarded: Option<Instant>,
+    now: Instant,
+) -> bool {
+    // A pane with no output on record has painted nothing, and the read below
+    // then finds no prompt.
+    let quiet = state
+        .last_output_at
+        .get(key)
+        .is_none_or(|at| now.saturating_duration_since(*at) >= CODEX_KICKOFF_QUIET_PERIOD);
+    quiet
+        && last_forwarded.is_none_or(|at| now.saturating_duration_since(at) >= INPUT_ECHO_SETTLE)
+        && codex_pane_at_prompt(state, key, |report| !report.is_blocked())
 }
 
 /// Whether a Goinkyo's pane is at its prompt, ready for its kickoff line. When
@@ -16986,20 +17100,270 @@ mod tests {
         assert!(state.unreadable_noticed.is_empty());
     }
 
-    #[test]
-    fn unmarked_codex_keeps_existing_nudge_behavior() {
+    const CODEX: Option<AgentKind> = Some(AgentKind::Codex);
+
+    /// A Codex pane showing something other than its empty prompt, unmarked.
+    fn unmarked_codex_pane_shows(paint: impl Fn(&mut EmporiumState, &SessionKey)) {
         let (mut state, mut app, brigade, director, mut now) = reading_fixture();
-        let screen = state.screens.get_mut(&director).unwrap();
-        screen.process(b"unrecognized typed content");
-        let writes = two_ticks_as(
+        paint(&mut state, &director);
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        assert!(writes.is_empty(), "{writes:?}");
+        let attempts = state
+            .relay_states
+            .get(&(1, "director".into()))
+            .map_or(0, |relay| relay.nudge.attempts);
+        assert_eq!(attempts, 0, "no attempt is spent while held");
+    }
+
+    #[test]
+    fn an_unmarked_codex_pane_at_a_picker_is_not_typed_into() {
+        // The report says idle while a picker is open (measured, 0.169.0): only
+        // the painted line tells it from a prompt.
+        unmarked_codex_pane_shows(|state, key| paint_codex_menu(state, key, Some("idle")));
+    }
+
+    #[test]
+    fn an_unmarked_codex_pane_at_a_dialog_is_not_typed_into() {
+        unmarked_codex_pane_shows(|state, key| {
+            paint_codex_menu(state, key, Some("blocked:kind=permission"));
+        });
+    }
+
+    #[test]
+    fn an_unmarked_codex_pane_with_text_in_the_composer_is_not_typed_into() {
+        unmarked_codex_pane_shows(paint_codex_prompt_with_text);
+    }
+
+    #[test]
+    fn an_unmarked_codex_pane_that_has_reported_nothing_is_not_typed_into() {
+        unmarked_codex_pane_shows(|state, key| {
+            let screen = state.screens.get_mut(key).unwrap();
+            let (rows, _) = screen.size();
+            screen.process(
+                format!(
+                    "\x1b[2J\x1b[{row};1H\x1b[1m\u{203a}\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m",
+                    row = rows - 3
+                )
+                .as_bytes(),
+            );
+        });
+    }
+
+    #[test]
+    fn a_codex_pane_at_its_empty_prompt_is_nudged_whether_it_reports_idle_or_done() {
+        for report in ["idle", "done", "working"] {
+            let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+            draw_empty_codex_prompt(&mut state, &director);
+            report_codex_state(&mut state, &director, report);
+            let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+            assert_eq!(writes, nudge_for(&director), "{report}");
+        }
+    }
+
+    #[test]
+    fn a_codex_pane_reporting_blocked_is_not_nudged_even_where_the_line_reads_empty() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        draw_empty_codex_prompt(&mut state, &director);
+        report_codex_state(&mut state, &director, "blocked:kind=permission");
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        assert!(writes.is_empty(), "{writes:?}");
+    }
+
+    #[test]
+    fn a_codex_pane_still_painting_is_not_nudged_until_it_has_been_quiet() {
+        let (mut state, mut app, brigade, director, now) = reading_fixture();
+        draw_empty_codex_prompt(&mut state, &director);
+        state.last_output_at.insert(director.clone(), now);
+        state.relay_states.insert(
+            (1, "director".into()),
+            RelayState {
+                idle_streak: 1,
+                nudge: NudgeState::default(),
+            },
+        );
+        let seen = Seen {
+            agent: CODEX,
+            idle: Some(true),
+            has_unseen: true,
+        };
+
+        let early = tick_obs(
             &mut state,
             &mut app,
             &brigade,
             &director,
-            Some(AgentKind::Codex),
-            &mut now,
+            seen,
+            now + CODEX_KICKOFF_QUIET_PERIOD - Duration::from_millis(1),
         );
-        assert_eq!(writes, nudge_for(&director));
+        assert!(writes_of(&early).is_empty(), "{early:?}");
+        let due = tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            seen,
+            now + CODEX_KICKOFF_QUIET_PERIOD,
+        );
+        assert_eq!(writes_of(&due), nudge_for(&director));
+    }
+
+    #[test]
+    fn a_codex_pane_held_off_its_prompt_is_told_about_once_after_a_minute_and_nothing_is_typed() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        paint_codex_menu(&mut state, &director, Some("idle"));
+        let mut writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        assert!(state.status.is_none(), "not yet: {:?}", state.status);
+
+        now += INPUT_LINE_UNREADABLE_AFTER;
+        writes.extend(two_ticks_as(
+            &mut state, &mut app, &brigade, &director, CODEX, &mut now,
+        ));
+
+        assert!(writes.is_empty(), "{writes:?}");
+        let status = state.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("not at its prompt")
+                && status.contains("answer what the pane shows")
+                && status.contains("its mail waits"),
+            "{status}"
+        );
+        assert!(!status.contains("unsent input"), "{status}");
+
+        // Said once: the next tick, inside the reminder cycle, says nothing more.
+        state.status = None;
+        now += Duration::from_secs(1);
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CODEX,
+                idle: Some(true),
+                has_unseen: true,
+            },
+            now,
+        );
+        assert!(state.status.is_none(), "{:?}", state.status);
+    }
+
+    #[test]
+    fn mail_held_off_a_codex_prompt_for_a_minute_stops_holding_the_bell_and_resumes_at_the_prompt()
+    {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        paint_codex_menu(&mut state, &director, Some("idle"));
+        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        let observed = TickObservations {
+            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
+            directors: HashSet::new(),
+        };
+        assert!(
+            state.mail_pending(&director, true, &observed, now),
+            "a minute has not passed: the mail is on the way"
+        );
+
+        now += INPUT_LINE_UNREADABLE_AFTER;
+        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        assert!(
+            !state.mail_pending(&director, true, &observed, now),
+            "mail the relay will not deliver does not hold the bell"
+        );
+
+        // The operator answers the picker; the prompt is back and the nudge goes
+        // out on that very tick, the held time having spent no attempt.
+        draw_empty_codex_prompt(&mut state, &director);
+        let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        assert_eq!(writes, nudge_then_enter_for(&director));
+        assert!(state.prompt_held_since.is_empty());
+        assert!(state.mail_pending(&director, true, &observed, now));
+    }
+
+    #[test]
+    fn a_tick_on_which_a_held_codex_member_is_not_eligible_does_not_restart_the_minute() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        paint_codex_menu(&mut state, &director, Some("idle"));
+        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        let observed = TickObservations {
+            unread: HashMap::from([(director.clone(), (1, "director".to_string()))]),
+            directors: HashSet::new(),
+        };
+        now += INPUT_LINE_UNREADABLE_AFTER;
+        two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        assert!(!state.mail_pending(&director, true, &observed, now));
+
+        // One tick on which the member reads busy: no verdict on the pane.
+        now += Duration::from_secs(1);
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CODEX,
+                idle: Some(false),
+                has_unseen: true,
+            },
+            now,
+        );
+        assert!(
+            !state.mail_pending(&director, true, &observed, now),
+            "still past the notice, the bell still released"
+        );
+
+        // The mail being read ends it.
+        now += Duration::from_secs(1);
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CODEX,
+                idle: Some(true),
+                has_unseen: false,
+            },
+            now,
+        );
+        assert!(state.prompt_held_since.is_empty());
+    }
+
+    #[test]
+    fn a_marked_codex_pane_off_its_prompt_keeps_the_draft_wording() {
+        let (mut state, mut app, brigade, director, mut now) = reading_fixture();
+        paint_codex_menu(&mut state, &director, Some("idle"));
+        state.unsent_operator_input.insert(director.clone());
+        let mut writes = two_ticks_as(&mut state, &mut app, &brigade, &director, CODEX, &mut now);
+        now += INPUT_LINE_UNREADABLE_AFTER;
+        writes.extend(two_ticks_as(
+            &mut state, &mut app, &brigade, &director, CODEX, &mut now,
+        ));
+
+        assert!(writes.is_empty(), "{writes:?}");
+        let status = state.status.clone().unwrap_or_default();
+        assert!(status.contains("unsent input in the pane"), "{status}");
+        assert!(!status.contains("not at its prompt"), "{status}");
+        assert!(state.prompt_held_since.is_empty());
+    }
+
+    #[test]
+    fn a_codex_pane_that_is_not_waiting_for_mail_is_not_read_or_reported() {
+        // The gate runs only on a tick that would nudge: no mail, no screen read,
+        // no held-since entry, however odd the screen.
+        let (mut state, mut app, brigade, director, now) = reading_fixture();
+        paint_codex_menu(&mut state, &director, Some("idle"));
+        tick_obs(
+            &mut state,
+            &mut app,
+            &brigade,
+            &director,
+            Seen {
+                agent: CODEX,
+                idle: Some(true),
+                has_unseen: false,
+            },
+            now,
+        );
+        assert!(state.prompt_held_since.is_empty());
     }
 
     #[test]
@@ -17147,12 +17511,12 @@ mod tests {
     #[test]
     fn codex_does_not_use_the_claude_prompt_reader() {
         let codex = Some(AgentKind::Codex);
-        // Text drawn like Claude's, no mark: the screen is not read, so the
-        // nudge goes.
+        // Text drawn like Claude's, no mark: Codex's reader does not call it an
+        // empty prompt, so the relay holds the nudge.
         let (mut state, mut app, brigade, director, mut now) = reading_fixture();
         draw_prompt(&mut state, &director, Some("text"));
         let writes = two_ticks_as(&mut state, &mut app, &brigade, &director, codex, &mut now);
-        assert_eq!(writes, nudge_for(&director));
+        assert!(writes.is_empty(), "{writes:?}");
 
         // A mark and an empty-looking screen: the mark stands.
         let (mut state, mut app, brigade, director, mut now) = reading_fixture();

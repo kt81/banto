@@ -113,7 +113,14 @@ see the kickoff below. It is never used to estimate or keep track of
 state — that is the disguised input above in a new coat. The input-line
 reader (`banto_core::input_line`) is one instance: it reads Claude's line for
 text and recognises one bounded empty-looking Codex prompt shape. It has two
-callers. Relay asks it only when it decides to nudge. The kickoff of a Codex
+callers. Relay reads a Claude member's line on every relay tick (the line is
+judged for a draft whether or not a nudge is due) and a Codex member's only on a
+tick otherwise eligible to nudge; for a Codex member it is the second caller that
+does not fall back when unsure: a Codex pane is
+typed into only when quiet, not `blocked`, and reading `Empty`; otherwise banto
+does not type, holds the mail with no attempt spent, and tells the operator once
+(approved 2026-11-19: on Codex 0.169.0 a nudge typed into an open picker moved its
+selection and applied it, while the pane's own report said `idle`). The kickoff of a Codex
 Worker, and of a Goinkyo whose live file does not yet name its pane, asks it on
 each tick the first line is due, because the alternative witness (the product's
 trust registry) was wrong both ways and a typed first line into a screen that is

@@ -7854,6 +7854,15 @@ fn the_relay_keeps_the_rollout_for_a_codex_member_whatever_it_reports() {
     // working: the relay reads the observation the shell built from the rollout,
     // never the report.
     let (mut state, mut app, director, codex, idle_from) = brigade_with_a_codex_worker();
+    // At its empty prompt (the relay types only there), yet reporting `working`.
+    state.size = (160, 50);
+    resize_staged_tiles(&mut state);
+    let rows = state.screens.get(&codex).unwrap().size().0;
+    let prompt = format!(
+        "\x1b[2J\x1b[{row};1H\x1b[1m\u{203a}\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\x1b[{row};3H",
+        row = rows - 3
+    );
+    said(&mut state, &mut app, &codex, prompt.as_bytes(), idle_from);
     said(&mut state, &mut app, &codex, REPORT_WORKING, idle_from);
     let both = [(&director, Idle), (&codex, Idle)];
     let mut nudged_codex = false;

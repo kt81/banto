@@ -1974,8 +1974,9 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   mouse events forwarded to a Claude pane count as operator input), every member
   sampled idle meanwhile, and the bell rang 5 s in with the report still unread; to
   him the work was not finished. Mail the relay will not deliver — relay not
-  automatic, or attempts exhausted — does not hold the bell: the brigade is then
-  waiting on the operator. Consequences: a nudge delivered but never read keeps the
+  automatic, attempts exhausted, or a Codex member held for `INPUT_LINE_UNREADABLE_AFTER`
+  (60 s) because its pane is not at its prompt (see "Auto-relay") — does not hold
+  the bell: the brigade is then waiting on the operator. Consequences: a nudge delivered but never read keeps the
   bell held through the relay's retries, and an operator's draft left in a Worker's
   pane holds that Worker's mail and so the bell. In detail, for a nudge typed but
   not answered: the bell stays held through the relay's retries (a cooldown of 60 s
@@ -3442,7 +3443,8 @@ A Director↔Worker exchange over the MCP tools above pulls each message's text
 without a nudge. With the relay in `auto`, a message to an idle recipient
 can wake it for a turn over its whole context, even when the message asks for
 nothing. The relay holds the nudge back when the relay is `manual`, the pane is
-marked for possible unsent input or Claude's reader detects text, the member has no
+marked for possible unsent input or Claude's reader detects text, a Codex member's
+pane is not at its prompt (below), the member has no
 hosted pane or an unknown idle state, or its
 attempts on the batch are used up. The auto-relay closes that loop: it
 observes every live brigade pane's idle/busy status, including panes behind
@@ -3630,12 +3632,38 @@ recognised `Empty` clears a mark only on a tick otherwise eligible to nudge and
 at least 3 seconds after the last forwarded input. Until then the mark holds.
 This applies automatically, with no new setting or operator action. The dim
 attribute is required and was observed through ConPTY. The prompt glyph and
-placeholder are tied to Codex 0.169.0; a future change falls back to the
-existing mark rather than guessing.
+placeholder are tied to Codex 0.169.0; a future change reads `Unrecognized`, and
+the relay then types nothing into that pane (below).
+
+**The Codex gate (approved 2026-11-19).** The relay types a nudge into a Codex
+member's pane only when the pane is at its prompt, whether or not the operator's
+mark is set: its output has been quiet for `CODEX_KICKOFF_QUIET_PERIOD`; its own
+OSC 7501 report is present and not `blocked` (any other state will do, because a
+pane that took a turn sits in `done`; the relay's idle reading from the rollout is
+still asked separately); and the reader above says `Empty`, with the 3-second
+settle after banto's last forwarded input. It is the kickoff's own test
+(`codex_kickoff_at_prompt`) with the report condition widened from `idle`. The
+screen is read only on a tick that would nudge otherwise. Why: on Codex 0.169.0 the
+pane's report says `idle` while a picker (`/permissions`, `/model`, `/statusline`,
+`/title`) is open, and the nudge's `k` moved the selection and its delayed Enter
+applied it — Read Only permissions, another model, a rewritten `config.toml`.
+A pane that is not at its prompt is never typed into, and there is no fallback to
+typing blind. No attempt on the batch is spent while it is held, and the nudge goes
+out on the tick the prompt reads `Empty` again. The hold's clock starts on the
+first held tick and ends only when the pane reads at its prompt or the member has
+no unseen mail left; a tick on which the member is merely not eligible to nudge
+(busy that tick, the operator's keystroke quiet window after typing into the
+picker) neither restarts it nor ends it. After `INPUT_LINE_UNREADABLE_AFTER`
+(60 s) of being held the operator is told, once and then on the status reminder
+cycle: `relay: <member>: not at its prompt — answer what the pane shows; its mail
+waits`. That held mail also stops counting as on the way for the brigade-quiet bell
+("Mail on the way"), as it now waits on the operator. A pane carrying the operator's
+unsent mark that is not at its prompt keeps the existing "unsent input in the pane"
+wording instead, and keeps holding the bell as any draft does. Claude members are unchanged.
 
 The reading is evidence of a painted shape, not a guarantee that Codex has no
-draft. Unmarked text recalled from history or restored can still receive a blind
-nudge when the shape is unrecognised, as before. An attachment-only composer can
+draft. Unmarked text recalled from history or restored reads `Unrecognized`, so the
+relay does not type over it. An attachment-only composer can
 look empty to this reader, so a nudge can be sent with images attached. A draft
 held by Codex outside the composer is not observable here; whether a restored
 startup draft can coexist with this placeholder is unverified. A mark over an
