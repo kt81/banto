@@ -55,6 +55,18 @@ Nothing flagged it at any step. The binary is unsigned.
 | The same exe double-clicked in Explorer | SmartScreen "Windows protected your PC"; "More info" → "Run anyway" started it |
 | The draft's `install.ps1` run as `Get-Content -Raw .\install.ps1 \| iex` on the browser-downloaded files | installed; `banto` resolved on `PATH`; nothing from Defender or SmartScreen |
 
+## 2026-11-20: v0.2.0
+
+Nothing flagged it. SmartScreen warned on the first double-click, as for v0.1.0. The binary is unsigned.
+
+| Step | What Windows said |
+|---|---|
+| Workflow scan of the freshly built exe (run 44743485012, hosted runner), definitions 1.463.386.0 | no threats, exit 0 |
+| The draft's zip downloaded with `gh`, checked against `SHA256SUMS`, extracted, `banto.exe` (sha256 `9a106d7ff2323f4459f665bb0cb8de27c13934ac9cddfc9583a053a64aabfa82`) scanned with the command above, definitions 1.463.379.0 | no threats, exit 0 |
+| The operator's machine: the zip downloaded with a browser, `banto.exe` double-clicked in Explorer | SmartScreen warned the first time and started it once allowed; the second time it did not warn (banto itself refused the start, because the operator's own banto held the database) |
+| The same exe started from a terminal | unknown for a first start: it was started only after the Explorer start, when SmartScreen no longer warned |
+| The draft's `install.ps1` | not run for this release |
+
 ## How to record the next one
 
 Add a section like the ones above, with a heading of the date. Copy this table and fill
