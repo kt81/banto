@@ -151,10 +151,27 @@ pub struct Resolved {
 
 impl Resolved {
     pub fn claude_home(&self) -> Result<ClaudeHome> {
-        self.claude_home
-            .clone()
-            .map(ClaudeHome::new)
-            .context("could not determine the Claude home directory; pass --claude-home <PATH>")
+        self.claude_home_in(|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::claude_home`] over an injected environment.
+    ///
+    /// The root is what banto lists (`--claude-home` and the config key win
+    /// over the variable), but the `.claude.json` that decides trust is the
+    /// one the agent in a pane reads, and a pane's agent is started from
+    /// banto's own environment with no `--claude-home` of its own. So that file
+    /// is named from the environment alone, whatever the root: it is what the
+    /// agent will consult, and an advisory about the agent has nothing else to
+    /// read.
+    fn claude_home_in(&self, env: impl Fn(&str) -> Option<String>) -> Result<ClaudeHome> {
+        let home =
+            self.claude_home.clone().map(ClaudeHome::new).context(
+                "could not determine the Claude home directory; pass --claude-home <PATH>",
+            )?;
+        Ok(match ClaudeHome::agent_trust_registry_from_env(env) {
+            Some(registry) => home.with_trust_registry(registry),
+            None => home,
+        })
     }
 
     pub fn codex_home(&self) -> Option<CodexHome> {

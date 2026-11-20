@@ -531,6 +531,72 @@ fn a_parent_that_starts_children_always_has_a_claude_home_and_a_database() {
     assert!(r.db_path().is_err());
 }
 
+// --- the .claude.json that decides trust is the pane agent's, not the root's ----
+
+/// `claude_home_in` over a synthetic `CLAUDE_CONFIG_DIR`.
+fn claude_home_under(r: &Resolved, claude_config_dir: Option<&Path>) -> ClaudeHome {
+    let value = claude_config_dir.map(|dir| dir.to_string_lossy().into_owned());
+    r.claude_home_in(|key| {
+        (key == "CLAUDE_CONFIG_DIR")
+            .then(|| value.clone())
+            .flatten()
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_claude_config_dir_puts_the_trust_registry_inside_that_directory() {
+    // `CLAUDE_CONFIG_DIR=<x>/.claude-work` must not read `<x>/.claude.json`,
+    // which belongs to the account that lives in `<x>/.claude`.
+    let m = Machine::new();
+    let work = m.path("acct/.claude-work");
+    let mut inputs = m.inputs();
+    inputs.env.claude_config_dir = Some(work.to_string_lossy().into_owned());
+    let r = resolved(&inputs);
+    let home = claude_home_under(&r, Some(&work));
+    assert_eq!(home.root(), work);
+    assert_eq!(home.trust_registry_path(), work.join(".claude.json"));
+}
+
+#[test]
+fn claude_home_flag_moves_the_listing_but_not_the_agents_trust_registry() {
+    // `--claude-home` is banto's own: the pane's agent never sees it, so with the
+    // variable set the agent still reads the variable's file, and with it unset
+    // the user's own `.claude.json`.
+    let m = Machine::new();
+    let listed = m.path("elsewhere/claude");
+    let work = m.path("acct/.claude-work");
+    let mut inputs = m.inputs();
+    inputs.cli_claude_home = Some(listed.clone());
+    inputs.env.claude_config_dir = Some(work.to_string_lossy().into_owned());
+    let r = resolved(&inputs);
+
+    let home = claude_home_under(&r, Some(&work));
+    assert_eq!(home.root(), listed);
+    assert_eq!(home.trust_registry_path(), work.join(".claude.json"));
+
+    // Not `<elsewhere>/.claude.json`, the sibling of the listed root.
+    let home = claude_home_under(&r, None);
+    assert_eq!(home.root(), listed);
+    assert_ne!(home.trust_registry_path(), m.path("elsewhere/.claude.json"));
+    if let Some(user_home) = dirs::home_dir() {
+        assert_eq!(home.trust_registry_path(), user_home.join(".claude.json"));
+    }
+}
+
+#[test]
+fn an_empty_claude_config_dir_is_the_unset_default_for_the_trust_registry() {
+    let m = Machine::new();
+    let r = resolved(&m.inputs());
+    let home = r
+        .claude_home_in(|key| (key == "CLAUDE_CONFIG_DIR").then(String::new))
+        .unwrap();
+    assert!(home.trust_registry_path().ends_with(".claude.json"));
+    if let Some(user_home) = dirs::home_dir() {
+        assert_eq!(home.trust_registry_path(), user_home.join(".claude.json"));
+    }
+}
+
 // --- the platform's own locations are made absolute like everything else --------
 
 #[test]

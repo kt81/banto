@@ -1121,7 +1121,9 @@ that is the one thing that would make Claude Code report over the same protocol
 
 **Directory trust** (`crate::directory_trust`, advisory-only, read-only): banto
 reads Claude Code's own record of whether it has been told to trust a directory
-(`~/.claude.json`'s `.projects[<path>].hasTrustDialogAccepted`, keyed by whatever
+(the agent's `.claude.json` — `~/.claude.json`, or inside `$CLAUDE_CONFIG_DIR` when that is
+set, read from banto's own environment whatever `--claude-home` says — its
+`.projects[<path>].hasTrustDialogAccepted`, keyed by whatever
 exact string a past launch happened to pass as cwd, no normalization — the same
 real directory was found stored under both backslash and forward-slash forms
 disagreeing with each other). It **gates nothing**: no keystroke is typed or held

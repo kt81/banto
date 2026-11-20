@@ -81,7 +81,9 @@ fn normalize_path(raw: &str) -> String {
 }
 
 /// Whether Claude Code has already been told to trust `cwd`, read from
-/// `~/.claude.json`'s `.projects[<path>].hasTrustDialogAccepted`. `spawned` is
+/// `.projects[<path>].hasTrustDialogAccepted` in the `.claude.json` the agent
+/// uses (`~/.claude.json`, or inside `$CLAUDE_CONFIG_DIR`; see
+/// [`ClaudeHome::trust_registry_path`]). `spawned` is
 /// `cwd`'s spellings, which the discovery tracker measured at the spawn so no
 /// pass measures them again. `Unknown` on a missing/unopenable/unparsable file
 /// or a document with no `projects` object at all — see the module doc for the
@@ -178,6 +180,48 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(dir.path().join(".claude.json"), registry_text).unwrap();
         ClaudeHome::new(root)
+    }
+
+    /// A registry with one project, the directory the next two tests ask about.
+    const SYNTHETIC_CWD: &str = r"C:\Users\synthetic\Projects\banto";
+    const SYNTHETIC_TRUSTED: &str = r#"{"projects": {"C:\\Users\\synthetic\\Projects\\banto": {"hasTrustDialogAccepted": true}}}"#;
+    const SYNTHETIC_REFUSED: &str = r#"{"projects": {"C:\\Users\\synthetic\\Projects\\banto": {"hasTrustDialogAccepted": false}}}"#;
+
+    /// The home an agent with `CLAUDE_CONFIG_DIR=<work>` has.
+    fn home_with_config_dir(work: &Path) -> ClaudeHome {
+        let value = work.to_string_lossy().into_owned();
+        ClaudeHome::default_home_from_env(move |key| {
+            (key == "CLAUDE_CONFIG_DIR").then(|| value.clone())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_claude_config_dir_is_read_from_inside_that_directory_not_beside_it() {
+        // The multi-account layout: the work account's file is in its own
+        // directory, and `<parent>/.claude.json` is another account's, which here
+        // trusts the directory the work account has refused.
+        let dir = TempDir::new().unwrap();
+        let work = dir.path().join(".claude-work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join(".claude.json"), SYNTHETIC_REFUSED).unwrap();
+        std::fs::write(dir.path().join(".claude.json"), SYNTHETIC_TRUSTED).unwrap();
+        assert_eq!(
+            trust(&home_with_config_dir(&work), Path::new(SYNTHETIC_CWD)),
+            DirectoryTrust::NotTrusted
+        );
+    }
+
+    #[test]
+    fn a_missing_registry_under_a_claude_config_dir_is_unknown_not_the_neighbours_answer() {
+        let dir = TempDir::new().unwrap();
+        let work = dir.path().join(".claude-work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(dir.path().join(".claude.json"), SYNTHETIC_TRUSTED).unwrap();
+        assert_eq!(
+            trust(&home_with_config_dir(&work), Path::new(SYNTHETIC_CWD)),
+            DirectoryTrust::Unknown
+        );
     }
 
     #[test]
