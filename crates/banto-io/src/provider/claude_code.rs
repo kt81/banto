@@ -24,8 +24,43 @@ use crate::file_identity::DirectorySpellings;
 use banto_core::model::{AgentKind, SessionId, SessionMeta};
 
 /// Maximum number of bytes read from the head of each session file.
-/// Titles and cwd appear in the first few records, so this is plenty.
+///
+/// The cwd and a `custom-title` sit in the first few records, but an
+/// `ai-title` does not any more. Measured over 62 real transcripts that had
+/// one: in the 14 from Claude Code 2.1.202 through 2.1.209 it was within the
+/// first 32153 bytes; the one from 2.1.227 had it at byte 421969; of the 47
+/// from 2.1.318 on, 13 had it inside this cap (the earliest at byte 455), the
+/// median sat at byte 283781 and the latest at byte 1057871, behind
+/// `attachment` and `api-request-blob` records. Nothing was measured between
+/// 2.1.227 and 2.1.318, so where it moved is not known. A head of 512 KiB
+/// would cost about half again as much parse time per file and still miss that
+/// last one, which is why the part of the file past this cap is searched for
+/// the title by [`scan_for_ai_title`] instead of by widening this.
 const HEAD_CAP_BYTES: u64 = 256 * 1024;
+
+/// How far past the head's kept text [`scan_for_ai_title`] looks for the first
+/// `ai-title` record: a line is considered when it *starts* within this many
+/// bytes, and the read is cut off at this plus [`AI_TITLE_LINE_MAX_BYTES`] and
+/// one, so the last such line can be read whole. The latest first offset in the
+/// measurement behind [`HEAD_CAP_BYTES`] was 1057871 bytes into the file, so
+/// this leaves room for one that lands well beyond it.
+const AI_TITLE_SCAN_CAP_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Buffer size of that scan's reader. The default 8 KiB would make a 2 MiB
+/// window cost a few hundred reads instead of a few.
+const AI_TITLE_SCAN_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Longest line [`scan_for_ai_title`] will parse, newline not counted. A real
+/// `ai-title` record is a few hundred bytes. Of a longer line only this many
+/// bytes and one more are copied into memory, the rest is passed over where it
+/// lies, and it is not parsed, whatever it begins with.
+const AI_TITLE_LINE_MAX_BYTES: usize = 64 * 1024;
+
+/// What an `ai-title` record's line begins with. Tested on a whole line, never
+/// searched for inside a buffer: a raw newline cannot occur inside a JSON
+/// string (it is written `\n`), so text that quotes such a record inside
+/// another record's content can never be at the start of a line.
+const AI_TITLE_LINE_START: &[u8] = b"{\"type\":\"ai-title\"";
 
 /// Maximum number of bytes read from the tail of a session file larger than
 /// [`HEAD_CAP_BYTES`], to catch a `custom-title` record a rename (`/rename`)
@@ -160,7 +195,7 @@ impl SessionProvider for ClaudeCodeProvider {
                 let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let Ok(head) = read_head(&path, HEAD_CAP_BYTES) else {
+                let Ok((head, _)) = read_head(&path, HEAD_CAP_BYTES) else {
                     continue;
                 };
                 let fields = extract_head_fields(&head);
@@ -214,7 +249,7 @@ fn parse_session(path: &Path, mtime: SystemTime, size: u64) -> Parsed {
     let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return Parsed::Settled(None);
     };
-    let Ok(head) = read_head(path, HEAD_CAP_BYTES) else {
+    let Ok((head, head_kept)) = read_head(path, HEAD_CAP_BYTES) else {
         return Parsed::Provisional(None);
     };
     let mut fields = extract_head_fields(&head);
@@ -233,6 +268,23 @@ fn parse_session(path: &Path, mtime: SystemTime, size: u64) -> Parsed {
             // returns — but a title the tail would have overridden is a title
             // this parse did not get to see, so it is not one to remember.
             Err(_) => settled = false,
+        }
+        // Claude Code's own title now usually sits past the head (see
+        // `HEAD_CAP_BYTES`). Only worth looking for when the title would
+        // otherwise be the first user line: a usable custom-title wins over
+        // it wherever it was found, and a usable one already seen in the head
+        // makes the search pointless. "Usable" is what `title_and_source`
+        // accepts, so a blank `customTitle` (an empty one, or a rename that
+        // cleared the title) does not suppress the search. The ai-title is a
+        // different record from the one the tail looks for, so the tail
+        // finding no custom-title says nothing about it.
+        if !fields.has_title_record() {
+            match scan_for_ai_title(path, head_kept, AI_TITLE_SCAN_CAP_BYTES) {
+                Ok(found) => fields.ai_title = found,
+                // Same reason as the tail's: a title this parse failed to look
+                // for must not be remembered as "this file has none".
+                Err(_) => settled = false,
+            }
         }
     }
     let (title, title_is_custom) = fields.title_and_source();
@@ -259,11 +311,16 @@ fn parse_session(path: &Path, mtime: SystemTime, size: u64) -> Parsed {
     }
 }
 
-/// Read at most `cap` bytes from the head of `path` as lossy UTF-8.
+/// Read at most `cap` bytes from the head of `path` as lossy UTF-8, and say
+/// how many bytes of the file that text stands for.
 ///
 /// If the cap is hit, everything after the last newline is dropped so that
-/// a truncated final line is never parsed.
-fn read_head(path: &Path, cap: u64) -> std::io::Result<String> {
+/// a truncated final line is never parsed. The byte count is taken after that
+/// cut, so the next unread byte is always the start of a line (or the start of
+/// the file, when no newline fell inside the cap): that is where
+/// [`scan_for_ai_title`] must begin. Counted in bytes of the file, not of the
+/// returned `String`, which lossy decoding can make longer.
+fn read_head(path: &Path, cap: u64) -> std::io::Result<(String, u64)> {
     let file = File::open(path)?;
     let mut buf = Vec::new();
     file.take(cap).read_to_end(&mut buf)?;
@@ -273,7 +330,80 @@ fn read_head(path: &Path, cap: u64) -> std::io::Result<String> {
             None => buf.clear(),
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let kept = buf.len() as u64;
+    Ok((String::from_utf8_lossy(&buf).into_owned(), kept))
+}
+
+/// The value of the first `ai-title` record starting within `cap` bytes of
+/// byte offset `from`, which must be the start of a line (what [`read_head`]
+/// returns). `Ok(None)` when there is none in that window or the record found
+/// cannot be read; an `Err` means the file could not be.
+///
+/// Line by line, copying and parsing only a line that begins like an
+/// `ai-title` record: the lines in front of it are the large `attachment` and
+/// `api-request-blob` records, and parsing them is what makes a bigger head
+/// expensive. A line that begins like one but does not parse as one is skipped
+/// and the scan goes on, as is a last line with no newline (its writer has not
+/// finished it).
+///
+/// The line ends are found by `read_until` and `skip_until`, not by a search
+/// of ours: std's own memchr is precompiled, so it matches the `memchr` crate
+/// in a release build and beats it in a dev build, where this crate is not
+/// optimised (measured on 31 real transcripts and 2 MiB of synthetic lines
+/// with no hit: 8.0 against 8.1 ms and 0.4 against 1.0 ms in release, 10.4
+/// against 11.4 ms and 0.5 against 1.2 ms in dev). A hand-written search over a
+/// buffer was 5 to 30 times slower in dev. Do not swap it back for either.
+fn scan_for_ai_title(path: &Path, from: u64, cap: u64) -> std::io::Result<Option<String>> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(from))?;
+    // A line that starts inside the window is read to its end, so the file is
+    // cut off at the longest one worth parsing past it. That also bounds how
+    // far `skip_until` can run over a line that never ends.
+    let mut lines = BufReader::with_capacity(
+        AI_TITLE_SCAN_BUFFER_BYTES,
+        file.take(cap + AI_TITLE_LINE_MAX_BYTES as u64 + 1),
+    );
+    let mut line = Vec::new();
+    // Offset of the line about to be read, from `from`.
+    let mut start = 0u64;
+    while start < cap {
+        line.clear();
+        // One byte more than the longest line worth parsing, so that a line
+        // that long cannot be told from one that is cut short, and the rest of
+        // it is not copied.
+        let n = lines
+            .by_ref()
+            .take(AI_TITLE_LINE_MAX_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        start += n as u64;
+        if line.last() != Some(&b'\n') {
+            // Too long to be the record, or the unfinished last line, where
+            // the skip finds nothing more.
+            start += lines.skip_until(b'\n')? as u64;
+        } else if line.starts_with(AI_TITLE_LINE_START)
+            && let Some(title) = ai_title_of(&line)
+        {
+            return Ok(Some(title));
+        }
+    }
+    Ok(None)
+}
+
+/// The `aiTitle` of one line, if it is an `ai-title` record that has one.
+fn ai_title_of(line: &[u8]) -> Option<String> {
+    let record: Value = serde_json::from_slice(line).ok()?;
+    if record.get("type").and_then(Value::as_str) != Some("ai-title") {
+        return None;
+    }
+    record
+        .get("aiTitle")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Read at most `cap` bytes from the tail of `path` as lossy UTF-8.
@@ -355,6 +485,16 @@ impl HeadFields {
             .flatten()
             .find_map(|raw| normalize_single_line(raw, TITLE_MAX_CHARS));
         (title, false)
+    }
+
+    /// Whether [`HeadFields::title_and_source`] would take the title from a
+    /// `custom-title` or an `ai-title` record, that is, from one that is not
+    /// blank, rather than fall back to the first user message.
+    fn has_title_record(&self) -> bool {
+        [&self.custom_title, &self.ai_title]
+            .into_iter()
+            .flatten()
+            .any(|raw| normalize_single_line(raw, TITLE_MAX_CHARS).is_some())
     }
 
     /// The first user message, normalized for the summary panel.
@@ -973,14 +1113,18 @@ mod tests {
     fn records_beyond_head_cap_are_not_parsed() {
         let root = TempDir::new().unwrap();
         // One unterminated garbage line larger than the head cap, followed
-        // by a title record: the title is out of reach, but the session is
-        // still listed with its fs metadata.
+        // by a user record: what it says is out of reach (only an `ai-title`
+        // is searched for past the head, see `scan_for_ai_title`), but the
+        // session is still listed with its fs metadata.
         let mut content = "x".repeat(300 * 1024);
-        content.push_str("\n{\"type\":\"ai-title\",\"aiTitle\":\"unreachable\"}\n");
+        content.push_str(
+            "\n{\"type\":\"user\",\"cwd\":\"/late\",\"message\":{\"content\":\"unreachable\"}}\n",
+        );
         write_session(&root, "proj", "big.jsonl", &content);
         let sessions = discover_sorted(&root);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, None);
+        assert_eq!(sessions[0].cwd, None);
         assert_eq!(sessions[0].size, content.len() as u64);
     }
 
@@ -1374,6 +1518,345 @@ mod tests {
 
         let sessions = discover_sorted(&root);
         assert_eq!(sessions[0].title.as_deref(), Some("only title"));
+    }
+
+    // --- an ai-title past the head (see `HEAD_CAP_BYTES`) -------------------
+
+    const FIRST_LINE: &str = "{\"type\":\"user\",\"message\":{\"content\":\"first line\"}}\n";
+
+    /// One record line of exactly `len` bytes, its newline included, of the
+    /// kind (`attachment`) that sits between a session's start and its title.
+    fn filler_line(len: usize) -> String {
+        let frame = "{\"type\":\"attachment\",\"data\":\"\"}\n".len();
+        format!(
+            "{{\"type\":\"attachment\",\"data\":\"{}\"}}\n",
+            "x".repeat(len - frame)
+        )
+    }
+
+    fn ai_title_record(title: &str) -> String {
+        format!("{{\"type\":\"ai-title\",\"aiTitle\":\"{title}\",\"sessionId\":\"s1\"}}\n")
+    }
+
+    /// The first user line, one filler record `gap` bytes long, then `after`.
+    /// With `gap` over the head cap the head keeps only the first line, so the
+    /// record that follows the filler starts exactly `gap` bytes past where the
+    /// scan begins.
+    fn session_with_gap(gap: usize, after: &str) -> String {
+        format!("{FIRST_LINE}{}{after}", filler_line(gap))
+    }
+
+    fn only_session(root: &TempDir, content: &str) -> SessionMeta {
+        write_session(root, "proj", "s1.jsonl", content);
+        let mut sessions = discover_sorted(root);
+        assert_eq!(sessions.len(), 1);
+        sessions.remove(0)
+    }
+
+    #[test]
+    fn an_ai_title_past_the_head_is_found() {
+        let root = TempDir::new().unwrap();
+        let content = session_with_gap(
+            HEAD_CAP_BYTES as usize + 4096,
+            &format!(
+                "{}{}",
+                ai_title_record("Claude's title"),
+                filler_line(70 * 1024)
+            ),
+        );
+        let meta = only_session(&root, &content);
+
+        assert_eq!(meta.title.as_deref(), Some("Claude's title"));
+        assert!(
+            !meta.title_is_custom,
+            "a title Claude derived is not one the operator gave"
+        );
+        // The first user line is still the preview, whatever names the row.
+        assert_eq!(meta.preview.as_deref(), Some("first line"));
+    }
+
+    #[test]
+    fn an_ai_title_starting_inside_the_scan_cap_is_found_and_one_at_the_cap_is_not() {
+        // The head keeps `FIRST_LINE` alone (the filler is one line longer than
+        // the cap), so the record after the filler starts exactly `gap` bytes
+        // into the window.
+        let cap = AI_TITLE_SCAN_CAP_BYTES as usize;
+        let inside = only_session(
+            &TempDir::new().unwrap(),
+            &session_with_gap(cap - 1, &ai_title_record("inside")),
+        );
+        assert_eq!(inside.title.as_deref(), Some("inside"));
+
+        let at_cap = only_session(
+            &TempDir::new().unwrap(),
+            &session_with_gap(cap, &ai_title_record("beyond")),
+        );
+        assert_eq!(
+            at_cap.title.as_deref(),
+            Some("first line"),
+            "a record starting at the cap is outside the window"
+        );
+    }
+
+    #[test]
+    fn an_ai_title_far_past_the_scan_cap_is_not_looked_for() {
+        let root = TempDir::new().unwrap();
+        let meta = only_session(
+            &root,
+            &session_with_gap(
+                AI_TITLE_SCAN_CAP_BYTES as usize + 1024 * 1024,
+                &ai_title_record("too far"),
+            ),
+        );
+        assert_eq!(meta.title.as_deref(), Some("first line"));
+    }
+
+    #[test]
+    fn a_custom_title_still_wins_over_an_ai_title_past_the_head() {
+        // Renamed later: the custom-title is in the tail, the ai-title between.
+        let root = TempDir::new().unwrap();
+        let later = only_session(
+            &root,
+            &session_with_gap(
+                HEAD_CAP_BYTES as usize + 4096,
+                &format!(
+                    "{}{}",
+                    ai_title_record("derived"),
+                    "{\"type\":\"custom-title\",\"customTitle\":\"given\"}\n"
+                ),
+            ),
+        );
+        assert_eq!(later.title.as_deref(), Some("given"));
+        assert!(later.title_is_custom);
+
+        // Renamed at the start: the head has it and nothing is scanned for.
+        let early = only_session(
+            &TempDir::new().unwrap(),
+            &format!(
+                "{{\"type\":\"custom-title\",\"customTitle\":\"given early\"}}\n{}",
+                session_with_gap(HEAD_CAP_BYTES as usize + 4096, &ai_title_record("derived"))
+            ),
+        );
+        assert_eq!(early.title.as_deref(), Some("given early"));
+        assert!(early.title_is_custom);
+    }
+
+    #[test]
+    fn a_large_file_with_no_ai_title_falls_back_to_the_first_user_line() {
+        let root = TempDir::new().unwrap();
+        let meta = only_session(
+            &root,
+            &session_with_gap(HEAD_CAP_BYTES as usize + 4096, &filler_line(4096)),
+        );
+        assert_eq!(meta.title.as_deref(), Some("first line"));
+        assert!(!meta.title_is_custom);
+    }
+
+    #[test]
+    fn the_head_is_cut_on_a_line_boundary_and_says_how_much_it_kept() {
+        let root = TempDir::new().unwrap();
+        // 100-byte lines whose 100th does not fit the cap evenly, so the cut
+        // falls inside one.
+        let line = filler_line(100);
+        let content = line.repeat(10) + &filler_line(500);
+        let path = write_session(&root, "proj", "cut.jsonl", &content);
+
+        let (head, kept) = read_head(&path, 1050).unwrap();
+        assert_eq!(
+            kept, 1000,
+            "the 11th line is cut by the cap, so it is dropped"
+        );
+        assert_eq!(head.len() as u64, kept);
+        assert!(head.ends_with('\n'));
+        assert_eq!(
+            content.as_bytes()[kept as usize],
+            b'{',
+            "the next byte starts a record"
+        );
+
+        // A file the cap does not reach is kept whole.
+        let (head, kept) = read_head(&path, 1 << 20).unwrap();
+        assert_eq!(
+            (head.len() as u64, kept),
+            (content.len() as u64, content.len() as u64)
+        );
+
+        // No newline inside the cap: nothing is kept, and the scan starts at 0.
+        let (head, kept) = read_head(&path, 50).unwrap();
+        assert_eq!((head.as_str(), kept), ("", 0));
+    }
+
+    #[test]
+    fn a_record_straddling_the_head_cap_is_found_whole_by_the_scan() {
+        // The head cuts this record in two, so the head parse never sees it;
+        // the scan must begin where the head's text ended, i.e. at the start of
+        // this very record, and read it whole. Padded lines of 100 bytes put
+        // its start 50 bytes inside the cap and its end past it.
+        let root = TempDir::new().unwrap();
+        let before = filler_line(100).repeat((HEAD_CAP_BYTES as usize - 50) / 100);
+        let straddling = format!(
+            "{{\"type\":\"ai-title\",\"aiTitle\":\"straddles the cap\",\"pad\":\"{}\"}}\n",
+            "p".repeat(200)
+        );
+        let content = format!("{before}{straddling}{}", filler_line(4096));
+        let start = before.len() as u64;
+        assert!(start < HEAD_CAP_BYTES && start + straddling.len() as u64 > HEAD_CAP_BYTES);
+        let meta = only_session(&root, &content);
+
+        assert_eq!(meta.title.as_deref(), Some("straddles the cap"));
+    }
+
+    #[test]
+    fn text_that_quotes_an_ai_title_record_inside_a_json_string_never_matches() {
+        // A newline inside a JSON string is the two characters `\n`, never a
+        // raw line break, so a record's text quoted by another record cannot
+        // begin a line. Three shapes of it, all past the head: a well-formed
+        // string, a line broken by an unescaped quote, and a quotation cut
+        // short.
+        let root = TempDir::new().unwrap();
+        let quoted = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"x\\n{\\\"type\\\":\\\"ai-title\\\",\\\"aiTitle\\\":\\\"fake one\\\"}\"}}\n",
+            "{\"type\":\"user\",\"message\":\"x\\n{\"type\":\"ai-title\",\"aiTitle\":\"fake two\"}\n",
+            "{\"type\":\"attachment\",\"data\":\"a\\n{\\\"type\\\":\\\"ai-title\\\"\"}\n",
+        );
+        let meta = only_session(
+            &root,
+            &session_with_gap(HEAD_CAP_BYTES as usize + 4096, quoted),
+        );
+        assert_eq!(meta.title.as_deref(), Some("first line"));
+
+        // And the real record after them is still the one found.
+        let meta = only_session(
+            &TempDir::new().unwrap(),
+            &session_with_gap(
+                HEAD_CAP_BYTES as usize + 4096,
+                &format!("{quoted}{}", ai_title_record("the real one")),
+            ),
+        );
+        assert_eq!(meta.title.as_deref(), Some("the real one"));
+    }
+
+    #[test]
+    fn a_line_that_begins_like_an_ai_title_but_is_broken_is_skipped() {
+        let root = TempDir::new().unwrap();
+        let meta = only_session(
+            &root,
+            &session_with_gap(
+                HEAD_CAP_BYTES as usize + 4096,
+                &format!(
+                    "{{\"type\":\"ai-title\",\"aiTitle\":\n{{\"type\":\"ai-title\"}}\n{}",
+                    ai_title_record("after the broken ones")
+                ),
+            ),
+        );
+        assert_eq!(meta.title.as_deref(), Some("after the broken ones"));
+    }
+
+    #[test]
+    fn a_last_line_still_being_written_does_not_make_a_title() {
+        // The file ends inside an ai-title record, as a writer's append would
+        // leave it for a moment; the next walk, with a changed size, reads it.
+        let root = TempDir::new().unwrap();
+        let unfinished = "{\"type\":\"ai-title\",\"aiTitle\":\"half";
+        let meta = only_session(
+            &root,
+            &session_with_gap(HEAD_CAP_BYTES as usize + 4096, unfinished),
+        );
+        assert_eq!(meta.title.as_deref(), Some("first line"));
+    }
+
+    #[test]
+    fn a_record_that_begins_like_an_ai_title_but_runs_on_for_ever_is_not_followed() {
+        let root = TempDir::new().unwrap();
+        let huge = format!(
+            "{{\"type\":\"ai-title\",\"aiTitle\":\"too long a line\",\"pad\":\"{}\"}}\n",
+            "p".repeat(AI_TITLE_LINE_MAX_BYTES + 1)
+        );
+        let meta = only_session(
+            &root,
+            &session_with_gap(HEAD_CAP_BYTES as usize + 4096, &huge),
+        );
+        assert_eq!(meta.title.as_deref(), Some("first line"));
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_skipped_and_still_counts_toward_the_window() {
+        // The skip over the rest of such a line must add what it passed to the
+        // offset, or a record behind it would be judged against the wrong end
+        // of the window.
+        let cap = AI_TITLE_SCAN_CAP_BYTES as usize;
+        let gap = HEAD_CAP_BYTES as usize + 4096;
+        let giant = |len: usize| {
+            let (open, close) = ("{\"type\":\"ai-title\",\"pad\":\"", "\"}\n");
+            format!(
+                "{open}{}{close}",
+                "p".repeat(len - open.len() - close.len())
+            )
+        };
+        for (record_start, expected) in [(cap - 1, "found"), (cap, "first line")] {
+            let content = session_with_gap(
+                gap,
+                &format!("{}{}", giant(record_start - gap), ai_title_record("found")),
+            );
+            let meta = only_session(&TempDir::new().unwrap(), &content);
+            assert_eq!(meta.title.as_deref(), Some(expected), "at {record_start}");
+        }
+    }
+
+    // `title_and_source` skips a custom-title that normalizes to nothing, so
+    // the ai-title past the head is the title and must be looked for.
+
+    #[test]
+    fn a_blank_custom_title_in_the_head_does_not_stop_the_search_for_an_ai_title() {
+        let content = format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"\"}}\n{}",
+            session_with_gap(
+                HEAD_CAP_BYTES as usize + 4096,
+                &ai_title_record("Claude's title")
+            )
+        );
+        let meta = only_session(&TempDir::new().unwrap(), &content);
+        assert_eq!(meta.title.as_deref(), Some("Claude's title"));
+        assert!(!meta.title_is_custom);
+    }
+
+    #[test]
+    fn a_rename_to_nothing_in_the_tail_does_not_stop_the_search_for_an_ai_title() {
+        // The operator cleared the title after Claude had written one.
+        let content = session_with_gap(
+            HEAD_CAP_BYTES as usize + 4096,
+            &format!(
+                "{}{}{{\"type\":\"custom-title\",\"customTitle\":\"  \"}}\n",
+                ai_title_record("Claude's title"),
+                filler_line(70 * 1024),
+            ),
+        );
+        let meta = only_session(&TempDir::new().unwrap(), &content);
+        assert_eq!(meta.title.as_deref(), Some("Claude's title"));
+        assert!(!meta.title_is_custom);
+    }
+
+    #[test]
+    fn a_record_exactly_as_long_as_the_limit_is_parsed_and_one_byte_longer_is_not() {
+        let line = |len: usize| {
+            let (open, close) = (
+                "{\"type\":\"ai-title\",\"aiTitle\":\"exact\",\"pad\":\"",
+                "\"}\n",
+            );
+            format!(
+                "{open}{}{close}",
+                "p".repeat(len - open.len() - close.len())
+            )
+        };
+        // The limit counts the line without its newline.
+        for (len, expected) in [
+            (AI_TITLE_LINE_MAX_BYTES + 1, "exact"),
+            (AI_TITLE_LINE_MAX_BYTES + 2, "first line"),
+        ] {
+            let content = session_with_gap(HEAD_CAP_BYTES as usize + 4096, &line(len));
+            let meta = only_session(&TempDir::new().unwrap(), &content);
+            assert_eq!(meta.title.as_deref(), Some(expected), "{len} bytes");
+        }
     }
 
     // --- the memoized walk (see `super::super::cache`) --------------------
