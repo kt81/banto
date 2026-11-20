@@ -46,6 +46,25 @@ multiplexer cannot carry what banto does with them: a ledger beside the
 panes, sessions that know which cell they belong to, messages relayed between
 them.
 
+## Why not just herdr?
+
+[herdr](https://github.com/herdrdev/herdr) is a terminal multiplexer built for
+coding agents: a background server owns the panes, you detach and come back
+later, and it shows which of more than twenty agents is working, blocked or
+idle. If what you want is many agents of any kind kept alive across detaches,
+machines and SSH connections, it does that, and banto does not.
+
+banto's subject is the session, not the terminal. It reads Claude Code's and
+Codex's own files, read-only, so it knows sessions you started before banto
+existed or outside it, which of them are still running, and which one you
+meant; it never writes to either agent's home, and it will not resume one
+conversation twice. herdr learns a session's id from the agent running in its
+own pane, through a hook its integration installs in the agent's
+configuration. banto also hosts Director/Worker cells in which it relays
+messages between the sessions itself, where herdr hands scripts and agents a
+CLI and socket API to drive each other. The trade: banto speaks two agents and
+has no server that outlives it.
+
 ## What it does
 
 The ledger on the left has a name: the **chōba** (帳場, "the shop counter") —
