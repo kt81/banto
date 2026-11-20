@@ -199,7 +199,7 @@ fn prefix_x_on_a_worker_with_a_real_key_dismisses_it_after_one_confirmation() {
         },
         t,
     ));
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }]);
+    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }, Cmd::Reload]);
     assert!(matches!(&state.stage, Stage::Brigade { panes, .. } if !panes.contains(&key("w1"))));
     assert!(
         status(&state).ends_with("dismissed from the brigade"),
@@ -248,9 +248,12 @@ fn prefix_x_on_a_worker_with_a_synthetic_key_dismisses_it_directly() {
     ));
     assert_eq!(
         cmds,
-        vec![Cmd::KillPty {
-            key: synthetic.clone()
-        }]
+        vec![
+            Cmd::KillPty {
+                key: synthetic.clone()
+            },
+            Cmd::Reload
+        ]
     );
     assert!(matches!(&state.stage, Stage::Brigade { panes, .. } if !panes.contains(&synthetic)));
 }
@@ -527,7 +530,8 @@ fn an_exit_banto_asked_for_removes_nobody_whatever_asked() {
         t,
     ));
     assert!(
-        cmds.iter().all(|cmd| matches!(cmd, Cmd::KillPty { .. })),
+        cmds.iter()
+            .all(|cmd| matches!(cmd, Cmd::KillPty { .. } | Cmd::Reload)),
         "{cmds:?}"
     );
     for id in ["w1", "w2"] {
@@ -923,4 +927,153 @@ fn lost_output_of_a_director_being_reopened_waits_for_confirmed_exit() {
         ),
         "{cmds:?}"
     );
+}
+
+// A dismissed Goinkyo's session is archived by the store in the same write that
+// removes its row, and a row's `archived` mark is only ever set by a reload. So
+// every answer that un-hides a row asks for the reload that marks it; these are
+// the arms that can.
+
+fn hidden(ids: &[&str]) -> HashSet<String> {
+    ids.iter().map(|id| id.to_string()).collect()
+}
+
+#[test]
+fn a_dismissal_answer_reloads_whether_or_not_the_pane_was_staged() {
+    let (mut state, mut app) = brigade(&["g1"]);
+    app.set_hidden_member_ids(hidden(&["g1"]));
+    // The Goinkyo's pane is not one of the staged ones.
+    state.pending_dismiss = Some(key("g1"));
+    let cmds = without_resizes(send(
+        &mut state,
+        &mut app,
+        Event::WorkerDismissed {
+            brigade_id: 1,
+            result: Ok((HashSet::new(), HashSet::new())),
+        },
+        now(),
+    ));
+    assert_eq!(cmds, vec![Cmd::Reload]);
+    assert_eq!(app.filtered_len(), 2, "the row is listed again");
+}
+
+#[test]
+fn a_dismissal_that_failed_reloads_nothing() {
+    let (mut state, mut app) = brigade(&["g1"]);
+    app.set_hidden_member_ids(hidden(&["g1"]));
+    state.pending_dismiss = Some(key("g1"));
+    let cmds = without_resizes(send(
+        &mut state,
+        &mut app,
+        Event::WorkerDismissed {
+            brigade_id: 1,
+            result: Err("disk full".to_string()),
+        },
+        now(),
+    ));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert_eq!(app.filtered_len(), 1, "the row stays hidden");
+}
+
+#[test]
+fn a_disband_that_failed_reloads_nothing() {
+    let (mut state, mut app) = brigade(&[]);
+    let cmds = without_resizes(send(
+        &mut state,
+        &mut app,
+        Event::Disbanded {
+            brigade_id: 1,
+            result: Err("disk full".to_string()),
+        },
+        now(),
+    ));
+    assert!(cmds.is_empty(), "{cmds:?}");
+}
+
+#[test]
+fn an_exited_worker_answer_reloads_only_when_it_released_a_hidden_id() {
+    // The row released here is the stand-in for a Goinkyo the Director ended
+    // from its own process: nothing in this process asked for the reload.
+    let (mut state, mut app) = brigade(&["g1", "w1"]);
+    app.set_hidden_member_ids(hidden(&["g1", "w1"]));
+    let released = without_resizes(send(
+        &mut state,
+        &mut app,
+        Event::ExitedWorkerDismissed {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            repeated: false,
+            result: Ok((true, hidden(&["w1"]), HashSet::new())),
+        },
+        now(),
+    ));
+    assert_eq!(released, vec![Cmd::Reload]);
+
+    let unchanged = without_resizes(send(
+        &mut state,
+        &mut app,
+        Event::ExitedWorkerDismissed {
+            brigade_id: 1,
+            token: "worker-2".to_string(),
+            repeated: false,
+            result: Ok((true, hidden(&["w1"]), HashSet::new())),
+        },
+        now(),
+    ));
+    assert!(unchanged.is_empty(), "{unchanged:?}");
+}
+
+#[test]
+fn a_recorded_member_session_reloads_only_when_it_released_a_hidden_id() {
+    let (mut state, mut app) = brigade(&["g1", "w1"]);
+    app.set_hidden_member_ids(hidden(&["g1"]));
+    let record = |state: &mut EmporiumState, app: &mut App, ids: &[&str]| {
+        without_resizes(send(
+            state,
+            app,
+            Event::MemberSessionRecorded {
+                hidden: hidden(ids),
+                directors: HashSet::new(),
+            },
+            now(),
+        ))
+    };
+
+    // A Worker's id arriving only grows the set: nothing came out of hiding.
+    assert!(record(&mut state, &mut app, &["g1", "w1"]).is_empty());
+    // Nothing changed.
+    assert!(record(&mut state, &mut app, &["g1", "w1"]).is_empty());
+    // The Goinkyo's row was removed from the other process: its id is gone.
+    assert_eq!(record(&mut state, &mut app, &["w1"]), vec![Cmd::Reload]);
+    assert!(record(&mut state, &mut app, &["w1"]).is_empty());
+}
+
+#[test]
+fn a_goinkyo_row_gone_reloads_once_not_on_every_tick_that_finds_it_gone() {
+    // The observation is sent every tick for any brigade with a hosted Director
+    // and no Goinkyo row, which is every ordinary brigade; the reload belongs to
+    // the one tick that finds a pane to release.
+    let (mut state, mut app) = brigade(&[]);
+    let gone = |state: &mut EmporiumState, app: &mut App| {
+        without_resizes(send(
+            state,
+            app,
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::NoGoinkyo { brigade_id: 1 },
+            },
+            now(),
+        ))
+    };
+    // A brigade that never had a consultation: every tick, nothing.
+    for _ in 0..3 {
+        assert!(gone(&mut state, &mut app).is_empty());
+    }
+
+    state.goinkyo_pane.insert(1, key("g1"));
+    let first = gone(&mut state, &mut app);
+    assert_eq!(first.last(), Some(&Cmd::Reload), "{first:?}");
+    for _ in 0..3 {
+        let later = gone(&mut state, &mut app);
+        assert!(later.is_empty(), "{later:?}");
+    }
 }

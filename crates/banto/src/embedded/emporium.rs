@@ -400,11 +400,12 @@ pub fn run(
     let (rows, pinned, groups, session_groups, hidden, directors) = {
         let store = store.borrow();
         let rows = session::rows_from_metas(metas, claude_home, codex_home, thresholds);
+        // Before the archive marks, for the reason `gather_reload` gives.
+        let hidden = crate::session::load_hidden_member_ids(&store);
         let rows = crate::session::mark_archived(rows, &store);
         let pinned = crate::session::load_pinned(&store);
         let groups = crate::session::load_groups(&store);
         let session_groups = crate::session::load_session_groups(&store, &groups);
-        let hidden = crate::session::load_hidden_member_ids(&store);
         let directors = crate::session::load_directors(&store);
         (rows, pinned, groups, session_groups, hidden, directors)
     };
@@ -2102,8 +2103,18 @@ fn gather_reload(deps: &Deps) -> Vec<Event> {
     };
     let store = deps.store.borrow();
     let rows = session::rows_from_metas(metas, deps.claude_home, deps.codex_home, deps.thresholds);
-    let rows = crate::session::mark_archived(rows, &store);
+    // The hidden member ids come BEFORE the archive marks, and an innocent
+    // reorder would reintroduce a race. The Director's `_mcp` process ends a
+    // Goinkyo with one transaction that deletes its member row and archives its
+    // session (`Store::dismiss_worker`), so a reader sees both or neither, but
+    // these are two separate reads on a store in rollback-journal mode, each
+    // seeing whatever is committed when it runs. Hidden first: a dismissal that
+    // lands between them leaves the id hidden *and* archived (stale, mended by
+    // the next refresh), never the other combination. Marks first would let it
+    // land in between and yield an id no longer hidden but not marked, listed
+    // as an ordinary row, with nothing asking for another reload.
     let hidden = crate::session::load_hidden_member_ids(&store);
+    let rows = crate::session::mark_archived(rows, &store);
     let directors = crate::session::load_directors(&store);
     vec![Event::RowsLoaded {
         rows,

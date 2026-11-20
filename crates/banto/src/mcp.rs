@@ -1185,6 +1185,12 @@ fn tool_consult_goinkyo(ctx: &mut ServerContext, msg: &Value) -> Value {
 /// engine types built around the same operator-driven flow) is a separate,
 /// larger question flagged to the Director rather than folded in here.
 ///
+/// The Goinkyo's session is archived by that same call, in the transaction
+/// that removes its row (`dismiss_worker`'s own doc says why): this process
+/// shares only the store with the emporium, so the emporium learns of it
+/// through the store like everything else here, and marks the row at its next
+/// reload.
+///
 /// The Goinkyo's own replies survive this: `dismiss_worker` purges mail
 /// *addressed to* the dismissed token, and a Goinkyo's own message is never
 /// that — `BrigadeRole::Goinkyo::addressability` names the Director as its
@@ -4244,6 +4250,32 @@ mod tests {
                 .iter()
                 .any(|m| m.role == BrigadeRole::Goinkyo),
             "the Goinkyo row must be gone"
+        );
+    }
+
+    #[test]
+    fn dismiss_goinkyo_archives_the_session_the_goinkyo_row_held() {
+        let mut ctx = ctx(
+            "dir",
+            Some(1),
+            Some("director"),
+            Some(BrigadeRole::Director),
+        );
+        ctx.store
+            .add_brigade_member(
+                1,
+                "goinkyo",
+                BrigadeRole::Goinkyo,
+                Some(&SessionId("g1".to_string())),
+            )
+            .unwrap();
+
+        let response = call(&mut ctx, &dismiss_call());
+
+        assert_eq!(response["result"]["isError"], false, "got {response:?}");
+        assert_eq!(
+            ctx.store.archived_ids().unwrap(),
+            [SessionId("g1".to_string())]
         );
     }
 

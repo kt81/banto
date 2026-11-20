@@ -1645,7 +1645,7 @@ A Worker added later gets the mean of the others' height.
 | … `1`-`9` | jump to pane N |
 | … `s` | back to the sidebar |
 | … `Esc` | cancel the prefix: nothing else happens — focus stays, nothing reaches the child |
-| … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted); on a Director or a single session, end its process (confirm) |
+| … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted; a Goinkyo's session is archived, see "Ending a consultation"); on a Director or a single session, end its process (confirm) |
 | … `b`/`Ctrl+B` | send a literal prefix chord through to the child |
 
 While the prefix is armed, the status bar shows the full binding table.
@@ -2360,6 +2360,53 @@ pane at once and forgets what the core kept for the token — the tick's later
 is already gone (a no-op). Neither removes the consultation's request file at
 once; the data directory sweep does (see "Working files of ended members"
 below), and the next consultation overwrites it in the meantime.
+
+**The Goinkyo's session is archived when its row goes.** Once the row is
+deleted nothing hides the session any more, and it would come back to the list as
+an ordinary row titled with banto's own kickoff sentence ("[banto] This pane just
+started as your brigade's Goinkyo."); the operator had been burying every one of
+them by hand with `d`. So `Store::dismiss_worker` and `Store::delete_brigade`
+(a disband takes an open consultation with it) insert the id into the `archived`
+table in the same transaction that deletes the row, with the statement
+`archive_session` uses, so an id already archived keeps its first archive time.
+The role and the id are read from the row inside that transaction, never from the
+token the caller passed: the exited-Worker path comes through `dismiss_worker`
+too, and a Worker's session is never archived. The row is then listed only at the
+archive level (`a`), marked as any archived row is, and `D` restores one session.
+Because the archive is part of the removal, the core asks for a reload with every
+answer that un-hides the row (the prefix-`x` answer and the disband answer
+always; the answers that merely refresh the hidden set — a member's session being
+recorded, an exited Worker's removal — when an id left it, which is how a
+consultation the Director ended from its own process is marked): the mark is only
+ever set by a reload, and without one the row would be listed unmarked until the
+next. The tick that finds a Director-ended consultation's row gone and releases
+its pane asks for one too — once per consultation, since only the tick that finds
+a pane still tracked gets that far — so its session does not stay hidden until
+some unrelated reload. A Goinkyo whose pane had already died is not tracked any
+more, so it gets no such reload: its session waits for the next one (any
+transcript write under the agent homes brings it, the filesystem watch debounced
+by 250ms) and is hidden at every reveal level until then. A reload reads the hidden member ids before the archive
+marks: the dismissal writes both in one transaction, and this order can only ever
+see an id hidden and archived (stale), never unhidden and unmarked.
+
+This is always on and has no setting: it is the operator's standing instruction
+(2026-11-20) for what a dismissed consultation leaves behind. Three things follow
+from how it is done:
+
+- The `archived` table holds one fact per session and cannot tell the
+  operator's `d` from banto's archive, so "restore every consultation" cannot be
+  answered from it; `D` restores the sessions one at a time.
+- Some Goinkyo sessions stay unarchived and show as ordinary rows: one
+  dismissed before a session id was bound to its row (it has no session to bury
+  yet), and an *earlier* id of one whose session moved in place — `/clear` in its
+  pane replaces the id its row holds (`MemberSessionForked`), and only the id the
+  row holds at removal is archived. The operator buries those with `d`.
+- A wrong binding archives the wrong session. A Claude pane's session is bound
+  by the process id its live file names; only when that finds nothing does
+  discovery falls back to a session that appeared in the pane's directory since
+  it was spawned (`poll_discovery`). A session the operator started in the same
+  directory in that window could be bound to the Goinkyo, and would be archived
+  at its dismissal; it is not deleted, and `D` restores it.
 
 That dialog decides in two separate stages, not one, both role-based now:
 *whether the confirm dismisses* anything reads the focused pane's member token

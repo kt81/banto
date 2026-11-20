@@ -244,7 +244,9 @@ pub struct SessionRow {
     /// session, rather than the user starting it interactively. See
     /// [`SessionMeta::is_agent`].
     pub is_agent: bool,
-    /// True when the operator archived this session in banto (`d`), which is
+    /// True when this session is archived in banto: by the operator (`d`), or by
+    /// banto itself for a dismissed Goinkyo's session, on the operator's standing
+    /// instruction. The store keeps no record of which of the two did it. It is
     /// banto's own per-session fact and reversible from within banto (`D`) —
     /// unlike [`Self::source_archived`], which the source product owns and
     /// banto can only ever read. A row carrying this is listed only at

@@ -212,8 +212,9 @@ fn row_line(
     } else {
         visible.row.activity
     });
-    // Archived outranks the rest: it is the only class here the operator put
-    // on the row themselves, and the only one a key (`D`) acts on. Rows at
+    // Archived outranks the rest: it is the only class here the operator chose
+    // (with `d`, or by telling banto to archive a dismissed Goinkyo's session),
+    // and the only one a key (`D`) acts on. Rows at
     // `Reveal::Archived` sit mixed in among ordinary ones, so without this
     // the level that exists to show what was buried cannot say which rows
     // those are.

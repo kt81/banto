@@ -170,9 +170,11 @@ pub enum Modal {
 /// The order is the taxonomy, not a preference: **who hid a row decides
 /// where it reappears.** `Hidden` reveals what banto hid on its own
 /// judgment — agent-run sessions, presumed noise.
-/// `Archived` additionally reveals what the *operator* buried one row at a
-/// time with `d`, which is a different kind of fact and so sits a step
-/// further in rather than beside it.
+/// `Archived` additionally reveals what the *operator* buried: one row at a
+/// time with `d`, and a dismissed Goinkyo's session, which banto archives
+/// itself on the operator's standing instruction. That is a different kind of
+/// fact from banto's own judgment and so sits a step further in rather than
+/// beside it. (The archive cannot say which of the two buried a row.)
 ///
 /// Monotonic on purpose: each level is a strict superset of the one before,
 /// so the count of what is still hidden means the same thing at every step
@@ -188,7 +190,7 @@ pub enum Reveal {
     Ordinary,
     /// Plus what banto hid: agent-run sessions.
     Hidden,
-    /// Plus what the operator archived.
+    /// Plus what the operator archived, or told banto to archive.
     Archived,
 }
 
@@ -908,8 +910,8 @@ pub struct App {
     /// costs a lookup: every staged tile asks for its row on every frame.
     row_index: HashMap<String, usize>,
     /// Claude session ids of brigade Workers and Goinkyos (while still a
-    /// member of one — see `Store::brigade_hidden_session_ids`'s own doc for
-    /// why a Goinkyo drops out on dismissal instead of staying hidden),
+    /// member of one — a dismissed Goinkyo's row is gone, its session archived
+    /// instead: see `Store::brigade_hidden_session_ids`'s own doc),
     /// hidden from `filtered` (see [`Self::compute_filtered`]) — both are
     /// banto's own implementation detail, not a session the user picks
     /// directly; the Director is deliberately not in this set, since that
@@ -1691,11 +1693,17 @@ impl App {
 
     /// Replace the hidden-member-id set (e.g. after a reload, or once a
     /// brigade is formed/disbanded), keeping the current selection if it's
-    /// still visible.
-    pub fn set_hidden_member_ids(&mut self, hidden: HashSet<String>) {
+    /// still visible. Returns whether an id the old set held is gone from the
+    /// new one: a row that has just come out of hiding. Its `archived` mark is
+    /// only ever set by a reload, and the store may have archived the session
+    /// in the write that released it (a dismissed Goinkyo's), so a caller that
+    /// is not itself carrying rows asks for a reload when this says `true`.
+    pub fn set_hidden_member_ids(&mut self, hidden: HashSet<String>) -> bool {
+        let released = self.hidden.iter().any(|id| !hidden.contains(id));
         self.hidden = hidden;
         let selected_id = self.selected_row().map(|row| row.id.clone());
         self.refilter_keeping_selected(selected_id);
+        released
     }
 
     /// Seed the `Config.agents` setting, resolved (loaded once at startup —

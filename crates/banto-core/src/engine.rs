@@ -1509,7 +1509,8 @@ pub struct EmporiumState {
     /// own token, so both update this entry in place when that token is
     /// `"goinkyo"` and an entry for its brigade already exists — and
     /// dropped (not `Cmd::KillPty`'d — nothing to kill twice) if the pane
-    /// closes on its own first (`update_pty_exited`).
+    /// closes on its own first (`update_pty_exited`, `update_pty_output_lost`),
+    /// which also forgoes the one reload `NoGoinkyo` asks for.
     ///
     /// A disband does reach the `NoGoinkyo` removal above, one tick later:
     /// the gatherer asks about every brigade that has an entry here, and a
@@ -4591,9 +4592,14 @@ pub fn update(
             result,
         } => update_exited_worker_dismissed(state, app, brigade_id, token, repeated, result, now),
         Event::MemberSessionRecorded { hidden, directors } => {
-            app.set_hidden_member_ids(hidden);
+            let released = app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
-            Vec::new()
+            // A row that has just left the hidden set may be a dismissed
+            // Goinkyo's, whose dismissal came from the Director's own process
+            // (`dismiss_goinkyo`) and so never passed through an arm here that
+            // asks for this: its session was archived in that write, and only a
+            // reload marks the row, so without one it would show unmarked.
+            reload_if(released)
         }
         Event::MemberSessionForked {
             brigade_id,
@@ -8906,11 +8912,14 @@ fn update_pty_exited(
     // A Goinkyo pane can close this way without ever being dismissed (its
     // process just dies) — `goinkyo_pane`'s own doc: still discoverable, so a
     // later re-stage resumes it (the member stays; only a Worker that leaves on
-    // its own is removed, `unrequested_worker_exit`). Dropping the entry here is state
-    // hygiene, not correctness (a stale entry only means a future
-    // `NoGoinkyo` tries to unstage/kill an already-gone key, both harmless
-    // no-ops), but leaving it around would be one more stale-value question
-    // a future reader has to work through.
+    // its own is removed, `unrequested_worker_exit`). Dropping the entry keeps a
+    // stale key from being killed or unstaged later, but it is not only hygiene:
+    // `NoGoinkyo` asks for its one reload only on the tick that still finds the
+    // entry. A Goinkyo whose pane died first and is dismissed afterwards from the
+    // Director's own process (`dismiss_goinkyo`) therefore gets no reload from
+    // that arm, and its archived session stays in this process's hidden set until
+    // the next reload, which any transcript write under the agent homes brings
+    // (the watch in `banto_io::watch::live`, debounced 250ms).
     state.goinkyo_pane.retain(|_, pane| *pane != key);
     // A Director-reopen confirm killed exactly this pane and is waiting for
     // it to actually be gone before reopening it wired — see
@@ -9615,6 +9624,10 @@ fn update_worker_added(
 /// the kills flow through the same passive `PtyExited` fold as any other
 /// exit — a killed-but-unstaged member (already gone, or one this stage
 /// never resolved) is simply skipped, nothing to kill.
+///
+/// Every success also asks for a reload, whoever was staged: the members'
+/// sessions come out of hiding here, and a Goinkyo's was archived in the same
+/// write, which only a reload marks on its row.
 fn update_disbanded(
     state: &mut EmporiumState,
     app: &mut App,
@@ -9624,7 +9637,10 @@ fn update_disbanded(
 ) -> Vec<Cmd> {
     match result {
         Ok((hidden, directors)) => {
-            app.set_hidden_member_ids(hidden);
+            // The brigade's Goinkyo, if it had one, was archived in the write
+            // that disbanded it, and its row is un-hidden here: the reload that
+            // follows is what marks it, so it is never listed unmarked.
+            let _ = app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
             let (director_key, other_keys) = if let Stage::Brigade {
                 id,
@@ -9667,10 +9683,12 @@ fn update_disbanded(
             state.request_answered.remove(&brigade_id);
             state.request_spent.remove(&brigade_id);
             state.set_status("brigade disbanded".to_string(), now);
-            other_keys
+            let mut cmds: Vec<Cmd> = other_keys
                 .into_iter()
                 .map(|key| kill_pane(state, key))
-                .collect()
+                .collect();
+            cmds.push(Cmd::Reload);
+            cmds
         }
         Err(err) => {
             // The brigade lives on: its Workers ending are Workers ending again.
@@ -9728,11 +9746,17 @@ fn update_exited_worker_dismissed(
     state.removing_exited.remove(&(brigade_id, token.clone()));
     // Said as the operator knows the member, before its name is forgotten.
     let call = state.member_call(Some(brigade_id), &token);
+    // Only for a Worker, which the store never archives, so this does not mark
+    // anything itself; but the set it refreshes can release a Goinkyo that
+    // `dismiss_goinkyo` ended from the other process (see
+    // `Event::MemberSessionRecorded`).
+    let mut reload = false;
     match result {
         Ok((removed, hidden, directors)) => {
-            app.set_hidden_member_ids(hidden);
+            let released = app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
             forget_dismissed_member(state, brigade_id, &token);
+            reload = released;
             if removed {
                 let again = if repeated { " again" } else { "" };
                 state.set_status(
@@ -9746,7 +9770,7 @@ fn update_exited_worker_dismissed(
             now,
         ),
     }
-    Vec::new()
+    reload_if(reload)
 }
 
 /// On success: remove just the dismissed Worker's pane — unlike
@@ -9759,7 +9783,9 @@ fn update_exited_worker_dismissed(
 /// staged; `Stage::remove` clamps `focused` the same way any other pane
 /// removal does. The kill only fires if the pane was actually found staged
 /// for this brigade — same "already gone, nothing to kill" tolerance as
-/// [`update_disbanded`].
+/// [`update_disbanded`]. Every success also asks for a reload, staged or not,
+/// for the reason [`update_disbanded`] gives: a dismissed Goinkyo's session was
+/// archived by the write, and its row comes out of hiding here.
 fn update_worker_dismissed(
     state: &mut EmporiumState,
     app: &mut App,
@@ -9782,7 +9808,12 @@ fn update_worker_dismissed(
     };
     match result {
         Ok((hidden, directors)) => {
-            app.set_hidden_member_ids(hidden);
+            // A dismissed Goinkyo's session was archived in the write that
+            // removed its row, and the row is un-hidden here: the reload this
+            // returns is what marks it, so it is never listed unmarked. A
+            // Worker's session is not archived, and the same reload is how the
+            // list picks it up as the ordinary row it now is.
+            let _ = app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
             // Forget everything kept under the dismissed member's token: its
             // layout preferences and what its tile shows. Only a dismissal
@@ -9806,9 +9837,9 @@ fn update_worker_dismissed(
             if staged {
                 let kill = kill_pane(state, key.clone());
                 state.unstage(&key);
-                vec![kill]
+                vec![kill, Cmd::Reload]
             } else {
-                Vec::new()
+                vec![Cmd::Reload]
             }
         }
         Err(err) => {
@@ -9816,6 +9847,11 @@ fn update_worker_dismissed(
             Vec::new()
         }
     }
+}
+
+/// `Cmd::Reload` when `yes`, nothing otherwise.
+fn reload_if(yes: bool) -> Vec<Cmd> {
+    if yes { vec![Cmd::Reload] } else { Vec::new() }
 }
 
 /// The widest the quoted first line of a message may be in a status, in
@@ -10722,7 +10758,16 @@ fn update_goinkyo_awaiting_spawn(
             if staged {
                 state.unstage(&key);
             }
-            return vec![kill];
+            // The consultation's end as the Director's own process wrote it
+            // (`dismiss_goinkyo`): that write archived the session and removed
+            // the row, but nothing here refreshed the hidden set, so the session
+            // stays hidden at every reveal level until some unrelated reload.
+            // Asked for here, past the pane's removal, because this arm runs on
+            // every tick for any brigade with no Goinkyo; only the tick that finds
+            // a pane to release gets this far, which is once per consultation. A
+            // consultation whose pane died first has no entry left (see
+            // `update_pty_exited`) and gets no reload from here.
+            return vec![kill, Cmd::Reload];
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
@@ -10785,7 +10830,9 @@ fn update_goinkyo_awaiting_spawn(
         if staged {
             state.unstage(&existing);
         }
-        return vec![kill];
+        // An ended consultation, as in `NoGoinkyo`, and released only once (the
+        // entry is gone): its session was archived and is still hidden here.
+        return vec![kill, Cmd::Reload];
     }
     // A new consultation starts with nothing of the last one's: its end may not
     // have been seen (dismissed and summoned again inside one tick).
@@ -27050,7 +27097,7 @@ mod tests {
             test_instant(),
         );
         assert!(
-            matches!(released.as_slice(), [Cmd::KillPty { key }] if *key == SessionKey::new_worker(6, "goinkyo")),
+            matches!(released.as_slice(), [Cmd::KillPty { key }, Cmd::Reload] if *key == SessionKey::new_worker(6, "goinkyo")),
             "the pane goes with the row, staged or not: {released:?}"
         );
         assert!(!state.goinkyo_pane.contains_key(&6));
@@ -27130,8 +27177,8 @@ mod tests {
             test_instant(),
         );
         assert!(
-            matches!(&end_cmds[..], [Cmd::KillPty { key }] if *key == goinkyo_key),
-            "expected exactly one KillPty for the Goinkyo's own pane, got {end_cmds:?}"
+            matches!(&end_cmds[..], [Cmd::KillPty { key }, Cmd::Reload] if *key == goinkyo_key),
+            "expected exactly one KillPty for the Goinkyo's own pane, then a Reload, got {end_cmds:?}"
         );
         let Stage::Brigade { panes, .. } = &state.stage else {
             panic!("expected the brigade to stay staged — only the one pane leaves");
@@ -27271,9 +27318,12 @@ mod tests {
 
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
-                key: old_key.clone()
-            }],
+            vec![
+                Cmd::KillPty {
+                    key: old_key.clone()
+                },
+                Cmd::Reload
+            ],
             "the stale pane must be torn down, not layered under a fresh spawn"
         );
         let Stage::Brigade { panes, .. } = &state.stage else {
@@ -27367,9 +27417,12 @@ mod tests {
         );
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
-                key: old_key.clone()
-            }],
+            vec![
+                Cmd::KillPty {
+                    key: old_key.clone()
+                },
+                Cmd::Reload
+            ],
             "the stale pane is ended although it is not staged"
         );
         assert!(!state.goinkyo_pane.contains_key(&6));
@@ -27590,9 +27643,12 @@ mod tests {
 
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
-                key: SessionKey::from_id("g1")
-            }]
+            vec![
+                Cmd::KillPty {
+                    key: SessionKey::from_id("g1")
+                },
+                Cmd::Reload
+            ]
         );
         assert!(!state.goinkyo_pane.contains_key(&1));
         let Stage::Brigade { panes, .. } = &state.stage else {
@@ -29409,7 +29465,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }]);
+        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }, Cmd::Reload]);
         // w1 left the hidden set (it's a dismissed member now, honestly
         // surfaced as an ordinary session) — w2 is still hidden.
         assert_eq!(app.filtered_len(), 2);
@@ -29488,11 +29544,12 @@ mod tests {
             now,
         );
 
-        let killed: Vec<&SessionKey> = cmds
+        assert_eq!(cmds.last(), Some(&Cmd::Reload));
+        let killed: Vec<&SessionKey> = cmds[..cmds.len() - 1]
             .iter()
             .map(|cmd| match cmd {
                 Cmd::KillPty { key } => key,
-                _ => panic!("expected only KillPty cmds from a disband"),
+                _ => panic!("expected only KillPty cmds, then a Reload, from a disband"),
             })
             .collect();
         assert_eq!(killed.len(), 2);
@@ -29534,7 +29591,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }]);
+        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }, Cmd::Reload]);
         match &state.stage {
             Stage::Solo(key) => assert_eq!(key, &director),
             _ => panic!("expected the director to remain staged solo"),
@@ -29570,7 +29627,7 @@ mod tests {
             now,
         );
 
-        assert!(cmds.is_empty(), "nobody may be killed: {cmds:?}");
+        assert_eq!(cmds, vec![Cmd::Reload], "nobody may be killed");
         assert!(matches!(state.stage, Stage::Empty));
     }
 
@@ -29593,7 +29650,7 @@ mod tests {
             now,
         );
 
-        assert!(cmds.is_empty());
+        assert_eq!(cmds, vec![Cmd::Reload]);
         assert!(matches!(state.stage, Stage::Empty));
     }
 
@@ -30782,7 +30839,7 @@ mod tests {
             Ok((HashSet::new(), HashSet::new())),
             test_instant(),
         );
-        assert!(matches!(&kill[..], [Cmd::KillPty { key }] if *key == worker));
+        assert!(matches!(&kill[..], [Cmd::KillPty { key }, Cmd::Reload] if *key == worker));
 
         let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
 

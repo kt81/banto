@@ -32,6 +32,7 @@ use banto_core::model::{
     MessageGlance, SessionId, StoredLayout, StoredMemberLayout,
 };
 
+use super::archive::archive_on;
 use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 
 /// What `brigades.request_text` holds while a Director's request is open. A
@@ -39,6 +40,46 @@ use super::{Store, StoreError, system_time_to_unix_ms, unix_ms_to_system_time};
 /// decision, never anything an agent wrote (the question is in the Director's own
 /// pane).
 pub const REQUEST_OPEN: &str = "open";
+
+/// Archives the session of every Goinkyo row about to be deleted from
+/// `brigade_id` — only the one named by `token` when given, every one when not —
+/// inside the transaction that deletes it. A dismissed consultation's session
+/// would otherwise return to the list as an ordinary row titled with banto's own
+/// kickoff sentence, and the operator's standing instruction (2026-11-20) is that
+/// banto buries those itself; `D` restores any one of them.
+///
+/// The role and the id are read from the row, here, in the transaction: the
+/// caller's `token` is not a reason to archive (a Worker's dismissal comes
+/// through the same caller), and an id a concurrent writer bound a moment ago
+/// is the one that is archived. The caller's transaction must be `IMMEDIATE`:
+/// this reads before the delete writes, and a deferred one would start as a
+/// reader that cannot wait out another process's write lock (the emporium and a
+/// Director's `_mcp` are two writers of one file) but fails at once instead.
+/// A row with no id yet archives nothing — it has
+/// no session to bury — and only the id the row holds *now* is covered, not one
+/// it held before a session move.
+fn archive_goinkyo_sessions(
+    tx: &rusqlite::Transaction<'_>,
+    brigade_id: BrigadeId,
+    token: Option<&str>,
+) -> Result<(), StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT session_id FROM brigade_members
+         WHERE brigade_id = ?1 AND role = ?2 AND session_id IS NOT NULL
+           AND (?3 IS NULL OR member_token = ?3)",
+    )?;
+    let ids = stmt
+        .query_map(
+            params![brigade_id, BrigadeRole::Goinkyo.as_token(), token],
+            |row| row.get::<_, String>(0).map(SessionId),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for id in &ids {
+        archive_on(tx, id)?;
+    }
+    Ok(())
+}
 
 impl Store {
     /// A brigade with no member yet. Formation does not use this: between this
@@ -92,9 +133,14 @@ impl Store {
     /// read cursors — nothing is left orphaned for a deleted brigade id to
     /// accumulate under. (Pruning *read* messages out of a still-live brigade
     /// is a separate concern, left for later: this only clears a brigade that
-    /// is gone entirely.)
+    /// is gone entirely.) A consultation still open in it is over with the
+    /// brigade, so its Goinkyo's session is archived in the same transaction
+    /// ([`archive_goinkyo_sessions`]).
     pub fn delete_brigade(&mut self, id: BrigadeId) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        archive_goinkyo_sessions(&tx, id, None)?;
         tx.execute("DELETE FROM brigade_members WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_messages WHERE brigade_id = ?1", [id])?;
         tx.execute("DELETE FROM brigade_cursors WHERE brigade_id = ?1", [id])?;
@@ -383,8 +429,12 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a member from a brigade together with its cursor. Removing a
-    /// non-member is a no-op.
+    /// Removes a member from a brigade together with its cursor, and nothing
+    /// else: no mail, no solo, and — unlike [`Self::dismiss_worker`] — no archive
+    /// of a Goinkyo's session. Removing a non-member is a no-op. Nothing in the
+    /// product calls this; it is the bare row removal the store tests build their
+    /// rosters with, and a caller that ends a member for the operator wants
+    /// `dismiss_worker`.
     pub fn remove_brigade_member(
         &mut self,
         brigade_id: BrigadeId,
@@ -410,10 +460,9 @@ impl Store {
     /// filters by, no role — named for the Worker callers, kept for the
     /// Goinkyo's rather than adding a same-shaped sibling with a different name (see
     /// `crate::mcp::tool_dismiss_goinkyo`'s own doc): membership, its read
-    /// cursor, AND — unlike [`Self::remove_brigade_member`], which this
-    /// does not reuse, since that one is used elsewhere to tidy up a
-    /// resolved fork/collision and must leave mail alone — any message
-    /// addressed specifically to it (`to_member = token`). The mail purge is
+    /// cursor, AND — unlike [`Self::remove_brigade_member`], which leaves
+    /// mail alone — any message addressed specifically to it
+    /// (`to_member = token`). The mail purge is
     /// load-bearing, not tidiness: a token can come to denote a different
     /// member (the Goinkyo's is the fixed `goinkyo`, reused by every
     /// consultation; a Worker's `worker-N` never is within its brigade, but a
@@ -423,12 +472,21 @@ impl Store {
     /// every other member's own cursor still governs what they've seen of
     /// them. Dismissing a non-member is a no-op. Returns whether a member row
     /// was there to remove (`false`: it was already gone).
+    ///
+    /// A *Goinkyo's* session is archived in the same transaction, decided by the
+    /// role the row itself holds and never by `token` (the exited-Worker path
+    /// comes through here too): once the row is gone its session would come back
+    /// to the list as an ordinary row, and the operator has said those are to be
+    /// buried ([`archive_goinkyo_sessions`]).
     pub fn dismiss_worker(
         &mut self,
         brigade_id: BrigadeId,
         token: &str,
     ) -> Result<bool, StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        archive_goinkyo_sessions(&tx, brigade_id, Some(token))?;
         let removed = tx.execute(
             "DELETE FROM brigade_members WHERE brigade_id = ?1 AND member_token = ?2",
             params![brigade_id, token],
@@ -672,13 +730,13 @@ impl Store {
     /// Director is deliberately excluded: that pane is the operator's own
     /// interactive session, not a redundant view of it.
     ///
-    /// A Goinkyo is hidden only *while* it's still a member — dismissal
-    /// deletes its row (`Self::dismiss_worker`), and the moment it drops out
-    /// of this query the session list is the only trace of it left: the
-    /// operator never reads brigade mail, so a dismissed Goinkyo's own pane
-    /// (already closed) leaves its transcript as the sole copy of what it
-    /// actually said, and hiding that too would bury the one place its
-    /// answer still reaches the operator.
+    /// A Goinkyo is hidden only *while* it's still a member: dismissal deletes
+    /// its row (`Self::dismiss_worker`), so it drops out of this query. Its
+    /// session is archived in that same transaction, so the row the list gets
+    /// back is one the operator has to ask for (`a` to the archive level; `D`
+    /// restores it) — the transcript is still the only place its answer is
+    /// readable, which is why it is archived rather than deleted or left hidden
+    /// for good.
     pub fn brigade_hidden_session_ids(&self) -> Result<Vec<SessionId>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id FROM brigade_members
@@ -1784,11 +1842,10 @@ mod tests {
     #[test]
     fn a_dismissed_goinkyo_drops_out_of_the_hidden_set() {
         // The Director is never hidden (that pane is the operator's own
-        // session), and a dismissed Goinkyo's row is gone entirely — its own
-        // pane already closed by then, so the session list becomes the only
-        // place its answer is still readable (`brigade_hidden_session_ids`'s
-        // own doc). No special-casing needed: `dismiss_worker` deletes the
-        // row outright, so it simply stops matching this query.
+        // session), and a dismissed Goinkyo's row is gone entirely, so it
+        // simply stops matching this query. What keeps its session out of the
+        // ordinary list from then on is the archive, not this set
+        // (`dismissing_a_goinkyo_archives_its_session`).
         let mut store = Store::open_in_memory().unwrap();
         let br = store.create_brigade("cell").unwrap();
         store
@@ -1802,6 +1859,194 @@ mod tests {
         store.dismiss_worker(br, "goinkyo").unwrap();
 
         assert_eq!(store.brigade_hidden_session_ids().unwrap(), []);
+    }
+
+    /// The two ways a Goinkyo's row is deleted by banto, so every archive test
+    /// below runs against both: a dismissal, and the disbanding of its brigade.
+    fn end_goinkyo(store: &mut Store, brigade: BrigadeId, how: EndedBy) {
+        match how {
+            EndedBy::Dismissal => {
+                store.dismiss_worker(brigade, "goinkyo").unwrap();
+            }
+            EndedBy::Disband => store.delete_brigade(brigade).unwrap(),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EndedBy {
+        Dismissal,
+        Disband,
+    }
+
+    const BOTH: [EndedBy; 2] = [EndedBy::Dismissal, EndedBy::Disband];
+
+    fn archive_time(store: &Store, id: &str) -> Option<i64> {
+        use rusqlite::OptionalExtension;
+        store
+            .conn
+            .query_row(
+                "SELECT archived_at_ms FROM archived WHERE session_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn ending_a_goinkyo_archives_the_session_its_row_held() {
+        for how in BOTH {
+            let mut store = Store::open_in_memory().unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+                .unwrap();
+            store
+                .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+                .unwrap();
+
+            end_goinkyo(&mut store, br, how);
+
+            assert_eq!(store.archived_ids().unwrap(), [sid("g1")], "{how:?}");
+        }
+    }
+
+    #[test]
+    fn a_goinkyo_that_never_got_a_session_id_archives_nothing() {
+        for how in BOTH {
+            let mut store = Store::open_in_memory().unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+                .unwrap();
+            store
+                .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, None)
+                .unwrap();
+
+            end_goinkyo(&mut store, br, how);
+
+            assert!(store.archived_ids().unwrap().is_empty(), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn ending_a_brigade_member_other_than_the_goinkyo_archives_nothing() {
+        // A Worker's token is the one `dismiss_worker` is given on the exited
+        // path too, so the role has to come from the row. The Director is no
+        // Goinkyo either: disbanding the brigade deletes its row, and its
+        // session is the operator's own.
+        for how in BOTH {
+            let mut store = Store::open_in_memory().unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(br, "director", BrigadeRole::Director, Some(&sid("dir")))
+                .unwrap();
+            store
+                .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+                .unwrap();
+            match how {
+                EndedBy::Dismissal => {
+                    store.dismiss_worker(br, "worker-1").unwrap();
+                }
+                EndedBy::Disband => store.delete_brigade(br).unwrap(),
+            }
+
+            assert!(store.archived_ids().unwrap().is_empty(), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn dismissing_a_worker_leaves_the_goinkyo_and_its_session_alone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "worker-1", BrigadeRole::Worker, Some(&sid("w1")))
+            .unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+            .unwrap();
+
+        store.dismiss_worker(br, "worker-1").unwrap();
+
+        assert!(store.archived_ids().unwrap().is_empty());
+        assert_eq!(store.brigade_hidden_session_ids().unwrap(), [sid("g1")]);
+    }
+
+    #[test]
+    fn disbanding_one_brigade_archives_only_its_own_goinkyo() {
+        let mut store = Store::open_in_memory().unwrap();
+        let one = store.create_brigade("one").unwrap();
+        let other = store.create_brigade("other").unwrap();
+        store
+            .add_brigade_member(one, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+            .unwrap();
+        store
+            .add_brigade_member(other, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g2")))
+            .unwrap();
+
+        store.delete_brigade(one).unwrap();
+
+        assert_eq!(store.archived_ids().unwrap(), [sid("g1")]);
+    }
+
+    #[test]
+    fn ending_a_goinkyo_keeps_the_time_its_session_was_first_archived() {
+        for how in BOTH {
+            let mut store = Store::open_in_memory().unwrap();
+            let br = store.create_brigade("cell").unwrap();
+            store
+                .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO archived (session_id, archived_at_ms) VALUES ('g1', 1234)",
+                    [],
+                )
+                .unwrap();
+
+            end_goinkyo(&mut store, br, how);
+
+            assert_eq!(archive_time(&store, "g1"), Some(1234), "{how:?}");
+        }
+    }
+
+    #[test]
+    fn an_archived_goinkyo_session_is_restored_by_unarchiving_it() {
+        // `D` is the way back, and nothing re-archives it behind the operator's
+        // back: the archive happens at the dismissal, once.
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("g1")))
+            .unwrap();
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        store.unarchive_session(&sid("g1")).unwrap();
+
+        assert!(store.archived_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_goinkyos_earlier_session_after_a_move_is_not_archived() {
+        // `update_member_session_moved` replaces the id the row holds; the
+        // dismissal archives only the id it holds then.
+        let mut store = Store::open_in_memory().unwrap();
+        let br = store.create_brigade("cell").unwrap();
+        store
+            .add_brigade_member(br, "goinkyo", BrigadeRole::Goinkyo, Some(&sid("old")))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE brigade_members SET session_id = 'new' WHERE member_token = 'goinkyo'",
+                [],
+            )
+            .unwrap();
+
+        store.dismiss_worker(br, "goinkyo").unwrap();
+
+        assert_eq!(store.archived_ids().unwrap(), [sid("new")]);
     }
 
     #[test]

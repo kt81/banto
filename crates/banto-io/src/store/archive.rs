@@ -13,16 +13,28 @@ use banto_core::model::SessionId;
 
 use super::{Store, StoreError, system_time_to_unix_ms};
 
+/// The one statement that archives a session, on whatever connection or open
+/// transaction the caller holds: a brigade write that archives a session in the
+/// same transaction as the rows it deletes ([`Store::dismiss_worker`]) must not
+/// carry its own copy of this SQL, whose `ON CONFLICT` is what keeps the first
+/// archive time.
+pub(super) fn archive_on(
+    conn: &rusqlite::Connection,
+    session_id: &SessionId,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO archived (session_id, archived_at_ms) VALUES (?1, ?2)
+         ON CONFLICT(session_id) DO NOTHING",
+        params![session_id.0, system_time_to_unix_ms(SystemTime::now())],
+    )?;
+    Ok(())
+}
+
 impl Store {
     /// Archives a session. Idempotent: archiving an already-archived session
     /// keeps the original archive time.
     pub fn archive_session(&self, session_id: &SessionId) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO archived (session_id, archived_at_ms) VALUES (?1, ?2)
-             ON CONFLICT(session_id) DO NOTHING",
-            params![session_id.0, system_time_to_unix_ms(SystemTime::now())],
-        )?;
-        Ok(())
+        archive_on(&self.conn, session_id)
     }
 
     /// Unarchives a session. Unarchiving a session that isn't archived is a
