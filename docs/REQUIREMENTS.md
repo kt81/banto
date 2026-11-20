@@ -1336,8 +1336,18 @@ it ring?" by inference were settled by the first line it wrote.
 `<data dir>/logs/panes.log` is always on and needs no variable or key: the pane
 lifecycle log, for "what happened to this pane?" after the fact. Only the UI
 process appends to it. Each file begins with a `start` line, with the banto version,
-the build commit (`crates/banto/build.rs`, `unknown` when git cannot say), the
-store's schema version and the UI's process id. After it, one line per Event or Cmd that
+the build commit (`crates/banto/build.rs`: the environment's `BANTO_BUILD_COMMIT` if set,
+else git's, `unknown` when git cannot say),
+`dirty=yes|no|unknown` right after it, the store's schema version and the UI's
+process id. `dirty` says whether the sources the binary was built from — `crates/`,
+`Cargo.toml` and `Cargo.lock` — differed from that commit when it was built: `yes` for
+a tracked change or an untracked file there, `no` for neither, `unknown` when there is
+no `.git` two levels above the crate or git failed. Ignored files and files outside
+those sources (docs, CI) do not count. It exists because the operator builds his daily
+banto from a working tree, where the commit alone names where the edits started. It
+is recomputed whenever anything under those sources changes; a tracked file deleted
+with nothing else changed is, on Windows, noticed one build late (measured on a
+synthetic tree, cause not examined). After it, one line per Event or Cmd that
 is written, `<unix ms> panes +<ms since start>ms <Kind> <name=value ...>`:
 `Spawned`, `SpawnFailed` (a refusal word per refusal site and the OS error number,
 never the error text), `PtyExited` (the exit code or signal, `asked=yes|no`, the
@@ -3325,9 +3335,10 @@ is not noticed (Unix refuses that while the executable runs).
 
 *`banto --version`* prints `banto <package version> (commit <commit>, schema <n>)`, for
 example `banto 0.1.0 (commit abc1234, schema 18)`. The commit is
-`option_env!("BANTO_BUILD_COMMIT")`, set by the release workflow when it compiles, and
-printed as given; absent or blank it is `commit unknown` (a `cargo build` or
-`cargo install --git` build). There is no `build.rs`. The schema is
+`option_env!("BANTO_BUILD_COMMIT")`, which `crates/banto/build.rs` sets: a `BANTO_BUILD_COMMIT` already in the
+build environment (the release workflow's) wins, cut to 12 characters, otherwise `git
+rev-parse` (`unknown` when no `.git` sits beside the workspace or git fails); it is printed as given;
+absent or blank it is `commit unknown`. It does not print the dirty flag. The schema is
 `banto_io::store::SCHEMA_VERSION`, the number the migrations end at. `-V` prints the same.
 
 **Working files of ended members.** The data directory holds two kinds of

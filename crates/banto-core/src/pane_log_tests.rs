@@ -257,10 +257,10 @@ fn every_text_carrying_variant_leaves_its_marker_out() {
 
 #[test]
 fn start_line_has_the_fixed_fields_in_order() {
-    let line = start_line("0.1.0", "0123456789ab", 23, 4242);
+    let line = start_line("0.1.0", "0123456789ab", "yes", 23, 4242);
     assert_eq!(
         line.render(1_000, 5),
-        "1000 panes +5ms start version=0.1.0 commit=0123456789ab schema=23 pid=4242"
+        "1000 panes +5ms start version=0.1.0 commit=0123456789ab dirty=yes schema=23 pid=4242"
     );
 }
 

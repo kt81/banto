@@ -274,13 +274,13 @@ mod tests {
         }
     }
 
-    const START_BODY: &str = "start version=0.1.0 commit=unknown schema=23 pid=1";
+    const START_BODY: &str = "start version=0.1.0 commit=unknown dirty=unknown schema=23 pid=1";
 
     #[test]
     fn writes_each_line_as_it_is_emitted_in_order() {
         let dir = TempDir::new().unwrap();
         let mut log = PaneLog::open(dir.path()).expect("opens in a temp dir");
-        log.start(&start_line("0.1.0", "unknown", 23, 1));
+        log.start(&start_line("0.1.0", "unknown", "unknown", 23, 1));
         log.emit(&sample(1));
         log.emit(&sample(2));
         let text = read(dir.path(), FILE_NAME);
@@ -314,7 +314,7 @@ mod tests {
     fn each_file_begins_with_the_start_line() {
         let dir = TempDir::new().unwrap();
         let mut log = PaneLog::with_limit(dir.path(), 400).expect("opens");
-        log.start(&start_line("0.1.0", "unknown", 23, 1));
+        log.start(&start_line("0.1.0", "unknown", "unknown", 23, 1));
         for n in 0..20 {
             log.emit(&sample(n));
         }
@@ -331,7 +331,7 @@ mod tests {
     fn a_rotation_writes_the_unchanged_goinkyo_state_again_in_the_new_file() {
         let dir = TempDir::new().unwrap();
         let mut log = PaneLog::with_limit(dir.path(), 500).expect("opens");
-        log.start(&start_line("0.1.0", "unknown", 23, 1));
+        log.start(&start_line("0.1.0", "unknown", "unknown", 23, 1));
         log.goinkyo(&look("no_pane"));
         log.goinkyo(&look("no_pane"));
         let is_state = |line: &&str| line.contains(" goinkyo brigade=3 ");
@@ -497,7 +497,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(ROTATED_NAME), "older generation\n").unwrap();
         let mut log = PaneLog::with_limit(dir.path(), 400).expect("opens");
-        log.start(&start_line("0.1.0", "unknown", 23, 1));
+        log.start(&start_line("0.1.0", "unknown", "unknown", 23, 1));
         let reader = OpenOptions::new()
             .read(true)
             .share_mode(SHARE_READ_WRITE)

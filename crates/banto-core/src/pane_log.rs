@@ -179,10 +179,11 @@ pub struct CmdFacts {
 }
 
 /// The line for the start of the UI process.
-pub fn start_line(version: &str, commit: &str, schema: i64, pid: u32) -> Line {
+pub fn start_line(version: &str, commit: &str, dirty: &str, schema: i64, pid: u32) -> Line {
     Line::new("start")
         .token("version", version)
         .token("commit", commit)
+        .token("dirty", dirty)
         .num("schema", schema)
         .num("pid", pid)
 }

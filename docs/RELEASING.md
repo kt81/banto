@@ -31,7 +31,10 @@ drafting.
 2. Builds `--release --locked` for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`
    (on Ubuntu 22.04, so the glibc floor is 2.35; the step fails if the binary needs a
    newer one and writes the real floor to the job summary) and `aarch64-apple-darwin`,
-   with `BANTO_BUILD_COMMIT` set to the commit. On Windows it also runs an
+   with `BANTO_BUILD_COMMIT` set to the commit (`crates/banto/build.rs` uses a value
+   already in the environment in preference to asking git, cut to 12 characters; the
+   `dirty=` field of the pane log's start line is always git's, so a release from the
+   workflow's clean checkout says `no`). On Windows it also runs an
    informational Microsoft Defender scan of the built `banto.exe` and writes the result
    and the definitions version to the job summary.
 3. Packs `banto-<tag>-<target>.zip` / `.tar.gz` (the single binary at the root), fails if

@@ -5,10 +5,9 @@
 //! binary: a database a newer build has migrated cannot be opened by an older
 //! one (`banto_io::store::StoreError::UnsupportedSchemaVersion`), and the
 //! operator choosing between two builds on disk needs to see which numbers they
-//! carry. The commit comes from the build environment, not from `build.rs`: the
-//! release workflow sets `BANTO_BUILD_COMMIT` for the compiler, and a build made
-//! without it (`cargo build`, `cargo install --git`) says `commit unknown`
-//! rather than guessing from a checkout it may not be in.
+//! carry. The commit comes from `build.rs`, which asks git only where
+//! `.git` sits beside the workspace; with no `.git` there, or when git fails, the
+//! build says `commit unknown` rather than guessing.
 
 use std::sync::OnceLock;
 

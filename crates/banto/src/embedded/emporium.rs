@@ -2805,6 +2805,7 @@ fn open_pane_log(deps: &Deps) -> Option<PaneLog> {
     log.start(&pane_lines::start_line(
         env!("CARGO_PKG_VERSION"),
         env!("BANTO_BUILD_COMMIT"),
+        env!("BANTO_BUILD_DIRTY"),
         SCHEMA_VERSION,
         std::process::id(),
     ));
@@ -16895,5 +16896,31 @@ mod build_commit_tests {
     #[test]
     fn the_build_commit_is_never_empty() {
         assert!(!env!("BANTO_BUILD_COMMIT").is_empty());
+    }
+
+    /// The flag is one of three words whatever git said, so the start line never
+    /// carries `dirty=` with nothing after it.
+    #[test]
+    fn the_build_dirty_flag_is_never_empty() {
+        assert!(["yes", "no", "unknown"].contains(&env!("BANTO_BUILD_DIRTY")));
+    }
+
+    #[test]
+    fn this_builds_start_line_carries_the_dirty_flag_after_the_commit() {
+        let line = banto_core::pane_log::start_line(
+            env!("CARGO_PKG_VERSION"),
+            env!("BANTO_BUILD_COMMIT"),
+            env!("BANTO_BUILD_DIRTY"),
+            1,
+            1,
+        )
+        .render(0, 0);
+        let expected = format!(
+            "commit={} dirty={} schema=",
+            env!("BANTO_BUILD_COMMIT"),
+            env!("BANTO_BUILD_DIRTY")
+        );
+        assert!(line.contains(&expected), "{line}");
+        println!("{line}");
     }
 }
