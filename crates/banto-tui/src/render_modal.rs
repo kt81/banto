@@ -9,13 +9,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use banto_core::app::{
     GroupJoinState, GroupRenameState, Modal, NewSessionState, WorkerAgentPickerState,
     WorkerPickerField, WorkerPickerFor,
 };
+use banto_core::engine::CloseReading;
 
 use crate::text::truncate_to_width;
 
@@ -160,7 +161,18 @@ pub fn windowed_view(s: &str, cursor: usize, max_width: u16) -> (String, u16) {
 /// there is nothing to blank behind it — the one-column widen is solely to
 /// neutralize a background full-width character straddling the border
 /// itself (see [`modal_clear_area`]).
-pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
+///
+/// `close` is what closing the brigade would end *now*
+/// ([`banto_core::engine::EmporiumState::close_reading`]); only
+/// [`Modal::ConfirmCloseBrigade`] reads it. It is passed in rather than kept in
+/// the modal because the dialog stays open while panes end and start, and what
+/// it says must be what Enter would end at the moment it is read.
+pub fn render_modal(
+    frame: &mut Frame,
+    modal: &Modal,
+    full_area: Rect,
+    close: Option<&CloseReading>,
+) {
     let area = modal_area(full_area);
     frame.render_widget(Clear, modal_clear_area(full_area));
     match modal {
@@ -172,6 +184,9 @@ pub fn render_modal(frame: &mut Frame, modal: &Modal, full_area: Rect) {
             render_confirm_group_delete_modal(frame, name, area)
         }
         Modal::ConfirmDisband { name, .. } => render_confirm_disband_modal(frame, name, area),
+        Modal::ConfirmCloseBrigade { name, .. } => {
+            render_confirm_close_brigade_modal(frame, name, close, area)
+        }
         Modal::ConfirmKill {
             title, dismisses, ..
         } => render_confirm_kill_modal(frame, title, dismisses.as_deref(), area),
@@ -353,10 +368,9 @@ fn render_confirm_archive_modal(frame: &mut Frame, title: &str, area: Rect) {
 }
 
 /// Render the emporium's `B`-on-a-Director disband confirm dialog: a
-/// one-line yes/no prompt naming the brigade's Director. Its Workers'
-/// `claude` processes are left running (they simply reappear in the list as
-/// live sessions once the brigade's hiding is gone), so the prompt says as
-/// much to set expectations.
+/// one-line yes/no prompt naming the brigade's Director. A disband ends the
+/// Workers' and the Goinkyo's processes and leaves the Director's pane open on
+/// its own, so the prompt says so to set expectations.
 fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -373,11 +387,64 @@ fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
     let lines = vec![
         Line::from(prompt),
         Line::from(Span::styled(
-            "Its Workers keep running and simply reappear in the list.",
+            "Workers and Goinkyo end; a Director that is open stays open on its own.",
             Style::default().fg(Color::DarkGray),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Render the emporium's close-a-brigade confirm dialog: how many sessions end,
+/// which of them are not idle and why, and what is kept. Closing is a hard kill,
+/// so the operator is told who would lose a turn in flight, by the same
+/// classification and wording as the quit question; and told that nothing is
+/// deleted, since "close" next to "disband" must not read as the same
+/// thing. With no reading (the caller had none) the count and the names are
+/// left out rather than guessed.
+fn render_confirm_close_brigade_modal(
+    frame: &mut Frame,
+    name: &str,
+    reading: Option<&CloseReading>,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Close Brigade \u{2014} confirm ")
+        .title_bottom(" Enter close  Esc cancel ");
+    let inner = pad_horizontal(block.inner(area));
+    frame.render_widget(block, area);
+
+    let prompt = truncate_to_width(&format!("Close the brigade \"{name}\"?"), inner.width);
+    let mut lines = vec![Line::from(prompt)];
+    if let Some(reading) = reading {
+        lines.push(Line::from(match reading.ending {
+            0 => "Nothing of it is running any more.".to_string(),
+            1 => "Ends its 1 open session now.".to_string(),
+            n => format!("Ends its {n} open sessions now."),
+        }));
+        if !reading.not_idle.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("Not idle: {}.", reading.not_idle.join(", ")),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if !reading.background.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Running a background command: {}.",
+                    reading.background.join(", ")
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "The brigade, its members, sessions and mail are kept. \
+         Enter on its Director's row opens it again.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 /// Render the emporium's Codex-hook-trust confirm dialog — shown instead of
@@ -442,9 +509,9 @@ fn render_confirm_director_reopen_modal(frame: &mut Frame, name: &str, area: Rec
 /// Render the emporium's prefix-`x` confirm dialog. For a brigade member other
 /// than the Director (`dismisses: Some(who)`) confirming dismisses it, and the
 /// dialog says exactly that — who, that it leaves the brigade for good, and that
-/// its session itself is not deleted. A Director or solo pane (`dismisses:
-/// None`) keeps the plain kill prompt: ending the process is all it does, and a
-/// Director is removed by disbanding.
+/// its session itself is not deleted. A solo pane (`dismisses: None`) keeps the
+/// plain kill prompt: ending the process is all it does. (A Director's pane has
+/// a dialog of its own, [`render_confirm_close_brigade_modal`].)
 fn render_confirm_kill_modal(frame: &mut Frame, title: &str, dismisses: Option<&str>, area: Rect) {
     let Some(who) = dismisses else {
         let block = Block::default()
@@ -459,8 +526,7 @@ fn render_confirm_kill_modal(frame: &mut Frame, title: &str, dismisses: Option<&
         let lines = vec![
             Line::from(prompt),
             Line::from(Span::styled(
-                "Ends the process now. A Director stays in its brigade \
-                 (disband it with B to remove it).",
+                "Ends the process now. The session itself is untouched.",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -763,6 +829,64 @@ mod tests {
         );
     }
 
+    fn close_dialog_text(reading: Option<&CloseReading>) -> String {
+        let modal = Modal::ConfirmCloseBrigade {
+            brigade_id: 1,
+            name: "Alpha".to_string(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+        terminal
+            .draw(|frame| render_modal(frame, &modal, frame.area(), reading))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn the_close_dialog_says_how_many_end_who_is_not_idle_and_that_nothing_is_deleted() {
+        let reading = CloseReading {
+            ending: 4,
+            not_idle: vec!["worker-1 (busy)".to_string(), "dir (input)".to_string()],
+            background: vec!["worker-2".to_string()],
+        };
+        let text = close_dialog_text(Some(&reading));
+        for expected in [
+            "Close the brigade \"Alpha\"?",
+            "Ends its 4 open sessions now.",
+            "Not idle: worker-1 (busy), dir (input).",
+            "worker-2",
+            "are kept",
+            "opens it again",
+            "Enter close",
+            "Esc cancel",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected:?}:
+{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_close_dialog_leaves_out_what_it_has_no_reading_of_and_says_when_nothing_is_left() {
+        let idle = close_dialog_text(Some(&CloseReading {
+            ending: 1,
+            ..CloseReading::default()
+        }));
+        assert!(idle.contains("Ends its 1 open session now."), "{idle}");
+        assert!(!idle.contains("Not idle"), "{idle}");
+
+        let gone = close_dialog_text(Some(&CloseReading::default()));
+        assert!(
+            gone.contains("Nothing of it is running any more."),
+            "{gone}"
+        );
+
+        let unread = close_dialog_text(None);
+        assert!(unread.contains("Close the brigade"), "{unread}");
+        assert!(!unread.contains("Ends its"), "{unread}");
+    }
+
     #[test]
     fn render_modal_neutralizes_a_background_full_width_char_straddling_the_left_border() {
         let modal = Modal::ConfirmArchive {
@@ -783,7 +907,7 @@ mod tests {
                 // leave a dangling half-glyph once the border overwrote
                 // only the continuation cell.
                 frame.render_widget(Span::raw("あ"), Rect::new(1, 5, 2, 1));
-                render_modal(frame, &modal, area);
+                render_modal(frame, &modal, area, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -810,7 +934,7 @@ mod tests {
                 // `modal_area_shrinks_margin_in_a_narrow_pane_...`:
                 // width 36 starting at x=2 ends at column 37).
                 frame.render_widget(Span::raw("あ"), Rect::new(38, 5, 2, 1));
-                render_modal(frame, &modal, area);
+                render_modal(frame, &modal, area, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();

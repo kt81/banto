@@ -318,9 +318,10 @@ added to the list on 2026-11-14 by reading the code, not by repeating the sweep)
 family word such as `terra` can become a slug (`banto_core::codex_model`) — never
 for a resume, which passes no model — and once for all the Workers waiting on it,
 each of which is carried out only if it is still wanted when the answer arrives (the
-brigade exists and is not being disbanded, the member is on its roster and is not
-open or being opened under any key; otherwise it is dropped with its bookkeeping,
-and a successful disband drops its held creations at once). No creation is issued
+brigade exists and is not being disbanded or closed, the member is on its roster and
+is not open or being opened under any key; otherwise it is dropped with its
+bookkeeping, and a successful disband or a confirmed close drops its held creations
+at once). No creation is issued
 for a member that is already open or being opened: a pane under any key, or an open
 in flight (a creation or a resume, issued or held). *By whom:* the core emits
 `Cmd::ReadCodexCatalog { round }` (each read a round, which the answer echoes and

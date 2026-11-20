@@ -52,7 +52,7 @@ fn existing_director_can_disband_with_an_unrelated_unidentified_codex() {
     let mut state = EmporiumState::new(PrefixKey::default());
     unknown(&mut state);
     let mut app = App::new(vec![row("dir", AgentKind::Codex)]);
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     let cmds = update(
         &mut state,
         &mut app,
@@ -90,7 +90,7 @@ fn staging_mixed_brigade_does_not_partially_launch_while_identity_is_unknown() {
         row("dir", AgentKind::Codex),
         row("worker", AgentKind::ClaudeCode),
     ]);
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
     let members = vec![
         (
             "director".to_string(),
@@ -210,7 +210,7 @@ fn saved_brigade_can_be_staged_after_the_unidentified_pane_exits() {
             .iter()
             .any(|cmd| matches!(cmd, Cmd::Store(StoreIntent::FormBrigade { .. })))
     );
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
     let members = vec![
         (
             "director".to_string(),

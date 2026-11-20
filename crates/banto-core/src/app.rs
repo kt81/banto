@@ -113,6 +113,15 @@ pub enum Modal {
     /// disbands the brigade (`brigade_id`), Esc cancels. `name` is the
     /// Director's title, for the prompt.
     ConfirmDisband { brigade_id: i64, name: String },
+    /// The emporium's close-a-brigade confirm dialog (prefix-`x` on the
+    /// Director's tile, `x` on the Director's row): Enter ends every process
+    /// the brigade has hosted, Esc cancels. Nothing is deleted: the brigade, its
+    /// members, their sessions and the mail all stay, and Enter on the
+    /// Director's row opens it again. `name` is how the brigade is called, for
+    /// the prompt. The dialog carries no list of panes: it is drawn from, and
+    /// confirmed against, the panes hosted at that moment
+    /// (`EmporiumState::close_reading`), so what it says is what Enter ends.
+    ConfirmCloseBrigade { brigade_id: i64, name: String },
     /// The emporium's prefix-`x` confirm dialog. Enter confirms, Esc cancels.
     /// What confirming does depends on who the focused pane is:
     ///
@@ -121,9 +130,10 @@ pub enum Modal {
     ///   good (membership, read cursor, mail addressed to it) and its pane ends.
     ///   There is no "close the pane and keep the member": a Worker is
     ///   disposable, and a member with no pane has no tile to act on.
-    /// - a Director or a single non-brigade session (`dismisses` is `None`) has
-    ///   its process ended and nothing else: a Director leaves a brigade by
-    ///   disbanding it (`B`), and a solo session has no brigade at all.
+    /// - a single non-brigade session (`dismisses` is `None`) has its process
+    ///   ended and nothing else; it has no brigade at all. (A Director's pane
+    ///   never opens this dialog: its Prefix+`x` is [`Self::ConfirmCloseBrigade`],
+    ///   because a brigade whose Director alone was ended is broken.)
     ///
     /// `key` is the pane's `SessionKey` as a plain string (kept a `String` so
     /// `Modal` does not depend on an `embedded`-internal type); `title` is its
@@ -1119,7 +1129,8 @@ impl App {
     /// Whether typed characters are currently being accepted as text:
     /// [`Mode::Search`], or a modal with a text field ([`Modal::NewSession`]/
     /// [`Modal::GroupJoin`]/[`Modal::WorkerAgentPicker`]). `false` for a
-    /// confirm-only modal (`ConfirmArchive`/`ConfirmDisband`/`ConfirmKill`)
+    /// confirm-only modal (`ConfirmArchive`/`ConfirmDisband`/`ConfirmKill`/
+    /// `ConfirmCloseBrigade`)
     /// — those ignore [`Self::push_char`]/[`Self::modal_push_char`]
     /// entirely. Named for its one consumer so far, the emporium's paste
     /// accumulator (`paste_accum::is_in_scope`, see its doc for why a
@@ -1210,6 +1221,7 @@ impl App {
             Some(Modal::ConfirmArchive { .. })
             | Some(Modal::ConfirmGroupDelete { .. })
             | Some(Modal::ConfirmDisband { .. })
+            | Some(Modal::ConfirmCloseBrigade { .. })
             | Some(Modal::ConfirmKill { .. })
             | Some(Modal::ConfirmCodexTrust)
             | Some(Modal::ConfirmDirectorReopen { .. })
@@ -1757,6 +1769,12 @@ impl App {
         self.modal = Some(Modal::ConfirmDisband { brigade_id, name });
     }
 
+    /// Open the emporium's close-a-brigade confirm dialog — see
+    /// [`Modal::ConfirmCloseBrigade`].
+    pub fn open_confirm_close_brigade_modal(&mut self, brigade_id: i64, name: String) {
+        self.modal = Some(Modal::ConfirmCloseBrigade { brigade_id, name });
+    }
+
     /// Open the emporium's Codex-hook-trust confirm dialog — see
     /// [`Modal::ConfirmCodexTrust`]. Takes no parameters: unlike
     /// `open_confirm_disband_modal`/`open_confirm_kill_modal`, the modal
@@ -1780,10 +1798,11 @@ impl App {
     }
 
     /// Open the emporium's confirm dialog for the given session (bound to
-    /// prefix-`x` on the focused pane). `dismisses` is how the dialog names the
-    /// member that confirming dismisses from its brigade — `Some` for a Worker
-    /// or a Goinkyo pane, `None` for the Director's own pane or a solo session,
-    /// whose confirm only ends the process — see [`Modal::ConfirmKill`].
+    /// prefix-`x` on the focused pane, and to `x` on a single session's row).
+    /// `dismisses` is how the dialog names the member that confirming dismisses
+    /// from its brigade — `Some` for a Worker or a Goinkyo pane, `None` for a
+    /// solo session, whose confirm only ends the process — see
+    /// [`Modal::ConfirmKill`].
     pub fn open_confirm_kill_modal(
         &mut self,
         key: String,

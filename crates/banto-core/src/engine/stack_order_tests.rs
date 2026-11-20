@@ -243,7 +243,8 @@ impl Scene {
         dir_session: &str,
         arrival: Arrival,
     ) -> Vec<Cmd> {
-        self.state.pending_membership = Some(PendingMembership::Activate);
+        self.state.pending_membership =
+            Some((PendingMembership::Activate, dir_session.to_string()));
         let cmds = self.feed(Event::MembershipResolved {
             session_id: dir_session.to_string(),
             membership: Some((

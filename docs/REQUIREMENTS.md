@@ -1637,6 +1637,7 @@ A Worker added later gets the mean of the others' height.
 | `D` | Restore (un-archive) the selected session, while archived ones are revealed |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
+| `x` | End what the selected row hosts (with the list focused and no dialog or search box taking the key). On a Director's row: close its brigade (confirm; "Closing a brigade"), whether it is on stage or not and whether its own pane still exists; a status line says so when nothing of it is running. On a single session's row with an open pane: end its process (confirm). On a row with nothing hosted: a status line, nothing else. It never dismisses: a Worker's or Goinkyo's row (members are not listed, at any reveal level, so one shows at most for the moment between its session appearing and the next reload) answers with a status line pointing to prefix-`x` on its tile |
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
 | `F4` | Switch the brigade bell between silent-while-the-Director's-pane-is-focused (the default) and ringing there too (bell only, no mark); says which in the status line, and a standing `BELL ALWAYS` badge shows left of the counts while it is on. One keystroke from the list or from a pane, taken by banto like `F2`/`F3` and never forwarded to the agent; with a modal or the search box open the key goes to that, and with the prefix armed it is an unbound prefix key (no toggle), as for `F2`/`F3` |
@@ -1652,7 +1653,7 @@ A Worker added later gets the mean of the others' height.
 | … `1`-`9` | jump to pane N |
 | … `s` | back to the sidebar |
 | … `Esc` | cancel the prefix: nothing else happens — focus stays, nothing reaches the child |
-| … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted; a Goinkyo's session is archived, see "Ending a consultation"); on a Director or a single session, end its process (confirm) |
+| … `x` | dismiss the focused Worker or Goinkyo from its brigade (one confirmation: it leaves for good — membership, read cursor and the mail addressed to it — and its session is not deleted; a Goinkyo's session is archived, see "Ending a consultation"); on a Director's tile, close the whole brigade (confirm; "Closing a brigade"); on a single session, end its process (confirm) |
 | … `b`/`Ctrl+B` | send a literal prefix chord through to the child |
 
 While the prefix is armed, the status bar shows the full binding table.
@@ -2105,10 +2106,12 @@ record of its own (see *Effect* below) rather than through a pane's latch.
   through a pane that is not that member (a tick gathered just before a session-id
   change the core has already applied). In a tick without that observation — a
   roster that could not be read, or the brigade gone from the store by any path —
-  nothing fires and the quiet stretch
-  starts over; the armed state is kept. A disband in flight does not fire and its
-  watch is kept as it was; a successful disband ends the watch (what was kept for it
-  is dropped with it); a failed one leaves it watched; and a former Director left
+  nothing fires and the quiet stretch starts over; the armed state is kept. A
+  disband in flight does not fire and its watch is kept as it was; a successful
+  disband ends the watch (what was kept for it is dropped with it); a failed one
+  leaves it watched. A brigade being closed does not fire either, and its watch is
+  dropped once its Director's pane is gone, like any brigade with no Director
+  hosted. A former Director left
   open on its own never rings for the brigade that is gone (its pane keeps the
   membership maps it was staged with, which is why the test is observation, not
   those maps). A brigade formed again around the same Director is a new brigade and
@@ -2474,8 +2477,11 @@ That dialog decides in two separate stages, not one, both role-based now:
 in a staged brigade (a Worker's or the Goinkyo's, never the Director's) — not
 the pane's position, and not whether the Director's own pane is currently known:
 a Worker is plainly a Worker either way. (Not dismissed, the confirm only ends
-the process: the Director's own pane, a single non-brigade session, and a pane of
-a staged brigade the core holds no member token for.) `panes`' own order is display-only and best-effort (a convenience
+the process: a single non-brigade session, and a pane of a staged brigade the core
+holds no member token for. The Director's own pane never opens this dialog: its
+prefix-`x` is the close dialog ("Closing a brigade"), decided by the same token. A
+Director that survives its brigade's disband keeps its token and leads nothing, so
+it is a single session to this key.) `panes`' own order is display-only and best-effort (a convenience
 `update_spawned` attempts on arrival, director-first when it can, never
 load-bearing): `Store::brigade_members`' `ORDER BY` puts the Director
 first and the common formation path preserves that into `panes`, but a
@@ -2492,7 +2498,8 @@ guards deletion; the two stages agreeing is what closes the old UX gap
 (Dismiss missing, or offered, on the wrong pane) that a position-derived
 first stage used to risk. A disband is noticed a tick later too: the
 brigade's roster reads as empty, so its Goinkyo row reads as gone, the guard is
-released and the kill names a pane the disband already closed (a no-op).
+released and the kill names a pane the disband already ended (a repeat, costing
+nothing).
 **Reopening a
 brigade around an already-discovered Goinkyo (one that already has a
 session id, resolvable to a real row) already works**, for free, through
@@ -2711,10 +2718,72 @@ tile asks once and *dismisses* it: it leaves the brigade for good — membership
 read cursor, and any mail addressed specifically to it, all gone — and its pane
 ends; its session itself is not deleted (it can still be resumed on its own).
 There is no "close the pane but keep the member": one with no pane has no tile to
-act on, and too many tiles is what collapse and solo are for. A Director leaves
-only by disbanding the brigade (`B`), which removes the whole cell. A **restart**
+act on, and too many tiles is what collapse and solo are for. A Director's tile
+never ends alone from the keyboard: prefix-`x` on it closes the whole brigade,
+which keeps everyone ("Closing a brigade"). A Director leaves only by disbanding
+the brigade (`B`), which removes the whole cell: every Worker
+and the Goinkyo end with it, wherever their panes are hosted, on stage or not
+(each is picked by its own role, so a brigade whose Director's pane was ended
+earlier still ends its Workers; one whose open was still in flight ends when it
+appears), and the Director's pane, if it is open, stays open on its own as a solo
+session (reached with Enter on its row, which shows the pane already running, never
+a second resume). Disbanding a brigade that is not on stage leaves whatever is
+showing. A **restart**
 keeps everyone: staging reopens every member there is (resuming its session, or a
 fresh spawn for a Worker with nothing to resume).
+
+**Closing a brigade.** Every process the brigade hosts ends — the Director, the
+Workers and a Goinkyo in consultation, on stage or not — and nothing is deleted:
+the brigade, its members and their session ids, its mail and read cursors, open
+requests and a consultation in progress all stay, and the close itself writes
+nothing to the store. Afterwards it is as after a restart: Enter on the Director's
+row stages it and resumes everyone, a Goinkyo in consultation included (it stays a
+member, is not dismissed and not archived, and is not started again while the
+brigade is closing). Unread mail stays unread, so a reopened brigade can start
+working by itself, exactly as after a restart.
+
+Two gestures ask. Prefix-`x` on the Director's tile; and `x` on the Director's row
+in the list, which also reaches a brigade that is off stage or whose Director's pane
+is already gone — it needs only that some pane of the brigade is hosted, and says so
+in the status line when none is. The list's `x` learns whether a row is a Director's
+from the same membership read Enter and `B` use. The confirmation is its own
+dialog: it says how many sessions end and names the ones not known to be idle, by
+the quit question's own classification and wording ("Is it idle? (the quit
+question)"), narrowed to this brigade's panes so the two cannot disagree. It is read
+when drawn and again when Enter is pressed, not taken when the dialog opened. Enter
+closes, Esc cancels. The panes counted are the ones the core's ownership map
+(`member_brigades`) gives to the brigade and that have a screen, which is what
+`hosted_panes_of` returns: a member opened alone from the list, with no ownership
+entry, is a single session to it.
+
+A brigade on stage empties the stage and hands the focus back to the list; one off
+stage leaves what is showing and the focus alone. While the close is under way
+(`closing`, the transient sibling of `disbanding`) the brigade cannot be staged
+(a status line says it is still closing), nothing of it is created, relaunched,
+nudged, dismissed for having left or rung for (a `request_decision` that lands
+meanwhile stays in the store and makes no bell and no mark), and a pane that was
+still being opened is ended the moment it appears. A Worker whose addition the
+store answers after the confirm is recorded in the roster and not started: it is
+created afresh the next time the brigade is opened, as after a restart. The exits
+are folded into one status line, `<name> closed`, said when the last pane has gone.
+What the panes left queued — a nudge's delayed Enter, held Codex creations, the
+hold and unreadable-input clocks — is dropped at the confirm, because nothing
+between it and the exits may act on it (a disband drops the same for the panes it
+ends, by the same code). A kill that does not take is silent, so a close does not
+wait for ever: ten seconds after the confirm (`CLOSE_GIVE_UP`; in banto's pane log,
+six operator kills of idle panes each exited within 140-192 ms of the kill; panes
+in the middle of a turn were not measured) it gives up, once, with a line saying
+how many panes did not end. It does not kill them again; the brigade can be closed
+or staged once more.
+
+It is a hard kill, like every kill banto issues: what an agent loses when it is
+ended in the middle of a turn has not been measured. Restarting only the Director
+is still possible: exit the agent inside its pane, then press Enter on its row
+(staging reuses the live Workers).
+
+*Why the Director's prefix-`x` changed (operator's decision, 2026-11-20).* It used
+to end only the Director's process. The operator's reason: a brigade with only its
+Director gone is, from that moment, broken.
 
 **A Worker that ends on its own.** An exit banto did not ask for (a crash, an
 agent updating itself, Ctrl+D in the pane) — one whose *process is known to have
@@ -2727,8 +2796,8 @@ no confirmation) and the status says so (`worker-5 exited — removed from the
 brigade`, `"impl" exited again — removed from the brigade`); a store failure says
 so and leaves the member. It is Workers only: a Director's or a Goinkyo's pane
 ending un-stages it and keeps the member, as before. It never fires for an exit
-banto asked for (a kill, a dismissal, a disband), while banto is quitting, for a
-brigade being disbanded, twice for one member, or when the row is already gone.
+banto asked for (a kill, a dismissal, a disband, a close), while banto is quitting, for a
+brigade being disbanded or closed, twice for one member, or when the row is already gone.
 
 **A pane whose output is lost.** The pane's output stream can end without the
 process having: the reader thread stops on any read error, and ConPTY and Unix
@@ -2892,11 +2961,11 @@ created a second time; then, a held creation was released beside a resume whose 
 had not arrived yet.
 
 A held creation is carried out only if it is still wanted when its round's answer
-arrives (`creation_still_wanted`): the brigade exists and is not being disbanded,
-the member is still on its roster, and it is not open or being opened under any
-key. Otherwise it is dropped,
-silently, together with what opening it would have registered. A successful disband
-drops that brigade's held creations at once, without waiting for the answer. *Why
+arrives (`creation_still_wanted`): the brigade exists and is not being disbanded or
+closed, the member is still on its roster, and it is not open or being opened under
+any key. Otherwise it is dropped, silently, together with what opening it would have
+registered. A successful disband or a confirmed close drops that brigade's held
+creations at once, without waiting for the answer. *Why
 (found in review):* the answer used to release every held creation unconditionally,
 so a brigade disbanded in between got a Worker opened for it. The Director's spawn,
 which opens the Workers of a brigade just formed, asks the same question before it

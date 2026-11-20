@@ -238,7 +238,7 @@ fn form(
 ) -> (EmporiumState, App, Run) {
     let mut state = EmporiumState::new(PrefixKey::default());
     let mut app = App::new(vec![row("dir", director_agent)]);
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     let first = update(
         &mut state,
         &mut app,
@@ -274,7 +274,7 @@ fn restaging_a_brigade_resumes_every_member_with_no_model_and_no_effort() {
         row("w2", AgentKind::Codex),
         row("g1", AgentKind::ClaudeCode),
     ]);
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
     let roster = vec![
         ("director".to_string(), BrigadeRole::Director, s("dir")),
         ("worker-1".to_string(), BrigadeRole::Worker, s("w1")),
@@ -370,7 +370,7 @@ fn opening_a_solo_session_and_reopening_a_director_pass_no_model_and_no_effort()
         // A row activated on its own.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = App::new(vec![row("a", agent)]);
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "a".to_string()));
         let cmds = update(
             &mut state,
             &mut app,
@@ -660,7 +660,7 @@ fn a_worker_that_died_before_its_session_existed_is_created_again_from_the_defau
         };
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = App::new(vec![row("dir", AgentKind::ClaudeCode)]);
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
         let first = update(
             &mut state,
             &mut app,
@@ -726,7 +726,7 @@ fn a_fresh_goinkyo_is_created_with_its_model_and_effort_and_a_resumed_one_with_n
 
     // Resumed: the restaging test above covers `g1`; here the same Goinkyo's
     // row now exists and the brigade is staged again.
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
     let mut app = App::new(vec![
         row("dir", AgentKind::ClaudeCode),
         row("g1", AgentKind::ClaudeCode),
@@ -766,7 +766,7 @@ fn what_the_picker_confirms_is_what_the_workers_are_created_with() {
     };
     let mut state = EmporiumState::new(PrefixKey::default());
     let mut app = App::new(vec![row("dir", AgentKind::ClaudeCode)]);
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     update(
         &mut state,
         &mut app,
@@ -860,9 +860,9 @@ fn the_picker_opens_on_the_agent_chosen_last_time_with_that_agents_defaults() {
     };
     let mut state = EmporiumState::new(PrefixKey::default());
     let mut app = App::new(vec![row("dir", AgentKind::ClaudeCode)]);
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     let resolve = |state: &mut EmporiumState, app: &mut App| {
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
         update(
             state,
             app,
@@ -950,7 +950,7 @@ fn confirming_stores_the_agent_once_and_a_value_loaded_at_start_is_never_written
     assert!(saves(&cmds).is_empty(), "{cmds:?}");
 
     // Confirming the picker on the other agent stores it, once.
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     update(
         &mut state,
         &mut app,
@@ -984,7 +984,7 @@ fn confirming_stores_the_agent_once_and_a_value_loaded_at_start_is_never_written
     assert!(saves(&cmds).is_empty(), "not again: {cmds:?}");
 
     // Confirming on the agent already stored writes nothing.
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     let first = update(
         &mut state,
         &mut app,
@@ -1052,7 +1052,7 @@ fn other_worker_agent_settings_never_show_the_picker_and_use_the_resolved_agents
             AgentKind::Codex
         });
         let mut app = App::new(vec![row("dir", director)]);
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
         let first = update(
             &mut state,
             &mut app,
@@ -1234,7 +1234,7 @@ fn formation_awaiting_catalog(workers: usize) -> (EmporiumState, App, BrigadeCon
     };
     let mut state = EmporiumState::new(PrefixKey::default());
     let mut app = App::new(vec![row("dir", AgentKind::ClaudeCode)]);
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
     let mut cmds = update(
         &mut state,
         &mut app,
@@ -1826,7 +1826,7 @@ fn restage_with_worker_resumed(state: &mut EmporiumState, app: &mut App, brigade
         row("dir", AgentKind::ClaudeCode),
         row("w1", AgentKind::Codex),
     ]);
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
     let cmds = update(
         state,
         app,
@@ -2249,7 +2249,7 @@ fn restage_with_roster_tail(
         row("dir", AgentKind::ClaudeCode),
         row("w1", AgentKind::Codex),
     ]);
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
     let mut roster = vec![
         ("director".to_string(), BrigadeRole::Director, s("dir")),
         ("worker-1".to_string(), BrigadeRole::Worker, s("w1")),

@@ -21,7 +21,7 @@ pub const SEARCH_HINTS: &str = "type to search · Enter confirm · Esc cancel";
 /// Shown while the prefix chord is armed: the keys the chord's follow-up takes.
 pub const PREFIX_HINTS: &str = "prefix: Esc cancel · o/Tab cycle · arrows move · Shift+Up/Down reorder · m collapse · z solo · M restore · = reset sizes · 1-9 pane · b literal · s sidebar · x close";
 
-const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
+const LIST_HINTS: &str = "j/k move · Enter open · F2 pane · B brigade/disband · x close · b +worker · \
                           F3 next pane · F4 bell · / search · n new · d archive · g group · \
                           Tab grouped/flat · p pin · a reveal · q/Esc quit";
 
@@ -105,7 +105,7 @@ mod tests {
         let hints = idle_hints(&input(Focus::Sidebar, Mode::Normal));
         assert_eq!(
             hints,
-            "j/k move · Enter open · F2 pane · B brigade/disband · b +worker · \
+            "j/k move · Enter open · F2 pane · B brigade/disband · x close · b +worker · \
              F3 next pane · F4 bell · / search · n new · d archive · g group · \
              Tab grouped/flat · p pin · a reveal · q/Esc quit"
         );

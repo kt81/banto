@@ -48,7 +48,7 @@ fn press_b(title: Option<&str>, brigade: &BrigadeConfig) -> (EmporiumState, App,
 fn press_b_on(director: SessionRow, brigade: &BrigadeConfig) -> (EmporiumState, App, Vec<Cmd>) {
     let mut state = EmporiumState::new(PrefixKey::default());
     let mut app = App::new(vec![director]);
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, ID.to_string()));
     let cmds = update(
         &mut state,
         &mut app,

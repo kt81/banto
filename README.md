@@ -451,6 +451,7 @@ finish.
 | `q` / `Esc` | Quit (a second press is needed while a session is not idle or is running a background command, see above) |
 | `B` | Appoint Director + auto-spawn Workers (on a Director: disband) |
 | `b` | Spawn one more Worker into the staged cell |
+| `x` | End what the selected row runs (confirm). On a Director: **close its brigade**, on stage or not — every process of the cell ends and nothing is deleted, so Enter on the Director's row brings it all back. On a single session with an open pane: end its process. It never dismisses a Worker; use `Ctrl+B x` on that Worker's tile |
 | `F2` | Move focus between the list and the panes |
 | `F3` | Make the next pane of the staged brigade the current one (collapsed tiles are skipped); pressed from the list, the keyboard stays on the list |
 | `F4` | Switch the brigade bell (see "Director/Worker cells") between silent-while-you-watch and ringing even while the Director's pane is focused; one keystroke from the list or from a pane, taken by banto and not sent to the agent; the status bar shows `BELL ALWAYS` while the second is on |
@@ -465,7 +466,7 @@ finish.
 | … `1`-`9` | jump to pane N |
 | … `s` | back to the sidebar |
 | … `Esc` | cancel the prefix (focus stays; nothing is sent to the child) |
-| … `x` | dismiss the focused Worker/Goinkyo from its brigade (confirm; it leaves for good, its session is kept); on a Director or a single session, end its process |
+| … `x` | dismiss the focused Worker/Goinkyo from its brigade (confirm; it leaves for good, its session is kept); on a Director, close the whole brigade (confirm; every process ends, nothing is deleted, Enter on the Director's row resumes it); on a single session, end its process |
 | … `b`/`Ctrl+B` | send a literal prefix chord to the child |
 
 While the prefix is armed, the status bar shows the full binding table —

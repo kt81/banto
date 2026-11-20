@@ -1,5 +1,6 @@
 //! A brigade member leaving: prefix-`x` on a member other than the Director
-//! dismisses it (one confirmation), and a Worker whose pane ends on its own and
+//! dismisses it (one confirmation; on the Director it closes the brigade, see
+//! `close_brigade_tests`), and a Worker whose pane ends on its own and
 //! cannot be relaunched leaves the brigade too — a member with no pane is an
 //! invisible one. Everything here is driven through real `Event`s.
 
@@ -169,7 +170,7 @@ fn prefix_x_on_a_worker_with_a_real_key_dismisses_it_after_one_confirmation() {
     );
     assert!(app.modal().is_none(), "one confirmation, nothing more");
     // ... whose answer is the DismissWorker ...
-    state.pending_membership = Some(PendingMembership::DismissWorker);
+    state.pending_membership = Some((PendingMembership::DismissWorker, "w1".to_string()));
     let cmds = send(
         &mut state,
         &mut app,
@@ -307,20 +308,33 @@ fn prefix_x_on_the_goinkyo_dismisses_it_the_same_way() {
 }
 
 #[test]
-fn prefix_x_on_the_director_only_ends_the_pane_and_keeps_the_member() {
+fn prefix_x_on_the_director_closes_the_brigade_instead_of_ending_only_its_pane() {
     let (mut state, mut app) = brigade(&["w1"]);
     if let Stage::Brigade { focused, .. } = &mut state.stage {
         *focused = 0;
     }
     let t = now();
     prefix_x(&mut state, &mut app, t);
-    assert_eq!(modal_dismisses(&app), Some(None));
+    assert_eq!(modal_dismisses(&app), None, "not the plain kill dialog");
+    assert!(matches!(
+        app.modal(),
+        Some(Modal::ConfirmCloseBrigade { brigade_id: 1, .. })
+    ));
     let cmds = press(&mut state, &mut app, KeyCode::Enter, t);
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("dir") }]);
+    assert_eq!(
+        cmds,
+        vec![
+            Cmd::KillPty { key: key("dir") },
+            Cmd::KillPty { key: key("w1") },
+            Cmd::KillPty { key: key("w2") },
+        ]
+    );
     assert_eq!(state.pending_dismiss, None);
-    // Its exit (asked for) is the Director's, and removes nobody.
-    let cmds = without_resizes(exits(&mut state, &mut app, "dir", t));
-    assert!(cmds.is_empty(), "{cmds:?}");
+    // Their exits (asked for) remove nobody from the brigade.
+    for id in ["dir", "w1", "w2"] {
+        let cmds = without_resizes(exits(&mut state, &mut app, id, t));
+        assert!(cmds.is_empty(), "{id}: {cmds:?}");
+    }
 }
 
 #[test]
@@ -354,7 +368,13 @@ fn a_worker_is_dismissable_even_when_the_directors_pane_is_unknown() {
         *focused = 0;
     }
     prefix_x(&mut state, &mut app, now());
-    assert_eq!(modal_dismisses(&app), Some(None), "the Director's token");
+    assert!(
+        matches!(
+            app.modal(),
+            Some(Modal::ConfirmCloseBrigade { brigade_id: 1, .. })
+        ),
+        "the Director's token: it closes the brigade, it is never dismissed"
+    );
 }
 
 #[test]
@@ -551,8 +571,11 @@ fn panes_of_a_brigade_that_is_being_disbanded_or_gone_leave_nobody() {
     let cmds = without_resizes(exits(&mut state, &mut app, "w1", t));
     assert!(cmds.is_empty(), "{cmds:?}");
 
-    // A disbanded brigade whose pane was off-stage (nothing killed it): it ends
-    // later, and nobody is removed from a brigade that is gone.
+    // A disbanded brigade whose pane was off-stage: the disband ends it, so its
+    // exit is one banto asked for and nobody is removed from a brigade that is
+    // gone. That is no longer the path the `disbanding` guard covers, which is
+    // only reachable through an exit banto did not ask for: the guard is pinned
+    // directly, with the one record that would otherwise answer first removed.
     let (mut state, mut app) = brigade(&[]);
     state.stage = Stage::Empty;
     send(
@@ -564,6 +587,15 @@ fn panes_of_a_brigade_that_is_being_disbanded_or_gone_leave_nobody() {
         },
         t,
     );
+    let w2 = key("w2");
+    assert!(state.expected_exits.contains_key(&w2));
+    assert!(unrequested_worker_exit(&state, &app, &w2, false).is_none());
+    state.disbanding.remove(&1);
+    assert!(
+        unrequested_worker_exit(&state, &app, &w2, false).is_some(),
+        "without `disbanding` the same exit is a Worker leaving"
+    );
+    state.disbanding.insert(1);
     let cmds = without_resizes(exits(&mut state, &mut app, "w2", t));
     assert!(cmds.is_empty(), "{cmds:?}");
 

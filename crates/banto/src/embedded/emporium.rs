@@ -4008,9 +4008,16 @@ fn draw(
     render_status_bar(frame, app, state, areas.status);
 
     if let Some(modal) = app.modal() {
-        // `true`: the emporium binds Shift-Tab to `App::modal_toggle_agent`
-        // (see `engine::update_modal_key`) — see `render_modal`'s doc.
-        banto_tui::render_modal::render_modal(frame, modal, full_area);
+        // Read at the moment of drawing, from the panes hosted now: the close
+        // dialog stays open while panes end and start, and Enter acts on what
+        // is hosted when it is pressed.
+        let close = match modal {
+            banto_core::app::Modal::ConfirmCloseBrigade { brigade_id, .. } => {
+                Some(state.close_reading(app, *brigade_id, Instant::now()))
+            }
+            _ => None,
+        };
+        banto_tui::render_modal::render_modal(frame, modal, full_area, close.as_ref());
     }
 
     frame_cursor

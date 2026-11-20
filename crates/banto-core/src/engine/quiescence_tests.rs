@@ -10050,7 +10050,7 @@ fn open_a_plain_session_solo(off_stage: &mut OffStage, at: Instant, waiting: &st
     }
     rows.push(row_for("plain"));
     off_stage.app.replace_rows(rows);
-    off_stage.state.pending_membership = Some(PendingMembership::Activate);
+    off_stage.state.pending_membership = Some((PendingMembership::Activate, "plain".to_string()));
     let mut cmds = send(
         &mut off_stage.state,
         &mut off_stage.app,
@@ -10992,4 +10992,121 @@ fn a_session_move_never_renames_a_brigade_members_pane() {
 
     assert!(cmds.is_empty(), "{cmds:?}");
     assert!(state.screens.contains_key(&w));
+}
+
+// --- a brigade being closed makes no news --------------------------------------
+//
+// Each of these is reachable only in the moments between the operator's confirm
+// and the last pane's exit, and each runs the scenario both ways: the control
+// without a close is what proves the test could see the news it says is absent.
+
+#[test]
+fn a_brigade_that_goes_quiet_while_being_closed_rings_no_bell_and_marks_nothing() {
+    for closing in [false, true] {
+        let (mut state, mut app, director, worker, at) = quiet_fixture();
+        let idle_from = busy_then_idle(&mut state, &mut app, &[&worker, &director], at);
+        if closing {
+            state.closing.insert(1, idle_from);
+        }
+        let cmds = sample(
+            &mut state,
+            &mut app,
+            &[(&director, Idle), (&worker, Idle)],
+            idle_from + BRIGADE_QUIET_SETTLE,
+        );
+        assert_eq!(rang(&cmds), !closing, "closing {closing}: {cmds:?}");
+        assert_eq!(
+            state.attention_panes().contains(&director),
+            !closing,
+            "closing {closing}"
+        );
+    }
+}
+
+#[test]
+fn an_off_stage_worker_that_waits_while_its_brigade_is_closed_marks_no_row_and_rings_nothing() {
+    for closing in [false, true] {
+        let (mut state, mut app, _director, _worker, at) = quiet_fixture();
+        let mut rows = vec![row_for("dir"), row_for("w1")];
+        rows[1].activity = crate::model::Activity::Waiting;
+        app.replace_rows(rows);
+        app.set_hidden_member_ids(["w1".to_string()].into_iter().collect());
+        app.set_viewport_height(20);
+        state.stage = Stage::Empty;
+        if closing {
+            state.closing.insert(1, at);
+        }
+        let cmds = tick(&mut state, &mut app, at + SECOND);
+        assert_eq!(rings(&cmds), usize::from(!closing), "closing {closing}");
+        assert_eq!(app.has_brigade_mark("dir"), !closing, "closing {closing}");
+    }
+}
+
+#[test]
+fn the_relay_types_nothing_into_a_pane_of_a_brigade_being_closed() {
+    for closing in [false, true] {
+        let (mut state, mut app, director, worker, at) = quiet_fixture();
+        let start = at + 20 * SECOND;
+        if closing {
+            state.closing.insert(1, start);
+        }
+        let observation = || RelayObservation {
+            live: None,
+            glance: None,
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            key: worker.clone(),
+            has_unseen: true,
+            is_idle_this_tick: Some(true),
+            agent: None,
+            briefed_since_launch: None,
+        };
+        let idle = [(&director, Idle), (&worker, Idle)];
+        let mut written = Vec::new();
+        // Inside the close's own limit, which would end the closing and with it
+        // the guard under test.
+        for secs in 20..28 {
+            let cmds = sample_with_relay(
+                &mut state,
+                &mut app,
+                &idle,
+                vec![observation()],
+                at + secs * SECOND,
+            );
+            written.extend(
+                cmds.into_iter()
+                    .filter(|cmd| matches!(cmd, Cmd::WritePty { .. })),
+            );
+        }
+        assert_eq!(
+            written.is_empty(),
+            closing,
+            "closing {closing}: {written:?}"
+        );
+    }
+}
+
+#[test]
+fn a_request_that_lands_while_its_brigade_is_being_closed_is_kept_and_makes_no_noise() {
+    for closing in [false, true] {
+        let (mut state, mut app, director, _worker, at) = request_fixture();
+        tick(&mut state, &mut app, at + SECOND);
+        if closing {
+            state.closing.insert(1, at + SECOND);
+        }
+        store_request(1);
+        let cmds = tick(&mut state, &mut app, at + 2 * SECOND);
+        assert_eq!(rings(&cmds), usize::from(!closing), "closing {closing}");
+        assert_eq!(
+            state.attention_panes().contains(&director),
+            !closing,
+            "closing {closing}"
+        );
+        assert!(state.has_request(&director), "recorded either way");
+        assert_eq!(
+            state.request_spent.contains(&1),
+            !closing,
+            "closing {closing}: nothing is spent for a brigade on its way out"
+        );
+    }
 }

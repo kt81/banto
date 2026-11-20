@@ -165,12 +165,12 @@ pub enum Stage {
         /// all read this instead of assuming `panes[0]`). `None` is a
         /// legitimate state, not a gap to close: `stage_brigade` sets it
         /// leniently from the store's own member row (no session id
-        /// recorded yet there → `None`), and closing just the Director's
-        /// own pane (prefix-`x` on it only ends the process — a Director leaves
-        /// a brigade by disbanding it, see `PrefixAction::Kill`'s own doc; `Stage::remove`
-        /// clears this field the same moment it drops that pane from
-        /// `panes`) leaves a brigade legitimately staged around its other
-        /// members with the Director simply unknown-for-now. Every
+        /// recorded yet there → `None`), and a Director whose pane ends on its
+        /// own (its agent exited; `Stage::remove` clears this field the same
+        /// moment it drops that pane from `panes`) leaves a brigade
+        /// legitimately staged around its other members with the Director
+        /// simply unknown-for-now. (Prefix-`x` on a Director's tile is no way
+        /// there: it closes the whole brigade, see `PrefixAction::Kill`.) Every
         /// consumer's own `None` behavior is its safe default, not an
         /// error path — see each site's own doc.
         director: Option<SessionKey>,
@@ -328,6 +328,19 @@ const BRIGADE_QUIET_SETTLE: Duration = Duration::from_secs(5);
 /// panes settled to idle within about 3.5 seconds. Self-started work that is
 /// still going when it ends arms at the first reading past it.
 const PROCESS_START_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a close waits for its panes to be gone before it gives up and lets
+/// the brigade be used again. A kill that does not take is silent — the shell
+/// ignores `Cmd::KillPty` for a key with no handle and a `kill()` that fails —
+/// so without a limit the brigade would refuse to be staged or closed until
+/// banto restarted. Measured, in banto's own pane log (`logs/panes.log`, read
+/// by the Goinkyo during the design consultation on 2026-11-20): six operator
+/// kills of idle panes, each exit following its kill within 140–192 ms. Panes
+/// in the middle of a turn were not measured. Ten seconds is a margin of fifty
+/// times over those, not a derived value. Giving up does not kill again: a pane
+/// that outlived one kill will not be helped by a loop of them, and the
+/// operator is told how many are left.
+const CLOSE_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// How long after banto last wrote input into a pane the quit question counts
 /// that pane as not idle whatever its sample says. The sample is up to a tick
@@ -1007,6 +1020,10 @@ enum PendingMembership {
     Activate,
     /// `B`.
     BrigadeKey,
+    /// `x` on a list row: whether the row is a brigade's Director (close the
+    /// brigade) or a single session (end its pane) is the store's to say, and
+    /// the Director's pane may not exist for the core to read it from.
+    CloseKey,
     /// Prefix-`x` confirmed on a Worker (or Goinkyo) pane whose key isn't a
     /// synthetic placeholder, so its token isn't embedded in the key itself
     /// ([`SessionKey::worker_identity`]) — one round trip to learn
@@ -1353,7 +1370,10 @@ pub struct EmporiumState {
     pending_opens: HashMap<SessionKey, PendingOpen>,
     unresolved_codex: HashSet<SessionKey>,
     lost_output_waiting_for_exit: HashSet<SessionKey>,
-    pending_membership: Option<PendingMembership>,
+    /// The one membership question in flight: what it was asked for, and the
+    /// session id it was asked about, which the answer has to carry back
+    /// ([`update_membership_resolved`]).
+    pending_membership: Option<(PendingMembership, String)>,
     pending_brigade_formation: Option<PendingBrigadeFormation>,
     pending_worker_addition: Option<PendingWorkerAddition>,
     pending_codex_trust_formation: Option<PendingCodexTrustFormation>,
@@ -1412,6 +1432,17 @@ pub struct EmporiumState {
     /// follows (`unrequested_worker_exit`). Brigade ids are never reissued, so
     /// an entry never has to be taken back — except when the disband fails.
     disbanding: HashSet<BrigadeId>,
+    /// Brigades being closed, each with the moment the confirm was given: some of
+    /// their panes are still ending, or a pane of theirs is still being opened.
+    /// Closing ends every process the brigade hosts and deletes nothing, so unlike
+    /// a disband it is over, and its entry is taken back by [`settle_closing`],
+    /// when no pane of the brigade is hosted or opening any more, or when
+    /// [`CLOSE_GIVE_UP`] has passed. While it stands no pane of the brigade is
+    /// created, relaunched, nudged or dismissed for having left, no quiet or
+    /// waiting bell is rung for it, the Goinkyo is not respawned and the brigade
+    /// cannot be staged: every exit in it is one banto asked for, and together
+    /// they are one line on the status bar.
+    closing: HashMap<BrigadeId, Instant>,
     /// Workers whose removal from the store, after an exit nobody asked for, is
     /// in flight: never asked for twice, and the answer
     /// ([`Event::ExitedWorkerDismissed`]) carries the token, so it needs no
@@ -1515,8 +1546,10 @@ pub struct EmporiumState {
     /// A disband does reach the `NoGoinkyo` removal above, one tick later:
     /// the gatherer asks about every brigade that has an entry here, and a
     /// deleted brigade's roster reads as empty (not as an error), so it has
-    /// no Goinkyo row and the entry is released. The kill that arm issues
-    /// names a pane the disband already closed, which costs nothing.
+    /// no Goinkyo row and the entry is released. `update_disbanded` has already
+    /// killed this pane, staged or not (it ends every hosted pane of the
+    /// brigade whose member token is a Worker's or the Goinkyo's), so the kill
+    /// that arm issues names a pane already on its way out, which costs nothing.
     goinkyo_pane: HashMap<BrigadeId, SessionKey>,
     /// Durable brigade member identity carried alongside a live pane key.
     /// Every key in `Stage::Brigade::panes` has one entry here; `panes`
@@ -1661,15 +1694,19 @@ const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 /// Ask for `key`'s pane to end, recording that banto is the one asking.
 ///
 /// Every kill banto performs goes through here. The alternative — reading the
-/// surrounding state at exit time — very nearly works: dismissing a Worker,
-/// disbanding, and both Goinkyo paths all un-stage before they kill, so by
-/// the time the exit arrives the key is already gone from the stage. The ones
-/// that do not — prefix-`x` on a Director or a single session, which only ends
-/// the process — set nothing and un-stage nothing, and are therefore
+/// surrounding state at exit time — very nearly works for the callers that take
+/// the pane off the stage as they kill (a dismissed Worker, both Goinkyo paths,
+/// and a disband for the panes that were staged): by the time the exit arrives
+/// the key is no longer staged. The ones that do not — prefix-`x` on a single
+/// session, closing a brigade, and a disband's off-stage panes, none of which
+/// need ever have been on the stage — leave the pane's state exactly as it was
+/// (a disband's per-pane maps go only when the exit arrives), and are therefore
 /// indistinguishable at exit time from a child that died by itself. That
-/// asymmetry is what this exists to remove; and an exit banto did not ask for is
-/// the one after which a Worker that cannot be relaunched leaves its brigade
-/// (`unrequested_worker_exit`), so the record must never be missing.
+/// asymmetry is what this exists to remove; and an exit banto did not ask for
+/// is the one after which a Worker that cannot be relaunched leaves its
+/// brigade (`unrequested_worker_exit`), so the record must never be missing:
+/// for a closed brigade a missing one would delete a member from the store,
+/// which closing promises not to do.
 ///
 /// The member is read here, not at exit time, because the callers that end a
 /// Worker's pane unstage it, which removes the member's maps. So every caller
@@ -1739,6 +1776,7 @@ impl EmporiumState {
             pending_dismiss_member: None,
             sweep_due: None,
             disbanding: HashSet::new(),
+            closing: HashMap::new(),
             removing_exited: HashSet::new(),
             size: (0, 0),
             sidebar_width: SIDEBAR_WIDTH,
@@ -1969,6 +2007,13 @@ impl EmporiumState {
         self.pending_kickoffs.retain(|pending| &pending.key != key);
         self.pending_goinkyo_kickoffs
             .retain(|pending| &pending.key != key);
+        self.settle_focus();
+    }
+
+    /// Put [`Self::focus`] back on the sidebar when the stage has nothing left
+    /// to focus (the rule [`Self::unstage`] explains). For a caller that empties
+    /// the stage itself rather than by dropping a pane.
+    fn settle_focus(&mut self) {
         if !self.stage.is_active() {
             self.focus = Focus::Sidebar;
         }
@@ -2256,6 +2301,79 @@ impl EmporiumState {
                 .last_given_input
                 .get(key)
                 .map(|at| now.saturating_duration_since(*at).as_millis()),
+        }
+    }
+
+    /// Every pane this process hosts for `brigade_id`, staged or not: the panes
+    /// with a screen that the ownership map gives to the brigade, in key order.
+    /// The Director's pane and a Goinkyo's are among them, and so is a Worker
+    /// whose cell is not the one on stage. `Stage` only describes the one cell
+    /// that is visible; anything that has to reach a brigade's every pane (a
+    /// disband, and whatever closes a brigade as a whole) asks here instead of
+    /// the stage, which cannot see the others.
+    fn hosted_panes_of(&self, brigade_id: BrigadeId) -> Vec<SessionKey> {
+        let mut panes: Vec<SessionKey> = self
+            .member_brigades
+            .iter()
+            .filter(|(key, owner)| **owner == brigade_id && self.screens.contains_key(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        panes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        panes
+    }
+
+    /// The brigade `key`'s pane is the Director of, read from the ownership maps
+    /// like every other role question about a pane. A brigade whose disband was
+    /// confirmed does not count: its surviving Director keeps the maps it was
+    /// staged with (`update_disbanded`) and leads nothing, so it is a single
+    /// session to everything that asks.
+    fn directed_brigade(&self, key: &SessionKey) -> Option<BrigadeId> {
+        let brigade_id = *self.member_brigades.get(key)?;
+        (self.member_tokens.get(key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+            && !self.disbanding.contains(&brigade_id))
+        .then_some(brigade_id)
+    }
+
+    /// How many of `brigade_id`'s panes are asked for and not reported spawned
+    /// yet, which [`Self::hosted_panes_of`] cannot see: they have no screen.
+    fn pending_opens_of(&self, brigade_id: BrigadeId) -> usize {
+        self.pending_opens
+            .values()
+            .filter(|pending| {
+                matches!(
+                    pending,
+                    PendingOpen::BrigadeDirector { brigade_id: id, .. }
+                        | PendingOpen::BrigadeMember { brigade_id: id, .. }
+                        if *id == brigade_id
+                )
+            })
+            .count()
+    }
+
+    /// What closing `brigade_id` would end, read now: how many panes, and the ones
+    /// the quit question would ask about, by its own classification
+    /// ([`Self::quit_counts_of`]) so the two cannot drift. The close dialog is
+    /// drawn from this on every frame and its confirm acts on the panes hosted
+    /// when Enter is pressed, never on a list taken when the dialog opened.
+    pub fn close_reading(&self, app: &App, brigade_id: BrigadeId, now: Instant) -> CloseReading {
+        let counts = self.quit_counts_of(app, now, |key| {
+            self.member_brigades.get(key) == Some(&brigade_id)
+        });
+        let named = |wanted: fn(&QuitKind) -> bool| -> Vec<String> {
+            counts
+                .entries
+                .iter()
+                .filter(|entry| wanted(&entry.kind))
+                .map(|entry| match entry.kind {
+                    QuitKind::NotIdle(reason) => format!("{} ({})", entry.name, reason.word()),
+                    QuitKind::Background => entry.name.clone(),
+                })
+                .collect()
+        };
+        CloseReading {
+            ending: self.hosted_panes_of(brigade_id).len(),
+            not_idle: named(|kind| matches!(kind, QuitKind::NotIdle(_))),
+            background: named(|kind| matches!(kind, QuitKind::Background)),
         }
     }
 
@@ -2777,8 +2895,20 @@ impl EmporiumState {
     /// ([`QuitCounts`]), decided here with the count so the two cannot drift: the
     /// first condition a pane meets is its reason.
     fn quit_counts(&self, app: &App, now: Instant) -> QuitCounts {
+        self.quit_counts_of(app, now, |_| true)
+    }
+
+    /// [`Self::quit_counts`] over the hosted panes `wanted` accepts: what closing
+    /// a brigade asks about is the quit question's own count, narrowed, so the
+    /// two never classify a pane differently.
+    fn quit_counts_of(
+        &self,
+        app: &App,
+        now: Instant,
+        wanted: impl Fn(&SessionKey) -> bool,
+    ) -> QuitCounts {
         let mut counted: Vec<(&SessionKey, QuitKind)> = Vec::new();
-        for key in self.screens.keys() {
+        for key in self.screens.keys().filter(|key| wanted(key)) {
             let reading = self.quiescence_of(app, key);
             let kind = if self.took_input_recently(key, now) {
                 QuitKind::NotIdle(QuitReason::Input)
@@ -3030,6 +3160,19 @@ const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 struct PendingQuit {
     at: Instant,
     prompt: String,
+}
+
+/// What closing a brigade would end, as the dialog says it
+/// ([`EmporiumState::close_reading`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloseReading {
+    /// Every pane the brigade has hosted: all of them end.
+    pub ending: usize,
+    /// The ones not known to be idle, each as `name (why)`, in the quit
+    /// question's order.
+    pub not_idle: Vec<String>,
+    /// The ones idle but for a background command that is still running.
+    pub background: Vec<String>,
 }
 
 /// The hosted panes a quit would end that are worth asking about, each by name
@@ -4676,6 +4819,7 @@ pub fn update(
     refocus_expanded(state, None);
     validate_drag(state, app);
     settle_pending_quit(state, app, now);
+    settle_closing(state, app, now);
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(persist_preferences(state));
     if overlay_may_have_changed {
@@ -4807,7 +4951,8 @@ fn director_pane_of(state: &EmporiumState, brigade_id: BrigadeId) -> Option<Sess
 /// the brigade is staged or not. With the setting off the tag is all there is,
 /// and nothing is spent. Nothing is spent for a brigade whose Director is not
 /// hosted: there is no quiet to swallow, and a spending left standing would eat a
-/// later, unrelated one.
+/// later, unrelated one. Nor for a brigade being closed: the request is kept, and
+/// neither a mark nor a bell is made for it.
 fn apply_request_fact(
     state: &mut EmporiumState,
     config: &BrigadeConfig,
@@ -4832,6 +4977,13 @@ fn apply_request_fact(
         state.requests.insert(brigade_id, seq);
     }
     if !is_new || !config.request_attention {
+        return Vec::new();
+    }
+    // A request that lands between the confirm and the Director's exit is
+    // recorded above and stays in the store, as a close keeps everything there;
+    // but a brigade being closed rings no bell and gets no mark, and a spending
+    // for it would outlive the Director's pane.
+    if state.closing.contains_key(&brigade_id) {
         return Vec::new();
     }
     let Some(director) = director_pane_of(state, brigade_id) else {
@@ -5087,8 +5239,10 @@ fn update_brigade_quiet(
             continue;
         };
         // One that is being disbanded is left alone and its watch kept as it was,
-        // in case the disband fails.
-        if state.disbanding.contains(&brigade_id) {
+        // in case the disband fails. One that is being closed is left alone too:
+        // its panes are ending on purpose, and the quiet they leave behind is no
+        // news.
+        if state.disbanding.contains(&brigade_id) || state.closing.contains_key(&brigade_id) {
             continue;
         }
         // A brigade is judged only in a tick that observed its Director: that
@@ -5346,7 +5500,7 @@ fn sync_brigade_marks(state: &mut EmporiumState, app: &mut App, now: Instant) ->
         let Some(&director) = directors.get(&brigade_id) else {
             continue;
         };
-        if state.disbanding.contains(&brigade_id) {
+        if state.disbanding.contains(&brigade_id) || state.closing.contains_key(&brigade_id) {
             continue;
         }
         marked.insert(director);
@@ -5796,7 +5950,7 @@ fn update_key(
     }
 
     if app.modal().is_some() {
-        return update_modal_key(state, app, code, key.modifiers);
+        return update_modal_key(state, app, code, key.modifiers, now);
     }
     if app.mode() == Mode::Search {
         update_search_key(app, code);
@@ -5935,6 +6089,7 @@ fn update_key(
                 }
                 (KeyCode::Enter, _) => activate_selected(state, app),
                 (KeyCode::Char('B'), Modifiers::NONE | Modifiers::SHIFT) => brigade_key(state, app),
+                (KeyCode::Char('x'), Modifiers::NONE) => close_key(state, app),
                 (KeyCode::Char('b'), Modifiers::NONE) => add_worker(state, app, brigade),
                 (KeyCode::Tab, _) => {
                     app.toggle_grouped_view();
@@ -6065,6 +6220,15 @@ fn resolve_armed_prefix(
             let Some(target) = state.stage.focused_key().cloned() else {
                 return Vec::new();
             };
+            // A Director's pane is not one to end alone: a brigade with only its
+            // Director gone is broken, so this closes the whole brigade. Who the
+            // Director is comes from the ownership maps, as every other role
+            // question here does, not from `Stage::director`, which is `None` for
+            // a brigade staged around a Director with no known pane and is not
+            // there at all for a Director shown on its own.
+            if let Some(brigade_id) = state.directed_brigade(&target) {
+                return open_close_brigade(state, app, brigade_id);
+            }
             let title = app
                 .row_for_id(target.as_str())
                 .map(SessionRow::sentence_name)
@@ -6074,8 +6238,7 @@ fn resolve_armed_prefix(
             // but the Director's is a Worker or the Goinkyo — dismissed, named as
             // the operator knows it. That holds with or without a known Director
             // pane: a Worker is plainly a Worker either way. Not dismissed (the
-            // confirm only ends the process, as it always did): the Director's
-            // own pane (a Director leaves by disbanding, `B`), and a single
+            // confirm only ends the process, as it always did): a single
             // non-brigade session — including a member opened solo from the
             // sidebar, which carries no membership in the stage to read.
             let dismisses = match &state.stage {
@@ -6126,6 +6289,7 @@ fn update_modal_key(
     app: &mut App,
     code: KeyCode,
     mods: Modifiers,
+    now: Instant,
 ) -> Vec<Cmd> {
     if mods.ctrl {
         match code {
@@ -6194,7 +6358,7 @@ fn update_modal_key(
             app.modal_delete_forward();
             Vec::new()
         }
-        KeyCode::Enter => confirm_modal(state, app),
+        KeyCode::Enter => confirm_modal(state, app, now),
         KeyCode::Char(c) => {
             app.modal_push_char(c);
             Vec::new()
@@ -6203,7 +6367,7 @@ fn update_modal_key(
     }
 }
 
-fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
+fn confirm_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
     enum Kind {
         Archive,
         Group,
@@ -6211,6 +6375,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         GroupDelete,
         New,
         Disband,
+        CloseBrigade,
         Kill,
         WorkerAgent,
         CodexTrust,
@@ -6223,6 +6388,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Modal::ConfirmGroupDelete { .. }) => Some(Kind::GroupDelete),
         Some(Modal::NewSession(_)) => Some(Kind::New),
         Some(Modal::ConfirmDisband { .. }) => Some(Kind::Disband),
+        Some(Modal::ConfirmCloseBrigade { .. }) => Some(Kind::CloseBrigade),
         Some(Modal::ConfirmKill { .. }) => Some(Kind::Kill),
         Some(Modal::WorkerAgentPicker(_)) => Some(Kind::WorkerAgent),
         Some(Modal::ConfirmCodexTrust) => Some(Kind::CodexTrust),
@@ -6236,6 +6402,7 @@ fn confirm_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
         Some(Kind::GroupDelete) => confirm_group_delete_modal(app),
         Some(Kind::New) => confirm_new_session_modal(app),
         Some(Kind::Disband) => confirm_disband_modal(state, app),
+        Some(Kind::CloseBrigade) => confirm_close_brigade_modal(state, app, now),
         Some(Kind::Kill) => confirm_kill_modal(state, app),
         Some(Kind::WorkerAgent) => confirm_worker_agent_modal(state, app),
         Some(Kind::CodexTrust) => confirm_codex_trust_modal(state, app),
@@ -6464,15 +6631,124 @@ fn confirm_disband_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     vec![Cmd::Store(StoreIntent::Disband { brigade_id })]
 }
 
+/// Open the close dialog for `brigade_id`, or say why not: the brigade is
+/// already closing, is being disbanded, or has nothing hosted to close. Shared by
+/// the Director's Prefix+`x` and the list's `x`, so both refuse the same way.
+fn open_close_brigade(state: &mut EmporiumState, app: &mut App, brigade_id: BrigadeId) -> Vec<Cmd> {
+    let name = state.brigade_name(app, brigade_id);
+    if state.closing.contains_key(&brigade_id) {
+        state.status = Some(format!("{name} is already closing"));
+    } else if state.disbanding.contains(&brigade_id) {
+        state.status = Some(format!("{name} is being disbanded"));
+    } else if state.hosted_panes_of(brigade_id).is_empty() {
+        state.status = Some(format!(
+            "nothing of {name} is running \u{2014} Enter on its Director's row opens it"
+        ));
+    } else {
+        app.open_confirm_close_brigade_modal(brigade_id, name);
+    }
+    Vec::new()
+}
+
+/// Confirm the close dialog: end every pane the brigade hosts, delete nothing.
+///
+/// The panes are read from the state now, not from when the dialog opened: one
+/// that ended meanwhile is simply not there, and one that began is ended too. All
+/// of them are killed through [`kill_pane`] (a hard kill, as every kill banto
+/// issues is), which records each exit as one banto asked for, so a Worker is not
+/// relaunched and not dismissed for having left, and a Director is not read as
+/// having wandered off. The brigade, its members and their session ids, its mail
+/// and read cursors, request records and a consultation in progress all stay in
+/// the store, which this never writes: a Goinkyo in consultation is still a
+/// member and resumes with the rest when the Director's row is opened.
+///
+/// A brigade on the stage empties it (and the focus goes back to the list, since
+/// a pane focus on an empty stage strands every key); one that is off stage
+/// leaves what is showing and the focus alone. What the panes left queued or
+/// half-counted is dropped here rather than when their exits arrive
+/// ([`drop_leftovers_of_ended_panes`], which says why). The exits come as
+/// ordinary events and are folded into one line by [`settle_closing`], which also
+/// gives up after [`CLOSE_GIVE_UP`] if a kill did not take.
+fn confirm_close_brigade_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
+    let Some(Modal::ConfirmCloseBrigade { brigade_id, .. }) = app.modal() else {
+        return Vec::new();
+    };
+    let brigade_id = *brigade_id;
+    app.close_modal();
+    let hosted = state.hosted_panes_of(brigade_id);
+    if state.closing.contains_key(&brigade_id)
+        || state.disbanding.contains(&brigade_id)
+        || hosted.is_empty()
+    {
+        return Vec::new();
+    }
+    state.closing.insert(brigade_id, now);
+    if matches!(&state.stage, Stage::Brigade { id, .. } if *id == brigade_id) {
+        state.stage = Stage::Empty;
+        state.settle_focus();
+    }
+    drop_leftovers_of_ended_panes(state, brigade_id, &hosted);
+    hosted
+        .into_iter()
+        .map(|key| kill_pane(state, key))
+        .collect()
+}
+
+/// End the closing of every brigade that has finished: no pane of it is hosted
+/// or being opened any more. Says it once, as the one line the brigade's exits
+/// were folded into (`update_pty_exited` says nothing for them). Run at the end
+/// of every update, so it holds however the last pane left (an exit, a pane
+/// whose output was lost, a spawn that failed).
+fn settle_closing(state: &mut EmporiumState, app: &App, now: Instant) {
+    if state.closing.is_empty() {
+        return;
+    }
+    let mut ids: Vec<BrigadeId> = state.closing.keys().copied().collect();
+    ids.sort_unstable();
+    for brigade_id in ids {
+        let left = state.hosted_panes_of(brigade_id).len() + state.pending_opens_of(brigade_id);
+        let name = state.brigade_name(app, brigade_id);
+        if left == 0 {
+            state.closing.remove(&brigade_id);
+            state.set_status(format!("{name} closed"), now);
+        } else if state
+            .closing
+            .get(&brigade_id)
+            .is_some_and(|since| now.saturating_duration_since(*since) >= CLOSE_GIVE_UP)
+        {
+            // Not killed again, and the panes keep their expected-exit records:
+            // if one does end later it is still an exit banto asked for.
+            state.closing.remove(&brigade_id);
+            let plural = if left == 1 { "" } else { "s" };
+            state.set_status(
+                format!("{name}: {left} pane{plural} did not end after the close"),
+                now,
+            );
+        }
+    }
+}
+
+/// `x` on a list row: request the membership of the row, as Enter and `B` do —
+/// [`update_membership_resolved`] decides what the row is and what to do.
+fn close_key(state: &mut EmporiumState, app: &App) -> Vec<Cmd> {
+    let Some(row) = app.selected_row() else {
+        return Vec::new();
+    };
+    state.pending_membership = Some((PendingMembership::CloseKey, row.id.clone()));
+    vec![Cmd::Store(StoreIntent::ResolveMembership {
+        session_id: row.id.clone(),
+    })]
+}
+
 /// Confirm the prefix-`x` dialog. For a brigade member other than the Director —
 /// a Worker or the Goinkyo, the dialog's `dismisses` is `Some` — confirming
 /// **dismisses** it: it leaves the brigade for good (membership, read cursor,
 /// mail addressed to it) and its pane ends. There is no "close the pane and keep
 /// the member": a Worker is disposable, and a member with no pane has no tile to
 /// act on, so keeping one only made invisible members. (A restart is unaffected:
-/// staging reopens every member there is.) For the Director's own pane and for a
-/// single session, `dismisses` is `None` and confirming only ends the process
-/// — a Director leaves a brigade by disbanding it.
+/// staging reopens every member there is.) For a single session, `dismisses` is
+/// `None` and confirming only ends the process. A Director's pane never gets
+/// here: its Prefix+`x` closes the brigade ([`confirm_close_brigade_modal`]).
 ///
 /// Dismissing needs `(brigade_id, token)` before `StoreIntent::DismissWorker` can
 /// be built: a still-awaiting-discovery member's synthetic key already embeds
@@ -6502,7 +6778,8 @@ fn confirm_kill_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
             vec![Cmd::Store(StoreIntent::DismissWorker { brigade_id, token })]
         }
         None => {
-            state.pending_membership = Some(PendingMembership::DismissWorker);
+            state.pending_membership =
+                Some((PendingMembership::DismissWorker, key.as_str().to_string()));
             vec![Cmd::Store(StoreIntent::ResolveMembership {
                 session_id: key.as_str().to_string(),
             })]
@@ -6517,7 +6794,7 @@ fn activate_selected(state: &mut EmporiumState, app: &App) -> Vec<Cmd> {
     let Some(row) = app.selected_row() else {
         return Vec::new();
     };
-    state.pending_membership = Some(PendingMembership::Activate);
+    state.pending_membership = Some((PendingMembership::Activate, row.id.clone()));
     vec![Cmd::Store(StoreIntent::ResolveMembership {
         session_id: row.id.clone(),
     })]
@@ -6528,7 +6805,7 @@ fn brigade_key(state: &mut EmporiumState, app: &App) -> Vec<Cmd> {
     let Some(row) = app.selected_row() else {
         return Vec::new();
     };
-    state.pending_membership = Some(PendingMembership::BrigadeKey);
+    state.pending_membership = Some((PendingMembership::BrigadeKey, row.id.clone()));
     vec![Cmd::Store(StoreIntent::ResolveMembership {
         session_id: row.id.clone(),
     })]
@@ -6543,7 +6820,18 @@ fn update_membership_resolved(
     members: Option<Vec<(MemberToken, BrigadeRole, Option<String>)>>,
     layout: Option<StoredLayout>,
 ) -> Vec<Cmd> {
-    let Some(purpose) = state.pending_membership.take() else {
+    // One slot, and an answer belongs to the session that was asked about: Enter
+    // on one row and `x` on another before the first answer comes back would
+    // otherwise hand the first row's membership to the second's purpose (a close
+    // dialog for a brigade the operator never pointed at). An answer for any
+    // other session is dropped and the slot kept for its own.
+    let Some((_, asked)) = &state.pending_membership else {
+        return Vec::new();
+    };
+    if *asked != session_id {
+        return Vec::new();
+    }
+    let Some((purpose, _)) = state.pending_membership.take() else {
         return Vec::new();
     };
     // Handled before the `row_for_id` guard below (which `DismissWorker`
@@ -6606,9 +6894,49 @@ fn update_membership_resolved(
             // Spelled out rather than `_`, same reasoning as the
             // `DismissWorker` branch above: staging the whole brigade is a
             // Director-only action, so a Goinkyo activated directly opens
-            // solo, same as a Worker does.
+            // solo, same as a Worker does. Not while its brigade is closing:
+            // the pane is on its way out, and showing it would hand the
+            // operator a pane that dies under their hands.
+            Some((brigade_id, _, BrigadeRole::Worker | BrigadeRole::Goinkyo))
+                if refuse_while_closing(state, app, brigade_id) =>
+            {
+                Vec::new()
+            }
             Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo)) | None => {
                 open_solo(state, &row)
+            }
+        },
+        // `x` on a row. A Director's row closes its brigade, whichever of its
+        // panes are hosted and wherever (the Director's own may be gone). A
+        // Worker's or Goinkyo's row never ends it: that is a dismissal, which
+        // leaves the brigade for good and belongs to the pane's own tile, where
+        // the operator can see whom they are dismissing. (Such a row is not
+        // normally in the list at all: `App::hidden` keeps members out at every
+        // reveal level; one shows only in the moment between a member's session
+        // appearing and the reload that hides it.) A session that is no member is
+        // a single session: its own pane, if it has one, ends as Prefix+`x` on
+        // its tile would end it.
+        PendingMembership::CloseKey => match membership {
+            Some((brigade_id, _, BrigadeRole::Director)) => {
+                open_close_brigade(state, app, brigade_id)
+            }
+            Some((_, _, BrigadeRole::Worker | BrigadeRole::Goinkyo)) => {
+                state.status = Some(
+                    "that session is a brigade's Worker or Goinkyo \u{2014} dismiss it with \
+                     Prefix+x on its tile"
+                        .to_string(),
+                );
+                Vec::new()
+            }
+            None => {
+                let key = SessionKey::from_id(&row.id);
+                if state.screens.contains_key(&key) {
+                    let title = row.sentence_name();
+                    app.open_confirm_kill_modal(key.as_str().to_string(), title, None);
+                } else {
+                    state.status = Some(format!("{} has no open pane", row.sentence_name()));
+                }
+                Vec::new()
             }
         },
         PendingMembership::BrigadeKey => match membership {
@@ -7065,6 +7393,21 @@ fn surviving_pane(
         .expect("at least one live pane")
 }
 
+/// Say that a brigade cannot be opened yet because it is still closing, and
+/// answer whether that was the case. Opening it now would resume sessions whose
+/// processes have not finished ending (a double resume), and the exits that are
+/// still to come would take the new panes' state with them.
+fn refuse_while_closing(state: &mut EmporiumState, app: &App, brigade_id: BrigadeId) -> bool {
+    if !state.closing.contains_key(&brigade_id) {
+        return false;
+    }
+    let name = state.brigade_name(app, brigade_id);
+    state.status = Some(format!(
+        "{name} is still closing \u{2014} try again in a moment"
+    ));
+    true
+}
+
 /// Stage brigade `brigade_id`: `members` is its full roster (token, role,
 /// session id if known), already fetched by the shell alongside the
 /// membership resolution that led here. A member whose row is already
@@ -7081,6 +7424,9 @@ fn stage_brigade(
     members: &[(MemberToken, BrigadeRole, Option<String>)],
     brigade: &BrigadeConfig,
 ) -> Vec<Cmd> {
+    if refuse_while_closing(state, app, brigade_id) {
+        return Vec::new();
+    }
     if members.iter().any(|(_, _, id)| {
         id.as_deref().is_some_and(|id| {
             state
@@ -8347,6 +8693,35 @@ fn update_spawned(
     let Some(pending) = state.pending_opens.remove(&key) else {
         return Vec::new();
     };
+    // Asked for before a close or a disband, reported after it: the brigade has
+    // no pane to gain, so this one is ended at once instead of being staged. It
+    // was not hosted when the kills were chosen, and landing would make it a pane
+    // of a brigade that is closed or gone. A closing brigade ends everything it
+    // opens, a Director included. A disbanded one ends only what its token names a
+    // Worker or the Goinkyo: a resumed Director opened by `stage_brigade` is the
+    // pane that stays, as it does when it was already hosted. A Worker's maps were
+    // written when it was asked for (`open_worker`); a closing brigade's Director
+    // gets them here, which is what makes its pane count as the brigade's until
+    // its exit arrives, so that exit folds into the close like the others.
+    if let PendingOpen::BrigadeDirector { brigade_id, .. }
+    | PendingOpen::BrigadeMember { brigade_id, .. } = &pending
+    {
+        let closing = state.closing.contains_key(brigade_id);
+        let disbanded_worker = state.disbanding.contains(brigade_id)
+            && state
+                .member_tokens
+                .get(&key)
+                .is_some_and(|token| token != DIRECTOR_TOKEN);
+        if closing || disbanded_worker {
+            if closing && matches!(pending, PendingOpen::BrigadeDirector { .. }) {
+                state
+                    .member_tokens
+                    .insert(key.clone(), DIRECTOR_TOKEN.to_string());
+                state.member_brigades.insert(key.clone(), *brigade_id);
+            }
+            return vec![kill_pane(state, key)];
+        }
+    }
     match pending {
         PendingOpen::Solo => {
             state.stage = Stage::Solo(key);
@@ -8572,19 +8947,20 @@ fn open_worker(
 
 /// Whether a creation of `token` in `brigade_id`, decided earlier and carried
 /// out later, is still wanted when its turn comes: the brigade is not being
-/// disbanded (and was not — a disbanded brigade forgets its join order), the
-/// member is still on its roster, and it is not open or being opened under any
-/// key ([`member_open_or_opening`], not counting the creation's own pending
-/// entry). The roster is the core's own record
+/// disbanded (and was not — a disbanded brigade forgets its join order) or
+/// closed, the member is still on its roster, and it is not open or being
+/// opened under any key ([`member_open_or_opening`], not counting the
+/// creation's own pending entry). The roster is the core's own record
 /// (`EmporiumState::member_order`): what it is told of — a formation, a join,
 /// a staging from the store's roster, a dismissal, a disband — and not a
-/// removal made behind its back. Asked where a
-/// launch waits on an answer: the catalog read, and the Director's spawn that
-/// opens the Workers. Between the request and the answer the operator can
-/// disband the brigade, and an answer that opened a Worker for a brigade that
-/// is gone would start an agent nothing owns.
+/// removal made behind its back. Asked where a launch waits on an answer: the
+/// catalog read, the Director's spawn that opens the Workers, and the store's
+/// answer to adding a Worker. Between the request and the answer the operator
+/// can disband the brigade, and an answer that opened a Worker for a brigade
+/// that is gone would start an agent nothing owns.
 fn creation_still_wanted(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> bool {
     !state.disbanding.contains(&brigade_id)
+        && !state.closing.contains_key(&brigade_id)
         && state
             .member_order
             .get(&brigade_id)
@@ -8628,8 +9004,41 @@ fn held_creation_member(held: &HeldCreation) -> Option<(BrigadeId, &str)> {
     }
 }
 
-/// Drop what a disband leaves held: the brigade's creations waiting for the
-/// catalog, with their bookkeeping, at once rather than when the answer comes.
+/// Drop what the panes `ended` of `brigade_id` left queued or half-counted, for
+/// a close and a disband alike: both end panes now and say so before their exits
+/// arrive, and nothing in between may act on it. A delayed Enter or a Codex
+/// kickoff would be written into a dead pane (and reported as an internal
+/// error), a held creation would start a process for a brigade that has none,
+/// and the hold and unreadable-input clocks would start from a stale reading
+/// when the brigade has panes again. The clocks are the brigade's, not only the
+/// ended panes': a Director that outlives a disband leads nothing.
+fn drop_leftovers_of_ended_panes(
+    state: &mut EmporiumState,
+    brigade_id: BrigadeId,
+    ended: &[SessionKey],
+) {
+    state
+        .pending_submits
+        .retain(|pending| !ended.contains(&pending.key));
+    state
+        .pending_kickoffs
+        .retain(|pending| !ended.contains(&pending.key));
+    state
+        .pending_goinkyo_kickoffs
+        .retain(|pending| !ended.contains(&pending.key));
+    state
+        .prompt_held_since
+        .retain(|(id, _), _| *id != brigade_id);
+    state
+        .unreadable_since
+        .retain(|(id, _), _| *id != brigade_id);
+    state.unreadable_noticed.retain(|(id, _)| *id != brigade_id);
+    drop_held_creations_of(state, brigade_id);
+}
+
+/// Drop what a disband or a close leaves held: the brigade's creations waiting
+/// for the catalog, with their bookkeeping, at once rather than when the answer
+/// comes.
 fn drop_held_creations_of(state: &mut EmporiumState, brigade_id: BrigadeId) {
     let held = std::mem::take(&mut state.codex_opens_awaiting_catalog);
     for creation in held {
@@ -8816,6 +9225,9 @@ fn relaunch_member(
     if token == DIRECTOR_TOKEN
         || token == GOINKYO_TOKEN
         || state.goinkyo_pane.values().any(|pane| pane == key)
+        // A brigade being closed is ending its panes on purpose; one that
+        // exited on its own a moment before is not restarted into that.
+        || state.closing.contains_key(&brigade_id)
     {
         return None;
     }
@@ -8896,6 +9308,12 @@ fn update_pty_exited(
     now: Instant,
 ) -> Vec<Cmd> {
     let banto_asked = state.expected_exits.remove(&key).is_some();
+    // Read before the unstage below takes the maps: an exit in a brigade that is
+    // being closed is one of the panes the close ended, and says nothing itself.
+    let in_closing_brigade = state
+        .member_brigades
+        .get(&key)
+        .is_some_and(|brigade_id| state.closing.contains_key(brigade_id));
     // Decided before anything below touches the member's maps: whether this is a
     // Worker that left on its own, so that if it cannot be relaunched it leaves
     // the brigade instead of lingering in the roster with no tile.
@@ -8947,6 +9365,11 @@ fn update_pty_exited(
     {
         let wiring = state.pending_director_wiring.take().unwrap();
         return open_director_with_wiring(state, app, wiring);
+    }
+    // One line for the whole brigade, said once its last pane is gone
+    // ([`settle_closing`]); not one "session ended" per pane.
+    if in_closing_brigade {
+        return Vec::new();
     }
     let title = app
         .row_for_id(key.as_str())
@@ -9058,7 +9481,8 @@ fn update_pty_output_lost(
 /// - **it is a Worker of a brigade**: not the Director, not the Goinkyo (a
 ///   consultation that ends without being dismissed keeps today's outcome), not a
 ///   pane with no membership.
-/// - **its brigade is not being disbanded or gone** ([`EmporiumState::disbanding`]).
+/// - **its brigade is not being disbanded, closed or gone**
+///   ([`EmporiumState::disbanding`], [`EmporiumState::closing`]).
 /// - **no dismissal of this member is already in flight**: the operator's own
 ///   (`pending_dismiss`), or the one this function starts (`removing_exited`).
 fn unrequested_worker_exit(
@@ -9076,6 +9500,7 @@ fn unrequested_worker_exit(
         || token == GOINKYO_TOKEN
         || state.goinkyo_pane.values().any(|pane| pane == key)
         || state.disbanding.contains(&brigade_id)
+        || state.closing.contains_key(&brigade_id)
         || state.pending_dismiss.as_ref() == Some(key)
         || state
             .pending_dismiss_member
@@ -9588,6 +10013,13 @@ fn update_worker_added(
                 now,
             );
             record_join(state, brigade_id, &token);
+            // The store's write was already in flight when a close was confirmed
+            // (or a disband): a process started now would only be ended when it
+            // landed. The member row stays, and a Worker with nothing to resume
+            // is created afresh when the brigade is next opened.
+            if !creation_still_wanted(state, brigade_id, &token) {
+                return Vec::new();
+            }
             open_worker(
                 state,
                 brigade_id,
@@ -9608,22 +10040,33 @@ fn update_worker_added(
     }
 }
 
-/// On success while the disbanded brigade is staged: fall the stage back to
-/// `Solo(director)` and kill every *other* staged pane — Workers and a
-/// Goinkyo alike, whatever role they hold; disband tears down the whole
-/// cell, not just Workers specifically. Requires knowing the Director for
-/// certain: `Stage::Brigade::director` is `Some` *and* its own pane is
-/// still actually staged (the ordinary case — belt-and-suspenders past the
-/// `Some` alone, since kill is irreversible and this is cheap to check).
-/// Anything short of that certainty — `director` is `None`, or points at a
-/// pane that already isn't staged — kills nobody and drops straight to
-/// `Stage::Empty` instead of guessing who's safe to spare: an operator who
-/// disbands with the Director's own pane already closed gets a
-/// no-op-on-the-kills-but-still-collapses-the-stage outcome, not a wrong
-/// kill. Workers are banto-spawned creatures that die with their brigade;
-/// the kills flow through the same passive `PtyExited` fold as any other
-/// exit — a killed-but-unstaged member (already gone, or one this stage
-/// never resolved) is simply skipped, nothing to kill.
+/// On success: kill every Worker and Goinkyo pane the brigade has hosted, staged
+/// or not ([`EmporiumState::hosted_panes_of`], plus whatever the stage lists for
+/// this brigade). Disband closes the whole cell; the Director's pane is the one
+/// that stays if it is hosted, and an off-stage Worker left running would be
+/// owned by a brigade that no longer exists. The stage is touched only when the
+/// disbanded brigade is the one on it: it falls back to `Solo(director)`, or to
+/// `Stage::Empty` (and the focus back on the sidebar) when no hosted Director is
+/// known. A disband of a brigade that is off stage leaves what is showing, and
+/// the focus, alone.
+///
+/// Who is killed is decided by each pane's own member token, not by knowing the
+/// Director first: a pane whose token is a Worker's or the Goinkyo's cannot be
+/// the Director, so killing it is never the wrong kill, and a Director whose
+/// pane was ended alone earlier leaves its Workers hosted and still ending with
+/// the brigade. A pane with no token, and the Director's, are spared. The
+/// Director is needed only to say what the stage becomes: its pane is
+/// `Stage::Brigade::director` when that is `Some` and still staged, or else the
+/// one hosted pane that holds the Director's token in this brigade (none, or two,
+/// is not known, and the stage empties). The kills never read that identity, and
+/// the stage reads the same one the operator keeps open, so the two cannot
+/// disagree about who stays. A pane whose open was still in flight is not hosted
+/// yet: it is ended when its spawn is reported (`update_spawned`). The kills flow
+/// through the same passive `PtyExited` fold as any other exit, which is also
+/// when each pane's maps go; what those panes left queued goes at once
+/// ([`drop_leftovers_of_ended_panes`]). The Goinkyo's own `NoGoinkyo` release a
+/// tick later then names a pane this already closed, which is a no-op (see
+/// [`EmporiumState::goinkyo_pane`]).
 ///
 /// Every success also asks for a reload, whoever was staged: the members'
 /// sessions come out of hiding here, and a Goinkyo's was archived in the same
@@ -9642,29 +10085,54 @@ fn update_disbanded(
             // follows is what marks it, so it is never listed unmarked.
             let _ = app.set_hidden_member_ids(hidden);
             app.set_directors(directors);
-            let (director_key, other_keys) = if let Stage::Brigade {
-                id,
-                director,
-                panes,
-                ..
-            } = &state.stage
-                && *id == brigade_id
-                && let Some(d) = director
-                && panes.contains(d)
-            {
-                (
-                    Some(d.clone()),
-                    panes.iter().filter(|k| *k != d).cloned().collect(),
-                )
-            } else {
-                (None, Vec::new())
+            let staged = matches!(&state.stage, Stage::Brigade { id, .. } if *id == brigade_id);
+            let (staged_director, staged_panes) = match &state.stage {
+                Stage::Brigade {
+                    id,
+                    director,
+                    panes,
+                    ..
+                } if *id == brigade_id => (
+                    director.clone().filter(|d| panes.contains(d)),
+                    panes.clone(),
+                ),
+                _ => (None, Vec::new()),
             };
-            state.stage = match &director_key {
-                Some(key) => Stage::Solo(key.clone()),
-                None => Stage::Empty,
-            };
+            let hosted = state.hosted_panes_of(brigade_id);
+            let hosted_directors: Vec<&SessionKey> = hosted
+                .iter()
+                .filter(|key| {
+                    state.member_tokens.get(*key).map(String::as_str) == Some(DIRECTOR_TOKEN)
+                })
+                .collect();
+            let known_director = staged_director
+                .clone()
+                .or_else(|| match hosted_directors[..] {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                });
+            // By token, not by knowing the Director: see the doc. A staged pane
+            // the maps do not place in this brigade is not this brigade's to end.
+            let mut other_keys: Vec<SessionKey> = Vec::new();
+            for key in staged_panes.iter().chain(hosted.iter()) {
+                let is_member_worker = state.member_brigades.get(key) == Some(&brigade_id)
+                    && state
+                        .member_tokens
+                        .get(key)
+                        .is_some_and(|token| token != DIRECTOR_TOKEN);
+                if is_member_worker && !other_keys.contains(key) {
+                    other_keys.push(key.clone());
+                }
+            }
+            if staged {
+                state.stage = match &known_director {
+                    Some(key) => Stage::Solo(key.clone()),
+                    None => Stage::Empty,
+                };
+                state.settle_focus();
+            }
             state.disbanding.insert(brigade_id);
-            drop_held_creations_of(state, brigade_id);
+            drop_leftovers_of_ended_panes(state, brigade_id, &other_keys);
             state.brigade_layouts.remove(&brigade_id);
             state.persisted_layouts.remove(&brigade_id);
             state.brigade_names.remove(&brigade_id);
@@ -10292,6 +10760,12 @@ fn update_tick(
     if brigade.relay == RelayMode::Auto {
         let focused = state.stage.focused_key().cloned();
         for obs in relay {
+            // A pane of a brigade being closed is not nudged and not read: its
+            // process was asked to end, and a line typed into it would only
+            // become another queued Enter for a pane that is gone.
+            if state.closing.contains_key(&obs.brigade_id) {
+                continue;
+            }
             // Claude's reader also detects text the operator recalled without
             // forwarding keys; Codex is checked separately at the release gate.
             let reading = match (obs.agent, state.screens.get(&obs.key)) {
@@ -10725,14 +11199,16 @@ fn update_goinkyo_awaiting_spawn(
     let candidate = match observation {
         GoinkyoObservation::Unchanged => return Vec::new(),
         // The row disappearing out from under a still-staged brigade is
-        // what actually means a consultation was dismissed — see
-        // `GoinkyoObservation`'s own doc for why a disbanded brigade never
-        // reaches this arm at all. Releasing the guard here rather than on
-        // success/failure is what lets a *later* consultation on the same
-        // brigade spawn again, without needing to know anything about the
-        // one before it — and closing whatever pane the removed entry names
-        // is the other half of `goinkyo_pane`'s own doc: nothing else knows
-        // which staged pane was the Goinkyo's once its row is gone.
+        // what actually means a consultation was dismissed. A disbanded
+        // brigade reads the same way (`GoinkyoObservation`'s own doc), one
+        // tick after `update_disbanded` closed its Workers' and Goinkyo's panes:
+        // the kill below is then a repeat of one already issued.
+        // Releasing the guard here rather than on success/failure is what lets
+        // a *later* consultation on the same brigade spawn again, without
+        // needing to know anything about the one before it — and closing
+        // whatever pane the removed entry names is the other half of
+        // `goinkyo_pane`'s own doc: nothing else knows which staged pane was
+        // the Goinkyo's once its row is gone.
         GoinkyoObservation::NoGoinkyo { brigade_id } => {
             // Whether or not a pane is left to close, the consultation is over:
             // the next one joins the brigade afresh, after whoever joined
@@ -10768,6 +11244,15 @@ fn update_goinkyo_awaiting_spawn(
             // consultation whose pane died first has no entry left (see
             // `update_pty_exited`) and gets no reload from here.
             return vec![kill, Cmd::Reload];
+        }
+        // A brigade being closed has no Goinkyo to start: its Director's pane is
+        // ending, and a Goinkyo started now would be a process of a brigade that
+        // is not running. It is started, like any other member without a session,
+        // when the brigade is opened again.
+        GoinkyoObservation::AwaitingSpawn(candidate)
+            if state.closing.contains_key(&candidate.brigade_id) =>
+        {
+            return Vec::new();
         }
         GoinkyoObservation::AwaitingSpawn(candidate) => candidate,
     };
@@ -11230,6 +11715,9 @@ mod data_dir_sweep_tests;
 mod member_exit_tests;
 
 #[cfg(test)]
+mod close_brigade_tests;
+
+#[cfg(test)]
 mod startup_notice_tests;
 
 #[cfg(test)]
@@ -11456,7 +11944,7 @@ mod tests {
         ));
         assert!(matches!(&state.stage, Stage::Solo(key) if key == &real));
         assert!(state.unresolved_codex.is_empty());
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
         update(
             &mut state,
             &mut app,
@@ -12443,7 +12931,7 @@ mod tests {
                 .collect()
         };
         let activate = |state: &mut EmporiumState, app: &mut App| {
-            state.pending_membership = Some(PendingMembership::Activate);
+            state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
             update(
                 state,
                 app,
@@ -12744,7 +13232,7 @@ mod tests {
             row("g1"),
         ]);
         let now = test_instant();
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
 
         let roster = vec![
             (
@@ -12852,7 +13340,7 @@ mod tests {
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
         let now = test_instant();
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
 
         let roster = vec![
             (
@@ -12923,7 +13411,7 @@ mod tests {
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
         let now = test_instant();
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
 
         let roster = vec![
             (
@@ -13004,7 +13492,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config(); // worker_agent defaults to Inherit
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
 
         let roster = vec![
             (
@@ -13043,7 +13531,7 @@ mod tests {
             worker_agent: WorkerAgentSetting::Codex, // ...but pinned regardless
             ..BrigadeConfig::default()
         };
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
 
         let roster = vec![
             (
@@ -13659,7 +14147,7 @@ mod tests {
         // session was ever discovered is created afresh.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
         let cmds = update(
             &mut state,
             &mut app,
@@ -13724,7 +14212,7 @@ mod tests {
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
 
         let cmds = update(
             &mut state,
@@ -13761,7 +14249,7 @@ mod tests {
             .insert(SessionKey::from_id("dir"), Screen::new(24, 80));
         let mut app = app_with(vec![row("dir")]);
         let brigade = brigade_config();
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
 
         let cmds = update(
             &mut state,
@@ -13848,7 +14336,13 @@ mod tests {
         let mut app = app_with(vec![row("dir")]);
         app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
 
-        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
+        let cmds = update_modal_key(
+            &mut state,
+            &mut app,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            test_instant(),
+        );
 
         assert!(cmds.is_empty());
         assert!(app.modal().is_none());
@@ -13878,7 +14372,7 @@ mod tests {
             worker_agent: WorkerAgentSetting::Select,
             ..BrigadeConfig::default()
         };
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
 
         let cmds = update(
             &mut state,
@@ -13939,7 +14433,7 @@ mod tests {
             worker_agent: WorkerAgentSetting::Codex,
             ..BrigadeConfig::default()
         };
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
 
         let cmds = update(
             &mut state,
@@ -13973,7 +14467,7 @@ mod tests {
             worker_agent,
             ..BrigadeConfig::default()
         };
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, id.clone()));
         update(
             &mut state,
             &mut app,
@@ -14064,7 +14558,7 @@ mod tests {
             worker_agent: WorkerAgentSetting::Select,
             ..BrigadeConfig::default()
         };
-        state.pending_membership = Some(PendingMembership::BrigadeKey);
+        state.pending_membership = Some((PendingMembership::BrigadeKey, "dir".to_string()));
 
         let cmds = update(
             &mut state,
@@ -14303,7 +14797,13 @@ mod tests {
             },
         );
 
-        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
+        let cmds = update_modal_key(
+            &mut state,
+            &mut app,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            test_instant(),
+        );
 
         assert!(cmds.is_empty());
         assert!(app.modal().is_none());
@@ -14328,7 +14828,13 @@ mod tests {
             },
         );
 
-        update_modal_key(&mut state, &mut app, KeyCode::BackTab, Modifiers::NONE);
+        update_modal_key(
+            &mut state,
+            &mut app,
+            KeyCode::BackTab,
+            Modifiers::NONE,
+            test_instant(),
+        );
 
         assert!(matches!(
             app.modal(),
@@ -14456,7 +14962,13 @@ mod tests {
             },
         );
 
-        let cmds = update_modal_key(&mut state, &mut app, KeyCode::Esc, Modifiers::NONE);
+        let cmds = update_modal_key(
+            &mut state,
+            &mut app,
+            KeyCode::Esc,
+            Modifiers::NONE,
+            test_instant(),
+        );
 
         assert!(cmds.is_empty());
         assert!(app.modal().is_none());
@@ -22995,7 +23507,7 @@ mod tests {
         stored: Option<StoredLayout>,
         now: Instant,
     ) -> Vec<Cmd> {
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
         update(
             state,
             app,
@@ -27485,7 +27997,7 @@ mod tests {
             test_instant(),
         );
 
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
         let roster = vec![
             (
                 "director".to_string(),
@@ -27598,7 +28110,7 @@ mod tests {
         state
             .screens
             .insert(SessionKey::from_id("g1"), Screen::new(24, 80));
-        state.pending_membership = Some(PendingMembership::Activate);
+        state.pending_membership = Some((PendingMembership::Activate, "dir".to_string()));
 
         let roster = vec![
             (
@@ -29382,7 +29894,7 @@ mod tests {
         // how the round trip was reached.
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![row("dir")]);
-        state.pending_membership = Some(PendingMembership::DismissWorker);
+        state.pending_membership = Some((PendingMembership::DismissWorker, "dir".to_string()));
         state.pending_dismiss = Some(SessionKey::from_id("dir"));
         let brigade = brigade_config();
         let now = test_instant();
@@ -29406,9 +29918,9 @@ mod tests {
     }
 
     #[test]
-    fn kill_confirm_on_a_director_or_solo_pane_only_ends_the_process_and_never_touches_the_store() {
-        // No dismissal for a Director (it leaves by disbanding) or a single
-        // session: no round trip, no DismissWorker.
+    fn kill_confirm_with_nothing_to_dismiss_only_ends_the_process_and_never_touches_the_store() {
+        // No dismissal for a single session: no round trip, no DismissWorker.
+        // (A Director's tile never reaches this dialog, it closes the brigade.)
         let mut state = EmporiumState::new(PrefixKey::default());
         let mut app = app_with(vec![]);
         app.open_confirm_kill_modal("dir".to_string(), "dir".to_string(), None);
@@ -29529,6 +30041,14 @@ mod tests {
             panes: vec![director.clone(), w1.clone(), w2.clone()],
             focused: 0,
         };
+        for (key, token) in [
+            (&director, DIRECTOR_TOKEN),
+            (&w1, "worker-1"),
+            (&w2, "worker-2"),
+        ] {
+            state.member_tokens.insert(key.clone(), token.to_string());
+            state.member_brigades.insert(key.clone(), 1);
+        }
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
         let now = test_instant();
@@ -29566,7 +30086,7 @@ mod tests {
     fn disband_while_staged_kills_workers_but_not_the_director_even_when_panes_are_reversed() {
         // The Worker staged solo first, ahead of the Director, so
         // `panes[0]` is a Worker — proves the "who survives" split reads
-        // `director`, not position.
+        // the token, not position.
         let mut state = EmporiumState::new(PrefixKey::default());
         let director = SessionKey::from_id("dir");
         let w1 = SessionKey::from_id("w1");
@@ -29576,6 +30096,10 @@ mod tests {
             panes: vec![w1.clone(), director.clone()],
             focused: 0,
         };
+        for (key, token) in [(&director, DIRECTOR_TOKEN), (&w1, "worker-1")] {
+            state.member_tokens.insert(key.clone(), token.to_string());
+            state.member_brigades.insert(key.clone(), 1);
+        }
         let mut app = app_with(vec![]);
         let brigade = brigade_config();
         let now = test_instant();
@@ -29599,10 +30123,10 @@ mod tests {
     }
 
     #[test]
-    fn disbanding_with_no_known_director_kills_nobody() {
-        // Kill is irreversible: `director == None` (unresolved, or its own
-        // pane already closed) must not fall back to guessing who's safe —
-        // see `update_disbanded`'s own doc.
+    fn disbanding_staged_panes_the_core_holds_no_token_for_kills_nobody() {
+        // Kill is irreversible: a pane the core cannot place by its member
+        // token is never guessed to be a Worker, whether or not a Director is
+        // known — see `update_disbanded`'s own doc. The stage still collapses.
         let mut state = EmporiumState::new(PrefixKey::default());
         let w1 = SessionKey::from_id("w1");
         let w2 = SessionKey::from_id("w2");
@@ -29652,6 +30176,700 @@ mod tests {
 
         assert_eq!(cmds, vec![Cmd::Reload]);
         assert!(matches!(state.stage, Stage::Empty));
+    }
+
+    /// Confirm the disband modal of `brigade_id` with Enter, as the operator
+    /// does after `B` on that brigade's Director row, and deliver the store's
+    /// success for it. Returns what the disband's result produced.
+    fn confirm_and_complete_disband(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade_id: BrigadeId,
+    ) -> Vec<Cmd> {
+        let brigade = brigade_config();
+        let now = test_instant();
+        app.open_confirm_disband_modal(brigade_id, "Director B".to_string());
+        let asked = update(
+            state,
+            app,
+            &brigade,
+            Event::Input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::NONE,
+            ))),
+            now,
+        );
+        // Panes on stage add resizes of their own to whatever an update returns.
+        assert!(
+            asked.contains(&Cmd::Store(StoreIntent::Disband { brigade_id })),
+            "Enter on the modal asks the store to disband exactly that brigade: {asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|cmd| matches!(cmd, Cmd::KillPty { .. })),
+            "the confirm itself ends nothing: {asked:?}"
+        );
+        update(
+            state,
+            app,
+            &brigade,
+            Event::Disbanded {
+                brigade_id,
+                result: Ok((HashSet::new(), HashSet::new())),
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn disbanding_an_offstage_brigade_leaves_the_staged_brigade_alone() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = SessionKey::from_id("dir-a");
+        let worker = SessionKey::from_id("w-a");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: Some(director.clone()),
+            panes: vec![director.clone(), worker.clone()],
+            focused: 0,
+        };
+        let mut app = app_with(vec![]);
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::Reload],
+            "brigade A's panes must not be killed"
+        );
+        match &state.stage {
+            Stage::Brigade {
+                id,
+                director: d,
+                panes,
+                ..
+            } => {
+                assert_eq!(*id, 1);
+                assert_eq!(d.as_ref(), Some(&director));
+                assert_eq!(panes, &vec![director, worker]);
+            }
+            other => panic!("brigade A's stage was replaced by {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disbanding_an_offstage_brigade_leaves_a_staged_solo_session_alone() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let solo = SessionKey::from_id("sess-solo");
+        state.stage = Stage::Solo(solo.clone());
+        let mut app = app_with(vec![]);
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        assert_eq!(cmds, vec![Cmd::Reload]);
+        match &state.stage {
+            Stage::Solo(key) => assert_eq!(key, &solo),
+            other => panic!("the solo session's stage was replaced by {other:?}"),
+        }
+    }
+
+    /// Host brigade `brigade_id`'s Director and one Worker as staging leaves
+    /// them (a screen each, the ownership maps) and stage the brigade through
+    /// `stage_brigade` itself, which opens nothing because both are live.
+    fn host_and_stage_brigade(
+        state: &mut EmporiumState,
+        app: &App,
+        brigade_id: BrigadeId,
+        director_id: &str,
+        worker_id: &str,
+    ) -> (SessionKey, SessionKey) {
+        let (director, worker) = (key_of(director_id), key_of(worker_id));
+        for (key, token) in [(&director, DIRECTOR_TOKEN), (&worker, "worker-1")] {
+            state.screens.insert(key.clone(), Screen::new(24, 80));
+            state.member_tokens.insert(key.clone(), token.to_string());
+            state.member_brigades.insert(key.clone(), brigade_id);
+        }
+        let members = vec![
+            (
+                DIRECTOR_TOKEN.to_string(),
+                BrigadeRole::Director,
+                Some(director_id.to_string()),
+            ),
+            (
+                "worker-1".to_string(),
+                BrigadeRole::Worker,
+                Some(worker_id.to_string()),
+            ),
+        ];
+        let cmds = stage_brigade(state, app, brigade_id, &members, &brigade_config());
+        assert!(
+            cmds.is_empty(),
+            "staging live panes opens nothing: {cmds:?}"
+        );
+        (director, worker)
+    }
+
+    /// Brigade 2 staged, then left for a solo session: its panes keep running
+    /// off-stage (`open_solo` only changes the stage). Disband it as the
+    /// operator would. Returns the cmds, brigade 2's Director and Worker.
+    fn disband_brigade_two_left_for_a_solo_session(
+        state: &mut EmporiumState,
+    ) -> (Vec<Cmd>, SessionKey, SessionKey) {
+        let mut app = app_with(vec![row("sess-solo")]);
+        let (director, worker) = host_and_stage_brigade(state, &app, 2, "dir-2", "w-2");
+        let solo = key_of("sess-solo");
+        state.screens.insert(solo.clone(), Screen::new(24, 80));
+        let solo_row = app.row_for_id("sess-solo").cloned().unwrap();
+        assert!(open_solo(state, &solo_row).is_empty());
+        assert!(matches!(&state.stage, Stage::Solo(key) if *key == solo));
+        let cmds = confirm_and_complete_disband(state, &mut app, 2);
+        (cmds, director, worker)
+    }
+
+    /// The same with brigade 1 staged over brigade 2 instead of a solo session.
+    fn disband_brigade_two_left_for_brigade_one(
+        state: &mut EmporiumState,
+    ) -> (Vec<Cmd>, SessionKey, SessionKey) {
+        let mut app = app_with(vec![]);
+        let (director, worker) = host_and_stage_brigade(state, &app, 2, "dir-2", "w-2");
+        host_and_stage_brigade(state, &app, 1, "dir-1", "w-1");
+        assert!(matches!(&state.stage, Stage::Brigade { id: 1, .. }));
+        let cmds = confirm_and_complete_disband(state, &mut app, 2);
+        (cmds, director, worker)
+    }
+
+    #[test]
+    fn disbanding_a_brigade_left_for_a_solo_session_ends_its_worker_and_spares_its_director() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let (cmds, director, worker) = disband_brigade_two_left_for_a_solo_session(&mut state);
+
+        assert!(
+            cmds.contains(&Cmd::KillPty {
+                key: worker.clone()
+            }),
+            "the Worker of the disbanded brigade is still running off-stage: {cmds:?}"
+        );
+        assert!(!cmds.contains(&Cmd::KillPty { key: director }));
+    }
+
+    #[test]
+    fn disbanding_a_brigade_left_for_another_brigade_ends_its_worker_and_spares_its_director() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let (cmds, director, worker) = disband_brigade_two_left_for_brigade_one(&mut state);
+
+        assert!(
+            cmds.contains(&Cmd::KillPty {
+                key: worker.clone()
+            }),
+            "the Worker of the disbanded brigade is still running off-stage: {cmds:?}"
+        );
+        assert!(!cmds.contains(&Cmd::KillPty { key: director }));
+    }
+
+    #[test]
+    fn an_offstage_disband_leaves_the_directors_pane_hosted_with_its_membership() {
+        // What the Director's off-stage pane is after the disband: still
+        // hosted, never asked to end, and still carrying the membership maps it
+        // was staged with (`update_disbanded`'s own comment). Nothing here says
+        // what the stage is; the tests around this one pin that.
+        for scenario in [
+            disband_brigade_two_left_for_a_solo_session,
+            disband_brigade_two_left_for_brigade_one,
+        ] {
+            let mut state = EmporiumState::new(PrefixKey::default());
+            let (cmds, director, worker) = scenario(&mut state);
+
+            assert!(!cmds.contains(&Cmd::KillPty {
+                key: director.clone()
+            }));
+            assert!(state.screens.contains_key(&director));
+            assert_eq!(state.member_brigades.get(&director), Some(&2));
+            assert_eq!(
+                state.member_tokens.get(&director).map(String::as_str),
+                Some(DIRECTOR_TOKEN)
+            );
+            // The Worker is asked to end, and only it; its pane stays hosted
+            // until its exit arrives like any other.
+            assert!(state.screens.contains_key(&worker));
+            assert_eq!(
+                state.expected_exits.keys().collect::<Vec<_>>(),
+                vec![&worker]
+            );
+            assert!(state.disbanding.contains(&2));
+        }
+    }
+
+    /// Host a Goinkyo pane for `brigade_id` the way a spawn leaves it: a screen,
+    /// the ownership maps, and the one-shot guard naming it. Never staged.
+    fn host_goinkyo_pane(state: &mut EmporiumState, brigade_id: BrigadeId) -> SessionKey {
+        let key = SessionKey::new_worker(brigade_id, GOINKYO_TOKEN);
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state
+            .member_tokens
+            .insert(key.clone(), GOINKYO_TOKEN.to_string());
+        state.member_brigades.insert(key.clone(), brigade_id);
+        state.goinkyo_pane.insert(brigade_id, key.clone());
+        key
+    }
+
+    #[test]
+    fn a_disband_ends_a_goinkyo_pane_hosted_off_stage_in_the_same_handling() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("sess-solo")]);
+        let (director, worker) = host_and_stage_brigade(&mut state, &app, 2, "dir-2", "w-2");
+        let goinkyo = host_goinkyo_pane(&mut state, 2);
+        let solo = key_of("sess-solo");
+        state.screens.insert(solo.clone(), Screen::new(24, 80));
+        let solo_row = app.row_for_id("sess-solo").cloned().unwrap();
+        assert!(open_solo(&mut state, &solo_row).is_empty());
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        for ended in [&worker, &goinkyo] {
+            assert!(
+                cmds.contains(&Cmd::KillPty { key: ended.clone() }),
+                "{ended:?} must end with its brigade: {cmds:?}"
+            );
+        }
+        assert!(!cmds.contains(&Cmd::KillPty {
+            key: director.clone()
+        }));
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::KillPty { key } if *key == solo)),
+            "a session of no brigade is nobody's to end: {cmds:?}"
+        );
+
+        // The tick after: the roster of a deleted brigade has no Goinkyo, so the
+        // release names the pane the disband already closed. The same kill again
+        // is the harmless repeat the docs promise, and the guard is released.
+        let released = update(
+            &mut state,
+            &mut app,
+            &brigade_config(),
+            Event::GoinkyoAwaitingSpawn {
+                observation: GoinkyoObservation::NoGoinkyo { brigade_id: 2 },
+            },
+            test_instant(),
+        );
+        assert_eq!(
+            released,
+            vec![
+                Cmd::KillPty {
+                    key: goinkyo.clone()
+                },
+                Cmd::Reload
+            ]
+        );
+        assert!(!state.goinkyo_pane.contains_key(&2));
+
+        // And its exit, whichever of the two kills the process answers to, is an
+        // exit banto asked for: nothing is reopened.
+        let exited = update(
+            &mut state,
+            &mut app,
+            &brigade_config(),
+            Event::PtyExited {
+                key: goinkyo.clone(),
+                reason: None,
+            },
+            test_instant(),
+        );
+        assert!(
+            !exited
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
+            "{exited:?}"
+        );
+        assert!(!state.screens.contains_key(&goinkyo));
+        assert!(state.screens.contains_key(&director));
+    }
+
+    #[test]
+    fn a_disband_ends_every_hosted_worker_of_the_brigade_and_no_other_brigades() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let (director_2, worker_2) = host_and_stage_brigade(&mut state, &app, 2, "dir-2", "w-2");
+        let (director_1, worker_1) = host_and_stage_brigade(&mut state, &app, 1, "dir-1", "w-1");
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        assert_eq!(
+            cmds,
+            vec![Cmd::KillPty { key: worker_2 }, Cmd::Reload],
+            "brigade 2's Worker only"
+        );
+        assert!(!cmds.contains(&Cmd::KillPty { key: director_2 }));
+        assert!(!cmds.contains(&Cmd::KillPty { key: worker_1 }));
+        assert!(!cmds.contains(&Cmd::KillPty { key: director_1 }));
+    }
+
+    #[test]
+    fn an_offstage_disband_leaves_the_focus_where_it_was() {
+        // An empty stage is the one a settle would act on (`settle_focus` hands
+        // a pane focus back to the sidebar), so a disband that settled whatever
+        // it did not touch would move this one. A focus on an empty stage is not
+        // a state the operator reaches; it is what makes the test able to fail.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Empty;
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+
+        confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        assert_eq!(state.focus, Focus::Pane);
+    }
+
+    /// Host `token`'s pane of `brigade_id`: a screen and the ownership maps, as
+    /// a Worker's spawn leaves them, never staged.
+    fn host_member_pane(
+        state: &mut EmporiumState,
+        brigade_id: BrigadeId,
+        id: &str,
+        token: &str,
+    ) -> SessionKey {
+        let key = key_of(id);
+        state.screens.insert(key.clone(), Screen::new(24, 80));
+        state.member_tokens.insert(key.clone(), token.to_string());
+        state.member_brigades.insert(key.clone(), brigade_id);
+        key
+    }
+
+    /// Keys in a fixed order, since `SessionKey` is not ordered and the kills
+    /// come out in whatever order the stage and the maps list them.
+    fn sorted_keys(mut keys: Vec<SessionKey>) -> Vec<SessionKey> {
+        keys.sort_by_key(|key| format!("{key:?}"));
+        keys
+    }
+
+    fn killed_keys(cmds: &[Cmd]) -> Vec<SessionKey> {
+        sorted_keys(
+            cmds.iter()
+                .filter_map(|cmd| match cmd {
+                    Cmd::KillPty { key } => Some(key.clone()),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_disband_ends_the_workers_of_a_brigade_whose_directors_pane_was_ended_alone_staged() {
+        // The old Director prefix-`x` and a Director that exited on its own both
+        // leave the Workers hosted and the stage with no Director to name.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let w1 = host_member_pane(&mut state, 1, "w-1", "worker-1");
+        let w2 = host_member_pane(&mut state, 1, "w-2", "worker-2");
+        let goinkyo = host_member_pane(&mut state, 1, "g-1", GOINKYO_TOKEN);
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: None,
+            panes: vec![w1.clone(), w2.clone(), goinkyo.clone()],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 1);
+
+        assert_eq!(
+            killed_keys(&cmds),
+            sorted_keys(vec![w1, w2, goinkyo]),
+            "{cmds:?}"
+        );
+        assert!(matches!(state.stage, Stage::Empty));
+        assert_eq!(state.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn a_disband_ends_the_workers_of_a_brigade_whose_directors_pane_was_ended_alone_offstage() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let w1 = host_member_pane(&mut state, 2, "w-1", "worker-1");
+        let goinkyo = host_member_pane(&mut state, 2, "g-1", GOINKYO_TOKEN);
+        let solo = key_of("sess-solo");
+        state.screens.insert(solo.clone(), Screen::new(24, 80));
+        state.stage = Stage::Solo(solo.clone());
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        assert_eq!(
+            killed_keys(&cmds),
+            sorted_keys(vec![w1, goinkyo]),
+            "{cmds:?}"
+        );
+        assert!(matches!(&state.stage, Stage::Solo(key) if *key == solo));
+        assert_eq!(state.focus, Focus::Pane);
+    }
+
+    #[test]
+    fn a_disband_drops_what_its_ended_panes_left_queued_and_only_theirs() {
+        // A delayed Enter written into a dead pane is a bug whichever way the
+        // pane died, and a disband ends panes exactly as a close does.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let (director, worker) = host_and_stage_brigade(&mut state, &app, 2, "dir-2", "w-2");
+        let other = host_member_pane(&mut state, 3, "w-3", "worker-1");
+        let at = test_instant();
+        for pane in [&worker, &director, &other] {
+            state.pending_submits.push(PendingSubmit {
+                key: pane.clone(),
+                nudged_at: at,
+            });
+        }
+        for brigade_id in [2, 3] {
+            let member = (brigade_id, "worker-1".to_string());
+            state.prompt_held_since.insert(member.clone(), at);
+            state.unreadable_since.insert(member.clone(), at);
+            state.unreadable_noticed.insert(member);
+        }
+
+        confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        let queued: Vec<SessionKey> = state
+            .pending_submits
+            .iter()
+            .map(|pending| pending.key.clone())
+            .collect();
+        assert_eq!(
+            sorted_keys(queued),
+            sorted_keys(vec![director, other]),
+            "the Worker's delayed Enter goes; the surviving Director's stays"
+        );
+        for map in [&state.prompt_held_since, &state.unreadable_since] {
+            assert_eq!(map.keys().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3]);
+        }
+        assert_eq!(
+            state
+                .unreadable_noticed
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn a_disband_spares_the_director_and_a_pane_with_no_token_and_other_brigades() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = host_member_pane(&mut state, 2, "dir-2", DIRECTOR_TOKEN);
+        let worker = host_member_pane(&mut state, 2, "w-2", "worker-1");
+        // No token: the maps place it in the brigade but say nothing of its role.
+        let unnamed = key_of("odd");
+        state.screens.insert(unnamed.clone(), Screen::new(24, 80));
+        state.member_brigades.insert(unnamed.clone(), 2);
+        let other = host_member_pane(&mut state, 3, "w-3", "worker-1");
+        let mut app = app_with(vec![]);
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+
+        assert_eq!(killed_keys(&cmds), vec![worker], "{cmds:?}");
+        for spared in [&director, &unnamed, &other] {
+            assert!(!cmds.contains(&Cmd::KillPty {
+                key: spared.clone()
+            }));
+        }
+    }
+
+    #[test]
+    fn a_staged_disband_falls_to_the_hosted_director_even_when_the_stage_names_none() {
+        // The stage and the kills must agree about who stays: the Director is in
+        // `panes` and hosted, only the `director` field is `None`.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let director = host_member_pane(&mut state, 1, "dir-1", DIRECTOR_TOKEN);
+        let worker = host_member_pane(&mut state, 1, "w-1", "worker-1");
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: None,
+            panes: vec![director.clone(), worker.clone()],
+            focused: 1,
+        };
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 1);
+
+        assert_eq!(killed_keys(&cmds), vec![worker], "{cmds:?}");
+        assert!(matches!(&state.stage, Stage::Solo(key) if *key == director));
+        assert_eq!(state.focus, Focus::Pane);
+    }
+
+    /// Ask for `token`'s open as `open_worker` does and leave it in flight: the
+    /// maps and the pending open, no screen.
+    fn start_opening_member(
+        state: &mut EmporiumState,
+        brigade_id: BrigadeId,
+        token: &str,
+    ) -> SessionKey {
+        let key = SessionKey::new_worker(brigade_id, token);
+        state.member_tokens.insert(key.clone(), token.to_string());
+        state.member_brigades.insert(key.clone(), brigade_id);
+        state.pending_opens.insert(
+            key.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id,
+                needs_codex_kickoff: false,
+            },
+        );
+        key
+    }
+
+    fn spawned(state: &mut EmporiumState, app: &mut App, key: &SessionKey) -> Vec<Cmd> {
+        update(
+            state,
+            app,
+            &brigade_config(),
+            Event::Spawned {
+                key: key.clone(),
+                agent: None,
+            },
+            test_instant(),
+        )
+    }
+
+    #[test]
+    fn a_worker_or_goinkyo_that_lands_after_its_brigade_was_disbanded_is_ended_not_staged() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let worker = start_opening_member(&mut state, 2, "worker-4");
+        let goinkyo = start_opening_member(&mut state, 2, GOINKYO_TOKEN);
+        let solo = key_of("sess-solo");
+        state.stage = Stage::Solo(solo.clone());
+
+        let cmds = confirm_and_complete_disband(&mut state, &mut app, 2);
+        assert!(
+            killed_keys(&cmds).is_empty(),
+            "nothing is hosted yet to kill: {cmds:?}"
+        );
+
+        for pane in [&worker, &goinkyo] {
+            let landed = spawned(&mut state, &mut app, pane);
+            assert_eq!(killed_keys(&landed), vec![pane.clone()], "{landed:?}");
+            assert!(
+                !landed
+                    .iter()
+                    .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
+                "{landed:?}"
+            );
+            assert!(state.expected_exits.contains_key(pane));
+            assert!(!state.pending_opens.contains_key(pane));
+        }
+        assert!(matches!(&state.stage, Stage::Solo(key) if *key == solo));
+
+        // Its exit is one banto asked for: nobody is removed, nothing reopens.
+        let exited = update(
+            &mut state,
+            &mut app,
+            &brigade_config(),
+            Event::PtyExited {
+                key: worker.clone(),
+                reason: None,
+            },
+            test_instant(),
+        );
+        assert!(
+            !exited
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. } | Cmd::Store(_))),
+            "{exited:?}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_director_that_lands_after_its_brigade_was_disbanded_is_the_one_that_stays() {
+        // `stage_brigade` opens a resumed Director as a `BrigadeMember`, with the
+        // Director's token already in the maps. Ending it would end the pane the
+        // disband promises to leave.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        let director = key_of("dir-2");
+        state
+            .member_tokens
+            .insert(director.clone(), DIRECTOR_TOKEN.to_string());
+        state.member_brigades.insert(director.clone(), 2);
+        state.pending_opens.insert(
+            director.clone(),
+            PendingOpen::BrigadeMember {
+                brigade_id: 2,
+                needs_codex_kickoff: false,
+            },
+        );
+
+        confirm_and_complete_disband(&mut state, &mut app, 2);
+        let landed = spawned(&mut state, &mut app, &director);
+
+        assert!(killed_keys(&landed).is_empty(), "{landed:?}");
+        assert!(state.screens.contains_key(&director));
+    }
+
+    #[test]
+    fn a_staged_disband_that_empties_the_stage_hands_the_focus_back_to_the_sidebar() {
+        // A pane focus on an empty stage strands every key (`unstage`'s doc).
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.stage = Stage::Brigade {
+            id: 1,
+            director: None,
+            panes: vec![SessionKey::from_id("w1")],
+            focused: 0,
+        };
+        state.focus = Focus::Pane;
+        let mut app = app_with(vec![]);
+
+        confirm_and_complete_disband(&mut state, &mut app, 1);
+
+        assert!(matches!(state.stage, Stage::Empty));
+        assert_eq!(state.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn a_staged_disband_that_keeps_the_director_keeps_the_focus_on_the_pane() {
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![]);
+        host_and_stage_brigade(&mut state, &app, 1, "dir-1", "w-1");
+        state.focus = Focus::Pane;
+
+        confirm_and_complete_disband(&mut state, &mut app, 1);
+
+        assert!(matches!(&state.stage, Stage::Solo(key) if *key == key_of("dir-1")));
+        assert_eq!(state.focus, Focus::Pane);
+    }
+
+    #[test]
+    fn enter_on_the_surviving_directors_row_reuses_its_live_pane() {
+        // The one-session-one-process rule: after an off-stage disband the
+        // Director's row has no membership, and Enter on it must show the pane
+        // that is already running, not resume the session a second time.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        let mut app = app_with(vec![row("dir-2")]);
+        let (director, _) = host_and_stage_brigade(&mut state, &app, 2, "dir-2", "w-2");
+        host_and_stage_brigade(&mut state, &app, 1, "dir-1", "w-1");
+        confirm_and_complete_disband(&mut state, &mut app, 2);
+        assert!(matches!(&state.stage, Stage::Brigade { id: 1, .. }));
+
+        state.pending_membership = Some((PendingMembership::Activate, "dir-2".to_string()));
+        let cmds = update(
+            &mut state,
+            &mut app,
+            &brigade_config(),
+            Event::MembershipResolved {
+                session_id: "dir-2".to_string(),
+                membership: None,
+                members: None,
+                layout: None,
+                names: Vec::new(),
+            },
+            test_instant(),
+        );
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
+            "a second resume of a live session: {cmds:?}"
+        );
+        assert!(matches!(&state.stage, Stage::Solo(key) if *key == director));
+        assert_eq!(state.focus, Focus::Pane);
+        assert!(state.pending_opens.is_empty());
     }
 
     // --- F2/F3 regression ----------------------------------------------------
