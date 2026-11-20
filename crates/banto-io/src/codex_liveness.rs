@@ -106,6 +106,29 @@ pub fn is_thread_alive(
     newest_thread_is_alive(&conn, thread_id, start_time)
 }
 
+/// Whether `thread_id`'s newest log row names `pid` as a live process that wrote
+/// it (the recycling guard of [`is_thread_alive`]). A pane's own child is the
+/// process that switched threads inside it with `/new`, `/clear`, `/fork` or
+/// `/resume`, so a thread the pane's pid wrote last is the pane's, and one a
+/// different process wrote last is not. `false` for every failure mode, like
+/// [`is_thread_alive`]: a caller moves a pane onto a thread only on a positive
+/// answer.
+pub fn is_thread_owned_by(
+    codex_home: &CodexHome,
+    thread_id: &str,
+    pid: u32,
+    start_time: &dyn ProcessStartTime,
+) -> bool {
+    let db_path = codex_home.logs_db_path();
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = open_read_only(&db_path) else {
+        return false;
+    };
+    newest_live_pid(&conn, thread_id, start_time) == Some(pid)
+}
+
 /// An incremental, bounded scan of log rows written after a child was spawned.
 pub struct CodexLogScan {
     file: same_file::Handle,
@@ -363,6 +386,16 @@ fn newest_thread_is_alive(
     thread_id: &str,
     start_time: &dyn ProcessStartTime,
 ) -> bool {
+    newest_live_pid(conn, thread_id, start_time).is_some()
+}
+
+/// The pid `thread_id`'s newest log row names, when that process is alive and
+/// started no later than the row: the process that wrote it.
+fn newest_live_pid(
+    conn: &Connection,
+    thread_id: &str,
+    start_time: &dyn ProcessStartTime,
+) -> Option<u32> {
     let newest: Option<(i64, String)> = conn
         .query_row(
             "SELECT ts, process_uuid FROM logs \
@@ -374,19 +407,13 @@ fn newest_thread_is_alive(
         .optional()
         .ok()
         .flatten();
-    let Some((log_ts, process_uuid)) = newest else {
-        return false;
-    };
-    let Some(pid) = parse_pid(&process_uuid) else {
-        return false;
-    };
-    let Some(started_at) = start_time.start_time(pid) else {
-        return false;
-    };
+    let (log_ts, process_uuid) = newest?;
+    let pid = parse_pid(&process_uuid)?;
+    let started_at = start_time.start_time(pid)?;
     // Recycling guard: a process that started strictly after this log row
     // was written cannot be the one that wrote it, even though it now
     // holds the same pid.
-    started_at as i64 <= log_ts
+    (started_at as i64 <= log_ts).then_some(pid)
 }
 
 /// Parse the pid out of a `process_uuid` column value (`pid:<PID>:<suffix>`).
@@ -440,6 +467,31 @@ mod tests {
         fn start_time(&self, pid: u32) -> Option<u64> {
             self.0.get(&pid).copied()
         }
+    }
+
+    #[test]
+    fn a_thread_is_owned_by_the_pid_its_newest_row_names_while_that_process_lives() {
+        let dir = TempDir::new().unwrap();
+        let home = codex_home(&dir);
+        write_log_row(&home, 1_000, "t", Some("pid:100:a"));
+        // A later row from another process: the thread was last written there.
+        write_log_row(&home, 1_100, "moved", Some("pid:100:a"));
+        write_log_row(&home, 1_200, "moved", Some("pid:200:b"));
+        let starts = MockStartTime(HashMap::from([(100, 900), (200, 900)]));
+
+        assert!(is_thread_owned_by(&home, "t", 100, &starts));
+        assert!(!is_thread_owned_by(&home, "t", 200, &starts), "another pid");
+        assert!(
+            !is_thread_owned_by(&home, "moved", 100, &starts),
+            "newest row decides"
+        );
+        assert!(is_thread_owned_by(&home, "moved", 200, &starts));
+        assert!(!is_thread_owned_by(&home, "unknown", 100, &starts));
+        // The process is gone, or a recycled pid that started after the row.
+        let gone = MockStartTime(HashMap::new());
+        assert!(!is_thread_owned_by(&home, "t", 100, &gone));
+        let recycled = MockStartTime(HashMap::from([(100, 1_001)]));
+        assert!(!is_thread_owned_by(&home, "t", 100, &recycled));
     }
 
     #[test]

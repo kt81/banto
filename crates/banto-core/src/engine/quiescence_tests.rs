@@ -10798,6 +10798,24 @@ fn a_member_whose_process_moved_onto_a_session_another_members_row_holds_writes_
     assert_eq!(state.status, None, "not said again every tick");
 }
 
+#[test]
+fn a_member_whose_process_moved_onto_a_session_being_opened_writes_nothing() {
+    // The in-pane switch lands on a thread the operator just pressed Enter on.
+    let mut state = EmporiumState::new(PrefixKey::default());
+    let mut app = App::new(Vec::new());
+    let w = host(&mut state, 1, "worker-1", "w1");
+    state.pending_opens.insert(key("held"), PendingOpen::Solo);
+
+    let refused = send(&mut state, &mut app, member_moved("held", false), t0());
+
+    assert!(
+        refused.is_empty(),
+        "no rename and no store write: {refused:?}"
+    );
+    assert!(state.screens.contains_key(&w));
+    assert!(state.status.is_some(), "the refusal is said");
+}
+
 fn member_moved(new_id: &str, held_by_row: bool) -> Event {
     Event::MemberSessionForked {
         brigade_id: 1,

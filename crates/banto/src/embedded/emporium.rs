@@ -819,9 +819,21 @@ fn event_loop(
                 &handles,
                 app,
                 &mut session_moves,
-                &ProcessView {
-                    probe: &SysinfoProbe,
-                    alive: &alive,
+                &MoveSources {
+                    processes: &ProcessView {
+                        probe: &SysinfoProbe,
+                        alive: &alive,
+                    },
+                    owns_thread: &|thread, pid| {
+                        deps.codex_home.is_some_and(|home| {
+                            banto_io::codex_liveness::is_thread_owned_by(
+                                home,
+                                thread,
+                                pid,
+                                &banto_io::codex_liveness::SysinfoStartTime,
+                            )
+                        })
+                    },
                 },
                 Some(&mut tick_timings),
             ));
@@ -2948,6 +2960,16 @@ struct ProcessView<'a> {
     alive: &'a dyn Fn(u32) -> bool,
 }
 
+/// What [`gather_session_moves`] asks the outside world beyond the tick's reads.
+struct MoveSources<'a> {
+    processes: &'a ProcessView<'a>,
+    /// Whether Codex's log database says this thread's newest row was written by
+    /// this pid, a live process that started no later than the row
+    /// (`codex_liveness::is_thread_owned_by`). A closure so the gather is tested
+    /// without a database.
+    owns_thread: &'a dyn Fn(&str, u32) -> bool,
+}
+
 /// A probe that asks the probe it wraps for each pid's parent once and remembers
 /// the answer. A pane with no live file of its own (just started, or one nobody
 /// reports) never reaches the steady-state check, so it walks every live entry's
@@ -3007,6 +3029,14 @@ const MOVE_RESEND_TICKS: u32 = 5;
 /// worth a line.
 const MOVE_PAUSED_NOTICE_TICKS: u32 = 10;
 
+/// How many consecutive ticks a Codex member's recorded thread may stay
+/// unconfirmed ([`confirm_codex_thread`]) before the operator is told. The two
+/// things it waits for, Codex's log row and the reload that lists the new rollout,
+/// both lag the hook by a time nobody has measured, and a notice that says "not
+/// following" about a thread that is confirmed seconds later reads as a verdict. So
+/// it is long, and the wording says "yet".
+const UNCONFIRMED_NOTICE_TICKS: u32 = 30;
+
 /// What [`gather_session_moves`] has seen of each pane across ticks: which id it
 /// reported, for how many ticks, and when the move was last sent.
 ///
@@ -3019,10 +3049,21 @@ const MOVE_PAUSED_NOTICE_TICKS: u32 = 10;
 #[derive(Default)]
 struct SessionMoveWatch {
     seen: HashMap<SessionKey, WatchedMove>,
+    /// Codex members whose row records a thread the pane is not confirmed to be
+    /// in ([`confirm_codex_thread`]), by pane. Not in `seen`: nothing is sent for
+    /// these, and the entry only decides when the operator is told.
+    unconfirmed: HashMap<SessionKey, UnconfirmedMove>,
     /// Consecutive ticks the roster was not read in full, and whether this
     /// stretch has been told about already.
     unread_ticks: u32,
     paused_said: bool,
+}
+
+/// A Codex thread change not yet tied to its pane, and how long it has been so.
+struct UnconfirmedMove {
+    new_id: String,
+    ticks: u32,
+    said: bool,
 }
 
 struct WatchedMove {
@@ -3127,17 +3168,20 @@ fn row_holds(
     })
 }
 
-/// Detect a hosted Claude pane whose process now reports another session id
-/// (see [`moved_session_id`]): [`Event::MemberSessionForked`] for a brigade
-/// member, [`Event::PaneSessionMoved`] for any other pane. Each is sent after the
-/// move has held for [`MOVE_CONFIRM_TICKS`] ticks and again every
-/// [`MOVE_RESEND_TICKS`] while it is still observed ([`SessionMoveWatch`]); the
-/// core's handlers tolerate a repeat. A non-Claude pane never
-/// reaches any of this: `sessions/<pid>.json` is Claude's own file and a Codex
-/// session id is never in it, so its permanent absence would read every tick as
-/// "the id moved" on a mechanism that cannot apply. A pane whose product is not
-/// known yet (`app` has no row for it) is skipped the same way and caught on a
-/// later tick.
+/// Detect a hosted pane that has moved onto another session in place:
+/// [`Event::MemberSessionForked`] for a brigade member, [`Event::PaneSessionMoved`]
+/// for any other pane. Each is sent after the move has held for
+/// [`MOVE_CONFIRM_TICKS`] ticks and again every [`MOVE_RESEND_TICKS`] while it is
+/// still observed ([`SessionMoveWatch`]); the core's handlers tolerate a repeat.
+///
+/// A Claude pane is followed through its process's live file
+/// ([`moved_session_id`]), member or not. A Codex pane has no such file and its
+/// session id is never in Claude's `sessions/<pid>.json`, whose permanent absence
+/// would read every tick as "the id moved"; a Codex *member* is followed through
+/// what its SessionStart hook recorded instead ([`codex_moved_thread`]), and a Codex
+/// pane that is no member is not followed at all, since nothing in it runs the
+/// hook. A pane whose product is not known yet (`app` has no row for it) is
+/// skipped and caught on a later tick.
 ///
 /// A tick that could not read every brigade's members names no move at all. Which
 /// panes are members is read off the roster, and so is whether another member's
@@ -3152,17 +3196,17 @@ fn gather_session_moves(
     handles: &HashMap<SessionKey, PtyHandle>,
     app: &App,
     watch: &mut SessionMoveWatch,
-    view: &ProcessView,
+    sources: &MoveSources,
     timings: Option<&mut TickTimings>,
 ) -> Vec<Event> {
     let per_pane_start = Instant::now();
     let parents = CachedParents {
-        inner: view.probe,
+        inner: sources.processes.probe,
         parents: RefCell::new(HashMap::new()),
     };
     let view = ProcessView {
         probe: &parents,
-        alive: view.alive,
+        alive: sources.processes.alive,
     };
     let mut observed = Vec::new();
     let roster = read
@@ -3170,10 +3214,19 @@ fn gather_session_moves(
         .as_ref()
         .filter(|brigades| roster_is_complete(brigades));
     let notice = watch.roster_notice(roster.is_some());
+    // Only a complete roster re-examines the Codex members, so only then are the
+    // counters taken: a tick that reads nothing must not reset them, or the notice
+    // (a latch among them) would be said again after every unreadable tick.
+    let mut unconfirmed_before = if roster.is_some() {
+        std::mem::take(&mut watch.unconfirmed)
+    } else {
+        HashMap::new()
+    };
+    let mut unconfirmed_notices = Vec::new();
     if let Some(roster) = roster {
         let mut member_keys: HashSet<SessionKey> = HashSet::new();
-        let is_claude =
-            |id: &str| app.row_for_id(id).map(|row| row.agent) == Some(AgentKind::ClaudeCode);
+        let agent_of = |id: &str| app.row_for_id(id).map(|row| row.agent);
+        let is_claude = |id: &str| agent_of(id) == Some(AgentKind::ClaudeCode);
         for (brigade, members) in roster {
             for member in members.iter().flatten() {
                 let Some(session_id) = member.session_id.as_ref() else {
@@ -3181,7 +3234,71 @@ fn gather_session_moves(
                 };
                 let old_key = SessionKey::from_id(&session_id.0);
                 member_keys.insert(old_key.clone());
-                if !is_claude(&session_id.0) || !state.screens.contains_key(&old_key) {
+                if !state.screens.contains_key(&old_key) {
+                    continue;
+                }
+                if agent_of(&session_id.0) == Some(AgentKind::Codex) {
+                    let Some(handle) = handles.get(&old_key) else {
+                        continue;
+                    };
+                    let (Some(pid), Some(new_id)) = (
+                        handle.pid(),
+                        codex_moved_thread(member, handle.spawned_at()),
+                    ) else {
+                        continue;
+                    };
+                    // A move already admitted was tied to the pane then; the log
+                    // is not asked again every tick while the core refuses it.
+                    let tied = watch
+                        .seen
+                        .get(&old_key)
+                        .is_some_and(|watched| watched.new_id == new_id);
+                    match if tied {
+                        Ok(())
+                    } else {
+                        confirm_codex_thread(new_id, pid, app, sources.owns_thread)
+                    } {
+                        Ok(()) => observed.push(ObservedMove {
+                            key: old_key,
+                            entry_pid: pid,
+                            event: Event::MemberSessionForked {
+                                brigade_id: brigade.id,
+                                token: member.token.clone(),
+                                old_id: session_id.0.clone(),
+                                new_id: new_id.to_string(),
+                                held_by_row: row_holds(
+                                    roster,
+                                    new_id,
+                                    Some((brigade.id, &member.token)),
+                                ),
+                            },
+                            new_id: new_id.to_string(),
+                        }),
+                        Err(why) => {
+                            let mut entry = match unconfirmed_before.remove(&old_key) {
+                                Some(entry) if entry.new_id == new_id => entry,
+                                _ => UnconfirmedMove {
+                                    new_id: new_id.to_string(),
+                                    ticks: 0,
+                                    said: false,
+                                },
+                            };
+                            entry.ticks = entry.ticks.saturating_add(1);
+                            if !entry.said && entry.ticks >= UNCONFIRMED_NOTICE_TICKS {
+                                entry.said = true;
+                                unconfirmed_notices.push(format!(
+                                    "{} of \"{}\": Codex switched to session {new_id}, \
+                                     which banto cannot yet tie to this pane ({why}); \
+                                     not following it",
+                                    member.token, brigade.name
+                                ));
+                            }
+                            watch.unconfirmed.insert(old_key, entry);
+                        }
+                    }
+                    continue;
+                }
+                if !is_claude(&session_id.0) {
                     continue;
                 }
                 let Some(pid) = handles.get(&old_key).and_then(PtyHandle::pid) else {
@@ -3236,10 +3353,61 @@ fn gather_session_moves(
     }
     let mut events = watch.admit(observed);
     events.extend(notice);
+    if !unconfirmed_notices.is_empty() {
+        events.push(Event::StartupNotices {
+            notices: unconfirmed_notices,
+        });
+    }
     if let Some(t) = timings {
         t.session_moves += per_pane_start.elapsed();
     }
     events
+}
+
+/// The thread a hosted Codex member's row says its pane has moved onto: the
+/// session id `banto _hook` last ran under, when it differs from the one the row
+/// (and the pane's key) holds and the hook ran in this very process
+/// (`spawned_at`; the column is never cleared, so an older value is a previous
+/// process's). Codex switches thread inside one process with `/new`, `/clear`,
+/// `/fork` and an in-pane `/resume`, and the hook fires at the next typed turn with
+/// the new thread's id (measured on Codex 0.169.0). Which command switched is
+/// never asked: only what the hook recorded is read.
+fn codex_moved_thread(member: &BrigadeMember, spawned_at: SystemTime) -> Option<&str> {
+    let held = member.session_id.as_ref()?;
+    let briefed = member.briefed_session_id.as_ref()?;
+    (briefed != held && member.briefed_at.is_some_and(|at| at >= spawned_at))
+        .then_some(briefed.0.as_str())
+}
+
+/// Whether `new_id` is a thread the pane whose child is `pid` is in; `Err` is the
+/// reason it is not confirmed, for the operator. Both must hold. Codex's log
+/// database says the thread's newest row was written by that process
+/// (`owns_thread`, which carries the pid-recycling check): the hook's own word is
+/// not taken as proof. And the thread is a listed Codex session.
+///
+/// "Listed" is the only defence against a sub-agent thread of the same process,
+/// whose log rows name the pane's pid too. No sub-agent thread has been seen to run
+/// the hook (it may not), so this is a guard, not an observed case. It rests on the
+/// provider recognising the sub-agent `source` shape (`provider::codex`): a Codex
+/// release that changed that shape would list such a thread, and the pane would be
+/// re-pointed onto a sub-agent's conversation: the wrong identity, though never a
+/// double open, since the held-key refusal still applies.
+///
+/// The log write and the reload that lists the new rollout can each land after
+/// the hook, so the caller waits before it says anything.
+fn confirm_codex_thread(
+    new_id: &str,
+    pid: u32,
+    app: &App,
+    owns_thread: &dyn Fn(&str, u32) -> bool,
+) -> Result<(), &'static str> {
+    if app.row_for_id(new_id).map(|row| row.agent) != Some(AgentKind::Codex) {
+        return Err("it is not a listed Codex session");
+    }
+    if !owns_thread(new_id, pid) {
+        return Err("Codex's log does not show this pane's process writing it");
+    }
+    Ok(())
 }
 
 /// Whether every brigade's members were read: only then is a pane that is in none
@@ -3287,7 +3455,11 @@ fn gather_session_moves_viewing(
     app: &App,
 ) -> Vec<Event> {
     let read = TickRead::read(store, claude_home, None);
-    gather_session_moves(&read, state, handles, app, watch, view, None)
+    let sources = MoveSources {
+        processes: view,
+        owns_thread: &|_, _| false,
+    };
+    gather_session_moves(&read, state, handles, app, watch, &sources, None)
 }
 
 /// What the loop sends for a move that has held: the second tick's events, with
@@ -3308,8 +3480,12 @@ fn gather_session_moves_reading(
         probe: &SysinfoProbe,
         alive: &|_| true,
     };
-    gather_session_moves(&read, state, handles, app, &mut watch, &view, None);
-    gather_session_moves(&read, state, handles, app, &mut watch, &view, timings)
+    let sources = MoveSources {
+        processes: &view,
+        owns_thread: &|_, _| false,
+    };
+    gather_session_moves(&read, state, handles, app, &mut watch, &sources, None);
+    gather_session_moves(&read, state, handles, app, &mut watch, &sources, timings)
 }
 
 #[cfg(test)]
@@ -11129,11 +11305,12 @@ mod tests {
         // Same exact-pid-match setup as
         // `gather_session_moves_detects_a_moved_worker_by_exact_pid_match`
         // — `entry.pid == pid` would trip `ancestry_reaches` at depth 0
-        // with no real OS lookup at all, so if the Claude-only gate above
-        // this test's own body ever regressed, this would reliably produce
-        // a (wrong) move observation for a Codex member instead of quietly
-        // doing nothing. The only difference from the Claude test is the
-        // agent tag `staged_worker` puts in `App`'s row.
+        // with no real OS lookup at all, so if a Codex member were ever
+        // read through Claude's live file, this would reliably produce a
+        // (wrong) move observation instead of quietly doing nothing. The
+        // only difference from the Claude test is the agent tag
+        // `staged_worker` puts in `App`'s row. A Codex member's move has
+        // its own source (the briefing its hook recorded, below).
         let claude_home = tempfile::tempdir().unwrap();
         let (store, state, app) = staged_worker("w1-old", Some(AgentKind::Codex));
         write_live_state(claude_home.path(), 4242, "w1-new", Path::new("/work/alpha"));
@@ -11156,8 +11333,514 @@ mod tests {
 
         assert!(
             events.is_empty(),
-            "a Codex member must never produce a move observation: {events:?}"
+            "a Codex member is never followed through Claude's live file: {events:?}"
         );
+    }
+
+    // --- session-move tracking: a Codex member that switched thread in place --
+
+    const CODEX_PID: u32 = 4242;
+
+    /// The per-tick events of `ticks` consecutive ticks of the move gather, one
+    /// watch throughout, with `owns` standing in for Codex's log database.
+    fn gather_move_ticks(
+        state: &EmporiumState,
+        store: &RefCell<Store>,
+        handles: &HashMap<SessionKey, PtyHandle>,
+        app: &App,
+        owns: &dyn Fn(&str, u32) -> bool,
+        ticks: usize,
+    ) -> Vec<Vec<Event>> {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let mut watch = SessionMoveWatch::default();
+        let view = ProcessView {
+            probe: &SysinfoProbe,
+            alive: &|_| true,
+        };
+        (0..ticks)
+            .map(|_| {
+                let read = TickRead::read(store, &claude_home, None);
+                gather_session_moves(
+                    &read,
+                    state,
+                    handles,
+                    app,
+                    &mut watch,
+                    &MoveSources {
+                        processes: &view,
+                        owns_thread: owns,
+                    },
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// Store, staged state, session list, hosted panes, and the member's
+    /// `(old, new)` session ids.
+    type CodexMemberRig = (
+        RefCell<Store>,
+        EmporiumState,
+        App,
+        HashMap<SessionKey, PtyHandle>,
+        (&'static str, &'static str),
+    );
+
+    /// A staged brigade whose Codex member (the Director, or Worker `worker-1`)
+    /// holds thread `old` in a pane its process runs, and whose hook recorded the
+    /// session id `new` `briefed_secs` seconds after the pane's launch (negative:
+    /// before it; `None`: never). `new` is a listed Codex session when `listed`.
+    /// Returns the member's `(old, new)` ids.
+    fn codex_member_that_ran_its_hook_under_another_thread(
+        director: bool,
+        listed: bool,
+        briefed_secs: Option<i64>,
+    ) -> CodexMemberRig {
+        let (store, state, _) = staged_worker("w1-old", Some(AgentKind::Codex));
+        let (token, old, new) = if director {
+            ("director", "dir", "dir-new")
+        } else {
+            ("worker-1", "w1-old", "w1-new")
+        };
+        let agent_of = |id: &str| {
+            if id == old {
+                AgentKind::Codex
+            } else {
+                AgentKind::ClaudeCode
+            }
+        };
+        let mut rows = vec![
+            test_row("dir", agent_of("dir")),
+            test_row("w1-old", agent_of("w1-old")),
+        ];
+        if listed {
+            rows.push(test_row(new, AgentKind::Codex));
+        }
+        let app = App::new(rows);
+        let host = MockPtyHost {
+            pid: Some(CODEX_PID),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id(old), open(&host));
+        if let Some(secs) = briefed_secs {
+            let at = SystemTime::now();
+            let at = if secs >= 0 {
+                at + Duration::from_secs(secs as u64)
+            } else {
+                at - Duration::from_secs(secs.unsigned_abs())
+            };
+            let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+            store
+                .borrow_mut()
+                .record_briefing(brigade_id, token, &SessionId(new.to_string()), at)
+                .unwrap();
+        }
+        (store, state, app, handles, (old, new))
+    }
+
+    fn the_log_ties(thread: &'static str) -> impl Fn(&str, u32) -> bool {
+        move |asked, pid| asked == thread && pid == CODEX_PID
+    }
+
+    fn forked_events(events: &[Event]) -> Vec<&Event> {
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::MemberSessionForked { .. }))
+            .collect()
+    }
+
+    fn notices_in(per_tick: &[Vec<Event>]) -> Vec<String> {
+        per_tick
+            .iter()
+            .flatten()
+            .filter_map(|event| match event {
+                Event::StartupNotices { notices } => Some(notices.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn apply(state: &mut EmporiumState, app: &mut App, event: Event) -> Vec<Cmd> {
+        engine::update(state, app, &BrigadeConfig::default(), event, Instant::now())
+    }
+
+    #[test]
+    fn a_codex_workers_new_thread_is_followed_by_its_row_and_its_pane() {
+        let (store, mut state, mut app, handles, (old, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &the_log_ties(new), 3);
+
+        assert!(
+            ticks[0].is_empty(),
+            "believed only when it holds a second tick"
+        );
+        let [
+            Event::MemberSessionForked {
+                token,
+                old_id,
+                new_id,
+                held_by_row: false,
+                ..
+            },
+        ] = ticks[1].as_slice()
+        else {
+            panic!("expected exactly one move: {:?}", ticks[1]);
+        };
+        assert_eq!(
+            (token.as_str(), old_id.as_str(), new_id.as_str()),
+            ("worker-1", old, new)
+        );
+        assert!(notices_in(&ticks).is_empty());
+
+        let cmds = apply(&mut state, &mut app, ticks[1][0].clone());
+        assert!(state.screens.contains_key(&SessionKey::from_id(new)));
+        assert!(!state.screens.contains_key(&SessionKey::from_id(old)));
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::RekeyPty { from, to }
+                if *from == SessionKey::from_id(old) && *to == SessionKey::from_id(new)
+        )));
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            Cmd::Store(StoreIntent::SetMemberSession { token, session_id, .. })
+                if token == "worker-1" && session_id == new
+        )));
+    }
+
+    #[test]
+    fn a_codex_directors_clear_is_followed_by_its_pane() {
+        let (store, mut state, mut app, handles, (old, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(true, true, Some(5));
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &the_log_ties(new), 2);
+
+        let [
+            Event::MemberSessionForked {
+                token,
+                old_id,
+                new_id,
+                ..
+            },
+        ] = ticks[1].as_slice()
+        else {
+            panic!("expected exactly one move: {:?}", ticks[1]);
+        };
+        assert_eq!(
+            (token.as_str(), old_id.as_str(), new_id.as_str()),
+            ("director", old, new)
+        );
+        apply(&mut state, &mut app, ticks[1][0].clone());
+        let Stage::Brigade { director, .. } = &state.stage else {
+            panic!("expected a staged brigade");
+        };
+        assert_eq!(director.as_ref(), Some(&SessionKey::from_id(new)));
+    }
+
+    #[test]
+    fn a_hook_for_a_thread_the_log_does_not_tie_to_the_pane_moves_nothing_and_is_said_once() {
+        let (store, state, app, handles, (_, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let n = UNCONFIRMED_NOTICE_TICKS as usize;
+
+        // Another process wrote the thread last, or it has no rows at all.
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &|_, _| false, n + 10);
+
+        assert!(ticks.iter().all(|events| forked_events(events).is_empty()));
+        let notices = notices_in(&ticks);
+        assert_eq!(
+            notices.len(),
+            1,
+            "said once, not once a second: {notices:?}"
+        );
+        assert!(
+            notices[0].contains(new)
+                && notices[0].contains("cannot yet tie")
+                && notices[0].contains("does not show this pane's process writing it"),
+            "{notices:?}"
+        );
+        // The boundary: the tick before the threshold says nothing, the threshold's
+        // own tick says it. A log write that lags the hook is no cause for a line.
+        assert!(
+            ticks[..n - 1].iter().all(Vec::is_empty),
+            "nothing before tick {n}"
+        );
+        assert_eq!(notices_in(&ticks[n - 1..n]).len(), 1, "said on tick {n}");
+    }
+
+    #[test]
+    fn a_hook_for_a_thread_that_is_not_a_listed_session_moves_nothing_and_is_said_once() {
+        // A sub-agent's thread may run the hook, with log rows naming the pane's
+        // pid; only the session list tells it from the pane's own.
+        let (store, state, app, handles, (_, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, false, Some(5));
+        let n = UNCONFIRMED_NOTICE_TICKS as usize;
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &the_log_ties(new), n + 10);
+
+        assert!(ticks.iter().all(|events| forked_events(events).is_empty()));
+        let notices = notices_in(&ticks);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("not a listed Codex session"),
+            "{notices:?}"
+        );
+        assert!(ticks[..n - 1].iter().all(Vec::is_empty));
+        assert_eq!(notices_in(&ticks[n - 1..n]).len(), 1);
+    }
+
+    #[test]
+    fn a_listed_session_that_is_not_a_codex_one_is_never_followed_onto() {
+        // The id the hook reported is listed, but as a Claude session: a Codex pane
+        // is not in it, whatever the log says.
+        let (store, state, _, handles, (_, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let app = App::new(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1-old", AgentKind::Codex),
+            test_row(new, AgentKind::ClaudeCode),
+        ]);
+        let n = UNCONFIRMED_NOTICE_TICKS as usize;
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &the_log_ties(new), n);
+
+        assert!(ticks.iter().all(|events| forked_events(events).is_empty()));
+        assert_eq!(notices_in(&ticks).len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_roster_does_not_reset_the_unconfirmed_count_or_say_the_notice_again() {
+        let (store, state, app, handles, _) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let whole = TickRead::read(&store, &claude_home, None);
+        let mut unread = TickRead::read(&store, &claude_home, None);
+        unread.brigades.as_mut().unwrap()[0].1 = None;
+        let mut watch = SessionMoveWatch::default();
+        let view = ProcessView {
+            probe: &SysinfoProbe,
+            alive: &|_| true,
+        };
+        let sources = MoveSources {
+            processes: &view,
+            owns_thread: &|_, _| false,
+        };
+        let mut notices = |read: &TickRead, ticks: u32| -> usize {
+            (0..ticks)
+                .map(|_| {
+                    let events = gather_session_moves(
+                        read, &state, &handles, &app, &mut watch, &sources, None,
+                    );
+                    notices_in(&[events]).len()
+                })
+                .sum()
+        };
+
+        // One unreadable tick amid the count does not restart it...
+        assert_eq!(notices(&whole, UNCONFIRMED_NOTICE_TICKS - 1), 0);
+        assert_eq!(notices(&unread, 1), 0);
+        assert_eq!(notices(&whole, 1), 1, "the count carried across the gap");
+        // ...and one after the notice does not make it be said again.
+        assert_eq!(notices(&unread, 1), 0);
+        assert_eq!(notices(&whole, 5), 0, "the latch carried across the gap");
+    }
+
+    #[test]
+    fn a_thread_the_log_ties_to_the_pane_late_is_followed_without_a_word() {
+        let (store, state, app, handles, (_, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let asked = std::cell::Cell::new(0);
+
+        let ticks = gather_move_ticks(
+            &state,
+            &store,
+            &handles,
+            &app,
+            &|thread, pid| {
+                asked.set(asked.get() + 1);
+                asked.get() > 2 && the_log_ties(new)(thread, pid)
+            },
+            5,
+        );
+
+        assert_eq!(forked_events(&ticks[3]).len(), 1, "{ticks:?}");
+        assert!(notices_in(&ticks).is_empty());
+    }
+
+    #[test]
+    fn a_codex_move_onto_a_session_another_members_row_holds_is_marked_for_the_core_to_refuse() {
+        let (store, mut state, mut app, handles, (old, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                brigade_id,
+                "worker-2",
+                BrigadeRole::Worker,
+                Some(&SessionId(new.to_string())),
+            )
+            .unwrap();
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &the_log_ties(new), 2);
+
+        let [
+            Event::MemberSessionForked {
+                held_by_row: true, ..
+            },
+        ] = ticks[1].as_slice()
+        else {
+            panic!("expected the move marked as held by a row: {:?}", ticks[1]);
+        };
+        let cmds = apply(&mut state, &mut app, ticks[1][0].clone());
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RekeyPty { .. } | Cmd::Store(_))),
+            "nothing renamed, nothing written: {cmds:?}"
+        );
+        assert!(state.screens.contains_key(&SessionKey::from_id(old)));
+        assert!(state.status.as_deref().unwrap().contains("already in use"));
+    }
+
+    #[test]
+    fn a_codex_move_onto_a_session_a_pane_hosts_is_refused_by_the_core() {
+        let (store, mut state, mut app, handles, (old, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        // The operator opened the thread in a pane of its own before the hook ran.
+        state
+            .screens
+            .insert(SessionKey::from_id(new), Screen::new(24, 80));
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &the_log_ties(new), 2);
+
+        let cmds = apply(&mut state, &mut app, ticks[1][0].clone());
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RekeyPty { .. } | Cmd::Store(_))),
+            "{cmds:?}"
+        );
+        assert!(state.screens.contains_key(&SessionKey::from_id(old)));
+        assert!(state.status.as_deref().unwrap().contains("already in use"));
+    }
+
+    #[test]
+    fn a_codex_move_the_core_refuses_does_not_ask_the_log_again_every_tick() {
+        let (store, state, app, handles, (_, new)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        store
+            .borrow_mut()
+            .add_brigade_member(
+                brigade_id,
+                "worker-2",
+                BrigadeRole::Worker,
+                Some(&SessionId(new.to_string())),
+            )
+            .unwrap();
+        let asked = std::cell::Cell::new(0);
+
+        let ticks = gather_move_ticks(
+            &state,
+            &store,
+            &handles,
+            &app,
+            &|thread, pid| {
+                asked.set(asked.get() + 1);
+                the_log_ties(new)(thread, pid)
+            },
+            8,
+        );
+
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            ticks
+                .iter()
+                .map(|events| forked_events(events).len())
+                .sum::<usize>(),
+            2,
+            "sent when believed and again after the resend interval, as for Claude"
+        );
+    }
+
+    #[test]
+    fn a_briefing_from_before_the_pane_was_spawned_is_not_a_move() {
+        // The column is never cleared: an earlier process's value stays.
+        let (store, state, app, handles, _) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(-60));
+
+        let ticks = gather_move_ticks(
+            &state,
+            &store,
+            &handles,
+            &app,
+            &|_, _| unreachable!("a stale briefing is never checked against the log"),
+            15,
+        );
+
+        assert!(ticks.iter().all(Vec::is_empty), "{ticks:?}");
+    }
+
+    #[test]
+    fn a_briefing_under_the_session_the_row_already_holds_is_not_a_move() {
+        let (store, state, app, handles, (old, _)) =
+            codex_member_that_ran_its_hook_under_another_thread(false, true, Some(5));
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        store
+            .borrow_mut()
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId(old.to_string()),
+                SystemTime::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+
+        let ticks = gather_move_ticks(
+            &state,
+            &store,
+            &handles,
+            &app,
+            &|_, _| unreachable!("nothing differs"),
+            4,
+        );
+
+        assert!(ticks.iter().all(Vec::is_empty), "{ticks:?}");
+    }
+
+    #[test]
+    fn a_claude_members_briefing_column_is_never_read_as_a_move() {
+        let (store, state, _app) = staged_worker("w1-old", Some(AgentKind::ClaudeCode));
+        let app = App::new(vec![
+            test_row("dir", AgentKind::ClaudeCode),
+            test_row("w1-old", AgentKind::ClaudeCode),
+            test_row("w1-new", AgentKind::Codex),
+        ]);
+        let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+        let host = MockPtyHost {
+            pid: Some(CODEX_PID),
+            ..Default::default()
+        };
+        let mut handles = HashMap::new();
+        handles.insert(SessionKey::from_id("w1-old"), open(&host));
+        store
+            .borrow_mut()
+            .record_briefing(
+                brigade_id,
+                "worker-1",
+                &SessionId("w1-new".to_string()),
+                SystemTime::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+
+        let ticks = gather_move_ticks(&state, &store, &handles, &app, &|_, _| true, 4);
+
+        assert!(ticks.iter().all(Vec::is_empty), "{ticks:?}");
     }
 
     #[test]
@@ -11644,7 +12327,20 @@ mod tests {
             alive: &|_| true,
         };
         (0..3)
-            .flat_map(|_| gather_session_moves(read, state, handles, app, &mut watch, &view, None))
+            .flat_map(|_| {
+                gather_session_moves(
+                    read,
+                    state,
+                    handles,
+                    app,
+                    &mut watch,
+                    &MoveSources {
+                        processes: &view,
+                        owns_thread: &|_, _| false,
+                    },
+                    None,
+                )
+            })
             .collect()
     }
 
@@ -11695,7 +12391,18 @@ mod tests {
         let mut notices = |read: &TickRead, ticks: u32| -> usize {
             (0..ticks)
                 .flat_map(|_| {
-                    gather_session_moves(read, &state, &handles, &app, &mut watch, &view, None)
+                    gather_session_moves(
+                        read,
+                        &state,
+                        &handles,
+                        &app,
+                        &mut watch,
+                        &MoveSources {
+                            processes: &view,
+                            owns_thread: &|_, _| false,
+                        },
+                        None,
+                    )
                 })
                 .filter(|event| matches!(event, Event::StartupNotices { .. }))
                 .count()

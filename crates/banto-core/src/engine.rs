@@ -4228,13 +4228,15 @@ pub enum Event {
         hidden: HashSet<String>,
         directors: HashSet<String>,
     },
-    /// A live brigade member's own process now reports a different Claude
-    /// session id than the one the store and the pane know it by: `/clear`,
-    /// `/branch` or an in-pane `/resume` moved it, still under the same pid, and
-    /// its `sessions/<pid>.json` live file names the new id. Auto-compaction
-    /// does not do this (2.1.318 and later compact in place, under the same
-    /// id). `old_id` is what the store/pane still know the member by; `new_id` is
-    /// what the process now reports. Gathered shell-side
+    /// A live brigade member's own process is now in a different session than
+    /// the one the store and the pane know it by: `/clear`, `/branch`, `/new` or
+    /// an in-pane `/resume` moved it, still under the same pid. For Claude its
+    /// `sessions/<pid>.json` live file names the new id; for Codex the id its
+    /// SessionStart hook last ran under does, once Codex's log database ties that
+    /// thread to the pane's process. Auto-compaction does not do this (Claude
+    /// 2.1.318 and later compact in place, under the same id). `old_id` is what
+    /// the store/pane still know the member by; `new_id` is what the process now
+    /// reports. Gathered shell-side
     /// (`emporium::gather_session_moves`) alongside the relay tick: once the
     /// disagreement has held for two ticks, and again every few ticks for as long
     /// as the process still reports the new id and the pane still has the old
@@ -9228,7 +9230,7 @@ fn refuse_move_onto_a_held_key(
     )
 }
 
-/// A live member's own process now reports another Claude session id (see
+/// A live member's own process now reports another session id (see
 /// [`Event::MemberSessionForked`]'s doc). The store write and the pane/screen
 /// rename go together: the pane is renamed whenever it is still alive, including
 /// while another brigade is displayed, and the store row follows. `focused` needs

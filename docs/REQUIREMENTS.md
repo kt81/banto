@@ -853,8 +853,53 @@ held for two consecutive ticks (a live file missing or torn for one tick while a
 `claude -p` runs must not rename the pane onto the nested session and back), and only from a
 live file whose process is alive, a dead file naming the pane's own key included. A tick that
 could not read every brigade's members names no move at all, member or solo: the missing
-brigade could be where the pane belongs or the row that holds the id. A Codex pane is never
-examined: the live file is Claude's.
+brigade could be where the pane belongs or the row that holds the id. A Codex pane has no
+live file, so none of this reads it; a Codex *member* is followed another way, next.
+
+**A hosted Codex member follows its pane to another thread, from what its hook recorded.**
+Codex switches thread inside one process, same pid, with `/new`, `/clear`, `/fork` and an
+in-pane `/resume` (measured on Codex 0.169.0, whose log database attributes the new thread
+to that pid). The SessionStart hook then fires once, at the next typed turn, with the new
+thread's `session_id`, and `banto _hook` records it in the member row's
+`briefed_session_id` and `briefed_at`. When that id is not the row's `session_id` and was
+recorded at or after the moment the pane's process was spawned (the column is never cleared,
+so an older value is a previous process's) the gather proposes the same `MemberSessionForked`
+as for Claude, through the same watch: believed after two ticks, sent again while the core
+refuses it, held ids refused as above (another member's row, a pane, an open in flight),
+nothing changed and the store unwritten. The hook's word alone is not proof, so two more
+things must be confirmed first: the newest row of the new thread in `logs_2.sqlite` names the
+pane's own child pid, with the start-time check that guards against a recycled pid
+(`codex_liveness::is_thread_owned_by`), and the new thread is a listed Codex session. The
+listing is the only guard against a sub-agent thread of the same process: such a thread may
+run the hook and its log rows would name the same pid, but neither has been observed (a
+read-only count on the development machine found eight recorded hook rows, none naming a
+sub-agent thread, while most of its threads were sub-agent threads). The guard rests on the
+provider recognising the sub-agent `source` shape, so a Codex release that changed that
+shape would let a pane be re-pointed onto a sub-agent's thread: the wrong identity, though
+never a double open. An unconfirmed change moves nothing and is told once per stretch, after
+thirty ticks, because neither the log row nor the reload that lists the new rollout has been
+timed against the hook and a notice about a thread that is confirmed seconds later would read
+as a verdict (`<member> of "<brigade>": Codex switched to session <id>, which banto cannot yet
+tie to this pane (it is not a listed Codex session | Codex's log does not show this pane's
+process writing it); not following it`); once it is confirmed the pane moves with no word.
+The count is kept across a tick that could not read the roster, so such a tick neither
+restarts it nor lets the notice be said twice. A move already admitted is not checked against the log
+again while the core refuses it. Which command switched the thread (`source`) is neither
+stored nor read; it is not needed to follow the pane.
+
+Consequences, none repaired by banto:
+- A brigade is named by its Director's current session title, so after a Director's `/new` it
+  is named by the new thread's title.
+- The old thread reads as running while the process lives, since its newest log row still
+  names that pid, so banto refuses to open it in another pane. That fails safe.
+- `/new` in a git working directory can put the new thread in a worktree, and staging takes
+  the Director row's cwd for fresh Workers and the Goinkyo, so those start in the new
+  thread's directory.
+- Between the command and the next typed turn nothing says the pane moved: the hook has not
+  fired. That gap is benign, since a nudge that arrives in it becomes the new thread's first
+  turn, which fires the hook.
+- **Not covered:** a solo Codex pane. No hook runs in it and it has no row to record the
+  change in, so it keeps the key of the thread it was opened on.
 
 Note: the format is undocumented and subject to change. Defend with **lenient
 parsing** (ignore unknown records/fields, skip broken lines) plus tests against
@@ -874,7 +919,7 @@ index; the behavior below is from banto's implementation unless marked observed.
 | `threads.cwd` | Carries a Windows extended-length path prefix (`\\?\`) that a rollout file's own recorded cwd does not — normalized once, in `provider::codex`, at the point this becomes `SessionMeta.cwd`. It is also the *resolved* path in the on-disk letter case (measured, Codex 0.169.0), so tying a freshly started pane to its thread compares the row's raw `cwd` column (the normalization above is for `SessionMeta.cwd` only; the comparison writes the verbatim prefixes plainly itself) with the **spellings of the spawn directory** (`file_identity::DirectorySpellings`: the typed spelling and its `canonicalize`d form, verbatim `\\?\` and `\\?\UNC\` written plainly, letter case ignored only on a volume probed to fold it), never with `==` and never by opening the reported path: the spellings are measured once, on the directory banto has just spawned in, and a reported path (a transcript cwd, a registry key) is only text, because opening one on a dead share blocked the UI for 21 s (measured). The Claude live file and transcript head are matched the same way — Claude records a symlink's target in the case typed — and so is the directory-trust key check. Not covered by spellings: a path only partly resolved, a bind mount or a hard-linked directory, a short (`PROGRA~1`) name; none has been seen reported |
 | `threads.updated_at_ms` | Milliseconds since the Unix epoch, application-reported by Codex — not a filesystem mtime the way Claude Code's is. `SessionMeta.mtime` says so |
 | `threads.source` | Who started the thread. Measured (Codex 0.147 and 0.166–0.167.1): an ordinary session is plain text — `cli`, or `exec` for `codex exec` — while Codex's own automatic-review sub-thread of a session (title `Guardian review`, model `codex-auto-review`, one appearing beside every launch or resume) is a JSON object in the same TEXT column, `{"subagent":{"other":"guardian"}}`. `provider::codex` **does not list** a row whose `source` parses as a JSON object with a `subagent` key — in both `discover` and `find_new_sessions`, so no list, no Worker discovery and no liveness decoration can take one for a session. Everything else stays listed: plain text of any value (including ones never seen), empty, an object without that key, unparsable text, a non-text value, text that is not valid UTF-8, and a schema with no `source` column at all — only a positively recognised sub-agent is hidden, since hiding a real session costs more than showing a stray thread. Decided by `source`, never by `threads.thread_source` (newer, nullable, its value for the same thread changed between those versions) and never by title. Anything banto keys by such a thread's id (pins, groups, archive marks) simply no longer matches a listed row |
-| `$CODEX_HOME/logs_2.sqlite`, `logs` table | Process liveness (the Codex-side double-resume guard, `codex_liveness::is_thread_alive`) and fresh solo Codex attribution during discovery. Real schema, read from a real, live `~/.codex/logs_2.sqlite` on this machine (2026-07-27): `id, ts, ts_nanos, level, target, thread_id, process_uuid, ...`, with `CREATE INDEX idx_logs_thread_id_ts ON logs(thread_id, ts DESC, ts_nanos DESC, id DESC)` — the newest row per `thread_id` is exactly what that index is for |
+| `$CODEX_HOME/logs_2.sqlite`, `logs` table | Process liveness (the Codex-side double-resume guard, `codex_liveness::is_thread_alive`), fresh solo Codex attribution during discovery, and the check that a Codex member's new thread is its pane's own (`codex_liveness::is_thread_owned_by`, under "A hosted Codex member follows its pane"). Real schema, read from a real, live `~/.codex/logs_2.sqlite` on this machine (2026-07-27): `id, ts, ts_nanos, level, target, thread_id, process_uuid, ...`, with `CREATE INDEX idx_logs_thread_id_ts ON logs(thread_id, ts DESC, ts_nanos DESC, id DESC)` — the newest row per `thread_id` is exactly what that index is for |
 | `logs.process_uuid` | `pid:<PID>:<suffix>`. Confirmed against that same real database: the newest row's pid for the session actually running matched a real, live process (cross-checked via `Win32_Process`); three finished sessions' newest rows named three dead pids |
 | `logs.ts` | Unix **seconds** (confirmed by comparing a real row's value against the current clock — not milliseconds, unlike `threads.updated_at_ms`). Compared against `sysinfo::Process::start_time()` (also unix seconds, and available on every platform `sysinfo` supports — unlike Claude's Linux/WSL-only `/proc` ticks comparison) for the pid-recycling guard: a process that started strictly after this log row was written cannot be the one that wrote it |
 
