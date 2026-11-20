@@ -7,6 +7,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::display_text::display_name;
+
 /// Opaque session identifier (a UUID string for Claude Code).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
@@ -276,12 +278,28 @@ impl SessionRow {
         format!("{title} {}", self.cwd_display())
     }
 
-    /// Title shown in the list, falling back to the session id.
-    pub fn display_title(&self) -> &str {
-        match self.title.as_deref() {
-            Some(title) if !title.is_empty() => title,
-            _ => &self.id,
-        }
+    /// The session's title, if it has one the operator could read: `None` when
+    /// nothing visible is left of it (empty, whitespace, only control or
+    /// invisible characters), the rule `EmporiumState::brigade_name` applies to
+    /// the same text. Not folded or sanitised — a caller that puts it on one
+    /// line still does that.
+    ///
+    /// A surface that draws the row shows [`NO_TITLE`] for `None`; a sentence
+    /// uses [`Self::sentence_name`]. The id is no title: a session `/clear` has
+    /// just moved a pane onto has none until its first message, and a UUID in
+    /// the title's place read as the session's name.
+    pub fn title(&self) -> Option<&str> {
+        self.title
+            .as_deref()
+            .filter(|title| display_name(title).is_some())
+    }
+
+    /// What a sentence calls the session: its title, else the first eight
+    /// characters of its id ([`short_id`]), which is enough to tell two apart
+    /// and short enough to sit in a status line.
+    pub fn sentence_name(&self) -> String {
+        self.title()
+            .map_or_else(|| short_id(&self.id), str::to_string)
     }
 
     /// cwd rendered as a string (empty when unknown).
@@ -292,6 +310,10 @@ impl SessionRow {
             .unwrap_or_default()
     }
 }
+
+/// What a surface that draws a session without a title shows in the title's
+/// place: the list row, the Details panel and `banto list`.
+pub const NO_TITLE: &str = "(no title)";
 
 /// Number of seconds in one hour.
 const SECS_PER_HOUR: u64 = 60 * 60;
@@ -689,12 +711,11 @@ mod tests {
         assert_eq!(row.haystack(), " ");
     }
 
-    #[test]
-    fn display_title_falls_back_to_id() {
-        let row = SessionRow {
-            id: "the-id".into(),
+    fn row_titled(id: &str, title: Option<&str>) -> SessionRow {
+        SessionRow {
+            id: id.into(),
             agent: AgentKind::ClaudeCode,
-            title: None,
+            title: title.map(str::to_string),
             cwd: None,
             dialog_open: false,
             activity: Activity::Alive,
@@ -704,8 +725,36 @@ mod tests {
             size: 0,
             source_archived: false,
             archived: false,
-        };
-        assert_eq!(row.display_title(), "the-id");
+        }
+    }
+
+    #[test]
+    fn a_title_is_only_a_title_when_something_visible_is_left_of_it() {
+        let id = "0123456789abcdef";
+        assert_eq!(row_titled(id, Some("Fix login")).title(), Some("Fix login"));
+        // Not folded or sanitised: the caller still does that.
+        assert_eq!(row_titled(id, Some(" a  b ")).title(), Some(" a  b "));
+        for none in [
+            None,
+            Some(""),
+            Some("   \n\t"),
+            Some("\u{1b}\u{7}"),
+            Some("\u{200b}\u{200d}"),
+        ] {
+            assert_eq!(row_titled(id, none).title(), None, "{none:?}");
+        }
+    }
+
+    #[test]
+    fn a_sentence_calls_an_untitled_session_by_the_start_of_its_id() {
+        let id = "0123456789abcdef-0123";
+        assert_eq!(
+            row_titled(id, Some("Fix login")).sentence_name(),
+            "Fix login"
+        );
+        assert_eq!(row_titled(id, None).sentence_name(), "01234567");
+        assert_eq!(row_titled(id, Some("  ")).sentence_name(), "01234567");
+        assert_eq!(row_titled("short", None).sentence_name(), "short");
     }
 
     #[test]

@@ -48,7 +48,7 @@ use banto_core::config::{AgentBinaries, BrigadeConfig, KeysConfig, ResolvedAgent
 use banto_core::engine::{
     self, Axis, BellCause, BrigadeNameFacts, ButtonKind, Cmd, EmporiumState, Event, Focus, Ghost,
     GoinkyoLook, GoinkyoRow, GroupJoinTargetData, LiveStatus, PrefixKey, RelayObservation,
-    SessionKey, SpawnRefusal, StoreIntent, decide_goinkyo,
+    SessionKey, SpawnRefusal, StoreIntent, brigade_label, decide_goinkyo,
 };
 #[cfg(test)]
 use banto_core::engine::{GoinkyoObservation, GoinkyoSpawnCandidate};
@@ -3288,10 +3288,11 @@ fn gather_session_moves(
                             if !entry.said && entry.ticks >= UNCONFIRMED_NOTICE_TICKS {
                                 entry.said = true;
                                 unconfirmed_notices.push(format!(
-                                    "{} of \"{}\": Codex switched to session {new_id}, \
+                                    "{} of {}: Codex switched to session {new_id}, \
                                      which banto cannot yet tie to this pane ({why}); \
                                      not following it",
-                                    member.token, brigade.name
+                                    member.token,
+                                    brigade_label(None, &brigade.name, brigade.id)
                                 ));
                             }
                             watch.unconfirmed.insert(old_key, entry);
@@ -11398,7 +11399,16 @@ mod tests {
         listed: bool,
         briefed_secs: Option<i64>,
     ) -> CodexMemberRig {
-        let (store, state, _) = staged_worker("w1-old", Some(AgentKind::Codex));
+        codex_member_in_brigade_named("cell", director, listed, briefed_secs)
+    }
+
+    fn codex_member_in_brigade_named(
+        brigade_name: &str,
+        director: bool,
+        listed: bool,
+        briefed_secs: Option<i64>,
+    ) -> CodexMemberRig {
+        let (store, state, _) = staged_worker_in("w1-old", Some(AgentKind::Codex), brigade_name);
         let (token, old, new) = if director {
             ("director", "dir", "dir-new")
         } else {
@@ -11570,6 +11580,30 @@ mod tests {
             "nothing before tick {n}"
         );
         assert_eq!(notices_in(&ticks[n - 1..n]).len(), 1, "said on tick {n}");
+    }
+
+    #[test]
+    fn the_unconfirmed_notice_calls_a_brigade_by_its_name_or_else_its_number_never_by_empty_quotes()
+    {
+        let n = UNCONFIRMED_NOTICE_TICKS as usize;
+        let said = |name: &str| {
+            let (store, state, app, handles, _) =
+                codex_member_in_brigade_named(name, false, true, Some(5));
+            let ticks = gather_move_ticks(&state, &store, &handles, &app, &|_, _| false, n + 1);
+            let brigade_id = store.borrow().list_brigades().unwrap()[0].id;
+            (notices_in(&ticks), brigade_id)
+        };
+
+        let (notices, _) = said("cell");
+        assert!(
+            notices[0].starts_with("worker-1 of \"cell\": "),
+            "{notices:?}"
+        );
+        let (notices, id) = said("");
+        assert!(
+            notices[0].starts_with(&format!("worker-1 of brigade {id}: ")),
+            "{notices:?}"
+        );
     }
 
     #[test]
@@ -12809,8 +12843,16 @@ mod tests {
         worker_session_id: &str,
         worker_agent: Option<AgentKind>,
     ) -> (RefCell<Store>, EmporiumState, App) {
+        staged_worker_in(worker_session_id, worker_agent, "cell")
+    }
+
+    fn staged_worker_in(
+        worker_session_id: &str,
+        worker_agent: Option<AgentKind>,
+        brigade_name: &str,
+    ) -> (RefCell<Store>, EmporiumState, App) {
         let mut store = Store::open_in_memory().unwrap();
-        let brigade_id = store.create_brigade("cell").unwrap();
+        let brigade_id = store.create_brigade(brigade_name).unwrap();
         store
             .add_brigade_member(
                 brigade_id,

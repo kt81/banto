@@ -2132,17 +2132,14 @@ impl EmporiumState {
         }
         let title = sessions.into_iter().find_map(|session| {
             app.row_for_id(session)
-                .and_then(|row| row.title.as_deref())
+                .and_then(SessionRow::title)
                 .and_then(display_name)
         });
-        match title.or_else(|| facts.and_then(|facts| display_name(&facts.name))) {
-            // An ASCII quote inside the name would end the outer quoting early.
-            Some(name) => format!(
-                "\"{}\"",
-                shorten_to_columns(&name.replace('"', "'"), BRIGADE_NAME_COLUMNS)
-            ),
-            None => format!("brigade {brigade_id}"),
-        }
+        brigade_label(
+            title.as_deref(),
+            facts.map_or("", |facts| facts.name.as_str()),
+            brigade_id,
+        )
     }
 
     /// Members as one phrase, grouped by brigade so each name is said once:
@@ -2825,15 +2822,16 @@ impl EmporiumState {
     /// (the row's id would be a uuid). Any other member is what its brigade calls
     /// it ([`Self::member_call`]'s rule without the quotes: its display name, else
     /// its token), since that is what the Director says and a Worker has no row in
-    /// the list. A pane that is no member is what the list shows for it: its
-    /// title, else its id; a placeholder not yet resolved to a session has
-    /// neither, so it is a "new session". Sanitised like every other name that
-    /// reaches the bar.
+    /// the list. A pane that is no member is called what any sentence calls its
+    /// session ([`SessionRow::sentence_name`]): its title, else the start of its
+    /// id, where the list shows `(no title)`; a placeholder not yet resolved to
+    /// a session has neither, so it is a "new session". Sanitised like every
+    /// other name that reaches the bar.
     fn quit_name(&self, app: &App, key: &SessionKey) -> String {
         let row = || app.row_for_id(key.as_str());
         let called = match self.member_tokens.get(key) {
             Some(token) if token == DIRECTOR_TOKEN => row()
-                .and_then(|row| row.title.as_deref())
+                .and_then(SessionRow::title)
                 .and_then(display_name)
                 .unwrap_or_else(|| token.clone()),
             Some(token) => self
@@ -2843,9 +2841,7 @@ impl EmporiumState {
                 .unwrap_or(token)
                 .to_string(),
             None if key.is_synthetic() => "new session".to_string(),
-            None => row()
-                .map_or(key.as_str(), |row| row.display_title())
-                .to_string(),
+            None => row().map_or_else(|| key.as_str().to_string(), SessionRow::sentence_name),
         };
         display_name(&called).unwrap_or_else(|| key.as_str().to_string())
     }
@@ -6065,7 +6061,7 @@ fn resolve_armed_prefix(
             };
             let title = app
                 .row_for_id(target.as_str())
-                .map(|row| row.display_title().to_string())
+                .map(SessionRow::sentence_name)
                 .unwrap_or_else(|| target.as_str().to_string());
             // Who confirming dismisses, if anyone. Role, not position: a pane of
             // a staged brigade is a member whose token core holds, and anything
@@ -6611,7 +6607,7 @@ fn update_membership_resolved(
         },
         PendingMembership::BrigadeKey => match membership {
             Some((brigade_id, _, BrigadeRole::Director)) => {
-                app.open_confirm_disband_modal(brigade_id, row.display_title().to_string());
+                app.open_confirm_disband_modal(brigade_id, row.sentence_name());
                 Vec::new()
             }
             Some((_, _, BrigadeRole::Worker)) => {
@@ -6645,10 +6641,7 @@ fn update_membership_resolved(
                 Vec::new()
             }
             None if state.screens.contains_key(&SessionKey::from_id(&row.id)) => {
-                app.open_confirm_director_reopen_modal(
-                    row.id.clone(),
-                    row.display_title().to_string(),
-                );
+                app.open_confirm_director_reopen_modal(row.id.clone(), row.sentence_name());
                 Vec::new()
             }
             None => begin_brigade_formation(state, app, brigade, &row),
@@ -6692,7 +6685,7 @@ fn begin_brigade_formation(
         state.pending_brigade_formation = Some(PendingBrigadeFormation {
             director_row_id: row.id.clone(),
             director_agent: row.agent,
-            name: row.display_title().to_string(),
+            name: formation_name(row),
             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             worker_count: brigade.worker_count(),
         });
@@ -6716,7 +6709,7 @@ fn begin_brigade_formation(
         state.pending_codex_trust_formation = Some(PendingCodexTrustFormation {
             director_row_id: row.id.clone(),
             director_agent: row.agent,
-            name: row.display_title().to_string(),
+            name: formation_name(row),
             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             worker_count: brigade.worker_count(),
             worker_agent,
@@ -6728,13 +6721,23 @@ fn begin_brigade_formation(
     vec![Cmd::Store(StoreIntent::FormBrigade {
         director_row_id: row.id.clone(),
         director_agent: row.agent,
-        name: row.display_title().to_string(),
+        name: formation_name(row),
         cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
         worker_count: brigade.worker_count(),
         worker_agent,
         worker_model,
         worker_effort,
     })]
+}
+
+/// The name a brigade is stored under when it is formed on `row`: the row's
+/// title, or an empty string when it has none. An empty name is how "no name"
+/// is kept — [`EmporiumState::brigade_name`] counts it as absent and falls
+/// through to `brigade N` — whereas the row's id, which this used to freeze
+/// when the Director had no title yet, was stored as the brigade's name for
+/// good and said to the operator as a UUID.
+fn formation_name(row: &SessionRow) -> String {
+    row.title().unwrap_or_default().to_string()
 }
 
 /// Answers `Cmd::CheckCodexTrust`, always following a
@@ -6888,7 +6891,7 @@ fn open_solo(state: &mut EmporiumState, row: &SessionRow) -> Vec<Cmd> {
         target: SessionToOpen {
             id: row.id.clone(),
             agent: row.agent,
-            title: row.display_title().to_string(),
+            title: row.sentence_name(),
             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
         },
         brigade: None,
@@ -7220,7 +7223,7 @@ fn stage_brigade(
                         target: SessionToOpen {
                             id: row.id.clone(),
                             agent: row.agent,
-                            title: row.display_title().to_string(),
+                            title: row.sentence_name(),
                             cwd: row.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
                         },
                         brigade: Some((brigade_id, token.clone(), *role)),
@@ -8844,7 +8847,7 @@ fn relaunch_member(
         target: SessionToOpen {
             id: row.id.clone(),
             agent: row.agent,
-            title: row.display_title().to_string(),
+            title: row.sentence_name(),
             cwd,
         },
         brigade: Some((brigade_id, token, BrigadeRole::Worker)),
@@ -8874,7 +8877,7 @@ fn unarchive_selected(state: &mut EmporiumState, app: &mut App, now: Instant) ->
         return Vec::new();
     }
     let id = row.id.clone();
-    let title = row.display_title().to_string();
+    let title = row.sentence_name();
     vec![Cmd::Store(StoreIntent::Unarchive { id, title })]
 }
 
@@ -8938,7 +8941,7 @@ fn update_pty_exited(
     }
     let title = app
         .row_for_id(key.as_str())
-        .map(|row| row.display_title().to_string())
+        .map(SessionRow::sentence_name)
         .unwrap_or_else(|| key.as_str().to_string());
     let mut status = match reason {
         Some(reason) => format!("session ended: {title} — {}", reason.describe()),
@@ -8995,7 +8998,7 @@ fn update_pty_output_lost(
         (Some(brigade_id), Some(token)) => state.member_call(Some(*brigade_id), token),
         _ => app
             .row_for_id(key.as_str())
-            .map(|row| row.display_title().to_string())
+            .map(SessionRow::sentence_name)
             .unwrap_or_else(|| key.as_str().to_string()),
     };
     let is_member = state.member_tokens.contains_key(&key);
@@ -9445,10 +9448,32 @@ fn update_brigade_formed(
         open_director_with_wiring(state, app, wiring)
     };
     state.set_status(
-        format!("brigade formed — director: {name}, {worker_count} worker(s) spawned"),
+        format!(
+            "brigade formed — {}, {worker_count} worker(s) spawned",
+            state.brigade_name(app, brigade_id)
+        ),
         now,
     );
     cmds
+}
+
+/// How a sentence calls a brigade, given what is known of its name: the
+/// Director's title if there is one, else the name stored when it was formed,
+/// else its number. Public so the shell, which holds a brigade's stored name
+/// but no [`EmporiumState`], says the same thing as [`EmporiumState::brigade_name`]
+/// rather than quoting an empty name.
+pub fn brigade_label(title: Option<&str>, stored_name: &str, brigade_id: BrigadeId) -> String {
+    match title
+        .and_then(display_name)
+        .or_else(|| display_name(stored_name))
+    {
+        // An ASCII quote inside the name would end the outer quoting early.
+        Some(name) => format!(
+            "\"{}\"",
+            shorten_to_columns(&name.replace('"', "'"), BRIGADE_NAME_COLUMNS)
+        ),
+        None => format!("brigade {brigade_id}"),
+    }
 }
 
 /// Open the Director wired (MCP config / Codex `-c` overrides — see
@@ -9493,7 +9518,7 @@ fn open_director_with_wiring(
         target: SessionToOpen {
             id: director_row_id,
             agent: row.agent,
-            title: row.display_title().to_string(),
+            title: row.sentence_name(),
             cwd,
         },
         brigade: Some((
@@ -9775,7 +9800,7 @@ fn update_worker_dismissed(
             );
             let title = app
                 .row_for_id(key.as_str())
-                .map(|row| row.display_title().to_string())
+                .map(SessionRow::sentence_name)
                 .unwrap_or_else(|| key.as_str().to_string());
             state.set_status(format!("{title} dismissed from the brigade"), now);
             if staged {
@@ -11180,6 +11205,8 @@ mod launch_choice_tests;
 mod newline_integration_tests;
 #[cfg(test)]
 mod small_tile_tests;
+#[cfg(test)]
+mod untitled_session_tests;
 
 #[cfg(test)]
 mod tests {

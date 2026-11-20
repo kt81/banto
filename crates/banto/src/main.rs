@@ -58,7 +58,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use banto_core::model::{AgentKind, BrigadeRole};
+use banto_core::model::{AgentKind, BrigadeRole, NO_TITLE};
 use banto_core::status::AgeThresholds;
 use banto_io::agent_versions::{
     read_claude_last_auto_update, read_codex_current_version, read_codex_release_history,
@@ -345,7 +345,7 @@ fn run_list(
     let rows = load_rows(claude_home, codex_home, thresholds, enabled_agents)
         .context("failed to read sessions")?;
     for row in &rows {
-        let title = row.title.as_deref().unwrap_or("(no title)");
+        let title = row.title().unwrap_or(NO_TITLE);
         let cwd = row
             .cwd
             .as_ref()

@@ -237,7 +237,17 @@ fn row_line(
     let age_str = model::humanize_age_compact(visible.row.mtime, now);
     let age_width = age_str.width();
 
-    let title_full = visible.row.display_title().to_string();
+    // No id stands in for a missing title: the Details panel's meta line has the
+    // short id, and a UUID where a name goes read as the session's name. The
+    // placeholder is dimmed like the age and cwd it sits beside, which stay
+    // readable on the reversed selected row.
+    let (title_full, title_style) = match visible.row.title() {
+        Some(title) => (title.to_string(), Style::default()),
+        None => (
+            model::NO_TITLE.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
 
     let max_left_content = area_width.saturating_sub(prefix_width + MIN_GAP_BEFORE_AGE + age_width);
 
@@ -247,14 +257,14 @@ fn row_line(
         // prefix, and give the title whatever's left after the prefix.
         let title_budget = area_width.saturating_sub(prefix_width);
         let title = truncate_to_width(&title_full, title_budget as u16);
-        prefix.push(Span::raw(title));
+        prefix.push(Span::styled(title, title_style));
         return Line::from(prefix);
     }
 
     let title = truncate_to_width(&title_full, max_left_content as u16);
     let used_width = prefix_width + title.width();
     let mut spans = prefix;
-    spans.push(Span::raw(title));
+    spans.push(Span::styled(title, title_style));
 
     // Age, right-flush at the row's literal right edge. `used_width` is
     // bounded (by construction of `max_left_content` and the truncation
@@ -389,10 +399,13 @@ pub fn render_summary(frame: &mut Frame, app: &App, area: Rect, now: SystemTime)
     } else if row.is_agent {
         title_spans.push(Span::raw(format!("{AGENT_EMOJI} ")));
     }
-    title_spans.push(Span::styled(
-        row.display_title().to_string(),
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
+    title_spans.push(match row.title() {
+        Some(title) => Span::styled(
+            title.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(model::NO_TITLE, Style::default().fg(Color::DarkGray)),
+    });
     let title_line = Line::from(title_spans);
 
     let preview_line = Line::from(Span::styled(
@@ -886,6 +899,58 @@ mod tests {
         let line = text.lines().find(|l| l.contains("Both Row")).unwrap();
         assert!(line.contains(DIRECTOR_EMOJI));
         assert!(!line.contains(AGENT_EMOJI));
+    }
+
+    const UNTITLED_ID: &str = "0123456789abcdef-0123-4567";
+
+    #[test]
+    fn an_untitled_row_reads_no_title_in_the_dim_colour_and_shows_no_id() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut app = App::new(vec![
+            row(UNTITLED_ID, "", "/work", now),
+            row("other-id-1234", "Titled", "/work", now),
+        ]);
+        app.set_viewport_height(10);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, &app, frame.area(), now))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buffer_text(buf);
+        assert!(text.contains(model::NO_TITLE), "{text}");
+        assert!(!text.contains("01234567"), "no part of the id: {text}");
+        // The first row is the selected, reversed one; its placeholder keeps the
+        // dim foreground the age and cwd lines already wear there.
+        let at = (0..buf.area.width)
+            .find(|&x| buf.cell((x, 0)).unwrap().symbol() == "(")
+            .expect("the placeholder is on the first row");
+        let cell = buf.cell((at, 0)).unwrap();
+        assert_eq!(cell.fg, Color::DarkGray);
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+        // A titled row is drawn as before: no dimming of its title.
+        let at = (0..buf.area.width)
+            .find(|&x| buf.cell((x, 2)).unwrap().symbol() == "T")
+            .expect("the titled row is the third line");
+        assert_eq!(buf.cell((at, 2)).unwrap().fg, Color::Reset);
+    }
+
+    #[test]
+    fn the_details_title_of_an_untitled_session_reads_no_title_and_its_meta_line_has_the_short_id()
+    {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut app = App::new(vec![row(UNTITLED_ID, "", "/work", now)]);
+        app.set_viewport_height(10);
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        terminal
+            .draw(|frame| render_summary(frame, &app, frame.area(), now))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains(model::NO_TITLE), "{text}");
+        assert!(!lines[1].contains("01234567"), "{text}");
+        assert!(lines[4].contains("01234567"), "{text}");
+        assert!(!text.contains(UNTITLED_ID), "{text}");
     }
 
     #[test]

@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn display_title_falls_back_to_id() {
+    fn an_untitled_row_has_no_title_and_is_called_by_its_id() {
         let row = SessionRow {
             id: "the-id".into(),
             agent: AgentKind::ClaudeCode,
@@ -539,7 +539,8 @@ mod tests {
             source_archived: false,
             archived: false,
         };
-        assert_eq!(row.display_title(), "the-id");
+        assert_eq!(row.title(), None);
+        assert_eq!(row.sentence_name(), "the-id");
     }
 
     #[test]
@@ -879,7 +880,7 @@ mod tests {
 
         let claude_home = ClaudeHome::new(dir.path().to_path_buf());
         let rows = load_rows(&claude_home, None, &AgeThresholds::default(), &all_agents()).unwrap();
-        let titles: Vec<_> = rows.iter().map(|r| r.display_title().to_string()).collect();
+        let titles: Vec<_> = rows.iter().map(SessionRow::sentence_name).collect();
         assert_eq!(titles, vec!["New".to_string(), "Old".to_string()]);
     }
 

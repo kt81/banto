@@ -1148,7 +1148,7 @@ impl App {
         if let Some(row) = self.selected_row() {
             self.modal = Some(Modal::ConfirmArchive {
                 session_id: row.id.clone(),
-                title: row.display_title().to_string(),
+                title: row.sentence_name(),
             });
         }
     }
@@ -4254,6 +4254,19 @@ mod tests {
         };
         assert_eq!(session_id, "a");
         assert_eq!(title, "Alpha");
+    }
+
+    #[test]
+    fn the_archive_prompt_calls_an_untitled_session_by_the_start_of_its_id() {
+        let mut app = App::new(vec![row("0123456789abcdef-0123-4567", "", "")]);
+        app.set_viewport_height(10);
+
+        app.open_confirm_archive_modal();
+
+        let Some(Modal::ConfirmArchive { title, .. }) = app.modal() else {
+            panic!("expected an open archive-confirm modal");
+        };
+        assert_eq!(title, "01234567");
     }
 
     #[test]

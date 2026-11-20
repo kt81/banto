@@ -966,7 +966,9 @@ For a legacy row (including a missing or unrecognized `history_mode`), a
 nonblank `threads.title` distinct from the trimmed first user message wins;
 otherwise an indexed name wins, followed by the original database title. For
 `paginated`, banto uses the trimmed nonblank `threads.name`, then the trimmed
-nonblank first user message, then the session id if neither exists; it does not
+nonblank first user message, and the session has no title if neither exists (the
+list then shows `(no title)`, never the id; a sentence that must say which session
+it means uses the first eight characters of the id); it does not
 use an older title or index name. The first-message fallback is banto's display
 choice. An unreadable or absent index leaves the other fallbacks in use, and a
 read error partway through leaves the names already read in use. The mode-based
@@ -1755,8 +1757,8 @@ read of it, or it is on a dialog), `input` (given work within the last 3 seconds
 background. The order is unknown first, because no tile marks an unknown pane, then
 input, busy and background, each group by name. A Director is named by its list
 row's title, else its token; a Worker or Goinkyo by its display name, else its
-token; any other pane as the list shows it (a placeholder not yet resolved to a
-session reads `new session`). A name is cut to 11 columns, with a `#…` suffix when
+token; any other pane by its session's title, else the first eight characters of
+its id (a placeholder not yet resolved to a session reads `new session`). A name is cut to 11 columns, with a `#…` suffix when
 two would read the same. The shell gathers the answers about once a second, just ahead
 of the tick, from reads the tick already makes, and hands it to the core as
 `Event::QuiescenceSampled`, which replaces the previous sample as a whole; the core
@@ -3613,7 +3615,9 @@ first — control characters, escape sequences and invisible format characters
 line of at most 28 display columns (an ellipsis when cut, never between a letter
 and its combining mark or inside a flag); when the Director's
 session is not known or has no title, the title the brigade was formed under is
-used, and only when neither exists the number (`worker-2 of brigade 7`). Members
+used (empty when the Director's row had none then, which is stored as an empty
+name, never the row's id), and only when neither exists the number
+(`worker-2 of brigade 7`). Members
 of several brigades are grouped so each name is said once (`worker-1, worker-3 of
 "A" and worker-2 of "B"`). The brigade number is an identifier for agents and for
 banto's own plumbing; the operator is never shown it where a title is known.
