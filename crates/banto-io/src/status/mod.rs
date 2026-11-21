@@ -112,11 +112,12 @@ fn on_a_dialog(entry: &LiveSession) -> bool {
         && entry.waiting_for.as_deref() == Some(LIVE_WAITING_FOR_DIALOG_OPEN)
 }
 
-/// Whether the session `session_id` is `waiting` only because a dialog is open:
-/// it has a live process, nothing busy, at least one `waiting` entry, and every
-/// `waiting` entry says exactly [`LIVE_WAITING_FOR_DIALOG_OPEN`]. The list still
-/// calls such a session Waiting ([`classify`]); this is what lets the bell tell it
-/// apart, and nothing else.
+/// Whether the session `session_id` is `waiting` only because a dialog is open
+/// (`alive_pids` as in [`classify_from_alive_pids`]): it has a live process,
+/// nothing busy, at least one `waiting` entry, and every `waiting` entry says
+/// exactly [`LIVE_WAITING_FOR_DIALOG_OPEN`]. The list still calls such a session
+/// Waiting ([`classify`]); this is what lets the bell tell it apart, and nothing
+/// else.
 pub fn waiting_on_a_dialog(
     live: &[LiveSession],
     session_id: &str,
@@ -140,6 +141,24 @@ pub fn waiting_on_a_dialog(
     waiting
 }
 
+/// Whether the process a live-state file names is still the one that wrote it.
+///
+/// When the entry records `procStart`, the process must be alive **and** provably
+/// the same one ([`ProcessProbe::is_alive_matching`]); without it, alive is all
+/// there is to ask. The distinction matters for a leftover: Claude Code never
+/// sweeps the `<pid>.json` of a process that died without getting to, and the
+/// pid is later handed to an unrelated process, which a bare liveness check takes
+/// for the session still running. One definition for a point query, shared by
+/// the double-resume guard (`launch::is_live`) and the `brigade_status` reading;
+/// [`SysinfoProbe::alive_live_pids`] decides the same thing for every entry at
+/// once, and its answer is what the readers below take.
+pub fn entry_is_alive(entry: &LiveSession, probe: &dyn ProcessProbe) -> bool {
+    match &entry.proc_start {
+        Some(proc_start) => probe.is_alive_matching(entry.pid, proc_start),
+        None => probe.is_alive(entry.pid),
+    }
+}
+
 /// Whether the relay may treat the Claude session `session_id` as idle enough to
 /// nudge: `None` when no live entry names it, else `Some(true)` when at least one
 /// entry naming it has a live process and none of those is busy or waiting.
@@ -154,6 +173,10 @@ pub fn waiting_on_a_dialog(
 /// among the live ones busy or waiting anywhere wins, as in [`live_activity`]. An
 /// entry whose process is dead is only ever the answer when it is the only kind
 /// there is (`Some(false)`: a dead process is not idle).
+///
+/// `alive_pids` is [`SysinfoProbe::alive_live_pids`]'s answer, which leaves out a
+/// leftover whose pid was recycled by an unrelated process: one saying `busy`
+/// that stayed in would stop the relay for good.
 ///
 /// A `waiting` session is not idle for the relay whatever it is waiting for,
 /// `"dialog open"` included: a nudge is typed text and an Enter, and typed into
@@ -188,7 +211,8 @@ pub fn claude_nudgeable(
 }
 
 /// Whether the Claude session `session_id` is known to be idle, from the live
-/// files in `live` and the set of PIDs that are alive.
+/// files in `live` and the pids whose process is alive (`alive_pids` as in
+/// [`classify_from_alive_pids`]).
 ///
 /// `Idle` only when a live entry for the session has a live PID and every such
 /// entry reports `"idle"` — the other values (`busy`, `waiting`, `shell`, an
@@ -271,17 +295,20 @@ pub fn classify(
     let alive_pids = live
         .iter()
         .filter(|entry| entry.session_id.as_deref() == Some(meta.id.0.as_str()))
-        .filter(|entry| probe.is_alive(entry.pid))
+        .filter(|entry| entry_is_alive(entry, probe))
         .map(|entry| entry.pid)
         .collect();
     classify_from_alive_pids(meta, live, &alive_pids, now, thresholds)
 }
 
-/// The one activity decision, supplied with a snapshot of alive PIDs.
+/// The one activity decision, supplied with the pids whose process is alive.
 ///
 /// The set is taken rather than probed here so one list pass can obtain it
-/// through a single batched system refresh.  [`classify`] is the point-query
-/// compatibility shim for existing callers and mocks.
+/// through a single batched system refresh: [`SysinfoProbe::alive_live_pids`],
+/// which leaves out a leftover file whose pid was recycled by an unrelated
+/// process, so one that says `busy` cannot make a session look busy.
+/// [`classify`] is the point-query compatibility shim for existing callers and
+/// mocks.
 pub fn classify_from_alive_pids(
     meta: &SessionMeta,
     live: &[LiveSession],
@@ -293,8 +320,9 @@ pub fn classify_from_alive_pids(
         .unwrap_or_else(|| Activity::Idle(age_bucket(meta.mtime, now, thresholds)))
 }
 
-/// What the live files say a session is doing now, or `None` when no live entry
-/// with a running process names it. The whole of the list's classification but
+/// What the live files say a session is doing now (`alive_pids` as in
+/// [`classify_from_alive_pids`]), or `None` when no live entry with a running
+/// process names it. The whole of the list's classification but
 /// its fallback to the session file's age, and so the one decision for anything
 /// that shows a session's state without a list row (a member that has not run its
 /// first turn has no transcript, hence no row, but does have a live file).
@@ -357,12 +385,25 @@ mod tests {
     /// Mock probe reporting only an explicit set of PIDs as alive.
     struct MockProbe {
         alive: HashSet<u32>,
+        /// Alive pids that now belong to an unrelated process: `is_alive_matching`
+        /// is `false` for them whatever `proc_start` it is given.
+        recycled: HashSet<u32>,
     }
 
     impl MockProbe {
         fn with_alive(pids: &[u32]) -> Self {
             Self {
                 alive: pids.iter().copied().collect(),
+                recycled: HashSet::new(),
+            }
+        }
+
+        /// `alive` pids are all running; those also in `recycled` are running
+        /// as somebody else.
+        fn with_recycled(alive: &[u32], recycled: &[u32]) -> Self {
+            Self {
+                recycled: recycled.iter().copied().collect(),
+                ..Self::with_alive(alive)
             }
         }
     }
@@ -377,7 +418,7 @@ mod tests {
         }
 
         fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
-            self.is_alive(pid)
+            self.is_alive(pid) && !self.recycled.contains(&pid)
         }
     }
 
@@ -918,6 +959,146 @@ mod tests {
     fn nudgeable_of(live: &[LiveSession], alive: &[u32]) -> Option<bool> {
         let alive: HashSet<u32> = alive.iter().copied().collect();
         claude_nudgeable(live, SESSION_ID, &alive)
+    }
+
+    /// A live file as Claude Code writes it, with the start time it recorded.
+    fn started(pid: u32, status: &str, proc_start: Option<&str>) -> LiveSession {
+        LiveSession {
+            proc_start: proc_start.map(str::to_string),
+            ..live_entry(pid, Some(SESSION_ID), Some(status))
+        }
+    }
+
+    /// The alive set built the way the real one is, with `probe` standing in for
+    /// the operating system: an entry that recorded its start is settled by
+    /// `is_alive_matching`, the rest go to the one batch of liveness.
+    fn alive_set(live: &[LiveSession], probe: &MockProbe) -> HashSet<u32> {
+        probe::alive_from_entries(
+            live,
+            |pid, start| Some(probe.is_alive_matching(pid, start)),
+            |pids| {
+                pids.into_iter()
+                    .filter(|pid| probe.is_alive(*pid))
+                    .collect()
+            },
+        )
+    }
+
+    #[test]
+    fn an_entry_is_alive_when_its_process_is_the_one_that_wrote_it() {
+        let probe = MockProbe::with_recycled(&[100, 200], &[200]);
+        assert!(entry_is_alive(&started(100, "idle", Some("1")), &probe));
+        assert!(
+            !entry_is_alive(&started(200, "idle", Some("1")), &probe),
+            "the pid is running, as somebody else"
+        );
+        assert!(!entry_is_alive(&started(300, "idle", Some("1")), &probe));
+        // Without a recorded start only the pid can be asked, so a recycled one
+        // cannot be told apart; the check is no weaker than it was.
+        assert!(entry_is_alive(&started(200, "idle", None), &probe));
+        assert!(!entry_is_alive(&started(300, "idle", None), &probe));
+    }
+
+    #[test]
+    fn the_alive_set_leaves_out_a_recycled_pid_and_a_dead_one_and_keeps_the_rest() {
+        let probe = MockProbe::with_recycled(&[100, 200, 400], &[100]);
+        let live = [
+            started(100, "busy", Some("1")),
+            started(200, "idle", Some("2")),
+            started(300, "idle", Some("3")),
+            // No recorded start: counted by pid, recycled or not.
+            started(400, "idle", None),
+        ];
+        let set = alive_set(&live, &probe);
+        assert_eq!(set, [200, 400].into_iter().collect::<HashSet<u32>>());
+    }
+
+    #[test]
+    fn a_non_idle_leftover_on_a_recycled_pid_is_not_what_any_reader_says_of_the_session() {
+        let recycled = MockProbe::with_recycled(&[100, 200], &[100]);
+        // The control: the same files with pid 100 the session's own process.
+        let own = MockProbe::with_alive(&[100, 200]);
+        let thresholds = AgeThresholds::default();
+        let meta = meta_with_age(Duration::from_secs(60));
+        for status in ["busy", "waiting", "shell"] {
+            // What the session's file says when it is not its own process any
+            // more, beside the file of the session as it runs (idle, pid 200).
+            let mut stale = started(100, status, Some("1"));
+            if status == "waiting" {
+                stale.waiting_for = Some(LIVE_WAITING_FOR_DIALOG_OPEN.to_string());
+            }
+            let current = started(200, "idle", Some("2"));
+            // `read_dir` promises no order.
+            for live in [
+                [stale.clone(), current.clone()],
+                [current.clone(), stale.clone()],
+            ] {
+                let alive = alive_set(&live, &recycled);
+                let held = alive_set(&live, &own);
+                let ctx = format!("{status}, first file pid {}", live[0].pid);
+
+                assert_eq!(
+                    claude_nudgeable(&live, SESSION_ID, &alive),
+                    Some(true),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    claude_quiescence(&live, SESSION_ID, &alive),
+                    Quiescence::Idle,
+                    "{ctx}"
+                );
+                assert_eq!(
+                    live_activity(&live, SESSION_ID, &alive),
+                    Some(Activity::Alive),
+                    "{ctx}"
+                );
+                assert!(!waiting_on_a_dialog(&live, SESSION_ID, &alive), "{ctx}");
+                assert_eq!(
+                    classify_from_alive_pids(&meta, &live, &alive, fixed_now(), &thresholds),
+                    Activity::Alive,
+                    "{ctx}"
+                );
+
+                // With the pid the session's own, every reader says what the
+                // leftover says, so the answers above are the recycling's doing.
+                let (nudge, quiet, activity) = match status {
+                    "shell" => (Some(true), Quiescence::Background, Activity::Busy),
+                    "busy" => (Some(false), Quiescence::NotIdle, Activity::Busy),
+                    // A dialog proves neither idle nor busy (`claude_quiescence`).
+                    _ => (Some(false), Quiescence::Unknown, Activity::Waiting),
+                };
+                assert_eq!(claude_nudgeable(&live, SESSION_ID, &held), nudge, "{ctx}");
+                assert_eq!(claude_quiescence(&live, SESSION_ID, &held), quiet, "{ctx}");
+                assert_eq!(
+                    live_activity(&live, SESSION_ID, &held),
+                    Some(activity),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    waiting_on_a_dialog(&live, SESSION_ID, &held),
+                    status == "waiting",
+                    "{ctx}"
+                );
+                assert_eq!(
+                    classify_from_alive_pids(&meta, &live, &held, fixed_now(), &thresholds),
+                    activity,
+                    "{ctx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_recycled_pid_alone_is_a_dead_session_and_a_dead_session_is_not_idle() {
+        let probe = MockProbe::with_recycled(&[100], &[100]);
+        let live = [started(100, "idle", Some("1"))];
+        let alive = alive_set(&live, &probe);
+        assert_eq!(claude_nudgeable(&live, SESSION_ID, &alive), Some(false));
+        assert_eq!(
+            claude_quiescence(&live, SESSION_ID, &alive),
+            Quiescence::Unknown
+        );
+        assert_eq!(live_activity(&live, SESSION_ID, &alive), None);
     }
 
     #[test]

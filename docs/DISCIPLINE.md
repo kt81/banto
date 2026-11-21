@@ -357,7 +357,7 @@ every Codex brigade member, and the "is it idle?" sample for the quit question
 and the brigade bell (`Event::QuiescenceSampled`) now reads them for every other
 hosted Codex pane too — one sqlite lookup and one rollout tail per such pane per
 tick. A hosted Claude pane adds no read of its own: the live-file scan and the
-process snapshot are shared with the relay.
+liveness pass are shared with the relay.
 Codex discovery also reads the full `session_index.jsonl` name index on each
 reload; individual lines are bounded, but total scan time and retained names
 grow with the index ("Codex data sources" in `docs/REQUIREMENTS.md`).

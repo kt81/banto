@@ -13,7 +13,7 @@ use banto_core::config::AgentBinaries;
 use banto_core::model::{AgentKind, BrigadeRole, SessionToOpen};
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{self, ProcessStartTime};
-use banto_io::status::{LiveSession, ProcessProbe};
+use banto_io::status::{LiveSession, ProcessProbe, entry_is_alive};
 
 /// Read-only inputs an open/resume decision needs beyond the session itself
 /// — bundled once `open_session`'s own argument list hit clippy's
@@ -48,7 +48,8 @@ pub struct OpenContext<'a> {
 /// For Claude, when `entry` carries a `proc_start` (Claude Code's own
 /// record of its process's kernel start time), liveness is checked via
 /// [`ProcessProbe::is_alive_matching`] instead of a bare
-/// [`ProcessProbe::is_alive`] — so a pid recycled by an unrelated process
+/// [`ProcessProbe::is_alive`] ([`entry_is_alive`], which the relay's own
+/// readings share) — so a pid recycled by an unrelated process
 /// since the live-state file was written is not mistaken for the original
 /// session still running, which would otherwise block a resume forever with
 /// no self-heal (see that method's doc comment).
@@ -61,10 +62,7 @@ pub(crate) fn is_live(session: &SessionToOpen, ctx: &OpenContext) -> bool {
     match session.agent {
         AgentKind::ClaudeCode => ctx.live.iter().any(|entry| {
             entry.session_id.as_deref() == Some(session.id.as_str())
-                && match &entry.proc_start {
-                    Some(proc_start) => ctx.probe.is_alive_matching(entry.pid, proc_start),
-                    None => ctx.probe.is_alive(entry.pid),
-                }
+                && entry_is_alive(entry, ctx.probe)
         }),
         AgentKind::Codex => ctx.codex_home.is_some_and(|codex_home| {
             codex_liveness::is_thread_alive(codex_home, &session.id, ctx.start_time)

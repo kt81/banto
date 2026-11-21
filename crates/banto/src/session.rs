@@ -263,10 +263,14 @@ pub fn discover_all(
     Ok(metas)
 }
 
-/// The Claude display/activity seam for policy that cannot enter
-/// [`SysinfoProbe::alive_pids`]'s shared open/resume path.
-pub(crate) fn alive_claude_pids(pids: impl IntoIterator<Item = u32>) -> HashSet<u32> {
-    SysinfoProbe::alive_pids(pids)
+/// The pids of `live` whose process is still the session that wrote its file:
+/// what the list, the quit question, the brigade watch and the relay all read as
+/// "this Claude session is running". A file left by a process that died, whose
+/// pid has since gone to an unrelated one, is not among them
+/// ([`SysinfoProbe::alive_live_pids`]). The seam for display and activity policy;
+/// the open/resume guard asks `status::entry_is_alive` per entry instead.
+pub(crate) fn alive_claude_pids(live: &[banto_io::status::LiveSession]) -> HashSet<u32> {
+    SysinfoProbe::alive_live_pids(live)
 }
 
 /// The conversion half of [`load_rows`] — classify and sort already-
@@ -301,7 +305,7 @@ pub fn rows_from_metas(
                 .map(|meta| meta.id.0.clone()),
         )
     });
-    let live_claude = alive_claude_pids(live.iter().map(|entry| entry.pid));
+    let live_claude = alive_claude_pids(&live);
     let now = SystemTime::now();
 
     metas
@@ -315,7 +319,7 @@ pub fn rows_from_metas(
                 now,
                 thresholds,
             );
-            // Told apart here, from the same live file and process snapshot that
+            // Told apart here, from the same live file and liveness pass that
             // gave the activity: the list still draws such a row Waiting, and
             // the bell leaves it out.
             let dialog_open = activity == Activity::Waiting
@@ -1131,6 +1135,45 @@ mod tests {
                 "{live_file}"
             );
         }
+    }
+
+    /// Pins the wiring: the list and the alive set must go through the start-time
+    /// check, not bare pid liveness. This test's own pid is alive, so only a
+    /// start time that is not the process's own (`u64::MAX`, which no kernel
+    /// reports) can tell the file's writer is gone. Where the platform cannot
+    /// read a start time (macOS) the pid alone decides, so there is nothing to pin.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_leftover_on_a_recycled_pid_is_not_a_running_session_in_the_list() {
+        let pid = std::process::id();
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let claude_home = ClaudeHome::new(dir.path().to_path_buf());
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let row_of = |proc_start: &str| {
+            let body = format!(
+                r#"{{"pid":{pid},"sessionId":"sess","kind":"interactive","status":"busy"{proc_start}}}"#
+            );
+            std::fs::write(sessions.join(format!("{pid}.json")), body).unwrap();
+            let live = status::read_live_sessions(&claude_home.sessions_dir());
+            let alive = alive_claude_pids(&live);
+            let rows = rows_from_metas(
+                vec![meta("sess", when)],
+                &claude_home,
+                None,
+                &AgeThresholds::default(),
+            );
+            (alive.contains(&pid), rows[0].activity)
+        };
+
+        let (alive, activity) = row_of(r#","procStart":"18446744073709551615""#);
+        assert!(!alive, "a pid in use by someone else is not the writer");
+        assert!(matches!(activity, Activity::Idle(_)), "{activity:?}");
+        // The control: no recorded start leaves the pid to decide, and it is alive.
+        let (alive, activity) = row_of("");
+        assert!(alive);
+        assert_eq!(activity, Activity::Busy);
     }
 
     #[test]

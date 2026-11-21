@@ -1845,7 +1845,7 @@ every update, so it follows a background command to its end (Claude is re-invoke
 when the command ends, "Data sources"), and goes when both counts reach zero. The
 decision uses the last sample, so it can be about a tick (plus
 the product's report lag) behind a turn that has only just begun. Cost: a Claude
-pane adds no read (the live-file scan and process snapshot are the relay's); a
+pane adds no read (the live-file scan and liveness pass are the relay's); a
 Codex brigade member adds none (the relay already tails its rollout every tick);
 a hosted Codex pane outside any brigade adds one sqlite lookup and one rollout
 tail per tick (`docs/DISCIPLINE.md`, Appendix A).
@@ -3646,26 +3646,33 @@ seven tools:
 - `check_messages()` — pulls the messages addressed to this session's role
   that it hasn't seen yet, wrapped in framing that names them as relayed from
   another AI rather than a direct operator instruction.
-- `brigade_status()` — this member's own identity plus a roster of its
-  addressable peers, each with what it's doing right now and whether it's
-  holding unread mail from this member. Replaces an earlier bare ping-style
-  health check, added once dogfooding showed a Director launched with only
-  the two message tools and no roster information mostly never used them. A Claude
-  peer's state is its live file's own word (`busy`, `waiting`, `idle`), except that
-  `shell` prints as `idle (background command running)`. When several live files
-  name the peer's session — Claude Code leaves behind the file of a process that
-  died without removing it — only those whose process is alive count, `busy` before
-  `waiting` before `shell` before any other, and `not running` means every file
-  naming it is dead. The relay's idle reading follows the same rule. A Codex peer's state is
-  read from its rollout's last turn marker: `busy (turn in progress)` when a turn has
-  begun and not ended, `idle (turn ended; background work not visible)` when the last
-  one ended, `running` when it is alive with no turn record to read, and `not running`
-  when it is gone. Its limits: a background command left after a turn is not visible,
-  so such a peer reads idle; a pending approval or question is not visible either, so
-  such a peer reads busy; Codex never reads `waiting`. The hosted tile can disagree,
-  because it reads the pane's own OSC 7501 report first, and that report lives in the
-  UI process, which this tool (answered by the separate `_mcp` process) cannot see.
-  The relay's nudge reads the same rollout marker, so the nudge and this tool agree.
+- `brigade_status()` — this member's own identity plus a roster of its addressable
+  peers, each with what it's doing right now and whether it's holding unread mail from
+  this member. Replaces an earlier bare ping-style health check, added once dogfooding
+  showed a Director launched with only the two message tools and no roster information
+  mostly never used them. A Claude peer's state is its live file's own word (`busy`,
+  `waiting`, `idle`), except that `shell` prints as `idle (background command
+  running)`. When several live files name the peer's session — Claude Code leaves
+  behind the file of a process that died without removing it — only those whose
+  process is alive count (one that records its start time must also match it, so a pid
+  since handed to an unrelated process does not keep a dead peer's last word alive),
+  `busy` before `waiting` before `shell` before any other, and `not running` means
+  every file naming it is dead. Every other reading of the live files follows the
+  same rule: the relay's idle reading, the list's activity dots, the quit question
+  and the tile's state. Where the platform can read a process's start time
+  (Windows, Linux) that is one start-time check per live file per pass, and a
+  file with no recorded start time counts by its pid alone; macOS has no such
+  check, so there every file counts by its pid alone. A
+  Codex peer's state is read from its rollout's last turn marker: `busy (turn in
+  progress)` when a turn has begun and not ended, `idle (turn ended; background work
+  not visible)` when the last one ended, `running` when it is alive with no turn
+  record to read, and `not running` when it is gone. Its limits: a background command
+  left after a turn is not visible, so such a peer reads idle; a pending approval or
+  question is not visible either, so such a peer reads busy; Codex never reads
+  `waiting`. The hosted tile can disagree, because it reads the pane's own OSC 7501
+  report first, and that report lives in the UI process, which this tool (answered by
+  the separate `_mcp` process) cannot see. The relay's nudge reads the same rollout
+  marker, so the nudge and this tool agree.
 - `consult_goinkyo(kind, title, question, my_case, settled, unsettled, blind_spot[,
   their_case][, about][, alternatives])` — Director-only: files a written
   consultation request and creates the Goinkyo's member row (see "Brigade" above

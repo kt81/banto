@@ -61,7 +61,7 @@ use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
 use banto_io::status::{
     LIVE_STATUS_BUSY, LIVE_STATUS_SHELL, LIVE_STATUS_WAITING, LiveSession, ProcessProbe,
-    SysinfoProbe, read_live_sessions,
+    SysinfoProbe, entry_is_alive, read_live_sessions,
 };
 use banto_io::store::{MemberNaming, Store, StoreError};
 
@@ -692,10 +692,12 @@ fn elapsed_label(ms: i64) -> String {
 /// 2026-11-21 that same ordering kept the relay from ever nudging a live
 /// Director (`banto_io::status::claude_nudgeable`), and here it would print a
 /// running peer as "not running". So only entries whose process is alive are
-/// candidates, and among those the one reporting `busy` wins, then `waiting`,
-/// then `shell`, then any other, the order `banto_io::status::live_activity`
-/// uses for the list. Equal rank keeps the listing order. "not running" is what
-/// is left when entries name the session and none of them is alive.
+/// candidates (the process that wrote the file, when it recorded its start:
+/// a leftover whose pid was recycled is dead, not a busy peer), and among those
+/// the one reporting `busy` wins, then `waiting`, then `shell`, then any other,
+/// the order `banto_io::status::live_activity` uses for the list. Equal rank
+/// keeps the listing order. "not running" is what is left when entries name the
+/// session and none of them is alive.
 fn peer_activity(
     peer: &BrigadeMember,
     live: &[LiveSession],
@@ -710,7 +712,7 @@ fn peer_activity(
             .filter(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
     };
     let entry = named()
-        .filter(|entry| probe.is_alive(entry.pid))
+        .filter(|entry| entry_is_alive(entry, probe))
         .min_by_key(|entry| match entry.status.as_deref() {
             Some(LIVE_STATUS_BUSY) => 0,
             Some(LIVE_STATUS_WAITING) => 1,
@@ -1636,12 +1638,17 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A probe that calls exactly the listed pids alive, so a test decides which
-    /// of two files naming one session is a leftover.
-    struct AlivePids(Vec<u32>);
+    /// of two files naming one session is a leftover. `recycled` are alive pids
+    /// that now belong to an unrelated process: a file that recorded its start
+    /// does not match them.
+    struct AlivePids {
+        alive: Vec<u32>,
+        recycled: Vec<u32>,
+    }
 
     impl ProcessProbe for AlivePids {
         fn is_alive(&self, pid: u32) -> bool {
-            self.0.contains(&pid)
+            self.alive.contains(&pid)
         }
 
         fn parent_pid(&self, _pid: u32) -> Option<u32> {
@@ -1649,7 +1656,7 @@ mod tests {
         }
 
         fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
-            self.is_alive(pid)
+            self.is_alive(pid) && !self.recycled.contains(&pid)
         }
     }
 
@@ -1682,7 +1689,49 @@ mod tests {
     }
 
     fn activity_of(live: &[LiveSession], alive: &[u32]) -> String {
-        peer_activity(&peer_with_session(), live, &AlivePids(alive.to_vec()), None)
+        activity_with_recycled(live, alive, &[])
+    }
+
+    fn activity_with_recycled(live: &[LiveSession], alive: &[u32], recycled: &[u32]) -> String {
+        let probe = AlivePids {
+            alive: alive.to_vec(),
+            recycled: recycled.to_vec(),
+        };
+        peer_activity(&peer_with_session(), live, &probe, None)
+    }
+
+    #[test]
+    fn peer_activity_does_not_read_a_recycled_pids_leftover_as_the_peer() {
+        // Pid 100 once ran the peer and is running something else now, its file
+        // saying what the peer was doing when it died; pid 200 is the peer.
+        let leftover = |status| LiveSession {
+            proc_start: Some("1".to_string()),
+            ..peer_live_entry(100, PEER_SESSION, Some(status))
+        };
+        let current = LiveSession {
+            proc_start: Some("2".to_string()),
+            ..peer_live_entry(200, PEER_SESSION, Some("idle"))
+        };
+        for stale in ["busy", "waiting", "shell"] {
+            for live in [
+                [leftover(stale), current.clone()],
+                [current.clone(), leftover(stale)],
+            ] {
+                assert_eq!(
+                    activity_with_recycled(&live, &[100, 200], &[100]),
+                    "idle",
+                    "{stale}"
+                );
+                // The control: were the pid the peer's own, the same files read as
+                // whatever the leftover said, so the answer above is the recycling's.
+                assert_ne!(activity_with_recycled(&live, &[100, 200], &[]), "idle");
+            }
+        }
+        // Nothing but the recycled pid's file: the peer is not running.
+        assert_eq!(
+            activity_with_recycled(&[leftover("busy")], &[100], &[100]),
+            "not running"
+        );
     }
 
     #[test]

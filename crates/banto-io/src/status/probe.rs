@@ -4,6 +4,8 @@ use std::collections::HashSet;
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+use super::LiveSession;
+
 /// Checks whether a process id refers to a live process, and its parentage.
 ///
 /// Kept behind a trait so unit tests can substitute a mock instead of
@@ -65,6 +67,66 @@ impl SysinfoProbe {
             return HashSet::new();
         }
         alive_pids(&pids)
+    }
+
+    /// The pids among `entries` whose process is the one that wrote its file: the
+    /// batch every reader of the live files' liveness shares (the list, the
+    /// quit question, the brigade watch, the relay), so that none of them can
+    /// call a recycled pid the session still running.
+    ///
+    /// An entry that recorded its start time counts when the process with that
+    /// pid started then, exactly as [`ProcessProbe::is_alive_matching`] decides
+    /// it; one that did not, or whose process this platform cannot read the
+    /// start time of, counts by pid alone. The start time is read once per entry
+    /// and **only the entries it could not settle** go to the one batched
+    /// [`Self::alive_pids`] refresh: asking `is_alive_matching` entry by entry
+    /// would fall back to a refresh of its own for each of them on a platform
+    /// with no readable start time, which is every one on macOS. A pid is in the
+    /// set if any entry naming it matches; Claude Code names each file after
+    /// its pid, so there is one.
+    pub fn alive_live_pids(entries: &[LiveSession]) -> HashSet<u32> {
+        alive_from_entries(entries, identity_verdict, Self::alive_pids)
+    }
+}
+
+/// The pure half of [`SysinfoProbe::alive_live_pids`]: `verdict` settles an
+/// entry (`Some`) or declines (`None`), and `batch` is asked, once, about the
+/// pids of the entries it declined. `pub(super)` so the readers' own tests build
+/// their alive set the way the real one is built, with a mock in place of the OS.
+pub(super) fn alive_from_entries(
+    entries: &[LiveSession],
+    verdict: impl Fn(u32, &str) -> Option<bool>,
+    batch: impl FnOnce(HashSet<u32>) -> HashSet<u32>,
+) -> HashSet<u32> {
+    let mut alive = HashSet::new();
+    let mut undecided = HashSet::new();
+    for entry in entries {
+        match entry
+            .proc_start
+            .as_deref()
+            .and_then(|start| verdict(entry.pid, start))
+        {
+            Some(true) => {
+                alive.insert(entry.pid);
+            }
+            Some(false) => {}
+            None => {
+                undecided.insert(entry.pid);
+            }
+        }
+    }
+    alive.extend(batch(undecided));
+    alive
+}
+
+/// Whether `pid` is provably the process that recorded `proc_start`: `Some`
+/// when this platform could say, `None` when the recorded value does not parse or
+/// the start time cannot be read, and the caller must settle for liveness alone.
+fn identity_verdict(pid: u32, proc_start: &str) -> Option<bool> {
+    let expected = proc_start.parse::<u64>().ok()?;
+    match process_start(pid)? {
+        Some(actual) => Some(actual == expected),
+        None => Some(false),
     }
 }
 
@@ -136,14 +198,7 @@ impl ProcessProbe for SysinfoProbe {
     /// or when either platform cannot obtain a comparable value, this falls
     /// back to [`Self::is_alive`] — see the trait doc for why that is safe.
     fn is_alive_matching(&self, pid: u32, proc_start: &str) -> bool {
-        let Ok(expected) = proc_start.parse::<u64>() else {
-            return self.is_alive(pid);
-        };
-        match process_start(pid) {
-            Some(Some(actual)) => actual == expected,
-            Some(None) => false,
-            None => self.is_alive(pid),
-        }
+        identity_verdict(pid, proc_start).unwrap_or_else(|| self.is_alive(pid))
     }
 }
 
@@ -428,6 +483,93 @@ mod tests {
         let probe = SysinfoProbe;
         assert!(probe.is_alive_matching(pid, &creation.to_string()));
         assert!(!probe.is_alive_matching(pid, &creation.saturating_add(1).to_string()));
+    }
+
+    fn recorded(pid: u32, proc_start: Option<&str>) -> LiveSession {
+        LiveSession {
+            pid,
+            session_id: None,
+            cwd: None,
+            status: None,
+            waiting_for: None,
+            kind: None,
+            name: None,
+            proc_start: proc_start.map(str::to_string),
+            version: None,
+        }
+    }
+
+    #[test]
+    fn the_batch_is_asked_once_and_only_about_the_entries_the_start_time_did_not_settle() {
+        let entries = [
+            recorded(1, Some("matches")),
+            recorded(2, Some("differs")),
+            recorded(3, Some("unreadable")),
+            recorded(4, None),
+        ];
+        let mut asked = Vec::new();
+        let alive = alive_from_entries(
+            &entries,
+            |_, start| match start {
+                "matches" => Some(true),
+                "differs" => Some(false),
+                _ => None,
+            },
+            |pids| {
+                let mut pids: Vec<u32> = pids.into_iter().collect();
+                pids.sort_unstable();
+                asked.push(pids.clone());
+                pids.into_iter().filter(|pid| *pid == 4).collect()
+            },
+        );
+        assert_eq!(asked, vec![vec![3, 4]], "one batch, undecided entries only");
+        assert_eq!(alive, [1, 4].into_iter().collect::<HashSet<u32>>());
+    }
+
+    #[test]
+    fn no_entry_with_a_readable_start_time_costs_a_batch_of_anything() {
+        let mut batch_sizes = Vec::new();
+        alive_from_entries(
+            &[recorded(1, Some("a")), recorded(2, Some("b"))],
+            |_, _| Some(true),
+            |pids| {
+                batch_sizes.push(pids.len());
+                HashSet::new()
+            },
+        );
+        assert_eq!(batch_sizes, vec![0]);
+    }
+
+    /// The start time the platform records for the running test process, in the
+    /// form a live-state file records it, where it can be read at all.
+    #[cfg(any(windows, target_os = "linux"))]
+    fn own_recorded_start() -> String {
+        let pid = std::process::id();
+        #[cfg(windows)]
+        let start = windows_process_start(pid).flatten();
+        #[cfg(not(windows))]
+        let start = read_proc_start_ticks(pid);
+        start
+            .expect("this test process must have a readable start time")
+            .to_string()
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn the_real_alive_set_keeps_this_process_by_its_start_time_and_drops_a_recycled_pid() {
+        let me = std::process::id();
+        let own = own_recorded_start();
+        let other_start = (own.parse::<u64>().unwrap() + 1).to_string();
+        let entries = [recorded(me, Some(&own)), recorded(u32::MAX, Some(&own))];
+        let alive = SysinfoProbe::alive_live_pids(&entries);
+        assert!(alive.contains(&me));
+        assert!(!alive.contains(&u32::MAX));
+        // A running pid recorded with some other start time is somebody else's.
+        assert!(!SysinfoProbe::alive_live_pids(&[recorded(me, Some(&other_start))]).contains(&me));
+        // With no start time, or one that cannot be read as a number, the pid is
+        // all there is to go on.
+        assert!(SysinfoProbe::alive_live_pids(&[recorded(me, None)]).contains(&me));
+        assert!(SysinfoProbe::alive_live_pids(&[recorded(me, Some("x"))]).contains(&me));
     }
 
     /// A probe whose parentage is an explicit `child -> parent` map — no

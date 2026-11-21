@@ -2490,7 +2490,7 @@ fn gather_relay_observations_from(
     let roster_read = read.brigades.is_some();
     let brigades = read.brigades.as_deref().unwrap_or_default();
     let live = &read.live;
-    // One shared process-table refresh for every Claude member this tick,
+    // One shared liveness pass for every Claude member this tick,
     // not one per member: `SysinfoProbe::is_alive` was costing a full
     // `CreateToolhelp32Snapshot`-and-walk-every-process pass PER CALL on
     // Windows (sysinfo 0.39.6 — `ProcessesToUpdate::Some` still enumerates
@@ -2498,7 +2498,10 @@ fn gather_relay_observations_from(
     // members paid that multiple times a second. The set is the tick's
     // (`TickRead::alive_claude`, shared with the session-move gather, which may
     // have asked first and been charged for it), so it is never older than the
-    // tick that read the live files.
+    // tick that read the live files. It names the processes that are still the
+    // session that wrote their file, not merely pids in use: a leftover file
+    // whose pid was recycled is left out, so it can neither stop the nudges nor
+    // colour the tile.
     let claude_snapshot_start = Instant::now();
     let alive_claude = read.alive_claude();
     if let Some(t) = timings.as_deref_mut() {
@@ -2507,7 +2510,7 @@ fn gather_relay_observations_from(
     let mut observations = Vec::new();
     // What this same pass learns about whether each hosted pane is idle, for
     // the quit confirmation and the brigade-quiet bell. It adds no read of its
-    // own for a Claude pane — the live-file scan and the process snapshot above
+    // own for a Claude pane — the live-file scan and the liveness pass above
     // are shared — and none for a Codex brigade member, whose rollout tail the
     // relay already reads every tick; only a hosted Codex pane outside any
     // brigade costs one (sqlite lookup plus rollout tail) per tick.
@@ -2868,8 +2871,9 @@ struct TickRead {
     /// `None` is a brigade list that could not be read at all.
     brigades: Option<Roster>,
     live: Vec<LiveSession>,
-    /// Which of the live files' pids are running, asked of the OS at most once a
-    /// tick and by whichever gather needs it first ([`Self::alive_claude`]).
+    /// Which of the live files' pids are running as the session that wrote them,
+    /// asked of the OS at most once a tick and by whichever gather needs it first
+    /// ([`Self::alive_claude`]).
     alive: std::cell::OnceCell<HashSet<u32>>,
 }
 
@@ -2904,13 +2908,14 @@ impl TickRead {
         }
     }
 
-    /// The live files' pids that are running right now. One process-table
-    /// refresh per tick however many gathers ask: it is the costly part of a
-    /// tick on Windows (see `gather_relay_observations_from`), and the relay asks
-    /// every tick, so the session-move gather's use of it is free.
+    /// The live files' pids whose process is running right now and is the
+    /// session that wrote the file (`session::alive_claude_pids`). One liveness
+    /// pass per tick however many gathers ask: it is the costly part of a tick on
+    /// Windows (see `gather_relay_observations_from`), and the relay asks every
+    /// tick, so the session-move gather's use of it is free.
     fn alive_claude(&self) -> &HashSet<u32> {
         self.alive
-            .get_or_init(|| session::alive_claude_pids(self.live.iter().map(|entry| entry.pid)))
+            .get_or_init(|| session::alive_claude_pids(&self.live))
     }
 }
 
@@ -4484,7 +4489,7 @@ struct TickTimings {
     /// The live-state directory scan, read once for the whole tick.
     live_scan: Duration,
     session_moves: Duration,
-    /// The one shared `SysinfoProbe::alive_pids` refresh every Claude
+    /// The one shared `SysinfoProbe::alive_live_pids` pass every Claude
     /// member's activity check now reads from, instead of each paying its
     /// own — see that call site's own comment. Kept as its own field
     /// rather than folded into `relay_activity_claude` so this cost stays
