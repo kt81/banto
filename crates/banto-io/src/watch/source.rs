@@ -56,7 +56,7 @@ impl NotifyChangeSource {
     /// replacement. Only events naming `session_index.jsonl` trigger reloads;
     /// SQLite and log activity is excluded.
     ///
-    /// Reads never trigger a reload, under any root: see [`can_change_content`].
+    /// Reads never trigger a reload, under any root: see `can_change_content`.
     pub fn new(
         claude_home: &ClaudeHome,
         codex_home: Option<&CodexHome>,

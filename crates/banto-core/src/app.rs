@@ -2996,8 +2996,6 @@ mod tests {
         let mut app = App::new(numbered(5));
         app.set_viewport_height(5 * ROW_LINES);
         let t0 = test_instant();
-        // The viewport line a row's first physical line sits on.
-        let line_of = |row: usize| row * ROW_LINES;
 
         // First click selects.
         assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
