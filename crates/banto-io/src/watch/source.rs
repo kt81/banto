@@ -519,6 +519,9 @@ mod tests {
     /// descriptor and notify forwards them in that order, so once a sentinel
     /// write has been seen, everything that happened before it is in the
     /// returned list: "nothing was reported" can be asserted without sleeping.
+    /// Linux-only like its one caller: that ordering is inotify's promise, and a
+    /// helper left ungated is dead code that fails the other platforms' clippy.
+    #[cfg(target_os = "linux")]
     fn collect_until(
         source: &impl ChangeSource,
         want: WatchRoot,
