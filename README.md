@@ -86,13 +86,15 @@ running forks its history.
 
 ### Director/Worker cells
 
-![banto with a staged cell: the ledger on the left — a
-🤝 Director row pinned under a counted header — and three live panes: a
-Director session flanked by two Workers reporting back](docs/assets/emporium-brigade.png)
+![banto with a staged cell: the ledger on the left — two pinned rows, a 🤝
+Director and a Codex session, above sessions filed in groups — and the cell on
+the right: the Director in the large pane, one Worker beside it, and two more
+Workers collapsed to one-line strips that still show their latest
+message](docs/assets/emporium-brigade.png)
 
-*A live cell at work (on WSL): the Director reviews and directs; two
-Workers implement and report over banto's MCP channel. This screenshot is
-itself dogfooding — the session shown is building banto.*
+*A live cell at work (on WSL): the Director lays out what each test protects
+while a Worker reports its fix; two more Workers are collapsed to strips. This
+screenshot is itself dogfooding — the cell shown is fixing a banto bug.*
 
 `B` appoints the selected session as a **Director** and
 auto-spawns fresh **Worker** sessions beside it (count, model, and even
