@@ -15291,6 +15291,60 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_between_two_sidebar_presses_still_pairs_them_into_an_open() {
+        // On WSL the list reloaded about every 265ms, and each reload used to
+        // wipe the pending press, so a double-click (presses 131-192ms apart)
+        // mostly failed to open anything. The reload here carries the same
+        // rows, so nothing under the pointer changes.
+        let mut state = EmporiumState::new(PrefixKey::default());
+        state.size = (120, 40);
+        let mut app = app_with((1..=3).map(|n| row(&format!("sess-{n}"))).collect());
+        app.set_viewport_height(10);
+        let brigade = brigade_config();
+
+        let areas = state
+            .geometry(Rect::new(0, 0, state.size.0, state.size.1))
+            .areas;
+        let press = Event::Input(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: areas.sidebar.x + 1,
+            row: areas.sidebar.y + 1,
+        }));
+        let t0 = test_instant();
+
+        let first = update(&mut state, &mut app, &brigade, press.clone(), t0);
+        assert!(first.is_empty(), "a first press only selects: {first:?}");
+
+        let reloaded = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::RowsLoaded {
+                rows: (1..=3).map(|n| row(&format!("sess-{n}"))).collect(),
+                hidden: HashSet::new(),
+                directors: HashSet::new(),
+            },
+            t0 + Duration::from_millis(80),
+        );
+        assert!(reloaded.is_empty(), "{reloaded:?}");
+
+        let second = update(
+            &mut state,
+            &mut app,
+            &brigade,
+            press,
+            t0 + Duration::from_millis(150),
+        );
+        assert!(
+            second.iter().any(|cmd| matches!(
+                cmd,
+                Cmd::Store(StoreIntent::ResolveMembership { session_id }) if session_id == "sess-1"
+            )),
+            "the second press must request the membership resolution that opens the row: {second:?}"
+        );
+    }
+
+    #[test]
     fn sidebar_scroll_works_while_focus_is_on_a_pane_that_does_not_want_sgr_mouse() {
         // `App::scroll` moves the viewport, not the selection, so a
         // one-row viewport over several rows is what makes it observable.

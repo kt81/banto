@@ -991,8 +991,13 @@ pub struct App {
     offset: usize,
     /// Number of physical lines currently visible.
     viewport_height: usize,
-    /// Last click (filtered index + time) for double-click detection.
-    last_click: Option<(usize, Instant)>,
+    /// The press a second press may pair with (session id + time). Keyed by id,
+    /// not by position: the list is rebuilt under the pointer all the time (a
+    /// reload, an activity overlay), and a position-keyed pairing was wiped by
+    /// every rebuild — on WSL 24 of 37 double-clicks, presses 131-192ms apart,
+    /// never activated. Only the clock, a completed pair, and a press that
+    /// resolves to another session end it; a rebuild does not.
+    last_click: Option<(String, Instant)>,
     /// Set once the user asks to quit.
     should_quit: bool,
 }
@@ -2003,14 +2008,13 @@ impl App {
     /// Recompute `filtered` from the current query/haystacks, then re-select
     /// `keep_id` if it's still present — by id, since sorting or reloading
     /// makes index-based tracking meaningless — falling back to the top of
-    /// the list. Clears `last_click`, whose filtered index no longer
-    /// corresponds to anything meaningful after a reorder.
+    /// the list. Leaves `last_click` alone: it is keyed by session id, so it
+    /// survives a reorder or a reload by construction.
     fn refilter_keeping_selected(&mut self, keep_id: Option<String>) {
         self.rebuild_filtered();
         self.selected = keep_id
             .and_then(|id| self.filtered.iter().position(|&i| self.rows[i].id == id))
             .unwrap_or(0);
-        self.last_click = None;
         self.ensure_visible();
     }
 
@@ -2113,7 +2117,6 @@ impl App {
         self.rebuild_filtered();
         self.selected = 0;
         self.offset = 0;
-        self.last_click = None;
         self.ensure_visible();
     }
 
@@ -2327,11 +2330,12 @@ impl App {
         if filtered_index >= self.filtered.len() {
             return None;
         }
+        let id = self.rows[self.filtered[filtered_index]].id.clone();
         let is_double = matches!(
-            self.last_click,
-            Some((idx, when))
-                if idx == filtered_index
-                    && now.saturating_duration_since(when) <= DOUBLE_CLICK_INTERVAL
+            &self.last_click,
+            Some((pending, when))
+                if *pending == id
+                    && now.saturating_duration_since(*when) <= DOUBLE_CLICK_INTERVAL
         );
         self.selected = filtered_index;
         self.ensure_visible();
@@ -2340,7 +2344,7 @@ impl App {
             self.last_click = None;
             Some(ClickOutcome::Activated)
         } else {
-            self.last_click = Some((filtered_index, now));
+            self.last_click = Some((id, now));
             Some(ClickOutcome::Selected)
         }
     }
@@ -3015,6 +3019,184 @@ mod tests {
         // Too slow: not a double click.
         let t4 = t3 + Duration::from_millis(500);
         assert_eq!(app.click(line_of(3), t4), Some(ClickOutcome::Selected));
+    }
+
+    // A pending click is keyed by session id, so a rebuild of the list under
+    // the pointer neither ends it nor re-points it at whatever now sits there.
+
+    /// The viewport line a row's first physical line sits on, in a list of
+    /// plain (two-line) rows with no headers.
+    fn line_of(row: usize) -> usize {
+        row * ROW_LINES
+    }
+
+    #[test]
+    fn overlay_sync_between_two_presses_keeps_the_pair_set_reported_activity() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id2"));
+
+        // A value that merely differs from what `App` already holds (every
+        // `numbered()` row starts `Activity::Idle(AgeBucket::Older)`).
+        let mut reported = HashMap::new();
+        reported.insert("id2".to_string(), Activity::Alive);
+        app.set_reported_activity(reported, HashSet::new());
+
+        // The overlay moved nothing: the row under the pointer is the same.
+        assert_eq!(app.selected(), 2);
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id2"));
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Activated));
+    }
+
+    #[test]
+    fn overlay_sync_between_two_presses_keeps_the_pair_set_hosted_ids() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+
+        let mut hosted = HashSet::new();
+        hosted.insert("id2".to_string());
+        app.set_hosted_ids(hosted);
+
+        assert_eq!(app.selected(), 2);
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id2"));
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Activated));
+    }
+
+    #[test]
+    fn overlay_sync_between_two_presses_keeps_the_pair_set_brigade_marks() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+
+        let mut marks = HashSet::new();
+        marks.insert("id2".to_string());
+        app.set_brigade_marks(marks);
+
+        assert_eq!(app.selected(), 2);
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id2"));
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Activated));
+    }
+
+    #[test]
+    fn reload_with_the_same_rows_between_two_presses_keeps_the_pair() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+        app.replace_rows(numbered(5));
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Activated));
+    }
+
+    #[test]
+    fn reload_that_puts_another_session_under_the_pointer_does_not_pair() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+        // id2 moves down one place; id3 now sits where the pointer is.
+        app.replace_rows(vec![
+            row("id0", "title 0", ""),
+            row("id1", "title 1", ""),
+            row("id3", "title 3", ""),
+            row("id2", "title 2", ""),
+            row("id4", "title 4", ""),
+        ]);
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id3"));
+    }
+
+    #[test]
+    fn reload_that_moves_the_pressed_session_pairs_where_it_now_is() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+        // id2 jumps to the top, as a session that just got written to does.
+        app.replace_rows(vec![
+            row("id2", "title 2", ""),
+            row("id0", "title 0", ""),
+            row("id1", "title 1", ""),
+            row("id3", "title 3", ""),
+            row("id4", "title 4", ""),
+        ]);
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(0), t1), Some(ClickOutcome::Activated));
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id2"));
+    }
+
+    #[test]
+    fn reload_that_removes_the_pressed_session_does_not_pair_with_its_successor() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+        app.replace_rows(vec![
+            row("id0", "title 0", ""),
+            row("id1", "title 1", ""),
+            row("id3", "title 3", ""),
+            row("id4", "title 4", ""),
+        ]);
+
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(app.click(line_of(2), t1), Some(ClickOutcome::Selected));
+        assert_eq!(app.selected_row().map(|row| row.id.as_str()), Some("id3"));
+    }
+
+    #[test]
+    fn a_press_on_another_session_ends_the_pending_pair() {
+        let mut app = App::new(numbered(5));
+        app.set_viewport_height(5 * ROW_LINES);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(line_of(2), t0), Some(ClickOutcome::Selected));
+        let t1 = t0 + Duration::from_millis(50);
+        assert_eq!(app.click(line_of(3), t1), Some(ClickOutcome::Selected));
+        // id2 is no longer pending, even though this is well inside the window.
+        let t2 = t1 + Duration::from_millis(50);
+        assert_eq!(app.click(line_of(2), t2), Some(ClickOutcome::Selected));
+    }
+
+    #[test]
+    fn a_press_on_a_header_leaves_the_pending_pair_alone() {
+        // Display sequence: [Header(Pinned), Row(pinned), Header(Ungrouped), ..].
+        let mut app = App::new(vec![
+            row("a", "A", ""),
+            row("b", "B", ""),
+            row("pinned", "P", ""),
+        ])
+        .with_pinned(["pinned".to_string()].into_iter().collect());
+        app.set_viewport_height(4);
+        let t0 = test_instant();
+
+        assert_eq!(app.click(1, t0), Some(ClickOutcome::Selected));
+        assert_eq!(app.click(0, t0 + Duration::from_millis(50)), None);
+        assert_eq!(
+            app.click(2, t0 + Duration::from_millis(150)),
+            Some(ClickOutcome::Activated)
+        );
     }
 
     #[test]
