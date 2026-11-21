@@ -141,8 +141,19 @@ pub fn waiting_on_a_dialog(
 }
 
 /// Whether the relay may treat the Claude session `session_id` as idle enough to
-/// nudge: `None` when no live entry names it, else whether its first entry has a
-/// live process and is neither busy nor waiting.
+/// nudge: `None` when no live entry names it, else `Some(true)` when at least one
+/// entry naming it has a live process and none of those is busy or waiting.
+///
+/// Entries are not alternatives to pick between. Claude Code removes its own
+/// `<pid>.json` on a normal exit but never sweeps the file of a process that died
+/// without getting to, so a resumed session can be named by a dead leftover and
+/// the live file together, in whatever order `read_dir` returned them. Three such
+/// files from 2026-07-25 were still there four months later, and the one for the
+/// Director's own session, listed first, read as a dead process: the relay never
+/// nudged it and wrote nothing down. A dead entry therefore decides nothing, and
+/// among the live ones busy or waiting anywhere wins, as in [`live_activity`]. An
+/// entry whose process is dead is only ever the answer when it is the only kind
+/// there is (`Some(false)`: a dead process is not idle).
 ///
 /// A `waiting` session is not idle for the relay whatever it is waiting for,
 /// `"dialog open"` included: a nudge is typed text and an Enter, and typed into
@@ -155,15 +166,25 @@ pub fn claude_nudgeable(
     session_id: &str,
     alive_pids: &HashSet<u32>,
 ) -> Option<bool> {
-    live.iter()
-        .find(|entry| entry.session_id.as_deref() == Some(session_id))
-        .map(|entry| {
-            alive_pids.contains(&entry.pid)
-                && !matches!(
-                    entry.status.as_deref(),
-                    Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
-                )
-        })
+    let mut named = false;
+    let mut alive = false;
+    for entry in live
+        .iter()
+        .filter(|entry| entry.session_id.as_deref() == Some(session_id))
+    {
+        named = true;
+        if !alive_pids.contains(&entry.pid) {
+            continue;
+        }
+        if matches!(
+            entry.status.as_deref(),
+            Some(LIVE_STATUS_BUSY) | Some(LIVE_STATUS_WAITING)
+        ) {
+            return Some(false);
+        }
+        alive = true;
+    }
+    named.then_some(alive)
 }
 
 /// Whether the Claude session `session_id` is known to be idle, from the live
@@ -892,6 +913,74 @@ mod tests {
             "a dead process is not idle"
         );
         assert_eq!(claude_nudgeable(&[], SESSION_ID, &alive), None);
+    }
+
+    fn nudgeable_of(live: &[LiveSession], alive: &[u32]) -> Option<bool> {
+        let alive: HashSet<u32> = alive.iter().copied().collect();
+        claude_nudgeable(live, SESSION_ID, &alive)
+    }
+
+    #[test]
+    fn a_dead_leftover_entry_listed_before_the_live_one_does_not_hide_it() {
+        let live = [
+            live_entry(100, Some(SESSION_ID), Some("idle")),
+            live_entry(200, Some(SESSION_ID), Some("idle")),
+        ];
+        assert_eq!(nudgeable_of(&live, &[200]), Some(true));
+    }
+
+    #[test]
+    fn a_live_entry_listed_before_a_dead_leftover_is_still_nudgeable() {
+        let live = [
+            live_entry(200, Some(SESSION_ID), Some("idle")),
+            live_entry(100, Some(SESSION_ID), Some("idle")),
+        ];
+        assert_eq!(nudgeable_of(&live, &[200]), Some(true));
+    }
+
+    #[test]
+    fn entries_that_are_all_dead_are_not_idle_but_are_not_unknown() {
+        let live = [
+            live_entry(100, Some(SESSION_ID), Some("idle")),
+            live_entry(200, Some(SESSION_ID), Some("idle")),
+        ];
+        assert_eq!(nudgeable_of(&live, &[]), Some(false));
+        assert_eq!(nudgeable_of(&live[..1], &[]), Some(false));
+    }
+
+    #[test]
+    fn a_busy_or_waiting_live_entry_wins_over_an_idle_one_in_either_order() {
+        for busy_status in ["busy", "waiting"] {
+            let busy_first = [
+                live_entry(100, Some(SESSION_ID), Some(busy_status)),
+                live_entry(200, Some(SESSION_ID), Some("idle")),
+            ];
+            let idle_first = [
+                live_entry(200, Some(SESSION_ID), Some("idle")),
+                live_entry(100, Some(SESSION_ID), Some(busy_status)),
+            ];
+            assert_eq!(nudgeable_of(&busy_first, &[100, 200]), Some(false));
+            assert_eq!(nudgeable_of(&idle_first, &[100, 200]), Some(false));
+        }
+    }
+
+    #[test]
+    fn a_dead_busy_leftover_does_not_hold_a_live_idle_entry_back() {
+        let live = [
+            live_entry(100, Some(SESSION_ID), Some("busy")),
+            live_entry(200, Some(SESSION_ID), Some("idle")),
+        ];
+        assert_eq!(nudgeable_of(&live, &[200]), Some(true));
+    }
+
+    #[test]
+    fn entries_for_other_sessions_are_not_this_sessions_answer() {
+        let live = [
+            live_entry(100, Some("another-session"), Some("idle")),
+            live_entry(200, None, Some("idle")),
+        ];
+        assert_eq!(nudgeable_of(&live, &[100, 200]), None);
+        assert_eq!(nudgeable_of(&[], &[]), None);
     }
 
     #[test]

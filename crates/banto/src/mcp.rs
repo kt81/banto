@@ -60,7 +60,8 @@ use banto_io::codex_activity::is_thread_idle;
 use banto_io::codex_home::CodexHome;
 use banto_io::codex_liveness::{SysinfoStartTime, is_thread_alive};
 use banto_io::status::{
-    LIVE_STATUS_SHELL, LiveSession, ProcessProbe, SysinfoProbe, read_live_sessions,
+    LIVE_STATUS_BUSY, LIVE_STATUS_SHELL, LIVE_STATUS_WAITING, LiveSession, ProcessProbe,
+    SysinfoProbe, read_live_sessions,
 };
 use banto_io::store::{MemberNaming, Store, StoreError};
 
@@ -558,7 +559,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
         }
         out.push_str(&format!("\nYour {}s:\n", role_label(*peer_role)));
         for peer in group {
-            let activity = peer_activity(peer, &live, ctx.codex_home.as_ref());
+            let activity = peer_activity(peer, &live, &SysinfoProbe, ctx.codex_home.as_ref());
             let waiting = ctx
                 .store
                 .has_unseen_brigade_messages(brigade, &peer.token, peer.role)
@@ -683,19 +684,41 @@ fn elapsed_label(ms: i64) -> String {
 /// in the UI process, which this one has no way to ask. With no marker to read the
 /// answer stays `running`, never a guess. A member without a session id is still
 /// starting; otherwise no live source means not running.
+///
+/// Several live files can name one session: Claude Code removes its own on a
+/// normal exit but leaves the file of a process that died without getting to, and
+/// `read_live_sessions` returns them in `read_dir` order. Taking the first one
+/// let a dead leftover listed before the live file answer for the session: on
+/// 2026-11-21 that same ordering kept the relay from ever nudging a live
+/// Director (`banto_io::status::claude_nudgeable`), and here it would print a
+/// running peer as "not running". So only entries whose process is alive are
+/// candidates, and among those the one reporting `busy` wins, then `waiting`,
+/// then `shell`, then any other, the order `banto_io::status::live_activity`
+/// uses for the list. Equal rank keeps the listing order. "not running" is what
+/// is left when entries name the session and none of them is alive.
 fn peer_activity(
     peer: &BrigadeMember,
     live: &[LiveSession],
+    probe: &dyn ProcessProbe,
     codex_home: Option<&CodexHome>,
 ) -> String {
     let Some(session_id) = peer.session_id.as_ref() else {
         return "starting up (no session id yet)".to_string();
     };
-    let entry = live
-        .iter()
-        .find(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()));
+    let named = || {
+        live.iter()
+            .filter(|entry| entry.session_id.as_deref() == Some(session_id.0.as_str()))
+    };
+    let entry = named()
+        .filter(|entry| probe.is_alive(entry.pid))
+        .min_by_key(|entry| match entry.status.as_deref() {
+            Some(LIVE_STATUS_BUSY) => 0,
+            Some(LIVE_STATUS_WAITING) => 1,
+            Some(LIVE_STATUS_SHELL) => 2,
+            _ => 3,
+        });
     match entry {
-        Some(entry) if !SysinfoProbe.is_alive(entry.pid) => "not running".to_string(),
+        None if named().next().is_some() => "not running".to_string(),
         // The turn has ended and a background command runs on: the bare word
         // told a Director nothing, and "idle" alone would say nothing is
         // running. Every other status is the live file's own word.
@@ -1611,6 +1634,115 @@ mod tests {
     use banto_core::model::AgentKind;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A probe that calls exactly the listed pids alive, so a test decides which
+    /// of two files naming one session is a leftover.
+    struct AlivePids(Vec<u32>);
+
+    impl ProcessProbe for AlivePids {
+        fn is_alive(&self, pid: u32) -> bool {
+            self.0.contains(&pid)
+        }
+
+        fn parent_pid(&self, _pid: u32) -> Option<u32> {
+            None
+        }
+
+        fn is_alive_matching(&self, pid: u32, _proc_start: &str) -> bool {
+            self.is_alive(pid)
+        }
+    }
+
+    const PEER_SESSION: &str = "00000000-0000-4000-8000-0000000000bb";
+
+    fn peer_with_session() -> BrigadeMember {
+        BrigadeMember {
+            token: "worker-1".to_string(),
+            role: BrigadeRole::Worker,
+            session_id: Some(SessionId(PEER_SESSION.to_string())),
+            agent: Some(AgentKind::ClaudeCode),
+            briefed_at: None,
+            briefed_session_id: None,
+            display_name: None,
+        }
+    }
+
+    fn peer_live_entry(pid: u32, session_id: &str, status: Option<&str>) -> LiveSession {
+        LiveSession {
+            pid,
+            session_id: Some(session_id.to_string()),
+            cwd: None,
+            status: status.map(str::to_string),
+            waiting_for: None,
+            kind: None,
+            name: None,
+            proc_start: None,
+            version: None,
+        }
+    }
+
+    fn activity_of(live: &[LiveSession], alive: &[u32]) -> String {
+        peer_activity(&peer_with_session(), live, &AlivePids(alive.to_vec()), None)
+    }
+
+    #[test]
+    fn peer_activity_reads_the_live_file_when_a_dead_leftover_is_listed_before_it() {
+        let dead_first = [
+            peer_live_entry(100, PEER_SESSION, Some("idle")),
+            peer_live_entry(200, PEER_SESSION, Some("busy")),
+        ];
+        assert_eq!(activity_of(&dead_first, &[200]), "busy");
+        let dead_first_idle = [
+            peer_live_entry(100, PEER_SESSION, Some("busy")),
+            peer_live_entry(200, PEER_SESSION, Some("idle")),
+        ];
+        assert_eq!(activity_of(&dead_first_idle, &[200]), "idle");
+        let live_first = [
+            peer_live_entry(200, PEER_SESSION, Some("idle")),
+            peer_live_entry(100, PEER_SESSION, Some("busy")),
+        ];
+        assert_eq!(activity_of(&live_first, &[200]), "idle");
+    }
+
+    #[test]
+    fn peer_activity_is_not_running_only_when_every_entry_naming_the_session_is_dead() {
+        let live = [
+            peer_live_entry(100, PEER_SESSION, Some("idle")),
+            peer_live_entry(200, PEER_SESSION, Some("idle")),
+        ];
+        assert_eq!(activity_of(&live, &[]), "not running");
+        // No entry at all and no Codex home to ask: also not running.
+        assert_eq!(activity_of(&[], &[]), "not running");
+        let other = [peer_live_entry(100, "another-session", Some("idle"))];
+        assert_eq!(activity_of(&other, &[100]), "not running");
+    }
+
+    #[test]
+    fn peer_activity_among_live_entries_prefers_busy_then_waiting_then_shell() {
+        let ranked = [
+            ("idle", "busy", "busy"),
+            ("waiting", "busy", "busy"),
+            ("idle", "waiting", "waiting"),
+            ("shell", "waiting", "waiting"),
+            ("idle", "shell", "idle (background command running)"),
+        ];
+        for (a, b, expected) in ranked {
+            for (first, second) in [(a, b), (b, a)] {
+                let live = [
+                    peer_live_entry(100, PEER_SESSION, Some(first)),
+                    peer_live_entry(200, PEER_SESSION, Some(second)),
+                ];
+                assert_eq!(
+                    activity_of(&live, &[100, 200]),
+                    expected,
+                    "{first} / {second}"
+                );
+            }
+        }
+        // A status with no word still reads as idle, as it did for a single entry.
+        let bare = [peer_live_entry(100, PEER_SESSION, None)];
+        assert_eq!(activity_of(&bare, &[100]), "idle");
+    }
 
     fn codex_home_with_live_log(thread_id: &str, pid: u32) -> (tempfile::TempDir, CodexHome) {
         let dir = tempfile::tempdir().unwrap();

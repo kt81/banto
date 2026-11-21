@@ -3651,7 +3651,11 @@ seven tools:
   health check, added once dogfooding showed a Director launched with only
   the two message tools and no roster information mostly never used them. A Claude
   peer's state is its live file's own word (`busy`, `waiting`, `idle`), except that
-  `shell` prints as `idle (background command running)`. A Codex peer's state is
+  `shell` prints as `idle (background command running)`. When several live files
+  name the peer's session — Claude Code leaves behind the file of a process that
+  died without removing it — only those whose process is alive count, `busy` before
+  `waiting` before `shell` before any other, and `not running` means every file
+  naming it is dead. The relay's idle reading follows the same rule. A Codex peer's state is
   read from its rollout's last turn marker: `busy (turn in progress)` when a turn has
   begun and not ended, `idle (turn ended; background work not visible)` when the last
   one ended, `running` when it is alive with no turn record to read, and `not running`
