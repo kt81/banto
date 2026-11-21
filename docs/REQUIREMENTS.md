@@ -981,8 +981,9 @@ session remains unverified.
 appearing triggers the same debounced reload a Claude Code change does. It also
 watches an existing Codex home non-recursively for create, modify and remove
 events naming exactly `session_index.jsonl`, including creation and replacement.
-Access events and unrelated paths, including sqlite and log files, do not trigger
-reloads through this home watch. A home missing at startup is not watched later;
+Unrelated paths, including sqlite and log files, do not trigger reloads through
+this home watch, and no access event triggers one under any watched root (see the
+`notify` watch note below). A home missing at startup is not watched later;
 failure to register the optional home watch leaves the other watches running.
 Synthetic watcher tests cover index creation and replacement; they do not prove
 what events an installed Codex emits for a rename. Measured against a synthetic
@@ -4039,6 +4040,18 @@ a Director nothing and `idle` alone would say nothing is running.
 Watch `projects/` and `sessions/` with `notify` for realtime updates — plus,
 when a Codex home resolves, its rollout tree and filtered name-index events
 (see "Codex data sources" above).
+
+An access is not a change: an event that only reports a file or directory being
+opened, read or closed triggers no reload under any watched root. `notify`'s
+inotify backend reports every open, and while those were forwarded a reload's own
+reads of these trees re-armed the next one — measured on WSL on 2026-11-21, banto
+reloaded the whole list about every 265ms with nothing being written, and each
+reload cleared the sidebar's pending double-click. The Windows backend asks for no
+access notifications, so the loop never existed there. The filter is a deny-list
+of access events, not an allow-list of create, modify and remove: what other kinds
+the Windows and macOS backends send is not established, and an allow-list could
+drop a real change there. On Linux a write still arrives as a modify as well as a
+close-after-write.
 
 ## Stack
 

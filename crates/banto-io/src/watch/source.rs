@@ -55,6 +55,8 @@ impl NotifyChangeSource {
     /// The Codex home is watched non-recursively to catch index creation and
     /// replacement. Only events naming `session_index.jsonl` trigger reloads;
     /// SQLite and log activity is excluded.
+    ///
+    /// Reads never trigger a reload, under any root: see [`can_change_content`].
     pub fn new(
         claude_home: &ClaudeHome,
         codex_home: Option<&CodexHome>,
@@ -64,6 +66,9 @@ impl NotifyChangeSource {
         let watch_roots = roots.clone();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             let Ok(event) = res else { return };
+            if !can_change_content(&event.kind) {
+                return;
+            }
             let now = SystemTime::now();
             let index_changed = matches!(
                 event.kind,
@@ -83,6 +88,26 @@ impl NotifyChangeSource {
             changes: rx,
         })
     }
+}
+
+/// Whether an event of this kind can mean something under a watched root
+/// changed. Only `Access` (an open, a read, a close) cannot.
+///
+/// notify 8.2.0's inotify backend subscribes to `IN_OPEN` (its watch mask,
+/// `notify-8.2.0/src/inotify.rs`), so every open of a watched file or
+/// directory arrives as `Access(Open)` — including the opens of the reload
+/// this watcher triggers. Forwarding those closed a loop: reload, 250ms of
+/// quiet, reload. Measured on a running banto over 8 seconds: 29 full walks
+/// of `projects/` (13 directory opens each) and of `sessions/`, 252-373ms
+/// apart, for one real write.
+///
+/// A deny-list, not an allow-list of `Create`/`Modify`/`Remove` as the Codex
+/// index filter uses: what the Windows and macOS backends send as `Any` or
+/// `Other` is not known here, and an allow-list could silently drop a real
+/// change there. On Linux a write raises `Modify(Data)` as well as
+/// `Access(Close(Write))`, so dropping all of `Access` still catches writes.
+fn can_change_content(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_))
 }
 
 fn register_roots(
@@ -487,5 +512,156 @@ mod tests {
         });
         assert!(result.is_ok());
         assert_eq!(registered.len(), 3);
+    }
+
+    /// Like [`wait_for`], but returns every change drained on the way, the
+    /// batch that holds `want` included. inotify queues events in order on one
+    /// descriptor and notify forwards them in that order, so once a sentinel
+    /// write has been seen, everything that happened before it is in the
+    /// returned list: "nothing was reported" can be asserted without sleeping.
+    fn collect_until(
+        source: &impl ChangeSource,
+        want: WatchRoot,
+        timeout: Duration,
+    ) -> Option<Vec<RawChange>> {
+        let deadline = Instant::now() + timeout;
+        let mut seen = Vec::new();
+        loop {
+            seen.extend(source.drain());
+            if seen.iter().any(|change| change.root == want) {
+                return Some(seen);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Linux only: the failure being pinned is notify's inotify backend
+    /// subscribing to `IN_OPEN`, so a reload's own reads came back as changes
+    /// and re-armed the debounce, ~265ms apart, for as long as banto ran.
+    ///
+    /// A read-only pass over all three roots must report nothing. The sentinel
+    /// write that proves delivery has to land under one of the roots, and a
+    /// root's own sentinel events would hide that root's read events, so the
+    /// pass is repeated with the sentinel under each root in turn and only the
+    /// other two roots are asserted quiet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_the_watched_trees_reports_no_change() {
+        for sentinel_root in [
+            WatchRoot::Projects,
+            WatchRoot::Sessions,
+            WatchRoot::CodexSessions,
+        ] {
+            let claude = tempfile::tempdir().unwrap();
+            let codex = tempfile::tempdir().unwrap();
+            let projects = claude.path().join("projects/-work-app");
+            let sessions = claude.path().join("sessions");
+            let rollouts = codex.path().join("sessions/2026/07/27");
+            for dir in [&projects, &sessions, &rollouts] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(projects.join("a.jsonl"), "{}\n").unwrap();
+            fs::write(sessions.join("1234.json"), "{}").unwrap();
+            fs::write(rollouts.join("rollout-1.jsonl"), "{}\n").unwrap();
+            let source = NotifyChangeSource::new(
+                &ClaudeHome::new(claude.path().to_path_buf()),
+                Some(&CodexHome::new(codex.path().to_path_buf())),
+            )
+            .unwrap();
+
+            // What a reload does: list directories and read files, nothing else.
+            for dir in [
+                claude.path().join("projects"),
+                projects.clone(),
+                sessions.clone(),
+                codex.path().join("sessions"),
+                rollouts.clone(),
+            ] {
+                for entry in fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_file() {
+                        fs::read_to_string(&path).unwrap();
+                    }
+                }
+            }
+
+            let sentinel = match sentinel_root {
+                WatchRoot::Projects => projects.join("sentinel.jsonl"),
+                WatchRoot::Sessions => sessions.join("sentinel.json"),
+                WatchRoot::CodexSessions => rollouts.join("sentinel.jsonl"),
+            };
+            fs::write(sentinel, "{}\n").unwrap();
+            let seen = collect_until(&source, sentinel_root, Duration::from_secs(5))
+                .expect("the sentinel write must be reported");
+
+            let from_reads: Vec<_> = seen
+                .iter()
+                .filter(|change| change.root != sentinel_root)
+                .collect();
+            assert!(
+                from_reads.is_empty(),
+                "reads reported as changes (sentinel under {sentinel_root:?}): {from_reads:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_events_cannot_change_content_and_everything_else_might() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+            RenameMode,
+        };
+
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Access(AccessKind::Any),
+        ] {
+            assert!(!can_change_content(&kind), "{kind:?}");
+        }
+        // `Any` and `Other` are what backends that cannot say more send; they
+        // must stay forwarded.
+        for kind in [
+            EventKind::Any,
+            EventKind::Other,
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+        ] {
+            assert!(can_change_content(&kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn writing_an_existing_file_is_still_reported() {
+        let claude = tempfile::tempdir().unwrap();
+        fs::create_dir_all(claude.path().join("projects")).unwrap();
+        fs::create_dir_all(claude.path().join("sessions")).unwrap();
+        let transcript = claude.path().join("projects/a.jsonl");
+        let live = claude.path().join("sessions/1234.json");
+        fs::write(&transcript, "{}\n").unwrap();
+        fs::write(&live, "{}").unwrap();
+        let source =
+            NotifyChangeSource::new(&ClaudeHome::new(claude.path().to_path_buf()), None).unwrap();
+
+        // No Create here: only the write to a file that already existed can
+        // be what raises the change.
+        for (path, root) in [
+            (transcript, WatchRoot::Projects),
+            (live, WatchRoot::Sessions),
+        ] {
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, b"{}\n").unwrap();
+            drop(file);
+            assert!(wait_for(&source, root, Duration::from_secs(2)), "{root:?}");
+        }
     }
 }
