@@ -329,17 +329,45 @@ const BRIGADE_QUIET_SETTLE: Duration = Duration::from_secs(5);
 /// still going when it ends arms at the first reading past it.
 const PROCESS_START_GRACE: Duration = Duration::from_secs(10);
 
+/// How long a pane is given to leave on its own after banto hangs it up
+/// ([`Cmd::HangUpPty`]) before banto kills it ([`Cmd::KillPty`]).
+///
+/// Every end banto asks for starts as a hang-up, the same console close an
+/// ordinary window close is, because a Claude process that is killed outright
+/// cannot clean up after itself. Claude Code 2.1.330 writes a "fullscreen boot
+/// pending" record into `~/.claude.json` at each launch and removes it only
+/// when the process runs its shutdown; a process killed within about ten
+/// seconds of starting leaves it, and two of those make Claude turn its
+/// fullscreen renderer off machine-wide, which breaks drag-select in every pane.
+/// That happened on 2026-11-21 at 22:25, when a brigade of five Claude panes was
+/// closed 6.5 s after it had been reopened (every pane then ended with
+/// `TerminateProcess(handle, 1)`). Measured on 2026-11-22 (Windows 10.0.26300,
+/// Claude 2.1.330, through banto-io's own `PortablePtyHost`): a hang-up ended a
+/// live Claude with exit code 129 in 767–813 ms (four runs), and a fullscreen
+/// one hung up after 5 s removed its own record.
+///
+/// Five seconds is not derived. Per Microsoft's documentation, as read in a
+/// design consultation and not measured here, Windows gives a console client
+/// told its console is closing about that long before it ends the process; it is
+/// also about six times the measured exit. A process that is still there at the
+/// deadline is not shutting down, and the kill is what the operator asked for.
+/// The shell's quit path waits for the same time (`SHUTDOWN_GRACE`).
+pub const PANE_END_GRACE: Duration = Duration::from_secs(5);
+
 /// How long a close waits for its panes to be gone before it gives up and lets
-/// the brigade be used again. A kill that does not take is silent — the shell
+/// the brigade be used again. A pane that does not end is silent — the shell
 /// ignores `Cmd::KillPty` for a key with no handle and a `kill()` that fails —
 /// so without a limit the brigade would refuse to be staged or closed until
-/// banto restarted. Measured, in banto's own pane log (`logs/panes.log`, read
-/// by the Goinkyo during the design consultation on 2026-11-20): six operator
-/// kills of idle panes, each exit following its kill within 140–192 ms. Panes
-/// in the middle of a turn were not measured. Ten seconds is a margin of fifty
-/// times over those, not a derived value. Giving up does not kill again: a pane
-/// that outlived one kill will not be helped by a loop of them, and the
-/// operator is told how many are left.
+/// banto restarted. A pane that hangs up normally is gone in under a second
+/// (see [`PANE_END_GRACE`]); one that does not is killed after
+/// [`PANE_END_GRACE`] and, killed, went within 140–192 ms in banto's own pane
+/// log (`logs/panes.log`, read by the Goinkyo during the design consultation on
+/// 2026-11-20: six operator kills of idle panes; panes in the middle of a turn
+/// were not measured). So a close that settles at all does so in about five and
+/// a quarter seconds at worst, and ten leaves the same margin over the kill as
+/// before, not a derived value. Giving up does not end anything again: a pane
+/// that outlived its hang-up and its kill will not be helped by a loop of them,
+/// and the operator is told how many are left.
 const CLOSE_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// How long after banto last wrote input into a pane the quit question counts
@@ -1539,7 +1567,7 @@ pub struct EmporiumState {
     /// (`update_member_session_moved`) — both know the renamed member's
     /// own token, so both update this entry in place when that token is
     /// `"goinkyo"` and an entry for its brigade already exists — and
-    /// dropped (not `Cmd::KillPty`'d — nothing to kill twice) if the pane
+    /// dropped (not hung up — nothing to end twice) if the pane
     /// closes on its own first (`update_pty_exited`, `update_pty_output_lost`),
     /// which also forgoes the one reload `NoGoinkyo` asks for.
     ///
@@ -1663,14 +1691,27 @@ pub struct EmporiumState {
     /// tell an exit banto caused from one it merely observed.
     ///
     /// Those two arrive as the same event through the same poll loop
-    /// (`Cmd::KillPty`'s own doc: the Cmd only makes the exit happen, the
+    /// (`Cmd::HangUpPty`'s own doc: the Cmd only makes the exit happen, the
     /// passive fold is what cleans up), and only this record separates them.
-    /// Written by [`kill_pane`] and nowhere else — a `Cmd::KillPty` built by
+    /// Written by [`kill_pane`] and nowhere else — a `Cmd::HangUpPty` built by
     /// hand somewhere else would read, correctly as far as this state can
     /// see, as a child that died on its own. The member the pane held when the
     /// kill was issued is kept with it: unstaging removes that membership before
     /// the exit arrives, and the exit's log line still has to name it.
     expected_exits: HashMap<SessionKey, Option<(BrigadeId, MemberToken)>>,
+    /// Panes [`kill_pane`] has hung up and not yet seen leave, each with the
+    /// moment [`PANE_END_GRACE`] runs out. `None` is a hang-up requested during
+    /// the update being handled: [`force_overdue_hangups`] stamps it at the end of
+    /// that same update, so every caller of [`kill_pane`] is timed from the
+    /// event that asked without a clock having to be passed to it.
+    ///
+    /// An entry goes with the exit it waits for (`update_pty_exited`), when a new
+    /// process is spawned under its key (the old one's deadline must never end
+    /// that one), and when the force is issued; it follows its pane through a
+    /// re-key. It is deliberately not tied to the pane's screen: a pane whose
+    /// output was lost has no screen and is still a process that may have to be
+    /// killed.
+    hangups: HashMap<SessionKey, Option<Instant>>,
     /// When each member's pane was last restarted by [`update_pty_exited`],
     /// so a member that cannot stay up is not restarted forever. Never
     /// cleared on success: a member that dies once an hour should be
@@ -1691,9 +1732,13 @@ pub struct EmporiumState {
 /// without this it would be respawned as fast as the process can fail.
 const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Ask for `key`'s pane to end, recording that banto is the one asking.
+/// Ask for `key`'s pane to end, recording that banto is the one asking. The pane
+/// is hung up ([`Cmd::HangUpPty`]) and [`force_overdue_hangups`] kills it if it
+/// has not gone within [`PANE_END_GRACE`]. `None` when a hang-up of it is already
+/// on its way: one request, one deadline, and the expected-exit record is the
+/// same one either way.
 ///
-/// Every kill banto performs goes through here. The alternative — reading the
+/// Every end banto asks for goes through here. The alternative — reading the
 /// surrounding state at exit time — very nearly works for the callers that take
 /// the pane off the stage as they kill (a dismissed Worker, both Goinkyo paths,
 /// and a disband for the panes that were staged): by the time the exit arrives
@@ -1712,13 +1757,43 @@ const RELAUNCH_COOLDOWN: Duration = Duration::from_secs(60);
 /// Worker's pane unstage it, which removes the member's maps. So every caller
 /// issues this before it unstages. A kill already on record keeps the member it
 /// was issued with.
-fn kill_pane(state: &mut EmporiumState, key: SessionKey) -> Cmd {
+fn kill_pane(state: &mut EmporiumState, key: SessionKey) -> Option<Cmd> {
     let member = state.member_of(&key);
     let recorded = state.expected_exits.entry(key.clone()).or_default();
     if recorded.is_none() {
         *recorded = member;
     }
-    Cmd::KillPty { key }
+    if state.hangups.contains_key(&key) {
+        return None;
+    }
+    state.hangups.insert(key.clone(), None);
+    Some(Cmd::HangUpPty { key })
+}
+
+/// The kills owed by hang-ups whose [`PANE_END_GRACE`] has run out, and the
+/// stamping of the ones requested by the update being handled. Run at the end of
+/// every update, so the first event after the deadline issues the kill: the tick
+/// at the latest, and a pane's own output or a keypress sooner. Each pane is
+/// killed once; the record of its hang-up goes with the kill, and what it asked
+/// for ([`expected_exits`](EmporiumState::expected_exits)) stays until the exit.
+fn force_overdue_hangups(state: &mut EmporiumState, now: Instant) -> Vec<Cmd> {
+    if state.hangups.is_empty() {
+        return Vec::new();
+    }
+    let mut overdue = Vec::new();
+    for (key, deadline) in &mut state.hangups {
+        if now >= *deadline.get_or_insert(now + PANE_END_GRACE) {
+            overdue.push(key.clone());
+        }
+    }
+    overdue.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    for key in &overdue {
+        state.hangups.remove(key);
+    }
+    overdue
+        .into_iter()
+        .map(|key| Cmd::KillPty { key })
+        .collect()
 }
 
 impl EmporiumState {
@@ -1814,6 +1889,7 @@ impl EmporiumState {
             previous_ring_set: None,
             last_attention_bell: None,
             expected_exits: HashMap::new(),
+            hangups: HashMap::new(),
             last_relaunch: HashMap::new(),
             spawn_order: HashMap::new(),
             next_spawn: 0,
@@ -1930,6 +2006,9 @@ impl EmporiumState {
         }
         if let Some(record) = self.expected_exits.remove(old_key) {
             self.expected_exits.insert(new_key.clone(), record);
+        }
+        if let Some(deadline) = self.hangups.remove(old_key) {
+            self.hangups.insert(new_key.clone(), deadline);
         }
         if let Some(value) = self.last_relaunch.remove(old_key) {
             self.last_relaunch.insert(new_key.clone(), value);
@@ -3877,10 +3956,22 @@ pub enum Cmd {
         disallowed_tools: Option<String>,
         autocompact: Option<String>,
     },
-    /// Kill the child at `key` — active termination (a confirmed prefix-`x`
-    /// dismissal or kill, a disbanded brigade's Workers, a Goinkyo's end). The passive `Event::PtyExited` fold
-    /// is what actually cleans up the pane once this takes effect; this Cmd
-    /// is only ever "make the exit happen".
+    /// Hang the child at `key` up: close its terminal the way closing an ordinary
+    /// window does, so the process runs its own shutdown. How every end banto
+    /// asks for starts (a confirmed prefix-`x` dismissal or kill, a closed or
+    /// disbanded brigade's panes, a Goinkyo's end, a reopen). Does not wait and
+    /// does not kill: [`Cmd::KillPty`] follows from the core if the pane is still
+    /// there [`PANE_END_GRACE`] later. The passive `Event::PtyExited` fold is what
+    /// actually cleans up the pane once the process ends; this Cmd is only ever
+    /// "make the exit happen". The shell does the closing off the event loop,
+    /// where closing a console can block.
+    HangUpPty {
+        key: SessionKey,
+    },
+    /// Kill the child at `key` outright: the force at the end of
+    /// [`PANE_END_GRACE`] for a pane that was hung up and did not leave. Issued
+    /// by the core only after a [`Cmd::HangUpPty`] for the same key, and never
+    /// for an exit that has been seen.
     KillPty {
         key: SessionKey,
     },
@@ -4820,6 +4911,7 @@ pub fn update(
     validate_drag(state, app);
     settle_pending_quit(state, app, now);
     settle_closing(state, app, now);
+    cmds.extend(force_overdue_hangups(state, now));
     cmds.extend(resize_staged_tiles(state));
     cmds.extend(persist_preferences(state));
     if overlay_may_have_changed {
@@ -6654,8 +6746,8 @@ fn open_close_brigade(state: &mut EmporiumState, app: &mut App, brigade_id: Brig
 ///
 /// The panes are read from the state now, not from when the dialog opened: one
 /// that ended meanwhile is simply not there, and one that began is ended too. All
-/// of them are killed through [`kill_pane`] (a hard kill, as every kill banto
-/// issues is), which records each exit as one banto asked for, so a Worker is not
+/// of them are ended through [`kill_pane`] (hung up, then killed if they stay past
+/// [`PANE_END_GRACE`]), which records each exit as one banto asked for, so a Worker is not
 /// relaunched and not dismissed for having left, and a Director is not read as
 /// having wandered off. The brigade, its members and their session ids, its mail
 /// and read cursors, request records and a consultation in progress all stay in
@@ -6668,7 +6760,7 @@ fn open_close_brigade(state: &mut EmporiumState, app: &mut App, brigade_id: Brig
 /// half-counted is dropped here rather than when their exits arrive
 /// ([`drop_leftovers_of_ended_panes`], which says why). The exits come as
 /// ordinary events and are folded into one line by [`settle_closing`], which also
-/// gives up after [`CLOSE_GIVE_UP`] if a kill did not take.
+/// gives up after [`CLOSE_GIVE_UP`] if a pane did not end.
 fn confirm_close_brigade_modal(state: &mut EmporiumState, app: &mut App, now: Instant) -> Vec<Cmd> {
     let Some(Modal::ConfirmCloseBrigade { brigade_id, .. }) = app.modal() else {
         return Vec::new();
@@ -6690,7 +6782,7 @@ fn confirm_close_brigade_modal(state: &mut EmporiumState, app: &mut App, now: In
     drop_leftovers_of_ended_panes(state, brigade_id, &hosted);
     hosted
         .into_iter()
-        .map(|key| kill_pane(state, key))
+        .filter_map(|key| kill_pane(state, key))
         .collect()
 }
 
@@ -6768,7 +6860,7 @@ fn confirm_kill_modal(state: &mut EmporiumState, app: &mut App) -> Vec<Cmd> {
     let dismiss = dismisses.is_some();
     app.close_modal();
     if !dismiss {
-        return vec![kill_pane(state, key)];
+        return kill_pane(state, key).into_iter().collect();
     }
     state.pending_dismiss = Some(key.clone());
     state.pending_dismiss_member = None;
@@ -7200,7 +7292,7 @@ fn confirm_director_reopen_modal(state: &mut EmporiumState, app: &mut App) -> Ve
     app.close_modal();
     let director_key = SessionKey::from_id(&director_row_id);
     state.pending_director_reopen = Some(director_row_id);
-    vec![kill_pane(state, director_key)]
+    kill_pane(state, director_key).into_iter().collect()
 }
 
 /// Stage `row` solo: reuse its screen if already open, else request a spawn.
@@ -7504,7 +7596,7 @@ fn stage_brigade(
             // before the unstage that takes the duplicate's membership away, so
             // its exit still names the member; the survivor is never touched.
             for duplicate in live.iter().filter(|key| **key != survivor) {
-                cmds.push(kill_pane(state, duplicate.clone()));
+                cmds.extend(kill_pane(state, duplicate.clone()));
                 state.unstage(duplicate);
                 duplicates += 1;
             }
@@ -8664,6 +8756,8 @@ fn update_spawned(
     // otherwise leave its record behind to suppress the first genuine crash
     // of whatever opens under this key next.
     state.expected_exits.remove(&key);
+    // And its hang-up's deadline, which must not end the process that replaces it.
+    state.hangups.remove(&key);
     // A new process starts with nothing known about it, whatever the pane that
     // held this key before was last read as.
     state.quiescence.remove(&key);
@@ -8719,7 +8813,7 @@ fn update_spawned(
                     .insert(key.clone(), DIRECTOR_TOKEN.to_string());
                 state.member_brigades.insert(key.clone(), *brigade_id);
             }
-            return vec![kill_pane(state, key)];
+            return kill_pane(state, key).into_iter().collect();
         }
     }
     match pending {
@@ -9308,6 +9402,7 @@ fn update_pty_exited(
     now: Instant,
 ) -> Vec<Cmd> {
     let banto_asked = state.expected_exits.remove(&key).is_some();
+    state.hangups.remove(&key);
     // Read before the unstage below takes the maps: an exit in a brigade that is
     // being closed is one of the panes the close ended, and says nothing itself.
     let in_closing_brigade = state
@@ -9438,7 +9533,7 @@ fn update_pty_output_lost(
     let cmds = if was_expected {
         Vec::new()
     } else {
-        vec![kill_pane(state, key.clone())]
+        kill_pane(state, key.clone()).into_iter().collect()
     };
     state.lost_output_waiting_for_exit.insert(key.clone());
     state.screens.remove(&key);
@@ -9877,7 +9972,7 @@ fn update_brigade_formed(
         // MCP/hook wiring), so it is killed and reopened here too, same as
         // the interactive gate, just without asking first.
         state.pending_director_wiring = Some(wiring);
-        vec![kill_pane(state, director_key)]
+        kill_pane(state, director_key).into_iter().collect()
     } else {
         open_director_with_wiring(state, app, wiring)
     };
@@ -10153,7 +10248,7 @@ fn update_disbanded(
             state.set_status("brigade disbanded".to_string(), now);
             let mut cmds: Vec<Cmd> = other_keys
                 .into_iter()
-                .map(|key| kill_pane(state, key))
+                .filter_map(|key| kill_pane(state, key))
                 .collect();
             cmds.push(Cmd::Reload);
             cmds
@@ -10305,7 +10400,7 @@ fn update_worker_dismissed(
             if staged {
                 let kill = kill_pane(state, key.clone());
                 state.unstage(&key);
-                vec![kill, Cmd::Reload]
+                kill.into_iter().chain([Cmd::Reload]).collect()
             } else {
                 vec![Cmd::Reload]
             }
@@ -11224,7 +11319,7 @@ fn update_goinkyo_awaiting_spawn(
             // applies either way. A pane whose brigade is off stage is still
             // a running process — panes are pumped whether staged or not —
             // and this entry was the last thing that knew which process it
-            // was. `Cmd::KillPty` naming a key with no handle is a no-op, so
+            // was. `Cmd::HangUpPty` naming a key with no handle is a no-op, so
             // a pane that already closed on its own costs nothing here.
             let staged = matches!(
                 &state.stage,
@@ -11243,7 +11338,7 @@ fn update_goinkyo_awaiting_spawn(
             // a pane to release gets this far, which is once per consultation. A
             // consultation whose pane died first has no entry left (see
             // `update_pty_exited`) and gets no reload from here.
-            return vec![kill, Cmd::Reload];
+            return kill.into_iter().chain([Cmd::Reload]).collect();
         }
         // A brigade being closed has no Goinkyo to start: its Director's pane is
         // ending, and a Goinkyo started now would be a process of a brigade that
@@ -11317,7 +11412,7 @@ fn update_goinkyo_awaiting_spawn(
         }
         // An ended consultation, as in `NoGoinkyo`, and released only once (the
         // entry is gone): its session was archived and is still hidden here.
-        return vec![kill, Cmd::Reload];
+        return kill.into_iter().chain([Cmd::Reload]).collect();
     }
     // A new consultation starts with nothing of the last one's: its end may not
     // have been seen (dismissed and summoned again inside one tick).
@@ -11718,6 +11813,9 @@ mod member_exit_tests;
 mod close_brigade_tests;
 
 #[cfg(test)]
+mod pane_end_tests;
+
+#[cfg(test)]
 mod startup_notice_tests;
 
 #[cfg(test)]
@@ -11963,7 +12061,7 @@ mod tests {
             Some(Modal::ConfirmDirectorReopen { .. })
         ));
         assert!(
-            matches!(confirm_director_reopen_modal(&mut state, &mut app).as_slice(), [Cmd::KillPty { key }] if key == &real)
+            matches!(confirm_director_reopen_modal(&mut state, &mut app).as_slice(), [Cmd::HangUpPty { key }] if key == &real)
         );
         let cmds = update(
             &mut state,
@@ -13607,7 +13705,7 @@ mod tests {
 
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
+            vec![Cmd::HangUpPty {
                 key: SessionKey::from_id("dir")
             }],
             "must not spawn anything until the existing pane is confirmed gone"
@@ -14293,7 +14391,7 @@ mod tests {
 
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
+            vec![Cmd::HangUpPty {
                 key: SessionKey::from_id("dir")
             }]
         );
@@ -14396,7 +14494,7 @@ mod tests {
         let cmds = confirm_director_reopen_modal(&mut state, &mut app);
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
+            vec![Cmd::HangUpPty {
                 key: SessionKey::from_id("dir")
             }]
         );
@@ -27663,7 +27761,7 @@ mod tests {
             test_instant(),
         );
         assert!(
-            matches!(released.as_slice(), [Cmd::KillPty { key }, Cmd::Reload] if *key == SessionKey::new_worker(6, "goinkyo")),
+            matches!(released.as_slice(), [Cmd::HangUpPty { key }, Cmd::Reload] if *key == SessionKey::new_worker(6, "goinkyo")),
             "the pane goes with the row, staged or not: {released:?}"
         );
         assert!(!state.goinkyo_pane.contains_key(&6));
@@ -27743,8 +27841,8 @@ mod tests {
             test_instant(),
         );
         assert!(
-            matches!(&end_cmds[..], [Cmd::KillPty { key }, Cmd::Reload] if *key == goinkyo_key),
-            "expected exactly one KillPty for the Goinkyo's own pane, then a Reload, got {end_cmds:?}"
+            matches!(&end_cmds[..], [Cmd::HangUpPty { key }, Cmd::Reload] if *key == goinkyo_key),
+            "expected exactly one HangUpPty for the Goinkyo's own pane, then a Reload, got {end_cmds:?}"
         );
         let Stage::Brigade { panes, .. } = &state.stage else {
             panic!("expected the brigade to stay staged — only the one pane leaves");
@@ -27885,7 +27983,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::KillPty {
+                Cmd::HangUpPty {
                     key: old_key.clone()
                 },
                 Cmd::Reload
@@ -27984,7 +28082,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::KillPty {
+                Cmd::HangUpPty {
                     key: old_key.clone()
                 },
                 Cmd::Reload
@@ -28210,7 +28308,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![
-                Cmd::KillPty {
+                Cmd::HangUpPty {
                     key: SessionKey::from_id("g1")
                 },
                 Cmd::Reload
@@ -29405,7 +29503,7 @@ mod tests {
 
         assert!(matches!(
             cmds.as_slice(),
-            [Cmd::KillPty { key }] if key.as_str() == "sess-1"
+            [Cmd::HangUpPty { key }] if key.as_str() == "sess-1"
         ));
         assert!(app.modal().is_none());
     }
@@ -29474,7 +29572,7 @@ mod tests {
 
         assert!(
             cmds.iter()
-                .any(|cmd| matches!(cmd, Cmd::KillPty { key: killed } if *killed == key)),
+                .any(|cmd| matches!(cmd, Cmd::HangUpPty { key: killed } if *killed == key)),
             "dismissing a staged Worker kills its pane: {cmds:?}"
         );
         let facts = state.pane_facts(&app, &key, now);
@@ -29994,7 +30092,7 @@ mod tests {
 
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty {
+            vec![Cmd::HangUpPty {
                 key: SessionKey::from_id("dir")
             }]
         );
@@ -30031,7 +30129,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }, Cmd::Reload]);
+        assert_eq!(cmds, vec![Cmd::HangUpPty { key: w1 }, Cmd::Reload]);
         // w1 left the hidden set (it's a dismissed member now, honestly
         // surfaced as an ordinary session) — w2 is still hidden.
         assert_eq!(app.filtered_len(), 2);
@@ -30122,7 +30220,7 @@ mod tests {
         let killed: Vec<&SessionKey> = cmds[..cmds.len() - 1]
             .iter()
             .map(|cmd| match cmd {
-                Cmd::KillPty { key } => key,
+                Cmd::HangUpPty { key } => key,
                 _ => panic!("expected only KillPty cmds, then a Reload, from a disband"),
             })
             .collect();
@@ -30169,7 +30267,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(cmds, vec![Cmd::KillPty { key: w1 }, Cmd::Reload]);
+        assert_eq!(cmds, vec![Cmd::HangUpPty { key: w1 }, Cmd::Reload]);
         match &state.stage {
             Stage::Solo(key) => assert_eq!(key, &director),
             _ => panic!("expected the director to remain staged solo"),
@@ -30259,7 +30357,7 @@ mod tests {
             "Enter on the modal asks the store to disband exactly that brigade: {asked:?}"
         );
         assert!(
-            !asked.iter().any(|cmd| matches!(cmd, Cmd::KillPty { .. })),
+            !asked.iter().any(|cmd| matches!(cmd, Cmd::HangUpPty { .. })),
             "the confirm itself ends nothing: {asked:?}"
         );
         update(
@@ -30396,12 +30494,12 @@ mod tests {
         let (cmds, director, worker) = disband_brigade_two_left_for_a_solo_session(&mut state);
 
         assert!(
-            cmds.contains(&Cmd::KillPty {
+            cmds.contains(&Cmd::HangUpPty {
                 key: worker.clone()
             }),
             "the Worker of the disbanded brigade is still running off-stage: {cmds:?}"
         );
-        assert!(!cmds.contains(&Cmd::KillPty { key: director }));
+        assert!(!cmds.contains(&Cmd::HangUpPty { key: director }));
     }
 
     #[test]
@@ -30410,12 +30508,12 @@ mod tests {
         let (cmds, director, worker) = disband_brigade_two_left_for_brigade_one(&mut state);
 
         assert!(
-            cmds.contains(&Cmd::KillPty {
+            cmds.contains(&Cmd::HangUpPty {
                 key: worker.clone()
             }),
             "the Worker of the disbanded brigade is still running off-stage: {cmds:?}"
         );
-        assert!(!cmds.contains(&Cmd::KillPty { key: director }));
+        assert!(!cmds.contains(&Cmd::HangUpPty { key: director }));
     }
 
     #[test]
@@ -30431,7 +30529,7 @@ mod tests {
             let mut state = EmporiumState::new(PrefixKey::default());
             let (cmds, director, worker) = scenario(&mut state);
 
-            assert!(!cmds.contains(&Cmd::KillPty {
+            assert!(!cmds.contains(&Cmd::HangUpPty {
                 key: director.clone()
             }));
             assert!(state.screens.contains_key(&director));
@@ -30479,23 +30577,23 @@ mod tests {
 
         for ended in [&worker, &goinkyo] {
             assert!(
-                cmds.contains(&Cmd::KillPty { key: ended.clone() }),
+                cmds.contains(&Cmd::HangUpPty { key: ended.clone() }),
                 "{ended:?} must end with its brigade: {cmds:?}"
             );
         }
-        assert!(!cmds.contains(&Cmd::KillPty {
+        assert!(!cmds.contains(&Cmd::HangUpPty {
             key: director.clone()
         }));
         assert!(
             !cmds
                 .iter()
-                .any(|cmd| matches!(cmd, Cmd::KillPty { key } if *key == solo)),
+                .any(|cmd| matches!(cmd, Cmd::HangUpPty { key } if *key == solo)),
             "a session of no brigade is nobody's to end: {cmds:?}"
         );
 
         // The tick after: the roster of a deleted brigade has no Goinkyo, so the
-        // release names the pane the disband already closed. The same kill again
-        // is the harmless repeat the docs promise, and the guard is released.
+        // release names the pane the disband already closed. Asking again adds
+        // no second hang-up (one request, one deadline), and the guard is released.
         let released = update(
             &mut state,
             &mut app,
@@ -30505,18 +30603,10 @@ mod tests {
             },
             test_instant(),
         );
-        assert_eq!(
-            released,
-            vec![
-                Cmd::KillPty {
-                    key: goinkyo.clone()
-                },
-                Cmd::Reload
-            ]
-        );
+        assert_eq!(released, vec![Cmd::Reload]);
         assert!(!state.goinkyo_pane.contains_key(&2));
 
-        // And its exit, whichever of the two kills the process answers to, is an
+        // And its exit, whichever of the two ends the process answers to, is an
         // exit banto asked for: nothing is reopened.
         let exited = update(
             &mut state,
@@ -30549,12 +30639,12 @@ mod tests {
 
         assert_eq!(
             cmds,
-            vec![Cmd::KillPty { key: worker_2 }, Cmd::Reload],
+            vec![Cmd::HangUpPty { key: worker_2 }, Cmd::Reload],
             "brigade 2's Worker only"
         );
-        assert!(!cmds.contains(&Cmd::KillPty { key: director_2 }));
-        assert!(!cmds.contains(&Cmd::KillPty { key: worker_1 }));
-        assert!(!cmds.contains(&Cmd::KillPty { key: director_1 }));
+        assert!(!cmds.contains(&Cmd::HangUpPty { key: director_2 }));
+        assert!(!cmds.contains(&Cmd::HangUpPty { key: worker_1 }));
+        assert!(!cmds.contains(&Cmd::HangUpPty { key: director_1 }));
     }
 
     #[test]
@@ -30599,7 +30689,7 @@ mod tests {
         sorted_keys(
             cmds.iter()
                 .filter_map(|cmd| match cmd {
-                    Cmd::KillPty { key } => Some(key.clone()),
+                    Cmd::HangUpPty { key } => Some(key.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -30719,7 +30809,7 @@ mod tests {
 
         assert_eq!(killed_keys(&cmds), vec![worker], "{cmds:?}");
         for spared in [&director, &unnamed, &other] {
-            assert!(!cmds.contains(&Cmd::KillPty {
+            assert!(!cmds.contains(&Cmd::HangUpPty {
                 key: spared.clone()
             }));
         }
@@ -32083,7 +32173,7 @@ mod tests {
         let worker = SessionKey::from_id("w1");
 
         let kill = kill_pane(&mut state, worker.clone());
-        assert!(matches!(&kill, Cmd::KillPty { key } if *key == worker));
+        assert!(matches!(&kill, Some(Cmd::HangUpPty { key }) if *key == worker));
 
         let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
 
@@ -32111,7 +32201,7 @@ mod tests {
             Ok((HashSet::new(), HashSet::new())),
             test_instant(),
         );
-        assert!(matches!(&kill[..], [Cmd::KillPty { key }, Cmd::Reload] if *key == worker));
+        assert!(matches!(&kill[..], [Cmd::HangUpPty { key }, Cmd::Reload] if *key == worker));
 
         let cmds = worker_exits(&mut state, &mut app, &brigade, test_instant());
 

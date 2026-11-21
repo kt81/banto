@@ -6598,8 +6598,8 @@ fn disband(
     for other in others {
         assert!(
             cmds.iter()
-                .any(|cmd| matches!(cmd, Cmd::KillPty { key } if key == *other)),
-            "{other:?} is killed: {cmds:?}"
+                .any(|cmd| matches!(cmd, Cmd::HangUpPty { key } if key == *other)),
+            "{other:?} is hung up: {cmds:?}"
         );
         send(
             state,

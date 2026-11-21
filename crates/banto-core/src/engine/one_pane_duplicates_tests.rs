@@ -101,7 +101,7 @@ fn kills(cmds: &[Cmd]) -> Vec<String> {
     let mut keys: Vec<String> = cmds
         .iter()
         .filter_map(|cmd| match cmd {
-            Cmd::KillPty { key } => Some(key.as_str().to_string()),
+            Cmd::HangUpPty { key } => Some(key.as_str().to_string()),
             _ => None,
         })
         .collect();

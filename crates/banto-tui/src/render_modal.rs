@@ -395,8 +395,9 @@ fn render_confirm_disband_modal(frame: &mut Frame, name: &str, area: Rect) {
 }
 
 /// Render the emporium's close-a-brigade confirm dialog: how many sessions end,
-/// which of them are not idle and why, and what is kept. Closing is a hard kill,
-/// so the operator is told who would lose a turn in flight, by the same
+/// which of them are not idle and why, and what is kept. A close still ends turns
+/// in flight (the agent is hung up, and killed if it does not leave), so the
+/// operator is told who would lose one, by the same
 /// classification and wording as the quit question; and told that nothing is
 /// deleted, since "close" next to "disband" must not read as the same
 /// thing. With no reading (the caller had none) the count and the names are
@@ -510,23 +511,23 @@ fn render_confirm_director_reopen_modal(frame: &mut Frame, name: &str, area: Rec
 /// than the Director (`dismisses: Some(who)`) confirming dismisses it, and the
 /// dialog says exactly that — who, that it leaves the brigade for good, and that
 /// its session itself is not deleted. A solo pane (`dismisses: None`) keeps the
-/// plain kill prompt: ending the process is all it does. (A Director's pane has
+/// plain end prompt: ending the process is all it does. (A Director's pane has
 /// a dialog of its own, [`render_confirm_close_brigade_modal`].)
 fn render_confirm_kill_modal(frame: &mut Frame, title: &str, dismisses: Option<&str>, area: Rect) {
     let Some(who) = dismisses else {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .title(" Kill Session \u{2014} confirm ")
-            .title_bottom(" Enter kill  Esc cancel ");
+            .title(" End Session \u{2014} confirm ")
+            .title_bottom(" Enter end  Esc cancel ");
         let inner = pad_horizontal(block.inner(area));
         frame.render_widget(block, area);
 
-        let prompt = truncate_to_width(&format!("Kill \"{title}\"?"), inner.width);
+        let prompt = truncate_to_width(&format!("End \"{title}\"?"), inner.width);
         let lines = vec![
             Line::from(prompt),
             Line::from(Span::styled(
-                "Ends the process now. The session itself is untouched.",
+                "Closes its terminal and ends the process. The session itself is untouched.",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -811,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn director_or_solo_kill_modal_is_the_plain_kill_prompt() {
+    fn director_or_solo_kill_modal_is_the_plain_end_prompt() {
         let area = Rect::new(2, 2, 50, 10);
         let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
         terminal
@@ -820,9 +821,10 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
 
         assert!(
-            text.contains("Kill \"sess-1\"?"),
+            text.contains("End \"sess-1\"?"),
             "missing plain prompt:\n{text}"
         );
+        assert!(text.contains("Enter end"), "missing the hint:\n{text}");
         assert!(
             !text.contains("Dismiss"),
             "a Director/solo pane must not offer to dismiss:\n{text}"

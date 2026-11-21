@@ -59,6 +59,9 @@ pub(crate) struct PtyHandle {
     output_loss_reported: bool,
     /// How long that wait lasts. A field so a test need not sleep.
     output_lost_grace: std::time::Duration,
+    /// [`Self::begin_graceful_close`] has run: the child has been hung up and
+    /// the master given away, so a second request has nothing left to do.
+    hung_up: bool,
 }
 
 /// How long a disconnected output stream waits for the child's own exit report
@@ -86,6 +89,7 @@ impl PtyHandle {
             output_lost_since: None,
             output_loss_reported: false,
             output_lost_grace: OUTPUT_LOST_GRACE,
+            hung_up: false,
         })
     }
 
@@ -203,8 +207,13 @@ impl PtyHandle {
         let _ = self.io.resizer.resize(rows, cols);
     }
 
-    /// Kill the child (`Cmd::KillPty`'s executor).
+    /// Kill the child outright (`Cmd::KillPty`'s executor): the force after a
+    /// hang-up that was not answered in time. Skipped for a child already known
+    /// to have exited, for the reason [`Self::begin_graceful_close`] gives.
     pub(crate) fn kill(&mut self) -> Result<()> {
+        if self.has_exited() {
+            return Ok(());
+        }
         self.io.killer.kill()
     }
 
@@ -229,14 +238,28 @@ impl PtyHandle {
     /// not a mistake worth risking to save a no-op.
     ///
     /// Does not kill and does not wait — pair with [`Self::has_exited`] and a
-    /// deadline, then fall back to [`Self::kill`] for stragglers (see
-    /// `emporium::shutdown_handles`, which owns that policy).
+    /// deadline, then fall back to [`Self::kill`] for stragglers (the core's
+    /// `PANE_END_GRACE` for a pane that is ended, `emporium::shutdown_handles`
+    /// for quit). Idempotent: a handle already hung up is left alone.
+    ///
+    /// The two drops are done on a helper thread, on every platform. Dropping the
+    /// master is `ClosePseudoConsole` on Windows, which Microsoft documents as
+    /// waiting indefinitely for the pseudoconsole to exit before Windows 11 24H2
+    /// (build 26100): done here it would stop the event loop for as long as the
+    /// child takes, and for every pane in turn on quit. Elsewhere it is a quick
+    /// `close`, and one path is easier to keep right than two. A thread that
+    /// cannot be started leaves the drops to this one, which is what it was.
     pub(crate) fn begin_graceful_close(&mut self) {
+        if self.hung_up {
+            return;
+        }
+        self.hung_up = true;
         if !self.has_exited() {
             let _ = self.io.hangup.hangup();
         }
-        self.io.input = Box::new(std::io::sink());
-        self.io.resizer = Box::new(NullResizer);
+        let input = std::mem::replace(&mut self.io.input, Box::new(std::io::sink()));
+        let master = std::mem::replace(&mut self.io.resizer, Box::new(NullResizer));
+        drop_off_thread(input, master);
     }
 
     /// Non-blocking: has the child actually exited? Distinct from
@@ -248,6 +271,17 @@ impl PtyHandle {
         self.latch_exit();
         self.exit_reason.is_some()
     }
+}
+
+/// Drops the child's writer and the PTY master on a thread of their own, in that
+/// order, and does not wait for them (see [`PtyHandle::begin_graceful_close`]).
+fn drop_off_thread(input: Box<dyn Write + Send>, master: Box<dyn Resizer>) {
+    let _ = std::thread::Builder::new()
+        .name("pty-close".to_string())
+        .spawn(move || {
+            drop(input);
+            drop(master);
+        });
 }
 
 /// Swapped in by [`PtyHandle::begin_graceful_close`]: resizing a child
@@ -684,6 +718,88 @@ mod tests {
             "master/resizer was dropped"
         );
         assert_eq!(*kills.lock().unwrap(), 0, "a graceful close is not a kill");
+    }
+
+    #[test]
+    fn a_second_hang_up_request_signals_nothing_more() {
+        let hangups = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            hangups: hangups.clone(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        handle.begin_graceful_close();
+        handle.begin_graceful_close();
+        assert_eq!(*hangups.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn the_force_after_a_hang_up_still_reaches_the_killer() {
+        // The hang-up gives the master away; the kill must not depend on it.
+        let kills = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            kills: kills.clone(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        handle.begin_graceful_close();
+        handle.kill().unwrap();
+        assert_eq!(*kills.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_kill_for_a_child_that_has_already_exited_is_not_sent() {
+        // Its pid may be someone else's by now, and the core's deadline can fire
+        // between the exit and the event that carries it.
+        let kills = Arc::new(Mutex::new(0));
+        let host = MockPtyHost {
+            kills: kills.clone(),
+            ..Default::default()
+        };
+        let mut handle = open_handle(&host);
+        host.fire_exit();
+        handle.kill().unwrap();
+        assert_eq!(*kills.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_master_that_blocks_in_its_drop_does_not_block_the_hang_up() {
+        // ClosePseudoConsole on Windows before build 26100 waits for the child.
+        struct BlockedOnDrop(Option<std::sync::mpsc::Receiver<()>>);
+        impl banto_io::pty::Resizer for BlockedOnDrop {
+            fn resize(&self, _rows: u16, _cols: u16) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for BlockedOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.recv();
+                }
+            }
+        }
+
+        let host = MockPtyHost::default();
+        let mut handle = open_handle(&host);
+        let (release, blocked) = std::sync::mpsc::channel();
+        handle.io.resizer = Box::new(BlockedOnDrop(Some(blocked)));
+
+        // The call runs on a thread of its own so that a regression (the drop
+        // made synchronous) is a failed assertion after the bound and not a test
+        // that never returns.
+        let (done, returned) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            handle.begin_graceful_close();
+            let _ = done.send(());
+        });
+        let answered = returned.recv_timeout(Duration::from_secs(2));
+        // Let a blocked drop go either way, so no thread outlives the test.
+        let _ = release.send(());
+        let _ = caller.join();
+        assert!(
+            answered.is_ok(),
+            "the hang-up waited for the master to close"
+        );
     }
 
     #[test]

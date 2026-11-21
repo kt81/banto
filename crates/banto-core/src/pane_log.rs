@@ -455,9 +455,10 @@ pub fn event_lines(ev: &Event, facts: &PaneFacts) -> Vec<Line> {
 /// Exhaustive, as [`event_name`] is.
 pub fn cmd_handle_key(cmd: &Cmd) -> Option<&SessionKey> {
     match cmd {
-        Cmd::OpenEmbedded { key, .. } | Cmd::OpenCodexTrustPane { key } | Cmd::KillPty { key } => {
-            Some(key)
-        }
+        Cmd::OpenEmbedded { key, .. }
+        | Cmd::OpenCodexTrustPane { key }
+        | Cmd::HangUpPty { key }
+        | Cmd::KillPty { key } => Some(key),
         Cmd::RekeyPty { from, .. } => Some(from),
         Cmd::Store(_)
         | Cmd::WritePty { .. }
@@ -480,6 +481,7 @@ pub fn is_logged_cmd(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::OpenEmbedded { .. }
         | Cmd::OpenCodexTrustPane { .. }
+        | Cmd::HangUpPty { .. }
         | Cmd::KillPty { .. }
         | Cmd::RekeyPty { .. } => true,
         Cmd::Store(intent) => store_line(intent, "").is_some(),
@@ -533,6 +535,10 @@ pub fn cmd_line(cmd: &Cmd, by: &'static str, facts: CmdFacts) -> Option<Line> {
                 .flag("replaced", facts.replaced),
             facts.pid,
         ),
+        Cmd::HangUpPty { key } => Line::new("HangUpPty")
+            .key("key", key)
+            .word("by", by)
+            .flag("handle", facts.handle_present),
         Cmd::KillPty { key } => Line::new("KillPty")
             .key("key", key)
             .word("by", by)

@@ -1367,7 +1367,7 @@ or a solo pane's own process now reports another session id; `held_by_row=yes|no
 `MembershipRoster` (tokens, roles and session ids), `BrigadeFormed`, `WorkerAdded`,
 `WorkerDismissed`, `ExitedWorkerDismissed`, `Disbanded`; and the Cmds `OpenEmbedded`
 (with `replaced=yes` when it displaced a live handle under its key), `OpenCodexTrustPane`
-(the same, with `pid`), `KillPty` and
+(the same, with `pid`), `HangUpPty`, `KillPty` and
 `RekeyPty` (with `handle=yes|no`), and the store intents that set, clear or remove a
 member's session or row. Every Cmd line carries `by=<the Event that produced it>`.
 Input, pane output, the bytes sent to a pane, ticks, quiescence samples and row loads
@@ -1851,8 +1851,9 @@ a hosted Codex pane outside any brigade adds one sqlite lookup and one rollout
 tail per tick (`docs/DISCIPLINE.md`, Appendix A).
 
 **The closing line.** The shutdown sweep that runs once quitting is decided
-closes each hosted pane in turn and then waits for the children, up to 5 seconds
-in all (`SHUTDOWN_GRACE`); no further frame is drawn while it runs, so before this
+hangs each hosted pane up (off the event loop, so one slow console close does not hold
+back the rest) and then waits for the children, up to 5 seconds in all
+(`SHUTDOWN_GRACE`), killing what is left; no further frame is drawn while it runs, so before this
 nothing on screen said that banto was closing, and the status line had already
 gone back to its hints. Once `App::should_quit()` is set the status line therefore
 shows `Closing — ending N session(s)…` — `Closing…` when nothing is hosted — with
@@ -2367,8 +2368,8 @@ dismissal a Worker's pane has. Both end in the same store operation
 (`Store::dismiss_worker(brigade, "goinkyo")`); the MCP tool then relies on the
 next tick finding the row gone, while the operator's path also unstages the
 pane at once and forgets what the core kept for the token — the tick's later
-`NoGoinkyo` still releases the one-shot spawn guard and asks to kill a pane that
-is already gone (a no-op). Neither removes the consultation's request file at
+`NoGoinkyo` still releases the one-shot spawn guard and asks to end a pane that
+is already on its way out (a no-op: one request, one deadline). Neither removes the consultation's request file at
 once; the data directory sweep does (see "Working files of ended members"
 below), and the next consultation overwrites it in the meantime.
 
@@ -2499,8 +2500,8 @@ guards deletion; the two stages agreeing is what closes the old UX gap
 (Dismiss missing, or offered, on the wrong pane) that a position-derived
 first stage used to risk. A disband is noticed a tick later too: the
 brigade's roster reads as empty, so its Goinkyo row reads as gone, the guard is
-released and the kill names a pane the disband already ended (a repeat, costing
-nothing).
+released and the end names a pane the disband already ended (a repeat: it asks for
+no second hang-up and keeps the first deadline).
 **Reopening a
 brigade around an already-discovered Goinkyo (one that already has a
 session id, resolvable to a real row) already works**, for free, through
@@ -2770,17 +2771,54 @@ are folded into one status line, `<name> closed`, said when the last pane has go
 What the panes left queued — a nudge's delayed Enter, held Codex creations, the
 hold and unreadable-input clocks — is dropped at the confirm, because nothing
 between it and the exits may act on it (a disband drops the same for the panes it
-ends, by the same code). A kill that does not take is silent, so a close does not
-wait for ever: ten seconds after the confirm (`CLOSE_GIVE_UP`; in banto's pane log,
-six operator kills of idle panes each exited within 140-192 ms of the kill; panes
-in the middle of a turn were not measured) it gives up, once, with a line saying
-how many panes did not end. It does not kill them again; the brigade can be closed
-or staged once more.
-
-It is a hard kill, like every kill banto issues: what an agent loses when it is
-ended in the middle of a turn has not been measured. Restarting only the Director
+ends, by the same code). Every pane is ended as "How a pane ends" below says: hung up,
+then killed five seconds later if it is still there. An end that does not take is
+silent, so a close does not wait for ever: ten seconds after the confirm
+(`CLOSE_GIVE_UP`) it gives up, once, with a line saying how many panes did not end.
+It ends nothing again; the brigade can be closed or staged once more. A pane that
+answers its hang-up is gone in under a second, one that is killed went within
+140-192 ms of the kill (in banto's pane log, six operator kills of idle panes; panes
+in the middle of a turn were not measured), so a close that settles at all does so
+in about five and a quarter seconds at worst. What an agent loses when it is ended in
+the middle of a turn has not been measured. Restarting only the Director
 is still possible: exit the agent inside its pane, then press Enter on its row
 (staging reuses the live Workers).
+
+**How a pane ends.** Every end banto asks for (prefix-`x` and the list's `x`, closing or
+disbanding a brigade, dismissing a Worker, ending a consultation, reopening or rewiring a
+Director, a duplicate found at staging, a pane whose output was lost) is the same two
+steps, for every agent and every pane, however old. First a hang-up
+(`Cmd::HangUpPty`): the pane's terminal is closed as closing an ordinary window closes
+it, so the agent runs its own shutdown. Then, if the pane has not exited five
+seconds later (`PANE_END_GRACE`, kept in the core's state per pane and checked on
+whatever event comes next, so on the tick at the latest), a kill (`Cmd::KillPty`):
+`TerminateProcess` on Windows, `SIGKILL` to the child's process group elsewhere. An
+exit seen before the deadline drops it, and a second request while one is pending is
+neither a second hang-up nor a later deadline. Quit does the same for every pane at
+once and waits for the same five seconds in all (`SHUTDOWN_GRACE`); there the event
+loop has already ended, and what runs on a thread of its own is the master drop.
+*Why (2026-11-21):* Claude Code 2.1.330 writes a "fullscreen boot
+pending" record into `~/.claude.json` at each launch and removes it only when it runs
+its shutdown; a Claude killed within about ten seconds of starting leaves the record,
+and two of them make it turn its fullscreen renderer off machine-wide, which breaks
+drag-select in every Claude pane. Closing a brigade 6.5 s after its five panes had been
+reopened did exactly that (each pane then ended with `TerminateProcess(handle, 1)`).
+Measured on 2026-11-22 through banto-io's own `PortablePtyHost` on Windows 10.0.26300
+with Claude 2.1.330: a hang-up ended a live Claude with exit code 129 in 767-813 ms
+(four runs), and a fullscreen one hung up after 5 s removed its own record. The five
+seconds are not derived: per Microsoft's documentation (read in a design consultation,
+not measured here) they are about what Windows gives a console client told its console
+is closing, and about six times the measured exit. A hang-up does not hide the pane while it lasts: the
+tile stays until the exit event (or, when the output closes first and the exit does not
+follow within a second, the lost-output path unstages it and holds the key against a
+second resume), Enter on its row reuses the pane, and a reopen waits for the exit
+event. Dropping the PTY master is what hangs a Windows pane up, and per Microsoft's
+documentation (not measured here) `ClosePseudoConsole` before Windows 11 24H2 (build
+26100) waits for the process to exit, so the drop is done on a thread of its own. On Unix the hang-up is `SIGHUP` to the process group and the force, new
+with this, a `SIGKILL` (the PTY library's own killer only sends `SIGHUP`).
+Unverified: macOS (never run); that an agent's `SessionEnd` hooks run for a session
+ended this way, which was not measured; and how an agent mid-turn answers a hang-up.
+The Linux half has run green under WSL.
 
 *Why the Director's prefix-`x` changed (operator's decision, 2026-11-20).* It used
 to end only the Director's process. The operator's reason: a brigade with only its

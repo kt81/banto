@@ -76,7 +76,7 @@ fn confirmation_does_not_kill_a_known_director_if_identity_became_uncertain() {
     assert!(
         !cmds
             .iter()
-            .any(|cmd| matches!(cmd, Cmd::KillPty { key } if key == &director)),
+            .any(|cmd| matches!(cmd, Cmd::HangUpPty { key } if key == &director)),
         "{cmds:?}"
     );
     assert!(state.screens.contains_key(&director));

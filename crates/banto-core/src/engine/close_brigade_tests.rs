@@ -123,7 +123,7 @@ fn without_resizes(cmds: Vec<Cmd>) -> Vec<Cmd> {
 fn kills(cmds: &[Cmd]) -> Vec<SessionKey> {
     cmds.iter()
         .filter_map(|cmd| match cmd {
-            Cmd::KillPty { key } => Some(key.clone()),
+            Cmd::HangUpPty { key } => Some(key.clone()),
             _ => None,
         })
         .collect()
@@ -251,7 +251,7 @@ fn prefix_x_on_a_single_session_is_still_a_plain_kill() {
     ));
     assert_eq!(
         press(&mut state, &mut app, KeyCode::Enter, t),
-        vec![Cmd::KillPty { key: key("solo") }]
+        vec![Cmd::HangUpPty { key: key("solo") }]
     );
 }
 
@@ -288,7 +288,7 @@ fn x_on_a_hosted_single_sessions_row_asks_the_plain_kill_and_confirming_ends_it(
     ));
     assert_eq!(
         press(&mut state, &mut app, KeyCode::Enter, t),
-        vec![Cmd::KillPty { key: key("solo") }]
+        vec![Cmd::HangUpPty { key: key("solo") }]
     );
 }
 
@@ -484,7 +484,7 @@ fn a_staged_close_ends_every_pane_empties_the_stage_hands_the_focus_back_and_wri
     );
     assert!(matches!(state.stage, Stage::Empty));
     assert_eq!(state.focus, Focus::Sidebar);
-    // Hard kills banto asked for, each remembered with its member.
+    // Ends banto asked for, each remembered with its member.
     for key in kills(&cmds) {
         assert!(state.expected_exits.contains_key(&key), "{key:?}");
     }
@@ -973,8 +973,10 @@ fn a_close_whose_panes_never_end_gives_up_after_the_limit_and_counts_what_is_lef
         status(&state)
     );
     assert!(
-        !cmds.iter().any(|cmd| matches!(cmd, Cmd::KillPty { .. })),
-        "giving up kills nothing again: {cmds:?}"
+        !cmds
+            .iter()
+            .any(|cmd| matches!(cmd, Cmd::HangUpPty { .. } | Cmd::KillPty { .. })),
+        "giving up ends nothing again: {cmds:?}"
     );
     // The pane's record stays, so an exit that does come is still one banto
     // asked for, and the brigade can be closed or staged once more.

@@ -200,7 +200,7 @@ fn prefix_x_on_a_worker_with_a_real_key_dismisses_it_after_one_confirmation() {
         },
         t,
     ));
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }, Cmd::Reload]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("w1") }, Cmd::Reload]);
     assert!(matches!(&state.stage, Stage::Brigade { panes, .. } if !panes.contains(&key("w1"))));
     assert!(
         status(&state).ends_with("dismissed from the brigade"),
@@ -250,7 +250,7 @@ fn prefix_x_on_a_worker_with_a_synthetic_key_dismisses_it_directly() {
     assert_eq!(
         cmds,
         vec![
-            Cmd::KillPty {
+            Cmd::HangUpPty {
                 key: synthetic.clone()
             },
             Cmd::Reload
@@ -324,9 +324,9 @@ fn prefix_x_on_the_director_closes_the_brigade_instead_of_ending_only_its_pane()
     assert_eq!(
         cmds,
         vec![
-            Cmd::KillPty { key: key("dir") },
-            Cmd::KillPty { key: key("w1") },
-            Cmd::KillPty { key: key("w2") },
+            Cmd::HangUpPty { key: key("dir") },
+            Cmd::HangUpPty { key: key("w1") },
+            Cmd::HangUpPty { key: key("w2") },
         ]
     );
     assert_eq!(state.pending_dismiss, None);
@@ -348,7 +348,7 @@ fn prefix_x_on_a_single_session_only_ends_it() {
     prefix_x(&mut state, &mut app, t);
     assert_eq!(modal_dismisses(&app), Some(None));
     let cmds = press(&mut state, &mut app, KeyCode::Enter, t);
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("solo") }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("solo") }]);
 }
 
 #[test]
@@ -533,7 +533,7 @@ fn an_exit_banto_asked_for_removes_nobody_whatever_asked() {
     let (mut state, mut app) = brigade(&[]);
     let t = now();
     let kill = kill_pane(&mut state, key("w1"));
-    assert!(matches!(kill, Cmd::KillPty { .. }));
+    assert!(matches!(kill, Some(Cmd::HangUpPty { .. })));
     let cmds = without_resizes(exits(&mut state, &mut app, "w1", t));
     assert!(cmds.is_empty(), "{cmds:?}");
 
@@ -551,7 +551,7 @@ fn an_exit_banto_asked_for_removes_nobody_whatever_asked() {
     ));
     assert!(
         cmds.iter()
-            .all(|cmd| matches!(cmd, Cmd::KillPty { .. } | Cmd::Reload)),
+            .all(|cmd| matches!(cmd, Cmd::HangUpPty { .. } | Cmd::Reload)),
         "{cmds:?}"
     );
     for id in ["w1", "w2"] {
@@ -799,7 +799,7 @@ fn lost_output_never_removes_a_worker_that_has_no_session_to_resume() {
     assert!(!removes_a_member(&cmds), "{cmds:?}");
     assert!(state.removing_exited.is_empty());
     // The unreadable pane is closed, and its process asked to end.
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("w1") }]);
     assert!(matches!(&state.stage, Stage::Brigade { panes, .. } if !panes.contains(&key("w1"))));
     assert!(!state.screens.contains_key(&key("w1")));
     assert_eq!(
@@ -816,7 +816,7 @@ fn lost_output_does_not_relaunch_a_worker_that_has_a_session_to_resume() {
     let cmds = without_resizes(output_lost(&mut state, &mut app, "w1", now()));
     assert!(!opens_a_pane(&cmds), "{cmds:?}");
     assert!(!removes_a_member(&cmds), "{cmds:?}");
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("w1") }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("w1") }]);
     assert!(!state.last_relaunch.contains_key(&key("w1")));
 }
 
@@ -848,7 +848,7 @@ fn the_exit_that_follows_lost_output_removes_nobody_either() {
 fn lost_output_of_the_director_closes_its_pane_and_keeps_the_member() {
     let (mut state, mut app) = brigade(&["w1"]);
     let cmds = without_resizes(output_lost(&mut state, &mut app, "dir", now()));
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("dir") }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("dir") }]);
     assert!(matches!(
         &state.stage,
         Stage::Brigade { director: None, .. }
@@ -881,7 +881,7 @@ fn lost_output_of_the_goinkyo_closes_its_pane_and_removes_nobody() {
         },
         now(),
     ));
-    assert_eq!(cmds, vec![Cmd::KillPty { key: goinkyo }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: goinkyo }]);
     assert!(state.goinkyo_pane.is_empty());
 }
 
@@ -892,7 +892,7 @@ fn lost_output_of_a_single_session_just_closes_it() {
     state.stage = Stage::Solo(key("solo"));
     let mut app = App::new(vec![row("solo")]);
     let cmds = without_resizes(output_lost(&mut state, &mut app, "solo", now()));
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("solo") }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("solo") }]);
     assert!(!state.screens.contains_key(&key("solo")));
     assert_eq!(
         status(&state),
@@ -907,7 +907,7 @@ fn lost_output_of_a_pane_banto_asked_to_end_is_an_ordinary_asked_for_end() {
     let (mut state, mut app) = brigade(&[]);
     let t = now();
     let kill = kill_pane(&mut state, key("w1"));
-    assert!(matches!(kill, Cmd::KillPty { .. }));
+    assert!(matches!(kill, Some(Cmd::HangUpPty { .. })));
     let cmds = without_resizes(output_lost(&mut state, &mut app, "w1", t));
     assert!(cmds.is_empty(), "{cmds:?}");
     assert!(!state.screens.contains_key(&key("w1")));
@@ -944,7 +944,7 @@ fn lost_output_of_a_director_being_reopened_waits_for_confirmed_exit() {
     let mut app = App::new(vec![row("dir")]);
     app.open_confirm_director_reopen_modal("dir".to_string(), "dir".to_string());
     let cmds = confirm_director_reopen_modal(&mut state, &mut app);
-    assert_eq!(cmds, vec![Cmd::KillPty { key: key("dir") }]);
+    assert_eq!(cmds, vec![Cmd::HangUpPty { key: key("dir") }]);
 
     let cmds = output_lost(&mut state, &mut app, "dir", now());
     assert!(!state.screens.contains_key(&key("dir")));

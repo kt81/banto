@@ -1121,11 +1121,12 @@ fn read_or_idle_tick(
     }
 }
 
-/// Windows gives a console-closing child ~5s (`CTRL_CLOSE_EVENT`) before it
-/// force-terminates the process — the budget `shutdown_handles` mirrors for
-/// its whole sweep (see that function's doc for why it's shared, not per
-/// child).
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long quit waits for the children it hung up before it kills them: the
+/// time every other end banto asks for gives a pane
+/// ([`banto_core::engine::PANE_END_GRACE`], which says where the five seconds
+/// come from), spent once for the whole sweep (see `shutdown_handles` for why
+/// it is shared, not per child).
+const SHUTDOWN_GRACE: Duration = banto_core::engine::PANE_END_GRACE;
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Graceful-close-then-wait-then-force teardown for every still-registered
@@ -1142,12 +1143,12 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// module-level constants directly) purely so tests can drive this with a
 /// short deadline instead of the real 5s.
 ///
-/// Deliberately NOT how the prefix-x kill path (`Cmd::KillPty`) works: that
-/// is explicit user intent for an immediate stop, and session jsonl is
-/// append-only and parsed leniently on both sides, so a hard kill there
-/// risks at most one truncated trailing line — an already-accepted trade for
-/// responsiveness that this sweep does not need to make, since nothing here
-/// is time-sensitive to the user.
+/// The same shape as every other end banto asks for — hang up, give the child
+/// [`banto_core::engine::PANE_END_GRACE`], then kill — except that the sweep owns
+/// the waiting here, because the event loop that would time it has stopped.
+/// Hanging up is done off this thread (`PtyHandle::begin_graceful_close`), so on
+/// a Windows build whose console close blocks, the children are not closed one
+/// after another before the shared deadline has even started.
 fn shutdown_handles(
     handles: &mut HashMap<SessionKey, PtyHandle>,
     grace: Duration,
@@ -1192,6 +1193,12 @@ fn execute_cmd(
         Cmd::ResizePty { key, rows, cols } => {
             if let Some(handle) = handles.get_mut(&key) {
                 handle.resize(rows, cols);
+            }
+            Vec::new()
+        }
+        Cmd::HangUpPty { key } => {
+            if let Some(handle) = handles.get_mut(&key) {
+                handle.begin_graceful_close();
             }
             Vec::new()
         }
@@ -15533,8 +15540,27 @@ mod tests {
             events.pop_front().unwrap(),
             Instant::now(),
         );
+        // A pane whose output is gone is hung up like any other, and the force
+        // still follows when it does not leave: the screen is not what the
+        // deadline hangs on.
         assert!(
             cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::HangUpPty { key: k } if k == &key))
+        );
+        assert!(!cmds.iter().any(|cmd| matches!(cmd, Cmd::KillPty { .. })));
+        let forced = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            },
+            Instant::now() + engine::PANE_END_GRACE + Duration::from_secs(1),
+        );
+        assert!(
+            forced
+                .iter()
                 .any(|cmd| matches!(cmd, Cmd::KillPty { key: k } if k == &key))
         );
         assert!(handles.get_mut(&key).unwrap().kill().is_err());

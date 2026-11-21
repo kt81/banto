@@ -21,7 +21,8 @@ pub struct PtyIo {
     pub input: Box<dyn Write + Send>,
     /// Resizes the child's PTY (and keeps the child process alive).
     pub resizer: Box<dyn Resizer>,
-    /// Kills the child (`Cmd::KillPty`'s executor).
+    /// Kills the child outright (`Cmd::KillPty`'s executor): the force that
+    /// follows a hang-up the child did not answer. See [`Killer`].
     pub killer: Box<dyn Killer>,
     /// Asks the child to shut down as if its terminal window closed — what
     /// dropping the master alone fails to convey on Unix. See [`Hangup`].
@@ -54,7 +55,12 @@ pub trait Resizer: Send {
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
 }
 
-/// Kills a hosted child's process.
+/// Kills a hosted child's process, for good.
+///
+/// Windows: `TerminateProcess`. Unix: `SIGKILL` to the child's process group.
+/// `portable-pty-psmux`'s own killer is not that on Unix: it sends `SIGHUP`
+/// (its `ChildKiller` for the spawned child, in `lib.rs`), which a child may
+/// handle or ignore, so it is a hang-up and cannot be the force that follows one.
 pub trait Killer: Send {
     fn kill(&mut self) -> Result<()>;
 }
@@ -240,7 +246,7 @@ impl PtyHost for PortablePtyHost {
             resizer: Box::new(PortablePtyResizer {
                 master: pair.master,
             }),
-            killer: Box::new(PortablePtyKiller(killer)),
+            killer: new_killer(killer, pid),
             hangup: new_hangup(pid),
             pid,
             exited: exited_rx,
@@ -469,6 +475,45 @@ impl Hangup for SignalHangup {
     }
 }
 
+/// Unix: `portable-pty`'s killer only hangs up (see [`Killer`]), so the force is
+/// a `SIGKILL` of the child's process group, as the hangup signals it.
+#[cfg(unix)]
+fn new_killer(inner: Box<dyn ChildKiller + Send + Sync>, pid: Option<u32>) -> Box<dyn Killer> {
+    Box::new(SignalKiller { pid, inner })
+}
+
+/// Windows: `portable-pty`'s killer is `TerminateProcess`.
+#[cfg(not(unix))]
+fn new_killer(inner: Box<dyn ChildKiller + Send + Sync>, _pid: Option<u32>) -> Box<dyn Killer> {
+    Box::new(PortablePtyKiller(inner))
+}
+
+#[cfg(unix)]
+struct SignalKiller {
+    pid: Option<u32>,
+    inner: Box<dyn ChildKiller + Send + Sync>,
+}
+
+#[cfg(unix)]
+impl Killer for SignalKiller {
+    fn kill(&mut self) -> Result<()> {
+        // The same guard as the hangup's, for the same reason: `killpg(0, ..)`
+        // would signal banto's own process group.
+        let Some(pid) = self.pid.filter(|pid| *pid > 1) else {
+            return self.inner.kill().map_err(Into::into);
+        };
+        if unsafe { libc::killpg(pid as i32, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            // Already gone: what was asked for.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(unix))]
 struct NoHangup;
 
@@ -495,11 +540,92 @@ impl Resizer for PortablePtyResizer {
     }
 }
 
+#[cfg(not(unix))]
 struct PortablePtyKiller(Box<dyn ChildKiller + Send + Sync>);
 
+#[cfg(not(unix))]
 impl Killer for PortablePtyKiller {
     fn kill(&mut self) -> Result<()> {
         self.0.kill().map_err(Into::into)
+    }
+}
+
+/// Real processes, Unix only: the force has to end what a hang-up did not.
+#[cfg(all(test, unix))]
+mod unix_kill_tests {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::{Hangup, Killer, SignalHangup, SignalKiller};
+
+    #[derive(Debug)]
+    struct NoKiller;
+
+    impl portable_pty::ChildKiller for NoKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            panic!("a child with a pid is killed by signal, not through the inner killer");
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(NoKiller)
+        }
+    }
+
+    /// A child that ignores `SIGHUP`, as a process in the middle of its own
+    /// shutdown or one that simply does not care would. Its own process group,
+    /// as a pane's child leads its session, so the signals reach it as they do.
+    fn deaf_child() -> std::process::Child {
+        let child = Command::new("sh")
+            .args(["-c", "trap '' HUP; while :; do sleep 0.05; done"])
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("sh must be spawnable");
+        // The trap is installed by the shell, not by `spawn`: give it a moment so
+        // the hangup below meets it rather than the default action.
+        std::thread::sleep(Duration::from_millis(300));
+        child
+    }
+
+    #[test]
+    fn the_kill_ends_a_child_that_ignores_the_hangup_by_sigkill() {
+        let mut child = deaf_child();
+        let pid = child.id();
+
+        SignalHangup(Some(pid)).hangup().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the hangup alone must not have ended this child"
+        );
+
+        let mut killer = SignalKiller {
+            pid: Some(pid),
+            inner: Box::new(NoKiller),
+        };
+        killer.kill().unwrap();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "still running");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn killing_a_child_that_is_already_gone_is_not_an_error() {
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let mut killer = SignalKiller {
+            pid: Some(pid),
+            inner: Box::new(NoKiller),
+        };
+        assert!(killer.kill().is_ok());
     }
 }
 

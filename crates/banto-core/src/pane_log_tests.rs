@@ -151,6 +151,7 @@ fn every_text_carrying_variant_leaves_its_marker_out() {
     };
     let cmds = vec![
         open,
+        Cmd::HangUpPty { key: key.clone() },
         Cmd::KillPty { key: key.clone() },
         Cmd::OpenCodexTrustPane { key: key.clone() },
         Cmd::RekeyPty {
@@ -394,6 +395,19 @@ fn every_written_cmd_line_carries_the_event_that_produced_it() {
     )
     .expect("KillPty is written");
     assert_eq!(kill.body(), "KillPty key=sess-3 by=Tick handle=yes");
+    let hangup = cmd_line(
+        &Cmd::HangUpPty {
+            key: SessionKey::from_id("sess-3"),
+        },
+        "Input",
+        CmdFacts {
+            handle_present: true,
+            replaced: false,
+            pid: None,
+        },
+    )
+    .expect("HangUpPty is written");
+    assert_eq!(hangup.body(), "HangUpPty key=sess-3 by=Input handle=yes");
     let disband = cmd_line(
         &Cmd::Store(StoreIntent::Disband { brigade_id: 5 }),
         "ExitedWorkerDismissed",
@@ -409,6 +423,9 @@ fn every_written_cmd_line_carries_the_event_that_produced_it() {
 #[test]
 fn is_logged_cmd_agrees_with_the_line_cmd_line_writes() {
     let cmds = [
+        Cmd::HangUpPty {
+            key: SessionKey::from_id("s"),
+        },
         Cmd::KillPty {
             key: SessionKey::from_id("s"),
         },

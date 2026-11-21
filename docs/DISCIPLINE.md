@@ -272,7 +272,7 @@ suite) before the next begins.
   phase deliberately carries the two features that motivated it:
   - **session termination** — `Event::PtyExited` (today a dead child's
     channel disconnect is silently swallowed by `pump()` and the pane just
-    freezes) and `Cmd::KillPty` for deliberately stopping a solo session or
+    freezes) and `Cmd::HangUpPty` / `Cmd::KillPty` for deliberately stopping a solo session or
     a whole brigade. `Stage` moves from raw indices to session keys; the
     append-only sessions invariant retires with it;
   - **the keymap layer** — `Event::Key` resolves through a configurable
