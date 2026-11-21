@@ -1,5 +1,7 @@
 # banto (番頭)
 
+[日本語](README.ja.md)
+
 ![The bantō at his counter, writing in a ledger whose rows glow like a
 terminal list, while clerks carry boxed sessions between the shelves —
 one box glowing mid-handoff](docs/assets/banto-hero.png)
