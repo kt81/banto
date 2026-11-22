@@ -27,6 +27,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture,
@@ -4397,6 +4398,14 @@ fn pane_title(text: &str, focused: bool) -> Span<'static> {
 fn setup_terminal() -> Result<(Tui, FrameOutputHandle<Stdout>)> {
     install_panic_hook();
     enable_raw_mode()?;
+    // `run` returns on a setup error without reaching `restore_terminal`, so a
+    // failure past this point undoes what was already done.
+    enter_screen().inspect_err(|_| {
+        let _ = restore_terminal();
+    })
+}
+
+fn enter_screen() -> Result<(Tui, FrameOutputHandle<Stdout>)> {
     let mut stdout = io::stdout();
     execute!(
         stdout,
@@ -4415,14 +4424,24 @@ fn setup_terminal() -> Result<(Tui, FrameOutputHandle<Stdout>)> {
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
+    write_restore_sequence(&mut io::stdout())?;
+    Ok(())
+}
+
+/// What undoes `setup_terminal`'s escape sequences, shared by the normal exit,
+/// the panic hook and a failed setup so the lists cannot drift. `Show` comes
+/// after `LeaveAlternateScreen`, so it lands on the main screen: ratatui hides
+/// the cursor while drawing, and zsh does not re-show a hidden cursor at its
+/// prompt.
+fn write_restore_sequence(out: &mut impl io::Write) -> io::Result<()> {
     execute!(
-        io::stdout(),
+        out,
         LeaveAlternateScreen,
+        Show,
         DisableMouseCapture,
         DisableBracketedPaste,
         DisableFocusChange
-    )?;
-    Ok(())
+    )
 }
 
 /// Open the diagnostic input-event log when `BANTO_INPUT_LOG` is set: one
@@ -5061,13 +5080,7 @@ fn install_panic_hook() {
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                DisableFocusChange
-            );
+            let _ = write_restore_sequence(&mut io::stdout());
             original(info);
         }));
     });
@@ -9497,6 +9510,21 @@ mod tests {
                 "{quiet}s after the pane wrote"
             );
         }
+    }
+
+    // Unix only: on Windows crossterm sets the mouse mode through the console
+    // API, not bytes, and fails on a buffer ("Initial console modes not set").
+    #[cfg(unix)]
+    #[test]
+    fn the_restore_sequence_shows_the_cursor_on_the_main_screen() {
+        let mut written = Vec::new();
+        write_restore_sequence(&mut written).unwrap();
+        let written = String::from_utf8(written).unwrap();
+        let leave = written
+            .find("\x1b[?1049l")
+            .expect("leaves the alternate screen");
+        let show = written.find("\x1b[?25h").expect("shows the cursor");
+        assert!(leave < show, "{written:?}");
     }
 
     #[test]
