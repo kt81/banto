@@ -3943,7 +3943,10 @@ fn draw(
     let tiles = &geometry.tiles;
     if tiles.is_empty() {
         let block = Block::bordered()
-            .title(pane_title("session", false))
+            .title(Span::styled(
+                title_text("session"),
+                Style::default().fg(Color::Reset),
+            ))
             .border_style(border_style(false, false));
         let content = block.inner(areas.pane);
         frame.render_widget(block, areas.pane);
@@ -4161,8 +4164,9 @@ struct TitleRow<'a> {
 /// Draw a tile's title row — the border, the label, the status and the buttons —
 /// for every staged tile, collapsed or open, and return the tile's content area
 /// (inside the border). The only place that does it, so the two states cannot
-/// look different: the label (reversed only when focused, which a collapsed tile
-/// never is), then `Agent · word · age` as far as there is room, then `[S]` and
+/// look different: the label (a tab in every state: reversed cyan when focused,
+/// which a collapsed tile never is, otherwise `pane_title`'s slate), then
+/// `Agent · word · age` as far as there is room, with no background, then `[S]` and
 /// `[_]` or `[+]`. Also while the tile is being dragged: the gesture colours the
 /// border and the label, and the status keeps its own colours on top of that;
 /// the drop line and the ghost label are painted over the finished frame, so
@@ -4350,20 +4354,22 @@ fn border_style(focused: bool, waiting: bool) -> Style {
     })
 }
 
-/// A pane's title, padded so it sits in the border's own gap
-/// (`┌ title ┐`) instead of colliding with it (`┌title┐`). The focused
-/// pane's title is reversed video — `Modifier::REVERSED` swaps the pane's
-/// own background in under the focus colour — so focus reads as a tab even
-/// when the operator is looking at the middle of the screen, not the
-/// border. An unfocused title names the terminal's default foreground
-/// (`Color::Reset`) and is not dimmed: it is drawn over the border row, so a
-/// title with no foreground of its own inherited the unfocused border's
-/// `DarkGray`, and the dimming on top made it close to invisible on a dark
-/// terminal theme (operator report, 2026-11-10). The default foreground is
-/// readable on both dark and light themes, where any fixed grey is not. Named
-/// colours only (see `border_style`, whose focus colour this reuses): the
-/// reversal and the default resolve through the user's own terminal theme
-/// rather than a hard-coded truecolor pair.
+/// A staged tile's label, padded so it sits in the border's own gap
+/// (`┌ title ┐`) instead of colliding with it (`┌title┐`), and filled so the
+/// row reads as a header: reversed cyan when focused, slate (black on grey, no
+/// modifier) otherwise. Every staged tile's label goes through here except one
+/// being dragged, which `tile_block` draws in the gesture colour.
+///
+/// Grey, not a reversed default-colour tab, keeps the focused tab the
+/// brightest block on screen. The measurement and the operator's report are in
+/// `docs/REQUIREMENTS.md`, "The title row of a tile".
+///
+/// The text is never `DarkGray` and never dimmed. It is drawn over the border
+/// row, so a label with no colour of its own inherited the unfocused border's
+/// `DarkGray`, and dimming on top of that made it close to invisible on a
+/// dark terminal theme (operator report, 2026-11-10). Named colours only (see
+/// `border_style`, whose focus colour this reuses): they resolve through the
+/// user's own terminal palette rather than a hard-coded truecolor pair.
 fn pane_title(text: &str, focused: bool) -> Span<'static> {
     let padded = title_text(text);
     if focused {
@@ -4374,7 +4380,7 @@ fn pane_title(text: &str, focused: bool) -> Span<'static> {
                 .add_modifier(Modifier::REVERSED),
         )
     } else {
-        Span::styled(padded, Style::default().fg(Color::Reset))
+        Span::styled(padded, Style::default().fg(Color::Black).bg(Color::Gray))
     }
 }
 
@@ -6259,7 +6265,17 @@ mod tests {
             " worker-1 ",
             "the text is unchanged"
         );
-        assert_eq!(pressed[(moved.x + 2, moved.y)].fg, DRAG_LINE_COLOR);
+        // The moved tile's label is the gesture's own reversed yellow, not
+        // the grey tab every other tile's label wears.
+        let moved_label = &pressed[(moved.x + 2, moved.y)];
+        assert_eq!(moved_label.fg, DRAG_LINE_COLOR);
+        assert!(moved_label.modifier.contains(Modifier::REVERSED));
+        assert_ne!(moved_label.bg, Color::Gray);
+        assert_eq!(
+            pressed[(other.x + 2, other.y)].bg,
+            Color::Gray,
+            "the tile that is not moved keeps its grey tab"
+        );
         assert_ne!(
             pressed[(other.x, other.y + 3)].fg,
             DRAG_LINE_COLOR,
@@ -6770,8 +6786,8 @@ mod tests {
                 let (open, shut) = (&buffer[(x, open_tile.y)], &collapsed_buffer[(x, strip.y)]);
                 if open.symbol() != "_" && open.symbol() != "+" {
                     assert_eq!(
-                        (open.fg, open.modifier),
-                        (shut.fg, shut.modifier),
+                        (open.fg, open.bg, open.modifier),
+                        (shut.fg, shut.bg, shut.modifier),
                         "{what}: column {x}"
                     );
                 }
@@ -7291,6 +7307,123 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+        assert_eq!(buffer[(dir.x + 2, dir.y)].bg, Color::Gray);
+    }
+
+    /// The cells of `id`'s label on its title row, the one-space padding on each
+    /// side included, and the cells of the stretch between the label and the
+    /// buttons, where the status is drawn.
+    fn label_and_status_cells(
+        state: &EmporiumState,
+        buffer: &Buffer,
+        id: &str,
+        width: u16,
+    ) -> (Vec<ratatui::buffer::Cell>, Vec<ratatui::buffer::Cell>) {
+        let key = SessionKey::from_id(id);
+        let geometry = state.geometry(Rect::new(0, 0, width, 40));
+        let rect = geometry
+            .tiles
+            .iter()
+            .find(|(tile, _)| *tile == key)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        let (start, end) = banto_core::layout::title_columns(rect, &state.tile_label(&key));
+        let buttons_at = geometry
+            .buttons()
+            .iter()
+            .filter(|button| button.key == key)
+            .map(|button| button.rect.x)
+            .min()
+            .unwrap_or(rect.right() - 1);
+        let cells = |from: u16, to: u16| {
+            (from..to)
+                .map(|x| buffer[(x, rect.y)].clone())
+                .collect::<Vec<_>>()
+        };
+        (cells(start, end), cells(end, buttons_at))
+    }
+
+    #[test]
+    fn every_unfocused_tile_label_is_a_slate_tab_and_its_status_has_no_background() {
+        // Focus on the list, so no tile is the focused one: the Director's tile,
+        // an open stack tile and a collapsed strip all go through the same label
+        // style. Worker 1 is Waiting, so its border is magenta; its label is
+        // slate all the same.
+        let (mut state, mut app, brigade, now) =
+            scene(160, [Activity::Busy, Activity::Waiting, Activity::Alive]);
+        state.focus = Focus::Sidebar;
+        let collapsed = SessionKey::from_id(W2);
+        toggle_minimize_for_test(&mut state, &mut app, &brigade, &collapsed);
+        let buffer = render_at(&state, &app, 160, now);
+        for (what, id) in [
+            ("the Director's tile", DIR),
+            ("an open stack tile", W1),
+            ("a collapsed strip", W2),
+        ] {
+            let (label, status) = label_and_status_cells(&state, &buffer, id, 160);
+            assert!(label.len() >= 3, "{what}: a label with its padding");
+            for (at, cell) in label.iter().enumerate() {
+                assert_eq!(
+                    (cell.fg, cell.bg, cell.modifier),
+                    (Color::Black, Color::Gray, Modifier::empty()),
+                    "{what}: label cell {at}, {:?}",
+                    cell.symbol()
+                );
+            }
+            // The padding is part of the tab, one space on each side.
+            assert_eq!(label.first().unwrap().symbol(), " ", "{what}");
+            assert_eq!(label.last().unwrap().symbol(), " ", "{what}");
+            assert!(
+                status.iter().any(|cell| cell.symbol() != "\u{2500}"),
+                "{what}: fixture check: there is a status on the row"
+            );
+            for (at, cell) in status.iter().enumerate() {
+                assert_eq!(
+                    cell.bg,
+                    Color::Reset,
+                    "{what}: status cell {at}, {:?}",
+                    cell.symbol()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_focused_tile_label_stays_a_reversed_cyan_tab_and_its_status_has_no_background() {
+        let (state, app, _brigade, now) =
+            scene(160, [Activity::Busy, Activity::Waiting, Activity::Alive]);
+        let buffer = render_at(&state, &app, 160, now);
+        assert_eq!(state.focus, Focus::Pane);
+        let (label, status) = label_and_status_cells(&state, &buffer, DIR, 160);
+        for cell in &label {
+            assert_eq!(cell.fg, Color::Cyan);
+            assert!(cell.modifier.contains(Modifier::REVERSED));
+        }
+        assert!(status.iter().all(|cell| cell.bg == Color::Reset));
+    }
+
+    #[test]
+    fn the_empty_stage_placeholder_keeps_the_plain_default_look() {
+        // It labels an empty area, not a tile: default foreground, no
+        // background, no modifier, whatever the tile tab looks like.
+        let state = EmporiumState::new(PrefixKey::default());
+        let app = App::new(vec![test_row("dir", AgentKind::ClaudeCode)]);
+        let buffer = render(&state, &app);
+        let (x, y) = (0..buffer.area.height)
+            .find_map(|y| {
+                let row = text_at(&buffer, 0, y, buffer.area.width);
+                row.find(" session ")
+                    .map(|at| (row[..at].chars().count() as u16, y))
+            })
+            .expect("the placeholder's label is drawn");
+        for at in x..x + " session ".len() as u16 {
+            let cell = &buffer[(at, y)];
+            assert_eq!(
+                (cell.fg, cell.bg, cell.modifier),
+                (Color::Reset, Color::Reset, Modifier::empty()),
+                "column {at}"
+            );
+        }
     }
 
     #[test]
@@ -13154,11 +13287,15 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_pane_title_names_the_terminals_default_foreground_and_is_not_dimmed() {
-        assert_eq!(
-            pane_title("director", false).style,
-            Style::default().fg(Color::Reset)
-        );
+    fn unfocused_pane_title_is_a_slate_tab_with_no_modifier() {
+        // Black on grey, so it is not dimmed and carries no REVERSED that would
+        // let it compete with the focused tab.
+        assert_eq!(pane_title("director", false).style, slate());
+    }
+
+    /// An unfocused tile's label: black on grey, no modifier.
+    fn slate() -> Style {
+        Style::default().fg(Color::Black).bg(Color::Gray)
     }
 
     /// Draw a bordered block carrying `title` the way the pane frame does and
@@ -13191,7 +13328,7 @@ mod tests {
         );
         let cell = drawn_title_cell(false);
         assert_ne!(cell.fg, Color::DarkGray);
-        assert_eq!(cell.fg, Color::Reset);
+        assert_eq!((cell.fg, cell.bg), (Color::Black, Color::Gray));
         assert!(!cell.modifier.contains(Modifier::DIM));
     }
 

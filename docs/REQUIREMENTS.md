@@ -1710,22 +1710,34 @@ steps fall are in the tests, not here. A pane whose activity is not known keeps 
 form that still says what the age measures: `Agent · output 2m ago`, `output 2m
 ago`, `output 2m` (a bare `2m` beside nothing would not say), then nothing; a pane
 that has produced nothing shows "no output yet" in place of the age, which has no
-short form. Only the label is reversed on a focused tile (a collapsed tile is never
-focused); the status is not. A Director's open decision request puts the fixed tag
-`▸ decision`, in the waiting colour, after the status: `label · status · ▸ decision
-[buttons]`. The status sheds as before with the tag kept (the agent first, then the
-age's steps), then `word · ▸ decision` (`word · bg · ▸ decision` for a background
-pane), then the tag alone; the tag is never cut and
-has no ellipsis, and when it does not fit the status is drawn as if there were no
-request. Only a Director's tile ever shows it, and it stays while that pane is
-focused. There is no collapsed-body rule: a collapsed Director cannot exist today.
+short form. Every tile's label is a tab: reversed cyan when the tile is focused (a
+collapsed tile never is), reversed yellow while it is being moved, otherwise black on
+grey; the status never has a background. A Director's open decision request puts the
+fixed tag `▸ decision`, in the waiting colour, after the status: `label · status · ▸
+decision [buttons]`. The status sheds as before with the tag kept (the agent first,
+then the age's steps), then `word · ▸ decision` (`word · bg · ▸ decision` for a
+background pane), then the tag alone; the tag is never cut and has no ellipsis, and
+when it does not fit the status is drawn as if there were no request. Only a
+Director's tile ever shows it, and it stays while that pane is focused. There is no
+collapsed-body rule: a collapsed Director cannot exist today.
 On the Director's list row (whenever its brigade has an open request, staged or not)
 the tag is on line two in place of the cwd, only when it fits beside the agent label
 and a two-cell gap, and otherwise the row is as it was. *Why:* the operator asked
 for the status on the open tile's title, then for the collapsed tile to use the same
 row ("One title row for every tile" in the decision entry); the age is shortened
 before it is dropped because on a collapsed tile the pane cannot be seen and, for
-Codex, the output age is the only liveness signal.
+Codex, the output age is the only liveness signal. *Why the label is a tab in
+every state:* the operator reported on 2026-11-22 that with three or more open
+tiles stacked on the Worker side their title rows were hard to pick out. Measured
+on their terminal theme (Tokyo Night Moon, sampled from
+`docs/assets/emporium-brigade.png`), an unfocused frame is 1.80:1 against the
+background, where the rules Claude draws inside its own pane are 3.87:1, and a
+label that was plain default-foreground text read as one more line of the upper
+tile's footer. A filled grey tab marks the row as a header. Grey, not a reversed
+default-colour tab, so that the focused tile's reversed cyan stays the brightest
+block on screen (the focused title became a tab on 2026-08-09 because border
+colour alone did not show focus). The border and button colours were left as
+they are.
 
 **Size floor.** A hosted pane's screen and its PTY are never smaller than 2 rows × 2
 columns (`MIN_ROWS`/`MIN_COLS` in `banto-core`'s `screen.rs`; a freshly spawned pane
@@ -1890,10 +1902,11 @@ same edge); only a BEL latch, and the brigade-quiet fire below, are suppressed f
 pane the operator is already in. What the border *draws* does depend on it: the tile
 that has the pane focus (banto's own focus on that pane, whether or not its window
 is focused) is drawn in the focus colour (cyan) and its title reversed, which
-outranks the waiting colour, so a focused Waiting tile looks like any focused tile;
-an unfocused one is magenta when Waiting and dark grey when not; a tile being moved
-is yellow; a collapsed tile is never the focused one, so its border shows the
-waiting colour. The list row's dot and the sidebar count show the Waiting session
+outranks the waiting colour, so a focused Waiting tile looks like any focused tile
+(every other tile's title is the grey tab, except a tile being moved's, whatever its
+border says); an unfocused one is magenta when Waiting and dark grey when not; a tile
+being moved is yellow; a collapsed tile is never the focused one, so its border shows
+the waiting colour. The list row's dot and the sidebar count show the Waiting session
 whatever the focus. The sidebar's title counts the visible Waiting sessions of
 either product (`banto · waiting N`). The bell rings for the *ring set*: the display
 set minus a Claude session that is Waiting only because a dialog is open
