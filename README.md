@@ -23,6 +23,14 @@ session that hands work to Worker sessions.**
 *番頭 (bantō) is the head clerk of a traditional Japanese merchant house, who
 stays on the premises and runs the shop.*
 
+![banto on WSL: a new session is renamed and made a Director with three Workers, two
+Claude Code and one Codex; the Director gives them role names, they report back over
+banto's relay, the Director consults the Goinkyo (an advisor session), and you pick
+one of the options the Director lays out](docs/assets/brigade-demo.gif)
+
+*Recorded on WSL and sped up 3–5×, and 40× while the Goinkyo (an advisor session the
+Director consults) is thinking.*
+
 ## Why not just tmux?
 
 tmux is a window manager for terminals. banto is a lifecycle manager for Claude
@@ -57,13 +65,6 @@ else (another banto, a bare `claude`) is refused with a message, never started
 twice.
 
 ### Director/Worker brigades
-
-![banto with a staged brigade: the session list on the left, and on the right the Director in
-the large pane, one Worker beside it, and two more Workers collapsed to one-line
-strips](docs/assets/emporium-brigade.png)
-
-*A live brigade at work (on WSL): the Director lays out what each test protects
-while a Worker reports its fix; two more Workers are collapsed to strips.*
 
 Press `B` on a session to make it the **Director**; banto spawns fresh **Worker**
 sessions beside it (count, model and product are configurable, and Workers can run
