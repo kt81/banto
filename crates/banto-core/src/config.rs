@@ -399,7 +399,8 @@ an idle recipient for a turn over its whole context, and a wake is not \
 guaranteed (the operator can turn the relay off, and a draft in a pane holds \
 it back), so a sent message is not a read one. Send a Worker only work, or a \
 correction to work in flight, and a stop whenever its work may still be \
-running. Thanks, a stand-down and a closing note go to no Worker whose errand \
+running (for a Claude Worker, interrupt_worker delivers such a correction \
+or stop at once instead of after the turn). Thanks, a stand-down and a closing note go to no Worker whose errand \
 is finished and reported, not even when the operator ends the day. banto \
 tells the operator when the brigade has gone quiet. Call check_messages when banto nudges you, and \
 at natural checkpoints while waiting on a Worker. The Workers named above were \

@@ -458,6 +458,7 @@ pub fn cmd_handle_key(cmd: &Cmd) -> Option<&SessionKey> {
         Cmd::OpenEmbedded { key, .. }
         | Cmd::OpenCodexTrustPane { key }
         | Cmd::HangUpPty { key }
+        | Cmd::InterruptPty { key }
         | Cmd::KillPty { key } => Some(key),
         Cmd::RekeyPty { from, .. } => Some(from),
         Cmd::Store(_)
@@ -482,6 +483,7 @@ pub fn is_logged_cmd(cmd: &Cmd) -> bool {
         Cmd::OpenEmbedded { .. }
         | Cmd::OpenCodexTrustPane { .. }
         | Cmd::HangUpPty { .. }
+        | Cmd::InterruptPty { .. }
         | Cmd::KillPty { .. }
         | Cmd::RekeyPty { .. } => true,
         Cmd::Store(intent) => store_line(intent, "").is_some(),
@@ -536,6 +538,12 @@ pub fn cmd_line(cmd: &Cmd, by: &'static str, facts: CmdFacts) -> Option<Line> {
             facts.pid,
         ),
         Cmd::HangUpPty { key } => Line::new("HangUpPty")
+            .key("key", key)
+            .word("by", by)
+            .flag("handle", facts.handle_present),
+        // The Esc is the one write the log records: it is what the 300 ms quiet
+        // time behind it is explained by when a later keystroke seems to lag.
+        Cmd::InterruptPty { key } => Line::new("InterruptPty")
             .key("key", key)
             .word("by", by)
             .flag("handle", facts.handle_present),
@@ -620,6 +628,27 @@ fn store_line(intent: &StoreIntent, by: &'static str) -> Option<Line> {
             .word("by", by)
             .num("brigade", brigade_id)
             .token("member", token),
+        // The decision and, for the folded outcomes, the fixed word for the reason.
+        // Never a line of the Director's message or of the pane.
+        StoreIntent::RecordInterruptOutcome {
+            brigade_id,
+            token,
+            message_id,
+            outcome,
+            why,
+        } => {
+            let line = Line::new("Store")
+                .word("intent", "RecordInterruptOutcome")
+                .word("by", by)
+                .num("brigade", brigade_id)
+                .token("member", token)
+                .num("message", message_id)
+                .word("outcome", outcome.as_token());
+            match why {
+                Some(why) => line.word("why", why.as_token()),
+                None => line,
+            }
+        }
         StoreIntent::SetPin { .. }
         | StoreIntent::Archive { .. }
         | StoreIntent::Unarchive { .. }

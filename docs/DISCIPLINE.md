@@ -112,11 +112,13 @@ it did before it could read — except where there was no "before" worth keeping
 see the kickoff below. It is never used to estimate or keep track of
 state — that is the disguised input above in a new coat. The input-line
 reader (`banto_core::input_line`) is one instance: it reads Claude's line for
-text and recognises one bounded empty-looking Codex prompt shape. It has two
-callers. Relay reads a Claude member's line on every relay tick (the line is
-judged for a draft whether or not a nudge is due) and a Codex member's only on a
-tick otherwise eligible to nudge; for a Codex member it is the second caller that
-does not fall back when unsure: a Codex pane is
+text and recognises one bounded empty-looking Codex prompt shape. Its callers are
+the relay and the kickoffs. The relay reads a Claude member's line on every tick
+it runs (relay `auto`, the member's brigade not closing: the line is judged for a
+draft whether or not a nudge is due), through one verdict per pane per tick that
+the interrupt refinement shares (below), and a Codex member's only on a tick
+otherwise eligible to nudge; for a Codex member it does not fall back when
+unsure: a Codex pane is
 typed into only when quiet, not `blocked`, and reading `Empty`; otherwise banto
 does not type, holds the mail with no attempt spent, and tells the operator once
 (approved 2026-11-19: on Codex 0.169.0 a nudge typed into an open picker moved its
@@ -125,9 +127,10 @@ Worker, and of a Goinkyo whose live file does not yet name its pane, asks it on
 each tick the first line is due, because the alternative witness (the product's
 trust registry) was wrong both ways and a typed first line into a screen that is
 not a prompt answers whatever that screen is asking. Both kickoffs also ask it
-whether the operator's unsent mark still stands, on the ticks a line is due, with
-the relay's own verdict (the mark, overruled by an `Empty` read after the settle
-time), which closes to the mark when the read is unsure. There an unsure read does
+whether the operator's unsent mark still stands, on the ticks a line is due, by
+the relay's rule (the mark, overruled by an `Empty` read after the settle time:
+`unsent_verdict`), which closes to the mark when the read is unsure. They read the
+line themselves and do not go through the relay's per-tick verdict. There an unsure read does
 **not** fall back to what the caller did before: banto does not type, and tells
 the operator once so that they can answer the pane or type the line themselves
 (approved 2026-11-18, a departure from "the caller does what it did before it
@@ -135,11 +138,36 @@ could read"). Nothing is dropped and nothing fails: the kickoff is typed on the
 tick the prompt reads `Empty`, and stays owed until a line banto typed has had its
 acknowledgement window and the pane is still not at a prompt, when banto tells the
 operator once and stops counting it as owed (it is typed again the moment the
-prompt reads `Empty`). A Codex match is not proof of
+prompt reads `Empty`). The Goinkyo kickoff reads the line for two more
+decisions of its own: whether the only text on it is its own sentence still
+waiting for its Enter, and whether the line reads `Empty` (asked when its live
+file names no pane yet, and on a retry always). A Codex match is not proof of
 semantic emptiness; its limits are in `docs/REQUIREMENTS.md`, "Auto-relay".
 Reading sends nothing; the operator approved the principle on 2026-11-10. The
 next shortcut that wants the screen cites this paragraph's conditions, not the
 instance.
+
+**One reading per Claude pane per tick for the relay and the interrupt.** The
+relay's verdict on a Claude pane (what the line reads, whether the unsent-draft
+fence holds a nudge, whether the reading releases the operator's mark) is taken the
+first time anyone asks in a tick and handed back unchanged to every later asker in
+that tick. The map holding it is built at the start of the tick's relay work and
+dropped at its end, so a reading is never kept: it is a reading, not state. Two
+decisions ask it for different purposes. The interrupt refinement (an Esc banto
+wrote for the Director's `interrupt_worker`; "Auto-relay" in `docs/REQUIREMENTS.md`)
+asks on a tick when a member with an unresolved press is seen idle, to say whether
+it came to rest with nothing holding the nudge (`stopped`) or with text on the line
+that is not the nudge sentence (`other-text`: the fence's own verdict, holding the
+nudge, on a line that is not exactly the nudge sentence, whether that is text or the
+operator's mark still standing on a line that does not read `Empty`); it runs before the relay loop in the same tick,
+so it is the one that reads and the relay gets the same value. The Enter-only
+repair, which sends a lone Enter when the line holds exactly the nudge sentence an
+Esc restored, uses the relay loop's verdict. Both compare the line with the nudge
+sentence (`restored_nudge_line`) only after a read of `HasText`, and only the
+comparison's result is used or recorded. What crosses ticks is a watch
+(message ids and a tick count) and a set of members: no screen content. "The relay
+is the one reader" is therefore true of the relay and the interrupt, not of the
+whole engine: the kickoff paths above, and Codex, read the line on their own.
 
 Reading a program's own state report out of its output stream is not a read of
 the painted screen: it is the child's explicit announcement (OSC 7501, for a
@@ -165,9 +193,13 @@ fn update(&mut self, ev: Event, now: Instant) -> Vec<Cmd>
   there is no second mechanism.
 
 Because *all* writes to a hosted session's stdin (key forwarding, mouse
-reports, paste, the relay nudge and its delayed Enter) become
-`Cmd::WritePty`-shaped data executed in one place, the single-writer
-invariant stops being a convention and becomes structure. Type-level
+reports, paste, the relay nudge and its delayed Enter, an Enter alone when a
+restored nudge line is already in the box, and the Director's interrupt Esc)
+become `Cmd`-shaped data executed in one place (`Cmd::WritePty`, and for the
+interrupt Esc a `Cmd` of its own, `Cmd::InterruptPty`, so the executor knows
+which write it is and can hold every other write to that pane for a quiet time
+after it), the single-writer invariant stops being a convention and becomes
+structure. Type-level
 enforcement (guard types with private constructors) remains the tool of
 choice only for what `Cmd`s cannot express.
 

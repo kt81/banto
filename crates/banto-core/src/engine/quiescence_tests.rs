@@ -35,6 +35,7 @@ fn listed(state: &EmporiumState) -> Vec<BrigadeNameFacts> {
             director_session: None,
             member_names: Vec::new(),
             request: stored_request(brigade_id),
+            interrupts: None,
         })
         .collect()
 }
@@ -1652,6 +1653,7 @@ fn a_member_that_is_waiting_is_waiting_and_never_in_the_background() {
         live: Some(LiveStatus {
             activity: Waiting,
             dialog_open: false,
+            status_busy: false,
         }),
         has_unseen: false,
         ..mail_for(1, "worker-1", &worker)
@@ -3384,6 +3386,7 @@ fn a_brigade_nothing_hosts_yet_shows_its_stored_request_on_its_directors_row_wit
         director_session: Some("dir9".to_string()),
         member_names: Vec::new(),
         request: stored_request(9),
+        interrupts: None,
     };
     let cmds = send(
         &mut state,
@@ -9101,6 +9104,7 @@ fn live(activity: crate::model::Activity, dialog_open: bool) -> Option<crate::en
     Some(crate::engine::LiveStatus {
         activity,
         dialog_open,
+        status_busy: false,
     })
 }
 
@@ -9345,6 +9349,7 @@ fn a_member_whose_live_file_has_turned_waiting_reads_waiting_before_the_list_rel
     let status = |activity, dialog_open| crate::engine::LiveStatus {
         activity,
         dialog_open,
+        status_busy: false,
     };
     tick(&mut state, &mut app, Some(status(Alive, false)), Idle, 1);
     assert_eq!(state.pane_word(&app, &worker), Some(Alive));

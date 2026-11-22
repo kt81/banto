@@ -152,6 +152,14 @@ fn every_text_carrying_variant_leaves_its_marker_out() {
     let cmds = vec![
         open,
         Cmd::HangUpPty { key: key.clone() },
+        Cmd::InterruptPty { key: key.clone() },
+        Cmd::Store(StoreIntent::RecordInterruptOutcome {
+            brigade_id: 9,
+            token: "worker-a".to_string(),
+            message_id: 4,
+            outcome: crate::model::InterruptOutcome::Pressed,
+            why: Some(crate::model::InterruptWhy::OwnLine),
+        }),
         Cmd::KillPty { key: key.clone() },
         Cmd::OpenCodexTrustPane { key: key.clone() },
         Cmd::RekeyPty {
@@ -408,6 +416,47 @@ fn every_written_cmd_line_carries_the_event_that_produced_it() {
     )
     .expect("HangUpPty is written");
     assert_eq!(hangup.body(), "HangUpPty key=sess-3 by=Input handle=yes");
+    let interrupt = cmd_line(
+        &Cmd::InterruptPty {
+            key: SessionKey::from_id("sess-3"),
+        },
+        "Tick",
+        CmdFacts {
+            handle_present: true,
+            replaced: false,
+            pid: None,
+        },
+    )
+    .expect("InterruptPty is written");
+    assert_eq!(
+        interrupt.body(),
+        "InterruptPty key=sess-3 by=Tick handle=yes"
+    );
+    let decided = |why| {
+        cmd_line(
+            &Cmd::Store(StoreIntent::RecordInterruptOutcome {
+                brigade_id: 5,
+                token: "worker-2".to_string(),
+                message_id: 11,
+                outcome: crate::model::InterruptOutcome::NotMidTurn,
+                why,
+            }),
+            "Tick",
+            CmdFacts::default(),
+        )
+        .expect("a decided interrupt is written")
+        .body()
+    };
+    assert_eq!(
+        decided(Some(crate::model::InterruptWhy::BackgroundCommand)),
+        "Store intent=RecordInterruptOutcome by=Tick brigade=5 member=worker-2 message=11 \
+         outcome=not-mid-turn why=background-command"
+    );
+    assert_eq!(
+        decided(None),
+        "Store intent=RecordInterruptOutcome by=Tick brigade=5 member=worker-2 message=11 \
+         outcome=not-mid-turn"
+    );
     let disband = cmd_line(
         &Cmd::Store(StoreIntent::Disband { brigade_id: 5 }),
         "ExitedWorkerDismissed",
@@ -429,6 +478,16 @@ fn is_logged_cmd_agrees_with_the_line_cmd_line_writes() {
         Cmd::KillPty {
             key: SessionKey::from_id("s"),
         },
+        Cmd::InterruptPty {
+            key: SessionKey::from_id("s"),
+        },
+        Cmd::Store(StoreIntent::RecordInterruptOutcome {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            message_id: 2,
+            outcome: crate::model::InterruptOutcome::Stopped,
+            why: None,
+        }),
         Cmd::Store(StoreIntent::Disband { brigade_id: 5 }),
         Cmd::Store(StoreIntent::Archive {
             id: "s".to_string(),

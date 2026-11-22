@@ -50,6 +50,7 @@ banto は両者の間のメッセージチャネルを MCP 上で仲介します
 
 - `consult_goinkyo` / `dismiss_goinkyo`
 - `request_decision`: あなたにしか下せない判断を Director が待っているときのためのものです。Director は質問を自分のペインに書き、banto はそこに `▸ decision` タグを付けます。Director を止めはせず、あなたがそのペインで Enter を押すまでタグは残ります
+- `interrupt_worker`: Director が Claude の Worker に出した仕事を考え直したときのためのものです。Worker の実行中のターンを Esc 1 回で止め、その理由を通常のメッセージとして渡します。banto が Esc を押すのは Worker がターンの途中にいるときだけで、押すたびにステータス行でお知らせします。Codex の Worker にはメッセージは届きますが、まだ中断はされません
 - `name_member`: Director が Worker に与えた常設の役割に対して、Worker に表示名を付けます。表示名はタイルのタイトル、`brigade_status`、メッセージのヘッダで、トークンの隣に表示されます。宛先になるのは引き続きトークンです
 
 各メンバーには、所属する班、自分のトークン、同僚を示す役割ブリーフィングも渡されます。Claude Code では起動時にシステムプロンプトへ追記します（再開時は、セッション自身が持つシステムプロンプトの記録がそのまま再利用されてしまう場合に、`--system-prompt-snapshot off` を付けます。このフラグには Claude Code 2.1.267 以降が必要です）。Codex は独自の `--append-system-prompt` を持たないため、banto 自身の `SessionStart` フックで届けます。ブリーフィングがなければ、班は banto のデータモデルと操作者の画面の中にしか存在せず、3 つのツール名だけを渡された Director は、たいてい使いません。`brigade_status` は、その続きの疑問に答えます（チームに誰がいるか、何をしているか、自分が送ったメッセージを誰かが抱えていないか）。

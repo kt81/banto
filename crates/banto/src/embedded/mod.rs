@@ -12,6 +12,7 @@
 mod convert;
 mod emporium;
 mod paste_accum;
+mod quiet_writes;
 mod session;
 
 pub use emporium::EmporiumSettings;

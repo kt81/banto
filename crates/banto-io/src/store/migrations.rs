@@ -358,6 +358,19 @@ pub(super) const MIGRATIONS: &[&str] = &[
         title TEXT NOT NULL,
         ended_at_ms INTEGER NOT NULL
     );",
+    // v21: `interrupt_worker`. The request to stop a Worker's turn is a property
+    // of the message that explains it, so it is a column of that row and is
+    // written in the same transaction (a request with no reason, or a reason
+    // that arrives without its request, would each be a different bug).
+    // `interrupt_outcome` is what the UI process decided: NULL until it has, and
+    // from then on also the mark that the request was taken, so it is never
+    // decided twice. Only the UI writes it, because only the UI can see the
+    // screen. A partial index, since the UI looks for undecided requests every
+    // second and the table only grows.
+    "ALTER TABLE brigade_messages ADD COLUMN interrupt INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE brigade_messages ADD COLUMN interrupt_outcome TEXT;
+    CREATE INDEX brigade_messages_open_interrupts ON brigade_messages (brigade_id, id)
+        WHERE interrupt = 1 AND interrupt_outcome IS NULL;",
 ];
 
 /// The schema version this build migrates to and knows how to read.
@@ -1143,6 +1156,87 @@ mod tests {
         assert!(
             before
                 .prepare("SELECT consult_title FROM brigade_members")
+                .is_err(),
+            "the copy is from before the column existed"
+        );
+    }
+
+    #[test]
+    fn v20_to_v21_upgrade_adds_the_interrupt_columns_and_index_and_keeps_the_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("banto.db");
+
+        // A database as v20 code left it: a Director, a Worker and two messages,
+        // one of them broadcast.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for script in &MIGRATIONS[0..20] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO brigades (id, name, created_at_ms) VALUES (1, 'cell', 3000);
+                 INSERT INTO brigade_members (brigade_id, member_token, role, session_id)
+                 VALUES (1, 'director', 'director', 'dir-1'),
+                        (1, 'worker-1', 'worker', 'w-1');
+                 INSERT INTO brigade_messages
+                     (brigade_id, from_session, to_role, body, created_at_ms, to_member)
+                 VALUES (1, 'dir-1', 'worker', 'first', 4000, 'worker-1'),
+                        (1, 'dir-1', 'worker', 'second', 4100, NULL);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 20).unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+
+        let rows: Vec<(String, i64, Option<String>)> = store
+            .conn
+            .prepare("SELECT body, interrupt, interrupt_outcome FROM brigade_messages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("first".to_string(), 0, None),
+                ("second".to_string(), 0, None)
+            ],
+            "the rows survive as ordinary messages: no request, no outcome"
+        );
+        assert!(
+            store.pending_interrupts(1).unwrap().is_empty(),
+            "an old message is never an open request"
+        );
+
+        let index_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'brigade_messages_open_interrupts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.contains("WHERE interrupt = 1 AND interrupt_outcome IS NULL"),
+            "a partial index over the open requests: {index_sql}"
+        );
+
+        // The copy kept before the upgrade is a v20 database.
+        let before = rusqlite::Connection::open(dir.path().join("banto.db.before-v21")).unwrap();
+        let version: i64 = before
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+        assert!(
+            before
+                .prepare("SELECT interrupt FROM brigade_messages")
                 .is_err(),
             "the copy is from before the column existed"
         );

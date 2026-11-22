@@ -583,6 +583,7 @@ fn the_exits_of_a_closed_brigade_are_one_status_line_and_remove_and_reopen_nobod
             director_session: Some("dir".to_string()),
             member_names: Vec::new(),
             request: None,
+            interrupts: None,
         },
     );
     let name = state.brigade_name(&app, 1);

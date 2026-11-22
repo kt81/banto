@@ -111,7 +111,11 @@ mcp_servers.banto.*` overrides — so members get `send_to_peer` /
 queue (plus Director-only `consult_goinkyo` / `dismiss_goinkyo`,
 `request_decision` (the Director is waiting on a decision only you can make: it
 writes the question in its own pane and banto shows a `▸ decision` tag against it,
-without stopping it, until you press Enter in its pane), and
+without stopping it, until you press Enter in its pane),
+`interrupt_worker` (the Director has changed its mind about a Claude Worker's
+task: it stops the Worker's running turn with one Esc and hands over the reason
+as an ordinary message — banto presses only mid-turn and shows each press on the
+status line; a Codex Worker gets the message but is not interrupted yet), and
 `name_member`, which gives a Worker a display name for the standing role the
 Director has given it — shown beside its token in the tile title, in
 `brigade_status` and in message headers; the token stays the address). Each member is also handed a role briefing naming its brigade, its

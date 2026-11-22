@@ -24,12 +24,22 @@
 //! - `request_decision()` (Director only) records that the brigade is waiting on
 //!   the operator's decision, shown as a short fixed tag until they answer in the
 //!   Director's pane. It takes no text: the question is in the Director's own
-//!   output. It never blocks.
+//!   output. It never blocks;
+//! - `interrupt_worker(member, text)` (Director only) stops a Worker's running
+//!   Claude turn by writing one Esc into its pane, and delivers `text` to it as an
+//!   ordinary message. The tool only records the request, in the same transaction
+//!   as the message; the decision to press, and the press, are the UI process's,
+//!   made once, against the screen and the live file, and written back as an
+//!   outcome the tool waits about two seconds for. A turn cut this way leaves its
+//!   running tool call recorded in the Worker's transcript as refused by the user,
+//!   which no header banto adds undoes, so the tool's description prices it.
 //!
 //! The text of a message is a *pull*, never a stdin injection: even though the
 //! embedded banto is the sole writer to a child's stdin, injecting a peer's
 //! message there would forge operator input mid-turn. A tool result respects
-//! turn boundaries and carries the firewall framing for free.
+//! turn boundaries and carries the firewall framing for free. An interrupt keeps
+//! to that: what banto types into the pane is the Esc key and nothing else, and
+//! the reason travels as the message.
 //!
 //! What banto does type into an idle member's pane is a fixed line that says to
 //! call `check_messages` (the relay in `banto_core::engine`), and that starts a
@@ -45,14 +55,15 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
 use banto_core::consultation::check_title;
 use banto_core::model::{
-    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, MemberToken, SessionId,
+    BrigadeId, BrigadeMember, BrigadeMessage, BrigadeRole, GOINKYO_TOKEN, InterruptOutcome,
+    MemberToken, SessionId,
 };
 use banto_io::brigade_log::{BrigadeLog, Entry, EntryKind, Party, Recipient};
 use banto_io::claude_home::ClaudeHome;
@@ -63,7 +74,7 @@ use banto_io::status::{
     LIVE_STATUS_BUSY, LIVE_STATUS_SHELL, LIVE_STATUS_WAITING, LiveSession, ProcessProbe,
     SysinfoProbe, entry_is_alive, read_live_sessions,
 };
-use banto_io::store::{MemberNaming, Store, StoreError};
+use banto_io::store::{InterruptState, MemberNaming, Store, StoreError};
 
 /// Who banto launched this server for — passed in via the `_mcp` args at
 /// launch (the "register the pair at launch" hook). `brigade` + `member`
@@ -302,7 +313,10 @@ fn tools_list_result() -> Value {
             {
                 "name": "check_messages",
                 "description": "Pull any new messages your brigade peer has sent you via banto \
-                                (since you last checked). Call it at natural checkpoints.",
+                                (since you last checked). Call it at natural checkpoints. A \
+                                message whose header says banto interrupted your turn stopped \
+                                you mid-work: the tool call it cut was stopped, not refused by \
+                                the user, so look at what it left half-done before you go on.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             },
             {
@@ -476,6 +490,47 @@ fn tools_list_result() -> Value {
                     "additionalProperties": false,
                 },
             },
+            {
+                "name": "interrupt_worker",
+                "description": "Director only. Stop a Worker's running turn, then deliver \
+                                `text` to it as an ordinary message. banto writes one Esc \
+                                into the Worker's pane, but only when it is a Claude Worker \
+                                in a running turn right now, and then types its usual \
+                                one-line nudge to read mail once the pane is at rest. Use it \
+                                when work in flight has become wrong or wasted and letting \
+                                the turn finish costs more than cutting it. The price: the \
+                                tool call the Worker was in the middle of is cut, and its \
+                                own transcript records that as refused by the user. banto's \
+                                inbox header on your message says it was an interrupt and \
+                                that the call was stopped, not refused, but the Worker may \
+                                weigh the transcript line first. If the stop is the \
+                                operator's wish, say so in `text`. Not for an idle Worker \
+                                (send_to_peer reaches it), and not for a Codex Worker: its \
+                                turn is not interrupted, and the message goes as ordinary \
+                                mail. One Worker per call: there is no broadcast, and the \
+                                Goinkyo and the Director cannot be interrupted. The call \
+                                waits about 2 seconds for banto's decision and reports it; \
+                                if it says the request is queued and not decided, \
+                                brigade_status shows what followed for as long as the \
+                                message is unread.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "member": {
+                            "type": "string",
+                            "description": "The Worker's token, e.g. \"worker-2\"."
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "The message, delivered as send_to_peer's is. Say \
+                                            why the turn was stopped and what to do next; \
+                                            the Worker reads it when it next pulls its mail."
+                        }
+                    },
+                    "required": ["member", "text"],
+                    "additionalProperties": false,
+                },
+            },
         ],
     })
 }
@@ -493,6 +548,7 @@ fn tools_call_result(ctx: &mut ServerContext, msg: &Value) -> Value {
         "dismiss_goinkyo" => tool_dismiss_goinkyo(ctx),
         "name_member" => tool_name_member(ctx, msg),
         "request_decision" => tool_request_decision(ctx),
+        "interrupt_worker" => interrupt_worker(ctx, msg, INTERRUPT_WAIT),
         other => tool_error(&format!("unknown tool: {other}")),
     }
 }
@@ -538,6 +594,11 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
         "No unread mail for you.\n"
     });
 
+    // What became of the interrupts this brigade sent that are still unread, and
+    // only those: once the Worker has read its message the cursor says it was
+    // delivered, and nothing about the pane is left worth saying.
+    let unread_interrupts = ctx.store.unread_interrupts(brigade).unwrap_or_default();
+
     let peers: Vec<&BrigadeMember> = members.iter().filter(|m| role.can_reach(m.role)).collect();
     if peers.is_empty() {
         out.push_str("\nNo peers in this brigade yet — there is nobody to delegate to.");
@@ -567,7 +628,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
             // The token first, then what a Director gave it to call it by and the
             // product it runs: additions to the line that was there before.
             out.push_str(&format!(
-                "  {}{} — {activity}{}{}\n",
+                "  {}{} — {activity}{}{}{}\n",
                 labelled(&peer.token, peer.display_name.as_deref()),
                 peer.agent
                     .map(|agent| format!(" ({})", agent.label()))
@@ -577,6 +638,7 @@ fn tool_brigade_status(ctx: &mut ServerContext) -> Value {
                 } else {
                     ""
                 },
+                interrupt_note(&unread_interrupts, &peer.token),
                 if peer.role == BrigadeRole::Goinkyo {
                     consultation_age(ctx, brigade, &peer.token)
                 } else {
@@ -1445,8 +1507,15 @@ fn format_inbox(messages: &[BrigadeMessage], members: &[BrigadeMember]) -> Strin
             .iter()
             .find(|member| member.token == message.from_token)
             .and_then(|member| member.display_name.as_deref());
+        // Said in the header because the transcript says the opposite: the call an
+        // interrupt cut is recorded there as refused by the user.
+        let interrupted = if message.interrupted {
+            INTERRUPT_HEADER
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "\n[from {} — {addressing}]\n{}\n",
+            "\n[from {} — {addressing}{interrupted}]\n{}\n",
             labelled(&message.from_token, sender_name),
             message.body
         ));
@@ -1571,6 +1640,262 @@ fn tool_name_member(ctx: &mut ServerContext, msg: &Value) -> Value {
             ))
         }
         Err(err) => tool_error(&format!("failed to set the name: {err}")),
+    }
+}
+
+/// How long `interrupt_worker` waits for the UI's decision. The UI decides on
+/// its once-a-second tick, so two seconds covers one tick and its write with a
+/// margin; a longer wait would hold the Director's turn for a thing that is
+/// better looked at afterwards.
+const INTERRUPT_WAIT: Duration = Duration::from_secs(2);
+const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+
+/// The suffix `format_inbox` puts in the header of a message whose request had an
+/// Esc written for it.
+const INTERRUPT_HEADER: &str = " — banto interrupted your turn for this message; the tool call it cut was stopped, not refused";
+
+/// Refuses any key of `arguments` that is not in `allowed`, and an `arguments`
+/// that is not an object. A key the tool does not know is a caller that believes
+/// the tool does something it does not, and here the something is a write into
+/// another session's pane.
+fn only_arguments(msg: &Value, allowed: &[&str]) -> Result<(), String> {
+    match msg.pointer("/params/arguments") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(arguments)) => match arguments
+            .keys()
+            .find(|key| !allowed.contains(&key.as_str()))
+        {
+            Some(key) => Err(format!(
+                "unknown argument `{key}`; this tool takes {}.",
+                allowed
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )),
+            None => Ok(()),
+        },
+        Some(_) => Err("`arguments` must be an object.".to_string()),
+    }
+}
+
+/// `interrupt_worker`: record a request to stop one Worker's running turn, in the
+/// same transaction as the message that says why, then wait up to `wait` for the
+/// UI's decision and report it.
+///
+/// Director only, by the store's live membership; the write checks again, in its
+/// own transaction, that the caller is the brigade's Director and the target one
+/// of its Workers. Nothing here looks at a pane, a live file or a screen: those are
+/// the UI process's, and whether anything is pressed is decided there, once.
+/// `wait` is a parameter so a test need not sit through the real two seconds.
+fn interrupt_worker(ctx: &mut ServerContext, msg: &Value, wait: Duration) -> Value {
+    let (brigade, token, role) = match live_membership(ctx) {
+        Ok(Some(membership)) => membership,
+        Ok(None) => return not_in_brigade(),
+        Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
+    };
+    if role != BrigadeRole::Director {
+        return tool_error("interrupt_worker may only be called by a Director.");
+    }
+    if let Err(message) = only_arguments(msg, &["member", "text"]) {
+        return tool_error(&message);
+    }
+    let member = match require_string_arg(msg, "member") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let text = match require_string_arg(msg, "text") {
+        Ok(value) => value,
+        Err(message) => return tool_error(&message),
+    };
+    let members = match ctx.store.brigade_members(brigade) {
+        Ok(members) => members,
+        Err(err) => return tool_error(&format!("failed to read the brigade roster: {err}")),
+    };
+    let target = match members.iter().find(|candidate| candidate.token == member) {
+        Some(found) if found.role == BrigadeRole::Worker => found,
+        Some(found) => {
+            return tool_error(&format!(
+                "{} cannot be interrupted — only a Worker can.",
+                match found.role {
+                    BrigadeRole::Director => "The Director",
+                    BrigadeRole::Goinkyo => "The Goinkyo",
+                    BrigadeRole::Worker => "A Worker",
+                }
+            ));
+        }
+        None => {
+            if named_member(&members, member).is_some() {
+                return tool_error(&names_are_not_addresses(member, &members));
+            }
+            let workers: Vec<&str> = members
+                .iter()
+                .filter(|candidate| candidate.role == BrigadeRole::Worker)
+                .map(|candidate| candidate.token.as_str())
+                .collect();
+            return tool_error(&format!(
+                "\"{member}\" is not a member of this brigade. Workers you can interrupt: {}.",
+                if workers.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    workers.join(", ")
+                }
+            ));
+        }
+    };
+    let who = labelled(&target.token, target.display_name.as_deref());
+    let target_token = target.token.clone();
+
+    let id = match ctx
+        .store
+        .enqueue_interrupt_message(brigade, &token, &target_token, text)
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return tool_error(&format!(
+                "Nothing was sent: the brigade changed while the call ran (you are no longer its \
+                 Director, or {who} is gone)."
+            ));
+        }
+        Err(err) => return tool_error(&format!("failed to send: {err}")),
+    };
+    log_message(
+        ctx,
+        brigade,
+        &token,
+        id,
+        (BrigadeRole::Worker, Some(&target_token)),
+        text,
+    );
+
+    let deadline = Instant::now() + wait;
+    loop {
+        match ctx.store.interrupt_state(id) {
+            Ok(InterruptState::Gone) => {
+                return tool_text(
+                    format!(
+                        "{who} is gone: it was dismissed, or its brigade was disbanded, before \
+                         banto acted, and its mail went with it, your message included."
+                    ),
+                    false,
+                );
+            }
+            Ok(InterruptState::Decided(outcome)) => {
+                return tool_text(interrupt_result(&who, outcome), false);
+            }
+            Ok(InterruptState::Undecided) => {}
+            Err(err) => {
+                return tool_text(
+                    format!(
+                        "Queued for {who}, but the decision could not be read ({err}); \
+                         brigade_status shows what followed."
+                    ),
+                    false,
+                );
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(INTERRUPT_POLL.min(deadline - now));
+    }
+    tool_text(
+        format!(
+            "Queued for {who}, not decided yet; brigade_status shows what followed for as \
+             long as the message is unread."
+        ),
+        false,
+    )
+}
+
+/// What the Director is told of a decided interrupt. The message is delivered in
+/// every case; what differs is whether an Esc was written for it and what to
+/// expect of the Worker.
+fn interrupt_result(who: &str, outcome: InterruptOutcome) -> String {
+    use InterruptOutcome::*;
+    match outcome {
+        Pressed => format!(
+            "Esc written into {who}'s pane; your message is queued as ordinary mail, and \
+             banto will nudge it to read once the pane is at rest. brigade_status shows \
+             whether the turn stopped for as long as the message is unread."
+        ),
+        Stopped => format!(
+            "{who}'s turn was stopped and your message is queued; banto will nudge it to \
+             read it."
+        ),
+        OtherText => format!(
+            "Esc written into {who}'s pane and its turn stopped, but the pane holds unsent \
+             input banto did not type, so your message waits: the operator has to clear the \
+             line (or send that input) before the nudge can be typed."
+        ),
+        StillBusy => format!(
+            "Esc written into {who}'s pane, but it was still busy afterwards; your message \
+             is queued as ordinary mail and it reads it at its next pull."
+        ),
+        NotMidTurn => format!(
+            "No Esc written: {who} is not in a running turn. Your message is queued as \
+             ordinary mail."
+        ),
+        Waiting => format!(
+            "No Esc written: {who} is waiting on a prompt only the operator can answer, and \
+             an Esc would answer it for them. Your message is queued as ordinary mail."
+        ),
+        Read => {
+            format!("No Esc written: {who} had already read your message by the time banto looked.")
+        }
+        Codex => format!(
+            "No Esc written: {who} runs Codex, whose turns banto does not interrupt. Your \
+             message is queued as ordinary mail."
+        ),
+        RelayManual => "No Esc written: this brigade's relay is manual, so banto writes nothing \
+                        into panes. Your message is queued as ordinary mail."
+            .to_string(),
+        NoPane => format!(
+            "No Esc written: banto has no pane for {who} right now. Your message is queued \
+             as ordinary mail."
+        ),
+        Expired => "No Esc written: the request was too old when banto got to it. Your message is \
+                    queued as ordinary mail."
+            .to_string(),
+    }
+}
+
+/// The `brigade_status` words for one unread interrupt: what became of it, in
+/// a line the Director can act on. `None` is a request the UI has not decided yet.
+fn interrupt_phrase(outcome: Option<InterruptOutcome>) -> &'static str {
+    use InterruptOutcome::*;
+    match outcome {
+        None => "interrupt not decided yet",
+        Some(Pressed) => "interrupt: Esc pressed, what followed is not seen yet",
+        Some(Stopped) => "interrupt: its turn was stopped",
+        Some(OtherText) => {
+            "interrupt: Esc pressed, but the pane holds unsent input banto did not type, so your \
+             message waits for the operator"
+        }
+        Some(StillBusy) => "interrupt: Esc pressed, it was still busy afterwards",
+        Some(NotMidTurn) => "interrupt: not pressed, it was not in a running turn",
+        Some(Waiting) => "interrupt: not pressed, it waits on a prompt for the operator",
+        Some(Read) => "interrupt: not pressed, it had already read the message",
+        Some(Codex) => "interrupt: not pressed, a Codex turn is not interrupted",
+        Some(RelayManual) => "interrupt: not pressed, the relay is manual",
+        Some(NoPane) => "interrupt: not pressed, it had no pane",
+        Some(Expired) => "interrupt: not pressed, the request had expired",
+    }
+}
+
+/// ` (interrupt: …)` for a member with unread interrupts, in the order they were
+/// sent, or nothing.
+fn interrupt_note(unread: &[(MemberToken, Option<InterruptOutcome>)], token: &str) -> String {
+    let phrases: Vec<&str> = unread
+        .iter()
+        .filter(|(member, _)| member == token)
+        .map(|(_, outcome)| interrupt_phrase(*outcome))
+        .collect();
+    if phrases.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", phrases.join("; "))
     }
 }
 
@@ -2465,6 +2790,381 @@ mod tests {
                 "params":{"name":"name_member","arguments":{"name":"x"}}}"#,
         );
         assert!(result_text(&missing_member).contains("`member` is required"));
+    }
+
+    // --- interrupt_worker ------------------------------------------------------
+
+    fn interrupt_msg(arguments: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+            "params": { "name": "interrupt_worker", "arguments": arguments }
+        })
+    }
+
+    /// The tool with no wait, so a request nobody decides answers at once. Wrapped
+    /// as a response is, so the helpers that read one read this.
+    fn interrupt_now(ctx: &mut ServerContext, arguments: Value) -> Value {
+        interrupt_waiting(ctx, arguments, Duration::ZERO)
+    }
+
+    fn interrupt_waiting(ctx: &mut ServerContext, arguments: Value, wait: Duration) -> Value {
+        json!({ "result": interrupt_worker(ctx, &interrupt_msg(arguments), wait) })
+    }
+
+    fn pull(ctx: &mut ServerContext) -> String {
+        result_text(&call(
+            ctx,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{"name":"check_messages","arguments":{}}}"#,
+        ))
+    }
+
+    #[test]
+    fn interrupt_worker_is_advertised_with_its_price_and_a_closed_schema() {
+        let tools = tools_list_result();
+        let tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "interrupt_worker")
+            .expect("advertised");
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.starts_with("Director only."), "{description}");
+        // The price, in the words the Director will read it by.
+        let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("refused by the user"), "{flat}");
+        assert!(flat.contains("stopped, not refused"), "{flat}");
+        assert!(flat.contains("operator's wish"), "{flat}");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            json!(["member", "text"]),
+            "both are required"
+        );
+    }
+
+    #[test]
+    fn every_member_is_told_in_check_messages_what_an_interrupted_turn_means() {
+        // The one text every member gets whatever role prompt the operator wrote:
+        // a custom `worker_prompt` replaces the default briefing, so the sentence
+        // cannot live only there.
+        let tools = tools_list_result();
+        let description = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "check_messages")
+            .and_then(|tool| tool["description"].as_str())
+            .expect("advertised");
+        let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("banto interrupted your turn"), "{flat}");
+        assert!(flat.contains("stopped, not refused by the user"), "{flat}");
+        assert!(flat.contains("half-done"), "{flat}");
+    }
+
+    #[test]
+    fn interrupt_worker_checks_its_arguments_and_stores_nothing_when_they_are_wrong() {
+        let mut ctx = named_ctx();
+        for (arguments, expect) in [
+            (json!({"text": "x"}), "`member` is required"),
+            (json!({"member": "worker-1"}), "`text` is required"),
+            (
+                json!({"member": "worker-1", "text": ""}),
+                "`text` must not be an empty string",
+            ),
+            (
+                json!({"member": "worker-1", "text": "  "}),
+                "`text` must not be an empty string",
+            ),
+            (
+                json!({"member": 3, "text": "x"}),
+                "`member` must be a string",
+            ),
+            (
+                json!({"member": "worker-1", "text": ["x"]}),
+                "`text` must be a string",
+            ),
+            (
+                json!({"member": "worker-1", "text": null}),
+                "`text` is required",
+            ),
+            (
+                json!({"member": "worker-1", "text": "x", "to": "worker-2"}),
+                "unknown argument `to`",
+            ),
+            (
+                json!({"member": "worker-1", "text": "x", "force": true}),
+                "unknown argument `force`",
+            ),
+            (json!("worker-1"), "`arguments` must be an object"),
+        ] {
+            let response = interrupt_now(&mut ctx, arguments.clone());
+            assert!(is_error(&response), "{arguments}");
+            assert!(
+                result_text(&response).contains(expect),
+                "{arguments}: {}",
+                result_text(&response)
+            );
+        }
+        assert!(ctx.store.pending_interrupts(1).unwrap().is_empty());
+        assert!(
+            !ctx.store
+                .has_unseen_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+                .unwrap(),
+            "no message was written either"
+        );
+    }
+
+    #[test]
+    fn only_a_director_can_interrupt_and_only_a_worker_can_be_interrupted() {
+        let mut ctx = named_ctx();
+        ctx.store.name_member(1, "worker-1", "impl").unwrap();
+        for (member, expect) in [
+            ("director", "The Director cannot be interrupted"),
+            ("goinkyo", "The Goinkyo cannot be interrupted"),
+            ("impl", "names are not addresses"),
+            ("all", "Workers you can interrupt: worker-1, worker-2"),
+            ("worker-9", "Workers you can interrupt: worker-1, worker-2"),
+        ] {
+            let response = interrupt_now(&mut ctx, json!({"member": member, "text": "x"}));
+            assert!(is_error(&response), "{member}");
+            assert!(
+                result_text(&response)
+                    .to_lowercase()
+                    .contains(&expect.to_lowercase()),
+                "{member}: {}",
+                result_text(&response)
+            );
+        }
+        assert!(ctx.store.pending_interrupts(1).unwrap().is_empty());
+
+        for token in ["worker-1", "goinkyo"] {
+            let mut other = worker_ctx_of(named_ctx(), token);
+            if token == "goinkyo" {
+                other.identity.role = Some(BrigadeRole::Goinkyo);
+            }
+            let response = interrupt_now(&mut other, json!({"member": "worker-2", "text": "x"}));
+            assert!(is_error(&response), "{token}");
+            assert!(result_text(&response).contains("may only be called by a Director"));
+            assert!(other.store.pending_interrupts(1).unwrap().is_empty());
+        }
+        let mut stranger = self::ctx("s", None, None, None);
+        let response = interrupt_now(&mut stranger, json!({"member": "worker-1", "text": "x"}));
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("not (or is no longer) part of a brigade"));
+    }
+
+    #[test]
+    fn an_undecided_interrupt_is_queued_as_one_ordinary_message_and_says_so() {
+        let mut ctx = named_ctx();
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": "switch to the other file"}),
+        );
+        assert!(!is_error(&response));
+        let text = result_text(&response);
+        assert!(text.contains("not decided yet"), "{text}");
+        assert!(
+            text.contains("brigade_status shows what followed"),
+            "{text}"
+        );
+
+        let pending = ctx.store.pending_interrupts(1).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].member, "worker-1");
+        // The Worker's own pull is the ordinary one, no header about an interrupt
+        // until banto has written an Esc for it.
+        let mut worker = worker_ctx_of(ctx, "worker-1");
+        let pulled = pull(&mut worker);
+        assert!(pulled.contains("switch to the other file"), "{pulled}");
+        assert!(
+            pulled.contains("[from director \u{2014} to you]"),
+            "{pulled}"
+        );
+        assert!(!pulled.contains("interrupted"), "{pulled}");
+    }
+
+    #[test]
+    fn the_worker_is_told_in_the_header_only_when_an_esc_was_written_for_its_message() {
+        for (outcome, header) in [
+            (InterruptOutcome::Pressed, true),
+            (InterruptOutcome::Stopped, true),
+            (InterruptOutcome::StillBusy, true),
+            (InterruptOutcome::NotMidTurn, false),
+            (InterruptOutcome::Codex, false),
+        ] {
+            let mut ctx = named_ctx();
+            interrupt_now(&mut ctx, json!({"member": "worker-1", "text": "stop"}));
+            let id = ctx.store.pending_interrupts(1).unwrap()[0].message_id;
+            // A refinement is only ever written over a press.
+            if outcome.is_refinement() {
+                ctx.store
+                    .record_interrupt_outcome(id, InterruptOutcome::Pressed)
+                    .unwrap();
+            }
+            ctx.store.record_interrupt_outcome(id, outcome).unwrap();
+            let mut worker = worker_ctx_of(ctx, "worker-1");
+            let pulled = pull(&mut worker);
+            assert_eq!(
+                pulled.contains(
+                    "[from director \u{2014} to you \u{2014} banto interrupted your turn for \
+                     this message; the tool call it cut was stopped, not refused]"
+                ),
+                header,
+                "{outcome:?}: {pulled}"
+            );
+        }
+    }
+
+    #[test]
+    fn brigade_status_shows_the_outcome_of_an_unread_interrupt_and_drops_it_once_read() {
+        let mut ctx = named_ctx();
+        interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": "zzz-marker"}),
+        );
+        let status = |ctx: &mut ServerContext| result_text(&call(ctx, &status_call()));
+        assert!(status(&mut ctx).contains("(interrupt not decided yet)"));
+
+        let id = ctx.store.pending_interrupts(1).unwrap()[0].message_id;
+        ctx.store
+            .record_interrupt_outcome(id, InterruptOutcome::Pressed)
+            .unwrap();
+        let text = status(&mut ctx);
+        assert!(
+            text.contains("has unread mail from you (interrupt: Esc pressed"),
+            "{text}"
+        );
+        ctx.store
+            .record_interrupt_outcome(id, InterruptOutcome::OtherText)
+            .unwrap();
+        let text = status(&mut ctx);
+        assert!(text.contains("unsent input banto did not type"), "{text}");
+        // No quotation of anything on the line, only the fact.
+        assert!(!text.contains("zzz-marker"), "{text}");
+
+        // worker-2 is not mentioned: the note is for the Worker it was sent to.
+        let line_of = |text: &str, token: &str| {
+            text.lines()
+                .find(|line| line.trim_start().starts_with(token))
+                .unwrap()
+                .to_string()
+        };
+        assert!(!line_of(&text, "worker-2").contains("interrupt"));
+
+        let mut worker = worker_ctx_of(ctx, "worker-1");
+        pull(&mut worker);
+        let mut director = worker_ctx_of(worker, "director");
+        director.identity.role = Some(BrigadeRole::Director);
+        let text = result_text(&call(&mut director, &status_call()));
+        assert!(
+            !text.contains("interrupt"),
+            "read: nothing left to say: {text}"
+        );
+    }
+
+    #[test]
+    fn every_outcome_is_worded_and_says_whether_an_esc_was_written() {
+        use InterruptOutcome::*;
+        for outcome in [
+            Pressed,
+            NotMidTurn,
+            Waiting,
+            Read,
+            Codex,
+            RelayManual,
+            NoPane,
+            Expired,
+            Stopped,
+            OtherText,
+            StillBusy,
+        ] {
+            let text = interrupt_result("worker-1", outcome);
+            assert!(text.contains("message"), "{outcome:?}: {text}");
+            assert_eq!(
+                text.starts_with("No Esc written"),
+                !outcome.esc_written(),
+                "{outcome:?}: {text}"
+            );
+            assert!(!interrupt_phrase(Some(outcome)).is_empty());
+        }
+    }
+
+    /// Runs `act` on a second connection once the request is listed, the way the UI
+    /// process decides it while the tool waits.
+    fn decide_while_waiting(
+        path: std::path::PathBuf,
+        act: impl FnOnce(&mut Store, i64) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut store = Store::open(&path).unwrap();
+            for _ in 0..200 {
+                if let Some(request) = store.pending_interrupts(1).unwrap().first() {
+                    act(&mut store, request.message_id);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
+
+    #[test]
+    fn the_tool_reports_the_decision_the_ui_writes_while_it_waits() {
+        let (dir, mut ctx, _emporium) = file_backed_ctx();
+        let decider = decide_while_waiting(dir.path().join("banto.db"), |store, id| {
+            store
+                .record_interrupt_outcome(id, InterruptOutcome::Pressed)
+                .unwrap();
+        });
+        let response = interrupt_waiting(
+            &mut ctx,
+            json!({"member": "worker-1", "text": "stop"}),
+            Duration::from_secs(5),
+        );
+        decider.join().unwrap();
+        assert!(!is_error(&response));
+        assert!(
+            result_text(&response).starts_with("Esc written into worker-1's pane"),
+            "{}",
+            result_text(&response)
+        );
+    }
+
+    #[test]
+    fn a_worker_dismissed_while_the_tool_waits_is_reported_gone() {
+        let (dir, mut ctx, _emporium) = file_backed_ctx();
+        let decider = decide_while_waiting(dir.path().join("banto.db"), |store, _| {
+            store.dismiss_worker(1, "worker-1").unwrap();
+        });
+        let response = interrupt_waiting(
+            &mut ctx,
+            json!({"member": "worker-1", "text": "stop"}),
+            Duration::from_secs(5),
+        );
+        decider.join().unwrap();
+        assert!(!is_error(&response));
+        assert!(
+            result_text(&response).starts_with("worker-1 is gone"),
+            "{}",
+            result_text(&response)
+        );
+    }
+
+    #[test]
+    fn a_codex_worker_is_queued_like_any_other_and_the_ui_answers_codex() {
+        // The tool does not look at the product: whether a pane is pressed is the
+        // UI's decision, and for a Codex Worker it is no.
+        let mut ctx = named_ctx();
+        let response = interrupt_now(&mut ctx, json!({"member": "worker-2", "text": "stop"}));
+        assert!(!is_error(&response));
+        let id = ctx.store.pending_interrupts(1).unwrap()[0].message_id;
+        ctx.store
+            .record_interrupt_outcome(id, InterruptOutcome::Codex)
+            .unwrap();
+        let mut worker = worker_ctx_of(ctx, "worker-2");
+        let pulled = pull(&mut worker);
+        assert!(pulled.contains("stop"), "{pulled}");
+        assert!(!pulled.contains("interrupted"), "{pulled}");
     }
 
     #[test]

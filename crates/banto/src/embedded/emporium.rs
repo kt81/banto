@@ -79,7 +79,7 @@ use banto_io::provider::codex::CodexProvider;
 use banto_io::pty::{PortablePtyHost, PtyHost, STRIPPED_CHILD_ENV_VARS};
 use banto_io::status::{
     LiveSession, ProcessProbe, SysinfoProbe, ancestry_distance, claude_nudgeable,
-    claude_quiescence, live_activity, read_live_sessions, waiting_on_a_dialog,
+    claude_quiescence, live_activity, live_reports_busy, read_live_sessions, waiting_on_a_dialog,
 };
 use banto_io::store::{SCHEMA_VERSION, Store};
 use banto_tui::paint;
@@ -1190,6 +1190,17 @@ fn execute_cmd(
                 vec![Event::PtyWriteDropped { key }]
             }
         }
+        Cmd::InterruptPty { key } => {
+            if let Some(handle) = handles.get_mut(&key) {
+                handle.interrupt();
+                Vec::new()
+            } else {
+                // The pane ended between the decision and this write: the same
+                // backstop as for a dropped line, and nothing else to undo (the
+                // outcome is already on its way to the store as `pressed`).
+                vec![Event::PtyWriteDropped { key }]
+            }
+        }
         Cmd::ResizePty { key, rows, cols } => {
             if let Some(handle) = handles.get_mut(&key) {
                 handle.resize(rows, cols);
@@ -1912,6 +1923,21 @@ fn execute_store_intent(intent: StoreIntent, store: &RefCell<Store>) -> Vec<Even
             let _ = store.borrow_mut().clear_request(brigade_id, seq);
             Vec::new()
         }
+        // The one writer of the outcome column (the `_mcp` process cannot see a
+        // screen). A write that changes nothing is a repeated or late one and is
+        // meant to; a failed write leaves the request undecided in the store, and
+        // the tool answers "queued, not decided yet" and `brigade_status` shows
+        // nothing for it.
+        StoreIntent::RecordInterruptOutcome {
+            message_id,
+            outcome,
+            ..
+        } => {
+            let _ = store
+                .borrow_mut()
+                .record_interrupt_outcome(message_id, outcome);
+            Vec::new()
+        }
         // A failed write loses a preference, not the brigade.
         StoreIntent::SaveLastWorkerAgent { agent } => {
             let _ = store.borrow().set_last_worker_agent(agent);
@@ -2561,6 +2587,7 @@ fn gather_relay_observations_from(
                 .filter_map(|member| Some((member.token.clone(), member.display_name.clone()?)))
                 .collect(),
             request,
+            interrupts: interrupt_facts(&store.borrow(), brigade.id),
         });
         for member in members {
             let Some(session_id) = member.session_id.as_ref() else {
@@ -2634,6 +2661,7 @@ fn gather_relay_observations_from(
                         activity,
                         dialog_open: activity == banto_core::model::Activity::Waiting
                             && waiting_on_a_dialog(live, &session_id.0, alive_claude),
+                        status_busy: live_reports_busy(live, &session_id.0, alive_claude),
                     }),
                 Some(AgentKind::Codex) | None => None,
             };
@@ -4901,8 +4929,45 @@ fn window_focus_event(raw: &crossterm::event::Event) -> Option<Event> {
     }
 }
 
+/// The brigade's `interrupt_worker` requests no outcome is recorded for, with
+/// their age by the wall clock (the core has none, and an `Instant` would not
+/// survive a restart, which is the very case the age exists for). `None` when the
+/// store could not be read, which the core must tell apart from an empty list:
+/// nothing is decided on a tick that could not read and nothing already decided
+/// is forgotten, and the request is still there for the next.
+///
+/// `read` is as the store had it a moment ago. A Worker can pull the message
+/// between this read and the press that follows; that window is accepted, and the
+/// price is one Esc that was not needed.
+fn interrupt_facts(
+    store: &Store,
+    brigade_id: BrigadeId,
+) -> Option<Vec<banto_core::engine::InterruptFact>> {
+    let Ok(pending) = store.pending_interrupts(brigade_id) else {
+        return None;
+    };
+    let now_ms = std::time::UNIX_EPOCH
+        .elapsed()
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    Some(
+        pending
+            .into_iter()
+            .map(|request| banto_core::engine::InterruptFact {
+                message_id: request.message_id,
+                member: request.member,
+                age_ms: u64::try_from(now_ms.saturating_sub(request.created_at_ms)).unwrap_or(0),
+                read: request.read,
+            })
+            .collect(),
+    )
+}
+
 fn pump_pty_handles(handles: &mut HashMap<SessionKey, PtyHandle>, events: &mut VecDeque<Event>) {
     for (key, handle) in handles {
+        // Whatever an interrupting Esc held back leaves on the first turn of the
+        // loop after its quiet time, not on the next unrelated write.
+        handle.flush_quiet();
         loop {
             match handle.poll() {
                 PtyPoll::Chunk(chunk) => events.push_back(Event::PtyOutput {
@@ -6848,6 +6913,7 @@ mod tests {
                             "\u{5b9f}\u{88c5}".to_string(),
                         )],
                         request: None,
+                        interrupts: None,
                     }],
                 },
                 now,
@@ -7568,6 +7634,7 @@ mod tests {
                 LiveStatus {
                     activity: Alive,
                     dialog_open: false,
+                    status_busy: false,
                 },
                 "Claude \u{b7} idle \u{b7} output now",
             ),
@@ -7575,6 +7642,7 @@ mod tests {
                 LiveStatus {
                     activity: Busy,
                     dialog_open: false,
+                    status_busy: true,
                 },
                 "Claude \u{b7} busy \u{b7} output now",
             ),
@@ -7589,6 +7657,7 @@ mod tests {
             Some(LiveStatus {
                 activity: Waiting,
                 dialog_open: false,
+                status_busy: false,
             }),
         );
         assert_eq!(
@@ -8113,6 +8182,7 @@ mod tests {
                 director_session: Some("dir".to_string()),
                 member_names: Vec::new(),
                 request: None,
+                interrupts: Some(Vec::new()),
             })
         );
         assert_eq!(
@@ -8123,6 +8193,7 @@ mod tests {
                 director_session: None,
                 member_names: Vec::new(),
                 request: None,
+                interrupts: Some(Vec::new()),
             })
         );
         assert_eq!(by_id(3).map(|f| f.director_session), Some(None));
@@ -8195,6 +8266,7 @@ mod tests {
                     director_session: Some(DIR.to_string()),
                     member_names: Vec::new(),
                     request: open.then_some(banto_core::engine::RequestFact { seq: 1 }),
+                    interrupts: None,
                 }],
             },
             now,
@@ -10361,6 +10433,263 @@ mod tests {
         assert!(
             handles.contains_key(&discovered),
             "the same live child, now reachable under its real id"
+        );
+    }
+
+    /// `execute_cmd` for one command against `handles`, with the dependencies a
+    /// command that touches only the handles and the store needs.
+    fn run_cmd(
+        store: Store,
+        cmd: Cmd,
+        handles: &mut HashMap<SessionKey, PtyHandle>,
+    ) -> (Vec<Event>, RefCell<Store>) {
+        let store = RefCell::new(store);
+        let mut discovery = Vec::new();
+        let meta_cache = MetaCache::new();
+        let pty_host = MockPtyHost::default();
+        let input_reader = MockInputReader::default();
+        let thresholds = AgeThresholds::default();
+        let brigade = BrigadeConfig::default();
+        let claude_home = ClaudeHome::new(PathBuf::from("/nonexistent"));
+        let agent_binaries = AgentBinaries::default();
+        let enabled_agents = all_agents();
+        let events = {
+            let deps = Deps {
+                claude_home: &claude_home,
+                codex_home: None,
+                thresholds: &thresholds,
+                store: &store,
+                meta_cache: &meta_cache,
+                pty_host: &pty_host,
+                input_reader: &input_reader,
+                brigade: &brigade,
+                agent_binaries: &agent_binaries,
+                enabled_agents: &enabled_agents,
+                codex_catalog: &NoCatalog,
+                child: None,
+                exe: crate::exe::test_support::current(),
+            };
+            execute_cmd(cmd, &deps, handles, &mut discovery)
+        };
+        (events, store)
+    }
+
+    #[test]
+    fn interrupt_pty_writes_one_esc_to_the_live_child_and_holds_the_next_write() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let host = MockPtyHost {
+            captured: captured.clone(),
+            ..Default::default()
+        };
+        let key = SessionKey::from_id("sess-1");
+        let mut handles = HashMap::new();
+        handles.insert(key.clone(), open(&host));
+
+        let (events, _) = run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::InterruptPty { key: key.clone() },
+            &mut handles,
+        );
+        assert!(events.is_empty());
+        assert_eq!(&*captured.lock().unwrap(), b"\x1b");
+
+        // The next write through the same command path is held, not merged.
+        let (events, _) = run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::WritePty {
+                key,
+                bytes: b"hello".to_vec(),
+            },
+            &mut handles,
+        );
+        assert!(events.is_empty(), "held is not dropped");
+        assert_eq!(&*captured.lock().unwrap(), b"\x1b", "still only the Esc");
+    }
+
+    #[test]
+    fn what_an_interrupt_held_back_survives_a_rekey_and_flushes_in_order() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let host = MockPtyHost {
+            captured: captured.clone(),
+            ..Default::default()
+        };
+        let pending = pending_key("worker-1");
+        let discovered = SessionKey::from_id("w1");
+        let mut handles = HashMap::new();
+        handles.insert(pending.clone(), open(&host));
+
+        run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::InterruptPty {
+                key: pending.clone(),
+            },
+            &mut handles,
+        );
+        for bytes in [b"one".as_slice(), b"two".as_slice()] {
+            run_cmd(
+                Store::open_in_memory().unwrap(),
+                Cmd::WritePty {
+                    key: pending.clone(),
+                    bytes: bytes.to_vec(),
+                },
+                &mut handles,
+            );
+        }
+        run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::RekeyPty {
+                from: pending.clone(),
+                to: discovered.clone(),
+            },
+            &mut handles,
+        );
+        assert!(!handles.contains_key(&pending));
+        assert_eq!(&*captured.lock().unwrap(), b"\x1b", "still held");
+
+        std::thread::sleep(
+            crate::embedded::quiet_writes::QUIET_AFTER_INTERRUPT
+                + std::time::Duration::from_millis(30),
+        );
+        handles.get_mut(&discovered).unwrap().flush_quiet();
+        assert_eq!(
+            &*captured.lock().unwrap(),
+            b"\x1bonetwo",
+            "the held bytes moved with the handle and left in order"
+        );
+    }
+
+    #[test]
+    fn what_an_interrupt_held_back_goes_with_the_handle_when_the_pane_ends() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let host = MockPtyHost {
+            captured: captured.clone(),
+            ..Default::default()
+        };
+        let key = SessionKey::from_id("sess-1");
+        let mut handles = HashMap::new();
+        handles.insert(key.clone(), open(&host));
+        run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::InterruptPty { key: key.clone() },
+            &mut handles,
+        );
+        run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::WritePty {
+                key: key.clone(),
+                bytes: b"never".to_vec(),
+            },
+            &mut handles,
+        );
+        // The pane ends by a kill and the loop drops the handle once it reports its
+        // exit, as it does for a natural exit too.
+        run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::KillPty { key: key.clone() },
+            &mut handles,
+        );
+        drop(handles.remove(&key));
+        std::thread::sleep(
+            crate::embedded::quiet_writes::QUIET_AFTER_INTERRUPT
+                + std::time::Duration::from_millis(30),
+        );
+        assert_eq!(
+            &*captured.lock().unwrap(),
+            b"\x1b",
+            "nothing is written after the handle is gone"
+        );
+    }
+
+    #[test]
+    fn interrupt_pty_against_a_key_with_no_live_handle_reports_it() {
+        let key = SessionKey::from_id("gone");
+        let (events, _) = run_cmd(
+            Store::open_in_memory().unwrap(),
+            Cmd::InterruptPty { key: key.clone() },
+            &mut HashMap::new(),
+        );
+        assert_eq!(events, vec![Event::PtyWriteDropped { key }]);
+    }
+
+    #[test]
+    fn recording_an_interrupt_outcome_reaches_the_store_once() {
+        use banto_core::model::{InterruptOutcome, InterruptWhy};
+        use banto_io::store::InterruptState;
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .add_brigade_member(1, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        let id = store
+            .enqueue_interrupt_message(1, "director", "worker-1", "m")
+            .unwrap()
+            .unwrap();
+        let record = |outcome, why| StoreIntent::RecordInterruptOutcome {
+            brigade_id: 1,
+            token: "worker-1".to_string(),
+            message_id: id,
+            outcome,
+            why,
+        };
+        let store = RefCell::new(store);
+        assert!(execute_store_intent(record(InterruptOutcome::Pressed, None), &store).is_empty());
+        assert_eq!(
+            store.borrow().interrupt_state(id).unwrap(),
+            InterruptState::Decided(InterruptOutcome::Pressed)
+        );
+        // `why` is for the pane log; the store keeps the outcome alone, and a second
+        // decision does not overwrite the first.
+        execute_store_intent(
+            record(InterruptOutcome::NotMidTurn, Some(InterruptWhy::Idle)),
+            &store,
+        );
+        assert_eq!(
+            store.borrow().interrupt_state(id).unwrap(),
+            InterruptState::Decided(InterruptOutcome::Pressed)
+        );
+    }
+
+    #[test]
+    fn the_tick_is_given_each_undecided_interrupt_with_its_age_and_whether_it_was_read() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .add_brigade_member(1, "director", BrigadeRole::Director, None)
+            .unwrap();
+        store
+            .add_brigade_member(1, "worker-1", BrigadeRole::Worker, None)
+            .unwrap();
+        assert!(interrupt_facts(&store, 1).unwrap().is_empty());
+        let id = store
+            .enqueue_interrupt_message(1, "director", "worker-1", "m")
+            .unwrap()
+            .unwrap();
+        let facts = interrupt_facts(&store, 1).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].message_id, id);
+        assert_eq!(facts[0].member, "worker-1");
+        assert!(!facts[0].read);
+        assert!(facts[0].age_ms < 5_000, "just written: {}", facts[0].age_ms);
+
+        store
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+            .unwrap();
+        assert!(
+            interrupt_facts(&store, 1).unwrap()[0].read,
+            "pulled before anyone looked"
+        );
+
+        store
+            .record_interrupt_outcome(id, banto_core::model::InterruptOutcome::Read)
+            .unwrap();
+        assert!(
+            interrupt_facts(&store, 1).unwrap().is_empty(),
+            "decided: not listed again"
+        );
+        assert!(
+            interrupt_facts(&store, 2).unwrap().is_empty(),
+            "another brigade's is not this one's"
         );
     }
 
@@ -13266,15 +13595,21 @@ mod tests {
         // A Worker that has not run a turn has a live file and no transcript, so
         // no session-list row; the product is the store's recorded choice. What
         // its file says is classified as the list does (shell is busy, a dialog
-        // is still Waiting but told apart), and only for a Claude member.
+        // is still Waiting but told apart), and only for a Claude member. Only a
+        // literal `busy` is also a running turn: `shell` classifies as busy and
+        // is not one, which is what an interrupt must not press on.
         use banto_core::model::Activity::{Alive, Busy, Waiting};
         for (status, reason, expected) in [
-            ("busy", None, Some((Busy, false))),
-            ("waiting", None, Some((Waiting, false))),
-            ("waiting", Some("input needed"), Some((Waiting, false))),
-            ("waiting", Some("dialog open"), Some((Waiting, true))),
-            ("shell", None, Some((Busy, false))),
-            ("idle", None, Some((Alive, false))),
+            ("busy", None, Some((Busy, false, true))),
+            ("waiting", None, Some((Waiting, false, false))),
+            (
+                "waiting",
+                Some("input needed"),
+                Some((Waiting, false, false)),
+            ),
+            ("waiting", Some("dialog open"), Some((Waiting, true, false))),
+            ("shell", None, Some((Busy, false, false))),
+            ("idle", None, Some((Alive, false, false))),
         ] {
             let claude_home = tempfile::tempdir().unwrap();
             let (store, state, app) = staged_worker("w1", None);
@@ -13310,9 +13645,10 @@ mod tests {
             let worker = observations.iter().find(|o| o.token == "worker-1").unwrap();
             assert_eq!(
                 worker.live,
-                expected.map(|(activity, dialog_open)| LiveStatus {
+                expected.map(|(activity, dialog_open, status_busy)| LiveStatus {
                     activity,
-                    dialog_open
+                    dialog_open,
+                    status_busy
                 }),
                 "{status} {reason}"
             );

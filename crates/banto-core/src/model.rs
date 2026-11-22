@@ -592,6 +592,12 @@ pub struct BrigadeMessage {
     /// broadcast to every member of the recipient role — the original,
     /// still-default addressing.
     pub to_member: Option<MemberToken>,
+    /// An Esc was written into the recipient's pane for this message
+    /// (`interrupt_worker`): the inbox header says so, because the transcript of
+    /// the turn it cut reads as the user having refused. Only what the UI
+    /// process had decided when the message was pulled counts; a Worker that
+    /// pulls first is told nothing, and the outcome is then `read`.
+    pub interrupted: bool,
 }
 
 /// A brigade message reduced to what a collapsed tile shows: when it was
@@ -678,11 +684,171 @@ impl PtyExitReason {
     }
 }
 
+/// What banto decided about one `interrupt_worker` request, as the store keeps
+/// it in `brigade_messages.interrupt_outcome` and the tool prints it. Written
+/// once by the UI process (the `_mcp` process cannot see a screen), and only
+/// [`Self::Pressed`] is ever refined, once, into one of the three that say what
+/// the Esc did.
+///
+/// The tokens are the durable format: changing a variant's spelling must not
+/// rewrite what a store already holds, so the strings are written out here and
+/// nowhere derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterruptOutcome {
+    /// One Esc was written into the Worker's pane.
+    Pressed,
+    /// No running turn to stop (the reason is an [`InterruptWhy`]).
+    NotMidTurn,
+    /// The pane waits on a prompt only the operator can answer.
+    Waiting,
+    /// The Worker had already read the message when the request was first seen.
+    Read,
+    /// The Worker is a Codex one: its turn is not interrupted yet.
+    Codex,
+    /// `[brigade] relay = "manual"`: banto writes nothing into panes by itself.
+    RelayManual,
+    /// No hosted pane with a live process (the reason is an [`InterruptWhy`]).
+    NoPane,
+    /// The request was already too old when it was first seen (a banto restart
+    /// in between): an Esc now would cut whatever the Worker is doing instead.
+    Expired,
+    /// After a press: the pane came to rest and nothing holds the nudge.
+    Stopped,
+    /// After a press: the pane came to rest with text on the input line that is
+    /// not the nudge sentence, so delivery waits on the operator.
+    OtherText,
+    /// After a press: the pane did not come to rest.
+    StillBusy,
+}
+
+impl InterruptOutcome {
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::Pressed => "pressed",
+            Self::NotMidTurn => "not-mid-turn",
+            Self::Waiting => "waiting",
+            Self::Read => "read",
+            Self::Codex => "codex",
+            Self::RelayManual => "relay-manual",
+            Self::NoPane => "no-pane",
+            Self::Expired => "expired",
+            Self::Stopped => "stopped",
+            Self::OtherText => "other-text",
+            Self::StillBusy => "still-busy",
+        }
+    }
+
+    /// Unknown values are not an error: a newer banto may have written one this
+    /// build does not know.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "pressed" => Self::Pressed,
+            "not-mid-turn" => Self::NotMidTurn,
+            "waiting" => Self::Waiting,
+            "read" => Self::Read,
+            "codex" => Self::Codex,
+            "relay-manual" => Self::RelayManual,
+            "no-pane" => Self::NoPane,
+            "expired" => Self::Expired,
+            "stopped" => Self::Stopped,
+            "other-text" => Self::OtherText,
+            "still-busy" => Self::StillBusy,
+            _ => return None,
+        })
+    }
+
+    /// Whether this is what a press turned into: written only over
+    /// [`Self::Pressed`], never over a first decision.
+    pub fn is_refinement(self) -> bool {
+        matches!(self, Self::Stopped | Self::OtherText | Self::StillBusy)
+    }
+
+    /// Whether an Esc was written into the pane, which is what the Worker's
+    /// inbox header says (a `pressed` row may later be refined, and stays true).
+    pub fn esc_written(self) -> bool {
+        self == Self::Pressed || self.is_refinement()
+    }
+}
+
+/// Why a decision that folds several reasons into one outcome chose it. Only the
+/// pane log keeps it, as one fixed word: the column stays the outcome alone, and
+/// nothing a pane showed is ever recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterruptWhy {
+    /// `not-mid-turn`: the live file says idle (or any status that is not a turn).
+    Idle,
+    /// `not-mid-turn`: the turn ended with a background command still running.
+    BackgroundCommand,
+    /// `not-mid-turn`: a line of banto's own was just going into the pane, and the
+    /// relay already declines to act across its own write.
+    OwnLine,
+    /// `no-pane`: the member's brigade is being closed.
+    Closing,
+    /// `no-pane`: the pane is being ended.
+    Ending,
+    /// `no-pane`: the pane is open but cannot be read yet: it has no session, its
+    /// product is not resolved, or a Claude process has published no live file.
+    Starting,
+    /// `no-pane`: nothing hosts the member.
+    NotRunning,
+}
+
+impl InterruptWhy {
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::BackgroundCommand => "background-command",
+            Self::OwnLine => "own-line",
+            Self::Closing => "closing",
+            Self::Ending => "ending",
+            Self::Starting => "starting",
+            Self::NotRunning => "not-running",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn interrupt_outcome_tokens_round_trip_and_unknown_is_none() {
+        let all = [
+            InterruptOutcome::Pressed,
+            InterruptOutcome::NotMidTurn,
+            InterruptOutcome::Waiting,
+            InterruptOutcome::Read,
+            InterruptOutcome::Codex,
+            InterruptOutcome::RelayManual,
+            InterruptOutcome::NoPane,
+            InterruptOutcome::Expired,
+            InterruptOutcome::Stopped,
+            InterruptOutcome::OtherText,
+            InterruptOutcome::StillBusy,
+        ];
+        for outcome in all {
+            assert_eq!(
+                InterruptOutcome::from_token(outcome.as_token()),
+                Some(outcome)
+            );
+        }
+        assert_eq!(InterruptOutcome::from_token("from-the-future"), None);
+        // Only the three that say what a press did are refinements, and an Esc
+        // was written for exactly those and `pressed`.
+        let refinements: Vec<_> = all.into_iter().filter(|o| o.is_refinement()).collect();
+        assert_eq!(
+            refinements,
+            [
+                InterruptOutcome::Stopped,
+                InterruptOutcome::OtherText,
+                InterruptOutcome::StillBusy
+            ]
+        );
+        let written: Vec<_> = all.into_iter().filter(|o| o.esc_written()).collect();
+        assert_eq!(written.len(), 4);
+    }
 
     #[test]
     fn haystack_joins_title_and_cwd() {

@@ -27,11 +27,12 @@ const CODEX_MEMBER_TOOLS: [&str; 3] = [
 /// three above, and the four Director tools added after it never reached it, so a
 /// Codex Director had no name to call them by; a test in `crate::mcp` now checks
 /// every advertised tool against these two lists.
-const CODEX_DIRECTOR_TOOLS: [&str; 4] = [
+const CODEX_DIRECTOR_TOOLS: [&str; 5] = [
     "mcp__banto__request_decision",
     "mcp__banto__name_member",
     "mcp__banto__consult_goinkyo",
     "mcp__banto__dismiss_goinkyo",
+    "mcp__banto__interrupt_worker",
 ];
 
 /// Facts a Codex member needs that a Claude one does not, appended to the
@@ -482,11 +483,12 @@ mod tests {
         "mcp__banto__brigade_status",
     ];
 
-    const DIRECTOR_TOOLS: [&str; 4] = [
+    const DIRECTOR_TOOLS: [&str; 5] = [
         "mcp__banto__request_decision",
         "mcp__banto__name_member",
         "mcp__banto__consult_goinkyo",
         "mcp__banto__dismiss_goinkyo",
+        "mcp__banto__interrupt_worker",
     ];
 
     #[test]

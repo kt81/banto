@@ -205,6 +205,7 @@ impl Scene {
             director_session: Some("dir".to_string()),
             member_names: self.names_of(brigade_id),
             request: None,
+            interrupts: None,
         };
         self.feed(Event::Tick {
             relay,

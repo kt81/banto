@@ -43,8 +43,9 @@ use crate::key_encode::{
 use crate::member_name;
 use crate::model::Activity;
 use crate::model::{
-    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, MemberGlance, MemberToken,
-    MessageGlance, PtyExitReason, Quiescence, SessionRow, SessionToOpen, StoredLayout,
+    AgentKind, BrigadeId, BrigadeRole, DIRECTOR_TOKEN, GOINKYO_TOKEN, InterruptOutcome,
+    InterruptWhy, MemberGlance, MemberToken, MessageGlance, PtyExitReason, Quiescence, SessionRow,
+    SessionToOpen, StoredLayout,
 };
 use crate::pane_log::PaneFacts;
 use crate::program_state::ReportedState;
@@ -291,6 +292,18 @@ const RELAY_NUDGE_LINE: &str =
 /// How long after the nudge text before its submitting `\r` is sent — see
 /// [`update_tick`].
 const RELAY_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+/// How old an `interrupt_worker` request may be, counted from the moment it was
+/// written, when the UI first sees it. Older is `expired`, and the Esc is not
+/// written: the reason it was written for has long gone by, and what the Worker
+/// is doing now is something else. That is what a banto restart between the
+/// request and the first look looks like. A margin of a few ticks over the one
+/// second a request normally waits for one, not a measured value.
+const INTERRUPT_STALE_AFTER: Duration = Duration::from_secs(10);
+/// How many ticks after an Esc the pane is given to come to rest before the
+/// press is called `still-busy`. The turn was measured to stop about 120 ms after
+/// the write and the live file to follow at once, so the first tick after the
+/// press reads the result; the other two are for a status that lags.
+const INTERRUPT_SETTLE_TICKS: u32 = 3;
 /// How long a transient status message shows before [`update_tick`] clears it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the status line stays clear — showing the key guidance — between
@@ -606,6 +619,33 @@ pub struct BrigadeNameFacts {
     /// existed reads as "none".
     #[serde(default)]
     pub request: Option<RequestFact>,
+    /// The brigade's `interrupt_worker` requests no outcome is recorded for, as
+    /// the store held them when the tick read it, whether or not the Worker has
+    /// read the message. Per brigade, not per member observation: a Worker with no
+    /// pane has no observation at all and still has to be answered (`no-pane`).
+    /// `None` when the store could not be read this tick, which is not the same
+    /// as nothing pending: an unreadable store must not make the run forget what
+    /// it has decided (the outcome write may be what failed, and the request would
+    /// then be read again, undecided, and pressed a second time). `None` too in a
+    /// stream recorded before interrupts existed.
+    #[serde(default)]
+    pub interrupts: Option<Vec<InterruptFact>>,
+}
+
+/// One `interrupt_worker` request waiting for the UI's decision. Nothing the
+/// Director wrote travels here (the message is in the store; the notices quote
+/// its first line from the member's glance, as the nudge notice does).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptFact {
+    /// The message row's id: the request's identity, and what an outcome is
+    /// recorded against.
+    pub message_id: i64,
+    pub member: MemberToken,
+    /// How long ago the request was written, by the wall clock, read by the shell
+    /// (the core has no clock but `now`, and a restart loses `Instant`s).
+    pub age_ms: u64,
+    /// The Worker's read cursor is already past the message.
+    pub read: bool,
 }
 
 /// A Director's open request for a decision as the store holds it: the sequence
@@ -668,6 +708,13 @@ pub struct RelayObservation {
 pub struct LiveStatus {
     pub activity: Activity,
     pub dialog_open: bool,
+    /// The live file says `busy` in so many words: a turn is running. Not
+    /// [`Self::activity`] being [`Activity::Busy`], which `shell` (a background
+    /// command after the turn ended) is as well, and which an Esc cuts nothing of.
+    /// The interrupt presses on this and nothing else. `#[serde(default)]`: a
+    /// stream recorded before it reads as "no turn".
+    #[serde(default)]
+    pub status_busy: bool,
 }
 
 /// What banto knows about a live member that is neither on its screen nor in
@@ -1232,6 +1279,20 @@ pub struct EmporiumState {
     /// the first off-stage Director left with unread mail exposed that sharing
     /// a cooldown or attempt count across those cells is wrong.
     pub relay_states: HashMap<(BrigadeId, MemberToken), RelayState>,
+    /// The `interrupt_worker` requests this run has decided, each with its
+    /// brigade. A request is decided once, on the first tick that sees it, and the
+    /// store's outcome column is what stops it being seen again; this is what stops
+    /// it between the decision and a write that has not landed, or has failed
+    /// (which leaves the request listed for good, and decided once). Forgotten when
+    /// a tick that lists the brigade no longer lists the request.
+    interrupt_decided: HashMap<i64, BrigadeId>,
+    /// Presses whose result has not been read yet, by member: see
+    /// [`refine_interrupts`]. Goes with the pane, like the relay state.
+    interrupt_watches: HashMap<(BrigadeId, MemberToken), InterruptWatch>,
+    /// The members the Enter-only repair is live for: from an Esc until the
+    /// member has no unread mail or its pane ends. See the relay loop in
+    /// [`update_tick`].
+    interrupt_repairs: HashSet<(BrigadeId, MemberToken)>,
     /// See [`MemberFacts`]. Forgotten when the member is dismissed or the
     /// brigade disbanded, like the layout preferences; a pane exiting or
     /// being relaunched keeps it.
@@ -1807,6 +1868,9 @@ impl EmporiumState {
             status_set_at: None,
             startup_notices: VecDeque::new(),
             relay_states: HashMap::new(),
+            interrupt_decided: HashMap::new(),
+            interrupt_watches: HashMap::new(),
+            interrupt_repairs: HashSet::new(),
             member_facts: HashMap::new(),
             persisted_layouts: HashMap::new(),
             brigade_names: HashMap::new(),
@@ -2072,7 +2136,10 @@ impl EmporiumState {
         let token = self.member_tokens.remove(key);
         let brigade_id = self.member_brigades.remove(key);
         if let (Some(token), Some(brigade_id)) = (token, brigade_id) {
-            self.relay_states.remove(&(brigade_id, token));
+            let member = (brigade_id, token);
+            self.relay_states.remove(&member);
+            self.interrupt_watches.remove(&member);
+            self.interrupt_repairs.remove(&member);
         }
         self.last_forwarded_input.remove(key);
         self.last_given_input.remove(key);
@@ -3884,6 +3951,17 @@ pub enum StoreIntent {
         brigade_id: BrigadeId,
         token: MemberToken,
     },
+    /// What the UI decided about the `interrupt_worker` request on message
+    /// `message_id` (`Store::record_interrupt_outcome`). `why` is the folded
+    /// reason behind a `not-mid-turn` or a `no-pane`: it is for the pane log, and
+    /// the store never sees it.
+    RecordInterruptOutcome {
+        brigade_id: BrigadeId,
+        token: MemberToken,
+        message_id: i64,
+        outcome: InterruptOutcome,
+        why: Option<InterruptWhy>,
+    },
 }
 
 /// Mirrors `crate::app::GroupJoinTarget`, but by value (the original borrows
@@ -3966,6 +4044,15 @@ pub enum Cmd {
     /// "make the exit happen". The shell does the closing off the event loop,
     /// where closing a console can block.
     HangUpPty {
+        key: SessionKey,
+    },
+    /// Write one Esc into the pane at `key` to stop its running turn
+    /// (`interrupt_worker`), and hold every other write to that pane for a quiet
+    /// time afterwards. A Cmd of its own, not a [`Cmd::WritePty`], because the
+    /// executor has to know which write is the Esc: any byte that follows it within
+    /// about 50 ms is read as an Alt chord, the turn does not stop and the byte is
+    /// lost. The stop itself is never delayed.
+    InterruptPty {
         key: SessionKey,
     },
     /// Kill the child at `key` outright: the force at the end of
@@ -9942,6 +10029,7 @@ fn update_brigade_formed(
             director_session: Some(director_row_id.clone()),
             member_names: Vec::new(),
             request: None,
+            interrupts: None,
         },
     );
     // A brigade formed in this run had no request when it was formed, so one that
@@ -10269,6 +10357,12 @@ fn update_disbanded(
 /// a dismissal).
 fn forget_dismissed_member(state: &mut EmporiumState, brigade_id: BrigadeId, token: &str) {
     state.member_facts.remove(&(brigade_id, token.to_string()));
+    state
+        .interrupt_watches
+        .remove(&(brigade_id, token.to_string()));
+    state
+        .interrupt_repairs
+        .remove(&(brigade_id, token.to_string()));
     state.stated_names.remove(&(brigade_id, token.to_string()));
     if let Some(joined) = state.member_order.get_mut(&brigade_id) {
         joined.retain(|listed| listed != token);
@@ -10443,6 +10537,358 @@ fn nudge_prompt(state: &EmporiumState, brigade_id: BrigadeId, message: &MessageG
 /// display columns, ellipsis included.
 const BRIGADE_NAME_COLUMNS: usize = 28;
 
+/// A press whose result [`refine_interrupts`] has yet to read.
+#[derive(Debug, Clone)]
+struct InterruptWatch {
+    /// The messages the press answers: usually one, more when two requests for
+    /// the same pane came on the same tick and shared the one Esc.
+    messages: Vec<i64>,
+    /// How many ticks have looked at the pane since the press. The press's own
+    /// tick is not one.
+    looked: u32,
+}
+
+/// Whether the pane's input line holds exactly [`RELAY_NUDGE_LINE`], whitespace
+/// aside, which is what an interrupt that cut a freshly submitted nudge leaves
+/// there. Only a caller that has read the line as `HasText` may ask: this is the
+/// comparison, not the reading. Compared by text so that nothing else on the line
+/// can be taken for banto's own; only its result is ever used or recorded.
+fn restored_nudge_line(pane: &crate::screen::Screen) -> bool {
+    typed_text_without_whitespace(pane).as_deref()
+        == Some(&*RELAY_NUDGE_LINE.replace(char::is_whitespace, ""))
+}
+
+/// What the tick decides about each `interrupt_worker` request it has not decided
+/// yet, once and never again, and the Esc for those that earn one.
+///
+/// The order the facts are weighed in is on [`judge_interrupt`]. An Esc is written
+/// only for a Claude pane whose live file says `busy` in so many words. An unsent
+/// draft is deliberately not a reason to hold it: an Esc was measured to leave a
+/// draft in the input line untouched, so the Esc cannot lose the operator's text,
+/// and holding it would make the Director's stop depend on what the operator last
+/// typed. The unsent-draft fence still holds the *nudge*, as it always has.
+///
+/// One Esc per pane per tick however many requests there are: a second Esc inside
+/// the quiet time would be read as an Alt chord and cut nothing, and one press
+/// stops the turn the same for both.
+fn decide_interrupts(
+    state: &mut EmporiumState,
+    app: &App,
+    config: &BrigadeConfig,
+    relay: &[RelayObservation],
+    requests: Vec<(BrigadeId, InterruptFact)>,
+    written_this_tick: &mut HashSet<SessionKey>,
+    now: Instant,
+) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    let mut pressed_panes: HashSet<SessionKey> = HashSet::new();
+    for (brigade_id, fact) in requests {
+        if state.interrupt_decided.contains_key(&fact.message_id) {
+            continue;
+        }
+        let member = (brigade_id, fact.member.clone());
+        let obs = relay
+            .iter()
+            .find(|obs| obs.brigade_id == brigade_id && obs.token == fact.member);
+        // The Esc this very pass wrote into the pane does not make it a pane
+        // with a line of banto's own in flight for the next request: that one
+        // shares the press.
+        let own_line = obs.is_some_and(|obs| {
+            (written_this_tick.contains(&obs.key) && !pressed_panes.contains(&obs.key))
+                || state
+                    .pending_submits
+                    .iter()
+                    .any(|entry| entry.key == obs.key)
+        });
+        let (outcome, why) = judge_interrupt(state, config, brigade_id, &fact, obs, own_line);
+        let who = state.members_phrase(app, &[(Some(brigade_id), fact.member.clone())]);
+        let director = state.member_call(Some(brigade_id), DIRECTOR_TOKEN);
+        match (outcome, obs) {
+            (InterruptOutcome::Pressed, Some(obs)) => {
+                if pressed_panes.insert(obs.key.clone()) {
+                    cmds.push(Cmd::InterruptPty {
+                        key: obs.key.clone(),
+                    });
+                    written_this_tick.insert(obs.key.clone());
+                }
+                // The nudge that follows the stop must not wait out the minute a
+                // nudge sent before the Director's message was written has left.
+                if let Some(relay_state) = state.relay_states.get_mut(&member) {
+                    relay_state.nudge = NudgeState::default();
+                }
+                state.interrupt_repairs.insert(member.clone());
+                let watch = state
+                    .interrupt_watches
+                    .entry(member.clone())
+                    .or_insert_with(|| InterruptWatch {
+                        messages: Vec::new(),
+                        looked: 0,
+                    });
+                watch.messages.push(fact.message_id);
+                watch.looked = 0;
+                let prompt = interrupt_prompt(state, brigade_id, &member.1);
+                state.set_status(
+                    format!("relay: interrupting {who} for {director}{prompt}"),
+                    now,
+                );
+            }
+            (InterruptOutcome::Waiting, _) => {
+                state.set_status(
+                    format!(
+                        "relay: {director} asked to interrupt {who}, but it is waiting on a \
+                         prompt only you can answer"
+                    ),
+                    now,
+                );
+            }
+            _ => {}
+        }
+        state.interrupt_decided.insert(fact.message_id, brigade_id);
+        cmds.push(Cmd::Store(StoreIntent::RecordInterruptOutcome {
+            brigade_id,
+            token: fact.member,
+            message_id: fact.message_id,
+            outcome,
+            why,
+        }));
+    }
+    cmds
+}
+
+/// The decision for one request, from the facts alone. See [`decide_interrupts`].
+///
+/// The first line that applies wins, in this order, and the order is the
+/// contract (the values overlap, and a different order answers the same facts
+/// differently):
+///
+/// 1. `read`: the Worker already has the message, whatever else is true now.
+/// 2. `expired`: the request is older than [`INTERRUPT_STALE_AFTER`].
+/// 3. `no-pane`: the brigade is closing, no pane is hosted for the member yet or
+///    any more, or the pane has a hang-up queued.
+/// 4. `relay-manual`: banto writes nothing into panes by itself.
+/// 5. `codex`.
+/// 6. `no-pane` again, for a pane that cannot be read yet: the product is not
+///    known, or a Claude pane has published no live file. It comes after the
+///    product checks because it is only meaningful for a Claude pane.
+/// 7. `waiting`: a prompt only the operator can answer.
+/// 8. `not-mid-turn`: a line of banto's own is in flight, a background command, or
+///    idle.
+/// 9. `pressed`: the live file says `busy` in so many words.
+///
+/// `waiting` and `pressed` cannot both be true (they are different words in the
+/// live file), so their order against each other is only a statement; the order
+/// of `waiting` before `not-mid-turn` is a choice: a dialog is the more useful
+/// thing to say about a pane that also has a line of banto's in flight.
+fn judge_interrupt(
+    state: &EmporiumState,
+    config: &BrigadeConfig,
+    brigade_id: BrigadeId,
+    fact: &InterruptFact,
+    obs: Option<&RelayObservation>,
+    own_line: bool,
+) -> (InterruptOutcome, Option<InterruptWhy>) {
+    use InterruptOutcome as Out;
+    use InterruptWhy as Why;
+    if fact.read {
+        return (Out::Read, None);
+    }
+    if Duration::from_millis(fact.age_ms) > INTERRUPT_STALE_AFTER {
+        return (Out::Expired, None);
+    }
+    if state.closing.contains_key(&brigade_id) {
+        return (Out::NoPane, Some(Why::Closing));
+    }
+    let Some(obs) = obs else {
+        // No observation: either the pane is open and has no session yet (the
+        // observation needs one), or nothing hosts the member.
+        let starting = state.member_tokens.iter().any(|(key, token)| {
+            *token == fact.member && state.member_brigades.get(key) == Some(&brigade_id)
+        });
+        let why = if starting {
+            Why::Starting
+        } else {
+            Why::NotRunning
+        };
+        return (Out::NoPane, Some(why));
+    };
+    if state.hangups.contains_key(&obs.key) {
+        return (Out::NoPane, Some(Why::Ending));
+    }
+    if config.relay == RelayMode::Manual {
+        return (Out::RelayManual, None);
+    }
+    match obs.agent {
+        Some(AgentKind::Codex) => return (Out::Codex, None),
+        Some(AgentKind::ClaudeCode) => {}
+        None => return (Out::NoPane, Some(Why::Starting)),
+    }
+    let Some(live) = obs.live else {
+        return (Out::NoPane, Some(Why::Starting));
+    };
+    if live.activity == Activity::Waiting {
+        return (Out::Waiting, None);
+    }
+    if own_line {
+        return (Out::NotMidTurn, Some(Why::OwnLine));
+    }
+    if live.status_busy {
+        return (Out::Pressed, None);
+    }
+    match live.activity {
+        Activity::Busy => (Out::NotMidTurn, Some(Why::BackgroundCommand)),
+        _ => (Out::NotMidTurn, Some(Why::Idle)),
+    }
+}
+
+/// What a pane's input line says this tick, and what the unsent-draft fence makes
+/// of it: the reading itself (`None` for a pane that is not a Claude one, whose
+/// line is read elsewhere), whether the fence holds a nudge back, and whether the
+/// reading releases the operator's mark.
+#[derive(Debug, Clone, Copy)]
+struct InputVerdict {
+    reading: Option<InputLine>,
+    has_unsent: bool,
+    clear_mark: bool,
+}
+
+/// One [`InputVerdict`] per pane per tick, taken the first time anyone asks and
+/// handed back unchanged to every later caller in the same tick. The relay loop
+/// is its owner and its main reader; the interrupt refinement asks for the same
+/// answer rather than reading the line a second time, so the two cannot disagree
+/// about a pane within a tick and the screen is read no more often than before.
+/// Nothing between the first ask and the last changes what the verdict depends on
+/// (the screen, the mark, when banto last forwarded input), which is why the
+/// answer may be shared, and why it is dropped at the end of the tick instead of
+/// kept: a verdict is a reading, and readings are not state.
+#[derive(Default)]
+struct InputVerdicts(HashMap<SessionKey, InputVerdict>);
+
+impl InputVerdicts {
+    fn of(&mut self, state: &EmporiumState, obs: &RelayObservation, now: Instant) -> InputVerdict {
+        *self.0.entry(obs.key.clone()).or_insert_with(|| {
+            // Claude's reader also detects text the operator recalled without
+            // forwarding keys; Codex is checked separately at the release gate.
+            let reading = match (obs.agent, state.screens.get(&obs.key)) {
+                (Some(AgentKind::ClaudeCode), Some(pane)) => Some(read_input_line(pane)),
+                _ => None,
+            };
+            let since_forwarded = state
+                .last_forwarded_input
+                .get(&obs.key)
+                .map(|at| now.saturating_duration_since(*at));
+            let (has_unsent, clear_mark) = unsent_verdict(
+                reading.unwrap_or(InputLine::Unrecognized),
+                state.has_unsent_operator_input(&obs.key),
+                since_forwarded,
+            );
+            InputVerdict {
+                reading,
+                has_unsent,
+                clear_mark,
+            }
+        })
+    }
+}
+
+/// Read what each earlier press did, and record it once.
+///
+/// - `stopped`: the pane came to rest (the relay's own idle reading) and nothing
+///   holds the nudge: the line is empty, or holds exactly the nudge the Esc
+///   restored, which the repair resubmits. An operator who clears that line has
+///   also stopped nothing from being delivered.
+/// - `other-text`: it came to rest with text that is not the nudge, so delivery
+///   waits on the operator.
+/// - `still-busy`: it did not come to rest within [`INTERRUPT_SETTLE_TICKS`]. That
+///   is two cases banto cannot tell apart: the Esc did nothing, and the Esc cut the
+///   turn and a prompt the Worker had queued started at once. The Esc is not
+///   written again either way; the message is read when that turn ends.
+///
+/// A tick that did not observe the member says nothing and counts for nothing.
+/// The notice quotes no text from the pane: only the result of the comparison.
+///
+/// The input line is not read here. The pane's [`InputVerdict`] is the relay's
+/// (see [`InputVerdicts`]): `other-text` is that verdict (the fence holds the
+/// nudge) on a line that is not exactly the nudge sentence, so the relay stays the
+/// one reader of the line, once per pane per tick.
+fn refine_interrupts(
+    state: &mut EmporiumState,
+    app: &App,
+    relay: &[RelayObservation],
+    verdicts: &mut InputVerdicts,
+    now: Instant,
+) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    let members: Vec<(BrigadeId, MemberToken)> = state.interrupt_watches.keys().cloned().collect();
+    for member in members {
+        let (brigade_id, token) = &member;
+        let Some(obs) = relay
+            .iter()
+            .find(|obs| obs.brigade_id == *brigade_id && obs.token == *token)
+        else {
+            continue;
+        };
+        let Some(watch) = state.interrupt_watches.get_mut(&member) else {
+            continue;
+        };
+        watch.looked += 1;
+        let looked = watch.looked;
+        let outcome = if obs.is_idle_this_tick == Some(true) {
+            let verdict = verdicts.of(state, obs, now);
+            let own = verdict.reading == Some(InputLine::HasText)
+                && state.screens.get(&obs.key).is_some_and(restored_nudge_line);
+            if verdict.has_unsent && !own {
+                InterruptOutcome::OtherText
+            } else {
+                InterruptOutcome::Stopped
+            }
+        } else if looked >= INTERRUPT_SETTLE_TICKS {
+            InterruptOutcome::StillBusy
+        } else {
+            continue;
+        };
+        let Some(watch) = state.interrupt_watches.remove(&member) else {
+            continue;
+        };
+        let who = state.members_phrase(app, &[(Some(*brigade_id), token.clone())]);
+        let director = state.member_call(Some(*brigade_id), DIRECTOR_TOKEN);
+        let prompt = interrupt_prompt(state, *brigade_id, token);
+        let text = match outcome {
+            InterruptOutcome::Stopped => format!("relay: {director} interrupted {who}{prompt}"),
+            InterruptOutcome::StillBusy => format!(
+                "relay: {who} is still busy after the Esc banto wrote for {director}; it reads \
+                 the message when this turn ends{prompt}"
+            ),
+            _ => format!(
+                "relay: {who}: the pane holds unsent input banto did not type, so the message \
+                 from {director} waits \u{2014} clear the line and it is delivered; Enter there \
+                 sends that input, and the Worker restarts without having read why it was stopped"
+            ),
+        };
+        state.set_status(text, now);
+        for message_id in watch.messages {
+            cmds.push(Cmd::Store(StoreIntent::RecordInterruptOutcome {
+                brigade_id: *brigade_id,
+                token: token.clone(),
+                message_id,
+                outcome,
+                why: None,
+            }));
+        }
+    }
+    cmds
+}
+
+/// ` ← director: first line` for an interrupt notice: the newest message the
+/// member was sent, which is the interrupt's unless another followed it.
+fn interrupt_prompt(state: &EmporiumState, brigade_id: BrigadeId, token: &str) -> String {
+    state
+        .member_facts
+        .get(&(brigade_id, token.to_string()))
+        .and_then(|facts| facts.inbound.as_ref())
+        .map(|inbound| nudge_prompt(state, brigade_id, inbound))
+        .unwrap_or_default()
+}
+
 fn update_tick(
     state: &mut EmporiumState,
     app: &App,
@@ -10474,6 +10920,7 @@ fn update_tick(
     // First, so the statuses below name each brigade by what this very tick
     // read. A brigade the tick does not list keeps its last facts (a failed
     // gather reads nothing and must not blank every name).
+    let mut interrupt_requests: Vec<(BrigadeId, InterruptFact)> = Vec::new();
     for mut facts in brigades {
         // The member names are the roster's truth as of this read: they replace
         // what events have stated for the brigade and are resolved as a roster
@@ -10482,6 +10929,21 @@ fn update_tick(
         state.replace_member_names(facts.brigade_id, names);
         let request = facts.request.take();
         let brigade_id = facts.brigade_id;
+        // A request the store no longer lists has its outcome recorded (or its
+        // member gone): what this run remembered of it can go. A list that could
+        // not be read says nothing about any request, so nothing is forgotten.
+        let interrupts = std::mem::take(&mut facts.interrupts);
+        if let Some(listed) = &interrupts {
+            state.interrupt_decided.retain(|id, owner| {
+                *owner != brigade_id || listed.iter().any(|f| f.message_id == *id)
+            });
+        }
+        interrupt_requests.extend(
+            interrupts
+                .into_iter()
+                .flatten()
+                .map(|fact| (brigade_id, fact)),
+        );
         state.brigade_names.insert(brigade_id, facts);
         cmds.extend(apply_request_fact(state, brigade, brigade_id, request, now));
     }
@@ -10840,6 +11302,22 @@ fn update_tick(
         );
     }
 
+    // Presses from earlier ticks are read first, so a request decided on this very
+    // tick is not read as a result before the pane has had a tick to come to rest.
+    // Both run before the relay below: an Esc written this tick makes the pane
+    // one with a line in flight, which the relay then leaves alone.
+    let mut verdicts = InputVerdicts::default();
+    cmds.extend(refine_interrupts(state, app, &relay, &mut verdicts, now));
+    cmds.extend(decide_interrupts(
+        state,
+        app,
+        brigade,
+        &relay,
+        interrupt_requests,
+        &mut written_this_tick,
+        now,
+    ));
+
     // Before the relay below consumes the observations: a notice about a member
     // that was never briefed does not depend on the relay being on.
     say_unbriefed_codex_members(state, app, &relay, now);
@@ -10861,18 +11339,12 @@ fn update_tick(
             if state.closing.contains_key(&obs.brigade_id) {
                 continue;
             }
-            // Claude's reader also detects text the operator recalled without
-            // forwarding keys; Codex is checked separately at the release gate.
-            let reading = match (obs.agent, state.screens.get(&obs.key)) {
-                (Some(AgentKind::ClaudeCode), Some(pane)) => Some(read_input_line(pane)),
-                _ => None,
-            };
+            let InputVerdict {
+                reading,
+                has_unsent,
+                clear_mark,
+            } = verdicts.of(state, &obs, now);
             let last_forwarded = state.last_forwarded_input.get(&obs.key).copied();
-            let (has_unsent, clear_mark) = unsent_verdict(
-                reading.unwrap_or(InputLine::Unrecognized),
-                state.has_unsent_operator_input(&obs.key),
-                last_forwarded.map(|at| now.saturating_duration_since(at)),
-            );
             if clear_mark {
                 state.unsent_operator_input.remove(&obs.key);
             }
@@ -10951,6 +11423,26 @@ fn update_tick(
                     input.has_unsent = true;
                 }
             }
+            // The Enter-only repair. An Esc written before the model produced any
+            // output puts the prompt it cut back into the input box, and when that
+            // prompt was the nudge, the line reads as text and the unsent-draft
+            // fence would hold it for good (measured: the box then holds exactly
+            // the nudge sentence). It is banto's own line, not a draft: when a
+            // nudge is due, its Enter alone delivers it. Typing the sentence again
+            // would put two onto the line, and any other text on the line is still
+            // the operator's and still holds the nudge. Live from the press until
+            // the member has no unread mail: it is not ended by the Enter going
+            // out, because an Enter that was lost has to be sent again.
+            let member = (obs.brigade_id, obs.token.clone());
+            if !obs.has_unseen {
+                state.interrupt_repairs.remove(&member);
+            }
+            let enter_only = state.interrupt_repairs.contains(&member)
+                && reading == Some(InputLine::HasText)
+                && state.screens.get(&obs.key).is_some_and(restored_nudge_line);
+            if enter_only {
+                input.has_unsent = false;
+            }
             // The clock ends only when the pane reads at its prompt or the mail is
             // gone. A tick on which the member is merely not eligible (not idle
             // that tick, the operator's keystroke quiet window, which typing into
@@ -10980,15 +11472,19 @@ fn update_tick(
                 if release_codex {
                     state.unsent_operator_input.remove(&obs.key);
                 }
-                state.last_prompted.insert(obs.key.clone(), now);
-                cmds.push(Cmd::WritePty {
-                    key: obs.key.clone(),
-                    bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
-                });
-                state.pending_submits.push(PendingSubmit {
-                    key: obs.key,
-                    nudged_at: now,
-                });
+                if enter_only {
+                    cmds.extend(type_kickoff(state, &obs.key, RELAY_NUDGE_LINE, true, now));
+                } else {
+                    state.last_prompted.insert(obs.key.clone(), now);
+                    cmds.push(Cmd::WritePty {
+                        key: obs.key.clone(),
+                        bytes: RELAY_NUDGE_LINE.as_bytes().to_vec(),
+                    });
+                    state.pending_submits.push(PendingSubmit {
+                        key: obs.key,
+                        nudged_at: now,
+                    });
+                }
                 let member =
                     state.members_phrase(app, &[(Some(obs.brigade_id), obs.token.clone())]);
                 // What prompted it: the newest message to this member, as
@@ -10999,7 +11495,8 @@ fn update_tick(
                     .and_then(|facts| facts.inbound.as_ref())
                     .map(|inbound| nudge_prompt(state, obs.brigade_id, inbound))
                     .unwrap_or_default();
-                state.set_status(format!("relay: nudged {member}{prompt}"), now);
+                let how = if enter_only { " (Enter only)" } else { "" };
+                state.set_status(format!("relay: nudged {member}{how}{prompt}"), now);
             } else if input.has_unsent
                 && !held_off
                 && state
@@ -11814,6 +12311,9 @@ mod close_brigade_tests;
 
 #[cfg(test)]
 mod pane_end_tests;
+
+#[cfg(test)]
+mod interrupt_tests;
 
 #[cfg(test)]
 mod startup_notice_tests;
@@ -23988,6 +24488,7 @@ mod tests {
             director_session: director.map(str::to_string),
             member_names: Vec::new(),
             request: None,
+            interrupts: None,
         }
     }
 

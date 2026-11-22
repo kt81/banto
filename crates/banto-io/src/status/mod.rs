@@ -372,6 +372,24 @@ pub fn live_activity(
     }
 }
 
+/// Whether some live entry with a running process names `session_id` and says,
+/// in so many words, `busy`: a turn is running. Neither [`live_activity`] nor
+/// [`claude_nudgeable`] can answer that. The first reads `shell` (a background
+/// command after the turn ended) as [`Activity::Busy`] too, and an Esc written
+/// then would cut nothing; the second says only "not nudgeable", which `waiting`
+/// is as well. The interrupt acts on this reading and no other.
+pub fn live_reports_busy(
+    live: &[LiveSession],
+    session_id: &str,
+    alive_pids: &HashSet<u32>,
+) -> bool {
+    live.iter().any(|entry| {
+        entry.session_id.as_deref() == Some(session_id)
+            && alive_pids.contains(&entry.pid)
+            && entry.status.as_deref() == Some(LIVE_STATUS_BUSY)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1218,6 +1236,41 @@ mod tests {
             Activity::Idle(AgeBucket::Today),
             "where the list falls back to the file's age"
         );
+    }
+
+    #[test]
+    fn only_a_literal_busy_from_a_live_process_is_a_running_turn() {
+        let alive: HashSet<u32> = [100].into_iter().collect();
+        let reports = |status: Option<&str>| {
+            live_reports_busy(
+                &[live_entry(100, Some(SESSION_ID), status)],
+                SESSION_ID,
+                &alive,
+            )
+        };
+        assert!(reports(Some("busy")));
+        // The statuses `live_activity` or the relay lump in with busy.
+        for status in [
+            Some("shell"),
+            Some("waiting"),
+            Some("idle"),
+            Some("other"),
+            None,
+        ] {
+            assert!(!reports(status), "{status:?}");
+        }
+        // Another session's entry, a dead process, no entry at all.
+        let other = [live_entry(100, Some("another-session"), Some("busy"))];
+        assert!(!live_reports_busy(&other, SESSION_ID, &alive));
+        let dead = [live_entry(300, Some(SESSION_ID), Some("busy"))];
+        assert!(!live_reports_busy(&dead, SESSION_ID, &alive));
+        assert!(!live_reports_busy(&[], SESSION_ID, &alive));
+        // One busy entry among others is enough, as in `live_activity`.
+        let several = [
+            live_entry(100, Some(SESSION_ID), Some("idle")),
+            live_entry(100, Some(SESSION_ID), Some("busy")),
+        ];
+        assert!(live_reports_busy(&several, SESSION_ID, &alive));
     }
 
     #[test]
