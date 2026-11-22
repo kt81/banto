@@ -324,8 +324,8 @@ given up to 5 seconds to finish.
 While the prefix is armed, the status bar shows the full binding table. With the
 mouse, drag a boundary between panes or tiles to resize, drag a stack tile by its
 title to move it, and use `[S]` (solo) or `[_]`/`[+]` (collapse/open) in a tile's
-title row. That row also shows **busy**, **waiting** or **idle**, and how long ago the
-session last wrote.
+title row. That row also shows the agent and whether it is **busy**, **waiting** or
+**idle**.
 
 ## Configuration
 

@@ -2682,11 +2682,6 @@ impl EmporiumState {
             .get(&(*id, self.member_tokens.get(key)?.clone()))
     }
 
-    /// When the pane last produced output.
-    pub fn last_output_at(&self, key: &SessionKey) -> Option<Instant> {
-        self.last_output_at.get(key).copied()
-    }
-
     /// One flag per staged pane, `panes` order (the master's always false).
     fn pane_collapsed(&self) -> Vec<bool> {
         let mut flags = vec![false];

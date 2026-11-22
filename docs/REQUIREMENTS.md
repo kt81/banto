@@ -265,9 +265,10 @@ and the plan-implementation prompt ring too, not only an approval.
    session**; what they mean is read from the Codex source. The facts and limits are
    in "Codex data sources" ("What the markers mean, and where the signal stops").
 5. **Later the same day: an expanded tile says what its pane is doing.** Its title
-   row shows `Agent · word · output age` after the label, in the strip's own words
-   and colours ("The title row of a tile"). *Why:* the operator asked: the clear
-   status word was visible only on a minimised tile.
+   row shows `Agent · word` after the label (the output age was on this row until
+   2026-11-22; see 11), in the strip's own words and colours ("The title row of a
+   tile"). *Why:* the operator asked: the clear status word was visible only on a
+   minimised tile.
 6. **Every surface reads the same activity, from one source.** For a hosted pane it
    is a believed Codex report first (`working` is busy, `blocked` is waiting), else
    the pane's list row, else what the member's live file said this tick (item 12),
@@ -319,14 +320,19 @@ and the plan-implementation prompt ring too, not only an approval.
     is only the two message rows, and a collapsed tile is four rows instead of five
     (`COLLAPSED_TILE_HEIGHT`; on a 24-row terminal 5 collapsed Workers fit instead
     of 4, on 40 rows 9 instead of 7). Nothing persisted depends on the height.
-11. **The status sheds the same way in both states, and the age outlives the
-    agent.** Full `Agent · word · output 2m ago`, then without the agent, then the
-    age shortened (`word · 2m`), then the word alone, then nothing; the word is
-    never cut and the label never sheds ("The title row of a tile"). *Why the short
-    age:* on a collapsed tile the pane cannot be seen, and for Codex the output age
-    is the only liveness signal, so it should outlive narrow tiles. *Cost, stated
-    plainly:* the label never sheds, so at the default collapsed width (36 columns)
-    a long display-named label leaves room for the word only.
+11. **The status sheds the same way in both states.** *Superseded on 2026-11-22:*
+    this entry first said that the output age outlives the agent (`Agent · word ·
+    output 2m ago`, then without the agent, then `word · 2m`, then the word alone),
+    because on a collapsed tile the pane cannot be seen and, for Codex, the output
+    age was the only liveness signal. The age left the title row at the operator's
+    request, and that reason had lapsed already: since commit b1ab94b (2026-11-13) a
+    Codex tile's word comes from the pane's own report, so the age is not the only
+    signal. **Do not add the age back to the title row for Codex.** What stands is
+    that both states shed the same way, now `Agent · word`, then `word`, then
+    nothing; the word is never cut and the label never sheds ("The title row of a
+    tile"). *Cost, stated plainly:* the label never sheds, so at the default
+    collapsed width (36 columns) a label of 19 cells or more, such as
+    `レビュー (worker-11)` (20), leaves no room for any status.
 12. **A member with no list row yet shows its live file's word.** A Claude member
     that has not run a turn has no transcript and so no session-list row; its tile
     showed no status word (the operator saw it on a freshly added Worker). The
@@ -762,9 +768,9 @@ has gone quiet have become relatively fewer". *Not his words:* the choice of `id
 over `busy` for the tile's word is read off the two decisions above, and no reason
 of his for it is recorded here.
 
-1. **A tile says `idle · bg`.** The mark `bg` follows the word, in the age text's
-   colour, and sheds with it (`Claude · idle · bg · output 2m ago`, then without the
-   agent, then `idle · bg · 2m`, then `idle · bg`, then nothing); it never appears
+1. **A tile says `idle · bg`.** The mark `bg` follows the word, in grey, and sheds
+   with it (`Claude · idle · bg`, then without the agent as `idle · bg`, then
+   nothing); it never appears
    or disappears without the word, and with a Director's decision tag the pairing
    holds (`idle · bg · ▸ decision`).
 2. **The quit question still counts the pane, and says why.** Each counted pane is
@@ -1495,9 +1501,10 @@ A stack tile can be collapsed to a four-row strip (its title row, two message ro
 border) that shows status-like facts instead of the session's screen, which keeps
 running untouched: the `[_]` button in its title row (or `m`), `[+]` to open it
 again. The strip's title row is the one every tile has ("The title row of a tile",
-below): the label, then agent · activity · output age, then the buttons, from one
-function (`tile_status`) and one painter (`paint_tile_title`); the strip itself is
-only the two message rows under it. The word is one of three, in the sidebar dot's
+below): the label, then agent · activity (anchored on the right), then the buttons,
+from one function (`tile_status`) and one painter (`paint_tile_title`); the strip
+itself is only the two message rows under it. The word is one of three, in the
+sidebar dot's
 colours, or none: **busy**, **waiting**, **idle**. For a pane banto hosts it is
 decided by `EmporiumState::pane_word`: **waiting** when the pane waits on the
 operator by the decision the marks, the count and the bell read (a Codex pane's own
@@ -1539,15 +1546,13 @@ pane showed no word while the quit question already treated it as not idle, foun
 review; a Claude Worker that had not run a turn showed none either, until its live
 file became the third source of `displayed_activity`; and until 2026-11-15 the title
 read `displayed_activity` itself. The product shown is the row's, else the one the
-relay resolved for the member. Output age is "output now", then in ten-second steps
-to a minute, then minutes, then hours; for Codex, whose session files record neither
+relay resolved for the member. For Codex, whose session files record neither
 busy nor waiting, the word comes from the pane's own report once it has made one
 (`blocked` reads waiting, `working` busy, `idle`, `done` and `error` idle; "Codex
-data sources") and until then from the shell's sample, and the output age stays the
-other liveness signal, which is why it is shortened (`2m`) before it is dropped on a
-narrow tile. The two body rows read `← <age> <first line of the last message sent to
-this member>` and `→ <age> <first line of the last message this member sent>`, from
-banto's own brigade message store, read without touching any read cursor (a glance
+data sources") and until then from the shell's sample. The two body rows read `←
+<age> <first line of the last message sent to this member>` and `→ <age> <first line
+of the last message this member sent>`, from banto's own brigade message store, read
+without touching any read cursor (a glance
 is not a delivery), counting only messages past the member's own join point
 (`brigade_members.joined_after_id`, schema v18: so a new member shows no broadcast
 sent before it joined, and a new Goinkyo shows none of the previous consultation's
@@ -1682,61 +1687,65 @@ way first, then the counts, then the badge's tail.
 Multiline paste and file drag&drop into panes are synthesized into bracketed
 pastes host-side, since the Windows console never reports pastes as pastes.
 
-**The title row of a tile.** Every staged tile, collapsed or open, has the same
-title row, drawn by one function (`paint_tile_title`): the border, the label, the
-status `Agent · word · output 2m ago`, then `[S]` and `[_]` (`[+]` on a collapsed
-tile). The status is the list's words and colours, from the one function
-`tile_status`, so a collapsed and an open tile cannot look different (a test renders
-the same pane both ways and compares the rows cell for cell, but for the button that
-now opens instead of collapsing). It is drawn in the stretch of the top border
-between the label and the buttons: the label and the buttons did not move, no
-hit-test changed, and one border cell stays free on each side of it. It is drawn
-while the tile is being dragged too, in its own colours on the border and label the
-gesture colours; the drop line and the ghost label are painted over the finished
-frame, so where they cross it they win; hit-testing is the same. When the room is
-short it gives way in this order, the same for both states: the agent label first
-(`word · output 2m ago`); then the age is shortened to a bare duration (`word · 2m`;
-"now", "20s", "3m", "2h", in the long form's steps); then the age goes (`word`); and
-when not even the word fits, the whole status. A session whose turn has ended with a
-background command still running has the mark `bg` after the word (`Claude · idle ·
-bg · output 2m ago`), in the age text's colour, not busy's or waiting's. It sheds
-with the word and is never drawn alone: the word and its mark are kept or dropped
-together at every step, so `bg` never appears or disappears without the word, and a
-pane whose activity is not known draws none. The word is never cut or shortened
-and the label never sheds, so at the default collapsed width (36 columns) a plain
-label such as `worker-1` still leaves room for a short word and the short age, but a
-long display-named label leaves room for the word only. The widths at which the
-steps fall are in the tests, not here. A pane whose activity is not known keeps a
-form that still says what the age measures: `Agent · output 2m ago`, `output 2m
-ago`, `output 2m` (a bare `2m` beside nothing would not say), then nothing; a pane
-that has produced nothing shows "no output yet" in place of the age, which has no
-short form. Every tile's label is a tab: reversed cyan when the tile is focused (a
-collapsed tile never is), reversed yellow while it is being moved, otherwise black on
-grey; the status never has a background. A Director's open decision request puts the
-fixed tag `▸ decision`, in the waiting colour, after the status: `label · status · ▸
-decision [buttons]`. The status sheds as before with the tag kept (the agent first,
-then the age's steps), then `word · ▸ decision` (`word · bg · ▸ decision` for a
-background pane), then the tag alone; the tag is never cut and has no ellipsis, and
-when it does not fit the status is drawn as if there were no request. Only a
-Director's tile ever shows it, and it stays while that pane is focused. There is no
-collapsed-body rule: a collapsed Director cannot exist today.
-On the Director's list row (whenever its brigade has an open request, staged or not)
-the tag is on line two in place of the cwd, only when it fits beside the agent label
-and a two-cell gap, and otherwise the row is as it was. *Why:* the operator asked
-for the status on the open tile's title, then for the collapsed tile to use the same
-row ("One title row for every tile" in the decision entry); the age is shortened
-before it is dropped because on a collapsed tile the pane cannot be seen and, for
-Codex, the output age is the only liveness signal. *Why the label is a tab in
-every state:* the operator reported on 2026-11-22 that with three or more open
-tiles stacked on the Worker side their title rows were hard to pick out. Measured
-on their terminal theme (Tokyo Night Moon, sampled from
-`docs/assets/emporium-brigade.png`), an unfocused frame is 1.80:1 against the
-background, where the rules Claude draws inside its own pane are 3.87:1, and a
-label that was plain default-foreground text read as one more line of the upper
-tile's footer. A filled grey tab marks the row as a header. Grey, not a reversed
-default-colour tab, so that the focused tile's reversed cyan stays the brightest
-block on screen (the focused title became a tab on 2026-08-09 because border
-colour alone did not show focus). The border and button colours were left as
+**The title row of a tile.** Every staged tile, collapsed or open, has the same title
+row, drawn by one function (`paint_tile_title`): the border, the label, the status
+`Agent · word`, then `[S]` and `[_]` (`[+]` on a collapsed tile). The status is the
+list's words and colours, from the one function `tile_status`, so a collapsed and an
+open tile cannot look different (a test renders the same pane both ways and compares
+the rows cell for cell, but for the button that now opens instead of collapsing). It
+is drawn in the stretch of the top border between the label and the buttons, anchored
+on the right: it ends one border cell before the first button (before the corner when
+there are none), with a space on each side, and the spare border lies between the
+label and the status, as in `┌ worker-3 ──────── Claude · idle ─[S][_]┐`. The label
+and the buttons did not move, no hit-test changed, and one border cell stays free
+after the label. Every stack tile has the stack's x and width and the same buttons,
+so the status ends in the same column on every tile of a stack whatever its label (a
+test draws labels of different widths, with a waiting tile and a `bg` tile among idle
+ones, and compares the columns). It is drawn while the tile is being dragged too, in
+its own colours on the border and label the gesture colours; the drop line and the
+ghost label are painted over the finished frame, so where they cross it they win;
+hit-testing is the same. When the room is short it gives way the same way in both
+states: the agent label first (`idle`, `idle · bg`), then the whole status. The word
+is never cut or shortened, and the label never sheds. A session whose turn has ended
+with a background command still running has the mark `bg` after the word (`Claude ·
+idle · bg`), in grey, not busy's or waiting's colour. It sheds with the word and is
+never drawn alone: the word and its mark are kept or dropped together, so `bg` never
+appears or disappears without the word, and a pane whose activity is not known draws
+none. A pane whose activity is not known shows its agent alone (`Claude`), then
+nothing; a pane with neither shows nothing. At the default collapsed width (36
+columns) a plain label such as `worker-1` still leaves room for `Claude · idle`, a
+15-cell label such as `実装 (worker-1)` for the word alone, and a label of 19 cells
+or more, such as `レビュー (worker-11)` (20), for no status at all. The widths at
+which the steps fall are in the tests, not here. There is no output age on the row:
+it left on 2026-11-22 (decision 11 in the decision entry). Every tile's label is a
+tab: reversed cyan when the tile is focused (a collapsed tile never is), reversed
+yellow while it is being moved, otherwise black on grey; the status never has a
+background. A Director's open decision request puts the fixed tag `▸ decision`, in
+the waiting colour, after everything: `label ── Claude · busy · ▸ decision
+─[buttons]`. The status sheds with the tag kept, as `Agent · word · ▸ decision`, then
+`word · ▸ decision` (`word · bg · ▸ decision` for a background pane), then the tag
+alone; the tag is never cut and has no ellipsis, and when it does not fit the status
+is drawn as if there were no request. Only a Director's tile ever shows it, and it
+stays while that pane is focused. There is no collapsed-body rule: a collapsed
+Director cannot exist today. On the Director's list row (whenever its brigade has an
+open request, staged or not) the tag is on line two in place of the cwd, only when it
+fits beside the agent label and a two-cell gap, and otherwise the row is as it was.
+*Why:* the operator asked for the status on the open tile's title, then for the
+collapsed tile to use the same row ("One title row for every tile" in the decision
+entry), then on 2026-11-22 for the output age to come off the row. *Why the age is
+not on it:* the reason it had been kept, that for Codex it was the only liveness
+signal, had lapsed when a Codex tile got its word from the pane's own report. *Why
+the status is on the right:* so the words line up down a stack of tiles instead of
+starting wherever each label happens to end. *Why the label is a tab in every state:*
+the operator reported on 2026-11-22 that with three or more open tiles stacked on the
+Worker side their title rows were hard to pick out. Measured on their terminal theme
+(Tokyo Night Moon, sampled from `docs/assets/emporium-brigade.png`), an unfocused
+frame is 1.80:1 against the background, where the rules Claude draws inside its own
+pane are 3.87:1, and a label that was plain default-foreground text read as one more
+line of the upper tile's footer. A filled grey tab marks the row as a header. Grey,
+not a reversed default-colour tab, so that the focused tile's reversed cyan stays the
+brightest block on screen (the focused title became a tab on 2026-08-09 because
+border colour alone did not show focus). The border and button colours were left as
 they are.
 
 **Size floor.** A hosted pane's screen and its PTY are never smaller than 2 rows × 2

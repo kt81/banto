@@ -4,7 +4,7 @@
 //! [`StripData`] carries.
 //!
 //! Two parts, one for each place a tile has room. The status — agent, activity
-//! word, output age — is one row of the tile's TITLE, for every tile, collapsed
+//! word — is one row of the tile's TITLE, for every tile, collapsed
 //! or not ([`title_status_parts`], [`render_title_status`]). The body of a
 //! collapsed tile ([`render_strip`]) is the two rows under that title: the last
 //! message the member was sent and the last it sent (`← 5m run the tests`,
@@ -13,7 +13,7 @@
 //! `view::agent_label_color`), shared rather than copied, so a tile and the
 //! sidebar dot cannot drift apart.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use banto_core::model::{Activity, AgentKind, humanize_age_compact};
 use ratatui::buffer::Buffer;
@@ -25,15 +25,12 @@ use crate::text::truncate_to_width;
 use crate::view::{activity_color, activity_word, agent_label_color};
 
 /// What a staged tile shows about its pane. Every field is optional: a member
-/// with no session row yet may have no agent or activity, a pane that has not
-/// written anything has no output age. The agent, activity and output age are the
-/// title's status; the two messages are the collapsed body's rows.
+/// with no session row yet may have no agent or activity. The agent and activity
+/// are the title's status; the two messages are the collapsed body's rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StripData {
     pub agent: Option<AgentKind>,
     pub activity: Option<Activity>,
-    /// Time since the pane last produced output.
-    pub output_age: Option<Duration>,
     /// The newest message addressed to the member (first body row).
     pub inbound: Option<StripMessage>,
     /// The newest message the member sent (second body row).
@@ -54,38 +51,6 @@ pub struct StripData {
 pub struct StripMessage {
     pub at: SystemTime,
     pub text: String,
-}
-
-/// "output now", "output 20s ago" in ten-second steps up to a minute, then
-/// "output 3m ago", then "output 2h ago". Codex never reports busy/waiting,
-/// so for it this is the only liveness signal on a tile.
-pub fn output_age_text(age: Duration) -> String {
-    let secs = age.as_secs();
-    if secs < 10 {
-        "output now".to_string()
-    } else if secs < 60 {
-        format!("output {}s ago", secs / 10 * 10)
-    } else if secs < 3600 {
-        format!("output {}m ago", secs / 60)
-    } else {
-        format!("output {}h ago", secs / 3600)
-    }
-}
-
-/// The same age as a bare duration, in the same steps: "now", "20s", "3m",
-/// "2h". What the title keeps of [`output_age_text`] when the long form no longer
-/// fits.
-pub fn output_age_short(age: Duration) -> String {
-    let secs = age.as_secs();
-    if secs < 10 {
-        "now".to_string()
-    } else if secs < 60 {
-        format!("{}s", secs / 10 * 10)
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{}h", secs / 3600)
-    }
 }
 
 const SEPARATOR: &str = " \u{b7} ";
@@ -150,50 +115,17 @@ fn render_message_row(
 /// One coloured piece of the title status.
 type Part = Option<(String, Color)>;
 
-/// How the output age is written at one step of the title status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgeForm {
-    /// `output 2m ago` (`no output yet` for a pane that has written nothing).
-    Long,
-    /// `2m` beside a word; `output 2m` where there is no word, since a bare
-    /// duration with nothing to say what it measures would not read.
-    Short,
-    /// Not shown.
-    Left,
-}
-
-/// What each step of the title status keeps — agent, activity word (and the
-/// background mark that goes with it, when there is one), age in which form —
-/// from the widest to the narrowest. The one place the shedding order and the
-/// long/short age choice are written: the agent goes first, then the age is
-/// shortened, then dropped; the word is never cut or shortened, and the label
-/// (not here) never sheds. The mark is never a step of its own: it is kept
-/// exactly when the word is, so it is never drawn without the word and never
-/// lost before it. A step that keeps nothing, or that a wider step already is
-/// (no age to shorten), is skipped.
+/// The status a tile's title row carries, for every tile, collapsed or not:
+/// agent label, then activity word, in the list's own words and colours (busy,
+/// waiting, idle), from the same [`StripData`] — so one decision, drawn in one
+/// place, whatever the tile's state. A session whose turn has ended with a
+/// background command still running reads `idle · bg` ([`BACKGROUND_MARK`])
+/// where the word is.
 ///
-/// Why the age is shortened before it is dropped: on a collapsed tile the pane
-/// cannot be seen, and for Codex the output age is the only liveness signal, so
-/// it has to outlive the agent label at the default collapsed width.
-const STATUS_STEPS: [(bool, AgeForm); 4] = [
-    (true, AgeForm::Long),
-    (false, AgeForm::Long),
-    (false, AgeForm::Short),
-    (false, AgeForm::Left),
-];
-
-/// The status a tile's title row carries after its label, for every tile,
-/// collapsed or not: agent label, activity word, output age, in the list's own
-/// words and colours (busy, waiting, idle), from the same [`StripData`] — so one
-/// decision, drawn in one place, whatever the tile's state. A session whose turn
-/// has ended with a background command still running reads `idle · bg`
-/// ([`BACKGROUND_MARK`]) where the word is.
-///
-/// Shed in [`STATUS_STEPS`] order as `room` cells run out: the agent label, then
-/// the age's long form for its short one (`word · 2m`), then the age, and last
-/// everything, never half a word. A pane with no activity known gets what is
-/// left the same way (`Agent · output 2m ago`, `output 2m ago`, `output 2m`),
-/// and nothing once not even that fits.
+/// As `room` cells run out the agent label goes first (`idle`), then everything:
+/// never half a word, and never the word without its mark. A pane with no
+/// activity known shows the agent alone, and nothing once that does not fit; a
+/// pane with neither shows nothing.
 pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)> {
     status_ladder(data)
         .into_iter()
@@ -202,10 +134,16 @@ pub fn title_status_parts(data: &StripData, room: usize) -> Vec<(String, Color)>
 }
 
 /// Every step of the title status, widest first, each as its coloured parts with
-/// the separators in place ([`STATUS_STEPS`] says what each keeps). A step that
-/// keeps nothing is not there. The one place the steps are built, so the status
-/// alone ([`title_status_parts`]) and the status beside a request
-/// ([`title_request_parts`]) shed the same way.
+/// the separators in place: with the agent, then without it. A step that keeps
+/// nothing, or that the wider step already is (no agent to shed), is not there.
+/// The one place the steps are built, so the status alone ([`title_status_parts`])
+/// and the status beside a request ([`title_request_parts`]) shed the same way.
+/// The mark is never a step of its own: it is kept exactly when the word is.
+///
+/// There is no output age here, on purpose. It was dropped at the operator's
+/// request, and the reason once given for keeping it (that for Codex it was the
+/// only liveness signal) lapsed when a Codex tile got a word from the pane's own
+/// report; do not add it back for Codex (`docs/REQUIREMENTS.md`, decision 11).
 fn status_ladder(data: &StripData) -> Vec<Vec<(String, Color)>> {
     let agent: Part = data
         .agent
@@ -216,52 +154,25 @@ fn status_ladder(data: &StripData) -> Vec<Vec<(String, Color)>> {
             activity_color(activity),
         )
     });
-    // In the age's colour, not busy's or waiting's: the word says the turn has
-    // ended, and the mark says only that something is still running behind it.
+    // Grey, not busy's or waiting's colour: the word says the turn has ended, and
+    // the mark says only that something is still running behind it.
     let mark: Part =
         (data.background && word.is_some()).then(|| (BACKGROUND_MARK.to_string(), Color::Gray));
-    let mut ladder = Vec::new();
-    for (with_agent, form) in STATUS_STEPS {
-        let age: Part = match form {
-            AgeForm::Long => Some((
-                data.output_age
-                    .map_or_else(|| "no output yet".to_string(), output_age_text),
-                Color::Gray,
-            )),
-            AgeForm::Short => data.output_age.map(|age| {
-                let short = output_age_short(age);
-                (
-                    if word.is_some() {
-                        short
-                    } else {
-                        format!("output {short}")
-                    },
-                    Color::Gray,
-                )
-            }),
-            AgeForm::Left => None,
-        };
-        let kept: Vec<&(String, Color)> = [
-            (with_agent, &agent),
-            (true, &word),
-            (true, &mark),
-            (true, &age),
-        ]
-        .into_iter()
-        .filter(|(keep, _)| *keep)
-        .filter_map(|(_, part)| part.as_ref())
-        .collect();
-        if kept.is_empty() {
-            continue;
-        }
-        let mut parts = Vec::new();
-        for (index, (text, color)) in kept.into_iter().enumerate() {
-            if index > 0 {
+    let mut ladder: Vec<Vec<(String, Color)>> = Vec::new();
+    for with_agent in [true, false] {
+        let mut parts: Vec<(String, Color)> = Vec::new();
+        for part in [if with_agent { &agent } else { &None }, &word, &mark]
+            .into_iter()
+            .flatten()
+        {
+            if !parts.is_empty() {
                 parts.push((SEPARATOR.to_string(), Color::DarkGray));
             }
-            parts.push((text.clone(), *color));
+            parts.push(part.clone());
         }
-        ladder.push(parts);
+        if !parts.is_empty() && ladder.last() != Some(&parts) {
+            ladder.push(parts);
+        }
     }
     ladder
 }
@@ -276,13 +187,13 @@ fn parts_width(parts: &[(String, Color)]) -> usize {
 /// is never cut and has no ellipsis.
 pub const REQUEST_TAG: &str = "\u{25b8} decision";
 
-/// The title row's status with the request tag after it: `Claude · busy · output
-/// 2m ago · ▸ decision`. The tag is whole or absent. As the room shrinks the status
-/// sheds as it always does (the agent, then the age's steps) with the tag kept,
-/// then the word with the tag (`busy · ▸ decision`), then the tag alone; and when
-/// the tag itself does not fit the status is drawn as if there were no request, so
-/// the word is not lost to a tag that cannot be drawn. The tag is in the waiting
-/// colour. With no request this is [`title_status_parts`].
+/// The title row's status with the request tag after it: `Claude · busy ·
+/// ▸ decision`. The tag is whole or absent. As the room shrinks the status sheds
+/// as it always does (the agent) with the tag kept, then the word goes and the tag
+/// stands alone (`▸ decision`); and when the tag itself does not fit the status is
+/// drawn as if there were no request, so the word is not lost to a tag that cannot
+/// be drawn. The tag is in the waiting colour. With no request this is
+/// [`title_status_parts`].
 pub fn title_request_parts(data: &StripData, room: usize) -> Vec<(String, Color)> {
     if !data.request {
         return title_status_parts(data, room);
@@ -302,10 +213,13 @@ pub fn title_request_parts(data: &StripData, room: usize) -> Vec<(String, Color)
     title_status_parts(data, room)
 }
 
-/// Draw [`title_status_parts`] on row `y` into the cells `from..to` (a free
+/// Draw [`title_request_parts`] on row `y` into the cells `from..to` (a free
 /// stretch of a tile's top border), set off by a space on each side the way the
-/// title's own text is. Draws nothing when there is no room for even the word.
-/// Returns the number of cells it used.
+/// title's own text is, and ending at `to`: the status is anchored on the right,
+/// so on every tile of a stack the word ends in the same column whatever the
+/// label's width, and the spare border lies between the label and the status.
+/// Draws nothing when there is no room for even the word. Returns the number of
+/// cells it used.
 pub fn render_title_status(
     buffer: &mut Buffer,
     y: u16,
@@ -318,7 +232,8 @@ pub fn render_title_status(
     if parts.is_empty() {
         return 0;
     }
-    let mut x = from;
+    let used = parts_width(&parts) as u16 + 2;
+    let mut x = to - used;
     buffer.set_string(x, y, " ", Style::default());
     x += 1;
     for (text, color) in &parts {
@@ -326,64 +241,17 @@ pub fn render_title_status(
         x += text.width() as u16;
     }
     buffer.set_string(x, y, " ", Style::default());
-    x + 1 - from
+    used
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn row_text(buffer: &Buffer, y: u16, width: u16) -> String {
         (0..width).map(|x| buffer[(x, y)].symbol()).collect()
-    }
-
-    #[test]
-    fn output_age_buckets() {
-        let text = |secs| output_age_text(Duration::from_secs(secs));
-        assert_eq!(text(0), "output now");
-        assert_eq!(text(9), "output now");
-        assert_eq!(text(10), "output 10s ago");
-        assert_eq!(text(19), "output 10s ago");
-        assert_eq!(text(20), "output 20s ago");
-        assert_eq!(text(59), "output 50s ago");
-        assert_eq!(text(60), "output 1m ago");
-        assert_eq!(text(179), "output 2m ago");
-        assert_eq!(text(3599), "output 59m ago");
-        assert_eq!(text(3600), "output 1h ago");
-        assert_eq!(text(3 * 3600 + 5), "output 3h ago");
-        assert_eq!(text(30 * 3600), "output 30h ago");
-    }
-
-    #[test]
-    fn the_short_age_is_the_long_one_without_its_words_in_the_same_steps() {
-        for secs in [
-            0,
-            9,
-            10,
-            19,
-            20,
-            59,
-            60,
-            179,
-            3599,
-            3600,
-            3 * 3600 + 5,
-            30 * 3600,
-        ] {
-            let age = Duration::from_secs(secs);
-            let long = output_age_text(age);
-            let short = output_age_short(age);
-            // "output 2m ago" -> "2m"; "output now" -> "now".
-            let bare = long
-                .strip_prefix("output ")
-                .unwrap()
-                .strip_suffix(" ago")
-                .map_or_else(
-                    || long.strip_prefix("output ").unwrap().to_string(),
-                    str::to_string,
-                );
-            assert_eq!(short, bare, "{secs}s");
-        }
     }
 
     fn draw(width: u16, data: &StripData) -> Buffer {
@@ -402,7 +270,6 @@ mod tests {
         StripData {
             agent: Some(AgentKind::ClaudeCode),
             activity: Some(Activity::Busy),
-            output_age: Some(Duration::from_secs(25)),
             ..StripData::default()
         }
     }
@@ -514,45 +381,42 @@ mod tests {
         parts.iter().map(|(text, _)| text.as_str()).collect()
     }
 
-    fn pane(agent: AgentKind, activity: Activity, age: u64) -> StripData {
+    fn pane(agent: AgentKind, activity: Activity) -> StripData {
         StripData {
             agent: Some(agent),
             activity: Some(activity),
-            output_age: Some(Duration::from_secs(age)),
             ..StripData::default()
         }
     }
 
     #[test]
     fn the_title_status_is_the_lists_words_and_colours() {
-        let data = pane(AgentKind::Codex, Activity::Busy, 200);
+        let data = pane(AgentKind::Codex, Activity::Busy);
         let parts = title_status_parts(&data, 80);
-        assert_eq!(texts(&parts), "Codex \u{b7} busy \u{b7} output 3m ago");
+        assert_eq!(texts(&parts), "Codex \u{b7} busy");
         assert_eq!(parts[0].1, agent_label_color(AgentKind::Codex));
         assert_eq!(parts[2].1, activity_color(Activity::Busy));
-        assert_eq!(parts[4].1, Color::Gray);
-        // The short age keeps the colour of the long one.
-        let short = title_status_parts(&data, 9);
-        assert_eq!(texts(&short), "busy \u{b7} 3m");
-        assert_eq!(short[2].1, Color::Gray);
+        // Never an output age, however the pane is doing: it left the title row.
+        for activity in [Activity::Busy, Activity::Waiting, Activity::Alive] {
+            let drawn = texts(&title_status_parts(&pane(AgentKind::Codex, activity), 80));
+            assert!(
+                !drawn.contains("output") && !drawn.contains("ago"),
+                "{drawn}"
+            );
+        }
     }
 
     /// The widths at which each step of the status is taken, for one pane, as
     /// `(room, what is shown)` pairs from the widest boundary down.
     #[test]
-    fn the_title_status_sheds_the_agent_then_shortens_the_age_then_drops_it_and_never_cuts_the_word()
-     {
-        let data = pane(AgentKind::ClaudeCode, Activity::Waiting, 125);
-        let full = "Claude \u{b7} waiting \u{b7} output 2m ago";
-        assert_eq!(full.width(), 32);
+    fn the_title_status_sheds_the_agent_and_then_everything_and_never_cuts_the_word() {
+        let data = pane(AgentKind::ClaudeCode, Activity::Waiting);
+        let full = "Claude \u{b7} waiting";
+        assert_eq!(full.width(), 16);
         for (room, expected) in [
             (200, full),
-            (32, full),
-            (31, "waiting \u{b7} output 2m ago"),
-            (23, "waiting \u{b7} output 2m ago"),
-            (22, "waiting \u{b7} 2m"),
-            (12, "waiting \u{b7} 2m"),
-            (11, "waiting"),
+            (16, full),
+            (15, "waiting"),
             (7, "waiting"),
             (6, ""),
             (0, ""),
@@ -565,27 +429,23 @@ mod tests {
         }
     }
 
-    fn in_the_background(age: u64) -> StripData {
+    fn in_the_background() -> StripData {
         StripData {
             background: true,
-            ..pane(AgentKind::ClaudeCode, Activity::Alive, age)
+            ..pane(AgentKind::ClaudeCode, Activity::Alive)
         }
     }
 
     #[test]
     fn a_background_mark_follows_the_word_and_sheds_only_with_it() {
         assert_eq!(BACKGROUND_MARK, "bg");
-        let data = in_the_background(125);
-        let full = "Claude \u{b7} idle \u{b7} bg \u{b7} output 2m ago";
-        assert_eq!(full.width(), 34);
+        let data = in_the_background();
+        let full = "Claude \u{b7} idle \u{b7} bg";
+        assert_eq!(full.width(), 18);
         for (room, expected) in [
             (200, full),
-            (34, full),
-            (33, "idle \u{b7} bg \u{b7} output 2m ago"),
-            (25, "idle \u{b7} bg \u{b7} output 2m ago"),
-            (24, "idle \u{b7} bg \u{b7} 2m"),
-            (14, "idle \u{b7} bg \u{b7} 2m"),
-            (13, "idle \u{b7} bg"),
+            (18, full),
+            (17, "idle \u{b7} bg"),
             (9, "idle \u{b7} bg"),
             // Never the word without its mark, and never the mark alone.
             (8, ""),
@@ -600,8 +460,8 @@ mod tests {
     }
 
     #[test]
-    fn the_background_mark_is_in_the_age_text_colour_not_busy_or_waiting() {
-        let parts = title_status_parts(&in_the_background(125), 80);
+    fn the_background_mark_is_grey_not_busys_or_waitings_colour() {
+        let parts = title_status_parts(&in_the_background(), 80);
         let mark = parts.iter().find(|(text, _)| text == "bg").unwrap();
         assert_eq!(mark.1, Color::Gray);
         let word = parts.iter().find(|(text, _)| text == "idle").unwrap();
@@ -612,54 +472,37 @@ mod tests {
 
     #[test]
     fn a_mark_with_no_word_to_stand_beside_is_not_drawn() {
-        for data in [
-            StripData {
-                activity: None,
-                ..in_the_background(125)
-            },
-            StripData {
-                output_age: None,
-                activity: None,
-                ..in_the_background(125)
-            },
-        ] {
-            for room in [80, 30, 20, 12, 9, 4] {
-                let drawn = texts(&title_status_parts(&data, room));
-                assert!(!drawn.contains("bg"), "room {room}: {drawn:?}");
-            }
+        let data = StripData {
+            activity: None,
+            ..in_the_background()
+        };
+        for room in [80, 30, 20, 12, 9, 6, 4] {
+            let drawn = texts(&title_status_parts(&data, room));
+            assert!(!drawn.contains("bg"), "room {room}: {drawn:?}");
         }
         // And a pane that is not in the background never draws it.
-        let plain = pane(AgentKind::ClaudeCode, Activity::Alive, 125);
+        let plain = pane(AgentKind::ClaudeCode, Activity::Alive);
         for room in [80, 30, 20, 12, 9, 4] {
             let drawn = texts(&title_status_parts(&plain, room));
             assert!(!drawn.contains("bg"), "room {room}: {drawn:?}");
         }
-        assert_eq!(
-            texts(&title_status_parts(&plain, 80)),
-            "Claude \u{b7} idle \u{b7} output 2m ago"
-        );
+        assert_eq!(texts(&title_status_parts(&plain, 80)), "Claude \u{b7} idle");
     }
 
     #[test]
     fn with_a_request_the_mark_stays_with_the_word_through_every_step() {
         let data = StripData {
             request: true,
-            ..in_the_background(125)
+            ..in_the_background()
         };
         let at = |room| texts(&title_request_parts(&data, room));
         let tag = "\u{25b8} decision";
-        assert_eq!(
-            at(80),
-            format!("Claude \u{b7} idle \u{b7} bg \u{b7} output 2m ago \u{b7} {tag}")
-        );
-        assert_eq!(
-            at(40),
-            format!("idle \u{b7} bg \u{b7} output 2m ago \u{b7} {tag}")
-        );
-        assert_eq!(at(30), format!("idle \u{b7} bg \u{b7} 2m \u{b7} {tag}"));
-        assert_eq!(at(25), format!("idle \u{b7} bg \u{b7} {tag}"));
+        assert_eq!(at(80), format!("Claude \u{b7} idle \u{b7} bg \u{b7} {tag}"));
+        assert_eq!(at(31), format!("Claude \u{b7} idle \u{b7} bg \u{b7} {tag}"));
+        assert_eq!(at(30), format!("idle \u{b7} bg \u{b7} {tag}"));
+        assert_eq!(at(22), format!("idle \u{b7} bg \u{b7} {tag}"));
         // The word and its mark go together, the tag standing alone ...
-        assert_eq!(at(20), tag);
+        assert_eq!(at(21), tag);
         assert_eq!(at(10), tag);
         // ... and a tag that does not fit leaves the status as if no request.
         assert_eq!(at(9), "idle \u{b7} bg");
@@ -675,20 +518,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_short_age_reads_now_when_the_pane_has_just_written() {
-        let data = pane(AgentKind::ClaudeCode, Activity::Busy, 3);
-        assert_eq!(texts(&title_status_parts(&data, 10)), "busy \u{b7} now");
-        assert_eq!(texts(&title_status_parts(&data, 7)), "busy");
-    }
-
     // --- a Director's request tag on its title row -------------------------------
 
     fn director(request: bool) -> StripData {
         StripData {
             agent: Some(AgentKind::ClaudeCode),
             activity: Some(Activity::Busy),
-            output_age: Some(Duration::from_secs(125)),
             request,
             ..StripData::default()
         }
@@ -706,26 +541,23 @@ mod tests {
     }
 
     #[test]
-    fn the_tag_is_a_fixed_word_and_the_status_sheds_around_it_in_the_order_it_always_did() {
+    fn the_tag_is_a_fixed_word_and_the_status_sheds_around_it_agent_first() {
         assert_eq!(REQUEST_TAG, "\u{25b8} decision");
         let data = director(true);
         let at = |room| texts(&title_request_parts(&data, room));
         // The whole status, then the tag.
-        assert_eq!(
-            at(80),
-            "Claude \u{b7} busy \u{b7} output 2m ago \u{b7} \u{25b8} decision"
-        );
-        // The agent goes, then the age shortens, then it goes, with the tag kept ...
-        assert_eq!(at(41), "busy \u{b7} output 2m ago \u{b7} \u{25b8} decision");
-        assert_eq!(at(32), "busy \u{b7} 2m \u{b7} \u{25b8} decision");
-        assert_eq!(at(21), "busy \u{b7} \u{25b8} decision");
+        assert_eq!(at(80), "Claude \u{b7} busy \u{b7} \u{25b8} decision");
+        assert_eq!(at(26), "Claude \u{b7} busy \u{b7} \u{25b8} decision");
+        // The agent goes, with the tag kept ...
+        assert_eq!(at(25), "busy \u{b7} \u{25b8} decision");
+        assert_eq!(at(17), "busy \u{b7} \u{25b8} decision");
         // ... then the word goes and the tag stands alone ...
         assert_eq!(at(16), "\u{25b8} decision");
         assert_eq!(at(10), "\u{25b8} decision");
         // ... and when the tag does not fit the status is drawn as if there were no
         // request, so the word is not lost to a tag that cannot be drawn.
         assert_eq!(at(9), texts(&title_status_parts(&data, 9)));
-        assert_eq!(at(9), "busy \u{b7} 2m");
+        assert_eq!(at(9), "busy");
         assert_eq!(at(4), "busy");
         assert_eq!(at(3), "");
     }
@@ -756,7 +588,12 @@ mod tests {
             activity: None,
             ..director(true)
         };
-        assert!(texts(&title_request_parts(&no_word, 60)).ends_with(REQUEST_TAG));
+        // The agent, then the tag; and the tag alone when the agent will not fit.
+        assert_eq!(
+            texts(&title_request_parts(&no_word, 60)),
+            "Claude \u{b7} \u{25b8} decision"
+        );
+        assert_eq!(texts(&title_request_parts(&no_word, 18)), REQUEST_TAG);
     }
 
     #[test]
@@ -784,81 +621,77 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_with_no_age_has_no_short_form_to_keep() {
-        let data = StripData {
-            agent: Some(AgentKind::ClaudeCode),
-            activity: Some(Activity::Alive),
-            output_age: None,
-            ..StripData::default()
-        };
-        // `Alive` is drawn as "idle": see `activity_word`.
-        assert_eq!(
-            texts(&title_status_parts(&data, 80)),
-            "Claude \u{b7} idle \u{b7} no output yet"
-        );
-        assert_eq!(
-            texts(&title_status_parts(&data, 28)),
-            "idle \u{b7} no output yet"
-        );
-        // Nothing to shorten: it goes to the bare word.
-        assert_eq!(texts(&title_status_parts(&data, 19)), "idle");
-    }
-
-    #[test]
-    fn a_pane_with_no_activity_known_shows_what_is_known() {
+    fn a_pane_with_no_activity_known_shows_its_agent_and_then_nothing() {
         let no_activity = StripData {
             agent: Some(AgentKind::Codex),
             activity: None,
-            output_age: Some(Duration::from_secs(125)),
             ..StripData::default()
         };
-        // Agent and age, then the age, then the age without "ago" (a bare "2m"
-        // beside a label would not say what it measures), then nothing.
-        for (room, expected) in [
-            (80, "Codex \u{b7} output 2m ago"),
-            (21, "Codex \u{b7} output 2m ago"),
-            (20, "output 2m ago"),
-            (13, "output 2m ago"),
-            (12, "output 2m"),
-            (9, "output 2m"),
-            (8, ""),
-        ] {
+        for (room, expected) in [(80, "Codex"), (5, "Codex"), (4, ""), (0, "")] {
             assert_eq!(
                 texts(&title_status_parts(&no_activity, room)),
                 expected,
                 "room {room}"
             );
         }
-        let never = StripData {
-            agent: Some(AgentKind::Codex),
-            ..StripData::default()
-        };
-        assert_eq!(
-            texts(&title_status_parts(&never, 80)),
-            "Codex \u{b7} no output yet"
-        );
-        assert_eq!(texts(&title_status_parts(&never, 14)), "no output yet");
-        assert_eq!(texts(&title_status_parts(&never, 12)), "");
-        assert_eq!(
-            texts(&title_status_parts(&StripData::default(), 80)),
-            "no output yet"
-        );
     }
 
     #[test]
-    fn render_title_status_sets_the_text_off_with_a_space_each_side_and_reports_its_width() {
+    fn a_pane_with_neither_agent_nor_word_shows_nothing() {
+        for room in [0, 5, 80] {
+            assert!(title_status_parts(&StripData::default(), room).is_empty());
+        }
+        // A word with no agent known is still a word.
+        let no_agent = StripData {
+            activity: Some(Activity::Busy),
+            ..StripData::default()
+        };
+        assert_eq!(texts(&title_status_parts(&no_agent, 80)), "busy");
+    }
+
+    #[test]
+    fn render_title_status_is_anchored_on_the_right_with_a_space_each_side() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
         let used = render_title_status(
             &mut buffer,
             0,
             3,
             30,
-            &pane(AgentKind::Codex, Activity::Busy, 0),
+            &pane(AgentKind::Codex, Activity::Busy),
         );
         let drawn: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert!(drawn.starts_with("   \u{20}Codex"), "{drawn:?}");
-        assert_eq!(drawn.trim_end(), "    Codex \u{b7} busy \u{b7} output now");
-        assert_eq!(used, " Codex \u{b7} busy \u{b7} output now ".width() as u16);
+        // `Codex · busy` is 12 cells; with its two spaces it ends at column 30
+        // (exclusive), whatever the room to its left.
+        assert_eq!(used, " Codex \u{b7} busy ".width() as u16);
+        assert_eq!(
+            drawn.trim_end(),
+            format!("{}Codex \u{b7} busy", " ".repeat(17))
+        );
+        assert_eq!(buffer[(29, 0)].symbol(), " ");
+        assert_eq!(buffer[(16, 0)].symbol(), " ");
+        assert_eq!(buffer[(17, 0)].symbol(), "C");
+        // The same status in a wider stretch ends in the same column.
+        let mut wider = Buffer::empty(Rect::new(0, 0, 40, 1));
+        render_title_status(
+            &mut wider,
+            0,
+            3,
+            30,
+            &pane(AgentKind::Codex, Activity::Busy),
+        );
+        assert_eq!(wider, buffer);
+        let mut other_from = Buffer::empty(Rect::new(0, 0, 40, 1));
+        render_title_status(
+            &mut other_from,
+            0,
+            12,
+            30,
+            &pane(AgentKind::Codex, Activity::Busy),
+        );
+        assert_eq!(
+            other_from, buffer,
+            "the word does not depend on where the label ends"
+        );
         // No room: nothing drawn.
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
         assert_eq!(
@@ -867,7 +700,7 @@ mod tests {
                 0,
                 3,
                 8,
-                &pane(AgentKind::Codex, Activity::Busy, 0)
+                &pane(AgentKind::Codex, Activity::Busy)
             ),
             0
         );

@@ -3976,7 +3976,7 @@ fn draw(
                 !collapsed && focus == Focus::Pane && focused_key.as_ref() == Some(key);
             let waiting = state.attention_panes().contains(key);
             let marked = marked_tile == Some(key);
-            let mut status = tile_status(state, app, key, tick);
+            let mut status = tile_status(state, app, key);
             // The one place a tile's title row is drawn, collapsed or open.
             let content = paint_tile_title(
                 frame.buffer_mut(),
@@ -4119,9 +4119,9 @@ fn paint_tile_buttons(
 }
 
 /// What a staged tile says about its pane's state, as its title row draws it
-/// (and a collapsed tile's body adds the messages): the one place the product,
-/// the activity and the output age are decided, so no two tiles or states can
-/// disagree. The activity is `EmporiumState::pane_word`: waiting when the pane
+/// (and a collapsed tile's body adds the messages): the one place the product and
+/// the activity are decided, so no two tiles or states can disagree. The
+/// activity is `EmporiumState::pane_word`: waiting when the pane
 /// waits on the operator (the decision the marks, the count and the bell read,
 /// and the member's live status of this tick), else busy or idle from what banto
 /// has read of it (the decision the quit question uses), else none, with a mark
@@ -4129,7 +4129,7 @@ fn paint_tile_buttons(
 /// runs (`EmporiumState::pane_background`); the product is the row's, else the
 /// one the relay resolved before there is a row. Computed
 /// per staged tile on every frame, by a few map lookups.
-fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant) -> StripData {
+fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey) -> StripData {
     let row = app.row_for_id(key.as_str());
     let facts = state.member_facts(key);
     StripData {
@@ -4137,9 +4137,6 @@ fn tile_status(state: &EmporiumState, app: &App, key: &SessionKey, tick: Instant
             .map(|row| row.agent)
             .or_else(|| facts.and_then(|facts| facts.agent)),
         activity: state.pane_word(app, key),
-        output_age: state
-            .last_output_at(key)
-            .map(|at| tick.saturating_duration_since(at)),
         inbound: None,
         sent: None,
         // Only a Director's tile has one, and it stays while that pane is focused:
@@ -4166,11 +4163,11 @@ struct TitleRow<'a> {
 /// (inside the border). The only place that does it, so the two states cannot
 /// look different: the label (a tab in every state: reversed cyan when focused,
 /// which a collapsed tile never is, otherwise `pane_title`'s slate), then
-/// `Agent · word · age` as far as there is room, with no background, then `[S]` and
-/// `[_]` or `[+]`. Also while the tile is being dragged: the gesture colours the
-/// border and the label, and the status keeps its own colours on top of that;
-/// the drop line and the ghost label are painted over the finished frame, so
-/// where they cross it they win.
+/// `Agent · word` as far as there is room, right-anchored against the buttons
+/// and with no background, then `[S]` and `[_]` or `[+]`. Also while the tile
+/// is being dragged: the gesture colours the border and the label, and the
+/// status keeps its own colours on top of that; the drop line and the ghost
+/// label are painted over the finished frame, so where they cross it they win.
 fn paint_tile_title(
     buffer: &mut Buffer,
     geometry: &banto_core::layout::Geometry,
@@ -6513,7 +6510,7 @@ mod tests {
             let buffer = render_at(&state, &app, 160, now);
             let (marked, _) = title_row(&state, &buffer, DIR, 160);
             assert!(
-                marked.contains(&format!(" Claude \u{b7} {word} \u{b7} output now ")),
+                marked.contains(&format!(" Claude \u{b7} {word} ")),
                 "{word}: the marked Director's title row is {marked:?}"
             );
             assert!(
@@ -6535,7 +6532,7 @@ mod tests {
             [Activity::Alive, Activity::Alive, Activity::Idle(Today)],
         );
         said(&mut state, &mut app, &brigade, W2, REPORT_IDLE, now);
-        assert!(title_of(&state, &app, W2, now).contains(" Codex \u{b7} idle \u{b7} "));
+        assert!(title_of(&state, &app, W2, now).contains(" Codex \u{b7} idle "));
         app.replace_rows(vec![
             SessionRow {
                 activity: Activity::Alive,
@@ -6551,7 +6548,7 @@ mod tests {
             },
         ]);
         let title = title_of(&state, &app, W2, now);
-        assert!(title.contains(" Codex \u{b7} idle \u{b7} "), "{title:?}");
+        assert!(title.contains(" Codex \u{b7} idle "), "{title:?}");
         assert!(!title.contains("alive"), "{title:?}");
     }
 
@@ -6575,14 +6572,11 @@ mod tests {
             now,
         );
         let codex = title_of(&state, &app, W2, now);
-        assert!(codex.contains(" Codex \u{b7} busy \u{b7} "), "{codex:?}");
+        assert!(codex.contains(" Codex \u{b7} busy "), "{codex:?}");
         let claude = title_of(&state, &app, W1, now);
-        assert!(claude.contains(" Claude \u{b7} busy \u{b7} "), "{claude:?}");
+        assert!(claude.contains(" Claude \u{b7} busy "), "{claude:?}");
         let director = title_of(&state, &app, DIR, now);
-        assert!(
-            director.contains(" Claude \u{b7} idle \u{b7} "),
-            "{director:?}"
-        );
+        assert!(director.contains(" Claude \u{b7} idle "), "{director:?}");
 
         sampled(&mut state, &mut app, &brigade, &[], now);
         for id in [DIR, W1, W2] {
@@ -6615,14 +6609,11 @@ mod tests {
         );
         let title = title_of(&state, &app, W1, now);
         assert!(
-            title.contains(" Claude \u{b7} idle \u{b7} bg \u{b7} output now "),
+            title.contains(" Claude \u{b7} idle \u{b7} bg "),
             "{title:?}"
         );
         let director = title_of(&state, &app, DIR, now);
-        assert!(
-            director.contains(" Claude \u{b7} busy \u{b7} "),
-            "{director:?}"
-        );
+        assert!(director.contains(" Claude \u{b7} busy "), "{director:?}");
         assert!(!director.contains("bg"), "{director:?}");
 
         sampled(
@@ -6633,10 +6624,7 @@ mod tests {
             now,
         );
         let title = title_of(&state, &app, W1, now);
-        assert!(
-            title.contains(" Claude \u{b7} idle \u{b7} output now "),
-            "{title:?}"
-        );
+        assert!(title.contains(" Claude \u{b7} idle "), "{title:?}");
         assert!(!title.contains("bg"), "{title:?}");
 
         // The same sample under a row that says waiting: waiting, no mark.
@@ -6650,10 +6638,7 @@ mod tests {
             now,
         );
         let title = title_of(&state, &app, W1, now);
-        assert!(
-            title.contains(" Claude \u{b7} waiting \u{b7} "),
-            "{title:?}"
-        );
+        assert!(title.contains(" Claude \u{b7} waiting "), "{title:?}");
         assert!(!title.contains("bg"), "{title:?}");
     }
 
@@ -6675,84 +6660,84 @@ mod tests {
                 AgentKind::Codex,
                 Activity::Alive,
                 Some(REPORT_WORKING),
-                "Codex \u{b7} busy \u{b7} output now",
+                "Codex \u{b7} busy",
             ),
             (
                 "codex blocked",
                 AgentKind::Codex,
                 Activity::Alive,
                 Some(REPORT_BLOCKED),
-                "Codex \u{b7} waiting \u{b7} output now",
+                "Codex \u{b7} waiting",
             ),
             (
                 "codex done",
                 AgentKind::Codex,
                 Activity::Alive,
                 Some(REPORT_DONE),
-                "Codex \u{b7} idle \u{b7} output now",
+                "Codex \u{b7} idle",
             ),
             (
                 "codex idle",
                 AgentKind::Codex,
                 Activity::Alive,
                 Some(REPORT_IDLE),
-                "Codex \u{b7} idle \u{b7} output now",
+                "Codex \u{b7} idle",
             ),
             (
                 "codex idle, its row proving no live process",
                 AgentKind::Codex,
                 Activity::Idle(Today),
                 Some(REPORT_IDLE),
-                "Codex \u{b7} idle \u{b7} output now",
+                "Codex \u{b7} idle",
             ),
             (
                 "codex no report, read idle",
                 AgentKind::Codex,
                 Activity::Alive,
                 None,
-                "Codex \u{b7} idle \u{b7} output now",
+                "Codex \u{b7} idle",
             ),
             (
                 "claude busy",
                 AgentKind::ClaudeCode,
                 Activity::Busy,
                 None,
-                "Claude \u{b7} busy \u{b7} output now",
+                "Claude \u{b7} busy",
             ),
             (
                 "claude waiting",
                 AgentKind::ClaudeCode,
                 Activity::Waiting,
                 None,
-                "Claude \u{b7} waiting \u{b7} output now",
+                "Claude \u{b7} waiting",
             ),
             (
                 "claude at its prompt",
                 AgentKind::ClaudeCode,
                 Activity::Alive,
                 None,
-                "Claude \u{b7} idle \u{b7} output now",
+                "Claude \u{b7} idle",
             ),
             (
                 "claude, no live file: nothing to say",
                 AgentKind::ClaudeCode,
                 Activity::Idle(Today),
                 None,
-                "Claude \u{b7} output now",
+                "Claude",
             ),
             (
                 "claude busy (a report is not read for it)",
                 AgentKind::ClaudeCode,
                 Activity::Busy,
                 Some(REPORT_IDLE),
-                "Claude \u{b7} busy \u{b7} output now",
+                "Claude \u{b7} busy",
             ),
             (
                 "codex, nothing known: nothing to say",
                 AgentKind::Codex,
                 Activity::Idle(Today),
                 None,
-                "Codex \u{b7} output now",
+                "Codex",
             ),
         ];
         for (what, agent, activity, report, expected) in cases {
@@ -6867,102 +6852,95 @@ mod tests {
     }
 
     #[test]
-    fn the_title_status_loses_the_agent_then_the_age_as_the_tile_narrows_and_the_word_is_never_cut()
-    {
-        // Director busy, Claude Worker waiting, Codex Worker working after its
-        // turn (the rollout says idle; the report says working).
+    fn the_title_status_loses_the_agent_as_the_tile_narrows_and_the_word_is_never_cut() {
+        // A Claude Worker waiting and a Codex Worker working after its turn (the
+        // rollout says idle; the report says working), in the stack column, whose
+        // width is `(width - 36) / 2`. Both labels are 8 cells.
         let segments_at = |width: u16| {
             let (mut state, mut app, brigade, now) =
                 scene(width, [Activity::Busy, Activity::Waiting, Activity::Alive]);
             said(&mut state, &mut app, &brigade, W2, REPORT_WORKING, now);
             let buffer = render_at(&state, &app, width, now);
-            [DIR, W1, W2].map(|id| status_segment(&state, &buffer, id, width))
+            [W1, W2].map(|id| status_segment(&state, &buffer, id, width))
         };
-        // Tiles 62 wide: everything.
-        assert_eq!(
-            segments_at(160),
-            [
-                "Claude \u{b7} busy \u{b7} output now",
-                "Claude \u{b7} waiting \u{b7} output now",
-                "Codex \u{b7} busy \u{b7} output now"
-            ]
-        );
-        // 42 wide: the agent label has gone.
-        assert_eq!(
-            segments_at(120),
-            [
-                "busy \u{b7} output now",
-                "waiting \u{b7} output now",
-                "busy \u{b7} output now"
-            ]
-        );
-        // 32 wide: the age is shortened to a bare duration, as far as it fits
-        // beside the word.
-        assert_eq!(
-            segments_at(100),
-            ["busy \u{b7} now", "waiting", "busy \u{b7} now"]
-        );
+        // Tiles 62 wide, and 42: everything.
+        let all = ["Claude \u{b7} waiting", "Codex \u{b7} busy"];
+        assert_eq!(segments_at(160), all);
+        assert_eq!(segments_at(120), all);
+        // 37 wide: `Claude · waiting` (16 cells) no longer fits beside an 8-cell
+        // label, so only that tile loses its agent; `Codex · busy` (12) still does.
+        assert_eq!(segments_at(110), ["waiting", "Codex \u{b7} busy"]);
+        // 32 wide: every agent label has gone.
+        assert_eq!(segments_at(100), ["waiting", "busy"]);
         // 22 wide: no room even for the word, so none of it: never half a word.
-        assert_eq!(segments_at(80), ["", "", ""]);
+        assert_eq!(segments_at(80), ["", ""]);
     }
 
-    /// A staged brigade of the Claude Director, a named Claude Worker and a
-    /// Codex Worker, `width` columns wide, whose Claude Worker is alive and wrote
-    /// `output 2m ago`; with its label `実装 (worker-1)` (15 cells) when `named`,
-    /// else `worker-1` (8). The stack column is `(width - 36) / 2` wide.
-    fn aged_pair(width: u16, named: bool) -> (EmporiumState, App, BrigadeConfig, Instant) {
+    /// A staged brigade of the Claude Director, a Claude Worker whose label is
+    /// `worker-1` (8 cells), or `{name} (worker-1)` when `name` is given, and a
+    /// Codex Worker, `width` columns wide, the Claude Worker alive. The stack
+    /// column is `(width - 36) / 2` wide.
+    fn labelled_pair(
+        width: u16,
+        name: Option<&str>,
+    ) -> (EmporiumState, App, BrigadeConfig, Instant) {
         let (mut state, mut app, brigade, now) =
             scene(width, [Activity::Alive, Activity::Alive, Activity::Alive]);
-        if named {
-            engine::update(
-                &mut state,
-                &mut app,
-                &brigade,
-                Event::Tick {
-                    relay: Vec::new(),
-                    brigades: vec![banto_core::engine::BrigadeNameFacts {
-                        brigade_id: 1,
-                        name: "cell".to_string(),
-                        director_session: None,
-                        member_names: vec![(
-                            "worker-1".to_string(),
-                            "\u{5b9f}\u{88c5}".to_string(),
-                        )],
-                        request: None,
-                        interrupts: None,
-                    }],
-                },
-                now,
-            );
+        if let Some(name) = name {
+            name_worker_1(&mut state, &mut app, &brigade, name, now);
         }
-        (state, app, brigade, now + Duration::from_secs(125))
+        (state, app, brigade, now)
     }
+
+    /// Give `worker-1` the display name `name`, so its label is `name (worker-1)`.
+    fn name_worker_1(
+        state: &mut EmporiumState,
+        app: &mut App,
+        brigade: &BrigadeConfig,
+        name: &str,
+        now: Instant,
+    ) {
+        engine::update(
+            state,
+            app,
+            brigade,
+            Event::Tick {
+                relay: Vec::new(),
+                brigades: vec![banto_core::engine::BrigadeNameFacts {
+                    brigade_id: 1,
+                    name: "cell".to_string(),
+                    director_session: None,
+                    member_names: vec![("worker-1".to_string(), name.to_string())],
+                    request: None,
+                    interrupts: None,
+                }],
+            },
+            now,
+        );
+    }
+
+    /// `実装`: 4 cells, so the label `実装 (worker-1)` is 15.
+    const IMPLEMENTATION: &str = "\u{5b9f}\u{88c5}";
+    /// `レビュー`: 8 cells, so the label `レビュー (worker-1)` is 19.
+    const REVIEW: &str = "\u{30ec}\u{30d3}\u{30e5}\u{30fc}";
 
     #[test]
     fn the_title_status_steps_happen_at_these_tile_widths_for_an_8_and_a_15_cell_label() {
         // The status needs the tile width minus the label's cells and 14 for the
-        // corners, the padding and the buttons: the word at label + 14 + 4 for
-        // "idle", the short age (`idle · 2m`, 9) at label + 23, the long age
-        // without the agent (20) at label + 34, the agent too (29) at label + 43.
+        // corners, the padding and the buttons: `idle` (4) at label + 18, and
+        // `Claude · idle` (13) at label + 27.
         let steps = |label: u16| -> Vec<(u16, &'static str)> {
-            let full = "Claude \u{b7} idle \u{b7} output 2m ago";
-            let no_agent = "idle \u{b7} output 2m ago";
-            let short = "idle \u{b7} 2m";
             vec![
-                (label + 43, full),
-                (label + 42, no_agent),
-                (label + 34, no_agent),
-                (label + 33, short),
-                (label + 23, short),
-                (label + 22, "idle"),
+                (label + 27, "Claude \u{b7} idle"),
+                (label + 26, "idle"),
                 (label + 18, "idle"),
                 (label + 17, ""),
             ]
         };
-        for (named, label) in [(false, 8u16), (true, 15)] {
+        for (name, label) in [(None, 8u16), (Some(IMPLEMENTATION), 15)] {
             for (tile_width, expected) in steps(label) {
                 let terminal = 2 * tile_width + 36;
-                let (state, app, _, tick) = aged_pair(terminal, named);
+                let (state, app, _, tick) = labelled_pair(terminal, name);
                 let buffer = render_at(&state, &app, terminal, tick);
                 let (row, rect) = title_row(&state, &buffer, W1, terminal);
                 assert_eq!(
@@ -6979,10 +6957,17 @@ mod tests {
     }
 
     #[test]
-    fn at_the_default_collapsed_width_a_named_tile_keeps_the_word_and_a_plain_one_the_age() {
-        // All collapsed, terminal 120: the stack column is 36 wide.
-        for (named, expected) in [(false, "idle \u{b7} 2m"), (true, "idle")] {
-            let (mut state, mut app, brigade, tick) = aged_pair(120, named);
+    fn at_the_default_collapsed_width_a_long_label_leaves_no_room_for_a_status() {
+        // All collapsed, terminal 120: the stack column is 36 wide, so the status
+        // gets 36 - 14 - the label's cells: `Claude · idle` for `worker-1` (8), the
+        // word alone for `実装 (worker-1)` (15), and nothing from 19 cells up, as
+        // for `レビュー (worker-11)` (20).
+        for (name, expected) in [
+            (None, "Claude \u{b7} idle"),
+            (Some(IMPLEMENTATION), "idle"),
+            (Some(REVIEW), ""),
+        ] {
+            let (mut state, mut app, brigade, tick) = labelled_pair(120, name);
             for id in [W1, W2] {
                 toggle_minimize_for_test_at(
                     &mut state,
@@ -7001,8 +6986,120 @@ mod tests {
             assert_eq!(
                 status_segment(&state, &buffer, W1, 120),
                 expected,
-                "named {named}"
+                "named {name:?}"
             );
+        }
+    }
+
+    /// The column after the last glyph of `id`'s status, the column after its
+    /// label's last cell, and the column of its first button.
+    fn status_columns(
+        state: &EmporiumState,
+        buffer: &Buffer,
+        id: &str,
+        width: u16,
+    ) -> (u16, u16, u16) {
+        let key = SessionKey::from_id(id);
+        let geometry = state.geometry(Rect::new(0, 0, width, 40));
+        let rect = geometry
+            .tiles
+            .iter()
+            .find(|(tile, _)| *tile == key)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        let buttons_at = geometry
+            .buttons()
+            .iter()
+            .filter(|button| button.key == key)
+            .map(|button| button.rect.x)
+            .min()
+            .unwrap_or(rect.right() - 1);
+        let (_, label_end) = banto_core::layout::title_columns(rect, &state.tile_label(&key));
+        let last_glyph = (label_end + 1..buttons_at)
+            .rev()
+            .find(|x| {
+                let symbol = buffer[(*x, rect.y)].symbol();
+                symbol != " " && symbol != "\u{2500}"
+            })
+            .expect("a status is drawn");
+        (last_glyph + 1, label_end, buttons_at)
+    }
+
+    #[test]
+    fn the_status_is_anchored_on_the_buttons_so_the_word_ends_in_one_column_on_every_stack_tile() {
+        // The Claude Worker's row, what the Codex Worker reports, the Claude
+        // Worker's display name, whether its turn has ended behind a background
+        // command, and what the two tiles read.
+        type Case = (
+            Activity,
+            &'static [u8],
+            Option<&'static str>,
+            bool,
+            [&'static str; 2],
+        );
+        let cases: [Case; 3] = [
+            // A waiting tile beside an idle one.
+            (
+                Activity::Waiting,
+                REPORT_IDLE,
+                Some(REVIEW),
+                false,
+                ["Claude \u{b7} waiting", "Codex \u{b7} idle"],
+            ),
+            // An idle tile with a `bg` mark beside a waiting one.
+            (
+                Activity::Alive,
+                REPORT_BLOCKED,
+                Some(REVIEW),
+                true,
+                ["Claude \u{b7} idle \u{b7} bg", "Codex \u{b7} waiting"],
+            ),
+            // The same with both labels plain: 8 cells each, so the status has
+            // the same room either way and only its own width differs.
+            (
+                Activity::Alive,
+                REPORT_BLOCKED,
+                None,
+                true,
+                ["Claude \u{b7} idle \u{b7} bg", "Codex \u{b7} waiting"],
+            ),
+        ];
+        for (index, (claude, codex, name, background, expected)) in cases.into_iter().enumerate() {
+            let (mut state, mut app, brigade, now) =
+                scene(160, [Activity::Alive, claude, Activity::Alive]);
+            if let Some(name) = name {
+                name_worker_1(&mut state, &mut app, &brigade, name, now);
+            }
+            said(&mut state, &mut app, &brigade, W2, codex, now);
+            if background {
+                sampled(
+                    &mut state,
+                    &mut app,
+                    &brigade,
+                    &[(W1, Quiescence::Background)],
+                    now,
+                );
+            }
+            let buffer = render_at(&state, &app, 160, now);
+            let segments = [W1, W2].map(|id| status_segment(&state, &buffer, id, 160));
+            assert_eq!(segments, expected, "case {index}");
+            let [
+                (first_end, first_label, first_buttons),
+                (second_end, second_label, second_buttons),
+            ] = [W1, W2].map(|id| status_columns(&state, &buffer, id, 160));
+            // Every stack tile has the stack's x and width and the same buttons ...
+            assert_eq!(first_buttons, second_buttons, "case {index}");
+            // ... so the word ends on one column, two cells short of the first
+            // button: the pad, and the border cell that stays free.
+            assert_eq!(
+                first_end, second_end,
+                "case {index}: the last column of the word"
+            );
+            assert_eq!(first_end + 2, first_buttons, "case {index}");
+            // Fixture check: the first two cases are the ones where the labels
+            // differ, which is what a status drawn from the label's end would
+            // follow; the third has statuses of different widths instead.
+            assert_eq!(name.is_some(), first_label != second_label, "case {index}");
         }
     }
 
@@ -7257,13 +7354,20 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_pane_with_an_age_shows_the_age_beside_its_word() {
+    fn the_status_shows_no_output_age_however_long_ago_the_pane_wrote() {
         let (state, app, _, now) = scene(160, [Activity::Alive, Activity::Alive, Activity::Alive]);
-        let buffer = render_at(&state, &app, 160, now + Duration::from_secs(185));
-        assert_eq!(
-            status_segment(&state, &buffer, DIR, 160),
-            "Claude \u{b7} idle \u{b7} output 3m ago"
-        );
+        for quiet in [0, 25, 185, 7300] {
+            let buffer = render_at(&state, &app, 160, now + Duration::from_secs(quiet));
+            assert_eq!(
+                status_segment(&state, &buffer, DIR, 160),
+                "Claude \u{b7} idle",
+                "{quiet}s after the pane wrote"
+            );
+            assert!(
+                !title_row(&state, &buffer, DIR, 160).0.contains("ago"),
+                "{quiet}s"
+            );
+        }
     }
 
     #[test]
@@ -7475,23 +7579,13 @@ mod tests {
         };
 
         said(&mut state, &mut app, &brigade, W1, REPORT_WORKING, now);
-        assert_eq!(
-            title(&state, &app, W1),
-            "Codex \u{b7} busy \u{b7} output now"
-        );
+        assert_eq!(title(&state, &app, W1), "Codex \u{b7} busy");
         said(&mut state, &mut app, &brigade, W2, REPORT_BLOCKED, now);
-        assert_eq!(
-            title(&state, &app, W2),
-            "output now",
-            "not known to be Codex"
-        );
+        assert_eq!(title(&state, &app, W2), "", "not known to be Codex");
         assert!(!state.attention_panes().contains(&SessionKey::from_id(W2)));
 
         said(&mut state, &mut app, &brigade, W1, REPORT_BLOCKED, now);
-        assert_eq!(
-            title(&state, &app, W1),
-            "Codex \u{b7} waiting \u{b7} output now"
-        );
+        assert_eq!(title(&state, &app, W1), "Codex \u{b7} waiting");
         assert!(state.attention_panes().contains(&key), "marked");
         assert_eq!(state.visible_waiting_count(), 1, "counted");
 
@@ -7500,7 +7594,7 @@ mod tests {
         let buffer = render_at(&state, &app, 160, now);
         assert_eq!(
             status_segment(&state, &buffer, W1, 160),
-            "Codex \u{b7} waiting \u{b7} output now"
+            "Codex \u{b7} waiting"
         );
 
         // The row turning up later changes nothing it shows.
@@ -7521,7 +7615,7 @@ mod tests {
         let buffer = render_at(&state, &app, 160, now);
         assert_eq!(
             status_segment(&state, &buffer, W1, 160),
-            "Codex \u{b7} waiting \u{b7} output now"
+            "Codex \u{b7} waiting"
         );
         assert_eq!(state.visible_waiting_count(), 1);
     }
@@ -7534,7 +7628,7 @@ mod tests {
         let area = Rect::new(0, 0, 160, 40);
         let before = state.geometry(area);
         let status_before = status_segment(&state, &render_at(&state, &app, 160, now), W1, 160);
-        assert_eq!(status_before, "Claude \u{b7} waiting \u{b7} output now");
+        assert_eq!(status_before, "Claude \u{b7} waiting");
         let (_, tile) = title_row(&state, &render_at(&state, &app, 160, now), W1, 160);
 
         // A press on the label marks the tile: its border and label take the
@@ -7648,8 +7742,8 @@ mod tests {
             let strip = collapsed.then(|| title.clone());
             (title, strip)
         };
-        let waiting = "Codex \u{b7} waiting \u{b7} output now";
-        let claude_idle = "Claude \u{b7} idle \u{b7} output now";
+        let waiting = "Codex \u{b7} waiting";
+        let claude_idle = "Claude \u{b7} idle";
         assert_eq!(both(&state, &app).0, waiting);
         assert!(state.attention_panes().contains(&key));
         assert_eq!(state.visible_waiting_count(), 1);
@@ -7695,7 +7789,7 @@ mod tests {
 
     #[test]
     fn a_claude_worker_with_no_row_yet_shows_what_its_live_file_says_on_both_surfaces() {
-        // The operator saw `Claude · output 2m ago` with no word on a Worker added
+        // The operator saw a bare `Claude` with no word on a Worker added
         // minutes before: no transcript, so no row, but a live file.
         use banto_core::model::Activity::{Alive, Busy, Waiting};
         let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
@@ -7759,9 +7853,9 @@ mod tests {
             let buffer = render_at(state, app, 160, now);
             status_segment(state, &buffer, W1, 160)
         };
-        // Nothing seen yet: the agent and the age, no word.
+        // Nothing seen yet: no agent known, and no word.
         observe(&mut state, &mut app, None);
-        assert_eq!(title(&state, &app), "output now");
+        assert_eq!(title(&state, &app), "");
         for (live, expected) in [
             (
                 LiveStatus {
@@ -7769,7 +7863,7 @@ mod tests {
                     dialog_open: false,
                     status_busy: false,
                 },
-                "Claude \u{b7} idle \u{b7} output now",
+                "Claude \u{b7} idle",
             ),
             (
                 LiveStatus {
@@ -7777,7 +7871,7 @@ mod tests {
                     dialog_open: false,
                     status_busy: true,
                 },
-                "Claude \u{b7} busy \u{b7} output now",
+                "Claude \u{b7} busy",
             ),
         ] {
             observe(&mut state, &mut app, Some(live));
@@ -7793,10 +7887,7 @@ mod tests {
                 status_busy: false,
             }),
         );
-        assert_eq!(
-            title(&state, &app),
-            "Claude \u{b7} waiting \u{b7} output now"
-        );
+        assert_eq!(title(&state, &app), "Claude \u{b7} waiting");
         assert!(state.attention_panes().contains(&key), "marked");
         assert_eq!(state.visible_waiting_count(), 1);
         assert!(
@@ -7806,14 +7897,11 @@ mod tests {
         );
         // The strip says the same once it is collapsed.
         toggle_minimize_for_test(&mut state, &mut app, &brigade, &key);
-        assert_eq!(
-            title(&state, &app),
-            "Claude \u{b7} waiting \u{b7} output now"
-        );
+        assert_eq!(title(&state, &app), "Claude \u{b7} waiting");
         // A tick that observed nothing leaves no word (the product it was
         // resolved as is kept, as before).
         observe(&mut state, &mut app, None);
-        assert_eq!(title(&state, &app), "Claude \u{b7} output now");
+        assert_eq!(title(&state, &app), "Claude");
         assert!(!state.attention_panes().contains(&key));
     }
 
@@ -7856,7 +7944,7 @@ mod tests {
         let buffer = render_at(&state, &app, 160, now);
         assert_eq!(
             status_segment(&state, &buffer, W1, 160),
-            "Claude \u{b7} waiting \u{b7} output now"
+            "Claude \u{b7} waiting"
         );
         assert!(state.attention_panes().contains(&SessionKey::from_id(W1)));
         assert_eq!(state.visible_waiting_count(), 1);
@@ -7865,7 +7953,7 @@ mod tests {
         let buffer = render_at(&state, &app, 160, now);
         assert_eq!(
             status_segment(&state, &buffer, W1, 160),
-            "Claude \u{b7} waiting \u{b7} output now"
+            "Claude \u{b7} waiting"
         );
     }
 
@@ -7936,12 +8024,12 @@ mod tests {
             )
         };
         let (text, colour) = status_row(&state, &app, "busy");
-        assert_eq!(text, "Codex \u{b7} busy \u{b7} output now");
+        assert_eq!(text, "Codex \u{b7} busy");
         assert_eq!(colour, banto_tui::view::activity_color(Activity::Busy));
 
         said(&mut state, &mut app, &brigade, W2, REPORT_BLOCKED, now);
         let (text, colour) = status_row(&state, &app, "waiting");
-        assert_eq!(text, "Codex \u{b7} waiting \u{b7} output now");
+        assert_eq!(text, "Codex \u{b7} waiting");
         assert_eq!(colour, WAITING_ACTIVITY_COLOR);
 
         said(
@@ -7955,10 +8043,7 @@ mod tests {
         // Nothing reported any more, and nothing read: no word. The sample the
         // shell takes next decides (the row's own "alive" never says it).
         let buffer = render_at(&state, &app, 160, now);
-        assert_eq!(
-            status_segment(&state, &buffer, W2, 160),
-            "Codex \u{b7} output now"
-        );
+        assert_eq!(status_segment(&state, &buffer, W2, 160), "Codex");
         sampled(
             &mut state,
             &mut app,
@@ -7966,10 +8051,7 @@ mod tests {
             &[(W2, Quiescence::Idle)],
             now,
         );
-        assert_eq!(
-            status_row(&state, &app, "idle").0,
-            "Codex \u{b7} idle \u{b7} output now"
-        );
+        assert_eq!(status_row(&state, &app, "idle").0, "Codex \u{b7} idle");
     }
 
     #[test]
@@ -8024,10 +8106,11 @@ mod tests {
         let right = strip.x + strip.width - 1;
         assert_eq!(text_at(&buffer, right - 6, strip.y, 6), "[S][+]");
         // The status is on that same row: the activity word, in the waiting
-        // colour, and as much more as fits between the label and the buttons (a
-        // 42-column tile has room for the bare word only, for a pane that has
-        // not written and so has no age to keep).
-        assert_eq!(status_segment(&state, &buffer, W1, 120), "waiting");
+        // colour, and the agent before it, which a 42-column tile has room for.
+        assert_eq!(
+            status_segment(&state, &buffer, W1, 120),
+            "Claude \u{b7} waiting"
+        );
         assert_eq!(
             word_colour(&state, &buffer, W1, 120, "waiting"),
             WAITING_ACTIVITY_COLOR
@@ -9014,9 +9097,8 @@ mod tests {
         let buffer = render(&state, &app);
 
         // The title row says what is known of a pane the list has no row for and
-        // that has written nothing: not an agent or a word, and at this width not
-        // the agent label either, just the honest "no output yet".
-        assert_eq!(status_segment(&state, &buffer, W1, 120), "no output yet");
+        // that has written nothing: the product the relay resolved, and no word.
+        assert_eq!(status_segment(&state, &buffer, W1, 120), "Codex");
         // The two body rows are the messages, the first row the inbound one.
         let inbound = text_at(&buffer, strip.x + 1, strip.y + 1, inner);
         assert!(
@@ -9397,58 +9479,24 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_tiles_output_age_comes_from_the_panes_last_output() {
-        use banto_core::input::{MouseButton, MouseEventKind};
-        let (mut state, mut app, brigade) = staged_brigade_of_two_workers();
-        let area = Rect::new(0, 0, 120, 40);
-        let key = SessionKey::from_id("new-worker::1::worker-1");
-        engine::update(
+    fn a_collapsed_tile_shows_no_output_age_however_long_the_pane_has_been_quiet() {
+        let (mut state, mut app, brigade, now) =
+            scene(120, [Activity::Alive, Activity::Alive, Activity::Alive]);
+        toggle_minimize_for_test_at(
             &mut state,
             &mut app,
             &brigade,
-            Event::PtyOutput {
-                key: key.clone(),
-                chunk: b"x".to_vec(),
-            },
-            Instant::now(),
+            &SessionKey::from_id(W1),
+            120,
         );
-        let minimize = state
-            .geometry(area)
-            .buttons()
-            .iter()
-            .find(|b| b.key == key && b.kind == ButtonKind::Minimize)
-            .cloned()
-            .unwrap();
-        mouse(
-            &mut state,
-            &mut app,
-            &brigade,
-            MouseEventKind::Down(MouseButton::Left),
-            minimize.rect.x,
-            minimize.rect.y,
-        );
-
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-        let mut cache = HashMap::new();
-        let mut row_at = |tick: Instant| {
-            terminal
-                .draw(|frame| {
-                    let _ = draw(frame, &app, &state, SystemTime::now(), tick, &mut cache);
-                })
-                .unwrap();
-            status_segment(&state, terminal.backend().buffer(), W1, 120)
-        };
-        let just_now = Instant::now();
-        // Nothing is known of a pane the list has no row for and that has
-        // reported nothing (the relay's facts here name no product): no agent and
-        // no activity; the output age is still there.
-        assert_eq!(row_at(just_now), "output now");
-        assert_eq!(row_at(just_now + Duration::from_secs(25)), "output 20s ago");
-        assert_eq!(row_at(just_now + Duration::from_secs(130)), "output 2m ago");
-        assert_eq!(
-            row_at(just_now + Duration::from_secs(7300)),
-            "output 2h ago"
-        );
+        for quiet in [0, 25, 130, 7300] {
+            let buffer = render_at(&state, &app, 120, now + Duration::from_secs(quiet));
+            assert_eq!(
+                status_segment(&state, &buffer, W1, 120),
+                "Claude \u{b7} idle",
+                "{quiet}s after the pane wrote"
+            );
+        }
     }
 
     #[test]
