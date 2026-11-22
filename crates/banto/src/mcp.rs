@@ -271,6 +271,27 @@ fn initialize_result(msg: &Value) -> Value {
     })
 }
 
+/// A tool's `_meta` that keeps Claude Code from deferring it. Claude Code defers
+/// MCP tools: a member sees their names only until it calls ToolSearch, so a
+/// description it never loaded is a description it never read. In the demo of
+/// 2026-11-22 the Claude Workers called `check_messages {}` without ever loading
+/// either of the two tools below, so they never saw their descriptions.
+///
+/// Only these two have it. `send_to_peer` is every member's first real call, and
+/// the `message` misnaming (see [`text_argument_name`]) came from members without
+/// its schema; `check_messages` carries the sentence about a turn banto
+/// interrupted.
+///
+/// The key takes effect only for a Claude session started with it: four sessions
+/// started before it and resumed (Claude Code 2.1.330, 2026-11-22) kept sending
+/// both tools deferred, cause unverified. A member created before this build does
+/// not see these descriptions until it is a new session. The key is Claude Code's:
+/// Codex reads the same `tools/list`, and whether it does anything there is not
+/// measured.
+fn always_loaded() -> Value {
+    json!({ "anthropic/alwaysLoad": true })
+}
+
 /// `tools/list`: the brigade mediation tools, plus the roster call that
 /// tells a member it is in a brigade at all.
 fn tools_list_result() -> Value {
@@ -278,6 +299,7 @@ fn tools_list_result() -> Value {
         "tools": [
             {
                 "name": "send_to_peer",
+                "_meta": always_loaded(),
                 "description": "Send a message to your brigade peer through banto: a Director \
                                 reaches every Worker by default, a Worker or a Goinkyo reaches \
                                 the Director. banto's relay, on by default, types a line into an \
@@ -312,6 +334,7 @@ fn tools_list_result() -> Value {
             },
             {
                 "name": "check_messages",
+                "_meta": always_loaded(),
                 "description": "Pull any new messages your brigade peer has sent you via banto \
                                 (since you last checked). Call it at natural checkpoints. A \
                                 message whose header says banto interrupted your turn stopped \
@@ -814,7 +837,7 @@ fn tool_send_to_peer(ctx: &mut ServerContext, msg: &Value) -> Value {
         Err(err) => return tool_error(&format!("failed to resolve brigade membership: {err}")),
     };
     let text = msg
-        .pointer("/params/arguments/text")
+        .pointer(&format!("/params/arguments/{}", text_argument_name(msg)))
         .and_then(Value::as_str)
         .unwrap_or("");
     if text.trim().is_empty() {
@@ -937,7 +960,17 @@ fn log_message(
 /// to say about what "no value" means for *this* argument (see
 /// [`parse_to_arg`]) builds its own from it instead.
 fn parse_optional_arg<'a>(msg: &'a Value, name: &str) -> Result<Option<&'a str>, String> {
-    match msg.pointer(&format!("/params/arguments/{name}")) {
+    parse_optional_arg_as(msg, name, name)
+}
+
+/// [`parse_optional_arg`] reading the argument `key` but naming it `name` in its
+/// errors, for a tolerated alias that no error may name.
+fn parse_optional_arg_as<'a>(
+    msg: &'a Value,
+    key: &str,
+    name: &str,
+) -> Result<Option<&'a str>, String> {
+    match msg.pointer(&format!("/params/arguments/{key}")) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => {
             let trimmed = s.trim();
@@ -1654,16 +1687,44 @@ const INTERRUPT_POLL: Duration = Duration::from_millis(50);
 /// Esc written for it.
 const INTERRUPT_HEADER: &str = " — banto interrupted your turn for this message; the tool call it cut was stopped, not refused";
 
-/// Refuses any key of `arguments` that is not in `allowed`, and an `arguments`
-/// that is not an object. A key the tool does not know is a caller that believes
-/// the tool does something it does not, and here the something is a write into
-/// another session's pane.
-fn only_arguments(msg: &Value, allowed: &[&str]) -> Result<(), String> {
+/// The argument that carries the message text of `send_to_peer` and
+/// `interrupt_worker`: `text`, or `message` when only that one is sent. `text`
+/// wins whenever it is given, even beside `message`; an argument that is absent
+/// or `null` is not given.
+///
+/// Measured over every transcript on this machine on 2026-11-22: 47 of 4,132
+/// Claude `send_to_peer` calls and 15 of about 1,030 Codex ones failed on a
+/// missing `text`, and every one whose arguments could be read had sent
+/// `message`. The schema does not list it: the alias saves the retry that
+/// resends the whole message, and listing it would advertise a second name. A
+/// different wrong name turning up should not grow an alias list here; put the
+/// schema in front of the model instead.
+fn text_argument_name(msg: &Value) -> &'static str {
+    let given = |name: &str| {
+        !matches!(
+            msg.pointer(&format!("/params/arguments/{name}")),
+            None | Some(Value::Null)
+        )
+    };
+    if !given("text") && given("message") {
+        "message"
+    } else {
+        "text"
+    }
+}
+
+/// Refuses any key of `arguments` that is neither in `allowed` nor in
+/// `tolerated`, and an `arguments` that is not an object. A key the tool does
+/// not know is a caller that believes the tool does something it does not, and
+/// here the something is a write into another session's pane. The refusal names
+/// `allowed` only: a tolerated key is accepted but not advertised, so it is not
+/// listed there.
+fn only_arguments(msg: &Value, allowed: &[&str], tolerated: &[&str]) -> Result<(), String> {
     match msg.pointer("/params/arguments") {
         None | Some(Value::Null) => Ok(()),
         Some(Value::Object(arguments)) => match arguments
             .keys()
-            .find(|key| !allowed.contains(&key.as_str()))
+            .find(|key| !allowed.contains(&key.as_str()) && !tolerated.contains(&key.as_str()))
         {
             Some(key) => Err(format!(
                 "unknown argument `{key}`; this tool takes {}.",
@@ -1697,15 +1758,17 @@ fn interrupt_worker(ctx: &mut ServerContext, msg: &Value, wait: Duration) -> Val
     if role != BrigadeRole::Director {
         return tool_error("interrupt_worker may only be called by a Director.");
     }
-    if let Err(message) = only_arguments(msg, &["member", "text"]) {
+    if let Err(message) = only_arguments(msg, &["member", "text"], &["message"]) {
         return tool_error(&message);
     }
     let member = match require_string_arg(msg, "member") {
         Ok(value) => value,
         Err(message) => return tool_error(&message),
     };
-    let text = match require_string_arg(msg, "text") {
-        Ok(value) => value,
+    // Read from `message` or `text`, reported as `text` either way.
+    let text = match parse_optional_arg_as(msg, text_argument_name(msg), "text") {
+        Ok(Some(value)) => value,
+        Ok(None) => return tool_error("`text` is required."),
         Err(message) => return tool_error(&message),
     };
     let members = match ctx.store.brigade_members(brigade) {
@@ -2844,10 +2907,13 @@ mod tests {
     }
 
     #[test]
-    fn every_member_is_told_in_check_messages_what_an_interrupted_turn_means() {
-        // The one text every member gets whatever role prompt the operator wrote:
-        // a custom `worker_prompt` replaces the default briefing, so the sentence
-        // cannot live only there.
+    fn check_messages_tells_what_an_interrupted_turn_means() {
+        // The sentence lives in the tool description, not the Worker briefing, so
+        // an operator's own `worker_prompt` cannot lose it. A new Claude session
+        // reads the description only because the tool is always loaded (see
+        // `always_loaded`, which says a resumed one keeps deferring it); a Codex
+        // member's tools are deferred, and only a Claude Worker's turn is ever
+        // stopped.
         let tools = tools_list_result();
         let description = tools["tools"]
             .as_array()
@@ -3151,6 +3217,77 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_worker_takes_message_for_text_and_text_wins_when_both_are_sent() {
+        let mut ctx = named_ctx();
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "message": "from message"}),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": "from text", "message": "from message"}),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(queued_for_worker_1(&mut ctx), ["from message", "from text"]);
+        // An empty `text` is refused whatever `message` says, and a different
+        // unknown key is refused in the words it always was: `message` is not
+        // listed among what the tool takes.
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": "", "message": "from message"}),
+        );
+        assert!(is_error(&response));
+        assert!(result_text(&response).contains("`text` must not be an empty string"));
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "message": "x", "force": true}),
+        );
+        assert_eq!(
+            result_text(&response),
+            "unknown argument `force`; this tool takes `member` and `text`."
+        );
+        assert_eq!(ctx.store.pending_interrupts(1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn interrupt_worker_reports_a_bad_message_as_a_bad_text() {
+        // `message` is tolerated, not advertised: no error names it, and one read
+        // from it is worded exactly as the same value sent as `text` would be.
+        let mut ctx = named_ctx();
+        for (arguments, expect) in [
+            (
+                json!({"member": "worker-1", "message": ""}),
+                "`text` must not be an empty string.",
+            ),
+            (
+                json!({"member": "worker-1", "message": "  "}),
+                "`text` must not be an empty string.",
+            ),
+            (
+                json!({"member": "worker-1", "message": 5}),
+                "`text` must be a string.",
+            ),
+            // `text` wins, so a wrong-typed one is its own refusal.
+            (
+                json!({"member": "worker-1", "text": 5, "message": "x"}),
+                "`text` must be a string.",
+            ),
+        ] {
+            let response = interrupt_now(&mut ctx, arguments.clone());
+            assert!(is_error(&response), "{arguments}");
+            assert_eq!(result_text(&response), expect, "{arguments}");
+        }
+        // A null `text` is not sent, so `message` is read.
+        let response = interrupt_now(
+            &mut ctx,
+            json!({"member": "worker-1", "text": null, "message": "x"}),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(ctx.store.pending_interrupts(1).unwrap().len(), 1);
+    }
+
+    #[test]
     fn a_codex_worker_is_queued_like_any_other_and_the_ui_answers_codex() {
         // The tool does not look at the product: whether a pane is pressed is the
         // UI's decision, and for a Codex Worker it is no.
@@ -3188,6 +3325,152 @@ mod tests {
             "params": { "name": "send_to_peer", "arguments": arguments }
         })
         .to_string()
+    }
+
+    /// What is waiting for Worker 1 in `ctx`'s brigade.
+    fn queued_for_worker_1(ctx: &mut ServerContext) -> Vec<String> {
+        ctx.store
+            .fetch_brigade_messages(1, "worker-1", BrigadeRole::Worker)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.body)
+            .collect()
+    }
+
+    fn send_with(ctx: &mut ServerContext, arguments: Value) -> Value {
+        call(
+            ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": { "name": "send_to_peer", "arguments": arguments }
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn a_message_argument_is_delivered_when_text_is_not_sent() {
+        let mut ctx = named_ctx();
+        let response = send_with(&mut ctx, json!({"to": "worker-1", "message": "hello"}));
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(queued_for_worker_1(&mut ctx), ["hello"]);
+    }
+
+    #[test]
+    fn text_wins_when_both_text_and_message_are_sent() {
+        let mut ctx = named_ctx();
+        let response = send_with(
+            &mut ctx,
+            json!({"to": "worker-1", "text": "the text", "message": "the message"}),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(queued_for_worker_1(&mut ctx), ["the text"]);
+    }
+
+    #[test]
+    fn an_empty_text_is_refused_even_beside_a_non_empty_message() {
+        let mut ctx = named_ctx();
+        for text in [json!(""), json!("   ")] {
+            let response = send_with(
+                &mut ctx,
+                json!({"to": "worker-1", "text": text, "message": "hello"}),
+            );
+            assert!(is_error(&response), "{text}");
+            assert!(
+                result_text(&response).contains("send_to_peer requires a non-empty `text`."),
+                "{text}: {}",
+                result_text(&response)
+            );
+        }
+        assert!(queued_for_worker_1(&mut ctx).is_empty());
+    }
+
+    #[test]
+    fn neither_text_nor_message_is_refused_with_the_same_words_as_before() {
+        let mut ctx = named_ctx();
+        for arguments in [
+            json!({"to": "worker-1"}),
+            json!({"to": "worker-1", "message": ""}),
+            json!({"to": "worker-1", "text": null}),
+        ] {
+            let response = send_with(&mut ctx, arguments.clone());
+            assert!(is_error(&response), "{arguments}");
+            assert_eq!(
+                result_text(&response),
+                "send_to_peer requires a non-empty `text`.",
+                "{arguments}"
+            );
+        }
+        assert!(queued_for_worker_1(&mut ctx).is_empty());
+    }
+
+    #[test]
+    fn a_null_text_counts_as_not_sent_so_message_is_delivered() {
+        let mut ctx = named_ctx();
+        let response = send_with(
+            &mut ctx,
+            json!({"to": "worker-1", "text": null, "message": "x"}),
+        );
+        assert!(!is_error(&response), "{}", result_text(&response));
+        assert_eq!(queued_for_worker_1(&mut ctx), ["x"]);
+    }
+
+    #[test]
+    fn a_text_of_the_wrong_type_wins_over_message_and_is_refused() {
+        let mut ctx = named_ctx();
+        let response = send_with(
+            &mut ctx,
+            json!({"to": "worker-1", "text": 5, "message": "x"}),
+        );
+        assert!(is_error(&response));
+        assert_eq!(
+            result_text(&response),
+            "send_to_peer requires a non-empty `text`."
+        );
+        assert!(queued_for_worker_1(&mut ctx).is_empty());
+    }
+
+    #[test]
+    fn exactly_send_to_peer_and_check_messages_are_always_loaded() {
+        let tools = tools_list_result();
+        let always: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["_meta"]["anthropic/alwaysLoad"] == true)
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(always, ["send_to_peer", "check_messages"]);
+        // No other tool carries a `_meta` of any shape.
+        for tool in tools["tools"].as_array().unwrap() {
+            if !always.contains(&tool["name"].as_str().unwrap()) {
+                assert!(tool.get("_meta").is_none(), "{}", tool["name"]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_schemas_do_not_advertise_message() {
+        let tools = tools_list_result();
+        for name in ["send_to_peer", "interrupt_worker"] {
+            let tool = tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("advertised");
+            assert!(
+                tool["inputSchema"]["properties"].get("message").is_none(),
+                "{name}"
+            );
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("text")),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -5666,7 +5949,7 @@ mod tests {
             "the agent still sees the tools"
         );
         let call = answer(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
-            "params":{"name":"send_to_peer","arguments":{"to":"director","message":"x"}}}));
+            "params":{"name":"send_to_peer","arguments":{"to":"director","text":"x"}}}));
         assert_eq!(call["result"]["isError"], true);
         assert_eq!(call["result"]["content"][0]["text"], reason);
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;

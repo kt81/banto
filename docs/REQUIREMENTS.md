@@ -3708,11 +3708,32 @@ tool approval and hook trust are Codex's own two separate mechanisms, solved
 two separate ways here.
 
 The server shares banto's own sqlite store with the TUI process and exposes
-eight tools:
+eight tools. `send_to_peer` and `check_messages`, and no other, carry
+`_meta: {"anthropic/alwaysLoad": true}` in `tools/list`, so Claude Code does not defer
+them: in the 2026-11-22 demo the Claude Workers never loaded either, called
+`check_messages {}` blind, and never read its description. `send_to_peer` is every
+member's first real call and the `message` misnaming came from members without its
+schema; `check_messages` carries the interrupted-turn sentence. Measured on Claude
+Code 2.1.330 (Windows, 2026-11-22, from the transcripts): a session created after the
+change sent both tools with no `defer_loading` key and called `send_to_peer` with
+`text` on its first try, without ToolSearch; four sessions started before it and
+resumed by the restart kept sending both with `defer_loading` true (for three of them
+the request shape hash was identical before and after). Why a resumed session keeps
+its earlier deferral is not verified. So the key takes effect for a session Claude
+Code starts with it, and a member created before this build does not see these two
+descriptions until it is a new session. The key is Claude Code's, and Codex reads the
+same `tools/list`:
 - `send_to_peer(text[, to])` — enqueues a message: a Director broadcasts to
   every Worker by default, or a Worker/Goinkyo sends to the Director;
   `to` names one specific member instead — the only way a Director reaches
-  a Goinkyo, since a broadcast never does.
+  a Goinkyo, since a broadcast never does. A call that sends `message` and no
+  `text` is read as if it had sent it as `text`, because that was the one wrong
+  name every failing call used whose arguments could be read (47 of 4,132 Claude
+  calls and 15 of about 1,030 Codex calls failed on a missing `text`, measured on
+  2026-11-22; all 47 Claude failures came from members without the schema in their
+  prompt, which was not checked for the Codex ones). A `text` that is absent or
+  null counts as not sent; any other `text` wins when both are sent, and an empty
+  one is still refused. The schema does not list `message`.
 - `check_messages()` — pulls the messages addressed to this session's role
   that it hasn't seen yet, wrapped in framing that names them as relayed from
   another AI rather than a direct operator instruction.
@@ -3790,7 +3811,9 @@ eight tools:
   `member` is one Worker token of the caller's own brigade (no broadcast; the
   Goinkyo and the Director are refused). A wrong type is an error and an unknown key
   is refused, because the server otherwise reads arguments by name and ignores keys it
-  does not know, so a misspelt argument would pass without a word. The result says
+  does not know, so a misspelt argument would pass without a word. The one
+  exception is `message`, read for `text` by the same rule and for the same
+  reason as in `send_to_peer`, and an error about it names `text`. The result says
   what banto decided, waiting up to about 2 s for it, or that the request is queued
   and `brigade_status` shows what followed, or that the member is gone. The tool's
   description carries the price (below). See "Interrupting a Worker's turn" under
@@ -4225,8 +4248,20 @@ for that message says so; a Worker that pulls first is told nothing, and the out
 `read`. For example `[from director — to you — banto interrupted
 your turn for this message; the tool call it cut was stopped, not refused]`. One more
 sentence lives in the `check_messages` tool description, not in the Worker briefing,
-because that description reaches every member, Claude or Codex, whatever its prompt says,
-and an operator's own `worker_prompt` would have lost a sentence placed in the briefing:
+because an operator's own `worker_prompt` would have lost a sentence placed in the
+briefing. Whether the description is read depends on the product. Claude Code defers
+MCP tools and shows names only until a member loads them, so `check_messages` carries
+`_meta: {"anthropic/alwaysLoad": true}` ("MCP mediation server"); the key takes effect
+for a session Claude Code starts with it, and a session started earlier and resumed
+keeps its earlier deferral (observed on four sessions, 2.1.330, 2026-11-22; cause
+unverified), so a member created before this build reads the description only once it
+is a new session. Codex defers MCP tools too: on
+codex-cli 0.145.0 the description was not in the model's context and was reachable
+only by searching `ALL_TOOLS` inside the `exec` sandbox
+(`docs/notes/codex-briefing-spike.md`, "Result"), and whether the `_meta` key changes
+that was not measured. That costs nothing here, because `interrupt_worker` only
+stops a Claude Worker's turn, so only a Claude member is ever told by that header. The
+sentence:
 "A message whose header says banto interrupted your turn stopped you mid-work: the tool
 call it cut was stopped, not refused by the user, so look at what it left half-done
 before you go on." The nudge line is the ordinary one; there is no second wake sentence.
