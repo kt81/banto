@@ -32,7 +32,7 @@ tmux はターミナルのウィンドウマネージャです。banto は Claud
 
 ### Director/Worker の Brigade
 
-`B` は、選択したセッションを **Director** に任命し、その隣に新しい **Worker** セッションを起こします。数、モデル、プロダクトは設定でき、Worker は Director とは別に Claude Code と Codex のどちらでも動かせます。Worker のモデルと reasoning effort（推論の強さ）はセッションを作るときだけ渡されるので、セッションの中で行った変更は再起動しても保たれます。
+`B` は、選択したセッションを **Director** に任命し、その隣に新しい **Worker** セッションを起こします。数、モデル、プロダクトは設定でき、Worker は Director とは別に Claude Code と Codex のどちらでも動かせます。Worker のモデルと reasoning effort（推論の強さ）はセッションを作るときだけ渡されます。再起動しても、モデルはセッションが最後に使っていたものが保たれます。effort は Codex ではそのまま保たれますが、Claude Code では手元の Claude 設定から決まるため、そこに保存したレベルだけが引き継がれます（`max` と、そのセッションだけに設定したレベルは再起動までです）。
 
 banto は MCP 上でメンバー間のメッセージを中継します。各メンバーの起動時に `banto _mcp` へつなぎ、Claude Code には `--mcp-config`、Codex には `-c mcp_servers.banto.*` の上書きで渡します。メンバーは `send_to_peer`、`check_messages`、`brigade_status` を使えます。Director にはさらに次のツールがあります。
 

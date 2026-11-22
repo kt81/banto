@@ -69,8 +69,10 @@ twice.
 Press `B` on a session to make it the **Director**; banto spawns fresh **Worker**
 sessions beside it (count, model and product are configurable, and Workers can run
 Claude Code or Codex independently of the Director). A Worker's model and reasoning
-effort are given only when its session is created, so a change you make inside a
-session survives restarts.
+effort are given only when its session is created. A restart keeps the model the
+session last ran on. Codex keeps the effort too, but Claude Code takes it from your
+own Claude settings, so only a level you saved there carries over (`max`, or a level
+set for one session only, lasts until the restart).
 
 banto relays messages between members over MCP, wiring each one to `banto _mcp` at
 launch (Claude Code via `--mcp-config`, Codex via `-c mcp_servers.banto.*`
