@@ -52,6 +52,8 @@ Four crates. The dependency direction is the discipline, not a preference —
   The one exception is `README.ja.md`, a Japanese translation of `README.md` that
   the operator asked for. `README.md` stays the source. A change to `README.md`
   updates `README.ja.md` in the same commit, leaving code blocks byte-identical
+  except for the comments in the Configuration example, which are translated (its
+  keys, values and section headers stay identical)
 - Keep clippy clean with `-D warnings`
 - Put every external process invocation (the agent processes, liveness probes, etc.) behind an abstraction (trait) and mock it in unit tests
 - **Comments earn their place.** Say what the code cannot: why it has this
