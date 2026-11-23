@@ -4611,7 +4611,9 @@ pub enum Event {
     },
     /// ~1/s, once per brigade with something to say: what the shell
     /// observed about that brigade's Goinkyo, staged or not —
-    /// gathered shell-side alongside `Tick`'s own observations, but its own
+    /// gathered shell-side only after every event queued ahead of it has been
+    /// handled, which `Tick`'s own observations are not (see the real-key case
+    /// in [`update_goinkyo_awaiting_spawn`] for why that matters here). Its own
     /// event rather than a field added to `Tick`: every existing
     /// `Event::Tick` literal (production and the many in tests) would
     /// otherwise need a new field just to keep compiling, for a fact only
@@ -11868,11 +11870,22 @@ fn update_goinkyo_awaiting_spawn(
         // that already ended. Discovery and a session move both always write a
         // real id back to a row (`update_discovery_result`/`update_member_
         // session_moved`), and a live consultation's own row always keeps
-        // its session id (`gather_goinkyo_observations` never reports
+        // its session id (`gather_goinkyo_looks` never reports
         // `AwaitingSpawn` for one) — so a real key paired with a
         // session-id-less row cannot arise from the same, still-open
         // consultation; the row behind that key was deleted and a new one
-        // took its place. Two ways that happens without `NoGoinkyo` ever
+        // took its place.
+        //
+        // That holds only because the shell reads the row once every event
+        // queued ahead of the observation has been handled (`next_event` in
+        // `emporium.rs`). The event that rekeys the pane is the one whose
+        // `SetMemberSession` writes the row, and an observation read between
+        // the two shows exactly this pair for a Goinkyo that has just been
+        // identified: two were hung up that way within a few milliseconds of
+        // their discovery, when the read happened ahead of the queue. Nothing
+        // here can tell the two apart.
+        //
+        // Two ways the real swap happens without `NoGoinkyo` ever
         // firing to release the guard first: `dismiss_goinkyo` immediately
         // followed by a fresh `consult_goinkyo`, close enough together that
         // the ~1Hz tick never observes the row-less moment in between; or a

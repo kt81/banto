@@ -800,6 +800,7 @@ fn event_loop(
         // into the same tick (see `engine::update_tick`'s doc).
         let tick_start = Instant::now();
         let mut tick_timings = TickTimings::default();
+        let mut goinkyo_owed = false;
         if last_tick.is_none_or(|tick| now.duration_since(tick) >= TICK_INTERVAL) {
             let first_tick = last_tick.is_none();
             last_tick = Some(now);
@@ -862,14 +863,7 @@ fn event_loop(
             let samples = std::mem::take(&mut glance_gate.quiescence);
             events.push_back(Event::QuiescenceSampled { samples });
             events.push_back(Event::Tick { relay, brigades });
-            for look in gather_goinkyo_looks(&state, deps.store, app, Some(&mut tick_timings)) {
-                if let Some(log) = pane_log.as_mut() {
-                    log.goinkyo(&look);
-                }
-                if let Some(observation) = decide_goinkyo(&look) {
-                    events.push_back(Event::GoinkyoAwaitingSpawn { observation });
-                }
-            }
+            goinkyo_owed = true;
         }
         let tick_dur = tick_start.elapsed();
 
@@ -879,7 +873,22 @@ fn event_loop(
         // the store to every shell-executed `Cmd` (spawning a PTY child is
         // just as synchronous a call as a store write).
         let dispatch_start = Instant::now();
-        while let Some(ev) = events.pop_front() {
+        // The Goinkyo looks are read inside this loop (`next_event`) but belong
+        // to the tick's cost, as they did when they were read above it, so
+        // `slow tick` blames a slow store read on the stage that made it.
+        let mut goinkyo_dur = Duration::ZERO;
+        while let Some(ev) = next_event(&mut events, &mut goinkyo_owed, || {
+            let observe_start = Instant::now();
+            let observed = goinkyo_events(
+                &state,
+                deps.store,
+                app,
+                pane_log.as_mut(),
+                Some(&mut tick_timings),
+            );
+            goinkyo_dur += observe_start.elapsed();
+            observed
+        }) {
             if let Some(recorder) = &mut event_recorder {
                 recorder.record(&ev, now);
             }
@@ -934,7 +943,8 @@ fn event_loop(
                 events.extend(results);
             }
         }
-        let dispatch_dur = dispatch_start.elapsed();
+        let tick_dur = tick_dur + goinkyo_dur;
+        let dispatch_dur = dispatch_start.elapsed().saturating_sub(goinkyo_dur);
 
         // A `PtyExited` or `PtyOutputLost` handler drops the session's `Screen`;
         // a lost-output handle stays until its child actually exits.
@@ -2736,6 +2746,50 @@ fn gather_relay_observations_from(
     observations
 }
 
+/// The next event to handle. A tick's Goinkyo observations are read here, once
+/// the queue has run dry, and not when the tick's own events are queued.
+///
+/// The core judges them against its own state: a pane under a real key beside a
+/// member row with no session is a pane left over from a consultation that
+/// ended, and is hung up. The event that rekeys a pane to its real id is also
+/// the one whose `SetMemberSession` writes the row, so a read made while it is
+/// still waiting sees that very pair for a Goinkyo that has just been
+/// identified (a live run lost two this way, a few milliseconds after each one's
+/// discovery). With nothing queued, no event is left that could change either
+/// half. The core's `update_goinkyo_awaiting_spawn` relies on this and does not
+/// check it.
+fn next_event(
+    queue: &mut VecDeque<Event>,
+    observations_owed: &mut bool,
+    observe: impl FnOnce() -> Vec<Event>,
+) -> Option<Event> {
+    if queue.is_empty() && std::mem::take(observations_owed) {
+        queue.extend(observe());
+    }
+    queue.pop_front()
+}
+
+/// The events this tick's Goinkyo looks call for, recorded in the pane log as
+/// they are read.
+fn goinkyo_events(
+    state: &EmporiumState,
+    store: &RefCell<Store>,
+    app: &App,
+    mut pane_log: Option<&mut PaneLog>,
+    timings: Option<&mut TickTimings>,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for look in gather_goinkyo_looks(state, store, app, timings) {
+        if let Some(log) = pane_log.as_deref_mut() {
+            log.goinkyo(&look);
+        }
+        if let Some(observation) = decide_goinkyo(&look) {
+            events.push(Event::GoinkyoAwaitingSpawn { observation });
+        }
+    }
+    events
+}
+
 /// What each live brigade's Goinkyo row looks like this tick, as a value:
 /// [`GoinkyoLook`] is both what [`decide_goinkyo`] decides from and what the
 /// pane log writes, so the record and the decision are one reading. A brigade
@@ -4531,8 +4585,9 @@ impl StageTimings {
 
 /// Sub-stage durations inside the ~1s tick block — filled in by
 /// `gather_session_moves`/`gather_relay_observations`/
-/// `gather_goinkyo_observations` as they run, so `tick`'s own cost in
-/// [`StageTimings`] is attributed rather than guessed at. Same measurement
+/// `goinkyo_events` as they run, so `tick`'s own cost in
+/// [`StageTimings`] is attributed rather than guessed at. The Goinkyo read runs
+/// inside the dispatch loop but is counted into `tick`, not `dispatch`. Same measurement
 /// discipline as [`StageTimings`]: accumulation is unconditional and cheap
 /// (`Instant::now()` deltas), only the eventual log write is gated. Per-member
 /// work inside each function's own loop accumulates into these fields as it
@@ -15236,6 +15291,135 @@ mod tests {
                 .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { .. })),
             "the one-shot spawn guard must stop a second respawn: {cmds_again:?}"
         );
+    }
+
+    #[test]
+    fn a_goinkyo_discovered_in_the_pass_that_observes_it_is_not_torn_down_as_stale() {
+        // The window a live run fell into twice: the hook records the Goinkyo's
+        // briefing, and `poll_discovery` finds it in the very pass that is also
+        // the tick pass. The pane is rekeyed to its real id and the member row
+        // is written when that pass's events are handled; an observation read
+        // before that sees a row with no session beside a pane that already has
+        // a real key, which is what a pane left over from an ended consultation
+        // looks like.
+        let (store, mut state, mut app) = staged_goinkyo(None);
+        let brigade = BrigadeConfig::default();
+        let synthetic = pending_key("goinkyo");
+        let observation = only_observation(&state, &store, &app);
+        let cmds = engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::GoinkyoAwaitingSpawn { observation },
+            Instant::now(),
+        );
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::OpenEmbedded { key, .. } if *key == synthetic)),
+            "{cmds:?}"
+        );
+        engine::update(
+            &mut state,
+            &mut app,
+            &brigade,
+            Event::Spawned {
+                key: synthetic.clone(),
+                agent: None,
+            },
+            Instant::now(),
+        );
+        let spawned = SystemTime::now() - Duration::from_secs(5);
+        store
+            .borrow()
+            .record_briefing(
+                1,
+                "goinkyo",
+                &SessionId("g1".to_string()),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let claude_home = tempfile::tempdir().unwrap();
+        let claude_home_ref = ClaudeHome::new(claude_home.path().to_path_buf());
+        let provider = ClaudeCodeProvider::new(claude_home_ref.clone());
+        let mut trackers = vec![codex_tracker(1, "goinkyo", spawned)];
+
+        // The pass, as the loop runs it: discovery is polled, the tick is due,
+        // and the events are handled by `next_event`, which is what reads the
+        // Goinkyo.
+        let mut events: VecDeque<Event> = poll_discovery(
+            &mut trackers,
+            &provider,
+            &HashSet::new(),
+            &[],
+            &store,
+            &claude_home_ref,
+        )
+        .into();
+        assert!(
+            matches!(events.front(), Some(Event::DiscoveryResult { session_id, .. }) if session_id == "g1"),
+            "{events:?}"
+        );
+        let mut goinkyo_owed = true;
+
+        let mut issued = Vec::new();
+        while let Some(event) = next_event(&mut events, &mut goinkyo_owed, || {
+            goinkyo_events(&state, &store, &app, None, None)
+        }) {
+            for cmd in engine::update(&mut state, &mut app, &brigade, event, Instant::now()) {
+                if let Cmd::Store(intent) = &cmd {
+                    events.extend(execute_store_intent(intent.clone(), &store));
+                }
+                issued.push(cmd);
+            }
+        }
+
+        assert!(
+            !issued
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::HangUpPty { .. })),
+            "a Goinkyo that was just identified must keep its pane: {issued:?}"
+        );
+        assert_eq!(
+            state.goinkyo_guard_facts(1).guard,
+            Some(SessionKey::from_id("g1")),
+            "the guard must still name the live pane"
+        );
+    }
+
+    #[test]
+    fn owed_observations_are_read_only_when_the_queue_is_empty_and_once() {
+        let mut queue: VecDeque<Event> = VecDeque::from([
+            Event::Resized {
+                width: 80,
+                height: 24,
+            },
+            Event::Resized {
+                width: 90,
+                height: 30,
+            },
+        ]);
+        let mut owed = true;
+        let mut reads = 0;
+        let mut handled = Vec::new();
+        while let Some(event) = next_event(&mut queue, &mut owed, || {
+            reads += 1;
+            // What the read sees: everything queued before it has been handled.
+            assert_eq!(handled.len(), 2);
+            vec![Event::Tick {
+                relay: Vec::new(),
+                brigades: Vec::new(),
+            }]
+        }) {
+            handled.push(event);
+        }
+        assert_eq!(reads, 1);
+        assert_eq!(handled.len(), 3);
+        assert!(matches!(handled[2], Event::Tick { .. }));
+
+        // Not owed: never read.
+        let mut owed = false;
+        assert!(next_event(&mut queue, &mut owed, || panic!("not owed")).is_none());
     }
 
     // --- tile_label -----------------------------------------------------
