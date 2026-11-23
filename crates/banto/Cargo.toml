@@ -24,3 +24,13 @@ vt100 = { version = "0.16.9", package = "vt100-psmux" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 tempfile = "3"
 toml = "0.9.8"
+
+# `test = true`: an example's tests are skipped by `cargo test` unless it says so.
+[[example]]
+name = "inspect_input_capture"
+test = true
+
+[[example]]
+name = "ptydrv"
+path = "examples/ptydrv/main.rs"
+test = true
