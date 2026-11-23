@@ -211,6 +211,11 @@ worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
 # "auto"、100000..=1000000 の整数、または ""（フラグなし）。Director と Goinkyo には渡しません。
 # Codex はトークン数だけを受け付けます。"auto" では何も渡しません。
 worker_autocompact = 250000
+# 新しい Goinkyo のモデルと effort。作成時にだけ渡します。"" ならフラグを渡しません。
+# Fable と max は既定ではなく、選んで使うものです。Fable は一部のプランで使用クレジットに
+# 課金され、max は Claude が保存できないため再起動で外れます。
+goinkyo_model = "opus"           # Claude: --model
+goinkyo_effort = "xhigh"         # Claude: --effort (low | medium | high | xhigh | max)
 relay = "auto"      # "auto" | "manual" — 起こすための Nudge エンジン
 # Brigade のメッセージをすべて全文のまま <data dir>/logs/brigade-<id>.log に追記します。
 # このファイルには実際の会話内容が入り、ローテーションも削除もされません。コミットしないでください。

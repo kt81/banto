@@ -366,6 +366,11 @@ worker_effort_codex = "high"     # Codex: -c model_reasoning_effort
 # "auto", an integer 100000..=1000000, or "" (no flag). Directors and Goinkyo never get it.
 # Codex takes only a token count; "auto" gives it nothing.
 worker_autocompact = 250000
+# Model and effort of a NEW Goinkyo, passed only at creation. "" passes no flag.
+# Fable and max are opt-ins, not the built-ins: Fable bills usage credits on some
+# plans, and Claude cannot save max, so a restart drops it.
+goinkyo_model = "opus"           # Claude: --model
+goinkyo_effort = "xhigh"         # Claude: --effort (low | medium | high | xhigh | max)
 relay = "auto"      # "auto" | "manual" — the wake-up nudge engine
 # Append every brigade message, in full, to <data dir>/logs/brigade-<id>.log. The
 # file holds real conversation content and is never rotated or deleted: don't commit it.

@@ -254,15 +254,23 @@ pub struct BrigadeConfig {
     /// plus `{request}` (the consultation request file's path — see
     /// `crate::briefing::render`), and the same empty-string escape hatch.
     pub goinkyo_prompt: String,
-    /// `--model` a Goinkyo is created with, built-in `"fable"` (a family
+    /// `--model` a Goinkyo is created with, built-in `"opus"` (a family
     /// word, no version). Only when its session is first created, never on a
     /// resume — [`Self::worker_model`]'s doc says why. Same empty-string escape
     /// hatch. Claude only — a Goinkyo is always Claude (see
     /// [`Self::goinkyo_effort`]'s doc for why this build never gives it a Codex
     /// counterpart).
+    ///
+    /// `fable` is an opt-in, not the built-in: a Pro or standard Team seat pays
+    /// for Fable with usage credits and an interactive session asks consent
+    /// first, a prompt that waits with no expiry in a pane nobody is watching
+    /// (`docs/REQUIREMENTS.md`, "Decision (2026-11-23)").
     pub goinkyo_model: String,
-    /// `--effort <level>` a Goinkyo is created with, built-in `"max"`, on
-    /// creation only like the model above — Claude's own reasoning-effort flag (`claude --help`,
+    /// `--effort <level>` a Goinkyo is created with, built-in `"xhigh"`, on
+    /// creation only like the model above. `max` is an opt-in: it cannot be
+    /// saved to Claude's settings, so a resumed Goinkyo never has it again,
+    /// and a Goinkyo that ran on it was a quarter of this project's measured
+    /// usage (same decision entry). Claude's own reasoning-effort flag (`claude --help`,
     /// accepts `low`/`medium`/`high`/`xhigh`/`max`), not a general
     /// per-product setting: a Goinkyo is Claude-only in this build (see
     /// `AgentLaunch::Claude`'s own `effort` field), so there is no
@@ -514,8 +522,8 @@ impl Default for BrigadeConfig {
             director_prompt: DEFAULT_DIRECTOR_PROMPT.to_string(),
             worker_prompt: DEFAULT_WORKER_PROMPT.to_string(),
             goinkyo_prompt: DEFAULT_GOINKYO_PROMPT.to_string(),
-            goinkyo_model: "fable".to_string(),
-            goinkyo_effort: "max".to_string(),
+            goinkyo_model: "opus".to_string(),
+            goinkyo_effort: "xhigh".to_string(),
             goinkyo_permission_mode: "auto".to_string(),
             goinkyo_disallowed_tools: "Edit,Write,NotebookEdit".to_string(),
             goinkyo_consult: "design".to_string(),
@@ -1316,8 +1324,8 @@ mod tests {
         assert_eq!(brigade.worker_effort, "high");
         assert_eq!(brigade.worker_model_codex, "terra");
         assert_eq!(brigade.worker_effort_codex, "high");
-        assert_eq!(brigade.goinkyo_model, "fable");
-        assert_eq!(brigade.goinkyo_effort, "max");
+        assert_eq!(brigade.goinkyo_model, "opus");
+        assert_eq!(brigade.goinkyo_effort, "xhigh");
         // A pinned version is how a built-in goes stale (the Codex one named
         // a build that later stopped being the newest of its family): none of
         // the model words may carry a digit.
@@ -1716,8 +1724,8 @@ worker_effort_codex = \"\"
     fn brigade_goinkyo_model_effort_permission_mode_and_disallowed_tools_default_and_have_their_own_empty_escape_hatch()
      {
         let config = Config::default();
-        assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
-        assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
+        assert_eq!(config.brigade.goinkyo_model(), Some("opus"));
+        assert_eq!(config.brigade.goinkyo_effort(), Some("xhigh"));
         assert_eq!(config.brigade.goinkyo_permission_mode(), Some("auto"));
         assert_eq!(
             config.brigade.goinkyo_disallowed_tools(),
@@ -1750,8 +1758,8 @@ worker_effort_codex = \"\"
         // gets_the_default`: a file written before these fields existed
         // must keep loading with their own defaults, not an empty value.
         let config = parse("[brigade]\nworker_model = \"sonnet\"\n");
-        assert_eq!(config.brigade.goinkyo_model(), Some("fable"));
-        assert_eq!(config.brigade.goinkyo_effort(), Some("max"));
+        assert_eq!(config.brigade.goinkyo_model(), Some("opus"));
+        assert_eq!(config.brigade.goinkyo_effort(), Some("xhigh"));
         assert_eq!(config.brigade.goinkyo_permission_mode(), Some("auto"));
         assert_eq!(
             config.brigade.goinkyo_disallowed_tools(),

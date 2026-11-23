@@ -139,7 +139,7 @@ worker_model = "elsewhere"
 
     def test_the_built_in_defaults_when_there_is_no_file(self):
         expected, note = what_ran.load_expected(os.path.join(tempfile.gettempdir(), "no-such-measure-config.toml"))
-        self.assertEqual(expected, {"worker": ("sonnet", "high"), "goinkyo": ("fable", "max")})
+        self.assertEqual(expected, {"worker": ("sonnet", "high"), "goinkyo": ("opus", "xhigh")})
         self.assertIn("--config names a missing file", note)
         self.assertIn("banto would not start", note)
 
@@ -216,7 +216,7 @@ worker_model = "elsewhere"
         home = tempfile.mkdtemp(prefix="measure-home-")
         self.addCleanup(synth.rmtree, home)
         expected, note = what_ran.load_expected(None, env={}, home=home, platform="linux")
-        self.assertEqual(expected["goinkyo"], ("fable", "max"))
+        self.assertEqual(expected["goinkyo"], ("opus", "xhigh"))
         self.assertIn("no config.toml found", note)
 
     def test_expect_flags_replace_and_add_roles(self):
@@ -320,7 +320,7 @@ class WhatRanEndToEnd(unittest.TestCase):
 
     def test_the_config_decides_what_is_expected(self):
         with open(self.cfg, "w", encoding="utf-8") as fh:
-            fh.write('[brigade]\nworker_model = "haiku"\nworker_effort = ""\ngoinkyo_effort = ""\n')
+            fh.write('[brigade]\nworker_model = "haiku"\nworker_effort = ""\ngoinkyo_model = "fable"\ngoinkyo_effort = ""\n')
         _, stdout, _ = self.run_ledger()
         section = stdout.split("4. CONFIGURED VERSUS OBSERVED")[1].split("5. PRICE WHAT-IF")[0]
         flagged = [ln for ln in section.splitlines() if "DIFFERS" in ln]

@@ -32,8 +32,9 @@ _MIN_TS = datetime.min.replace(tzinfo=timezone.utc)
 # it no model or effort flag, so it starts on the operator's own Claude defaults and there is
 # nothing configured to compare it with. The values are applied when the session is first created
 # and never on a resume (the same file's docs), so a difference below is a fact about what ran, not
-# proof that banto launched it wrong.
-BUILT_IN = {"worker": ("sonnet", "high"), "goinkyo": ("fable", "max")}
+# proof that banto launched it wrong. A Goinkyo created before 2026-11-23 was launched on fable/max,
+# the built-in until then, so with no config.toml those sessions read as a difference.
+BUILT_IN = {"worker": ("sonnet", "high"), "goinkyo": ("opus", "xhigh")}
 CONFIG_KEYS = {"worker": ("worker_model", "worker_effort"), "goinkyo": ("goinkyo_model", "goinkyo_effort")}
 
 

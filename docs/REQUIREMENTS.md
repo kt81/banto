@@ -373,7 +373,9 @@ launch, a resume of an existing session included, from a default
    `/effort` or `/model` picker saves to his own Claude settings: what a session is
    on is then his to say, not banto's.
 3. **The built-ins name no version.** Claude Worker `sonnet` / `high`, Codex Worker
-   `terra` (the family) / `high`, Goinkyo `fable` / `max`; the Director gets nothing
+   `terra` (the family) / `high`, Goinkyo `opus` / `xhigh` (*superseded on
+   2026-11-23:* this item first said `fable` / `max`; "Decision (2026-11-23)"
+   below); the Director gets nothing
    (`BrigadeConfig` has no `director_*` setting: that session is the operator's own,
    started and restarted outside banto's control). *Why:* a version written into the
    code goes stale, as `gpt-5.6-terra` did when 6.1 came out. A test keeps a digit
@@ -435,9 +437,10 @@ are the role's, are still passed on every launch, a resume included.
 
 *Consequences, stated plainly.*
 
-- A Goinkyo resumed after a banto restart no longer gets `--effort max`: its effort
-  then comes from the operator's own Claude settings, as the session's model comes
-  from its transcript. The `max` it is created with lasts as long as the process.
+- A Goinkyo resumed after a banto restart no longer gets the `--effort` it was
+  created with (then `max`, built-in `xhigh` since 2026-11-23): its effort then
+  comes from the operator's own Claude settings, as the session's model comes from
+  its transcript. A level Claude cannot save, `max`, lasts as long as the process.
 - The picker's choice is used once and is not stored (only the agent is). A Worker
   whose process died before its session existed is created again from the configured
   defaults, not from what the picker once said.
@@ -810,6 +813,60 @@ written into recordings made from here on.
 on a running pane is recorded here (the status `shell` itself was measured on
 2026-11-13, "Data sources"). The widths at which the title row sheds are in the
 tests, not here.
+
+## Decision (2026-11-23): the Goinkyo's built-in is `opus` / `xhigh`, not `fable` / `max`
+
+Decision of the operator, 2026-11-23, after a Goinkyo design consultation about what
+the Goinkyo should run on. It supersedes the Goinkyo half of item 3 of "Decision
+(2026-11-14): a model and an effort are given only when a session is created"
+(Goinkyo `fable` / `max`); the Worker and Codex built-ins in that item stand, and so
+do items 1, 2 and 4. `goinkyo_model` and `goinkyo_effort` keep their meaning: given
+only when the Goinkyo's session is created, `""` passes no flag. Only the built-in
+values changed, and `fable` and `max` remain what a `config.toml` can ask for.
+
+*Why, by where each reason comes from.*
+
+- *Money, Fable.* claude.com/pricing says a Pro seat gets "Fable, paid with usage
+  credits". Claude Code's docs (model-config, "Fable and usage credits") say that on
+  some plans and seat tiers Fable bills to usage credits, that an interactive
+  session shows a consent prompt first, and that after the user continues once the
+  prompt is not shown again. The same page gives an expiry (`dialogExpiry`, five
+  minutes by default) for Remote Control, background, teammate and Agent SDK
+  sessions and none for an interactive terminal session, which a banto pane is. So
+  an unattended Goinkyo on Fable can sit on a question about money with nothing to
+  end it, and once someone answers, every later Goinkyo spends credits without
+  asking. The expiry-less wait is read from that omission, not observed in a pane.
+- *Cost, `max`.* Measured on this machine from the transcripts with
+  `tools/measure`: 25 consultations since 2026-11-10; the median Goinkyo took 15.2
+  minutes to its first `send_to_peer`, made 31 calls and wrote 80k output tokens;
+  it was 26% of this project's usage under that tool's assumed weights (Fable's 4
+  among them, "not verified" in `tools/measure/README.md`), and over 50% on
+  2026-11-17, 2026-11-18 and 2026-11-22. Claude Code's docs say of `max` that it "may
+  show diminishing returns and is prone to overthinking".
+- *`max` does not last.* It cannot be saved to Claude's settings, so a Goinkyo
+  resumed after a banto restart is on whatever level the operator's settings hold
+  for its model, never `max` (the consequences of 2026-11-14, below). The built-in
+  named a level that held for one process only.
+- *`opus` is what a paid plan runs.* model-config: "Pro, Max, Ultra, Team,
+  Enterprise, and Anthropic API: defaults to Opus 5.5". `xhigh` is one level below
+  `max` and above Claude's default effort (`medium`), and unlike `max` Claude can
+  save it.
+
+**The rule this records:** *a built-in names what every paid plan of the product
+includes and runs by default, at an effort above the product's default and below its
+extreme; Fable, `max` and the other product are opt-ins in `config.toml`.* The Worker
+built-in, `sonnet` / `high`, already obeyed it. A built-in that stops obeying it is
+a decision to record here, not a value to change in the code.
+
+*Consequences.*
+
+- A Goinkyo created from now on is `--model opus --effort xhigh`. One that already
+  has a session keeps what its own record says (nothing is passed on a resume).
+- Whoever wants the earlier behaviour writes `goinkyo_model = "fable"` and
+  `goinkyo_effort = "max"` under `[brigade]`; the README's configuration example names
+  both keys.
+- `tools/measure/what_ran.py` keeps its own copy of the built-ins, which no test
+  compares with `BrigadeConfig::default`; it was changed in the same commit.
 
 ## Data sources (measured 2026-07-19, Claude Code 2.1.215)
 
@@ -2541,7 +2598,7 @@ reopens through (`stage_brigade`) — `--permission-mode` and
 "who's here to click 'allow'" and "what may this role attempt", not "what should
 this session think with"; `--model` and `--effort` do not (2026-11-14: a session
 keeps what it last used, so a Goinkyo reopened after a restart is on its own
-model and the effort from the operator's Claude settings, no longer `max`;
+model and the effort from the operator's Claude settings, not the creation flag;
 "Decision (2026-11-14)"). A Goinkyo that was never discovered
 (its pane died before it had a session id) does *not* reopen through that
 path — `stage_brigade`'s undiscovered-member branch is Worker-only — but
@@ -2911,8 +2968,8 @@ pub struct BrigadeConfig {
     pub goinkyo_consult: String,    // how readily a Director consults the Goinkyo: "off" | "disputes" | "design" | "decisions"; default "design"; "" = no paragraph — see "Role briefings" below
     pub worker_prompt: String,      // role briefing template for each Worker
     pub goinkyo_prompt: String,     // role briefing template for a Goinkyo; also substitutes {request}
-    pub goinkyo_model: String,      // --model for a NEW Goinkyo only; "" = no flag; default "fable"; Claude only
-    pub goinkyo_effort: String,     // --effort for a NEW Goinkyo only; "" = no flag; default "max"; Claude only
+    pub goinkyo_model: String,      // --model for a NEW Goinkyo only; "" = no flag; default "opus"; Claude only
+    pub goinkyo_effort: String,     // --effort for a NEW Goinkyo only; "" = no flag; default "xhigh"; Claude only
     pub goinkyo_permission_mode: String, // --permission-mode for an auto-spawned Goinkyo; "" = no flag; default "auto"; Claude only
     pub goinkyo_disallowed_tools: String, // --disallowedTools for an auto-spawned Goinkyo; "" = no flag; default "Edit,Write,NotebookEdit"; Claude only
     pub message_log: bool,          // append every brigade message to a plain-text file under banto's data dir (see "Message log" below); default false
@@ -2927,7 +2984,7 @@ Claude and `worker_model_codex`/`worker_effort_codex` for Codex, independent of 
 other, since the two products don't share a model namespace or an effort vocabulary:
 one shared field could never default sensibly for both at once. A key absent from
 the file is banto's built-in for that key alone (the built-ins name no version:
-`sonnet`/`high`, `terra`/`high`, and the Goinkyo's `fable`/`max`); every model and
+`sonnet`/`high`, `terra`/`high`, and the Goinkyo's `opus`/`xhigh`); every model and
 effort value is trimmed (`config::flag_value`, the one rule for the file, the
 built-ins, the picker, either product's Worker and the Goinkyo alike): empty or only
 spaces passes no flag, so a new member starts on the operator's own default for that
