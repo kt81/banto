@@ -34,10 +34,9 @@
 //! `Config.agents` gates which products get discovered at all — resolved
 //! once here via `banto_core::config::resolve_agents` into `resolved_agents`
 //! and passed down to every entry point, since `session::discover_all` (not
-//! any of these) is what actually decides which provider runs.
-//! `ResolvedAgents::ignored` is where a name banto didn't recognize ends up;
-//! `embedded::run_emporium` is what tells the operator about it, once, at
-//! startup — see `session::agents_ignored_notice`.
+//! any of these) is what actually decides which provider runs. A name in
+//! `agents` that is not a product never gets this far: the config refuses it
+//! when it is read.
 
 mod briefing;
 mod build_info;
@@ -90,9 +89,10 @@ struct Cli {
     codex_home: Option<PathBuf>,
 
     /// Explicit path to banto's own config.toml. Takes priority over
-    /// $BANTO_CONFIG and the XDG/~/.config/platform-default search — and
-    /// unlike those, the file must exist and parse (a bad path is a
-    /// startup error, not a silent fallback to defaults).
+    /// $BANTO_CONFIG and the XDG/~/.config/platform-default search. Every
+    /// config file must parse or banto does not start; this one must also
+    /// exist (a bad path is a startup error, not a silent fallback to
+    /// defaults), where a file banto looks for itself may be absent.
     #[arg(
         long,
         global = true,
@@ -192,6 +192,27 @@ impl Cli {
     }
 }
 
+/// What `main` does when resolving the locations failed because of a config
+/// file that is there and unusable.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigStop {
+    /// Print this to stderr and exit 1, before any terminal mode is touched.
+    Exit(String),
+    /// A `_mcp` process: answer through the refusing server, so the agent that
+    /// started it reads why instead of seeing a server that failed to start.
+    Serve(String),
+}
+
+/// `None` for any other failure, which `main` returns as it always did.
+fn config_stop(error: &anyhow::Error, is_mcp: bool) -> Option<ConfigStop> {
+    let error = error.downcast_ref::<banto_io::config::ConfigError>()?;
+    Some(if is_mcp {
+        ConfigStop::Serve(startup::mcp_refusal_message(error))
+    } else {
+        ConfigStop::Exit(startup::refusal_message(error))
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Err(message) = cli.check_hand_off_flags() {
@@ -223,7 +244,22 @@ fn main() -> Result<()> {
         // paths as they were given, as before.
         cwd: std::env::current_dir().ok(),
     };
-    let (config, resolved) = startup::resolve(&inputs, startup::Strictness::Strict)?;
+    // The first thing that can fail, and long before raw mode or the alternate
+    // screen: a refusal here lands on an ordinary terminal.
+    let (config, resolved) = match startup::resolve(&inputs, startup::Strictness::Strict) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let is_mcp = matches!(cli.command, Some(Command::Mcp { .. }));
+            return match config_stop(&error, is_mcp) {
+                Some(ConfigStop::Serve(message)) => mcp::run_refusing_server(&message),
+                Some(ConfigStop::Exit(message)) => {
+                    eprintln!("{message}");
+                    std::process::exit(1);
+                }
+                None => Err(error),
+            };
+        }
+    };
 
     let resolved_agents = banto_core::config::resolve_agents(&config.agents);
 
@@ -488,6 +524,33 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn broken_config_error(text: &str) -> anyhow::Error {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        anyhow::Error::new(banto_io::config::load(&path).unwrap_err())
+            .context("failed to load config file")
+    }
+
+    #[test]
+    fn a_broken_config_stops_the_ui_with_a_message_and_a_child_mcp_with_a_refusal() {
+        let error = broken_config_error("agents = [not toml");
+        assert!(matches!(
+            config_stop(&error, false),
+            Some(ConfigStop::Exit(message)) if message.starts_with("banto: config file ")
+        ));
+        // `_mcp` is answered, not exited: the agent reads the words.
+        assert!(matches!(
+            config_stop(&error, true),
+            Some(ConfigStop::Serve(message))
+                if message.contains("reconnect banto's MCP server (Claude: /mcp)")
+                    && message.contains("restart the member")
+        ));
+        // Anything else is not this function's to word.
+        assert_eq!(config_stop(&anyhow::anyhow!("something else"), true), None);
+        assert_eq!(config_stop(&anyhow::anyhow!("something else"), false), None);
+    }
 
     #[test]
     fn formats_release_time_as_an_iso_utc_timestamp() {

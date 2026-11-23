@@ -4,12 +4,11 @@
 //! command-string trust mechanism this reads).
 //!
 //! Read-only, same as every other access under a product home: banto never
-//! writes to `~/.codex` (invariant 1). A separate `banto codex-trust`
-//! subcommand is what actually earns trust, by running the hook once under
-//! Codex's own supervision; this module only reports whether that step
-//! looks like it has already happened, so the operator can be told "this
-//! looks unprimed" instead of finding out only when a briefing silently
-//! never arrives.
+//! writes to `~/.codex` (invariant 1). What earns trust is Codex's own
+//! prompt, answered once by the operator (`crates/banto/src/codex_trust.rs`
+//! explains how banto asks); this module only reports whether that step looks like it has
+//! already happened, so the operator can be told "this looks unprimed"
+//! instead of finding out only when a briefing silently never arrives.
 //!
 //! # Why this can only ever be a hint, never a guarantee
 //!
@@ -45,8 +44,8 @@ pub enum HookTrustState {
     NotPrimed,
     /// Nothing could be determined — the file doesn't exist, couldn't be
     /// read, or isn't valid TOML. Deliberately not an error: a caller
-    /// prompting the operator to run `banto codex-trust` treats this the
-    /// same as [`Self::NotPrimed`] (offer it), it just can't say why.
+    /// asking the operator to approve the hook treats this the same as
+    /// [`Self::NotPrimed`] (ask), it just can't say why.
     Unknown,
 }
 

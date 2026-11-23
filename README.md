@@ -332,11 +332,14 @@ title row. That row also shows the agent and whether it is **busy**, **waiting**
 
 ## Configuration
 
-`config.toml` is optional; missing or broken config falls back to defaults. The
-first hit wins: `--config <path>` or `$BANTO_CONFIG` (both must exist and parse, or
-startup fails), then `$XDG_CONFIG_HOME/banto/config.toml` and
-`~/.config/banto/config.toml` when they exist, then the default
-`dirs::config_dir()/banto/config.toml` (`%APPDATA%\banto\` on Windows).
+`config.toml` is optional, and a missing one means defaults. A file that is there
+must parse (valid TOML, and a known key given a value of the right type that it
+takes: `relay = "typo"` is refused like `relay = 5`), or banto prints the error,
+with its line and column, and does not start; unknown keys are ignored. The first hit wins:
+`--config <path>` or `$BANTO_CONFIG` (both must also exist), then
+`$XDG_CONFIG_HOME/banto/config.toml` and `~/.config/banto/config.toml` when they
+exist, then the default `dirs::config_dir()/banto/config.toml` (`%APPDATA%\banto\`
+on Windows).
 
 ```toml
 claude_home = "C:/Users/you/.claude"   # optional override

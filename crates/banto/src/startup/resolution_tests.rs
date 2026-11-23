@@ -187,19 +187,6 @@ fn what_a_parent_handed_over_beats_the_search_and_the_environment() {
 }
 
 #[test]
-fn a_parents_config_is_loaded_as_the_parent_loaded_it_even_when_it_does_not_parse() {
-    // The parent started with it (a discovered file that is broken is the
-    // defaults, not a failure); the child must not fail where the parent did not.
-    let m = Machine::new();
-    let broken = m.write("broken.toml", "this is not toml [");
-    let mut inputs = m.inputs();
-    inputs.parent_config = Some(broken.clone());
-    let (config, r) = resolve(&inputs, Strictness::Strict).unwrap();
-    assert_eq!(config, Config::default());
-    assert_eq!(r.config_file, ConfigFile::File(broken));
-}
-
-#[test]
 fn a_child_started_without_the_hand_off_resolves_for_itself_as_before() {
     let m = Machine::new();
     // A hand-run `banto _mcp`, or an MCP config an older banto wrote: no flags.
@@ -956,4 +943,289 @@ fn the_one_ui_starts_without_a_flag_and_the_old_flags_are_accepted_and_hidden() 
         assert!(!help.contains(word), "`{word}` is advertised:\n{help}");
     }
     assert!(Cli::try_parse_from(["banto", "_wrap", "--session", "s", "--", "claude"]).is_err());
+}
+
+// A config file that is there but cannot be used stops banto instead of silently
+// becoming the defaults. Only the explicit overrides refused before; a file banto
+// found for itself must now be just as sound, though a missing one is still
+// normal.
+
+fn config_error_of(inputs: &Inputs) -> Option<io_config::ConfigError> {
+    let error = resolve(inputs, Strictness::Strict).err()?;
+    error.downcast::<io_config::ConfigError>().ok()
+}
+
+/// The three places banto looks for itself, each as the one config file there is.
+fn each_discovered_place() -> Vec<(&'static str, Machine, Inputs, PathBuf)> {
+    let mut places = Vec::new();
+    for place in ["xdg", "home", "platform"] {
+        let m = Machine::new();
+        let mut inputs = m.inputs();
+        let path = match place {
+            "xdg" => {
+                inputs.env.xdg_config_home = Some(m.path("xdg"));
+                m.path("xdg/banto/config.toml")
+            }
+            "home" => m.path("home/.config/banto/config.toml"),
+            _ => m.path("platform/config.toml"),
+        };
+        places.push((place, m, inputs, path));
+    }
+    places
+}
+
+#[test]
+fn a_discovered_config_with_a_syntax_error_stops_banto() {
+    for (place, m, inputs, path) in each_discovered_place() {
+        m.write(
+            path.strip_prefix(&m.root).unwrap().to_str().unwrap(),
+            "agents = [not toml",
+        );
+        let error = config_error_of(&inputs);
+        assert!(
+            matches!(&error, Some(io_config::ConfigError::Parse { path: at, .. }) if *at == path),
+            "{place}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_discovered_config_with_a_known_key_of_the_wrong_type_stops_banto() {
+    for (place, m, inputs, path) in each_discovered_place() {
+        m.write(
+            path.strip_prefix(&m.root).unwrap().to_str().unwrap(),
+            "claude_home = 5\n",
+        );
+        let error = config_error_of(&inputs);
+        assert!(
+            matches!(&error, Some(io_config::ConfigError::Parse { .. })),
+            "{place}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn a_discovered_config_that_cannot_be_read_stops_banto() {
+    // A directory where the file should be, and bytes that are not UTF-8: both
+    // exist and neither is "no config".
+    for (place, m, inputs, path) in each_discovered_place() {
+        std::fs::create_dir_all(&path).unwrap();
+        let error = config_error_of(&inputs);
+        assert!(
+            matches!(&error, Some(io_config::ConfigError::Read { .. })),
+            "{place} (a directory): {error:?}"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0xc3, 0x28]).unwrap();
+        let error = config_error_of(&inputs);
+        assert!(
+            matches!(&error, Some(io_config::ConfigError::Read { .. })),
+            "{place} (not UTF-8): {error:?}"
+        );
+        drop(m);
+    }
+}
+
+#[test]
+fn a_missing_discovered_or_default_config_is_still_the_defaults() {
+    for (place, _m, inputs, path) in each_discovered_place() {
+        assert!(!path.exists());
+        let (config, resolved) = resolve(&inputs, Strictness::Strict).unwrap();
+        assert_eq!(config, Config::default(), "{place}");
+        assert!(
+            matches!(resolved.config_file, ConfigFile::File(_)),
+            "{place}"
+        );
+    }
+}
+
+#[test]
+fn unknown_keys_and_tables_in_a_discovered_config_still_load() {
+    for (place, m, inputs, path) in each_discovered_place() {
+        m.write(
+            path.strip_prefix(&m.root).unwrap().to_str().unwrap(),
+            "no_such_key = 1\n[brigade]\nworkers = 3\nno_such = true\n[no_such_table]\nx = 1\n",
+        );
+        let (config, _) = resolve(&inputs, Strictness::Strict).unwrap();
+        assert_eq!(config.brigade.workers, 3, "{place}");
+    }
+}
+
+#[test]
+fn a_known_key_with_a_value_it_does_not_take_stops_banto_wherever_the_file_is() {
+    for (place, m, inputs, path) in each_discovered_place() {
+        m.write(
+            path.strip_prefix(&m.root).unwrap().to_str().unwrap(),
+            "[brigade]\nworkers = 3\nworker_agent = \"typo\"\n",
+        );
+        assert!(
+            matches!(
+                config_error_of(&inputs),
+                Some(io_config::ConfigError::Parse { .. })
+            ),
+            "{place}"
+        );
+        // The hook reads leniently: a typo costs it the file, not the operator's agent.
+        let (config, _) = resolve(&inputs, Strictness::Lenient).unwrap();
+        assert_eq!(config, Config::default(), "{place}");
+    }
+}
+
+#[test]
+fn an_explicit_config_with_a_value_it_does_not_take_is_refused_too() {
+    let m = Machine::new();
+    let path = m.write("typo.toml", "[brigade]\nrelay = \"typo\"\n");
+    let mut inputs = m.inputs();
+    inputs.cli_config = Some(path);
+    assert!(matches!(
+        config_error_of(&inputs),
+        Some(io_config::ConfigError::Parse { .. })
+    ));
+}
+
+#[test]
+fn an_explicit_config_still_refuses_what_it_refused_and_the_lenient_hook_still_does_not() {
+    let m = Machine::new();
+    for (name, text) in [
+        ("syntax", "agents = [not toml"),
+        ("type", "claude_home = 5\n"),
+    ] {
+        let path = m.write(&format!("{name}.toml"), text);
+        for from_flag in [true, false] {
+            let mut inputs = m.inputs();
+            if from_flag {
+                inputs.cli_config = Some(path.clone());
+            } else {
+                inputs.env.banto_config = Some(path.clone());
+            }
+            assert!(
+                matches!(
+                    config_error_of(&inputs),
+                    Some(io_config::ConfigError::Parse { .. })
+                ),
+                "{name} {from_flag}"
+            );
+            let (config, _) = resolve(&inputs, Strictness::Lenient).unwrap();
+            assert_eq!(config, Config::default(), "{name} {from_flag}");
+        }
+    }
+}
+
+#[test]
+fn the_lenient_hook_never_refuses_a_discovered_config() {
+    for (place, m, inputs, path) in each_discovered_place() {
+        m.write(
+            path.strip_prefix(&m.root).unwrap().to_str().unwrap(),
+            "agents = [not toml",
+        );
+        let (config, _) = resolve(&inputs, Strictness::Lenient).unwrap();
+        assert_eq!(config, Config::default(), "{place}");
+    }
+}
+
+#[test]
+fn a_parents_config_that_does_not_parse_stops_the_strict_child_but_not_the_hook() {
+    let m = Machine::new();
+    let broken = m.write("broken.toml", "this is not toml [");
+    let mut inputs = m.inputs();
+    inputs.parent_config = Some(broken.clone());
+    let error = config_error_of(&inputs);
+    assert!(
+        matches!(&error, Some(io_config::ConfigError::Parse { path, .. }) if *path == broken),
+        "{error:?}"
+    );
+    // The hook reads it leniently: it must never fail the operator's own agent.
+    let (config, r) = resolve(&inputs, Strictness::Lenient).unwrap();
+    assert_eq!(config, Config::default());
+    assert_eq!(r.config_file, ConfigFile::File(broken));
+}
+
+#[test]
+fn a_parents_config_that_is_not_there_is_the_defaults_because_a_parent_hands_over_a_default_path_that_may_not_exist()
+ {
+    // `Resolved::child_args` passes `--parent-config` for the platform default
+    // whether or not the file exists (`ConfigFile::File` "may not exist"): a
+    // machine with no config.toml at all is the ordinary case, and its `_mcp`
+    // children must start.
+    let m = Machine::new();
+    let parent = resolved(&m.inputs());
+    assert_eq!(
+        parent.config_file,
+        ConfigFile::File(m.path("platform/config.toml"))
+    );
+    assert!(!m.path("platform/config.toml").exists());
+    let mut child = m.inputs();
+    child.parent_config = Some(m.path("platform/config.toml"));
+    let (config, _) = resolve(&child, Strictness::Strict).unwrap();
+    assert_eq!(config, Config::default());
+}
+
+/// What the operator reads when `text` is the config file: the message, with the
+/// file's path shown as `<FILE>`. The path is not what is pinned (a Windows one
+/// must show single backslashes, which `a_refusal_names_the_path_as_it_is_spelled`
+/// checks); the words around `toml`'s own text are, so a `toml` upgrade that
+/// rewords it is noticed here rather than by an operator.
+fn refusal_for(text: &str) -> String {
+    let m = Machine::new();
+    let path = m.write("platform/config.toml", text);
+    let error = config_error_of(&m.inputs()).unwrap();
+    assert_eq!(error.path(), path);
+    refusal_message(&error).replace(&path.display().to_string(), "<FILE>")
+}
+
+#[test]
+fn the_refusal_for_a_syntax_error_has_this_shape() {
+    assert_eq!(
+        refusal_for("agents = \"codex\"\n[brigade\nworkers = 3\n"),
+        "banto: config file <FILE> could not be used:\n\
+         TOML parse error at line 2, column 9\n  |\n2 | [brigade\n  |         ^\n\
+         unclosed table, expected `]`\n\
+         banto did not start. Fix the file and run banto again."
+    );
+}
+
+#[test]
+fn the_refusal_for_a_known_key_of_the_wrong_type_has_this_shape() {
+    assert_eq!(
+        refusal_for("agents = \"codex\"\nclaude_home = 5\n"),
+        "banto: config file <FILE> could not be used:\n\
+         TOML parse error at line 2, column 15\n  |\n2 | claude_home = 5\n  |               ^\n\
+         invalid type: integer `5`, expected path string\n\
+         banto did not start. Fix the file and run banto again."
+    );
+}
+
+#[test]
+fn the_refusal_for_a_value_a_key_does_not_take_has_this_shape() {
+    assert_eq!(
+        refusal_for("agents = \"codex\"\n[brigade]\nworker_agent = \"claud\"\n"),
+        "banto: config file <FILE> could not be used:\n\
+         TOML parse error at line 3, column 16\n  |\n3 | worker_agent = \"claud\"\n  |                ^^^^^^^\n\
+         `worker_agent` does not take \"claud\"; it takes \"inherit\", \"claude\", \"codex\" or \"select\"\n\
+         banto did not start. Fix the file and run banto again."
+    );
+}
+
+#[test]
+fn a_refusal_names_the_path_as_it_is_spelled_and_a_read_error_names_the_io_error() {
+    let m = Machine::new();
+    let path = m.write("platform/config.toml", "");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let error = config_error_of(&m.inputs()).unwrap();
+    let message = refusal_message(&error);
+    assert!(
+        message.starts_with(&format!(
+            "banto: config file {} could not be used:\n",
+            path.display()
+        )),
+        "{message}"
+    );
+    // Not the `{:?}` spelling, which doubles every backslash.
+    assert!(
+        !message.contains(&format!("{path:?}")) || !cfg!(windows),
+        "{message}"
+    );
+    assert!(message.contains(&error.reason()), "{message}");
+    assert!(message.ends_with("banto did not start. Fix the file and run banto again."));
 }

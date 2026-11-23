@@ -10,15 +10,20 @@
 //! never in an agent's home — which is why `banto::startup` refuses a data
 //! directory or database path inside one.
 //!
-//! Loading is tolerant by default: a missing file means all defaults,
-//! unknown keys are ignored. A malformed file is an error only for the
-//! strict [`load`]; normal startup goes through [`load_or_default`], which
-//! falls back to the defaults so a broken config never prevents the TUI
-//! from starting (use [`load`] when the error should be surfaced, e.g. for
-//! a diagnostics subcommand). The two explicit overrides are stricter still
-//! — see [`load_explicit`]: a missing file is *also* an error there, since
-//! silently falling back would hide a typo in a path the operator named on
-//! purpose.
+//! A file that is there must be usable. Only a *missing* file is normal, and
+//! means all defaults; one that cannot be read, is not valid TOML, or gives a
+//! known key a value of the wrong TOML type, or a string that is not one of the
+//! words that key takes, is an error ([`load`]), and normal startup stops on
+//! it: falling back to the defaults would run the operator's agents on settings
+//! they did not choose, with nothing to show that their file was never read.
+//! Which words a key takes is `banto_core::config`'s, whose deserializers give
+//! `toml` the error to report with its line and column; unknown keys are the
+//! one thing left ignored. The two explicit overrides differ in one respect only — see
+//! [`load_explicit`]: a missing file is *also* an error there, since a typo in a
+//! path the operator named on purpose would otherwise go unnoticed.
+//! [`load_or_default`] is the one tolerant load, kept for the `_hook` process,
+//! which runs inside the operator's own agent and must never fail it over
+//! banto's configuration.
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +36,9 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("banto").join("config.toml"))
 }
 
-/// Errors from the strict [`load`] and [`load_explicit`].
+/// Errors from the strict [`load`] and [`load_explicit`]. Its `Display` spells
+/// the path with `{:?}`; to show one to the operator use [`ConfigError::path`]
+/// and [`ConfigError::reason`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The file does not exist. Only [`load_explicit`] treats this as an
@@ -52,6 +59,29 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+}
+
+impl ConfigError {
+    /// The file the error is about.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Missing { path } | Self::Read { path, .. } | Self::Parse { path, .. } => path,
+        }
+    }
+
+    /// Why the file could not be used, as the failing layer words it and without
+    /// the path (the `Display` of this error spells the path with `{:?}`, which
+    /// doubles every backslash of a Windows path; a caller that shows the path
+    /// itself uses [`Self::path`] and this). A parse error is `toml`'s own text:
+    /// line, column, the offending line and what was expected, which is why it
+    /// is not paraphrased here.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Missing { .. } => "the file does not exist".to_string(),
+            Self::Read { source, .. } => source.to_string(),
+            Self::Parse { source, .. } => source.to_string().trim_end().to_string(),
+        }
+    }
 }
 
 /// Reads and parses `path`, distinguishing "file does not exist" (`Ok(None)`)
@@ -76,7 +106,8 @@ fn read_and_parse(path: &Path) -> Result<Option<Config>, ConfigError> {
     Ok(Some(config))
 }
 
-/// Strict load. A missing file yields all defaults (running without a config
+/// Strict load, for a file banto found for itself (or one a parent banto
+/// handed down). A missing file yields all defaults (running without a config
 /// file is normal), but an unreadable or unparsable file is an error.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     Ok(read_and_parse(path)?.unwrap_or_default())
@@ -91,8 +122,10 @@ pub fn load_explicit(path: &Path) -> Result<Config, ConfigError> {
     })
 }
 
-/// Tolerant load for normal startup: any read or parse failure silently falls
-/// back to the defaults. See the module docs for the rationale.
+/// Tolerant load: any read or parse failure silently falls back to the
+/// defaults. Only the `_hook` process uses it (`startup::Strictness::Lenient`);
+/// every other process refuses a file that is there and unusable. See the module
+/// docs.
 pub fn load_or_default(path: &Path) -> Config {
     load(path).unwrap_or_default()
 }
@@ -105,8 +138,9 @@ pub enum ConfigSource {
     /// must exist and parse — load with [`load_explicit`].
     Explicit(PathBuf),
     /// `$XDG_CONFIG_HOME/banto/config.toml` or `~/.config/banto/config.toml`,
-    /// found by existence probing. Loaded leniently, like the platform
-    /// default — only the two explicit overrides above are strict.
+    /// found by existence probing. Loaded with [`load`], like the platform
+    /// default: the file must be usable, though not even there is fine for
+    /// the default (the explicit overrides alone must exist).
     Discovered(PathBuf),
     /// `dirs::config_dir()/banto/config.toml`, the final, unconditional
     /// fallback. `None` only when the platform has no config dir at all.
@@ -123,7 +157,8 @@ pub enum ConfigSource {
 /// 4. `~/.config/banto/config.toml` (`home`-based), on every platform, if it
 ///    exists.
 /// 5. `default_path` (what [`default_config_path`] returns), unconditionally:
-///    a missing or broken file there just means defaults.
+///    a missing file there just means defaults (a broken one is an error, as
+///    for every file found on the way).
 ///
 /// Takes every input, the final tier's path included, as a parameter rather
 /// than reading it itself, so this stays a pure function of its arguments and

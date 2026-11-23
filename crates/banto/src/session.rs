@@ -9,7 +9,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
-use banto_core::config::{ActivityConfig, BrigadeConfig, ResolvedAgents};
+use banto_core::config::ActivityConfig;
 use banto_core::consultation;
 pub use banto_core::model::SessionRow;
 use banto_core::model::{Activity, AgeBucket, AgentKind, SessionMeta};
@@ -52,104 +52,15 @@ pub fn activity_tag(activity: Activity) -> &'static str {
     }
 }
 
-/// The startup notice for `Config.agents`, when [`resolve_agents`] had to
-/// ignore part of it — `None` when every name parsed cleanly (including the
-/// ordinary `all`/unset case, which never has anything to ignore). Shared
-/// by `crate::embedded::run_emporium`, the entry point with a status line to
-/// put this in; the `list` subcommand has no such line and doesn't call this.
-///
-/// Fires for a partial drop too, not only the total fallback: even when
-/// some names were recognized and the setting still did something real, a
-/// silently-dropped name is still a typo the operator would want to know
-/// about — `ResolvedAgents::fell_back_to_all` only changes the wording
-/// (naming what's still in effect vs. saying the setting did nothing at
-/// all), not whether the notice appears.
-///
-/// [`resolve_agents`]: banto_core::config::resolve_agents
-pub fn agents_ignored_notice(resolved: &ResolvedAgents) -> Option<String> {
-    if resolved.ignored.is_empty() {
-        return None;
-    }
-    let names = resolved.ignored.join(", ");
-    Some(if resolved.fell_back_to_all {
-        format!("agents: no recognized name in \"{names}\" — showing every product")
-    } else {
-        let kept = resolved
-            .enabled
-            .iter()
-            .map(|kind| kind.label())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("agents: ignored unknown name(s) \"{names}\" — showing {kept}")
-    })
-}
-
-/// How much of a rejected `worker_autocompact` or `goinkyo_consult` the notice
-/// quotes. Enough to recognise a typo, few enough that a pasted blob cannot push
-/// the rule far off the line. Capped, the rule in parentheses can still be clipped on a narrow
-/// terminal; that is accepted because "ignored" and the start of the value come
-/// first.
-const SHOWN_CHARS: usize = 24;
-
-/// The startup notice for `[brigade] worker_autocompact`, when it is set to
-/// something neither product takes, so Workers launch without it. `None` for a
-/// valid value and for the empty string alone: the operator who wrote nothing
-/// asked for no window and needs no telling. Without this a typo is silent, and
-/// the operator's own agent settings decide where a Worker compacts, which is
-/// the thing the setting exists to override. It names no flag: Claude and Codex
-/// each take the value in their own way.
-///
-/// The value is quoted with `{:?}`, so a newline, a tab or an escape sequence
-/// in it shows as text instead of breaking the one-line status it is drawn on.
-pub fn autocompact_ignored_notice(brigade: &BrigadeConfig) -> Option<String> {
-    let shown = shown_value(brigade.worker_autocompact_ignored()?);
-    Some(format!(
-        "worker_autocompact: ignored {shown:?} (not auto or 100000-1000000)"
-    ))
-}
-
-/// The startup notice for `[brigade] goinkyo_consult`, when it is set to
-/// something that is not a level. The Director is then briefed at the default
-/// level, which is not what an operator who mistyped `"decision"` meant to
-/// pick, and without the notice the typo is silent. `None` for a level and for
-/// the empty string, which is the policy text turned off on purpose.
-pub fn goinkyo_consult_ignored_notice(brigade: &BrigadeConfig) -> Option<String> {
-    let shown = shown_value(brigade.goinkyo_consult_ignored()?);
-    Some(format!(
-        "goinkyo_consult: ignored {shown:?} (not off, disputes, design or decisions) \u{2014} using design"
-    ))
-}
-
-/// A rejected setting as a notice quotes it: capped, with an ellipsis when cut.
-/// The caller formats it with `{:?}`, so control characters show as text.
-fn shown_value(written: &str) -> String {
-    let mut shown: String = written.chars().take(SHOWN_CHARS).collect();
-    if written.chars().count() > SHOWN_CHARS {
-        shown.push('\u{2026}');
-    }
-    shown
-}
-
 /// Every notice the status line carries at startup, in the order it carries
 /// them: `trust_notice` (already decided, since it needs the store and the
-/// agent's own home), `database_notices` (decided at startup, where the
-/// locations were resolved and the database claimed), then what
-/// config was ignored. Pulled out of
-/// `crate::embedded::run` so that a notice dropped from the line is a failing
-/// test rather than a silent one.
-pub fn startup_notices(
-    trust_notice: Option<String>,
-    database_notices: Vec<String>,
-    resolved_agents: &ResolvedAgents,
-    brigade: &BrigadeConfig,
-) -> Vec<String> {
-    trust_notice
-        .into_iter()
-        .chain(database_notices)
-        .chain(agents_ignored_notice(resolved_agents))
-        .chain(autocompact_ignored_notice(brigade))
-        .chain(goinkyo_consult_ignored_notice(brigade))
-        .collect()
+/// agent's own home), then `database_notices` (decided at startup, where the
+/// locations were resolved and the database claimed). A config value banto
+/// cannot use is not one of them: it stops the start instead
+/// (`crate::startup`). Pulled out of `crate::embedded::run` so that a notice
+/// dropped from the line is a failing test rather than a silent one.
+pub fn startup_notices(trust_notice: Option<String>, database_notices: Vec<String>) -> Vec<String> {
+    trust_notice.into_iter().chain(database_notices).collect()
 }
 
 /// Status-line notice telling the operator that Codex has not been asked to
@@ -663,234 +574,18 @@ mod tests {
         }
     }
 
-    // -- agents_ignored_notice -------------------------------------------
-
-    #[test]
-    fn agents_ignored_notice_is_none_when_nothing_was_ignored() {
-        assert_eq!(
-            agents_ignored_notice(&banto_core::config::resolve_agents("")),
-            None
-        );
-        assert_eq!(
-            agents_ignored_notice(&banto_core::config::resolve_agents("all")),
-            None
-        );
-        assert_eq!(
-            agents_ignored_notice(&banto_core::config::resolve_agents("claude,codex")),
-            None
-        );
-    }
-
-    #[test]
-    fn agents_ignored_notice_names_the_dropped_name_and_what_survived() {
-        let resolved = banto_core::config::resolve_agents("claude,made-up-product");
-        let notice = agents_ignored_notice(&resolved).unwrap();
-        assert!(notice.contains("made-up-product"), "{notice}");
-        assert!(notice.contains("Claude"), "{notice}");
-        // A partial drop, not a total one — must not claim the fallback.
-        assert!(!notice.contains("every product"), "{notice}");
-    }
-
-    #[test]
-    fn agents_ignored_notice_says_it_fell_back_when_nothing_was_recognized() {
-        let resolved = banto_core::config::resolve_agents("made-up-product");
-        let notice = agents_ignored_notice(&resolved).unwrap();
-        assert!(notice.contains("made-up-product"), "{notice}");
-        assert!(notice.contains("every product"), "{notice}");
-    }
-
-    // -- autocompact_ignored_notice ---------------------------------------
-
-    fn brigade_with_autocompact(value: &str) -> BrigadeConfig {
-        BrigadeConfig {
-            worker_autocompact: value.to_string(),
-            ..BrigadeConfig::default()
-        }
-    }
-
-    #[test]
-    fn autocompact_ignored_notice_is_none_for_a_valid_or_an_empty_value() {
-        for value in ["250000", "auto", "100000", "1000000", "", "  "] {
-            assert_eq!(
-                autocompact_ignored_notice(&brigade_with_autocompact(value)),
-                None,
-                "{value:?}"
-            );
-        }
-        assert_eq!(autocompact_ignored_notice(&BrigadeConfig::default()), None);
-    }
-
-    #[test]
-    fn autocompact_ignored_notice_names_the_value_and_what_it_cost() {
-        for value in ["abc", "99999", "1000001", "-1", "250k"] {
-            let notice = autocompact_ignored_notice(&brigade_with_autocompact(value))
-                .unwrap_or_else(|| panic!("{value:?} must be reported"));
-            assert!(notice.contains(value), "{notice}");
-            assert!(notice.contains("worker_autocompact"), "{notice}");
-            // What became of the setting, and what would have worked.
-            assert!(notice.contains("ignored"), "{notice}");
-            assert!(notice.contains("100000"), "{notice}");
-            assert!(notice.contains("1000000"), "{notice}");
-            assert!(notice.contains("auto"), "{notice}");
-            assert!(!notice.contains('\n'), "one line: {notice}");
-            // Both products take the setting now, so the notice must not name
-            // one product's flag.
-            assert!(!notice.contains("--autocompact"), "{notice}");
-        }
-        assert_eq!(
-            autocompact_ignored_notice(&brigade_with_autocompact("abc")).as_deref(),
-            Some(r#"worker_autocompact: ignored "abc" (not auto or 100000-1000000)"#)
-        );
-    }
-
-    #[test]
-    fn autocompact_ignored_notice_stays_one_line_whatever_the_value_holds() {
-        // A control character in the value would break the status line (a
-        // newline) or shift it (a tab); the value is shown escaped instead.
-        for (value, shown) in [
-            ("bad\nvalue", r#""bad\nvalue""#),
-            ("bad\tvalue", r#""bad\tvalue""#),
-            ("bad\r\nvalue", r#""bad\r\nvalue""#),
-            ("bad\u{1b}[31mvalue", r#""bad\u{1b}[31mvalue""#),
-            ("say \"hi\"", r#""say \"hi\"""#),
-        ] {
-            let notice = autocompact_ignored_notice(&brigade_with_autocompact(value))
-                .unwrap_or_else(|| panic!("{value:?} must be reported"));
-            assert!(
-                !notice.chars().any(char::is_control),
-                "a control character reached the line: {notice:?}"
-            );
-            assert!(notice.contains(shown), "{notice}");
-            assert!(
-                notice.starts_with("worker_autocompact: ignored "),
-                "the consequence leads: {notice}"
-            );
-        }
-    }
-
-    #[test]
-    fn autocompact_ignored_notice_cuts_a_long_value_and_keeps_the_consequence_first() {
-        let value = "x".repeat(300);
-        let notice = autocompact_ignored_notice(&brigade_with_autocompact(&value)).unwrap();
-        assert!(!notice.contains('\n'), "one line: {notice}");
-        // "ignored" is what a clipped line must still say: it comes before the
-        // value, well inside a narrow terminal's room.
-        let at = notice.find("ignored").expect("says what became of it");
-        assert!(
-            notice[..at].chars().count() + "ignored".len() <= 40,
-            "{notice}"
-        );
-        assert!(
-            notice.starts_with(&format!(
-                "worker_autocompact: ignored \"{}\u{2026}\"",
-                "x".repeat(SHOWN_CHARS)
-            )),
-            "{notice}"
-        );
-        assert!(!notice.contains(&"x".repeat(SHOWN_CHARS + 1)), "{notice}");
-        assert!(
-            notice.contains('\u{2026}'),
-            "a cut value says it was cut: {notice}"
-        );
-        // The cut value costs at most its cap and the ellipsis over the same
-        // notice for an empty-looking one.
-        let bare = autocompact_ignored_notice(&brigade_with_autocompact("x")).unwrap();
-        assert!(
-            notice.chars().count() <= bare.chars().count() + SHOWN_CHARS + 1,
-            "{notice}"
-        );
-        // A value exactly at the cap is shown whole, with no ellipsis.
-        let whole = "y".repeat(SHOWN_CHARS);
-        let notice = autocompact_ignored_notice(&brigade_with_autocompact(&whole)).unwrap();
-        assert!(
-            notice.contains(&whole) && !notice.contains('\u{2026}'),
-            "{notice}"
-        );
-    }
-
-    #[test]
-    fn goinkyo_consult_notice_names_the_value_and_the_level_used_instead() {
-        let with = |value: &str| BrigadeConfig {
-            goinkyo_consult: value.to_string(),
-            ..BrigadeConfig::default()
-        };
-        for ok in ["off", "disputes", "design", "decisions", "", " Design "] {
-            assert_eq!(goinkyo_consult_ignored_notice(&with(ok)), None, "{ok:?}");
-        }
-        assert_eq!(
-            goinkyo_consult_ignored_notice(&BrigadeConfig::default()),
-            None
-        );
-        assert_eq!(
-            goinkyo_consult_ignored_notice(&with("decision")).as_deref(),
-            Some(
-                "goinkyo_consult: ignored \"decision\" (not off, disputes, design or decisions) \u{2014} using design"
-            )
-        );
-        // One line whatever the value holds, and a long one is cut the way an
-        // autocompact value is.
-        let notice = goinkyo_consult_ignored_notice(&with("a\nb\u{1b}[31m")).unwrap();
-        assert!(
-            !notice.contains('\n') && !notice.contains('\u{1b}'),
-            "{notice:?}"
-        );
-        let long = "z".repeat(SHOWN_CHARS + 5);
-        let notice = goinkyo_consult_ignored_notice(&with(&long)).unwrap();
-        assert!(
-            notice.contains('\u{2026}') && !notice.contains(&long),
-            "{notice}"
-        );
-    }
-
-    #[test]
-    fn startup_notices_carry_a_goinkyo_consult_typo() {
-        let agents = banto_core::config::resolve_agents("made-up-product");
-        let brigade = BrigadeConfig {
-            goinkyo_consult: "sometimes".to_string(),
-            ..BrigadeConfig::default()
-        };
-        let notices = startup_notices(None, Vec::new(), &agents, &brigade);
-        assert!(
-            notices
-                .iter()
-                .any(|n| n.starts_with("goinkyo_consult: ignored")),
-            "{notices:?}"
-        );
-    }
-
-    #[test]
-    fn startup_notices_carry_each_ignored_setting_after_the_trust_notice() {
-        let agents = banto_core::config::resolve_agents("made-up-product");
-        let notices = startup_notices(
-            Some("trust".to_string()),
-            Vec::new(),
-            &agents,
-            &brigade_with_autocompact("abc"),
-        );
-        assert_eq!(notices.len(), 3, "{notices:?}");
-        assert_eq!(notices[0], "trust");
-        assert!(notices[1].starts_with("agents:"), "{notices:?}");
-        assert!(notices[2].contains("worker_autocompact"), "{notices:?}");
-    }
-
     #[test]
     fn startup_notices_carry_the_database_notices_right_after_the_trust_notice() {
-        let agents = banto_core::config::resolve_agents("made-up-product");
         let notices = startup_notices(
             Some("trust".to_string()),
             vec!["database".to_string(), "instance".to_string()],
-            &agents,
-            &BrigadeConfig::default(),
         );
-        assert_eq!(notices.len(), 4, "{notices:?}");
-        assert_eq!(notices[..3], ["trust", "database", "instance"]);
-        assert!(notices[3].starts_with("agents:"), "{notices:?}");
+        assert_eq!(notices, ["trust", "database", "instance"]);
     }
 
     #[test]
-    fn startup_notices_are_empty_when_nothing_was_ignored() {
-        let agents = banto_core::config::resolve_agents("");
-        assert!(startup_notices(None, Vec::new(), &agents, &BrigadeConfig::default()).is_empty());
+    fn startup_notices_are_empty_when_there_is_nothing_to_say() {
+        assert!(startup_notices(None, Vec::new()).is_empty());
     }
 
     #[test]

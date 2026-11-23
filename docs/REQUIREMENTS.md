@@ -1212,33 +1212,25 @@ Both kickoffs now ask the pane itself — see "Brigade" below.
 banto discovers sessions for: `"all"` — also what an absent or empty string
 means — or a comma-separated list of product names (`claude`, `codex`).
 `banto_core::config::resolve_agents` resolves it into a `ResolvedAgents`
-(`enabled: BTreeSet<AgentKind>`, plus `ignored`/`fell_back_to_all` — see
-below); `"all"` means every product this build currently supports
-(`AgentKind::ALL`), not a wildcard reserved for products that don't exist
-yet. An unrecognized name is dropped, not rejected — this crate's config
-layer is lenient by design (a broken setting must never prevent startup) —
-but if *every* name in a non-empty setting goes unrecognized, `enabled`
-falls back to `all` rather than an empty set that would silently discover
-nothing with no visible cause.
+(`enabled: BTreeSet<AgentKind>`); `"all"` means every product this build currently
+supports (`AgentKind::ALL`), not a wildcard reserved for products that don't exist
+yet. A name that is not a product (`"claude,made-up"`, and an empty entry such as
+`"claude,"`) is refused when the file is read, like any value a key does not take
+("A config file that is there must be usable", under Brigade), so the setting never
+quietly becomes `all`. Case and surrounding spaces do not matter, and `""` stays
+valid: it is documented as `all`. `resolve_agents` itself stays total for a `Config`
+built in code, where an unrecognised name is dropped and a setting with none left
+resolves to `all` rather than to an empty set that would discover nothing.
 
-**The ignored-name notice.** A dropped name still needs to be discoverable
-by the operator, or a typo is indistinguishable from `all` with no way to
-find out short of reading the source. `ResolvedAgents.ignored` records every
-unrecognized name (deduplicated, first-seen order); `session::agents_ignored_notice`
-turns that into one line. It is one of up to two **startup notices**; the other
-is the Codex hook-trust notice (see "Brigade", formation gate 3). At startup the
-shell computes whichever apply and hands them to the core as one event
-(`Event::StartupNotices`; nothing is sent when neither applies). The core shows
-them on the status line one after the other — each for the status line's normal
-duration, the next taking the line when it becomes free, a notice waiting
-rather than replacing some other status already showing — and they block no
-input. The `list` subcommand has no status line, and computes neither. The
-ignored-name notice fires for a partial drop too, not only the
-total fallback: an operator who kept a real, working filter is still owed
-the fact that part of what they wrote silently did nothing.
-`ResolvedAgents.fell_back_to_all` only changes the wording (naming what's
-still enabled vs. saying the setting had no effect at all) — both cases
-show the notice.
+**Startup notices.** What banto has to say at startup that is not a refusal (the
+Codex hook-trust notice, see "Brigade", formation gate 3; what startup found about
+the database and the executable) is computed by the shell and handed to the core as
+one event (`Event::StartupNotices`; nothing is sent when there is none). The core
+shows them on the status line one after the other, each for the status line's
+normal duration, the next taking the line when it becomes free, a notice waiting
+rather than replacing some other status already showing; they block no input. The
+`list` subcommand has no status line and computes none. A config value banto cannot
+use is not one of them: it stops the start.
 
 **Applies at discovery, not display — deliberately breaking precedent.**
 Every other row filter in this codebase (`App::show_agents`, the
@@ -3020,9 +3012,11 @@ next turn. The default threshold there is 450k by the source, and the same threa
 earlier compaction had come at 448k; no run without the override was made to
 compare. Accepted: `"auto"`, which gives Claude `--autocompact auto` and Codex
 nothing; an integer from 100000 to 1000000, which goes to both agents; or `""`,
-which passes nothing to either. Any other value, a TOML float included, passes
-nothing, and startup shows a one-line notice: `worker_autocompact: ignored "abc"
-(not auto or 100000-1000000)`, with the value escaped and cut to 24 characters. A
+which passes nothing to either. Any other value, a TOML float included, is refused
+when the file is read (`` `worker_autocompact` does not take "abc"; it takes "auto",
+an integer from 100000 to 1000000, or "" (no flag) ``; a boolean, float, list or
+table gets `toml`'s own `invalid type … expected an integer or a string`). The
+value in the message is escaped and cut to 40 characters. A
 Director and a Goinkyo never get it, whichever agent they run, so their compaction
 stays whatever that agent's own settings say.
 
@@ -3415,12 +3409,12 @@ joins of them), which `crate::briefing::compose` calls for both products, so the
 Claude and Codex Directors cannot be told different things.
 
 How the value is read:
-  - It is read as written whatever its TOML type, so `goinkyo_consult = false`
-    does not fail the document (a discovered config that failed to parse falls
-    back to every default). Case and surrounding spaces do not matter.
-  - Anything that is not a level reads as `"design"`, and one line at startup
-    says so: `goinkyo_consult: ignored "<value>" (not off, disputes, design or
-    decisions) — using design`.
+  - It is a string, and `goinkyo_consult = false` is refused like any wrong type.
+    Case and surrounding spaces do not matter.
+  - Anything that is not a level (or empty) is refused when the file is read:
+    `` `goinkyo_consult` does not take "decision"; it takes "off", "disputes",
+    "design", "decisions" or "" (no paragraph) ``, under the line and column
+    `toml` reports. Nothing reads it as the built-in any more.
   - `""` (or only spaces) is no paragraph at all, the file's usual empty-string
     convention: the operator who wants none of banto's policy text writes it.
   - The paragraph needs a template to follow. **With an empty `director_prompt`
@@ -3435,7 +3429,7 @@ re-reads the file at every firing (a fresh process each time), so its next
 `SessionStart` picks an edit up without a restart; a changed briefing is then
 delivered instead of withheld — see "Delivered once" above. A running Director
 never sees a change; the operator's immediate lever is to tell it in its pane, in
-one line. The invalid-value startup notice is shown only by the UI.
+one line.
 
 *Size.* The paragraph counts toward Codex's spill limit above. Measured: `off` 479
 bytes, `disputes` 1,144, `design` 2,368, `decisions` 3,311. The shipped default
@@ -3508,6 +3502,7 @@ because the parent had none; the same goes for `--data-dir`: a parent with no da
 directory passes none, and its child has none rather than finding one of its own
 (`consult_goinkyo` then says so, and no message log is written). `--config` is
 refused next to the hand-off flags.
+
 `_hook` cannot: Codex trusts the hook by a hash of its literal command
 string, and that string cannot be quoted, so it carries no argument, and the
 values travel as environment variables on the member's launch, beside its
@@ -3525,6 +3520,41 @@ where an agent keeps its home is not banto's to decide. A member that is already
 the server it was launched with; the next time its pane is opened (re-staging the
 brigade, a relaunch, a new member) the MCP config file is rewritten and the
 launch argv rebuilt with the hand-off.
+
+**A config file that is there must be usable.** Only a *missing* file is the
+defaults (an explicit `--config`/`BANTO_CONFIG` must exist as well). One that cannot
+be read (permissions, a directory, bytes that are not UTF-8), is not valid TOML,
+gives a known key a value of the wrong TOML type, or gives it a string it does not
+take stops banto: the UI, `list` and `versions` print, before any raw mode or
+alternate screen, `banto: config file <path> could not be used:` and `toml`'s own
+error (line, column, the offending line, what was expected), then `banto did not
+start. Fix the file and run banto again.`, and exit 1. There is no escape hatch:
+falling back to the defaults would run the operator's agents on settings they did
+not choose, with nothing to show their file was never read.
+
+A string the key does not take is the same as a value of the wrong type (decision
+2026-11-23: "refuse the typo too"): `worker_agent = "typo"` stops banto at the line
+and column `toml` reports, with `` `worker_agent` does not take "typo"; it takes
+"inherit", "claude", "codex" or "select" `` under it. Every setting that reads one
+of a fixed set of words is held to it when the file is read: `relay` (`auto` or
+`manual`), `worker_agent`, `goinkyo_consult`, `worker_autocompact`, `agents` and
+`[keys] prefix`, each trimmed and case-insensitive, and with `""` valid only where
+it is documented as an escape (`goinkyo_consult`, `worker_autocompact`, `agents`).
+Free text that goes to an agent (the model, effort and permission-mode settings,
+the prompts) has no fixed set and is not checked: the agent says what it thinks of
+it. Unknown keys are the one thing ignored.
+
+A `_mcp` child is held to the same file (`--parent-config`: a missing file is still
+the defaults, because a parent names its platform default whether or not one
+exists), but it answers through the refusing server (`mcp::run_refusing_server`)
+instead of exiting, so the agent that started it reads that the file is broken and
+that banto's MCP server must be reconnected (Claude: `/mcp`) or the member
+restarted once it is fixed. `_mcp` children started before the break keep working.
+`_hook` alone stays lenient (`Strictness::Lenient`: the defaults, exit 0, one JSON
+line): it runs inside the operator's own agent and must never fail it over banto's
+configuration. A config that breaks after the UI started therefore costs a hook
+run every setting in the file, its `[brigade]` templates included, not just the
+bad key.
 
 **One banto UI per database.** A banto UI that would open a database another
 running banto UI already uses does not start: it exits non-zero with one line on

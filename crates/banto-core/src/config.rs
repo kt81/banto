@@ -2,11 +2,15 @@
 //!
 //! Every field has a default and unknown keys are ignored (`#[serde(default)]`
 //! throughout), so any subset of a TOML document deserializes into a valid
-//! [`Config`] — that leniency is the contract these types promise; loading
-//! the actual `config.toml` file (locating it, reading it, turning a parse
-//! failure into an error or a silent default) is `banto_io::config`'s job —
-//! it needs filesystem access and the `dirs` crate for the default path,
-//! both forbidden here (`docs/DISCIPLINE.md` §2).
+//! [`Config`]. A key that is there must be right, though: a value of the wrong
+//! TOML type, or a string that is not one of the words its setting takes
+//! ([`not_accepted`]), is a deserialization error, so that `toml` reports its
+//! line and column and banto does not start on it. Free text (a model, an
+//! effort, a prompt) has no fixed set and is taken as written. Loading the
+//! actual `config.toml` file (locating it, reading it, turning a parse failure
+//! into an error) is `banto_io::config`'s job — it needs filesystem access and
+//! the `dirs` crate for the default path, both forbidden here
+//! (`docs/DISCIPLINE.md` §2).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -49,21 +53,19 @@ pub enum RelayMode {
     Manual,
 }
 
-/// Lenient by design (a plain enum derive would reject an unrecognized value
-/// with a parse error): an unrecognized `relay` string falls back to
-/// [`RelayMode::Auto`] rather than failing the whole config load, since a
-/// typo silently keeping the relay on is preferable to it silently taking
-/// the rest of `config.toml` down with it.
+/// `"auto"` or `"manual"`, trimmed and case-insensitive like the other word
+/// settings.
 impl<'de> Deserialize<'de> for RelayMode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "manual" => RelayMode::Manual,
-            _ => RelayMode::Auto,
-        })
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(RelayMode::Auto),
+            "manual" => Ok(RelayMode::Manual),
+            _ => Err(not_accepted("relay", &raw, "\"auto\" or \"manual\"")),
+        }
     }
 }
 
@@ -98,19 +100,17 @@ pub enum WorkerAgentSetting {
 
 impl WorkerAgentSetting {
     /// Parses `[brigade] worker_agent`'s raw string. Case-insensitive and
-    /// whitespace-trimmed — the same leniency [`resolve_agents`] already
-    /// applies to the neighboring `agents` setting, since both name the
-    /// same product vocabulary an operator might type inconsistently — and
-    /// an unrecognized value (including a typo, or empty) falls back to
-    /// [`Self::Inherit`] rather than a parse error: this crate's config
-    /// layer never fails a load over one bad setting (`banto_io::config`'s
-    /// module doc).
-    pub fn parse(raw: &str) -> Self {
+    /// whitespace-trimmed, like the neighboring `agents` setting, since both
+    /// name the same product vocabulary an operator might type inconsistently.
+    /// `None` for anything else, an empty string included: it is not one of the
+    /// four words, and there is no "no setting" spelling (omit the key).
+    pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "select" => Self::Select,
-            "claude" => Self::Claude,
-            "codex" => Self::Codex,
-            _ => Self::Inherit,
+            "inherit" => Some(Self::Inherit),
+            "select" => Some(Self::Select),
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
         }
     }
 }
@@ -121,7 +121,13 @@ impl<'de> Deserialize<'de> for WorkerAgentSetting {
         D: serde::Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        Ok(Self::parse(&raw))
+        Self::parse(&raw).ok_or_else(|| {
+            not_accepted(
+                "worker_agent",
+                &raw,
+                "\"inherit\", \"claude\", \"codex\" or \"select\"",
+            )
+        })
     }
 }
 
@@ -187,12 +193,11 @@ pub struct BrigadeConfig {
     /// same thread's earlier compaction had come at 448k; no run without the
     /// override was made to compare.
     ///
-    /// A value outside that set never stops a Worker launching: nothing is
-    /// passed, and the startup status line says so
-    /// ([`Self::worker_autocompact_ignored`]). Kept as the text the operator
+    /// A value outside that set, or a TOML type that is neither an integer nor a
+    /// string, is refused when the file is read. Kept as the text the operator
     /// wrote, as every other setting here is; [`Self::worker_autocompact`] is
     /// the one reader.
-    #[serde(deserialize_with = "as_written")]
+    #[serde(deserialize_with = "autocompact_setting")]
     pub worker_autocompact: String,
     /// The model a Codex Worker launches with when its session is first
     /// created — the Codex sibling of [`Self::worker_model`], same
@@ -329,13 +334,13 @@ pub struct BrigadeConfig {
     /// exactly as at any level. An empty string is the file's usual escape
     /// hatch, no paragraph. So is an empty `director_prompt`, which leaves
     /// nothing to append to: `off` cannot be expressed without a briefing. A
-    /// value that is none of the levels is read as the built-in, and only the UI
-    /// process reports it (at startup). The UI reads the config once at start; a
+    /// value that is none of the levels, or not a string, is refused when the
+    /// file is read. The UI reads the config once at start; a
     /// Claude Director carries the paragraph in its launch argv, so an edit needs
     /// banto restarted and the Director relaunched. `banto _hook` re-reads the
     /// file at every firing, so a Codex Director picks an edit up at its next
     /// `SessionStart` without a restart. A running Director never sees a change.
-    #[serde(deserialize_with = "as_written")]
+    #[serde(deserialize_with = "consult_setting")]
     pub goinkyo_consult: String,
     /// Append every brigade message, in full, to a plain-text file under banto's
     /// own data directory (`banto_io::brigade_log`) — for someone developing
@@ -533,6 +538,24 @@ impl Default for BrigadeConfig {
     }
 }
 
+/// The error every setting that takes one of a fixed set of words gives for a
+/// value that is none of them. It names the key, what the operator wrote (cut
+/// short and escaped, so a pasted blob or a control character cannot flood or
+/// break the line `toml` prints it on) and what the key takes. `toml` adds the
+/// line, the column and the offending line.
+fn not_accepted<E: serde::de::Error>(key: &str, given: &str, accepted: &str) -> E {
+    const SHOWN_CHARS: usize = 40;
+    let head: String = given.chars().take(SHOWN_CHARS).collect();
+    let cut = if given.chars().count() > SHOWN_CHARS {
+        "\u{2026}"
+    } else {
+        ""
+    };
+    E::custom(format!(
+        "`{key}` does not take {head:?}{cut}; it takes {accepted}"
+    ))
+}
+
 /// The one rule for every model and effort value, whichever path it arrives on
 /// (the config file, a built-in, the picker; a Worker of either product or the
 /// Goinkyo): trimmed, and if nothing is left no flag is passed; otherwise the
@@ -544,23 +567,22 @@ pub fn flag_value(raw: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-/// A `[brigade]` setting as the operator wrote it, whatever its TOML type: an
-/// integer becomes its digits, a string stays as it is, a boolean its word, and
-/// anything else (any float, a list, a table) a word for what it was, which no
-/// reader accepts. A field that failed to deserialize would fail the whole
-/// document, and with it every other setting in `config.toml` (the discovered
-/// path falls back to all defaults, an explicit `--config` refuses to start);
-/// `worker_autocompact` and `goinkyo_consult` each have the rule "a bad value
-/// is reported and does no harm", so neither gets to.
-fn as_written<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// `[brigade] worker_autocompact` as the operator wrote it: a TOML integer
+/// becomes its digits and a string stays as it is. Any other TOML type (a
+/// float, a boolean, a list, a table) is `serde`'s own "invalid type" error,
+/// since only an integer or a string can be a token count; a float of
+/// `250000.0` is not turned into digits. The text is then held to
+/// [`autocompact_reading`]: a value the flag does not take is refused here
+/// instead of reaching a Worker's command line.
+fn autocompact_setting<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use serde::de::Visitor;
 
-    struct AsWritten;
+    struct Written;
 
-    impl<'de> Visitor<'de> for AsWritten {
+    impl Visitor<'_> for Written {
         type Value = String;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -578,30 +600,69 @@ where
         fn visit_str<E>(self, value: &str) -> Result<String, E> {
             Ok(value.to_string())
         }
-
-        fn visit_bool<E>(self, value: bool) -> Result<String, E> {
-            Ok(value.to_string())
-        }
-
-        // Whatever its value: `250000.0` and `1e6` hold an integer, but only a
-        // TOML integer or a string is a token count, and `to_string` on the
-        // float would have turned them into digits.
-        fn visit_f64<E>(self, _value: f64) -> Result<String, E> {
-            Ok("a float".to_string())
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<String, A::Error> {
-            while seq.next_element::<IgnoredAny>()?.is_some() {}
-            Ok("a list".to_string())
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<String, A::Error> {
-            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            Ok("a table".to_string())
-        }
     }
 
-    deserializer.deserialize_any(AsWritten)
+    let written = deserializer.deserialize_any(Written)?;
+    match autocompact_reading(&written) {
+        AutocompactReading::Invalid => Err(not_accepted(
+            "worker_autocompact",
+            &written,
+            "\"auto\", an integer from 100000 to 1000000, or \"\" (no flag)",
+        )),
+        AutocompactReading::Pass(_) | AutocompactReading::Empty => Ok(written),
+    }
+}
+
+/// `[brigade] goinkyo_consult`: a string that is a level (or empty), kept as
+/// written. Not a string is `serde`'s "invalid type" error.
+fn consult_setting<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let written = String::deserialize(deserializer)?;
+    match consult_reading(&written) {
+        ConsultReading::Invalid => Err(not_accepted(
+            "goinkyo_consult",
+            &written,
+            "\"off\", \"disputes\", \"design\", \"decisions\" or \"\" (no paragraph)",
+        )),
+        ConsultReading::Level(_) | ConsultReading::Empty => Ok(written),
+    }
+}
+
+/// `agents`: `""`, `"all"`, or product names, kept as written. See
+/// [`agents_are_valid`].
+fn agents_setting<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let written = String::deserialize(deserializer)?;
+    if agents_are_valid(&written) {
+        Ok(written)
+    } else {
+        Err(not_accepted(
+            "agents",
+            &written,
+            "\"all\", \"\", or a comma-separated list of \"claude\" and \"codex\"",
+        ))
+    }
+}
+
+/// `[keys] prefix`: a chord [`crate::engine::PrefixKey`] can read, kept as written.
+fn prefix_setting<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let written = String::deserialize(deserializer)?;
+    if crate::engine::PrefixKey::try_parse(&written).is_some() {
+        Ok(written)
+    } else {
+        Err(not_accepted(
+            "prefix",
+            &written,
+            "\"C-<char>\" for a Control chord (\"C-b\") or one character for a bare key",
+        ))
+    }
 }
 
 /// The window sizes `--autocompact` takes, in tokens, as the CLI's own help
@@ -626,7 +687,9 @@ enum ConsultReading {
     Level(GoinkyoConsult),
     /// Nothing written: no paragraph, the tool allowed.
     Empty,
-    /// Written, but not a level: read as the built-in, and reported.
+    /// Written, but not a level. Refused when a file is read ([`consult_setting`]);
+    /// only a `BrigadeConfig` built in code can hold one, and is read as the
+    /// built-in.
     Invalid,
 }
 
@@ -652,7 +715,9 @@ enum AutocompactReading {
     Pass(String),
     /// Nothing written: the operator asked for no flag.
     Empty,
-    /// Written, but not a value the flag takes.
+    /// Written, but not a value the flag takes. Refused when a file is read
+    /// ([`autocompact_setting`]); only a `BrigadeConfig` built in code can hold
+    /// one, and it passes nothing.
     Invalid,
 }
 
@@ -719,10 +784,10 @@ impl BrigadeConfig {
     }
 
     /// The value a Claude Worker's `--autocompact` gets: `auto`, or the
-    /// token count as plain digits. `None` passes no flag, whether the setting
-    /// is empty or invalid ([`Self::worker_autocompact_ignored`] tells the two
-    /// apart). Read on every launch of a Claude Worker, a resume included
-    /// ([`Self::worker_autocompact`]'s field doc says why).
+    /// token count as plain digits. `None` passes no flag: the setting is empty
+    /// (or, only for a config built in code, invalid). Read on every launch of a
+    /// Claude Worker, a resume included ([`Self::worker_autocompact`]'s field doc
+    /// says why).
     pub fn worker_autocompact(&self) -> Option<String> {
         match autocompact_reading(&self.worker_autocompact) {
             AutocompactReading::Pass(value) => Some(value),
@@ -742,33 +807,15 @@ impl BrigadeConfig {
         }
     }
 
-    /// The setting as written when it is neither empty nor a value
-    /// [`Self::worker_autocompact`] can pass, so the startup status line can
-    /// say a Worker is launching without it.
-    pub fn worker_autocompact_ignored(&self) -> Option<&str> {
-        match autocompact_reading(&self.worker_autocompact) {
-            AutocompactReading::Invalid => Some(self.worker_autocompact.trim()),
-            AutocompactReading::Pass(_) | AutocompactReading::Empty => None,
-        }
-    }
-
     /// The level [`Self::goinkyo_consult`] names, or `None` for the empty
     /// string (no paragraph, the tool allowed). A value that is not a level
-    /// reads as the built-in `design`; [`Self::goinkyo_consult_ignored`] is how
-    /// the startup status line says so.
+    /// cannot come from a file (it is refused); a config built in code reads it
+    /// as the built-in `design`.
     pub fn goinkyo_consult(&self) -> Option<GoinkyoConsult> {
         match consult_reading(&self.goinkyo_consult) {
             ConsultReading::Level(level) => Some(level),
             ConsultReading::Empty => None,
             ConsultReading::Invalid => Some(GoinkyoConsult::Design),
-        }
-    }
-
-    /// The setting as written when it is not empty and not a level.
-    pub fn goinkyo_consult_ignored(&self) -> Option<&str> {
-        match consult_reading(&self.goinkyo_consult) {
-            ConsultReading::Invalid => Some(self.goinkyo_consult.trim()),
-            ConsultReading::Level(_) | ConsultReading::Empty => None,
         }
     }
 
@@ -829,10 +876,11 @@ pub struct KeysConfig {
     /// The prefix chord for pane operations (tmux-style: press it, then a
     /// second key — see `crate::engine::PrefixAction` for what each one
     /// does). `"C-<char>"` for a Control chord (e.g. the default `"C-b"`),
-    /// or a bare single character for an unmodified key. Parsed leniently in
-    /// the `banto` bin crate, not here: `KeyCode`/`Modifiers` parsing from a
-    /// raw chord string is `crate::engine::PrefixKey`'s job — this field is
-    /// just the raw string, validated no further than "is it a string".
+    /// or a bare single character for an unmodified key; anything else is
+    /// refused when the file is read. The chord grammar is
+    /// `crate::engine::PrefixKey::try_parse`'s, which this field asks and then
+    /// keeps the raw string.
+    #[serde(deserialize_with = "prefix_setting")]
     pub prefix: String,
 }
 
@@ -855,11 +903,11 @@ pub struct Config {
     pub agent_binaries: AgentBinaries,
     /// Which agent products banto discovers sessions for: `"all"` (also
     /// what an absent or empty string means, and the default), or a
-    /// comma-separated list of product names (`claude`, `codex`). Kept as
-    /// the raw string here and resolved by [`resolve_agents`] rather than
-    /// parsed into a set at deserialize time, so a name this build doesn't
-    /// recognize degrades leniently (see that function's doc) instead of
-    /// failing the whole document the way a strict enum would.
+    /// comma-separated list of product names (`claude`, `codex`), each
+    /// case-insensitive and trimmed. A name that is not a product, an empty
+    /// entry included, is refused when the file is read. Kept as the raw string
+    /// and resolved by [`resolve_agents`].
+    #[serde(deserialize_with = "agents_setting")]
     pub agents: String,
     /// Overrides the provider's default `~/.claude` location (read-only!).
     pub claude_home: Option<PathBuf>,
@@ -876,24 +924,30 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
 }
 
-/// The result of resolving [`Config::agents`]: the working set, plus enough
-/// of what [`resolve_agents`] discarded along the way for a caller to tell
-/// the operator about it (see that function's doc for why dropped names are
-/// tracked at all rather than simply vanishing).
+/// The result of resolving [`Config::agents`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedAgents {
     /// The agent products banto should actually discover sessions for.
     pub enabled: BTreeSet<AgentKind>,
-    /// Names from a non-empty setting that matched no known product, in the
-    /// order they first appeared, each listed once even if repeated. Empty
-    /// for `""`/`"all"`, or when every name in the list was recognized.
-    pub ignored: Vec<String>,
-    /// Whether every name in a non-empty setting went unrecognized, so
-    /// `enabled` fell back to [`AgentKind::ALL`] rather than reflecting
-    /// anything the operator actually wrote — worse than [`Self::ignored`]
-    /// being merely non-empty: there, the setting still did *something*;
-    /// here, it silently did nothing at all.
-    pub fell_back_to_all: bool,
+}
+
+/// The product a name in `agents` stands for, case-insensitive.
+fn agent_named(name: &str) -> Option<AgentKind> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(AgentKind::ClaudeCode),
+        "codex" => Some(AgentKind::Codex),
+        _ => None,
+    }
+}
+
+/// Whether `raw` is a value `agents` takes: empty, `all` (case-insensitive), or
+/// a comma-separated list of product names. One name that is not a product, an
+/// empty entry (`"claude,"`) included, makes the whole value invalid.
+fn agents_are_valid(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("all")
+        || trimmed.split(',').all(|name| agent_named(name).is_some())
 }
 
 /// Resolve [`Config::agents`] into the set of agent products banto should
@@ -904,61 +958,20 @@ pub struct ResolvedAgents {
 /// comma-separated entry is looked up independently, matched
 /// case-insensitively with surrounding whitespace trimmed.
 ///
-/// An unrecognized name is dropped, not rejected: this crate's config layer
-/// is lenient by design (`banto_io::config`'s module doc — a broken setting
-/// must never prevent startup), and every other lenient fallback in this
-/// file decays toward *less filtering*, never toward *less discovery*
-/// (`RelayMode`'s unknown value falls back to the working default, a
-/// malformed file falls back to the full default `Config`). So if every
-/// name in a non-empty setting goes unrecognized — a typo, or a product this
-/// build has never heard of — [`ResolvedAgents::enabled`] is
-/// [`AgentKind::ALL`] too, the same as leaving `agents` unset, rather than
-/// an empty set that would silently discover nothing with no visible cause.
-///
-/// Dropping a name silently would still leave the operator with no way to
-/// find a typo short of reading this function's source, so every
-/// unrecognized name is recorded in [`ResolvedAgents::ignored`] — this
-/// function only collects the fact; deciding whether and how to tell the
-/// operator (a status line, today) is `banto`'s job, not this crate's (see
-/// this module's doc: no I/O, no UI, here).
+/// Total, though a file can no longer reach the branches that make it so: a
+/// value with a name that is not a product is refused when the file is read
+/// ([`agents_setting`]). A `Config` built in code can still hold one; its
+/// unrecognized names are dropped, and a setting with no recognized name at all
+/// resolves to every product rather than to an empty set that would discover
+/// nothing.
 pub fn resolve_agents(raw: &str) -> ResolvedAgents {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
-        return ResolvedAgents {
-            enabled: AgentKind::ALL.into_iter().collect(),
-            ignored: Vec::new(),
-            fell_back_to_all: false,
-        };
-    }
-    let mut ignored = Vec::new();
-    let recognized: BTreeSet<AgentKind> = trimmed
-        .split(',')
-        .filter_map(|name| {
-            let name = name.trim();
-            match name.to_ascii_lowercase().as_str() {
-                "claude" => Some(AgentKind::ClaudeCode),
-                "codex" => Some(AgentKind::Codex),
-                _ => {
-                    if !ignored.iter().any(|seen: &String| seen == name) {
-                        ignored.push(name.to_string());
-                    }
-                    None
-                }
-            }
-        })
-        .collect();
-    if recognized.is_empty() {
-        ResolvedAgents {
-            enabled: AgentKind::ALL.into_iter().collect(),
-            ignored,
-            fell_back_to_all: true,
-        }
-    } else {
-        ResolvedAgents {
-            enabled: recognized,
-            ignored,
-            fell_back_to_all: false,
-        }
+    let recognized: BTreeSet<AgentKind> = raw.trim().split(',').filter_map(agent_named).collect();
+    ResolvedAgents {
+        enabled: if recognized.is_empty() {
+            AgentKind::ALL.into_iter().collect()
+        } else {
+            recognized
+        },
     }
 }
 
@@ -976,15 +989,10 @@ mod tests {
 
     /// `[brigade] worker_autocompact = <toml>` parsed, and what a Claude Worker
     /// would be handed for it.
-    fn autocompact_of(toml_value: &str) -> (Option<String>, Option<String>) {
-        let config = parse(&format!("[brigade]\nworker_autocompact = {toml_value}\n"));
-        (
-            config.brigade.worker_autocompact(),
-            config
-                .brigade
-                .worker_autocompact_ignored()
-                .map(str::to_string),
-        )
+    fn autocompact_of(toml_value: &str) -> Option<String> {
+        parse(&format!("[brigade]\nworker_autocompact = {toml_value}\n"))
+            .brigade
+            .worker_autocompact()
     }
 
     #[test]
@@ -996,9 +1004,6 @@ mod tests {
             ("1000000", Some("1000000"), Some("1000000")),
             ("\"auto\"", Some("auto"), None),
             ("\"AUTO\"", Some("auto"), None),
-            ("99999", None, None),
-            ("1000001", None, None),
-            ("\"abc\"", None, None),
             ("\"\"", None, None),
         ] {
             let config = parse(&format!("[brigade]\nworker_autocompact = {written}\n"));
@@ -1030,7 +1035,6 @@ mod tests {
     fn goinkyo_consult_defaults_to_design() {
         let brigade = BrigadeConfig::default();
         assert_eq!(brigade.goinkyo_consult(), Some(GoinkyoConsult::Design));
-        assert_eq!(brigade.goinkyo_consult_ignored(), None);
         assert_eq!(
             parse("[brigade]\nworkers = 2\n").brigade.goinkyo_consult(),
             Some(GoinkyoConsult::Design)
@@ -1049,7 +1053,6 @@ mod tests {
         ] {
             let brigade = consult_of(&format!("\"{written}\""));
             assert_eq!(brigade.goinkyo_consult(), Some(level), "{written:?}");
-            assert_eq!(brigade.goinkyo_consult_ignored(), None, "{written:?}");
         }
     }
 
@@ -1060,45 +1063,24 @@ mod tests {
         for written in ["\"\"", "\"  \""] {
             let brigade = consult_of(written);
             assert_eq!(brigade.goinkyo_consult(), None, "{written}");
-            assert_eq!(brigade.goinkyo_consult_ignored(), None, "{written}");
         }
     }
 
     #[test]
-    fn goinkyo_consult_that_is_not_a_level_falls_back_to_design_and_is_reported() {
-        // Any TOML type: a value of the wrong type must not fail the document,
-        // or the discovered-path load would fall back to ALL defaults.
-        for (written, shown) in [
-            ("\"sometimes\"", "sometimes"),
-            ("false", "false"),
-            ("true", "true"),
-            ("3", "3"),
-            ("1.5", "a float"),
-            ("[\"off\"]", "a list"),
-            ("{ level = \"off\" }", "a table"),
-        ] {
-            let config = parse(&format!(
-                "[brigade]\nworker_model = \"haiku\"\ngoinkyo_consult = {written}\n"
-            ));
-            assert_eq!(
-                config.brigade.goinkyo_consult(),
-                Some(GoinkyoConsult::Design),
-                "{written}"
-            );
-            assert_eq!(
-                config.brigade.goinkyo_consult_ignored(),
-                Some(shown),
-                "{written}"
-            );
-            assert_eq!(config.brigade.worker_model, "haiku", "{written}");
-        }
+    fn a_goinkyo_consult_built_in_code_that_is_not_a_level_reads_as_the_built_in() {
+        // A file cannot hold one (it is refused), but a `BrigadeConfig` can be
+        // built by hand, and the reader stays total.
+        let brigade = BrigadeConfig {
+            goinkyo_consult: "sometimes".into(),
+            ..BrigadeConfig::default()
+        };
+        assert_eq!(brigade.goinkyo_consult(), Some(GoinkyoConsult::Design));
     }
 
     #[test]
     fn worker_autocompact_defaults_to_the_operators_window() {
         let brigade = Config::default().brigade;
         assert_eq!(brigade.worker_autocompact().as_deref(), Some("250000"));
-        assert_eq!(brigade.worker_autocompact_ignored(), None);
         // A file that never mentions the key gets the same.
         let config = parse("[brigade]\nworkers = 2\n");
         assert_eq!(
@@ -1124,69 +1106,31 @@ mod tests {
             ("\"0300000\"", "300000"),
         ] {
             assert_eq!(
-                autocompact_of(written),
-                (Some(passed.to_string()), None),
+                autocompact_of(written).as_deref(),
+                Some(passed),
                 "{written}"
             );
         }
     }
 
     #[test]
-    fn worker_autocompact_outside_the_window_passes_nothing_and_is_reported() {
-        for written in [
-            "99999",
-            "1000001",
-            "0",
-            "-250000",
-            "\"99999\"",
-            "\"1000001\"",
-            "\"abc\"",
-            "\"-250000\"",
-            "\"250k\"",
-            "\"2.5e5\"",
-            "\"+250000\"",
-            "\"250 000\"",
-            "\"99999999999999999999999\"",
-            "true",
-            "2.5",
-            // A float is never a token count, even one that holds an integer
-            // value: only a TOML integer or a string is accepted.
-            "250000.0",
-            "1e6",
-            "1_000e3",
-            "300000.0",
-            "inf",
-            "nan",
-            "[250000]",
-            "{ tokens = 250000 }",
-        ] {
-            let (passed, ignored) = autocompact_of(written);
-            assert_eq!(passed, None, "{written}");
-            assert!(ignored.is_some(), "{written} must be reported");
-        }
-    }
-
-    #[test]
-    fn worker_autocompact_reports_the_value_as_the_operator_wrote_it() {
-        assert_eq!(autocompact_of("\"abc\"").1.as_deref(), Some("abc"));
-        assert_eq!(autocompact_of("99999").1.as_deref(), Some("99999"));
-        assert_eq!(autocompact_of("\" abc \"").1.as_deref(), Some("abc"));
-    }
-
-    #[test]
     fn worker_autocompact_empty_passes_nothing_and_is_not_an_error() {
         for written in ["\"\"", "\"   \""] {
-            assert_eq!(autocompact_of(written), (None, None), "{written}");
+            assert_eq!(autocompact_of(written), None, "{written}");
         }
     }
 
     #[test]
-    fn a_wrongly_typed_worker_autocompact_does_not_cost_the_rest_of_the_file() {
-        let config =
-            parse("[brigade]\nworkers = 3\nworker_autocompact = true\nworker_model = \"opus\"\n");
-        assert_eq!(config.brigade.workers, 3);
-        assert_eq!(config.brigade.worker_model, "opus");
-        assert_eq!(config.brigade.worker_autocompact(), None);
+    fn a_worker_autocompact_built_in_code_outside_the_window_passes_nothing() {
+        // Only a hand-built config can hold one: a file is refused.
+        for written in ["99999", "1000001", "abc", "250k", "-1"] {
+            let brigade = BrigadeConfig {
+                worker_autocompact: written.into(),
+                ..BrigadeConfig::default()
+            };
+            assert_eq!(brigade.worker_autocompact(), None, "{written}");
+            assert_eq!(brigade.worker_autocompact_for(AgentKind::Codex), None);
+        }
     }
 
     #[test]
@@ -1470,7 +1414,7 @@ worker_effort_codex = \"\"
     #[test]
     fn worker_agent_defaults_to_inherit() {
         assert_eq!(WorkerAgentSetting::default(), WorkerAgentSetting::Inherit);
-        assert_eq!(WorkerAgentSetting::parse(""), WorkerAgentSetting::Inherit);
+        assert_eq!(WorkerAgentSetting::parse(""), None, "empty is not a value");
     }
 
     #[test]
@@ -1481,7 +1425,7 @@ worker_effort_codex = \"\"
             ("claude", WorkerAgentSetting::Claude),
             ("codex", WorkerAgentSetting::Codex),
         ] {
-            assert_eq!(WorkerAgentSetting::parse(text), expected);
+            assert_eq!(WorkerAgentSetting::parse(text), Some(expected));
             let config = parse(&format!("[brigade]\nworker_agent = \"{text}\"\n"));
             assert_eq!(config.brigade.worker_agent, expected);
         }
@@ -1490,14 +1434,11 @@ worker_effort_codex = \"\"
     #[test]
     fn worker_agent_is_case_insensitive_and_trims_whitespace() {
         for text in ["Codex", "CODEX", "  codex  "] {
-            assert_eq!(WorkerAgentSetting::parse(text), WorkerAgentSetting::Codex);
+            assert_eq!(
+                WorkerAgentSetting::parse(text),
+                Some(WorkerAgentSetting::Codex)
+            );
         }
-    }
-
-    #[test]
-    fn worker_agent_unknown_value_falls_back_to_inherit() {
-        let config = parse("[brigade]\nworker_agent = \"made-up-product\"\n");
-        assert_eq!(config.brigade.worker_agent, WorkerAgentSetting::Inherit);
     }
 
     #[test]
@@ -1811,12 +1752,6 @@ worker_effort_codex = \"\"
     }
 
     #[test]
-    fn brigade_relay_unknown_value_falls_back_to_auto() {
-        let config = parse("[brigade]\nrelay = \"sometimes\"\n");
-        assert_eq!(config.brigade.relay, RelayMode::Auto);
-    }
-
-    #[test]
     fn partial_toml_fills_remaining_defaults() {
         let config = parse("agents = \"codex\"\n");
         assert_eq!(config.agents, "codex");
@@ -1936,8 +1871,6 @@ data_dir = \"C:/synthetic/banto-data\"
     fn resolve_agents_empty_means_all() {
         let resolved = resolve_agents("");
         assert_eq!(resolved.enabled, all_agents());
-        assert!(resolved.ignored.is_empty());
-        assert!(!resolved.fell_back_to_all);
     }
 
     #[test]
@@ -1945,8 +1878,6 @@ data_dir = \"C:/synthetic/banto-data\"
         for text in ["all", "ALL", "All", "  all  "] {
             let resolved = resolve_agents(text);
             assert_eq!(resolved.enabled, all_agents());
-            assert!(resolved.ignored.is_empty());
-            assert!(!resolved.fell_back_to_all);
         }
     }
 
@@ -1971,30 +1902,18 @@ data_dir = \"C:/synthetic/banto-data\"
     }
 
     #[test]
-    fn resolve_agents_drops_an_unrecognized_name_alongside_a_recognized_one() {
-        let resolved = resolve_agents("claude,made-up-product");
-        assert_eq!(resolved.enabled, BTreeSet::from([AgentKind::ClaudeCode]));
-        assert_eq!(resolved.ignored, vec!["made-up-product".to_string()]);
-        assert!(
-            !resolved.fell_back_to_all,
-            "a partial drop still used a real name, not the fallback"
-        );
-    }
-
-    #[test]
-    fn resolve_agents_falls_back_to_all_when_nothing_is_recognized() {
-        let single = resolve_agents("made-up-product");
-        assert_eq!(single.enabled, all_agents());
-        assert_eq!(single.ignored, vec!["made-up-product".to_string()]);
-        assert!(single.fell_back_to_all);
-
-        let list = resolve_agents("nonsense,also-nonsense");
-        assert_eq!(list.enabled, all_agents());
+    fn resolve_agents_stays_total_for_a_config_built_in_code() {
+        // A file with such a value is refused ([`agents_setting`]); a hand-built
+        // `Config` can still hold one, and discovers something rather than nothing.
         assert_eq!(
-            list.ignored,
-            vec!["nonsense".to_string(), "also-nonsense".to_string()]
+            resolve_agents("claude,made-up-product").enabled,
+            BTreeSet::from([AgentKind::ClaudeCode])
         );
-        assert!(list.fell_back_to_all);
+        assert_eq!(resolve_agents("made-up-product").enabled, all_agents());
+        assert_eq!(
+            resolve_agents("nonsense,also-nonsense").enabled,
+            all_agents()
+        );
     }
 
     #[test]
@@ -2005,9 +1924,226 @@ data_dir = \"C:/synthetic/banto-data\"
         );
     }
 
+    // -- a value no setting takes stops banto -------------------------------
+    //
+    // Every setting that reads one of a fixed set of words refuses a value that
+    // is not one of them, as it does a value of the wrong TOML type: a typo that
+    // silently became the built-in ran the operator's agents on something they
+    // did not choose. Trimming and case, where a setting had them, are kept; a
+    // free-text setting (a model, an effort, a prompt) is not in this list
+    // because it never had a fixed set.
+
+    /// What `toml` says about `text` as a `Config`, or `None` when it loads.
+    fn refusal(text: &str) -> Option<String> {
+        toml::from_str::<Config>(text)
+            .err()
+            .map(|error| error.to_string())
+    }
+
+    /// `text` is refused by `key`'s own reason sentence, not by some other `toml`
+    /// error: `toml` echoes the offending source line, so the key and the value
+    /// would be in any message about that line. The sentence is checked whole
+    /// (`` `key` does not take "given"; it takes ... ``) and for each accepted word.
+    fn assert_refused_naming(text: &str, key: &str, given: &str, accepted: &[&str]) {
+        let message = refusal(text).unwrap_or_else(|| panic!("{text:?} loaded"));
+        assert!(
+            message.starts_with("TOML parse error at line "),
+            "{message}"
+        );
+        let reason = message
+            .lines()
+            .find(|line| line.starts_with('`'))
+            .unwrap_or_else(|| panic!("no reason sentence in {message}"));
+        let lead = format!("`{key}` does not take {given:?}; it takes ");
+        assert!(reason.starts_with(&lead), "{lead} in {reason}");
+        for word in accepted {
+            assert!(reason.contains(word), "{word} in {reason}");
+        }
+    }
+
+    /// `text` is refused for having the wrong TOML type, with `toml`'s own
+    /// "invalid type ... expected `expected`" reason.
+    fn assert_wrong_type(text: &str, expected: &str) {
+        let message = refusal(text).unwrap_or_else(|| panic!("{text:?} loaded"));
+        assert!(
+            message.contains("invalid type: ") && message.contains(&format!("expected {expected}")),
+            "{text:?}: {message}"
+        );
+    }
+
     #[test]
-    fn resolve_agents_a_repeated_unrecognized_name_is_listed_once() {
-        let resolved = resolve_agents("claude,made-up,made-up");
-        assert_eq!(resolved.ignored, vec!["made-up".to_string()]);
+    fn relay_refuses_a_value_that_is_not_auto_or_manual() {
+        for bad in ["\"typo\"", "\"\"", "\"  \"", "\"manual!\""] {
+            assert_refused_naming(
+                &format!("[brigade]\nrelay = {bad}\n"),
+                "relay",
+                bad.trim_matches('"'),
+                &["auto", "manual"],
+            );
+        }
+        for (ok, mode) in [
+            ("auto", RelayMode::Auto),
+            ("manual", RelayMode::Manual),
+            (" Manual ", RelayMode::Manual),
+            ("AUTO", RelayMode::Auto),
+        ] {
+            assert_eq!(
+                parse(&format!("[brigade]\nrelay = \"{ok}\"\n"))
+                    .brigade
+                    .relay,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn worker_agent_refuses_a_value_that_is_not_one_of_its_four() {
+        for bad in ["\"typo\"", "\"\"", "\"  \"", "\"claud\""] {
+            assert_refused_naming(
+                &format!("[brigade]\nworker_agent = {bad}\n"),
+                "worker_agent",
+                bad.trim_matches('"'),
+                &["inherit", "claude", "codex", "select"],
+            );
+        }
+        for (ok, setting) in [
+            ("inherit", WorkerAgentSetting::Inherit),
+            ("select", WorkerAgentSetting::Select),
+            (" Claude ", WorkerAgentSetting::Claude),
+            ("CODEX", WorkerAgentSetting::Codex),
+        ] {
+            let config = parse(&format!("[brigade]\nworker_agent = \"{ok}\"\n"));
+            assert_eq!(config.brigade.worker_agent, setting, "{ok}");
+        }
+    }
+
+    #[test]
+    fn goinkyo_consult_refuses_a_value_that_is_not_a_level_or_empty() {
+        for bad in ["\"decision\"", "\"typo\"", "\"on\""] {
+            assert_refused_naming(
+                &format!("[brigade]\ngoinkyo_consult = {bad}\n"),
+                "goinkyo_consult",
+                bad.trim_matches('"'),
+                &["off", "disputes", "design", "decisions"],
+            );
+        }
+        // Not a string at all: the same as any wrong type.
+        for bad in ["false", "3", "1.5", "[\"off\"]", "{ level = \"off\" }"] {
+            assert_wrong_type(&format!("[brigade]\ngoinkyo_consult = {bad}\n"), "a string");
+        }
+        for ok in [
+            "off",
+            "disputes",
+            "design",
+            "decisions",
+            " DESIGN ",
+            "",
+            "   ",
+        ] {
+            let config = parse(&format!("[brigade]\ngoinkyo_consult = \"{ok}\"\n"));
+            assert_eq!(config.brigade.goinkyo_consult, ok);
+        }
+    }
+
+    #[test]
+    fn worker_autocompact_refuses_what_neither_product_takes_and_keeps_what_is_documented() {
+        for bad in [
+            "99999",
+            "1000001",
+            "-5",
+            "\"abc\"",
+            "\"250k\"",
+            "\"1e6\"",
+            "\"+250000\"",
+            "\"99999\"",
+        ] {
+            assert_refused_naming(
+                &format!("[brigade]\nworker_autocompact = {bad}\n"),
+                "worker_autocompact",
+                bad.trim_matches('"'),
+                &["auto", "100000", "1000000"],
+            );
+        }
+        for bad in ["true", "1.5", "250000.0", "[250000]", "{ n = 1 }"] {
+            assert_wrong_type(
+                &format!("[brigade]\nworker_autocompact = {bad}\n"),
+                "an integer or a string",
+            );
+        }
+        for (ok, passes) in [
+            ("250000", Some("250000")),
+            ("100000", Some("100000")),
+            ("1000000", Some("1000000")),
+            ("\"300000\"", Some("300000")),
+            ("\"auto\"", Some("auto")),
+            ("\"AUTO\"", Some("auto")),
+            ("\" 300000 \"", Some("300000")),
+            ("\"\"", None),
+        ] {
+            let config = parse(&format!("[brigade]\nworker_autocompact = {ok}\n"));
+            assert_eq!(
+                config.brigade.worker_autocompact().as_deref(),
+                passes,
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_refuses_a_name_that_is_not_a_product_even_beside_one_that_is() {
+        for bad in [
+            "\"made-up\"",
+            "\"claude,made-up\"",
+            "\"claude,\"",
+            "\"claude codex\"",
+        ] {
+            assert_refused_naming(
+                &format!("agents = {bad}\n"),
+                "agents",
+                bad.trim_matches('"'),
+                &["all", "claude", "codex"],
+            );
+        }
+        for ok in [
+            "",
+            "all",
+            "ALL",
+            "claude",
+            "codex",
+            "claude,codex",
+            " Claude , CODEX ",
+        ] {
+            assert_eq!(parse(&format!("agents = \"{ok}\"\n")).agents, ok);
+        }
+    }
+
+    #[test]
+    fn keys_prefix_refuses_what_is_not_a_chord() {
+        for bad in ["\"\"", "\"C-\"", "\"ctrl-b\"", "\"ab\"", "\"C-bb\""] {
+            assert_refused_naming(
+                &format!("[keys]\nprefix = {bad}\n"),
+                "prefix",
+                bad.trim_matches('"'),
+                &["C-"],
+            );
+        }
+        for ok in ["C-b", "C-]", "`", " ", "x"] {
+            assert_eq!(
+                parse(&format!("[keys]\nprefix = \"{ok}\"\n")).keys.prefix,
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_and_free_text_settings_still_load() {
+        let config = parse(
+            "no_such_key = 1\n[no_such_table]\nx = 1\n[brigade]\nno_such = true\n\
+             worker_model = \"whatever-model\"\nworker_effort = \"extreme\"\n\
+             goinkyo_permission_mode = \"anything\"\nworker_model_codex = \"\"\n",
+        );
+        assert_eq!(config.brigade.worker_model, "whatever-model");
+        assert_eq!(config.brigade.worker_effort, "extreme");
+        assert_eq!(config.brigade.worker_model_codex, "");
     }
 }

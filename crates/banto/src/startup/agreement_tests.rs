@@ -429,8 +429,16 @@ fn awkward_paths_come_through_every_builder_and_back_unchanged() {
     let world = World::new();
     let base = std::env::temp_dir();
     let awkward = |name: &str| base.join(format!("it's a \"quoted\" dir\\with sub {name}"));
+    // The one path that is read, and a child now refuses a config file it cannot
+    // read: Windows answers a `"` in a name with "invalid name" (os error 123), not
+    // "not found", where the other paths are only ever compared.
+    let awkward_config = if cfg!(windows) {
+        base.join("it's a dir\\with sub banto.toml")
+    } else {
+        awkward("banto.toml")
+    };
     let parent = Resolved {
-        config_file: ConfigFile::File(awkward("banto.toml")),
+        config_file: ConfigFile::File(awkward_config.clone()),
         db_path: Some(awkward("banto.db")),
         claude_home: Some(awkward("claude home")),
         codex_home: Some(awkward("codex home")),
@@ -441,7 +449,7 @@ fn awkward_paths_come_through_every_builder_and_back_unchanged() {
     // The paths really are in the arguments, whole.
     for args in [&invocations.claude_mcp, &invocations.codex_mcp] {
         for path in [
-            awkward("banto.toml"),
+            awkward_config.clone(),
             awkward("banto.db"),
             awkward("claude home"),
             awkward("codex home"),

@@ -3525,27 +3525,30 @@ pub struct PrefixKey {
 
 impl PrefixKey {
     /// `"C-<char>"` for a Control chord, or a bare single character for an
-    /// unmodified key. Anything else (empty, multi-character, malformed
-    /// `"C-"` forms) falls back to the default (`C-b`) with no error.
-    pub fn parse(raw: &str) -> Self {
-        if let Some(rest) = raw.strip_prefix("C-") {
-            let mut chars = rest.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                return Self {
-                    code: KeyCode::Char(c),
-                    mods: Modifiers::CONTROL,
-                };
-            }
-            return Self::default();
-        }
-        let mut chars = raw.chars();
-        if let (Some(c), None) = (chars.next(), chars.next()) {
-            return Self {
+    /// unmodified key; `None` for anything else (empty, several characters, a
+    /// malformed `"C-"`). A config file's `[keys] prefix` is held to this when it
+    /// is read (`config::prefix_setting`), so a file cannot hand [`Self::parse`]
+    /// a chord that falls back.
+    pub fn try_parse(raw: &str) -> Option<Self> {
+        let (rest, mods) = match raw.strip_prefix("C-") {
+            Some(rest) => (rest, Modifiers::CONTROL),
+            None => (raw, Modifiers::NONE),
+        };
+        let mut chars = rest.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(Self {
                 code: KeyCode::Char(c),
-                mods: Modifiers::NONE,
-            };
+                mods,
+            }),
+            _ => None,
         }
-        Self::default()
+    }
+
+    /// [`Self::try_parse`], with the default (`C-b`) for a chord it cannot read.
+    /// Total for a `KeysConfig` built in code; a file's value was already
+    /// checked.
+    pub fn parse(raw: &str) -> Self {
+        Self::try_parse(raw).unwrap_or_default()
     }
 
     fn matches(&self, key: &KeyEvent) -> bool {
@@ -29291,6 +29294,19 @@ mod tests {
     }
 
     // --- PrefixKey::parse ---------------------------------------------------
+
+    #[test]
+    fn try_parse_reads_a_chord_and_refuses_what_parse_would_default() {
+        assert_eq!(PrefixKey::try_parse("C-b"), Some(PrefixKey::default()));
+        assert_eq!(
+            PrefixKey::try_parse("x").map(|p| p.label()),
+            Some("x".into())
+        );
+        for raw in ["", "C-", "ctrl-b", "ab", "C-bb"] {
+            assert_eq!(PrefixKey::try_parse(raw), None, "{raw:?}");
+            assert_eq!(PrefixKey::parse(raw), PrefixKey::default(), "{raw:?}");
+        }
+    }
 
     #[test]
     fn prefix_key_parses_a_control_chord() {

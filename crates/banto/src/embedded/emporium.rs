@@ -352,10 +352,7 @@ pub struct EmporiumSettings<'a> {
     pub keys: &'a KeysConfig,
     /// `[agent_binaries]` — see `crate::launch::agent_binary`.
     pub agent_binaries: &'a AgentBinaries,
-    /// `Config.agents`, resolved. The whole [`ResolvedAgents`], not just its
-    /// `enabled` set, so [`run`]
-    /// can also post the startup notice for a name it had to ignore (see
-    /// `session::agents_ignored_notice`).
+    /// `Config.agents`, resolved.
     pub resolved_agents: &'a ResolvedAgents,
     /// Where this banto found its config, database and agent homes — handed on to
     /// every banto process it starts for a brigade member (`_mcp`, `_hook`), so
@@ -448,8 +445,6 @@ pub fn run(
             .cloned()
             .chain(settings.exe.watch_notice())
             .collect(),
-        settings.resolved_agents,
-        brigade,
     );
 
     let deps = Deps {
@@ -5392,14 +5387,14 @@ mod tests {
         let t0 = Instant::now();
         let notices = vec![
             "codex: brigade briefings need a one-time approval".to_string(),
-            "agents: ignored unknown name(s) \"codx\"".to_string(),
+            "data_dir: the database is not in it".to_string(),
         ];
 
         // Both apply: the first is up at once and the second is not lost, only
         // waiting for the line.
         let first = status_after(&mut state, &mut app, Event::StartupNotices { notices }, t0);
         assert!(first.contains("one-time approval"), "{first:?}");
-        assert!(!first.contains("codx"), "{first:?}");
+        assert!(!first.contains("data_dir"), "{first:?}");
 
         // The first has had its time: the second takes the line on that tick.
         let tick = || Event::Tick {
@@ -5407,10 +5402,7 @@ mod tests {
             brigades: Vec::new(),
         };
         let second = status_after(&mut state, &mut app, tick(), t0 + Duration::from_secs(6));
-        assert!(
-            second.contains("ignored unknown name(s) \"codx\""),
-            "{second:?}"
-        );
+        assert!(second.contains("the database is not in it"), "{second:?}");
         assert!(!second.contains("one-time approval"), "{second:?}");
 
         // And when that has run out too, the key guidance is back.
@@ -5696,11 +5688,11 @@ mod tests {
         // while the sweep runs, a notice) and a prefix chord armed on top: the
         // status would show and the prefix hint would normally outrank it.
         let notice = Event::StartupNotices {
-            notices: vec!["agents: ignored unknown name(s) \"codx\"".to_string()],
+            notices: vec!["data_dir: the database is not in it".to_string()],
         };
         let bar = status_after(&mut state, &mut app, notice, at + Duration::from_secs(2));
         assert!(bar.contains("Closing"), "{bar:?}");
-        assert!(!bar.contains("codx"), "{bar:?}");
+        assert!(!bar.contains("data_dir"), "{bar:?}");
         state.prefix_armed = Some(at);
         let bar = status_row(&render(&state, &app));
         assert!(bar.contains("Closing"), "{bar:?}");
@@ -5713,10 +5705,10 @@ mod tests {
         // quitting is decided.
         let (mut state, mut app, at) = quitting_fixture(1);
         let notice = Event::StartupNotices {
-            notices: vec!["agents: ignored unknown name(s) \"codx\"".to_string()],
+            notices: vec!["data_dir: the database is not in it".to_string()],
         };
         let bar = status_after(&mut state, &mut app, notice, at);
-        assert!(bar.contains("codx"), "{bar:?}");
+        assert!(bar.contains("data_dir"), "{bar:?}");
         assert!(!bar.contains("Closing"), "{bar:?}");
         state.prefix_armed = Some(at);
         let bar = status_row(&render(&state, &app));
@@ -5784,11 +5776,11 @@ mod tests {
         // A status message, the armed prefix hint, the quit prompt and the
         // closing line each take the left-hand text.
         let notice = Event::StartupNotices {
-            notices: vec!["agents: ignored unknown name(s) \"codx\"".to_string()],
+            notices: vec!["data_dir: the database is not in it".to_string()],
         };
         let bar = status_after(&mut state, &mut app, notice, at);
         assert!(
-            bar.contains("codx") && bar.contains("BELL ALWAYS"),
+            bar.contains("data_dir") && bar.contains("BELL ALWAYS"),
             "{bar:?}"
         );
 

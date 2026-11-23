@@ -181,7 +181,7 @@ banto を終了し、同じインストール行を実行して、banto をま�
 
 ## 設定
 
-`config.toml` は省略可能で、ファイルがない、または壊れている場合は既定値になります。最初に見つかったものが使われます。`--config <path>` と `$BANTO_CONFIG` は、存在してパースできなければ起動に失敗します。次に、存在すれば `$XDG_CONFIG_HOME/banto/config.toml`、続いて `~/.config/banto/config.toml` が使われます。どちらもなければ、既定の `dirs::config_dir()/banto/config.toml`（Windows では `%APPDATA%\banto\`）です。
+`config.toml` は省略可能で、ファイルがなければ既定値になります。ファイルがある場合はパースできる必要があり（正しい TOML で、既知のキーに、正しい型で、そのキーが取る値が入っていること。`relay = "typo"` は `relay = 5` と同じく拒否されます）、できなければ banto は行と列つきのエラーを表示して起動しません。未知のキーは無視されます。最初に見つかったものが使われます。`--config <path>` と `$BANTO_CONFIG` は、さらに存在していなければなりません。次に、存在すれば `$XDG_CONFIG_HOME/banto/config.toml`、続いて `~/.config/banto/config.toml` が使われます。どちらもなければ、既定の `dirs::config_dir()/banto/config.toml`（Windows では `%APPDATA%\banto\`）です。
 
 ```toml
 claude_home = "C:/Users/you/.claude"   # 上書き（任意）

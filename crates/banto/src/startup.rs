@@ -345,14 +345,43 @@ fn absolute(path: &Path, cwd: Option<&Path>) -> PathBuf {
     }
 }
 
-/// How strictly an explicitly named config file is loaded.
+/// How strictly a config file is loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strictness {
-    /// A named file that is missing or does not parse is an error.
+    /// A file that is there must be usable: one that cannot be read or parsed is
+    /// an error, whichever way it was found. A missing file is the defaults,
+    /// except for an explicit `--config`/`BANTO_CONFIG`, where it is an error
+    /// too (the operator named it).
     Strict,
     /// Any file problem means the defaults (the `_hook` process, which must
     /// never fail the operator's own agent).
     Lenient,
+}
+
+/// What the operator is told when banto stops on a config file it cannot use.
+/// Built by hand rather than from `ConfigError`'s `Display`, which spells the
+/// path with `{:?}` (every backslash of a Windows path doubled) and would put
+/// it inside an `anyhow` "Caused by" chain; `toml`'s own text for a syntax
+/// error (line, column, the offending line, what was expected) is the part
+/// worth keeping verbatim.
+pub fn refusal_message(error: &io_config::ConfigError) -> String {
+    format!(
+        "banto: config file {} could not be used:\n{}\nbanto did not start. Fix the file and run banto again.",
+        error.path().display(),
+        error.reason()
+    )
+}
+
+/// What a `_mcp` process says through its refusing server for the same
+/// condition. Its reader is an agent in a pane, not an operator at a prompt,
+/// and the process cannot stop the way the UI does: exiting would show the
+/// agent only an MCP server that failed to start, with none of these words.
+pub fn mcp_refusal_message(error: &io_config::ConfigError) -> String {
+    format!(
+        "banto's config file {} could not be used:\n{}\nFix the file, then reconnect banto's MCP server (Claude: /mcp) or restart the member.",
+        error.path().display(),
+        error.reason()
+    )
 }
 
 /// Resolve the config, then everything the config can override.
@@ -728,15 +757,26 @@ fn is_within(path: &Path, dir: &Path, rules: Rules) -> bool {
 fn resolve_config(inputs: &Inputs, strictness: Strictness) -> Result<(Config, ConfigFile)> {
     let cwd = inputs.cwd.as_deref();
     let env = &inputs.env;
+    // The file at `path` as `strictness` reads one that is not an explicit
+    // override: a missing one is the defaults in both, anything else wrong with
+    // it only for the hook.
+    let load_found = |path: &Path| match strictness {
+        Strictness::Strict => io_config::load(path)
+            .with_context(|| format!("failed to load config file {}", path.display())),
+        Strictness::Lenient => Ok(io_config::load_or_default(path)),
+    };
     // What the parent already settled on wins over any search: its file is loaded
-    // as the parent loaded it (leniently — the parent got this far with it), or
-    // there is none.
+    // the way the parent loaded it, or there is none. The parent got this far
+    // with it, so a file that is now broken was edited since, and the child says
+    // so. A file that is *missing* is the defaults, not an error: the parent
+    // names its platform default whether or not one exists (`ConfigFile::File`),
+    // and a machine with no config.toml is the ordinary case.
     if inputs.parent_no_config {
         return Ok((Config::default(), ConfigFile::None));
     }
     if let Some(path) = &inputs.parent_config {
         let path = absolute(path, cwd);
-        return Ok((io_config::load_or_default(&path), ConfigFile::File(path)));
+        return Ok((load_found(&path)?, ConfigFile::File(path)));
     }
     let cli_override = inputs.cli_config.as_deref().map(|path| absolute(path, cwd));
     let env_override = env.banto_config.as_deref().map(|path| absolute(path, cwd));
@@ -768,7 +808,7 @@ fn resolve_config(inputs: &Inputs, strictness: Strictness) -> Result<(Config, Co
         }
         io_config::ConfigSource::Discovered(path)
         | io_config::ConfigSource::Default(Some(path)) => {
-            (io_config::load_or_default(&path), ConfigFile::File(path))
+            (load_found(&path)?, ConfigFile::File(path))
         }
         io_config::ConfigSource::Default(None) => (Config::default(), ConfigFile::None),
     })

@@ -38,8 +38,11 @@
 //! own strict config load, specifically so a broken `--config`/`BANTO_
 //! CONFIG` the operator has set for unrelated reasons can't fail the hook
 //! either — this module resolves and loads its own config independently,
-//! always leniently, even for an explicit override that `main.rs`'s own
-//! resolution would treat as a hard error.
+//! always leniently, even for a config file that `main.rs`'s own resolution
+//! would refuse to start on (one that does not parse, or an explicit override
+//! that is missing).
+//! A config that breaks after the UI started therefore costs a hook run every
+//! setting in the file, its `[brigade]` templates included, not only the bad key.
 //!
 //! Where the config file and the database are comes from the banto that
 //! launched the agent, through the environment (`BANTO_PARENT_CONFIG`,
@@ -123,7 +126,7 @@ fn build_briefing(
 
 /// Resolves banto's own config and database, always leniently — see the module
 /// doc for why this deliberately doesn't use the strict load `main.rs` does for
-/// the other commands (it fails outright on a broken explicit override). `None`
+/// the other commands (it stops on a config file that does not parse). `None`
 /// for the store on any failure (unresolvable path, unopenable file): never an
 /// error the hook has to propagate.
 fn load_leniently() -> (Config, Option<Store>) {
