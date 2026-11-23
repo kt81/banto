@@ -98,7 +98,10 @@ administrator):
    archive into one directory (with the browser, as above), set
    `$env:BANTO_INSTALL_SOURCE` to that directory and `$env:BANTO_VERSION` to the tag, and
    run `Get-Content -Raw .\install.ps1 | iex`, which is what `irm <url> | iex` does with
-   the same text. After publishing, run the line exactly as printed (section 4).
+   the same text. After publishing, run the line exactly as printed (section 4). On a
+   machine that already has banto installed this upgrades that install in place:
+   `BANTO_INSTALL_DIR` is ignored then (one banto per machine), so it cannot be pointed
+   at a scratch directory (v0.3.0's check upgraded the maintainer's install that way).
 4. Write down what Defender and SmartScreen said at each step, even if it was nothing.
 
 ### c. macOS, on a real Mac

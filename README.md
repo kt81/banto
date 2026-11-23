@@ -175,8 +175,8 @@ built on Ubuntu 22.04, and the build fails if the binary needs a newer glibc;
 musl systems such as Alpine build from source), and macOS on Apple silicon. Intel
 Macs and Windows on ARM have no prebuilt binary.
 
-**macOS is lightly checked.** On one Apple silicon Mac, v0.1.0 installed with
-`install.sh` with no Gatekeeper prompt; sessions opened and closed in panes, and
+**macOS is lightly checked.** On one Apple silicon Mac, v0.1.0 and v0.3.0 installed
+with `install.sh` with no Gatekeeper prompt; sessions opened and closed in panes, and
 text selected in a pane copied out. Resume, the list following session-file
 changes, input in detail and a browser-downloaded binary are unchecked.
 
