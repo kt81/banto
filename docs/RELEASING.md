@@ -9,8 +9,8 @@ checks below, and it publishes the exact files the workflow produced.
 
 1. Bump `version` under `[workspace.package]` in the root `Cargo.toml` (and let
    `Cargo.lock` follow: the workflow builds with `--locked`).
-2. If the new version is past `0.1.x`, also move the five `version = "0.1.0"`
-   requirements that sit beside the `path` dependencies in the crate manifests. A
+2. Move the five `version` requirements that sit beside the `path` dependencies in
+   the crate manifests to the new version as well. A
    `path` dependency with a `version` is checked against the version it finds, so they
    do not follow the workspace version by themselves.
 3. Commit, then tag `v<version>` and push the tag. The tag **must equal Cargo's version

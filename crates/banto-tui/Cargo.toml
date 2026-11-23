@@ -8,7 +8,7 @@ repository.workspace = true
 description = "banto's rendering: ratatui views over the pure core's state"
 
 [dependencies]
-banto-core = { version = "0.2.0", path = "../banto-core" }
+banto-core = { version = "0.3.0", path = "../banto-core" }
 # Default features off: `ratatui`'s default `crossterm` feature pulls in the
 # real `crossterm` crate (a terminal backend) transitively, which this crate
 # must never depend on (`docs/DISCIPLINE.md` §2) — banto-tui only renders
