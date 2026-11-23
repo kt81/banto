@@ -388,6 +388,8 @@ worker_model_codex = \"terra\"
     /// the built-in is, so an example that drifts from the defaults fails here.
     fn readme_example_loads(readme: &str, heading: &str) {
         use banto_core::model::AgentKind::{ClaudeCode, Codex};
+        // CI's Windows checkout converts the READMEs to CRLF.
+        let readme = &readme.replace("\r\n", "\n");
         let section = readme.find(heading).expect("the Configuration section");
         let from = section
             + readme[section..].find("```toml\n").expect("a toml block")
